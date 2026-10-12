@@ -127,6 +127,12 @@ export interface PreviewJob {
   createdAt: number;
 }
 
+/** A converted 3D model that still needs a rendered grid thumbnail */
+export interface PendingModelThumbnail {
+  assetId: string;
+  modelPath: string;
+}
+
 // ── IPC / Command interfaces (Tauri invoke payloads) ─────────────────────
 export interface AddLibraryPayload {
   name: string;

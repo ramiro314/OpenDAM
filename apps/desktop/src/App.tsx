@@ -11,6 +11,7 @@ import { IconCheck } from './components/Icons';
 import { useUIStore } from './store';
 import { useLibraryStore, useTagStore, useCollectionStore, useAssetStore } from './store';
 import { api } from './api';
+import { startModelThumbnailer } from './preview/modelThumbnailer';
 import styles from './App.module.css';
 
 function isEditingText(): boolean {
@@ -60,6 +61,9 @@ export default function App() {
         useAssetStore.getState().setPreviewStatus(event.payload.assetId, 'error');
       }
     );
+
+    // Render grid thumbnails for 3D models the preview engine converted to .glb
+    const stopModelThumbnailer = startModelThumbnailer();
 
     const unlistenLib = listen('library:updated', () => {
       useAssetStore.getState().search();
@@ -183,6 +187,7 @@ export default function App() {
       unlistenDone.then((fn) => fn());
       unlistenError.then((fn) => fn());
       unlistenLib.then((fn) => fn());
+      stopModelThumbnailer();
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', handleBlur);
