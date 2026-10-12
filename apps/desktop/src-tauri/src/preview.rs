@@ -63,9 +63,6 @@ impl PythonWorker {
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONIOENCODING", "utf-8");
 
-        #[cfg(windows)]
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("Failed to take python stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to take python stdout"))?;
@@ -139,11 +136,7 @@ pub fn start_preview_worker(state: Arc<AppState>) {
             for root in &search_roots {
                 let candidates = [
                     root.join("packages").join("preview-engine").join(".venv").join("bin").join("python"),
-                    root.join("packages").join("preview-engine").join("venv").join("Scripts").join("pythonw.exe"),
-                    root.join("packages").join("preview-engine").join("venv").join("Scripts").join("python.exe"),
                     root.join("packages").join("preview-engine").join("venv").join("bin").join("python"),
-                    root.join("venv").join("Scripts").join("pythonw.exe"),
-                    root.join("venv").join("Scripts").join("python.exe"),
                     root.join("venv").join("bin").join("python"),
                 ];
                 if let Some(p) = candidates.into_iter().find(|p| p.exists()) {
@@ -151,10 +144,7 @@ pub fn start_preview_worker(state: Arc<AppState>) {
                     break;
                 }
             }
-            found_py.unwrap_or_else(|| {
-                let fallbacks = [PathBuf::from("pythonw"), PathBuf::from("python")];
-                fallbacks.into_iter().find(|p| p.exists()).unwrap_or_else(|| PathBuf::from("python"))
-            })
+            found_py.unwrap_or_else(|| PathBuf::from("python3"))
         };
 
         let worker_py = if let Ok(custom) = std::env::var("OPENDAM_WORKER") {

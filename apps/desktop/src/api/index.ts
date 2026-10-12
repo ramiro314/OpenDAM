@@ -75,9 +75,9 @@ export const api = {
   saveModelThumbnail: (assetId: string, png: Uint8Array) =>
     invoke<string>('save_model_thumbnail', png, { headers: { 'asset-id': assetId } }),
 
-  // Reveal in explorer / open with default app
-  revealInExplorer: (filePath: string) =>
-    invoke<void>('reveal_in_explorer', { filePath }),
+  // Reveal in file manager / open with default app
+  revealInFileManager: (filePath: string) =>
+    invoke<void>('reveal_in_file_manager', { filePath }),
   openWithDefault: (filePath: string) =>
     invoke<void>('open_with_default', { filePath }),
 };

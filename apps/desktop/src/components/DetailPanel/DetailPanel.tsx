@@ -270,12 +270,12 @@ export function DetailPanel() {
           <button
             id="detail-reveal"
             className={styles.actionBtn}
-            title="Reveal in Explorer"
+            title="Reveal in file manager"
             onClick={async () => {
               try {
-                await api.revealInExplorer(asset.filePath);
+                await api.revealInFileManager(asset.filePath);
               } catch (err) {
-                console.error('Failed to reveal in explorer:', err);
+                console.error('Failed to reveal in file manager:', err);
               }
             }}
           >
@@ -446,13 +446,13 @@ function InfoTab({
       <label className={styles.infoLabel}>Path</label>
       <span
         className={clsx(styles.infoValue, styles.mono, 'truncate')}
-        title={`${asset.filePath} (Click to reveal in Explorer)`}
+        title={`${asset.filePath} (Click to reveal in file manager)`}
         style={{ cursor: 'pointer' }}
         onClick={async () => {
           try {
-            await api.revealInExplorer(asset.filePath);
+            await api.revealInFileManager(asset.filePath);
           } catch (err) {
-            console.error('Failed to reveal in explorer:', err);
+            console.error('Failed to reveal in file manager:', err);
           }
         }}
       >

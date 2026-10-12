@@ -163,9 +163,7 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
 
     let mut existing_map: HashMap<String, (String, i64, i64, Option<String>)> = HashMap::with_capacity(existing_rows.len());
     for (id, file_path, modified_at, size_bytes, thumb) in existing_rows {
-        // Normalize path separators to forward slash for reliable matching
-        let norm = file_path.replace('\\', "/");
-        existing_map.insert(norm, (id, modified_at, size_bytes, thumb));
+        existing_map.insert(file_path, (id, modified_at, size_bytes, thumb));
     }
 
     let mut seen_paths: HashSet<String> = HashSet::with_capacity(existing_map.len() + 100);

@@ -376,7 +376,7 @@ pub async fn search_assets(
     if let Some(dir) = &f.directory {
         if !dir.trim().is_empty() {
             conditions.push("a.file_path LIKE ?".into());
-            binds.push(format!("%{}%", dir.trim().replace('\\', "/")));
+            binds.push(format!("%{}%", dir.trim()));
         }
     }
 
@@ -753,13 +753,12 @@ pub async fn rename_asset(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Asset> {
     let trimmed = new_name.trim();
-    if trimmed.is_empty() {
-        return Err("Asset file name cannot be empty".into());
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return Err("Asset file name cannot be empty, '.' or '..'".into());
     }
 
-    let invalid_chars = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
-    if trimmed.chars().any(|c| invalid_chars.contains(&c)) {
-        return Err("File name contains invalid characters: \\ / : * ? \" < > |".into());
+    if trimmed.contains(['/', '\0']) {
+        return Err("File name cannot contain '/' or NUL".into());
     }
 
     let libs = state.db.get_all_libraries().await;
