@@ -30,7 +30,7 @@ Please describe the manual or automated tests conducted to verify your changes:
 ## Checklist
 
 - [ ] My code follows the project's code style and conventions
-- [ ] `pnpm --filter @opendam/desktop vite:build` passes cleanly
+- [ ] `make lint check build` passes cleanly
 - [ ] `cargo clippy --all-targets -- -D warnings` passes without errors or warnings
 - [ ] `ruff check packages/preview-engine/` passes without errors
 - [ ] No secrets, local `.sqlite` databases, or personal files are committed

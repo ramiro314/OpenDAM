@@ -4,7 +4,7 @@
 import { readFileSync } from 'node:fs';
 
 const cargoLock = readFileSync('apps/desktop/src-tauri/Cargo.lock', 'utf8');
-const pnpmLock = readFileSync('pnpm-lock.yaml', 'utf8');
+const bunLock = readFileSync('bun.lock', 'utf8');
 
 const crates = new Map();
 for (const [, name, version] of cargoLock.matchAll(/\[\[package\]\]\nname = "(tauri(?:-plugin-[a-z-]+)?)"\nversion = "([^"]+)"/g)) {
@@ -15,8 +15,8 @@ const majorMinor = (version) => version.split('.').slice(0, 2).join('.');
 let failed = false;
 const seen = new Set();
 
-// Direct dependencies in the importers section: '@tauri-apps/x': / specifier: ... / version: 1.2.3
-for (const [, pkg, version] of pnpmLock.matchAll(/^\s+'@tauri-apps\/(api|plugin-[a-z-]+)':\n\s+specifier: .*\n\s+version: ([0-9][^\s(]*)/gm)) {
+// Resolved packages in the "packages" section: "@tauri-apps/x": ["@tauri-apps/x@1.2.3", ...
+for (const [, pkg, version] of bunLock.matchAll(/^\s+"@tauri-apps\/(api|plugin-[a-z-]+)": \["@tauri-apps\/\1@([0-9][^"]*)"/gm)) {
   if (seen.has(pkg)) continue;
   seen.add(pkg);
   const crate = pkg === 'api' ? 'tauri' : `tauri-${pkg}`;
@@ -33,7 +33,7 @@ for (const [, pkg, version] of pnpmLock.matchAll(/^\s+'@tauri-apps\/(api|plugin-
 }
 
 if (seen.size === 0) {
-  console.log('::error::No @tauri-apps packages found in pnpm-lock.yaml; the lockfile format may have changed');
+  console.log('::error::No @tauri-apps packages found in bun.lock; the lockfile format may have changed');
   failed = true;
 }
 process.exit(failed ? 1 : 0);

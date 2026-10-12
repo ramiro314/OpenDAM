@@ -29,58 +29,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Frontend ──────────────────────────────────────────────────────────────
-  frontend:
-    name: Frontend (TypeScript + Vite)
+  # One job: every make target spans TypeScript, Rust and Python, so
+  # splitting them would install the toolchains and compile Tauri repeatedly.
+  checks:
+    name: Lint, check and build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # tauri build refuses mismatched Rust/JS Tauri versions, and nothing else
-      # in CI runs it. Only reads the lockfiles, so it fails fast.
-      - name: Check Tauri crate and npm package versions match
-        run: node .github/scripts/check-tauri-versions.mjs
-      # pnpm version comes from "packageManager" in the root package.json
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      # https://v2.tauri.app/start/prerequisites/#linux
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: '20'
-          cache: 'pnpm'
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-      # Note: vite:build in apps/desktop already executes "tsc -b && vite build",
-      # validating all TypeScript types before generating the Vite build.
-      - name: Build frontend bundle
-        run: pnpm --filter @opendam/desktop vite:build
-
-  # ── Rust backend ──────────────────────────────────────────────────────────
-  rust:
-    name: Rust (Clippy + Checks)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
+          bun-version-file: package.json # "packageManager"
+      # uv installs the Python version in packages/preview-engine/.python-version
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: packages/preview-engine/uv.lock
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: 'apps/desktop/src-tauri -> target'
-      # cargo clippy already performs full typechecking + borrow checking;
-      # running cargo check right before it is redundant compilation work.
-      # --locked fails if Cargo.lock is out of date with Cargo.toml.
-      - name: Cargo clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-        working-directory: apps/desktop/src-tauri
-
-  # ── Python preview engine ────────────────────────────────────────────────
-  python:
-    name: Python (Ruff Lint)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # astral-sh/ruff-action downloads a precompiled standalone binary in ~1s
-      # without needing python setup or pip install.
-      # Paths go in `src`: the action appends `src` (default: repo root) to `args`.
-      - uses: astral-sh/ruff-action@v3
-        with:
-          args: check
-          src: packages/preview-engine
+      - run: make deps
+      # make check also verifies the Tauri crate and npm package versions match:
+      # tauri build refuses mismatched minor versions.
+      - run: make check
+      - run: make lint
+      - run: make build
