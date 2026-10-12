@@ -66,8 +66,12 @@ nextest's is listed as unverified.</li>
 sync already does. It then copies master's definitions down to the opened library's mirror, in
 a stable library order. The plan had said &quot;upsert&quot;, which would revert renames made while a
 library was offline and would make master depend on open order.</li>
-<li><strong>The flow diagrams' labels now match their mermaid source word for word.</strong> The consistency
-check enforces it.</li>
+<li><strong>The flow diagrams' labels now match their mermaid source word for word.</strong> I checked this with a
+comparison script when the plan was written. That script isn't committed, so <code>plan.html</code> is a
+snapshot: if <code>plan.md</code> changes, re-render <code>plan.html</code> from it or delete it.</li>
+<li><strong>Fix #6's mirror overwrite is an <code>UPDATE</code>, never <code>REPLACE</code></strong> (Inspector round 2). REPLACE
+deletes the old row, and the schema's <code>ON DELETE CASCADE</code> foreign keys would wipe the library's
+memberships and child collections. A new test with foreign keys on proves they survive an open.</li>
 </ul>
 <h2 id="summary">Summary</h2>
 <p><code>ramiro314/OpenDAM</code> is now a <strong>hard fork</strong>. It is a personal, <strong>Linux-only</strong> asset manager for
@@ -595,7 +599,13 @@ into dependency-linked tasks. A step may become several tickets.</p>
 <li><strong>Library open (insert-only, master wins):</strong>
 <ul>
 <li><strong>Keep <code>main</code>'s <code>sync_library_metadata</code></strong> (<code>db.rs:215-259</code>). It runs at startup and on library add, and only inserts missing rows (<code>INSERT OR IGNORE</code>). Master gains the definitions it lacks, so a library folder brought from another machine still brings its new tags. A mirror never overwrites a definition master already has, so a rename or recolour made while a library was offline is kept.</li>
-<li><strong>New in this fix:</strong> after that insert, master's definitions overwrite the opened library's mirror, so mirrors converge on master.</li>
+<li><strong>New in this fix:</strong> after that insert, master's definitions overwrite the opened library's mirror, so mirrors converge on master.
+<ul>
+<li><strong>Mechanism:</strong> the overwrite updates the existing row in place: <code>UPDATE tags SET name = ?, color = ?, parent_id = ? WHERE id = ?</code>, and <code>UPDATE collections SET name = ?, description = ?, parent_id = ?, is_smart = ?, filter_spec = ? WHERE id = ?</code>. An <code>INSERT ... ON CONFLICT(id) DO UPDATE</code> is equivalent.</li>
+<li><strong>Never <code>REPLACE</code> or <code>INSERT OR REPLACE</code>.</strong> REPLACE deletes the old row before inserting. On a connection with foreign keys on, <code>ON DELETE CASCADE</code> on <code>asset_tags.tag_id</code>, <code>collection_assets.collection_id</code> and <code>collections.parent_id</code> (and <code>ON DELETE SET NULL</code> on <code>tags.parent_id</code>) would then wipe the library's memberships and child collections.</li>
+<li><strong>Name collisions:</strong> <code>tags.name</code> is <code>UNIQUE</code>. If master's name for a tag collides with a different tag's name in the mirror, that row's update fails. Log it and leave the row; never delete either tag to make room.</li>
+</ul>
+</li>
 <li><strong>Stable order:</strong> startup syncs libraries in library-id order. When two mirrors disagree about a definition master lacks, the winner then doesn't depend on HashMap order.</li>
 </ul>
 </li>
@@ -606,6 +616,13 @@ into dependency-linked tasks. A step may become several tickets.</p>
 <li><strong>Memberships:</strong> tag one asset in A and another in B. Each <code>asset_tags</code> row exists only in its own library's DB. This fails on <code>main</code> whatever order the HashMap is in: the &quot;active&quot; library is always one of the two, so it receives the other library's row.</li>
 <li><strong>Reads:</strong> with both libraries open, give a tag a different name in master than in both mirrors. <code>list_tags</code> returns master's name. On <code>main</code> it returns a mirror's name.</li>
 <li><strong>Open:</strong> master names tag T &quot;new&quot;. A's mirror names T &quot;old&quot; and also holds a tag U that master lacks. After A opens, master still says &quot;new&quot; and has gained U, and A's mirror now says &quot;new&quot;. On <code>main</code> the mirror still says &quot;old&quot;, because the sync only inserts missing rows.</li>
+<li><strong>Open keeps memberships (foreign keys on):</strong> a separate fixture opens A's pool with <code>foreign_keys</code> on, as most production connections are.
+<ul>
+<li><strong>Setup:</strong> in A, an asset is tagged T and is in collection C, and C has a child collection C2. Master renames T and C.</li>
+<li><strong>Assertions:</strong> after A opens, A's mirror shows both new names, and the asset's <code>asset_tags</code> and <code>collection_assets</code> rows and C2 are all still there.</li>
+<li><strong>Why it fails on <code>main</code>:</strong> the mirror keeps the old names. A <code>REPLACE</code>-based fix would also fail it, by cascade-deleting those rows.</li>
+</ul>
+</li>
 </ul>
 </li>
 <li>After this lands, <code>AGENTS.md</code> records the rule.</li>

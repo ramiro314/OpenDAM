@@ -27,8 +27,12 @@ Revised after the GitHub Inspector review on PR #11:
   sync already does. It then copies master's definitions down to the opened library's mirror, in
   a stable library order. The plan had said "upsert", which would revert renames made while a
   library was offline and would make master depend on open order.
-- **The flow diagrams' labels now match their mermaid source word for word.** The consistency
-  check enforces it.
+- **The flow diagrams' labels now match their mermaid source word for word.** I checked this with a
+  comparison script when the plan was written. That script isn't committed, so `plan.html` is a
+  snapshot: if `plan.md` changes, re-render `plan.html` from it or delete it.
+- **Fix #6's mirror overwrite is an `UPDATE`, never `REPLACE`** (Inspector round 2). REPLACE
+  deletes the old row, and the schema's `ON DELETE CASCADE` foreign keys would wipe the library's
+  memberships and child collections. A new test with foreign keys on proves they survive an open.
 
 ## Summary
 
@@ -381,6 +385,9 @@ into dependency-linked tasks. A step may become several tickets.
    - **Library open (insert-only, master wins):**
      - **Keep `main`'s `sync_library_metadata`** (`db.rs:215-259`). It runs at startup and on library add, and only inserts missing rows (`INSERT OR IGNORE`). Master gains the definitions it lacks, so a library folder brought from another machine still brings its new tags. A mirror never overwrites a definition master already has, so a rename or recolour made while a library was offline is kept.
      - **New in this fix:** after that insert, master's definitions overwrite the opened library's mirror, so mirrors converge on master.
+       - **Mechanism:** the overwrite updates the existing row in place: `UPDATE tags SET name = ?, color = ?, parent_id = ? WHERE id = ?`, and `UPDATE collections SET name = ?, description = ?, parent_id = ?, is_smart = ?, filter_spec = ? WHERE id = ?`. An `INSERT ... ON CONFLICT(id) DO UPDATE` is equivalent.
+       - **Never `REPLACE` or `INSERT OR REPLACE`.** REPLACE deletes the old row before inserting. On a connection with foreign keys on, `ON DELETE CASCADE` on `asset_tags.tag_id`, `collection_assets.collection_id` and `collections.parent_id` (and `ON DELETE SET NULL` on `tags.parent_id`) would then wipe the library's memberships and child collections.
+       - **Name collisions:** `tags.name` is `UNIQUE`. If master's name for a tag collides with a different tag's name in the mirror, that row's update fails. Log it and leave the row; never delete either tag to make room.
      - **Stable order:** startup syncs libraries in library-id order. When two mirrors disagree about a definition master lacks, the winner then doesn't depend on HashMap order.
    - **Cleanup:** an idempotent pass removes orphan membership rows whose asset isn't in that library.
    - *Test:* two libraries, A and B, both open.
@@ -388,6 +395,10 @@ into dependency-linked tasks. A step may become several tickets.
      - **Memberships:** tag one asset in A and another in B. Each `asset_tags` row exists only in its own library's DB. This fails on `main` whatever order the HashMap is in: the "active" library is always one of the two, so it receives the other library's row.
      - **Reads:** with both libraries open, give a tag a different name in master than in both mirrors. `list_tags` returns master's name. On `main` it returns a mirror's name.
      - **Open:** master names tag T "new". A's mirror names T "old" and also holds a tag U that master lacks. After A opens, master still says "new" and has gained U, and A's mirror now says "new". On `main` the mirror still says "old", because the sync only inserts missing rows.
+     - **Open keeps memberships (foreign keys on):** a separate fixture opens A's pool with `foreign_keys` on, as most production connections are.
+       - **Setup:** in A, an asset is tagged T and is in collection C, and C has a child collection C2. Master renames T and C.
+       - **Assertions:** after A opens, A's mirror shows both new names, and the asset's `asset_tags` and `collection_assets` rows and C2 are all still there.
+       - **Why it fails on `main`:** the mirror keeps the old names. A `REPLACE`-based fix would also fail it, by cascade-deleting those rows.
    - After this lands, `AGENTS.md` records the rule.
 
 **Done when** each fix's regression test fails on `main` before the fix and passes after it, and `make lint check test build` is green.
