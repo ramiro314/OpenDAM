@@ -40,6 +40,15 @@ summary{cursor:pointer;font-size:.9em}
 <p>Status: approved 2026-10-12. Shaped in a three-round interview and approved at review with two
 additions (D22, D23). Follow-up: once this plan merges, Mission Control slices it into
 dependency-linked tickets.</p>
+<p>Revised 2026-10-12 after Plan Validation repair round 1. These are consistency repairs inside the
+approved decisions, not new decisions:</p>
+<ul>
+<li>Fix #5 gets an automated regression test, so every fix #1-#6 really has one.</li>
+<li>Step 2 documents only the make targets that exist when it lands. Steps 3 and 5 add <code>make test</code>
+and <code>make install</code>/<code>make uninstall</code> to the docs.</li>
+<li>Step 1's &quot;no Windows/pnpm references&quot; exit check is now an exact command. Step 2 extends it to
+the README and <code>CONTRIBUTING.md</code>.</li>
+</ul>
 <h2 id="summary">Summary</h2>
 <p><code>ramiro314/OpenDAM</code> is now a <strong>hard fork</strong>. It is a personal, <strong>Linux-only</strong> asset manager for
 <strong>game-dev assets</strong>, built and maintained by agents that Mission Control dispatches. This plan does
@@ -49,7 +58,8 @@ six things, in this order:</p>
 <li>Strips the Windows and upstream-community weight.</li>
 <li>Gives agents a root instructions file.</li>
 <li>Adds the first test runners.</li>
-<li>Fixes every bug the review confirmed, each with a regression test.</li>
+<li>Fixes all seven review findings. Fixes #1-#6 each get an automated regression test, and those
+tests guard #7's refactors.</li>
 <li>Ships a <code>make install</code> that gives you a working release build in <code>~/.local</code>.</li>
 </ol>
 <h2 id="context">Context</h2>
@@ -303,7 +313,7 @@ during shaping. The rest come from the review pass.</p>
 <li><strong>Linux only.</strong> Nothing for Windows or macOS remains, and CI is ubuntu-only.</li>
 <li><strong>Agent context.</strong> <code>AGENTS.md</code> gives an agent everything it needs: commands, layout, invariants, and how to run and screenshot the app.</li>
 <li><strong>Tests.</strong> Rust and TypeScript tests run with JUnit output, ready for Mission Control's testing contract.</li>
-<li><strong>Bugs.</strong> #1-#7 are fixed, and #1-#6 have regression tests.</li>
+<li><strong>Bugs.</strong> #1-#7 are fixed, and #1-#6 each have an automated regression test (for #5, a test of the shipped security configuration).</li>
 <li><strong>Install.</strong> <code>make install</code> puts a release OpenDAM in your app launcher, and it renders Python-backed previews.</li>
 </ul>
 <h2 id="flows-that-change">Flows that change</h2>
@@ -405,16 +415,32 @@ into dependency-linked tasks. A step may become several tickets.</p>
 <ul>
 <li>On a fresh clone or a new worktree, <code>mise install &amp;&amp; make deps &amp;&amp; make lint check build</code> passes.</li>
 <li>CI is green on ubuntu-only jobs that call <code>make</code>.</li>
-<li>No <code>pnpm</code>, <code>windows</code>, <code>nsis</code>, <code>explorer</code>, or <code>pythonw</code> references remain outside <code>docs/plans/</code> and <code>docs/adr/</code>.</li>
+<li>None of the paths listed under <strong>Delete</strong> above exist.</li>
+<li>No Windows, macOS or pnpm reference remains. This command prints nothing:<pre><code class="language-sh">git grep -n -P '\bpnpm\b|\bnsis\b|\bNSIS\b|pythonw|[Ee]xplorer|cfg\(windows\)|target_os = &quot;(windows|macos)&quot;|windows_subsystem|windows-latest|tauri\.windows|&quot;Scripts&quot;|CREATE_NO_WINDOW|creation_flags|raw_arg|icon\.(ico|icns)\b' \
+  -- . ':!docs/plans' ':!docs/adr' ':!README.md' ':!CONTRIBUTING.md' ':!*.lock'
+</code></pre>
+<ul>
+<li><strong>Exact patterns, not bare words.</strong> A bare word like <code>windows</code> or <code>nsis</code> matches things that legitimately stay: Tauri's <code>&quot;windows&quot;</code> key for app windows (<code>tauri.conf.json</code>, the capabilities file), a &quot;tall windows&quot; code comment, and &quot;consistent&quot; in <code>db.rs</code>.</li>
+<li><strong>Exclusions:</strong>
+<ul>
+<li><code>*.lock</code>: <code>Cargo.lock</code> lists transitive <code>windows-*</code> crates.</li>
+<li><code>docs/plans</code> and <code>docs/adr</code>: kept as history (D9).</li>
+<li><code>README.md</code> and <code>CONTRIBUTING.md</code>: step 2 rewrites or deletes them and carries this check over to them.</li>
+</ul>
+</li>
+<li><strong><code>docs/specs</code></strong> stays in scope. It has no matches today.</li>
+</ul>
+</li>
 <li><code>make dev</code> launches the app on your machine without exporting <code>WEBKIT_DISABLE_DMABUF_RENDERER</code>.</li>
 <li>Reveal works from the detail panel.</li>
 </ul>
 <h3 id="step-2-agent-docs">Step 2: Agent docs</h3>
 <ul>
-<li><strong><code>AGENTS.md</code></strong> (<code>CLAUDE.md</code> → symlink) stays well under Mission Control's 24 KB standards-bundle cap. Sections:
+<li>
+<p><strong><code>AGENTS.md</code></strong> (<code>CLAUDE.md</code> → symlink) stays well under Mission Control's 24 KB standards-bundle cap. Sections:</p>
 <ul>
 <li>what this fork is (D1, D2)</li>
-<li>commands (the make targets)</li>
+<li>commands: only the make targets that exist when step 2 lands (<code>deps</code>, <code>dev</code>, <code>lint</code>, <code>check</code>, <code>build</code>). Step 3 adds <code>make test</code>, and step 5 adds <code>make install</code>/<code>make uninstall</code>, the same way the D17 rule is deferred to step 4.</li>
 <li>repository layout</li>
 <li>architecture invariants carried over from <code>CONTRIBUTING.md</code>: relative paths in library DBs, <code>DELETE</code> journaling on library DBs, batched writes, Rust-native raster decoding, the persistent Python worker, zero telemetry</li>
 <li>the tag/collection rule from D17, written when step 4 lands</li>
@@ -423,7 +449,8 @@ into dependency-linked tasks. A step may become several tickets.</p>
 <li>writing style (D23): plain dashes only, never em dashes, in code, docs, commit messages, and PR text</li>
 </ul>
 </li>
-<li><strong><code>docs/agents/running-the-app.md</code>:</strong>
+<li>
+<p><strong><code>docs/agents/running-the-app.md</code>:</strong></p>
 <ul>
 <li><code>make dev</code></li>
 <li>where the app data and library DBs live</li>
@@ -431,23 +458,40 @@ into dependency-linked tasks. A step may become several tickets.</p>
 <li>capturing the window for workflow evidence on KDE with <code>spectacle -b -n -a -o &lt;file&gt;.png</code>, into a gitignored path</li>
 </ul>
 </li>
-<li><strong><code>.claude/settings.json</code>:</strong> a small allowlist with <code>make lint/check/test/build</code>, read-only <code>git</code>/<code>bun</code>/<code>cargo</code>/<code>uv</code> queries, and <code>gh pr checks</code>/<code>gh pr view</code>. <code>.gitignore</code> gets <code>.claude/settings.local.json</code> and <code>.claude/worktrees/</code>.</li>
-<li><strong>README:</strong> a short personal README covering what it is, how to install and run it on Linux, and credit to LawLaw09/OpenDAM with the MIT notice. Then delete <code>CONTRIBUTING.md</code>.</li>
+<li>
+<p><strong><code>.claude/settings.json</code>:</strong> a small allowlist with <code>make lint/check/build</code>, read-only <code>git</code>/<code>bun</code>/<code>cargo</code>/<code>uv</code> queries, and <code>gh pr checks</code>/<code>gh pr view</code>. Step 3 adds <code>make test</code>. <code>.gitignore</code> gets <code>.claude/settings.local.json</code> and <code>.claude/worktrees/</code>.</p>
+</li>
+<li>
+<p><strong>README:</strong> a short personal README covering:</p>
+<ul>
+<li>what it is</li>
+<li>how to set it up and run it from a checkout on Linux (<code>mise install &amp;&amp; make deps &amp;&amp; make dev</code>)</li>
+<li>credit to LawLaw09/OpenDAM, with the MIT notice</li>
+</ul>
+<p>Step 5 adds the install section. Then delete <code>CONTRIBUTING.md</code>.</p>
+</li>
 </ul>
 <p><strong>Done when</strong></p>
 <ul>
 <li><code>AGENTS.md</code> and <code>CLAUDE.md</code> resolve to the same content.</li>
 <li><code>AGENTS.md</code> states the no-agent-co-author rule (D22) and the plain-dashes rule (D23), and contains no em dashes.</li>
-<li>Every command in them runs as written.</li>
+<li>Every command in <code>AGENTS.md</code>, the README and the running-the-app doc runs as written. None of them names a make target that doesn't exist yet.</li>
 <li>The running-the-app doc's screenshot command produces a PNG of the app window.</li>
+<li><code>CONTRIBUTING.md</code> is gone, and step 1's reference check passes without the <code>':!README.md' ':!CONTRIBUTING.md'</code> exclusions.</li>
 </ul>
 <h3 id="step-3-test-runners">Step 3: Test runners</h3>
 <ul>
 <li><strong>Rust:</strong> cargo-nextest with a <code>ci</code> profile that writes JUnit (<code>apps/desktop/src-tauri/.config/nextest.toml</code>). Seed it with unit tests for pure helpers (<code>resolve_path</code>, <code>make_relative_path</code>) and one in-memory SQLite test (<code>sqlite::memory:</code> with <code>002_library_schema.sql</code>), which proves step 4 can test DB behaviour.</li>
 <li><strong>TypeScript:</strong> <code>bun test</code> (with <code>@types/bun</code>), JUnit via <code>--reporter=junit --reporter-outfile</code>. Seed it with a test of an existing pure frontend helper.</li>
 <li><strong><code>make test</code></strong> runs both. CI gets a test job.</li>
+<li><strong>Docs:</strong> add <code>make test</code> to <code>AGENTS.md</code>'s commands and to the <code>.claude/settings.json</code> allowlist.</li>
 </ul>
-<p><strong>Done when</strong> <code>make test</code> passes locally and in CI, and both runners can emit JUnit XML that names the test's file.</p>
+<p><strong>Done when</strong></p>
+<ul>
+<li><code>make test</code> passes locally and in CI.</li>
+<li>Both runners can emit JUnit XML that names the test's file.</li>
+<li><code>AGENTS.md</code> and the allowlist list <code>make test</code>.</li>
+</ul>
 <h3 id="step-4-fixes-1-6-each-with-a-regression-test">Step 4: Fixes #1-#6, each with a regression test</h3>
 <ol>
 <li><strong>#1 Offline library.</strong>
@@ -480,11 +524,31 @@ into dependency-linked tasks. A step may become several tickets.</p>
 </li>
 <li><strong>#5 Security surface.</strong>
 <ul>
-<li><strong>Asset protocol scope:</strong> the static scope is reduced to app data. Each library root is added at runtime with <code>asset_protocol_scope().allow_directory(root, true)</code> on startup and on library add.</li>
-<li><strong>Capabilities:</strong> only <code>core:default</code>, <code>dialog:default</code>, and opener's minimal permissions.</li>
-<li><strong>CSP:</strong> a real CSP that allows <code>'self'</code>, <code>asset:</code>/<code>http://asset.localhost</code>, <code>ipc:</code>/<code>http://ipc.localhost</code>, and <code>blob:</code>/<code>data:</code> only where three.js and video previews need them.</li>
-<li><strong>Devtools:</strong> the <code>devtools</code> feature is dropped (D20).</li>
-<li><em>Check:</em> thumbnails, the 3D viewer, video previews, and Quick Look work in <code>make dev</code> and in the release build with no CSP violations in the console.</li>
+<li>
+<p><strong>Asset protocol scope:</strong> the static scope is reduced to app data. Each library root is added at runtime with <code>asset_protocol_scope().allow_directory(root, true)</code> on startup and on library add.</p>
+</li>
+<li>
+<p><strong>Capabilities:</strong> only <code>core:default</code>, <code>dialog:default</code>, and opener's minimal permissions.</p>
+</li>
+<li>
+<p><strong>CSP:</strong> a real CSP that allows <code>'self'</code>, <code>asset:</code>/<code>http://asset.localhost</code>, <code>ipc:</code>/<code>http://ipc.localhost</code>, and <code>blob:</code>/<code>data:</code> only where three.js and video previews need them.</p>
+</li>
+<li>
+<p><strong>Devtools:</strong> the <code>devtools</code> feature is dropped (D20).</p>
+</li>
+<li>
+<p><em>Test:</em> a Rust integration test (for example <code>apps/desktop/src-tauri/tests/security_config.rs</code>) parses the shipped <code>tauri.conf.json</code>, <code>capabilities/*.json</code> and <code>Cargo.toml</code>. It asserts:</p>
+<ul>
+<li><code>app.security.csp</code> is a non-null policy with a <code>default-src</code>.</li>
+<li>The asset protocol's static scope has no <code>**</code>, <code>**/*</code>, <code>$HOME/**</code> or <code>$DESKTOP/**</code> entry.</li>
+<li>No capability grants a <code>**</code> path or any <code>fs:</code>/<code>shell:</code> permission.</li>
+<li>The <code>tauri</code> dependency's features don't include <code>devtools</code>.</li>
+</ul>
+<p>It fails on <code>main</code> before this fix, because the scope is <code>**</code>, <code>csp</code> is <code>null</code> and <code>devtools</code> is enabled.</p>
+</li>
+<li>
+<p><em>Check (manual, in addition to the test):</em> thumbnails, the 3D viewer, video previews, and Quick Look work in <code>make dev</code> and in the release build with no CSP violations in the console.</p>
+</li>
 </ul>
 </li>
 <li><strong>#6 Tag/collection model (D17).</strong>
@@ -520,6 +584,12 @@ into dependency-linked tasks. A step may become several tickets.</p>
 </li>
 <li><strong>Worker robustness:</strong> the bare-name fallback resolves <code>python3</code> on <code>PATH</code>, and the worker's stderr goes to <code>tracing</code> instead of <code>/dev/null</code>.</li>
 <li><strong><code>make uninstall</code></strong> removes exactly what <code>install</code> created. It never touches <code>~/.local/share/com.opendam.desktop</code> (master DB) or a library's <code>.opendam/</code> folder.</li>
+<li><strong>Docs:</strong>
+<ul>
+<li>add <code>make install</code>/<code>make uninstall</code> to <code>AGENTS.md</code>'s commands</li>
+<li>add an install section to the README: <code>make install</code>, how to update by re-running it, <code>make uninstall</code>, and what uninstall leaves in place</li>
+</ul>
+</li>
 </ul>
 <p><strong>Done when</strong> OpenDAM launched from the KDE launcher (not a terminal):</p>
 <ul>
@@ -527,7 +597,7 @@ into dependency-linked tasks. A step may become several tickets.</p>
 <li>generates a Python-backed preview for a non-native model format, for example FBX</li>
 <li>survives a corrupt PNG</li>
 </ul>
-<p><code>make uninstall</code> then leaves no installed files behind.</p>
+<p><code>make uninstall</code> then leaves no installed files behind. <code>AGENTS.md</code> and the README document both targets, and their commands run as written.</p>
 <h3 id="step-6-refactors-7">Step 6: Refactors (#7)</h3>
 <ul>
 <li>Split <code>Sidebar.tsx</code> into one component per section (libraries, collection tree, tags, smart filters) with no behaviour change.</li>

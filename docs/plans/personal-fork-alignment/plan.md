@@ -4,6 +4,14 @@ Status: approved 2026-10-12. Shaped in a three-round interview and approved at r
 additions (D22, D23). Follow-up: once this plan merges, Mission Control slices it into
 dependency-linked tickets.
 
+Revised 2026-10-12 after Plan Validation repair round 1. These are consistency repairs inside the
+approved decisions, not new decisions:
+- Fix #5 gets an automated regression test, so every fix #1-#6 really has one.
+- Step 2 documents only the make targets that exist when it lands. Steps 3 and 5 add `make test`
+  and `make install`/`make uninstall` to the docs.
+- Step 1's "no Windows/pnpm references" exit check is now an exact command. Step 2 extends it to
+  the README and `CONTRIBUTING.md`.
+
 ## Summary
 
 `ramiro314/OpenDAM` is now a **hard fork**. It is a personal, **Linux-only** asset manager for
@@ -14,7 +22,8 @@ six things, in this order:
 2. Strips the Windows and upstream-community weight.
 3. Gives agents a root instructions file.
 4. Adds the first test runners.
-5. Fixes every bug the review confirmed, each with a regression test.
+5. Fixes all seven review findings. Fixes #1-#6 each get an automated regression test, and those
+   tests guard #7's refactors.
 6. Ships a `make install` that gives you a working release build in `~/.local`.
 
 ## Context
@@ -144,7 +153,7 @@ during shaping. The rest come from the review pass.
 - **Linux only.** Nothing for Windows or macOS remains, and CI is ubuntu-only.
 - **Agent context.** `AGENTS.md` gives an agent everything it needs: commands, layout, invariants, and how to run and screenshot the app.
 - **Tests.** Rust and TypeScript tests run with JUnit output, ready for Mission Control's testing contract.
-- **Bugs.** #1-#7 are fixed, and #1-#6 have regression tests.
+- **Bugs.** #1-#7 are fixed, and #1-#6 each have an automated regression test (for #5, a test of the shipped security configuration).
 - **Install.** `make install` puts a release OpenDAM in your app launcher, and it renders Python-backed previews.
 
 ## Flows that change
@@ -247,7 +256,18 @@ into dependency-linked tasks. A step may become several tickets.
 **Done when**
 - On a fresh clone or a new worktree, `mise install && make deps && make lint check build` passes.
 - CI is green on ubuntu-only jobs that call `make`.
-- No `pnpm`, `windows`, `nsis`, `explorer`, or `pythonw` references remain outside `docs/plans/` and `docs/adr/`.
+- None of the paths listed under **Delete** above exist.
+- No Windows, macOS or pnpm reference remains. This command prints nothing:
+  ```sh
+  git grep -n -P '\bpnpm\b|\bnsis\b|\bNSIS\b|pythonw|[Ee]xplorer|cfg\(windows\)|target_os = "(windows|macos)"|windows_subsystem|windows-latest|tauri\.windows|"Scripts"|CREATE_NO_WINDOW|creation_flags|raw_arg|icon\.(ico|icns)\b' \
+    -- . ':!docs/plans' ':!docs/adr' ':!README.md' ':!CONTRIBUTING.md' ':!*.lock'
+  ```
+  - **Exact patterns, not bare words.** A bare word like `windows` or `nsis` matches things that legitimately stay: Tauri's `"windows"` key for app windows (`tauri.conf.json`, the capabilities file), a "tall windows" code comment, and "consistent" in `db.rs`.
+  - **Exclusions:**
+    - `*.lock`: `Cargo.lock` lists transitive `windows-*` crates.
+    - `docs/plans` and `docs/adr`: kept as history (D9).
+    - `README.md` and `CONTRIBUTING.md`: step 2 rewrites or deletes them and carries this check over to them.
+  - **`docs/specs`** stays in scope. It has no matches today.
 - `make dev` launches the app on your machine without exporting `WEBKIT_DISABLE_DMABUF_RENDERER`.
 - Reveal works from the detail panel.
 
@@ -255,7 +275,7 @@ into dependency-linked tasks. A step may become several tickets.
 
 - **`AGENTS.md`** (`CLAUDE.md` → symlink) stays well under Mission Control's 24 KB standards-bundle cap. Sections:
   - what this fork is (D1, D2)
-  - commands (the make targets)
+  - commands: only the make targets that exist when step 2 lands (`deps`, `dev`, `lint`, `check`, `build`). Step 3 adds `make test`, and step 5 adds `make install`/`make uninstall`, the same way the D17 rule is deferred to step 4.
   - repository layout
   - architecture invariants carried over from `CONTRIBUTING.md`: relative paths in library DBs, `DELETE` journaling on library DBs, batched writes, Rust-native raster decoding, the persistent Python worker, zero telemetry
   - the tag/collection rule from D17, written when step 4 lands
@@ -267,22 +287,32 @@ into dependency-linked tasks. A step may become several tickets.
   - where the app data and library DBs live
   - read-only sqlite inspection while the app holds the DB (`sqlite3 -readonly -cmd ".timeout 20000"`)
   - capturing the window for workflow evidence on KDE with `spectacle -b -n -a -o <file>.png`, into a gitignored path
-- **`.claude/settings.json`:** a small allowlist with `make lint/check/test/build`, read-only `git`/`bun`/`cargo`/`uv` queries, and `gh pr checks`/`gh pr view`. `.gitignore` gets `.claude/settings.local.json` and `.claude/worktrees/`.
-- **README:** a short personal README covering what it is, how to install and run it on Linux, and credit to LawLaw09/OpenDAM with the MIT notice. Then delete `CONTRIBUTING.md`.
+- **`.claude/settings.json`:** a small allowlist with `make lint/check/build`, read-only `git`/`bun`/`cargo`/`uv` queries, and `gh pr checks`/`gh pr view`. Step 3 adds `make test`. `.gitignore` gets `.claude/settings.local.json` and `.claude/worktrees/`.
+- **README:** a short personal README covering:
+  - what it is
+  - how to set it up and run it from a checkout on Linux (`mise install && make deps && make dev`)
+  - credit to LawLaw09/OpenDAM, with the MIT notice
+
+  Step 5 adds the install section. Then delete `CONTRIBUTING.md`.
 
 **Done when**
 - `AGENTS.md` and `CLAUDE.md` resolve to the same content.
 - `AGENTS.md` states the no-agent-co-author rule (D22) and the plain-dashes rule (D23), and contains no em dashes.
-- Every command in them runs as written.
+- Every command in `AGENTS.md`, the README and the running-the-app doc runs as written. None of them names a make target that doesn't exist yet.
 - The running-the-app doc's screenshot command produces a PNG of the app window.
+- `CONTRIBUTING.md` is gone, and step 1's reference check passes without the `':!README.md' ':!CONTRIBUTING.md'` exclusions.
 
 ### Step 3: Test runners
 
 - **Rust:** cargo-nextest with a `ci` profile that writes JUnit (`apps/desktop/src-tauri/.config/nextest.toml`). Seed it with unit tests for pure helpers (`resolve_path`, `make_relative_path`) and one in-memory SQLite test (`sqlite::memory:` with `002_library_schema.sql`), which proves step 4 can test DB behaviour.
 - **TypeScript:** `bun test` (with `@types/bun`), JUnit via `--reporter=junit --reporter-outfile`. Seed it with a test of an existing pure frontend helper.
 - **`make test`** runs both. CI gets a test job.
+- **Docs:** add `make test` to `AGENTS.md`'s commands and to the `.claude/settings.json` allowlist.
 
-**Done when** `make test` passes locally and in CI, and both runners can emit JUnit XML that names the test's file.
+**Done when**
+- `make test` passes locally and in CI.
+- Both runners can emit JUnit XML that names the test's file.
+- `AGENTS.md` and the allowlist list `make test`.
 
 ### Step 4: Fixes #1-#6, each with a regression test
 
@@ -307,7 +337,14 @@ into dependency-linked tasks. A step may become several tickets.
    - **Capabilities:** only `core:default`, `dialog:default`, and opener's minimal permissions.
    - **CSP:** a real CSP that allows `'self'`, `asset:`/`http://asset.localhost`, `ipc:`/`http://ipc.localhost`, and `blob:`/`data:` only where three.js and video previews need them.
    - **Devtools:** the `devtools` feature is dropped (D20).
-   - *Check:* thumbnails, the 3D viewer, video previews, and Quick Look work in `make dev` and in the release build with no CSP violations in the console.
+   - *Test:* a Rust integration test (for example `apps/desktop/src-tauri/tests/security_config.rs`) parses the shipped `tauri.conf.json`, `capabilities/*.json` and `Cargo.toml`. It asserts:
+     - `app.security.csp` is a non-null policy with a `default-src`.
+     - The asset protocol's static scope has no `**`, `**/*`, `$HOME/**` or `$DESKTOP/**` entry.
+     - No capability grants a `**` path or any `fs:`/`shell:` permission.
+     - The `tauri` dependency's features don't include `devtools`.
+
+     It fails on `main` before this fix, because the scope is `**`, `csp` is `null` and `devtools` is enabled.
+   - *Check (manual, in addition to the test):* thumbnails, the 3D viewer, video previews, and Quick Look work in `make dev` and in the release build with no CSP violations in the console.
 6. **#6 Tag/collection model (D17).**
    - **Reads:** `list_tags` and the collection reads come from the master DB.
    - **Definitions:** create, update, and delete write to master and mirror to every open library (as today).
@@ -333,13 +370,16 @@ into dependency-linked tasks. A step may become several tickets.
   3. the dev repo `.venv`
 - **Worker robustness:** the bare-name fallback resolves `python3` on `PATH`, and the worker's stderr goes to `tracing` instead of `/dev/null`.
 - **`make uninstall`** removes exactly what `install` created. It never touches `~/.local/share/com.opendam.desktop` (master DB) or a library's `.opendam/` folder.
+- **Docs:**
+  - add `make install`/`make uninstall` to `AGENTS.md`'s commands
+  - add an install section to the README: `make install`, how to update by re-running it, `make uninstall`, and what uninstall leaves in place
 
 **Done when** OpenDAM launched from the KDE launcher (not a terminal):
 - shows the existing Kenney library
 - generates a Python-backed preview for a non-native model format, for example FBX
 - survives a corrupt PNG
 
-`make uninstall` then leaves no installed files behind.
+`make uninstall` then leaves no installed files behind. `AGENTS.md` and the README document both targets, and their commands run as written.
 
 ### Step 6: Refactors (#7)
 
