@@ -8,6 +8,8 @@ import type {
   SearchPayload,
   SearchResult,
   PreviewJob,
+  PendingModelThumbnail,
+  PreviewProgress,
 } from '../types';
 
 /** Thin wrapper around Tauri IPC commands */
@@ -66,6 +68,12 @@ export const api = {
   requestPreview: (assetIds: string[]) =>
     invoke<void>('request_preview', { assetIds }),
   getPreviewJobs: () => invoke<PreviewJob[]>('get_preview_jobs'),
+  getPreviewProgress: () => invoke<PreviewProgress>('get_preview_progress'),
+  listPendingModelThumbnails: (limit: number) =>
+    invoke<PendingModelThumbnail[]>('list_pending_model_thumbnails', { limit }),
+  /** Sends the PNG as a raw body; returns the saved thumbnail's path. */
+  saveModelThumbnail: (assetId: string, png: Uint8Array) =>
+    invoke<string>('save_model_thumbnail', png, { headers: { 'asset-id': assetId } }),
 
   // Reveal in explorer / open with default app
   revealInExplorer: (filePath: string) =>

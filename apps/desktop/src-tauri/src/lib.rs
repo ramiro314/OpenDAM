@@ -143,6 +143,9 @@ pub fn run() {
             commands::collection::delete_collection,
             commands::preview::request_preview,
             commands::preview::get_preview_jobs,
+            commands::preview::list_pending_model_thumbnails,
+            commands::preview::save_model_thumbnail,
+            commands::preview::get_preview_progress,
             commands::shell::reveal_in_explorer,
             commands::shell::open_with_default,
         ])
