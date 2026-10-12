@@ -59,10 +59,5 @@
         "template": "installer.nsi"
       }
     }
-  },
-  "plugins": {
-    "shell": {
-      "open": true
-    }
   }
 }
