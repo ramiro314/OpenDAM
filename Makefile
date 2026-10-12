@@ -32,7 +32,11 @@ dev: deps
 	cd $(DESKTOP) && bun run dev
 
 lint: deps
+	bun run lint
+	bun run format:check
+	cd $(TAURI) && cargo fmt --check
 	cd $(TAURI) && cargo clippy --locked --all-targets -- -D warnings
+	cd $(PREVIEW) && uv run --frozen ruff format --check
 	cd $(PREVIEW) && uv run --frozen ruff check
 
 check: deps
