@@ -1,0 +1,6 @@
+# Toolchain for this repo. `mise install` provides everything `make deps` needs.
+[tools]
+bun = "1.4.2" # keep in step with "packageManager" in package.json
+rust = "stable"
+uv = "0.13.0"
+"github:nextest-rs/nextest" = { version = "0.9.148", version_prefix = "cargo-nextest-" }

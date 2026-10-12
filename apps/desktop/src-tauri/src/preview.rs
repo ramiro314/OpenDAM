@@ -138,6 +138,7 @@ pub fn start_preview_worker(state: Arc<AppState>) {
             let mut found_py = None;
             for root in &search_roots {
                 let candidates = [
+                    root.join("packages").join("preview-engine").join(".venv").join("bin").join("python"),
                     root.join("packages").join("preview-engine").join("venv").join("Scripts").join("pythonw.exe"),
                     root.join("packages").join("preview-engine").join("venv").join("Scripts").join("python.exe"),
                     root.join("packages").join("preview-engine").join("venv").join("bin").join("python"),
