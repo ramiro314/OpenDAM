@@ -37,6 +37,5 @@ interface Collection { id, name, description, assetIds, isSmart, filterSpec?, cr
 - Query performance benchmarks (Phase 5)
 
 ## Implementation Notes
-- Schema file: `apps/desktop/src-tauri/migrations/001_initial.sql`
-- Read by `db.rs` at startup via `include_str!`
+- Schema files: the per-library schema is `apps/desktop/src-tauri/migrations/002_library_schema.sql`, read by `db.rs` via `include_str!`; the master DB's `libraries` table is created inline in `Database::new` (`db.rs`).
 - FTS5 sync is trigger-based to avoid manual bookkeeping
