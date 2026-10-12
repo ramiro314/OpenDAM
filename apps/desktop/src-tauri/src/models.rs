@@ -30,14 +30,14 @@ pub enum AssetKind {
 impl AssetKind {
     pub fn from_extension(ext: &str) -> Self {
         match ext.to_lowercase().as_str() {
-            "fbx" | "obj" | "3ds" | "dae" | "gltf" | "glb" | "skp" | "blend"
-            | "c4d" | "3dm" | "rfa" | "rvt" | "dwg" | "dxf" | "stl" | "usd" | "usdz" | "max"
-            | "abc" | "ply" | "x3d" | "wrl" => AssetKind::Model3d,
+            "fbx" | "obj" | "3ds" | "dae" | "gltf" | "glb" | "skp" | "blend" | "c4d" | "3dm"
+            | "rfa" | "rvt" | "dwg" | "dxf" | "stl" | "usd" | "usdz" | "max" | "abc" | "ply"
+            | "x3d" | "wrl" => AssetKind::Model3d,
 
             "mat" | "vrmat" | "sbsar" | "sbs" | "mdl" => AssetKind::Material,
 
-            "jpg" | "jpeg" | "png" | "tga" | "tif" | "tiff" | "bmp" | "dds"
-            | "ktx" | "ktx2" | "webp" | "avif" => AssetKind::Texture,
+            "jpg" | "jpeg" | "png" | "tga" | "tif" | "tiff" | "bmp" | "dds" | "ktx" | "ktx2"
+            | "webp" | "avif" => AssetKind::Texture,
 
             "hdr" | "exr" | "hdri" => AssetKind::Hdri,
 
@@ -55,30 +55,30 @@ impl AssetKind {
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            AssetKind::Model3d   => "3d_model",
-            AssetKind::Material  => "material",
-            AssetKind::Texture   => "texture",
-            AssetKind::Hdri      => "hdri",
-            AssetKind::Ies       => "ies",
-            AssetKind::Video     => "video",
-            AssetKind::Image     => "image",
-            AssetKind::Document  => "document",
-            AssetKind::Other     => "other",
+            AssetKind::Model3d => "3d_model",
+            AssetKind::Material => "material",
+            AssetKind::Texture => "texture",
+            AssetKind::Hdri => "hdri",
+            AssetKind::Ies => "ies",
+            AssetKind::Video => "video",
+            AssetKind::Image => "image",
+            AssetKind::Document => "document",
+            AssetKind::Other => "other",
         }
     }
 
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
-            "3d_model"  => AssetKind::Model3d,
-            "material"  => AssetKind::Material,
-            "texture"   => AssetKind::Texture,
-            "hdri"      => AssetKind::Hdri,
-            "ies"       => AssetKind::Ies,
-            "video"     => AssetKind::Video,
-            "image"     => AssetKind::Image,
-            "document"  => AssetKind::Document,
-            _           => AssetKind::Other,
+            "3d_model" => AssetKind::Model3d,
+            "material" => AssetKind::Material,
+            "texture" => AssetKind::Texture,
+            "hdri" => AssetKind::Hdri,
+            "ies" => AssetKind::Ies,
+            "video" => AssetKind::Video,
+            "image" => AssetKind::Image,
+            "document" => AssetKind::Document,
+            _ => AssetKind::Other,
         }
     }
 }

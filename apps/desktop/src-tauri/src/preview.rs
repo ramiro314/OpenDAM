@@ -1,14 +1,14 @@
-use anyhow::{anyhow, Result};
-use std::path::{Path, PathBuf};
-use image::imageops::FilterType;
-use std::sync::Arc;
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader};
-use serde_json::json;
-use tauri::Emitter;
-use sqlx::{Pool, Sqlite};
-use crate::AppState;
 use crate::db::{make_relative_path, resolve_path};
+use crate::AppState;
+use anyhow::{anyhow, Result};
+use image::imageops::FilterType;
+use serde_json::json;
+use sqlx::{Pool, Sqlite};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tauri::Emitter;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 pub const THUMB_SIZE: u32 = 512;
 
@@ -67,11 +67,21 @@ impl PythonWorker {
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 
         let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("Failed to take python stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to take python stdout"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Failed to take python stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("Failed to take python stdout"))?;
         let reader = BufReader::new(stdout);
 
-        Ok(Self { child, stdin, reader })
+        Ok(Self {
+            child,
+            stdin,
+            reader,
+        })
     }
 
     async fn execute(&mut self, req: &serde_json::Value) -> Result<serde_json::Value> {
@@ -138,10 +148,26 @@ pub fn start_preview_worker(state: Arc<AppState>) {
             let mut found_py = None;
             for root in &search_roots {
                 let candidates = [
-                    root.join("packages").join("preview-engine").join(".venv").join("bin").join("python"),
-                    root.join("packages").join("preview-engine").join("venv").join("Scripts").join("pythonw.exe"),
-                    root.join("packages").join("preview-engine").join("venv").join("Scripts").join("python.exe"),
-                    root.join("packages").join("preview-engine").join("venv").join("bin").join("python"),
+                    root.join("packages")
+                        .join("preview-engine")
+                        .join(".venv")
+                        .join("bin")
+                        .join("python"),
+                    root.join("packages")
+                        .join("preview-engine")
+                        .join("venv")
+                        .join("Scripts")
+                        .join("pythonw.exe"),
+                    root.join("packages")
+                        .join("preview-engine")
+                        .join("venv")
+                        .join("Scripts")
+                        .join("python.exe"),
+                    root.join("packages")
+                        .join("preview-engine")
+                        .join("venv")
+                        .join("bin")
+                        .join("python"),
                     root.join("venv").join("Scripts").join("pythonw.exe"),
                     root.join("venv").join("Scripts").join("python.exe"),
                     root.join("venv").join("bin").join("python"),
@@ -153,7 +179,10 @@ pub fn start_preview_worker(state: Arc<AppState>) {
             }
             found_py.unwrap_or_else(|| {
                 let fallbacks = [PathBuf::from("pythonw"), PathBuf::from("python")];
-                fallbacks.into_iter().find(|p| p.exists()).unwrap_or_else(|| PathBuf::from("python"))
+                fallbacks
+                    .into_iter()
+                    .find(|p| p.exists())
+                    .unwrap_or_else(|| PathBuf::from("python"))
             })
         };
 
@@ -163,7 +192,9 @@ pub fn start_preview_worker(state: Arc<AppState>) {
             let mut found_worker = None;
             for root in &search_roots {
                 let candidates = [
-                    root.join("packages").join("preview-engine").join("worker.py"),
+                    root.join("packages")
+                        .join("preview-engine")
+                        .join("worker.py"),
                     root.join("worker.py"),
                 ];
                 if let Some(p) = candidates.into_iter().find(|p| p.exists()) {
@@ -174,13 +205,19 @@ pub fn start_preview_worker(state: Arc<AppState>) {
             found_worker.unwrap_or_else(|| PathBuf::from("worker.py"))
         };
 
-        tracing::info!("Preview worker using Python: {:?}, Script: {:?}", py_exec, worker_py);
+        tracing::info!(
+            "Preview worker using Python: {:?}, Script: {:?}",
+            py_exec,
+            worker_py
+        );
 
         // Crash-recovery: Reset any orphaned jobs left in 'processing' ONCE at startup
         for lib in state.db.get_all_libraries().await {
-            let _ = sqlx::query("UPDATE preview_jobs SET status = 'queued' WHERE status = 'processing'")
-                .execute(&lib.pool)
-                .await;
+            let _ = sqlx::query(
+                "UPDATE preview_jobs SET status = 'queued' WHERE status = 'processing'",
+            )
+            .execute(&lib.pool)
+            .await;
         }
 
         // Images and Python-backed formats run on separate queues so a slow
@@ -263,11 +300,14 @@ async fn complete_job(
     }
 
     let resolved_thumb = rel_thumb.as_ref().map(|r| resolve_path(root_path, r));
-    let _ = state.app_handle.emit("preview:done", json!({
-        "assetId": asset_id,
-        "thumbnailPath": &resolved_thumb,
-        "previewModel": &model_path,
-    }));
+    let _ = state.app_handle.emit(
+        "preview:done",
+        json!({
+            "assetId": asset_id,
+            "thumbnailPath": &resolved_thumb,
+            "previewModel": &model_path,
+        }),
+    );
 }
 
 async fn fail_job(state: &AppState, pool: &Pool<Sqlite>, job_id: &str, asset_id: &str) {
@@ -280,16 +320,21 @@ async fn fail_job(state: &AppState, pool: &Pool<Sqlite>, job_id: &str, asset_id:
         .bind(asset_id)
         .execute(pool)
         .await;
-    let _ = state.app_handle.emit("preview:error", json!({
-        "assetId": asset_id,
-        "jobId": job_id,
-    }));
+    let _ = state.app_handle.emit(
+        "preview:error",
+        json!({
+            "assetId": asset_id,
+            "jobId": job_id,
+        }),
+    );
 }
 
 /// Generates raster image thumbnails in Rust, one blocking task per CPU core.
 /// Images the `image` crate can't decode are handed to the Python queue as 'fallback' jobs.
 async fn run_image_queue(state: Arc<AppState>) {
-    let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let filter = format!(
         "p.status IN ('queued', 'pending') AND lower(coalesce(a.extension, '')) IN {}",
         NATIVE_EXTS_SQL
@@ -346,14 +391,27 @@ async fn run_image_queue(state: Arc<AppState>) {
                 match res {
                     Ok(()) => {
                         let rel_thumb = format!(".opendam/thumbs/{}", thumb_file_name);
-                        complete_job(&state, &lib.pool, &lib.root_path, &job_id, &asset_id, Some(rel_thumb), None).await;
+                        complete_job(
+                            &state,
+                            &lib.pool,
+                            &lib.root_path,
+                            &job_id,
+                            &asset_id,
+                            Some(rel_thumb),
+                            None,
+                        )
+                        .await;
                     }
                     Err(e) => {
-                        tracing::warn!("Native Rust image thumbnail failed for {}. Falling back to Python.", e);
-                        let _ = sqlx::query("UPDATE preview_jobs SET status = 'fallback' WHERE id = ?")
-                            .bind(&job_id)
-                            .execute(&lib.pool)
-                            .await;
+                        tracing::warn!(
+                            "Native Rust image thumbnail failed for {}. Falling back to Python.",
+                            e
+                        );
+                        let _ =
+                            sqlx::query("UPDATE preview_jobs SET status = 'fallback' WHERE id = ?")
+                                .bind(&job_id)
+                                .execute(&lib.pool)
+                                .await;
                     }
                 }
             }
@@ -406,16 +464,27 @@ async fn run_python_queue(state: Arc<AppState>, py_exec: PathBuf, worker_py: Pat
                 });
 
                 let py_resp = if let Some(ref mut worker) = py_worker {
-                    match tokio::time::timeout(std::time::Duration::from_secs(60), worker.execute(&req)).await {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        worker.execute(&req),
+                    )
+                    .await
+                    {
                         Ok(Ok(val)) => Ok(val),
                         Ok(Err(e)) => {
-                            tracing::error!("Python worker execute error: {}. Restarting worker.", e);
+                            tracing::error!(
+                                "Python worker execute error: {}. Restarting worker.",
+                                e
+                            );
                             worker.kill().await;
                             py_worker = None;
                             Err(e)
                         }
                         Err(_) => {
-                            tracing::error!("Python worker timed out after 60s processing {}. Killing worker.", full_source.display());
+                            tracing::error!(
+                                "Python worker timed out after 60s processing {}. Killing worker.",
+                                full_source.display()
+                            );
                             worker.kill().await;
                             py_worker = None;
                             Err(anyhow!("Job timed out"))
@@ -448,11 +517,25 @@ async fn run_python_queue(state: Arc<AppState>, py_exec: PathBuf, worker_py: Pat
                 }
 
                 if success {
-                    tracing::info!("Job {} succeeded, thumb: {:?}, model: {:?}", job_id, result_thumb, result_model);
+                    tracing::info!(
+                        "Job {} succeeded, thumb: {:?}, model: {:?}",
+                        job_id,
+                        result_thumb,
+                        result_model
+                    );
                     let rel_thumb = result_thumb
                         .or_else(|| result_model.clone())
                         .map(|abs| make_relative_path(root_path, Path::new(&abs)));
-                    complete_job(&state, pool, root_path, &job_id, &asset_id, rel_thumb, result_model).await;
+                    complete_job(
+                        &state,
+                        pool,
+                        root_path,
+                        &job_id,
+                        &asset_id,
+                        rel_thumb,
+                        result_model,
+                    )
+                    .await;
                 } else {
                     fail_job(&state, pool, &job_id, &asset_id).await;
                 }

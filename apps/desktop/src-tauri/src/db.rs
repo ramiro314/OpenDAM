@@ -29,7 +29,7 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     let options = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Delete)  // safe on SMB/NFS; WAL is not
+        .journal_mode(SqliteJournalMode::Delete) // safe on SMB/NFS; WAL is not
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(std::time::Duration::from_secs(30)); // 30s for slow NAS writes
 
@@ -45,7 +45,7 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
         PRAGMA temp_store = MEMORY;
         PRAGMA cache_size = -64000;
         PRAGMA foreign_keys = OFF;
-        "#
+        "#,
     )
     .execute(&pool)
     .await?;
@@ -57,7 +57,7 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
 
     // Backward compatibility: ensure dir_mtimes table exists
     let _ = sqlx::query(
-        "CREATE TABLE IF NOT EXISTS dir_mtimes (dir_path TEXT PRIMARY KEY, mtime INTEGER NOT NULL)"
+        "CREATE TABLE IF NOT EXISTS dir_mtimes (dir_path TEXT PRIMARY KEY, mtime INTEGER NOT NULL)",
     )
     .execute(&pool)
     .await;
@@ -70,20 +70,16 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     .await;
 
     // Backward compatibility migration for is_favorite
-    let _ = sqlx::query(
-        "ALTER TABLE assets ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0"
-    )
-    .execute(&pool)
-    .await;
-    let _ = sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_assets_is_favorite ON assets(is_favorite)"
-    )
-    .execute(&pool)
-    .await;
+    let _ = sqlx::query("ALTER TABLE assets ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_assets_is_favorite ON assets(is_favorite)")
+        .execute(&pool)
+        .await;
 
     // Purge any existing Revit backup files from database
     if let Ok(assets) = sqlx::query_as::<_, (String, String)>(
-        "SELECT id, file_name FROM assets WHERE extension IN ('rfa', 'rvt')"
+        "SELECT id, file_name FROM assets WHERE extension IN ('rfa', 'rvt')",
     )
     .fetch_all(&pool)
     .await
@@ -134,7 +130,7 @@ impl Database {
                 created_at  INTEGER NOT NULL,
                 asset_count INTEGER NOT NULL DEFAULT 0
             );
-            "#
+            "#,
         )
         .execute(&master_pool)
         .await?;
@@ -147,16 +143,17 @@ impl Database {
         let _ = sqlx::query("ALTER TABLE assets ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
             .execute(&master_pool)
             .await;
-        let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_assets_is_favorite ON assets(is_favorite)")
-            .execute(&master_pool)
-            .await;
+        let _ =
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_assets_is_favorite ON assets(is_favorite)")
+                .execute(&master_pool)
+                .await;
 
         let mut open_libraries = HashMap::new();
         let mut first_pool: Option<Pool<Sqlite>> = None;
 
         // Load all registered libraries and open their per-library SQLite pools
         if let Ok(rows) = sqlx::query_as::<_, (String, String, String)>(
-            "SELECT id, name, root_paths FROM libraries"
+            "SELECT id, name, root_paths FROM libraries",
         )
         .fetch_all(&master_pool)
         .await
@@ -187,7 +184,11 @@ impl Database {
                                 );
                             }
                             Err(e) => {
-                                tracing::error!("Failed to open library DB at {:?}: {}", lib_db_file, e);
+                                tracing::error!(
+                                    "Failed to open library DB at {:?}: {}",
+                                    lib_db_file,
+                                    e
+                                );
                             }
                         }
                     }
@@ -215,23 +216,41 @@ impl Database {
     pub async fn sync_library_metadata(&self, lib_pool: &Pool<Sqlite>) {
         // 1. Sync tags from master_pool to lib_pool
         if let Ok(tags) = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
-            "SELECT id, name, color, parent_id FROM tags"
-        ).fetch_all(&self.master_pool).await {
+            "SELECT id, name, color, parent_id FROM tags",
+        )
+        .fetch_all(&self.master_pool)
+        .await
+        {
             for (id, name, color, parent_id) in tags {
-                let _ = sqlx::query("INSERT OR IGNORE INTO tags (id, name, color, parent_id) VALUES (?, ?, ?, ?)")
-                    .bind(&id).bind(&name).bind(&color).bind(&parent_id)
-                    .execute(lib_pool).await;
+                let _ = sqlx::query(
+                    "INSERT OR IGNORE INTO tags (id, name, color, parent_id) VALUES (?, ?, ?, ?)",
+                )
+                .bind(&id)
+                .bind(&name)
+                .bind(&color)
+                .bind(&parent_id)
+                .execute(lib_pool)
+                .await;
             }
         }
 
         // 2. Sync tags from lib_pool to master_pool
         if let Ok(tags) = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
-            "SELECT id, name, color, parent_id FROM tags"
-        ).fetch_all(lib_pool).await {
+            "SELECT id, name, color, parent_id FROM tags",
+        )
+        .fetch_all(lib_pool)
+        .await
+        {
             for (id, name, color, parent_id) in tags {
-                let _ = sqlx::query("INSERT OR IGNORE INTO tags (id, name, color, parent_id) VALUES (?, ?, ?, ?)")
-                    .bind(&id).bind(&name).bind(&color).bind(&parent_id)
-                    .execute(&self.master_pool).await;
+                let _ = sqlx::query(
+                    "INSERT OR IGNORE INTO tags (id, name, color, parent_id) VALUES (?, ?, ?, ?)",
+                )
+                .bind(&id)
+                .bind(&name)
+                .bind(&color)
+                .bind(&parent_id)
+                .execute(&self.master_pool)
+                .await;
             }
         }
 
@@ -258,7 +277,12 @@ impl Database {
         }
     }
 
-    pub async fn register_library(&self, id: &str, name: &str, root_path: &Path) -> Result<LibraryHandle> {
+    pub async fn register_library(
+        &self,
+        id: &str,
+        name: &str,
+        root_path: &Path,
+    ) -> Result<LibraryHandle> {
         let opendam_dir = root_path.join(".opendam");
         let thumbs_dir = opendam_dir.join("thumbs");
         tokio::fs::create_dir_all(&thumbs_dir).await?;

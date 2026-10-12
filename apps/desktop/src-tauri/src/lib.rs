@@ -1,8 +1,8 @@
 pub mod commands;
 pub mod db;
 pub mod models;
-pub mod watcher;
 pub mod preview;
+pub mod watcher;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -20,7 +20,8 @@ pub fn run() {
     // Logging
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| "opendam=debug,info".parse().unwrap()),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "opendam=debug,info".parse().unwrap()),
         )
         .init();
 
@@ -49,22 +50,22 @@ pub fn run() {
             });
 
             app.manage(state.clone());
-            
+
             // Start the background preview worker queue
             crate::preview::start_preview_worker(state.clone());
 
             // Re-index all existing libraries on startup in background
             let startup_state = state.clone();
             tauri::async_runtime::spawn(async move {
-                let rows = sqlx::query_as::<_, (String, String)>(
-                    "SELECT id, root_paths FROM libraries"
-                )
-                .fetch_all(&startup_state.db.master_pool)
-                .await;
+                let rows =
+                    sqlx::query_as::<_, (String, String)>("SELECT id, root_paths FROM libraries")
+                        .fetch_all(&startup_state.db.master_pool)
+                        .await;
 
                 if let Ok(libraries) = rows {
                     for (id, root_paths_json) in libraries {
-                        let paths: Vec<String> = serde_json::from_str(&root_paths_json).unwrap_or_default();
+                        let paths: Vec<String> =
+                            serde_json::from_str(&root_paths_json).unwrap_or_default();
                         let _ = watcher::index_paths(&startup_state.db, &id, &paths).await;
                     }
                     let _ = startup_state.app_handle.emit("library:updated", ());

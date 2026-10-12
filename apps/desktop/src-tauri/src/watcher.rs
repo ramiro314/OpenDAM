@@ -58,7 +58,11 @@ impl IndexLock {
         if let Err(e) = std::fs::write(&lock_path, &ts) {
             // Couldn't write — NAS may be read-only. Log and proceed anyway
             // (best-effort: don't block indexing just because we can't lock).
-            tracing::warn!("Could not write index.lock at {:?}: {} — proceeding without lock", lock_path, e);
+            tracing::warn!(
+                "Could not write index.lock at {:?}: {} — proceeding without lock",
+                lock_path,
+                e
+            );
         }
 
         Some(IndexLock(lock_path))
@@ -74,23 +78,15 @@ impl Drop for IndexLock {
 // Supported extensions
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     // 3D & CAD
-    "fbx", "obj", "3ds", "dae", "gltf", "glb", "skp", "blend",
-    "c4d", "3dm", "rfa", "rvt", "dwg", "dxf", "stl", "usd", "usdz", "max",
-    "abc", "ply", "x3d", "wrl",
-    // Materials
-    "mat", "vrmat", "sbsar", "sbs", "mdl",
-    // Textures
-    "jpg", "jpeg", "png", "tga", "tif", "tiff", "bmp", "dds",
-    "ktx", "ktx2", "webp", "avif",
+    "fbx", "obj", "3ds", "dae", "gltf", "glb", "skp", "blend", "c4d", "3dm", "rfa", "rvt", "dwg",
+    "dxf", "stl", "usd", "usdz", "max", "abc", "ply", "x3d", "wrl", // Materials
+    "mat", "vrmat", "sbsar", "sbs", "mdl", // Textures
+    "jpg", "jpeg", "png", "tga", "tif", "tiff", "bmp", "dds", "ktx", "ktx2", "webp", "avif",
     // HDRI/HDR
-    "hdr", "exr", "hdri",
-    // IES
-    "ies", "ldt",
-    // Video
-    "mp4", "mov", "avi", "mkv", "webm", "m4v",
-    // Image layered
-    "psd", "psb", "ai", "svg", "gif",
-    // Docs
+    "hdr", "exr", "hdri", // IES
+    "ies", "ldt", // Video
+    "mp4", "mov", "avi", "mkv", "webm", "m4v", // Image layered
+    "psd", "psb", "ai", "svg", "gif", // Docs
     "pdf", "txt", "md",
 ];
 
@@ -104,7 +100,8 @@ pub fn is_revit_backup(file_name: &str) -> bool {
     if lower.ends_with(".rfa") || lower.ends_with(".rvt") {
         if let Some((stem, _ext)) = lower.rsplit_once('.') {
             if let Some((_base, suffix)) = stem.rsplit_once('.') {
-                return (3..=5).contains(&suffix.len()) && suffix.chars().all(|c| c.is_ascii_digit());
+                return (3..=5).contains(&suffix.len())
+                    && suffix.chars().all(|c| c.is_ascii_digit());
             }
         }
     }
@@ -150,18 +147,17 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
         None => return Ok(()), // another instance is indexing — yield
     };
 
-
     let now = Utc::now().timestamp_millis();
 
     // ── 1. Load existing assets in ONE single query into memory ──────────
-    let existing_rows: Vec<(String, String, i64, i64, Option<String>)> = sqlx::query_as(
-        "SELECT id, file_path, modified_at, size_bytes, thumbnail_path FROM assets"
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
+    let existing_rows: Vec<(String, String, i64, i64, Option<String>)> =
+        sqlx::query_as("SELECT id, file_path, modified_at, size_bytes, thumbnail_path FROM assets")
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
 
-    let mut existing_map: HashMap<String, (String, i64, i64, Option<String>)> = HashMap::with_capacity(existing_rows.len());
+    let mut existing_map: HashMap<String, (String, i64, i64, Option<String>)> =
+        HashMap::with_capacity(existing_rows.len());
     for (id, file_path, modified_at, size_bytes, thumb) in existing_rows {
         // Normalize path separators to forward slash for reliable matching
         let norm = file_path.replace('\\', "/");
@@ -186,7 +182,10 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
                 true
             });
 
-        for entry in walker.filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()) {
+        for entry in walker
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
             let path = entry.path();
             let ext = path
                 .extension()
@@ -240,24 +239,50 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
 
             let needs_preview = matches!(
                 ext.as_str(),
-                "max" | "fbx" | "obj" | "gltf" | "glb" | "dae" | "stl" | "3ds" | "skp" | "rfa" | "rvt" | "dwg" | "3dm" | "vrmat" | "psd" | "psb" | "ai" | "exr" | "hdr"
-                | "jpg" | "jpeg" | "png" | "tif" | "tiff" | "tga" | "bmp" | "webp"
+                "max"
+                    | "fbx"
+                    | "obj"
+                    | "gltf"
+                    | "glb"
+                    | "dae"
+                    | "stl"
+                    | "3ds"
+                    | "skp"
+                    | "rfa"
+                    | "rvt"
+                    | "dwg"
+                    | "3dm"
+                    | "vrmat"
+                    | "psd"
+                    | "psb"
+                    | "ai"
+                    | "exr"
+                    | "hdr"
+                    | "jpg"
+                    | "jpeg"
+                    | "png"
+                    | "tif"
+                    | "tiff"
+                    | "tga"
+                    | "bmp"
+                    | "webp"
             );
             if needs_preview {
                 preview_status = "pending";
                 needs_job = true;
             }
 
-            let (id, is_update) = if let Some((existing_id, _, _, existing_thumb)) = existing_map.get(&rel_path) {
-                if thumbnail_path.is_none() && existing_thumb.is_some() {
-                    thumbnail_path = existing_thumb.clone();
-                    preview_status = "done";
-                    needs_job = false;
-                }
-                (existing_id.clone(), true)
-            } else {
-                (Uuid::new_v4().to_string(), false)
-            };
+            let (id, is_update) =
+                if let Some((existing_id, _, _, existing_thumb)) = existing_map.get(&rel_path) {
+                    if thumbnail_path.is_none() && existing_thumb.is_some() {
+                        thumbnail_path = existing_thumb.clone();
+                        preview_status = "done";
+                        needs_job = false;
+                    }
+                    (existing_id.clone(), true)
+                } else {
+                    (Uuid::new_v4().to_string(), false)
+                };
 
             pending_batch.push(PendingAsset {
                 id,
@@ -308,7 +333,9 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
     }
 
     // ── 4. Update asset count ───────────────────────────────────────────
-    let count_row: Option<(i64,)> = sqlx::query_as("SELECT COUNT(*) FROM assets").fetch_optional(&pool).await?;
+    let count_row: Option<(i64,)> = sqlx::query_as("SELECT COUNT(*) FROM assets")
+        .fetch_optional(&pool)
+        .await?;
     let total_count = count_row.map(|(c,)| c).unwrap_or(0);
 
     let _ = sqlx::query("UPDATE libraries SET asset_count = ? WHERE id = ?")
@@ -323,7 +350,11 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
         .execute(&db.master_pool)
         .await;
 
-    tracing::info!("NAS-efficient indexing complete for library {}: {} total assets", library_id, total_count);
+    tracing::info!(
+        "NAS-efficient indexing complete for library {}: {} total assets",
+        library_id,
+        total_count
+    );
     Ok(())
 }
 
@@ -339,7 +370,7 @@ async fn commit_asset_batch(pool: &sqlx::Pool<sqlx::Sqlite>, batch: &[PendingAss
                     modified_at = ?,
                     preview_status = CASE WHEN preview_status = 'done' THEN 'done' ELSE ? END,
                     thumbnail_path = COALESCE(?, thumbnail_path)
-                   WHERE id = ?"#
+                   WHERE id = ?"#,
             )
             .bind(item.size_bytes)
             .bind(item.modified_at)
@@ -354,7 +385,7 @@ async fn commit_asset_batch(pool: &sqlx::Pool<sqlx::Sqlite>, batch: &[PendingAss
                    (id, file_path, file_name, extension, kind, size_bytes,
                     modified_at, indexed_at, rating, color_label, is_favorite, description,
                     thumbnail_path, preview_status, metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'none', 0, '', ?, ?, '{}')"#
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'none', 0, '', ?, ?, '{}')"#,
             )
             .bind(&item.id)
             .bind(&item.file_path)
