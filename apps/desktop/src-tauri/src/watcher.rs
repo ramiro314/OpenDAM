@@ -130,7 +130,7 @@ struct PendingAsset {
 /// Highly optimized for NAS:
 /// 1. Single initial query loads existing assets into RAM (0 queries during walk).
 /// 2. Skips `.opendam` directory.
-/// 3. Pre-checks `.opendam/thumbs/` to never re-render existing previews across network.
+/// 3. Reuses each asset's existing thumbnail from the DB to never re-render previews across network.
 /// 4. Groups writes into chunks of 200 inside single transactions (cutting NAS I/O by 99%).
 /// 5. Advisory index.lock prevents two machines from indexing the same library simultaneously.
 pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> Result<()> {
@@ -151,7 +151,6 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
     };
 
 
-    let thumbs_dir = root_path.join(".opendam").join("thumbs");
     let now = Utc::now().timestamp_millis();
 
     // ── 1. Load existing assets in ONE single query into memory ──────────
@@ -235,31 +234,18 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
             let kind = AssetKind::from_extension(&ext);
             let kind_str = kind.as_str();
 
-            // Pre-check if thumbnail already exists in .opendam/thumbs/
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(&file_name);
-            let thumb_png = thumbs_dir.join(format!("{}_thumb.png", stem));
-            let thumb_jpg = thumbs_dir.join(format!("{}_thumb.jpg", stem));
-
             let mut preview_status = "none";
             let mut thumbnail_path = None;
             let mut needs_job = false;
 
-            if thumb_png.exists() {
-                preview_status = "done";
-                thumbnail_path = Some(format!(".opendam/thumbs/{}_thumb.png", stem));
-            } else if thumb_jpg.exists() {
-                preview_status = "done";
-                thumbnail_path = Some(format!(".opendam/thumbs/{}_thumb.jpg", stem));
-            } else {
-                let needs_preview = matches!(
-                    ext.as_str(),
-                    "max" | "fbx" | "obj" | "gltf" | "glb" | "dae" | "stl" | "3ds" | "skp" | "rfa" | "rvt" | "dwg" | "3dm" | "vrmat" | "psd" | "psb" | "ai" | "exr" | "hdr"
-                    | "jpg" | "jpeg" | "png" | "tif" | "tiff" | "tga" | "bmp" | "webp"
-                );
-                if needs_preview {
-                    preview_status = "pending";
-                    needs_job = true;
-                }
+            let needs_preview = matches!(
+                ext.as_str(),
+                "max" | "fbx" | "obj" | "gltf" | "glb" | "dae" | "stl" | "3ds" | "skp" | "rfa" | "rvt" | "dwg" | "3dm" | "vrmat" | "psd" | "psb" | "ai" | "exr" | "hdr"
+                | "jpg" | "jpeg" | "png" | "tif" | "tiff" | "tga" | "bmp" | "webp"
+            );
+            if needs_preview {
+                preview_status = "pending";
+                needs_job = true;
             }
 
             let (id, is_update) = if let Some((existing_id, _, _, existing_thumb)) = existing_map.get(&rel_path) {

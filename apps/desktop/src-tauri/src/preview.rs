@@ -6,6 +6,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader};
 use serde_json::json;
 use tauri::Emitter;
+use sqlx::{Pool, Sqlite};
 use crate::AppState;
 use crate::db::{make_relative_path, resolve_path};
 
@@ -181,250 +182,287 @@ pub fn start_preview_worker(state: Arc<AppState>) {
                 .await;
         }
 
-        let mut py_worker: Option<PythonWorker> = None;
+        // Images and Python-backed formats run on separate queues so a slow
+        // 3D conversion never holds up the (much larger) image backlog.
+        tauri::async_runtime::spawn(run_image_queue(state.clone()));
+        run_python_queue(state, py_exec, worker_py).await;
+    });
+}
 
-        loop {
-            let libs = state.db.get_all_libraries().await;
-            if libs.is_empty() {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
-                continue;
+/// SQL list of the extensions `is_native_image` accepts, matched against `assets.extension`.
+const NATIVE_EXTS_SQL: &str = "('jpg','jpeg','png','bmp','gif','tif','tiff','tga','webp')";
+
+/// A claimed job: (job_id, asset_id, file_path)
+type Job = (String, String, String);
+
+/// Fetches up to `limit` jobs matching `filter` and marks them as 'processing'.
+async fn claim_jobs(pool: &Pool<Sqlite>, filter: &str, limit: usize) -> Vec<Job> {
+    let jobs: Vec<Job> = sqlx::query_as(&format!(
+        "SELECT p.id, p.asset_id, a.file_path FROM preview_jobs p JOIN assets a ON p.asset_id = a.id WHERE ({}) LIMIT {}",
+        filter, limit
+    ))
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let mut claimed = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        match sqlx::query("UPDATE preview_jobs SET status = 'processing' WHERE id = ?")
+            .bind(&job.0)
+            .execute(pool)
+            .await
+        {
+            Ok(_) => claimed.push(job),
+            Err(e) => tracing::error!("Failed to update job status to processing: {}", e),
+        }
+    }
+    claimed
+}
+
+fn resolve_source(root_path: &Path, file_path: &str) -> PathBuf {
+    if Path::new(file_path).is_absolute() {
+        PathBuf::from(file_path)
+    } else {
+        root_path.join(file_path)
+    }
+}
+
+/// Marks a job done, stores the asset's preview paths and notifies the UI.
+/// `rel_thumb` is relative to the library root; `model_path` is absolute.
+async fn complete_job(
+    state: &AppState,
+    pool: &Pool<Sqlite>,
+    root_path: &Path,
+    job_id: &str,
+    asset_id: &str,
+    rel_thumb: Option<String>,
+    model_path: Option<String>,
+) {
+    let _ = sqlx::query("UPDATE preview_jobs SET status = 'done' WHERE id = ?")
+        .bind(job_id)
+        .execute(pool)
+        .await;
+
+    if let Some(ref model_path) = model_path {
+        let rel_model = make_relative_path(root_path, Path::new(model_path));
+        let _ = sqlx::query(
+            "UPDATE assets SET preview_status = 'done', thumbnail_path = ?, metadata = json_set(coalesce(nullif(metadata, ''), '{}'), '$.preview_model', ?) WHERE id = ?"
+        )
+        .bind(&rel_thumb)
+        .bind(&rel_model)
+        .bind(asset_id)
+        .execute(pool)
+        .await;
+    } else {
+        let _ = sqlx::query("UPDATE assets SET preview_status = 'done', thumbnail_path = COALESCE(?, thumbnail_path) WHERE id = ?")
+            .bind(&rel_thumb)
+            .bind(asset_id)
+            .execute(pool)
+            .await;
+    }
+
+    let resolved_thumb = rel_thumb.as_ref().map(|r| resolve_path(root_path, r));
+    let _ = state.app_handle.emit("preview:done", json!({
+        "assetId": asset_id,
+        "thumbnailPath": &resolved_thumb,
+        "previewModel": &model_path,
+    }));
+}
+
+async fn fail_job(state: &AppState, pool: &Pool<Sqlite>, job_id: &str, asset_id: &str) {
+    tracing::error!("Job {} failed", job_id);
+    let _ = sqlx::query("UPDATE preview_jobs SET status = 'error' WHERE id = ?")
+        .bind(job_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("UPDATE assets SET preview_status = 'error' WHERE id = ?")
+        .bind(asset_id)
+        .execute(pool)
+        .await;
+    let _ = state.app_handle.emit("preview:error", json!({
+        "assetId": asset_id,
+        "jobId": job_id,
+    }));
+}
+
+/// Generates raster image thumbnails in Rust, one blocking task per CPU core.
+/// Images the `image` crate can't decode are handed to the Python queue as 'fallback' jobs.
+async fn run_image_queue(state: Arc<AppState>) {
+    let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let filter = format!(
+        "p.status IN ('queued', 'pending') AND lower(coalesce(a.extension, '')) IN {}",
+        NATIVE_EXTS_SQL
+    );
+
+    loop {
+        let mut processed_any = false;
+
+        for lib in state.db.get_all_libraries().await {
+            let thumb_dir = lib.root_path.join(".opendam").join("thumbs");
+            let _ = tokio::fs::create_dir_all(&thumb_dir).await;
+
+            let jobs = claim_jobs(&lib.pool, &filter, parallelism * 8).await;
+            processed_any |= !jobs.is_empty();
+
+            let mut tasks = tokio::task::JoinSet::new();
+            let mut results = Vec::new();
+            for (job_id, asset_id, file_path) in jobs {
+                let source = resolve_source(&lib.root_path, &file_path);
+                let ext = source
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                // Named by asset id: file names repeat across folders, asset ids don't.
+                let thumb_file_name = if ext == "png" || ext == "webp" {
+                    format!("{}_thumb.png", asset_id)
+                } else {
+                    format!("{}_thumb.jpg", asset_id)
+                };
+                let dest = thumb_dir.join(&thumb_file_name);
+
+                tasks.spawn_blocking(move || {
+                    // A malformed file can panic inside the decoder; treat that as a failure.
+                    let res = std::panic::catch_unwind(|| generate_image_thumb(&source, &dest))
+                        .unwrap_or_else(|_| Err(anyhow!("image decoder panicked")))
+                        .map_err(|e| format!("{}: {}", source.display(), e));
+                    (job_id, asset_id, thumb_file_name, res)
+                });
+
+                while tasks.len() >= parallelism {
+                    if let Some(Ok(r)) = tasks.join_next().await {
+                        results.push(r);
+                    }
+                }
             }
-
-            let mut processed_any = false;
-
-            for lib in libs {
-                let pool = &lib.pool;
-                let root_path = &lib.root_path;
-                let thumb_dir = root_path.join(".opendam").join("thumbs");
-                let _ = tokio::fs::create_dir_all(&thumb_dir).await;
-
-                // Poll batch of up to 10 jobs to minimize SQLite round-trip overhead
-                let jobs: Vec<(String, String, String)> = sqlx::query_as(
-                    "SELECT p.id, p.asset_id, a.file_path FROM preview_jobs p JOIN assets a ON p.asset_id = a.id WHERE p.status = 'queued' OR p.status = 'pending' LIMIT 10"
-                ).fetch_all(pool).await.unwrap_or_default();
-
-                for (job_id, asset_id, file_path) in jobs {
-                    processed_any = true;
-
-                    if let Err(e) = sqlx::query("UPDATE preview_jobs SET status = 'processing' WHERE id = ?")
-                        .bind(&job_id)
-                        .execute(pool)
-                        .await
-                    {
-                        tracing::error!("Failed to update job status to processing: {}", e);
-                        continue;
-                    }
-
-                    let full_source = if Path::new(&file_path).is_absolute() {
-                        PathBuf::from(&file_path)
-                    } else {
-                        root_path.join(&file_path)
-                    };
-
-                    let file_stem = full_source
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("preview");
-
-                    let ext = full_source
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-
-                    // Check if thumbnail already exists on disk
-                    let thumb_png = thumb_dir.join(format!("{}_thumb.png", file_stem));
-                    let thumb_jpg = thumb_dir.join(format!("{}_thumb.jpg", file_stem));
-
-                    let existing_thumb = if thumb_png.exists() {
-                        Some(format!(".opendam/thumbs/{}_thumb.png", file_stem))
-                    } else if thumb_jpg.exists() {
-                        Some(format!(".opendam/thumbs/{}_thumb.jpg", file_stem))
-                    } else {
-                        None
-                    };
-
-                    if let Some(rel_thumb) = existing_thumb {
-                        tracing::info!("Thumbnail already exists for {}, skipping generation", file_stem);
-                        let _ = sqlx::query("UPDATE preview_jobs SET status = 'done' WHERE id = ?")
-                            .bind(&job_id)
-                            .execute(pool)
-                            .await;
-                        let _ = sqlx::query("UPDATE assets SET preview_status = 'done', thumbnail_path = ? WHERE id = ?")
-                            .bind(&rel_thumb)
-                            .bind(&asset_id)
-                            .execute(pool)
-                            .await;
-
-                        let resolved_abs = resolve_path(root_path, &rel_thumb);
-                        let _ = state.app_handle.emit("preview:done", json!({
-                            "assetId": &asset_id,
-                            "thumbnailPath": resolved_abs,
-                        }));
-                        continue;
-                    }
-
-                    // ── 1. Fast Native Rust Path for Standard Raster Images ──
-                    if is_native_image(&ext) {
-                        let thumb_file_name = if ext == "png" || ext == "webp" {
-                            format!("{}_thumb.png", file_stem)
-                        } else {
-                            format!("{}_thumb.jpg", file_stem)
-                        };
-                        let thumb_dest = thumb_dir.join(&thumb_file_name);
-                        let rel_thumb = format!(".opendam/thumbs/{}", thumb_file_name);
-
-                        match generate_image_thumb(&full_source, &thumb_dest) {
-                            Ok(()) => {
-                                let _ = sqlx::query("UPDATE preview_jobs SET status = 'done' WHERE id = ?")
-                                    .bind(&job_id)
-                                    .execute(pool)
-                                    .await;
-                                let _ = sqlx::query("UPDATE assets SET preview_status = 'done', thumbnail_path = ? WHERE id = ?")
-                                    .bind(&rel_thumb)
-                                    .bind(&asset_id)
-                                    .execute(pool)
-                                    .await;
-
-                                let resolved_abs = resolve_path(root_path, &rel_thumb);
-                                let _ = state.app_handle.emit("preview:done", json!({
-                                    "assetId": &asset_id,
-                                    "thumbnailPath": resolved_abs,
-                                }));
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::warn!("Native Rust image thumbnail failed for {}: {}. Falling back to Python.", full_source.display(), e);
-                            }
-                        }
-                    }
-
-                    // ── 2. Persistent Python Worker Path for 3D/CAD/DCC Formats ──
-                    if py_worker.is_none() {
-                        match PythonWorker::spawn(&py_exec, &worker_py).await {
-                            Ok(w) => py_worker = Some(w),
-                            Err(e) => {
-                                tracing::error!("Failed to spawn Python preview worker: {}", e);
-                            }
-                        }
-                    }
-
-                    let req = json!({
-                        "id": &job_id,
-                        "method": "model_meta",
-                        "params": {
-                            "source": full_source.to_string_lossy().to_string(),
-                            "output_dir": thumb_dir.to_string_lossy().to_string()
-                        }
-                    });
-
-                    let py_resp = if let Some(ref mut worker) = py_worker {
-                        match tokio::time::timeout(std::time::Duration::from_secs(60), worker.execute(&req)).await {
-                            Ok(Ok(val)) => Ok(val),
-                            Ok(Err(e)) => {
-                                tracing::error!("Python worker execute error: {}. Restarting worker.", e);
-                                worker.kill().await;
-                                py_worker = None;
-                                Err(e)
-                            }
-                            Err(_) => {
-                                tracing::error!("Python worker timed out after 60s processing {}. Killing worker.", file_stem);
-                                worker.kill().await;
-                                py_worker = None;
-                                Err(anyhow!("Job timed out"))
-                            }
-                        }
-                    } else {
-                        Err(anyhow!("Python worker unavailable"))
-                    };
-
-                    let mut success = false;
-                    let mut result_thumb = None;
-                    let mut result_model = None;
-
-                    if let Ok(resp) = py_resp {
-                        if let Some(res) = resp.get("result") {
-                            if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                success = true;
-                                if let Some(thumb) = res.get("thumbnail").and_then(|v| v.as_str()) {
-                                    result_thumb = Some(thumb.to_string());
-                                }
-                                if let Some(model) = res.get("preview_model").and_then(|v| v.as_str()) {
-                                    result_model = Some(model.to_string());
-                                }
-                            } else {
-                                tracing::error!("Python returned ok=false: {:?}", res);
-                            }
-                        } else {
-                            tracing::error!("Python response missing result: {:?}", resp);
-                        }
-                    }
-
-                    if success {
-                        tracing::info!("Job {} succeeded, thumb: {:?}, model: {:?}", job_id, result_thumb, result_model);
-                        let _ = sqlx::query("UPDATE preview_jobs SET status = 'done' WHERE id = ?")
-                            .bind(&job_id)
-                            .execute(pool)
-                            .await;
-
-                        let thumb_to_save_abs = result_thumb.clone().or_else(|| result_model.clone());
-                        let rel_thumb = thumb_to_save_abs.as_ref().map(|abs| {
-                            make_relative_path(root_path, Path::new(abs))
-                        });
-
-                        if let Some(ref model_path) = result_model {
-                            let rel_model = make_relative_path(root_path, Path::new(model_path));
-                            let _ = sqlx::query(
-                                "UPDATE assets SET preview_status = 'done', thumbnail_path = ?, metadata = json_set(coalesce(nullif(metadata, ''), '{}'), '$.preview_model', ?) WHERE id = ?"
-                            )
-                            .bind(&rel_thumb)
-                            .bind(&rel_model)
-                            .bind(&asset_id)
-                            .execute(pool)
-                            .await;
-                        } else if let Some(ref thumb_rel_val) = rel_thumb {
-                            let _ = sqlx::query("UPDATE assets SET preview_status = 'done', thumbnail_path = ? WHERE id = ?")
-                                .bind(thumb_rel_val)
-                                .bind(&asset_id)
-                                .execute(pool)
-                                .await;
-                        } else {
-                            let _ = sqlx::query("UPDATE assets SET preview_status = 'done' WHERE id = ?")
-                                .bind(&asset_id)
-                                .execute(pool)
-                                .await;
-                        }
-
-                        let resolved_display_thumb = rel_thumb.as_ref().map(|r| resolve_path(root_path, r));
-                        let _ = state.app_handle.emit("preview:done", json!({
-                            "assetId": &asset_id,
-                            "thumbnailPath": &resolved_display_thumb,
-                            "previewModel": &result_model,
-                        }));
-                    } else {
-                        tracing::error!("Job {} failed", job_id);
-                        let _ = sqlx::query("UPDATE preview_jobs SET status = 'error' WHERE id = ?")
-                            .bind(&job_id)
-                            .execute(pool)
-                            .await;
-                        let _ = sqlx::query("UPDATE assets SET preview_status = 'error' WHERE id = ?")
-                            .bind(&asset_id)
-                            .execute(pool)
-                            .await;
-                        let _ = state.app_handle.emit("preview:error", json!({
-                            "assetId": &asset_id,
-                            "jobId": &job_id,
-                        }));
-                    }
-
-                    // Yield execution between items to allow other async runtime tasks to progress
-                    tokio::task::yield_now().await;
+            while let Some(r) = tasks.join_next().await {
+                if let Ok(r) = r {
+                    results.push(r);
                 }
             }
 
-            if !processed_any {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            for (job_id, asset_id, thumb_file_name, res) in results {
+                match res {
+                    Ok(()) => {
+                        let rel_thumb = format!(".opendam/thumbs/{}", thumb_file_name);
+                        complete_job(&state, &lib.pool, &lib.root_path, &job_id, &asset_id, Some(rel_thumb), None).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Native Rust image thumbnail failed for {}. Falling back to Python.", e);
+                        let _ = sqlx::query("UPDATE preview_jobs SET status = 'fallback' WHERE id = ?")
+                            .bind(&job_id)
+                            .execute(&lib.pool)
+                            .await;
+                    }
+                }
             }
         }
-    });
+
+        if !processed_any {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+        }
+    }
+}
+
+/// Runs 3D/CAD/DCC formats (and images Rust couldn't decode) through the persistent Python worker.
+async fn run_python_queue(state: Arc<AppState>, py_exec: PathBuf, worker_py: PathBuf) {
+    let filter = format!(
+        "(p.status IN ('queued', 'pending') AND lower(coalesce(a.extension, '')) NOT IN {}) OR p.status = 'fallback'",
+        NATIVE_EXTS_SQL
+    );
+    let mut py_worker: Option<PythonWorker> = None;
+
+    loop {
+        let mut processed_any = false;
+
+        for lib in state.db.get_all_libraries().await {
+            let pool = &lib.pool;
+            let root_path = &lib.root_path;
+            let thumb_dir = root_path.join(".opendam").join("thumbs");
+            let _ = tokio::fs::create_dir_all(&thumb_dir).await;
+
+            for (job_id, asset_id, file_path) in claim_jobs(pool, &filter, 10).await {
+                processed_any = true;
+                let full_source = resolve_source(root_path, &file_path);
+
+                if py_worker.is_none() {
+                    match PythonWorker::spawn(&py_exec, &worker_py).await {
+                        Ok(w) => py_worker = Some(w),
+                        Err(e) => {
+                            tracing::error!("Failed to spawn Python preview worker: {}", e);
+                        }
+                    }
+                }
+
+                let req = json!({
+                    "id": &job_id,
+                    "method": "model_meta",
+                    "params": {
+                        "source": full_source.to_string_lossy().to_string(),
+                        "output_dir": thumb_dir.to_string_lossy().to_string(),
+                        "name": &asset_id
+                    }
+                });
+
+                let py_resp = if let Some(ref mut worker) = py_worker {
+                    match tokio::time::timeout(std::time::Duration::from_secs(60), worker.execute(&req)).await {
+                        Ok(Ok(val)) => Ok(val),
+                        Ok(Err(e)) => {
+                            tracing::error!("Python worker execute error: {}. Restarting worker.", e);
+                            worker.kill().await;
+                            py_worker = None;
+                            Err(e)
+                        }
+                        Err(_) => {
+                            tracing::error!("Python worker timed out after 60s processing {}. Killing worker.", full_source.display());
+                            worker.kill().await;
+                            py_worker = None;
+                            Err(anyhow!("Job timed out"))
+                        }
+                    }
+                } else {
+                    Err(anyhow!("Python worker unavailable"))
+                };
+
+                let mut success = false;
+                let mut result_thumb = None;
+                let mut result_model = None;
+
+                if let Ok(resp) = py_resp {
+                    if let Some(res) = resp.get("result") {
+                        if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            success = true;
+                            if let Some(thumb) = res.get("thumbnail").and_then(|v| v.as_str()) {
+                                result_thumb = Some(thumb.to_string());
+                            }
+                            if let Some(model) = res.get("preview_model").and_then(|v| v.as_str()) {
+                                result_model = Some(model.to_string());
+                            }
+                        } else {
+                            tracing::error!("Python returned ok=false: {:?}", res);
+                        }
+                    } else {
+                        tracing::error!("Python response missing result: {:?}", resp);
+                    }
+                }
+
+                if success {
+                    tracing::info!("Job {} succeeded, thumb: {:?}, model: {:?}", job_id, result_thumb, result_model);
+                    let rel_thumb = result_thumb
+                        .or_else(|| result_model.clone())
+                        .map(|abs| make_relative_path(root_path, Path::new(&abs)));
+                    complete_job(&state, pool, root_path, &job_id, &asset_id, rel_thumb, result_model).await;
+                } else {
+                    fail_job(&state, pool, &job_id, &asset_id).await;
+                }
+
+                // Yield execution between items to allow other async runtime tasks to progress
+                tokio::task::yield_now().await;
+            }
+        }
+
+        if !processed_any {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+        }
+    }
 }

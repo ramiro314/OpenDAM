@@ -75,12 +75,15 @@ def video_thumb(source: str, output: str, timestamp: str = "00:00:01") -> dict:
 
 
 # ── 3D model metadata & previews ──────────────────────────────────────────────
-def model_meta(source: str, output_dir: str) -> dict:
+def model_meta(source: str, output_dir: str, name: str | None = None) -> dict:
     """
     Extract metadata and preview from a 3D model file.
     Supports: .max, .skp, .rfa, .rvt, .obj, .stl, .ply, .dae, .gltf, .glb, .fbx, .3ds, .dwg, .3dm
     """
     p = Path(source)
+    # Output files are named by `name` (the asset id) so assets that share a
+    # file name in different folders never overwrite each other's previews.
+    out_name = name or p.stem
     stat = p.stat()
     ext = p.suffix.lower()
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -133,7 +136,7 @@ def model_meta(source: str, output_dir: str) -> dict:
                                     )
                                 elif img.mode != "RGB":
                                     img = img.convert("RGB")
-                                out_path = Path(output_dir) / f"{p.stem}_thumb.png"
+                                out_path = Path(output_dir) / f"{out_name}_thumb.png"
                                 img.save(out_path, format="PNG")
                                 res["thumbnail"] = str(out_path)
         except Exception as e:
@@ -182,11 +185,11 @@ def model_meta(source: str, output_dir: str) -> dict:
                                 )
                             elif img.mode != "RGB":
                                 img = img.convert("RGB")
-                            out_path = Path(output_dir) / f"{p.stem}_thumb.png"
+                            out_path = Path(output_dir) / f"{out_name}_thumb.png"
                             img.save(out_path, format="PNG")
                             res["thumbnail"] = str(out_path)
                         except Exception:
-                            out_path = Path(output_dir) / f"{p.stem}_thumb.png"
+                            out_path = Path(output_dir) / f"{out_name}_thumb.png"
                             out_path.write_bytes(data)
                             res["thumbnail"] = str(out_path)
 
@@ -209,7 +212,7 @@ def model_meta(source: str, output_dir: str) -> dict:
                             )
                         elif img.mode != "RGB":
                             img = img.convert("RGB")
-                        out_path = Path(output_dir) / f"{p.stem}_thumb.png"
+                        out_path = Path(output_dir) / f"{out_name}_thumb.png"
                         img.save(out_path, format="PNG")
                         res["thumbnail"] = str(out_path)
                     except Exception:
@@ -246,11 +249,11 @@ def model_meta(source: str, output_dir: str) -> dict:
                                     )
                                 elif img.mode != "RGB":
                                     img = img.convert("RGB")
-                                out_path = Path(output_dir) / f"{p.stem}_thumb.png"
+                                out_path = Path(output_dir) / f"{out_name}_thumb.png"
                                 img.save(out_path, format="PNG")
                                 res["thumbnail"] = str(out_path)
                             except Exception:
-                                out_path = Path(output_dir) / f"{p.stem}_thumb.png"
+                                out_path = Path(output_dir) / f"{out_name}_thumb.png"
                                 out_path.write_bytes(stream[png_idx:])
                                 res["thumbnail"] = str(out_path)
         except Exception as e:
@@ -263,14 +266,14 @@ def model_meta(source: str, output_dir: str) -> dict:
 
             scene = trimesh.load(source, force="scene")
 
-            out_path = Path(output_dir) / f"{p.stem}_preview.glb"
+            out_path = Path(output_dir) / f"{out_name}_preview.glb"
             scene.export(str(out_path), file_type="glb")
             res["preview_model"] = str(out_path)
 
             try:
                 png = scene.save_image(resolution=(1024, 1024))
                 if png:
-                    thumb_path = Path(output_dir) / f"{p.stem}_thumb.png"
+                    thumb_path = Path(output_dir) / f"{out_name}_thumb.png"
                     thumb_path.write_bytes(png)
                     res["thumbnail"] = str(thumb_path)
             except Exception:
@@ -304,14 +307,14 @@ def model_meta(source: str, output_dir: str) -> dict:
 
             if meshes:
                 t_scene = trimesh.Scene(meshes)
-                out_path = Path(output_dir) / f"{p.stem}_preview.glb"
+                out_path = Path(output_dir) / f"{out_name}_preview.glb"
                 t_scene.export(str(out_path), file_type="glb")
                 res["preview_model"] = str(out_path)
 
                 try:
                     png = t_scene.save_image(resolution=(1024, 1024))
                     if png:
-                        thumb_path = Path(output_dir) / f"{p.stem}_thumb.png"
+                        thumb_path = Path(output_dir) / f"{out_name}_thumb.png"
                         thumb_path.write_bytes(png)
                         res["thumbnail"] = str(thumb_path)
                 except Exception:
@@ -336,7 +339,7 @@ def model_meta(source: str, output_dir: str) -> dict:
 
             raw_text = p.read_text(encoding="utf-8", errors="ignore")
             thumb_saved = False
-            out_path = Path(output_dir) / f"{p.stem}_thumb.jpg"
+            out_path = Path(output_dir) / f"{out_name}_thumb.jpg"
 
             def save_thumb(img_or_path) -> bool:
                 try:
@@ -594,13 +597,13 @@ def model_meta(source: str, output_dir: str) -> dict:
 
                 if t_meshes:
                     t_scene = trimesh.Scene(t_meshes)
-                    out_glb = Path(output_dir) / f"{p.stem}_preview.glb"
+                    out_glb = Path(output_dir) / f"{out_name}_preview.glb"
                     t_scene.export(str(out_glb), file_type="glb")
                     res["preview_model"] = str(out_glb)
                     try:
                         png = t_scene.save_image(resolution=(1024, 1024))
                         if png:
-                            thumb_path = Path(output_dir) / f"{p.stem}_thumb.png"
+                            thumb_path = Path(output_dir) / f"{out_name}_thumb.png"
                             thumb_path.write_bytes(png)
                             res["thumbnail"] = str(thumb_path)
                     except Exception:
@@ -639,7 +642,7 @@ def model_meta(source: str, output_dir: str) -> dict:
                             ]
                             if len(s_pts) > 1:
                                 draw.line(s_pts, fill=(100, 180, 255), width=3)
-                        out_thumb = Path(output_dir) / f"{p.stem}_thumb.png"
+                        out_thumb = Path(output_dir) / f"{out_name}_thumb.png"
                         img.save(out_thumb)
                         res["thumbnail"] = str(out_thumb)
                         meta["object_count"] = len(doc.Objects)
@@ -750,7 +753,7 @@ def model_meta(source: str, output_dir: str) -> dict:
                                     elif img.mode != "RGB":
                                         img = img.convert("RGB")
 
-                                    out_path = Path(output_dir) / f"{p.stem}_thumb.png"
+                                    out_path = Path(output_dir) / f"{out_name}_thumb.png"
                                     img.save(out_path, format="PNG")
                                     res["thumbnail"] = str(out_path)
                                     thumb_extracted = True
@@ -781,7 +784,7 @@ def model_meta(source: str, output_dir: str) -> dict:
                         elif img.mode != "RGB":
                             img = img.convert("RGB")
 
-                        out_path = Path(output_dir) / f"{p.stem}_thumb.png"
+                        out_path = Path(output_dir) / f"{out_name}_thumb.png"
                         img.save(out_path, format="PNG")
                         res["thumbnail"] = str(out_path)
                         thumb_extracted = True
@@ -803,7 +806,7 @@ def model_meta(source: str, output_dir: str) -> dict:
                 img.thumbnail((1440, 1440), Image.LANCZOS)
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            out_path = Path(output_dir) / f"{p.stem}_thumb.png"
+            out_path = Path(output_dir) / f"{out_name}_thumb.png"
             img.save(out_path, format="PNG")
             res["thumbnail"] = str(out_path)
         except Exception as e:
@@ -821,7 +824,7 @@ def model_meta(source: str, output_dir: str) -> dict:
                 img.thumbnail((1440, 1440), Image.LANCZOS)
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            out_path = Path(output_dir) / f"{p.stem}_thumb.png"
+            out_path = Path(output_dir) / f"{out_name}_thumb.png"
             img.save(out_path, format="PNG")
             res["thumbnail"] = str(out_path)
         except Exception as e:
@@ -860,7 +863,7 @@ def model_meta(source: str, output_dir: str) -> dict:
                 img = img.convert("RGB")
             if max(img.size) > 1440:
                 img.thumbnail((1440, 1440), Image.LANCZOS)
-            out_path = Path(output_dir) / f"{p.stem}_thumb.jpg"
+            out_path = Path(output_dir) / f"{out_name}_thumb.jpg"
             img.save(out_path, format="JPEG", quality=95)
             res["thumbnail"] = str(out_path)
         except Exception as e:
@@ -878,7 +881,7 @@ def model_meta(source: str, output_dir: str) -> dict:
 DISPATCH = {
     "image_thumb": lambda p: image_thumb(p["source"], p["output"], p.get("size", 256)),
     "video_thumb": lambda p: video_thumb(p["source"], p["output"], p.get("timestamp", "00:00:01")),
-    "model_meta": lambda p: model_meta(p["source"], p.get("output_dir", "")),
+    "model_meta": lambda p: model_meta(p["source"], p.get("output_dir", ""), p.get("name")),
 }
 
 
