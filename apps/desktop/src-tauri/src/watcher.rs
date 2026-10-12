@@ -75,18 +75,28 @@ impl Drop for IndexLock {
     }
 }
 
-// Supported extensions
+// Supported extensions, grouped by category. rustfmt would pack the rows and
+// leave each category comment trailing the row above it.
+#[rustfmt::skip]
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     // 3D & CAD
-    "fbx", "obj", "3ds", "dae", "gltf", "glb", "skp", "blend", "c4d", "3dm", "rfa", "rvt", "dwg",
-    "dxf", "stl", "usd", "usdz", "max", "abc", "ply", "x3d", "wrl", // Materials
-    "mat", "vrmat", "sbsar", "sbs", "mdl", // Textures
-    "jpg", "jpeg", "png", "tga", "tif", "tiff", "bmp", "dds", "ktx", "ktx2", "webp", "avif",
+    "fbx", "obj", "3ds", "dae", "gltf", "glb", "skp", "blend",
+    "c4d", "3dm", "rfa", "rvt", "dwg", "dxf", "stl", "usd", "usdz", "max",
+    "abc", "ply", "x3d", "wrl",
+    // Materials
+    "mat", "vrmat", "sbsar", "sbs", "mdl",
+    // Textures
+    "jpg", "jpeg", "png", "tga", "tif", "tiff", "bmp", "dds",
+    "ktx", "ktx2", "webp", "avif",
     // HDRI/HDR
-    "hdr", "exr", "hdri", // IES
-    "ies", "ldt", // Video
-    "mp4", "mov", "avi", "mkv", "webm", "m4v", // Image layered
-    "psd", "psb", "ai", "svg", "gif", // Docs
+    "hdr", "exr", "hdri",
+    // IES
+    "ies", "ldt",
+    // Video
+    "mp4", "mov", "avi", "mkv", "webm", "m4v",
+    // Image layered
+    "psd", "psb", "ai", "svg", "gif",
+    // Docs
     "pdf", "txt", "md",
 ];
 
