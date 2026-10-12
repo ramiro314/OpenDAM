@@ -1,0 +1,25 @@
+{
+  "app": {
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "**",
+          "**/*",
+          "$APPDATA/**",
+          "$APPDATA/**/*",
+          "$HOME/**",
+          "$HOME/**/*",
+          "$DESKTOP/**",
+          "$DESKTOP/**/*",
+          "C:\\**",
+          "C:\\**\\*",
+          "D:\\**",
+          "D:\\**\\*",
+          "E:\\**",
+          "E:\\**\\*"
+        ]
+      }
+    }
+  }
+}
