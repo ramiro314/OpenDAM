@@ -159,3 +159,33 @@ pub async fn save_model_thumbnail(
     Err(format!("asset {} not found", asset_id))
 }
 
+/// Preview queue totals across all libraries, for the status bar.
+#[derive(Serialize, Default)]
+pub struct PreviewProgress {
+    pub total: i64,
+    /// Jobs that finished, successfully or not
+    pub finished: i64,
+    #[serde(rename = "modelsAwaitingRender")]
+    pub models_awaiting_render: i64,
+}
+
+#[tauri::command]
+pub async fn get_preview_progress(state: State<'_, Arc<AppState>>) -> Result<PreviewProgress> {
+    let mut progress = PreviewProgress::default();
+    for lib in state.db.get_all_libraries().await {
+        let (total, finished): (i64, i64) = sqlx::query_as(
+            "SELECT count(*), coalesce(sum(status IN ('done', 'error')), 0) FROM preview_jobs"
+        )
+        .fetch_one(&lib.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let (awaiting,): (i64,) = sqlx::query_as("SELECT count(*) FROM assets WHERE thumbnail_path LIKE '%.glb'")
+            .fetch_one(&lib.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        progress.total += total;
+        progress.finished += finished;
+        progress.models_awaiting_render += awaiting;
+    }
+    Ok(progress)
+}

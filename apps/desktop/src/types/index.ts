@@ -127,6 +127,14 @@ export interface PreviewJob {
   createdAt: number;
 }
 
+/** Preview queue totals across all libraries */
+export interface PreviewProgress {
+  total: number;
+  /** Jobs that finished, successfully or not */
+  finished: number;
+  modelsAwaitingRender: number;
+}
+
 /** A converted 3D model that still needs a rendered grid thumbnail */
 export interface PendingModelThumbnail {
   assetId: string;
