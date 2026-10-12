@@ -30,8 +30,6 @@ opendam/
 │   └── preview-engine/        # Headless Python daemon worker for 3D/CAD/DCC formats
 │       ├── worker.py          # JSON-RPC listener (Max, Revit, SketchUp, FBX, Rhino, VRmat, etc.)
 │       └── pyproject.toml
-├── plugins/
-│   └── blender/               # DCC integration bridge plugins
 └── docs/                      # Architectural Decision Records (ADRs) and system specs
 ```
 

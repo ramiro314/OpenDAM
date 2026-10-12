@@ -51,10 +51,5 @@
       "icons/128x128.png",
       "icons/128x128@2x.png"
     ]
-  },
-  "plugins": {
-    "shell": {
-      "open": true
-    }
   }
 }

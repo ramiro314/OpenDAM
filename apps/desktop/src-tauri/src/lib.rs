@@ -6,15 +6,12 @@ pub mod preview;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
-use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
 use db::Database;
-use watcher::LibraryWatcher;
 
 pub struct AppState {
     pub db: Database,
-    pub watcher: Mutex<LibraryWatcher>,
     pub app_handle: tauri::AppHandle,
 }
 
@@ -28,9 +25,7 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             let app_data_dir = app
                 .path()
@@ -48,10 +43,8 @@ pub fn run() {
                     .expect("Failed to initialize database")
             });
 
-            let watcher = LibraryWatcher::new();
             let state = Arc::new(AppState {
                 db,
-                watcher: Mutex::new(watcher),
                 app_handle: app.handle().clone(),
             });
 

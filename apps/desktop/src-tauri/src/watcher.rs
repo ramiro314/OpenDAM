@@ -384,13 +384,3 @@ async fn commit_asset_batch(pool: &sqlx::Pool<sqlx::Sqlite>, batch: &[PendingAss
     tx.commit().await?;
     Ok(())
 }
-
-/// LibraryWatcher placeholder
-#[derive(Default)]
-pub struct LibraryWatcher {}
-
-impl LibraryWatcher {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
