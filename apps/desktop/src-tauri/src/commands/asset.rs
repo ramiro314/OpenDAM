@@ -1,11 +1,11 @@
-use std::sync::Arc;
-use std::path::Path;
-use tauri::{State, Emitter};
 use serde_json;
+use std::path::Path;
+use std::sync::Arc;
+use tauri::{Emitter, State};
 
+use crate::db::{make_relative_path, resolve_path};
+use crate::models::{Asset, AssetPatch, SearchPayload, SearchResult};
 use crate::AppState;
-use crate::models::{Asset, SearchPayload, SearchResult, AssetPatch};
-use crate::db::{resolve_path, make_relative_path};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -36,12 +36,17 @@ fn row_to_asset(root: Option<&Path>, row: RawAssetRow) -> Asset {
         serde_json::from_str(&row.metadata).unwrap_or_default();
     if let (Some(r), Some(pm)) = (root, metadata.get("preview_model").and_then(|v| v.as_str())) {
         let abs_pm = resolve_path(r, pm);
-        metadata.insert("preview_model".to_string(), serde_json::Value::String(abs_pm));
+        metadata.insert(
+            "preview_model".to_string(),
+            serde_json::Value::String(abs_pm),
+        );
     }
-    let tags: Vec<String> = row.tags
+    let tags: Vec<String> = row
+        .tags
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
-    let collections: Vec<String> = row.collections
+    let collections: Vec<String> = row
+        .collections
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
 
@@ -103,7 +108,10 @@ pub async fn search_assets(
 
         if list.is_empty() {
             if all_libs.is_empty() {
-                list.push((state.db.get_active_pool().await, state.db.get_library_root(None).await));
+                list.push((
+                    state.db.get_active_pool().await,
+                    state.db.get_library_root(None).await,
+                ));
             } else {
                 for lib in &all_libs {
                     list.push((lib.pool.clone(), Some(lib.root_path.clone())));
@@ -123,9 +131,7 @@ pub async fn search_assets(
     let mut binds: Vec<String> = Vec::new();
 
     if has_fts {
-        conditions.push(
-            "a.id IN (SELECT id FROM assets_fts WHERE assets_fts MATCH ?)".into(),
-        );
+        conditions.push("a.id IN (SELECT id FROM assets_fts WHERE assets_fts MATCH ?)".into());
         binds.push(format!("{}*", payload.query.text.trim()));
     }
 
@@ -139,7 +145,11 @@ pub async fn search_assets(
 
     if let Some(color_labels) = &f.color_labels {
         if !color_labels.is_empty() {
-            let placeholders = color_labels.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let placeholders = color_labels
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
             conditions.push(format!("a.color_label IN ({})", placeholders));
             binds.extend(color_labels.clone());
         }
@@ -218,12 +228,17 @@ pub async fn search_assets(
                 binds.push(tags.len().to_string());
             } else if tag_logic == "and_or" {
                 if tags.len() <= 1 {
-                    conditions.push("a.id IN (SELECT asset_id FROM asset_tags WHERE tag_id = ?)".into());
+                    conditions
+                        .push("a.id IN (SELECT asset_id FROM asset_tags WHERE tag_id = ?)".into());
                     binds.push(tags[0].clone());
                 } else {
                     let primary_tag = &tags[0];
                     let remaining_tags = &tags[1..];
-                    let placeholders = remaining_tags.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let placeholders = remaining_tags
+                        .iter()
+                        .map(|_| "?")
+                        .collect::<Vec<_>>()
+                        .join(",");
                     conditions.push(format!(
                         "a.id IN (SELECT asset_id FROM asset_tags WHERE tag_id = ?) AND a.id IN (SELECT asset_id FROM asset_tags WHERE tag_id IN ({}))",
                         placeholders
@@ -244,7 +259,12 @@ pub async fn search_assets(
 
     // Collection filter: supports multi-collection, subcollections, logic "and" (in all), "or" (in any), "and_or" (primary AND any remaining), "none" (unorganized)
     let mut target_collections: Vec<String> = Vec::new();
-    if let Some(col_id) = payload.query.collection_id.as_ref().or(f.collection_id.as_ref()) {
+    if let Some(col_id) = payload
+        .query
+        .collection_id
+        .as_ref()
+        .or(f.collection_id.as_ref())
+    {
         if !col_id.is_empty() && !target_collections.contains(col_id) {
             target_collections.push(col_id.clone());
         }
@@ -258,7 +278,9 @@ pub async fn search_assets(
     }
 
     let col_logic = f.collection_logic.as_deref().unwrap_or("or");
-    let include_sub = f.include_subcollections.unwrap_or_else(|| payload.query.include_subcollections.unwrap_or(true));
+    let include_sub = f
+        .include_subcollections
+        .unwrap_or_else(|| payload.query.include_subcollections.unwrap_or(true));
 
     if col_logic == "none" || f.unorganized == Some(true) {
         conditions.push("a.id NOT IN (SELECT asset_id FROM collection_assets)".into());
@@ -278,7 +300,8 @@ pub async fn search_assets(
                     );
                 } else {
                     conditions.push(
-                        "a.id IN (SELECT asset_id FROM collection_assets WHERE collection_id = ?)".into()
+                        "a.id IN (SELECT asset_id FROM collection_assets WHERE collection_id = ?)"
+                            .into(),
                     );
                 }
                 binds.push(cid.clone());
@@ -299,7 +322,8 @@ pub async fn search_assets(
                     );
                 } else {
                     conditions.push(
-                        "a.id IN (SELECT asset_id FROM collection_assets WHERE collection_id = ?)".into()
+                        "a.id IN (SELECT asset_id FROM collection_assets WHERE collection_id = ?)"
+                            .into(),
                     );
                 }
                 binds.push(cid.clone());
@@ -319,7 +343,11 @@ pub async fn search_assets(
                     );
                     binds.push(primary_col.clone());
 
-                    let rem_placeholders = remaining_cols.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let rem_placeholders = remaining_cols
+                        .iter()
+                        .map(|_| "?")
+                        .collect::<Vec<_>>()
+                        .join(",");
                     conditions.push(format!(
                         "a.id IN (
                             WITH RECURSIVE col_tree AS (
@@ -334,11 +362,16 @@ pub async fn search_assets(
                     binds.extend(remaining_cols.iter().cloned());
                 } else {
                     conditions.push(
-                        "a.id IN (SELECT asset_id FROM collection_assets WHERE collection_id = ?)".into()
+                        "a.id IN (SELECT asset_id FROM collection_assets WHERE collection_id = ?)"
+                            .into(),
                     );
                     binds.push(primary_col.clone());
 
-                    let rem_placeholders = remaining_cols.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let rem_placeholders = remaining_cols
+                        .iter()
+                        .map(|_| "?")
+                        .collect::<Vec<_>>()
+                        .join(",");
                     conditions.push(format!(
                         "a.id IN (SELECT asset_id FROM collection_assets WHERE collection_id IN ({}))",
                         rem_placeholders
@@ -348,7 +381,11 @@ pub async fn search_assets(
             }
         } else {
             if include_sub {
-                let placeholders = target_collections.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let placeholders = target_collections
+                    .iter()
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",");
                 conditions.push(format!(
                     "a.id IN (
                         WITH RECURSIVE col_tree AS (
@@ -362,7 +399,11 @@ pub async fn search_assets(
                 ));
                 binds.extend(target_collections);
             } else {
-                let placeholders = target_collections.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let placeholders = target_collections
+                    .iter()
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",");
                 conditions.push(format!(
                     "a.id IN (SELECT asset_id FROM collection_assets WHERE collection_id IN ({}))",
                     placeholders
@@ -401,19 +442,20 @@ pub async fn search_assets(
     };
 
     let sort_col = match payload.query.sort.field.as_str() {
-        "name"     => "a.file_name",
-        "size"     => "a.size_bytes",
-        "rating"   => "a.rating",
-        "kind"     => "a.kind",
+        "name" => "a.file_name",
+        "size" => "a.size_bytes",
+        "rating" => "a.rating",
+        "kind" => "a.kind",
         "favorite" => "a.is_favorite",
-        _          => "a.modified_at",
+        _ => "a.modified_at",
     };
-    let sort_dir = if payload.query.sort.order == "asc" { "ASC" } else { "DESC" };
+    let sort_dir = if payload.query.sort.order == "asc" {
+        "ASC"
+    } else {
+        "DESC"
+    };
 
-    let count_sql = format!(
-        "SELECT COUNT(*) FROM assets a {}",
-        where_clause
-    );
+    let count_sql = format!("SELECT COUNT(*) FROM assets a {}", where_clause);
     let data_sql = format!(
         r#"SELECT
             a.id, a.file_path, a.file_name, a.extension, a.kind,
@@ -436,7 +478,10 @@ pub async fn search_assets(
         for b in &binds {
             count_query = count_query.bind(b.clone());
         }
-        let total = count_query.fetch_one(pool).await.map_err(|e| e.to_string())?;
+        let total = count_query
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let mut data_query = sqlx::query_as::<_, RawAssetRow>(&data_sql);
         for b in &binds {
@@ -444,7 +489,10 @@ pub async fn search_assets(
         }
         data_query = data_query.bind(limit).bind(offset);
 
-        let rows = data_query.fetch_all(pool).await.map_err(|e| e.to_string())?;
+        let rows = data_query
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         let root_ref = root_opt.as_deref();
         let assets = rows
             .into_iter()
@@ -506,14 +554,18 @@ pub async fn search_assets(
     let is_asc = payload.query.sort.order == "asc";
     all_assets.sort_by(|a, b| {
         let cmp = match sort_field {
-            "name"     => a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()),
-            "size"     => a.size_bytes.cmp(&b.size_bytes),
-            "rating"   => a.rating.cmp(&b.rating),
-            "kind"     => a.kind.cmp(&b.kind),
+            "name" => a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()),
+            "size" => a.size_bytes.cmp(&b.size_bytes),
+            "rating" => a.rating.cmp(&b.rating),
+            "kind" => a.kind.cmp(&b.kind),
             "favorite" => a.is_favorite.cmp(&b.is_favorite),
-            _          => a.modified_at.cmp(&b.modified_at),
+            _ => a.modified_at.cmp(&b.modified_at),
         };
-        if is_asc { cmp } else { cmp.reverse() }
+        if is_asc {
+            cmp
+        } else {
+            cmp.reverse()
+        }
     });
 
     let paged_assets: Vec<Asset> = all_assets
@@ -531,10 +583,7 @@ pub async fn search_assets(
 }
 
 #[tauri::command]
-pub async fn get_asset(
-    id: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<Asset> {
+pub async fn get_asset(id: String, state: State<'_, Arc<AppState>>) -> Result<Asset> {
     let libs = state.db.get_all_libraries().await;
 
     // Search across open libraries
@@ -590,7 +639,8 @@ pub async fn update_asset(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Asset> {
     let libs = state.db.get_all_libraries().await;
-    let mut pools_to_update: Vec<(sqlx::Pool<sqlx::Sqlite>, Option<std::path::PathBuf>)> = Vec::new();
+    let mut pools_to_update: Vec<(sqlx::Pool<sqlx::Sqlite>, Option<std::path::PathBuf>)> =
+        Vec::new();
 
     for lib in &libs {
         let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM assets WHERE id = ?")
@@ -611,7 +661,10 @@ pub async fn update_asset(
         .unwrap_or(None);
 
     if master_exists.is_some() || pools_to_update.is_empty() {
-        pools_to_update.push((state.db.master_pool.clone(), state.db.get_library_root(None).await));
+        pools_to_update.push((
+            state.db.master_pool.clone(),
+            state.db.get_library_root(None).await,
+        ));
     }
 
     let active_pool = state.db.get_active_pool().await;
@@ -620,20 +673,32 @@ pub async fn update_asset(
     for (pool, root) in &pools_to_update {
         if let Some(rating) = patch.rating {
             let _ = sqlx::query("UPDATE assets SET rating = ? WHERE id = ?")
-                .bind(rating).bind(&id).execute(pool).await;
+                .bind(rating)
+                .bind(&id)
+                .execute(pool)
+                .await;
         }
         if let Some(ref color_label) = patch.color_label {
             let _ = sqlx::query("UPDATE assets SET color_label = ? WHERE id = ?")
-                .bind(color_label).bind(&id).execute(pool).await;
+                .bind(color_label)
+                .bind(&id)
+                .execute(pool)
+                .await;
         }
         if let Some(is_fav) = patch.is_favorite {
             let fav_int: i64 = if is_fav { 1 } else { 0 };
             let _ = sqlx::query("UPDATE assets SET is_favorite = ? WHERE id = ?")
-                .bind(fav_int).bind(&id).execute(pool).await;
+                .bind(fav_int)
+                .bind(&id)
+                .execute(pool)
+                .await;
         }
         if let Some(ref description) = patch.description {
             let _ = sqlx::query("UPDATE assets SET description = ? WHERE id = ?")
-                .bind(description).bind(&id).execute(pool).await;
+                .bind(description)
+                .bind(&id)
+                .execute(pool)
+                .await;
         }
         if let Some(ref thumbnail_path) = patch.thumbnail_path {
             let rel_thumb = match root {
@@ -641,21 +706,32 @@ pub async fn update_asset(
                 None => thumbnail_path.clone(),
             };
             let _ = sqlx::query("UPDATE assets SET thumbnail_path = ? WHERE id = ?")
-                .bind(rel_thumb).bind(&id).execute(pool).await;
+                .bind(rel_thumb)
+                .bind(&id)
+                .execute(pool)
+                .await;
         }
         if let Some(ref preview_status) = patch.preview_status {
             let _ = sqlx::query("UPDATE assets SET preview_status = ? WHERE id = ?")
-                .bind(preview_status).bind(&id).execute(pool).await;
+                .bind(preview_status)
+                .bind(&id)
+                .execute(pool)
+                .await;
         }
         if let Some(ref tags) = patch.tags {
             let _ = sqlx::query("DELETE FROM asset_tags WHERE asset_id = ?")
-                .bind(&id).execute(pool).await;
+                .bind(&id)
+                .execute(pool)
+                .await;
             for tag_id in tags {
-                let tag_def = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
-                    "SELECT id, name, color, parent_id FROM tags WHERE id = ?"
-                )
-                .bind(tag_id)
-                .fetch_optional(&state.db.master_pool).await.unwrap_or(None);
+                let tag_def =
+                    sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
+                        "SELECT id, name, color, parent_id FROM tags WHERE id = ?",
+                    )
+                    .bind(tag_id)
+                    .fetch_optional(&state.db.master_pool)
+                    .await
+                    .unwrap_or(None);
 
                 if let Some((tid, tname, tcolor, tparent)) = tag_def {
                     let _ = sqlx::query("INSERT OR IGNORE INTO tags (id, name, color, parent_id) VALUES (?, ?, ?, ?)")
@@ -663,12 +739,19 @@ pub async fn update_asset(
                         .execute(pool).await;
                 } else {
                     let _ = sqlx::query("INSERT OR IGNORE INTO tags (id, name) VALUES (?, ?)")
-                        .bind(tag_id).bind(tag_id)
-                        .execute(pool).await;
+                        .bind(tag_id)
+                        .bind(tag_id)
+                        .execute(pool)
+                        .await;
                 }
 
-                let _ = sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
-                    .bind(&id).bind(tag_id).execute(pool).await;
+                let _ = sqlx::query(
+                    "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)",
+                )
+                .bind(&id)
+                .bind(tag_id)
+                .execute(pool)
+                .await;
             }
         }
     }
@@ -714,7 +797,11 @@ pub async fn delete_asset(
             if path.exists() {
                 // Try moving to Recycle Bin first
                 if let Err(trash_err) = trash::delete(path) {
-                    tracing::warn!("Failed to trash {:?}, falling back to remove_file: {}", path, trash_err);
+                    tracing::warn!(
+                        "Failed to trash {:?}, falling back to remove_file: {}",
+                        path,
+                        trash_err
+                    );
                     let _ = std::fs::remove_file(path);
                 }
             }
@@ -723,11 +810,25 @@ pub async fn delete_asset(
 
     // Delete records from databases
     for pool in target_pools {
-        let _ = sqlx::query("DELETE FROM asset_tags WHERE asset_id = ?").bind(&id).execute(&pool).await;
-        let _ = sqlx::query("DELETE FROM collection_assets WHERE asset_id = ?").bind(&id).execute(&pool).await;
-        let _ = sqlx::query("DELETE FROM preview_jobs WHERE asset_id = ?").bind(&id).execute(&pool).await;
-        let _ = sqlx::query("DELETE FROM assets WHERE id = ?").bind(&id).execute(&pool).await;
-        let _ = sqlx::query("UPDATE libraries SET asset_count = (SELECT COUNT(*) FROM assets)").execute(&pool).await;
+        let _ = sqlx::query("DELETE FROM asset_tags WHERE asset_id = ?")
+            .bind(&id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM collection_assets WHERE asset_id = ?")
+            .bind(&id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM preview_jobs WHERE asset_id = ?")
+            .bind(&id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM assets WHERE id = ?")
+            .bind(&id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("UPDATE libraries SET asset_count = (SELECT COUNT(*) FROM assets)")
+            .execute(&pool)
+            .await;
     }
 
     let _ = state.app_handle.emit("library:updated", ());
@@ -767,11 +868,12 @@ pub async fn rename_asset(
     let mut current_ext = None;
 
     for lib in &libs {
-        let row: Option<(String, String)> = sqlx::query_as("SELECT file_path, extension FROM assets WHERE id = ?")
-            .bind(&id)
-            .fetch_optional(&lib.pool)
-            .await
-            .unwrap_or(None);
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT file_path, extension FROM assets WHERE id = ?")
+                .bind(&id)
+                .fetch_optional(&lib.pool)
+                .await
+                .unwrap_or(None);
 
         if let Some((fp, ext)) = row {
             found_lib = Some(lib.clone());
@@ -810,7 +912,10 @@ pub async fn rename_asset(
     let new_abs_path = parent_dir.join(&final_name);
 
     if new_abs_path.exists() && new_abs_path != old_abs_path {
-        return Err(format!("A file named '{}' already exists in this folder", final_name));
+        return Err(format!(
+            "A file named '{}' already exists in this folder",
+            final_name
+        ));
     }
 
     // Rename file on disk
@@ -823,7 +928,11 @@ pub async fn rename_asset(
     let now = chrono::Utc::now().timestamp_millis();
 
     // Update in all relevant databases
-    let pools_to_update = vec![lib.pool.clone(), state.db.master_pool.clone(), state.db.get_active_pool().await];
+    let pools_to_update = vec![
+        lib.pool.clone(),
+        state.db.master_pool.clone(),
+        state.db.get_active_pool().await,
+    ];
     for pool in pools_to_update {
         let _ = sqlx::query(
             "UPDATE assets SET file_name = ?, file_path = ?, extension = ?, modified_at = ? WHERE id = ?"

@@ -56,7 +56,10 @@ export function AssetGrid() {
     return (
       <div className={styles.container}>
         <FilterBar />
-        <div className={styles.loadingGrid} style={{ '--tile-size': `${tileSize}px` } as React.CSSProperties}>
+        <div
+          className={styles.loadingGrid}
+          style={{ '--tile-size': `${tileSize}px` } as React.CSSProperties}
+        >
           {Array.from({ length: 24 }).map((_, i) => (
             <div key={i} className={clsx(styles.skeletonCard, 'skeleton')} />
           ))}
@@ -149,14 +152,37 @@ function EmptyState() {
     <div className={styles.empty}>
       <div className={styles.emptyIcon}>
         <svg viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <rect x="10" y="20" width="60" height="48" rx="6"
-            fill="hsl(220 13% 16%)" stroke="hsl(220 10% 25%)" strokeWidth="1.5"/>
-          <path d="M28 36l8 8 8-8" stroke="hsl(220 85% 50%)" strokeWidth="2"
-            strokeLinecap="round" strokeLinejoin="round"/>
-          <circle cx="40" cy="12" r="8" fill="hsl(220 85% 50% / 0.15)"
-            stroke="hsl(220 85% 50%)" strokeWidth="1.5"/>
-          <path d="M40 8v8M36 12h8" stroke="hsl(220 85% 50%)" strokeWidth="1.5"
-            strokeLinecap="round"/>
+          <rect
+            x="10"
+            y="20"
+            width="60"
+            height="48"
+            rx="6"
+            fill="hsl(220 13% 16%)"
+            stroke="hsl(220 10% 25%)"
+            strokeWidth="1.5"
+          />
+          <path
+            d="M28 36l8 8 8-8"
+            stroke="hsl(220 85% 50%)"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+          <circle
+            cx="40"
+            cy="12"
+            r="8"
+            fill="hsl(220 85% 50% / 0.15)"
+            stroke="hsl(220 85% 50%)"
+            strokeWidth="1.5"
+          />
+          <path
+            d="M40 8v8M36 12h8"
+            stroke="hsl(220 85% 50%)"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+          />
         </svg>
       </div>
       <h2 className={styles.emptyTitle}>

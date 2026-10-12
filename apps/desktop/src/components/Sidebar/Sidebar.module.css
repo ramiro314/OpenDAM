@@ -36,14 +36,19 @@
   text-transform: uppercase;
   cursor: pointer;
   border-radius: var(--radius-sm);
-  transition: color var(--transition-fast), background var(--transition-fast);
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast);
 }
 .sectionToggle:hover {
   color: var(--color-text-primary);
   background: var(--color-bg-overlay);
 }
 
-.sectionLabel { flex: 1; text-align: left; }
+.sectionLabel {
+  flex: 1;
+  text-align: left;
+}
 
 .addBtn {
   display: flex;
@@ -56,7 +61,9 @@
   color: var(--color-text-muted);
   cursor: pointer;
   border-radius: var(--radius-sm);
-  transition: color var(--transition-fast), background var(--transition-fast);
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast);
 }
 .addBtn:hover {
   color: var(--color-text-primary);
@@ -82,7 +89,9 @@
   font-size: 13px;
   text-align: left;
   cursor: pointer;
-  transition: background var(--transition-fast), color var(--transition-fast);
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
 }
 .item:hover {
   background: var(--color-bg-elevated);
@@ -93,7 +102,9 @@
   color: var(--color-brand-300);
 }
 
-.itemName { flex: 1; }
+.itemName {
+  flex: 1;
+}
 
 .badge {
   font-size: 10px;
@@ -151,8 +162,14 @@
 }
 
 @keyframes fadeIn {
-  from { opacity: 0; transform: translateY(-3px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .createInput {
@@ -207,7 +224,9 @@
   background: transparent;
   color: var(--color-text-muted);
   cursor: pointer;
-  transition: color var(--transition-fast), background var(--transition-fast);
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast);
 }
 
 .item:hover .itemActionBtn {
@@ -274,8 +293,13 @@
 }
 
 @keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
 }
 
 /* Subgroup headers in Filters section */
@@ -300,7 +324,9 @@
   text-transform: uppercase;
   cursor: pointer;
   border-radius: var(--radius-sm);
-  transition: color var(--transition-fast), background var(--transition-fast);
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast);
 }
 
 .subGroupHeader:hover {
@@ -337,7 +363,10 @@
   border: 2px solid transparent;
   padding: 0;
   cursor: pointer;
-  transition: transform var(--transition-fast), border-color var(--transition-fast), box-shadow var(--transition-fast);
+  transition:
+    transform var(--transition-fast),
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast);
   outline: none;
 }
 
@@ -387,6 +416,3 @@
   text-decoration: underline;
   color: var(--color-brand-300);
 }
-
-
-

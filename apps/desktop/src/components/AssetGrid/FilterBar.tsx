@@ -16,7 +16,14 @@ const KIND_OPTIONS: { label: string; value: AssetKind }[] = [
 ];
 
 const COLOR_LABELS: ColorLabel[] = [
-  'red', 'orange', 'yellow', 'green', 'teal', 'blue', 'purple', 'pink',
+  'red',
+  'orange',
+  'yellow',
+  'green',
+  'teal',
+  'blue',
+  'purple',
+  'pink',
 ];
 
 interface SoftwareFilter {
@@ -28,18 +35,66 @@ interface SoftwareFilter {
 }
 
 const SOFTWARE_OPTIONS: SoftwareFilter[] = [
-  { id: 'max',         label: '3ds Max',     extLabel: '.max',       extensions: ['max'],                    color: '#0696d7' },
-  { id: 'rhino',       label: 'Rhino',       extLabel: '.3dm',       extensions: ['3dm'],                    color: '#e53935' },
-  { id: 'revit',       label: 'Revit',       extLabel: '.rvt, .rfa', extensions: ['rvt', 'rfa'],             color: '#00838f' },
-  { id: 'autocad',     label: 'AutoCAD',     extLabel: '.dwg, .dxf', extensions: ['dwg', 'dxf'],             color: '#c62828' },
-  { id: 'sketchup',    label: 'SketchUp',    extLabel: '.skp',       extensions: ['skp'],                    color: '#005f9e' },
-  { id: 'blender',     label: 'Blender',     extLabel: '.blend',     extensions: ['blend'],                  color: '#f5792a' },
-  { id: 'vray',        label: 'V-Ray',       extLabel: '.vrmat',     extensions: ['vrmat', 'mat'],           color: '#8e24aa' },
-  { id: 'photoshop',   label: 'Photoshop',   extLabel: '.psd',       extensions: ['psd', 'psb'],             color: '#1e88e5' },
-  { id: 'illustrator', label: 'Illustrator', extLabel: '.ai',        extensions: ['ai', 'svg'],              color: '#ff8f00' },
-  { id: 'hdri',        label: 'HDR / EXR',   extLabel: '.exr, .hdr', extensions: ['exr', 'hdr', 'hdri'],      color: '#d81b60' },
-  { id: 'open3d',      label: 'FBX / OBJ',   extLabel: '.fbx, .obj', extensions: ['fbx', 'obj', '3ds', 'gltf', 'glb', 'stl', 'dae'], color: '#43a047' },
-  { id: 'textures',    label: 'Textures',    extLabel: '.jpg, .png', extensions: ['jpg', 'jpeg', 'png', 'tif', 'tiff', 'tga', 'bmp', 'webp'], color: '#00acc1' },
+  { id: 'max', label: '3ds Max', extLabel: '.max', extensions: ['max'], color: '#0696d7' },
+  { id: 'rhino', label: 'Rhino', extLabel: '.3dm', extensions: ['3dm'], color: '#e53935' },
+  {
+    id: 'revit',
+    label: 'Revit',
+    extLabel: '.rvt, .rfa',
+    extensions: ['rvt', 'rfa'],
+    color: '#00838f',
+  },
+  {
+    id: 'autocad',
+    label: 'AutoCAD',
+    extLabel: '.dwg, .dxf',
+    extensions: ['dwg', 'dxf'],
+    color: '#c62828',
+  },
+  { id: 'sketchup', label: 'SketchUp', extLabel: '.skp', extensions: ['skp'], color: '#005f9e' },
+  { id: 'blender', label: 'Blender', extLabel: '.blend', extensions: ['blend'], color: '#f5792a' },
+  {
+    id: 'vray',
+    label: 'V-Ray',
+    extLabel: '.vrmat',
+    extensions: ['vrmat', 'mat'],
+    color: '#8e24aa',
+  },
+  {
+    id: 'photoshop',
+    label: 'Photoshop',
+    extLabel: '.psd',
+    extensions: ['psd', 'psb'],
+    color: '#1e88e5',
+  },
+  {
+    id: 'illustrator',
+    label: 'Illustrator',
+    extLabel: '.ai',
+    extensions: ['ai', 'svg'],
+    color: '#ff8f00',
+  },
+  {
+    id: 'hdri',
+    label: 'HDR / EXR',
+    extLabel: '.exr, .hdr',
+    extensions: ['exr', 'hdr', 'hdri'],
+    color: '#d81b60',
+  },
+  {
+    id: 'open3d',
+    label: 'FBX / OBJ',
+    extLabel: '.fbx, .obj',
+    extensions: ['fbx', 'obj', '3ds', 'gltf', 'glb', 'stl', 'dae'],
+    color: '#43a047',
+  },
+  {
+    id: 'textures',
+    label: 'Textures',
+    extLabel: '.jpg, .png',
+    extensions: ['jpg', 'jpeg', 'png', 'tif', 'tiff', 'tga', 'bmp', 'webp'],
+    color: '#00acc1',
+  },
 ];
 
 interface ExtensionOption {
@@ -49,24 +104,24 @@ interface ExtensionOption {
 }
 
 const EXTENSION_OPTIONS: ExtensionOption[] = [
-  { ext: 'max',   label: '.max',   softwareHint: '3ds Max' },
-  { ext: '3dm',   label: '.3dm',   softwareHint: 'Rhino' },
-  { ext: 'rvt',   label: '.rvt',   softwareHint: 'Revit Project' },
-  { ext: 'rfa',   label: '.rfa',   softwareHint: 'Revit Family' },
-  { ext: 'dwg',   label: '.dwg',   softwareHint: 'AutoCAD DWG' },
-  { ext: 'skp',   label: '.skp',   softwareHint: 'SketchUp' },
+  { ext: 'max', label: '.max', softwareHint: '3ds Max' },
+  { ext: '3dm', label: '.3dm', softwareHint: 'Rhino' },
+  { ext: 'rvt', label: '.rvt', softwareHint: 'Revit Project' },
+  { ext: 'rfa', label: '.rfa', softwareHint: 'Revit Family' },
+  { ext: 'dwg', label: '.dwg', softwareHint: 'AutoCAD DWG' },
+  { ext: 'skp', label: '.skp', softwareHint: 'SketchUp' },
   { ext: 'blend', label: '.blend', softwareHint: 'Blender' },
   { ext: 'vrmat', label: '.vrmat', softwareHint: 'V-Ray' },
-  { ext: 'psd',   label: '.psd',   softwareHint: 'Photoshop' },
-  { ext: 'ai',    label: '.ai',    softwareHint: 'Illustrator' },
-  { ext: 'exr',   label: '.exr',   softwareHint: 'OpenEXR' },
-  { ext: 'hdr',   label: '.hdr',   softwareHint: 'Radiance HDR' },
-  { ext: 'fbx',   label: '.fbx',   softwareHint: 'FBX' },
-  { ext: 'obj',   label: '.obj',   softwareHint: 'OBJ' },
-  { ext: '3ds',   label: '.3ds',   softwareHint: '3DS' },
-  { ext: 'jpg',   label: '.jpg',   softwareHint: 'JPEG' },
-  { ext: 'png',   label: '.png',   softwareHint: 'PNG' },
-  { ext: 'tif',   label: '.tif',   softwareHint: 'TIFF' },
+  { ext: 'psd', label: '.psd', softwareHint: 'Photoshop' },
+  { ext: 'ai', label: '.ai', softwareHint: 'Illustrator' },
+  { ext: 'exr', label: '.exr', softwareHint: 'OpenEXR' },
+  { ext: 'hdr', label: '.hdr', softwareHint: 'Radiance HDR' },
+  { ext: 'fbx', label: '.fbx', softwareHint: 'FBX' },
+  { ext: 'obj', label: '.obj', softwareHint: 'OBJ' },
+  { ext: '3ds', label: '.3ds', softwareHint: '3DS' },
+  { ext: 'jpg', label: '.jpg', softwareHint: 'JPEG' },
+  { ext: 'png', label: '.png', softwareHint: 'PNG' },
+  { ext: 'tif', label: '.tif', softwareHint: 'TIFF' },
 ];
 
 export function FilterBar() {
@@ -91,9 +146,7 @@ export function FilterBar() {
 
   const toggleKind = (kind: AssetKind) => {
     const current = filter.kinds ?? [];
-    const next = current.includes(kind)
-      ? current.filter((k) => k !== kind)
-      : [...current, kind];
+    const next = current.includes(kind) ? current.filter((k) => k !== kind) : [...current, kind];
     setFilter({ kinds: next.length ? next : undefined });
     search();
   };
@@ -105,9 +158,7 @@ export function FilterBar() {
 
   const toggleColorLabel = (label: ColorLabel) => {
     const current = filter.colorLabels ?? [];
-    const next = current.includes(label)
-      ? current.filter((l) => l !== label)
-      : [...current, label];
+    const next = current.includes(label) ? current.filter((l) => l !== label) : [...current, label];
     setFilter({ colorLabels: next.length ? next : undefined });
     search();
   };
@@ -132,9 +183,7 @@ export function FilterBar() {
 
   const toggleExtension = (ext: string) => {
     const current = filter.extensions ?? [];
-    const next = current.includes(ext)
-      ? current.filter((e) => e !== ext)
-      : [...current, ext];
+    const next = current.includes(ext) ? current.filter((e) => e !== ext) : [...current, ext];
     setFilter({ extensions: next.length > 0 ? next : undefined });
     search();
   };
@@ -174,7 +223,10 @@ export function FilterBar() {
               onClick={toggleFavorite}
               title="Show only favorite assets"
             >
-              <IconHeartFilled size={12} className={clsx(filter.isFavorite ? styles.heartActive : styles.heartMuted)} />
+              <IconHeartFilled
+                size={12}
+                className={clsx(filter.isFavorite ? styles.heartActive : styles.heartMuted)}
+              />
               <span>Favorites</span>
             </button>
             <button
@@ -206,7 +258,10 @@ export function FilterBar() {
               <button
                 key={label}
                 id={`filter-color-${label}`}
-                className={clsx(styles.colorBtn, filter.colorLabels?.includes(label) && styles.colorActive)}
+                className={clsx(
+                  styles.colorBtn,
+                  filter.colorLabels?.includes(label) && styles.colorActive
+                )}
                 style={{ background: `var(--swatch-${label})` }}
                 title={label}
                 onClick={() => toggleColorLabel(label)}
@@ -242,7 +297,10 @@ export function FilterBar() {
             id="filter-sort-field"
             className={styles.select}
             value={sort.field}
-            onChange={(e) => { setSort(e.target.value as never, sort.order); search(); }}
+            onChange={(e) => {
+              setSort(e.target.value as never, sort.order);
+              search();
+            }}
           >
             <option value="date">Date</option>
             <option value="name">Name</option>
@@ -254,7 +312,10 @@ export function FilterBar() {
           <button
             id="filter-sort-order"
             className={styles.sortOrderBtn}
-            onClick={() => { setSort(sort.field, sort.order === 'asc' ? 'desc' : 'asc'); search(); }}
+            onClick={() => {
+              setSort(sort.field, sort.order === 'asc' ? 'desc' : 'asc');
+              search();
+            }}
             title={sort.order === 'asc' ? 'Ascending' : 'Descending'}
           >
             {sort.order === 'asc' ? '↑' : '↓'}
@@ -320,12 +381,14 @@ export function FilterBar() {
                     key={sw.id}
                     id={`filter-sw-${sw.id}`}
                     className={clsx(styles.swPill, active && styles.swActive)}
-                    style={{
-                      '--sw-active-bg': `${sw.color}22`,
-                      '--sw-active-border': sw.color,
-                      '--sw-active-color': '#ffffff',
-                      '--sw-active-glow': `${sw.color}40`,
-                    } as React.CSSProperties}
+                    style={
+                      {
+                        '--sw-active-bg': `${sw.color}22`,
+                        '--sw-active-border': sw.color,
+                        '--sw-active-color': '#ffffff',
+                        '--sw-active-glow': `${sw.color}40`,
+                      } as React.CSSProperties
+                    }
                     onClick={() => toggleSoftware(sw)}
                     title={`Filter by ${sw.label} (${sw.extLabel})`}
                   >
@@ -411,7 +474,9 @@ export function FilterBar() {
           {/* Active extension badge if filtered */}
           {activeExtCount > 0 && (
             <div className={styles.activeBadge}>
-              <span>{activeExtCount} {activeExtCount === 1 ? 'type' : 'types'}</span>
+              <span>
+                {activeExtCount} {activeExtCount === 1 ? 'type' : 'types'}
+              </span>
               <button
                 className={styles.clearMiniBtn}
                 onClick={clearExtensions}

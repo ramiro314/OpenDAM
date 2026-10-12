@@ -1,13 +1,13 @@
-use std::sync::Arc;
-use std::path::PathBuf;
-use tauri::{State, Emitter};
-use uuid::Uuid;
 use chrono::Utc;
 use serde_json;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tauri::{Emitter, State};
+use uuid::Uuid;
 
-use crate::AppState;
-use crate::models::{Library, AddLibraryPayload};
+use crate::models::{AddLibraryPayload, Library};
 use crate::watcher;
+use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -24,7 +24,9 @@ pub async fn add_library(
     let root_path = PathBuf::from(first_path);
 
     // Register library in memory & open its .opendam/library.sqlite with NAS pragmas
-    let _handle = state.db.register_library(&id, &payload.name, &root_path)
+    let _handle = state
+        .db
+        .register_library(&id, &payload.name, &root_path)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -74,16 +76,19 @@ pub async fn list_libraries(state: State<'_, Arc<AppState>>) -> Result<Vec<Libra
         .map(|(id, name, root_paths_json, created_at, asset_count)| {
             let root_paths: Vec<String> =
                 serde_json::from_str(&root_paths_json).unwrap_or_default();
-            Ok(Library { id, name, root_paths, created_at, asset_count })
+            Ok(Library {
+                id,
+                name,
+                root_paths,
+                created_at,
+                asset_count,
+            })
         })
         .collect()
 }
 
 #[tauri::command]
-pub async fn remove_library(
-    id: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<()> {
+pub async fn remove_library(id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
     let _ = state.db.unregister_library(&id).await;
 
     sqlx::query("DELETE FROM libraries WHERE id = ?")
@@ -96,36 +101,29 @@ pub async fn remove_library(
 }
 
 #[tauri::command]
-pub async fn refresh_library(
-    id: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<()> {
-    let row = sqlx::query_as::<_, (String,)>(
-        "SELECT root_paths FROM libraries WHERE id = ?"
-    )
-    .bind(&id)
-    .fetch_optional(&state.db.master_pool)
-    .await
-    .map_err(|e| e.to_string())?;
+pub async fn refresh_library(id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
+    let row = sqlx::query_as::<_, (String,)>("SELECT root_paths FROM libraries WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.db.master_pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
     if let Some((root_paths_json,)) = row {
         let paths: Vec<String> = serde_json::from_str(&root_paths_json).unwrap_or_default();
-        watcher::index_paths(&state.db, &id, &paths).await.map_err(|e| e.to_string())?;
+        watcher::index_paths(&state.db, &id, &paths)
+            .await
+            .map_err(|e| e.to_string())?;
         let _ = state.app_handle.emit("library:updated", ());
     }
     Ok(())
 }
 
 #[tauri::command]
-pub async fn refresh_all_libraries(
-    state: State<'_, Arc<AppState>>,
-) -> Result<()> {
-    let rows = sqlx::query_as::<_, (String, String)>(
-        "SELECT id, root_paths FROM libraries"
-    )
-    .fetch_all(&state.db.master_pool)
-    .await
-    .map_err(|e| e.to_string())?;
+pub async fn refresh_all_libraries(state: State<'_, Arc<AppState>>) -> Result<()> {
+    let rows = sqlx::query_as::<_, (String, String)>("SELECT id, root_paths FROM libraries")
+        .fetch_all(&state.db.master_pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
     for (id, root_paths_json) in rows {
         let paths: Vec<String> = serde_json::from_str(&root_paths_json).unwrap_or_default();

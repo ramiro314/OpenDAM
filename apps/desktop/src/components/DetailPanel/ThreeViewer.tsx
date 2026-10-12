@@ -44,7 +44,16 @@ export function ThreeViewer({ modelPath }: { modelPath: string }) {
   return (
     <ThreeErrorBoundary
       fallback={
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--color-text-muted)', fontSize: 13 }}>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            height: '100%',
+            color: 'var(--color-text-muted)',
+            fontSize: 13,
+          }}
+        >
           Unable to render 3D preview
         </div>
       }
@@ -61,4 +70,3 @@ export function ThreeViewer({ modelPath }: { modelPath: string }) {
     </ThreeErrorBoundary>
   );
 }
-

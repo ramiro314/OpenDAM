@@ -64,7 +64,10 @@
   padding: var(--space-12);
   text-align: center;
 }
-.emptyIcon svg { width: 80px; height: 80px; }
+.emptyIcon svg {
+  width: 80px;
+  height: 80px;
+}
 .emptyTitle {
   font-size: 18px;
   font-weight: 600;
@@ -86,9 +89,14 @@
   font-size: 14px;
   font-weight: 500;
   cursor: pointer;
-  transition: background var(--transition-fast), transform var(--transition-fast);
+  transition:
+    background var(--transition-fast),
+    transform var(--transition-fast);
 }
-.emptyBtn:hover { background: var(--color-brand-400); transform: translateY(-1px); }
+.emptyBtn:hover {
+  background: var(--color-brand-400);
+  transform: translateY(-1px);
+}
 
 .emptyBtnSecondary {
   padding: var(--space-3) var(--space-6);
@@ -100,7 +108,9 @@
   font-size: 14px;
   font-weight: 500;
   cursor: pointer;
-  transition: background var(--transition-fast), color var(--transition-fast);
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
 }
 .emptyBtnSecondary:hover {
   background: var(--color-bg-overlay);

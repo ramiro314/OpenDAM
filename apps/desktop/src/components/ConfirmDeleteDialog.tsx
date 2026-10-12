@@ -71,7 +71,9 @@ export function ConfirmDeleteDialog({
             <div className={styles.iconCircle}>
               <IconTrash size={18} />
             </div>
-            <h3 className={styles.title}>{actionWordCap} {isAsset ? (itemType === 'assets' ? 'Files' : 'File') : itemType}</h3>
+            <h3 className={styles.title}>
+              {actionWordCap} {isAsset ? (itemType === 'assets' ? 'Files' : 'File') : itemType}
+            </h3>
           </div>
           <button className={styles.closeBtn} onClick={onCancel} title="Close">
             <IconX size={14} />
@@ -80,17 +82,27 @@ export function ConfirmDeleteDialog({
 
         <div className={styles.content}>
           <p className={styles.warningText}>
-            Are you sure you want to {actionWord} {isAsset ? (itemType === 'assets' ? 'the selected files' : 'the file') : `the ${itemType}`}{' '}
+            Are you sure you want to {actionWord}{' '}
+            {isAsset
+              ? itemType === 'assets'
+                ? 'the selected files'
+                : 'the file'
+              : `the ${itemType}`}{' '}
             <strong className={styles.targetName}>"{itemName}"</strong>?
           </p>
           {isLibrary ? (
             <p className={styles.subText}>
-              This will remove the library from OpenDAM. <strong style={{ color: 'var(--color-text-main, #ffffff)' }}>Your original files on disk will NOT be deleted.</strong> To verify, type{' '}
-              <code className={styles.confirmWord}>confirm</code> below:
+              This will remove the library from OpenDAM.{' '}
+              <strong style={{ color: 'var(--color-text-main, #ffffff)' }}>
+                Your original files on disk will NOT be deleted.
+              </strong>{' '}
+              To verify, type <code className={styles.confirmWord}>confirm</code> below:
             </p>
           ) : isAsset ? (
             <p className={styles.subText}>
-              This will move the file to the <strong style={{ color: 'var(--color-text-main, #ffffff)' }}>Recycle Bin</strong> on your system and remove it from OpenDAM.
+              This will move the file to the{' '}
+              <strong style={{ color: 'var(--color-text-main, #ffffff)' }}>Recycle Bin</strong> on
+              your system and remove it from OpenDAM.
             </p>
           ) : (
             <p className={styles.subText}>
@@ -125,11 +137,7 @@ export function ConfirmDeleteDialog({
                 ref={confirmBtnRef}
                 type="submit"
                 disabled={!isMatched}
-                className={clsx(
-                  styles.btn,
-                  styles.deleteBtn,
-                  isMatched && styles.deleteBtnActive
-                )}
+                className={clsx(styles.btn, styles.deleteBtn, isMatched && styles.deleteBtnActive)}
               >
                 {actionWordCap} {isAsset ? (itemType === 'assets' ? 'Files' : 'File') : itemType}
               </button>
@@ -140,4 +148,3 @@ export function ConfirmDeleteDialog({
     </div>
   );
 }
-
