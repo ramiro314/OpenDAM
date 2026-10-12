@@ -22,6 +22,14 @@ fails on `main` and every check can actually be carried out:
   nextest's is listed as unverified.
 - **#5:** the release-build check is visual, since D20 leaves no devtools console in release.
 
+Revised after the GitHub Inspector review on PR #11:
+- **Fix #6's library open is insert-only, master wins.** It adds definitions master lacks, as `main`'s
+  sync already does. It then copies master's definitions down to the opened library's mirror, in
+  a stable library order. The plan had said "upsert", which would revert renames made while a
+  library was offline and would make master depend on open order.
+- **The flow diagrams' labels now match their mermaid source word for word.** The consistency
+  check enforces it.
+
 ## Summary
 
 `ramiro314/OpenDAM` is now a **hard fork**. It is a personal, **Linux-only** asset manager for
@@ -209,7 +217,8 @@ flowchart LR
     C2[tag / collection commands] -->|reads| M[(master DB catalog)]
     C2 -->|definitions| ALL2["master + mirror in every open library"]
     C2 -->|memberships| OWN[("the asset's own library DB")]
-    OPEN[library open] -->|upsert its mirrored definitions| M
+    OPEN[library open] -->|adds only definitions master lacks| M
+    M -->|copies master's definitions to its mirror| OPEN
   end
 ```
 
@@ -369,12 +378,16 @@ into dependency-linked tasks. A step may become several tickets.
    - **Definitions:** create, update, and delete write to master and mirror to every open library (as today).
    - **Memberships:** `asset_tags` and `collection_assets` rows are written only to the asset's own library, resolved explicitly.
    - **Removals:** `get_active_pool` and the `libs.values().next()` fallback are removed. Every caller passes an explicit library or iterates all of them.
-   - **Library open:** opening a library upserts its mirrored definitions into master, so a library folder brought from another machine brings its tags.
+   - **Library open (insert-only, master wins):**
+     - **Keep `main`'s `sync_library_metadata`** (`db.rs:215-259`). It runs at startup and on library add, and only inserts missing rows (`INSERT OR IGNORE`). Master gains the definitions it lacks, so a library folder brought from another machine still brings its new tags. A mirror never overwrites a definition master already has, so a rename or recolour made while a library was offline is kept.
+     - **New in this fix:** after that insert, master's definitions overwrite the opened library's mirror, so mirrors converge on master.
+     - **Stable order:** startup syncs libraries in library-id order. When two mirrors disagree about a definition master lacks, the winner then doesn't depend on HashMap order.
    - **Cleanup:** an idempotent pass removes orphan membership rows whose asset isn't in that library.
    - *Test:* two libraries, A and B, both open.
      - **Fixture:** the fixture opens each library pool with `foreign_keys` off in its connect options. On `main`, `connect_library_sqlite` (`db.rs:43-51`) turns foreign keys off with a `PRAGMA` that reaches only the one pooled connection running it, while sqlx-sqlite 0.8.6 turns them on for every new connection. So a stray `asset_tags` insert for an asset the library doesn't hold can be silently rejected, depending on which connection runs it. Pinning the setting off makes the stray row land every time on `main`.
      - **Memberships:** tag one asset in A and another in B. Each `asset_tags` row exists only in its own library's DB. This fails on `main` whatever order the HashMap is in: the "active" library is always one of the two, so it receives the other library's row.
      - **Reads:** with both libraries open, give a tag a different name in master than in both mirrors. `list_tags` returns master's name. On `main` it returns a mirror's name.
+     - **Open:** master names tag T "new". A's mirror names T "old" and also holds a tag U that master lacks. After A opens, master still says "new" and has gained U, and A's mirror now says "new". On `main` the mirror still says "old", because the sync only inserts missing rows.
    - After this lands, `AGENTS.md` records the rule.
 
 **Done when** each fix's regression test fails on `main` before the fix and passes after it, and `make lint check test build` is green.
@@ -424,7 +437,7 @@ into dependency-linked tasks. A step may become several tickets.
 - **Watching.** No live filesystem watching. The empty `LibraryWatcher` is removed, not implemented.
 - **Kept but unmaintained.** The AEC format code stays but isn't maintained or advertised. `docs/adr`/`docs/specs` stay as they are, and ADR-001 still describes a cross-platform target.
 - **File size.** `DetailPanel.tsx` (711 lines) and `SmartFilterModal.tsx` (673 lines) aren't split.
-- **Deleted tags can come back.** A tag deleted while a library is offline survives in that library's mirror and comes back into master the next time the library opens. This is accepted for now, with no tombstones.
+- **Deleted tags can come back.** A tag deleted while a library is offline survives in that library's mirror. Because library open adds what master lacks, the tag comes back into master the next time that library opens. This is accepted for now, with no tombstones. Renames and recolours made while a library is offline are not affected: master wins and overwrites that library's mirror on open.
 - **Per-connection foreign keys.** Library DBs enforce foreign keys on some pooled connections and not others: `connect_library_sqlite` turns them off with a `PRAGMA` on one connection, while sqlx turns them on for every new connection. I found this while validating fix #6's test. It isn't one of the seven findings you scoped (D8), so it should become a GitHub issue rather than part of this plan.
 - **Fork network.** The repo stays in GitHub's fork network. `gh` already defaults to `ramiro314/OpenDAM`.
 - **Unverified.**
