@@ -35,6 +35,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # tauri build refuses mismatched Rust/JS Tauri versions, and nothing else
+      # in CI runs it. Only reads the lockfiles, so it fails fast.
+      - name: Check Tauri crate and npm package versions match
+        run: node .github/scripts/check-tauri-versions.mjs
       - uses: pnpm/action-setup@v4
         with:
           version: 12
