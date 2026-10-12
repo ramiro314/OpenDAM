@@ -10,9 +10,15 @@ PREVIEW := packages/preview-engine
 JS_STAMP := node_modules/.deps-stamp
 PY_STAMP := $(PREVIEW)/.venv/.deps-stamp
 
+# mise ignores an untrusted mise.toml and its shims then fail. `mise install`
+# trusts it, but Mission Control worktrees run make without that: trust it
+# for make's own commands, and `make deps` persists the trust for the shell.
+export MISE_TRUSTED_CONFIG_PATHS := $(CURDIR)
+
 .PHONY: deps dev lint check build
 
 deps: $(JS_STAMP) $(PY_STAMP)
+	@if command -v mise >/dev/null; then env -u MISE_TRUSTED_CONFIG_PATHS mise trust --quiet; fi
 
 $(JS_STAMP): package.json $(DESKTOP)/package.json bun.lock
 	bun install --frozen-lockfile
