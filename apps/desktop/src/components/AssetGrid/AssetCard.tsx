@@ -3,7 +3,15 @@ import clsx from 'clsx';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import type { Asset, AssetKind } from '../../types';
 import { useTagStore, useCollectionStore, useAssetStore } from '../../store';
-import { IconModel3D, IconImage, IconVideo, IconStar, IconCollection, IconHeart, IconHeartFilled } from '../Icons';
+import {
+  IconModel3D,
+  IconImage,
+  IconVideo,
+  IconStar,
+  IconCollection,
+  IconHeart,
+  IconHeartFilled,
+} from '../Icons';
 import styles from './AssetCard.module.css';
 
 export interface AssetCardProps {
@@ -25,20 +33,18 @@ const KIND_ICON: Record<AssetKind, React.FC<{ size?: number }>> = {
 };
 
 const KIND_COLOR: Record<AssetKind, string> = {
-  '3d_model':  'hsl(220 85% 55%)',
-  material:    'hsl(268 72% 60%)',
-  texture:     'hsl(178 64% 46%)',
-  hdri:        'hsl( 38 92% 56%)',
-  ies:         'hsl( 45 95% 50%)',
-  video:       'hsl(  4 80% 55%)',
-  image:       'hsl(140 64% 46%)',
-  document:    'hsl(213 84% 55%)',
-  other:       'hsl(220  8% 50%)',
+  '3d_model': 'hsl(220 85% 55%)',
+  material: 'hsl(268 72% 60%)',
+  texture: 'hsl(178 64% 46%)',
+  hdri: 'hsl( 38 92% 56%)',
+  ies: 'hsl( 45 95% 50%)',
+  video: 'hsl(  4 80% 55%)',
+  image: 'hsl(140 64% 46%)',
+  document: 'hsl(213 84% 55%)',
+  other: 'hsl(220  8% 50%)',
 };
 
-export const AssetCard = memo(function AssetCard({
-  asset, selected, onClick,
-}: AssetCardProps) {
+export const AssetCard = memo(function AssetCard({ asset, selected, onClick }: AssetCardProps) {
   const [imgError, setImgError] = useState(false);
   const patchAsset = useAssetStore((s) => s.patchAsset);
 
@@ -130,7 +136,7 @@ export const AssetCard = memo(function AssetCard({
             loading="lazy"
             onError={() => setImgError(true)}
           />
-        ) : (['image', 'texture'].includes(asset.kind) && asset.filePath && !imgError) ? (
+        ) : ['image', 'texture'].includes(asset.kind) && asset.filePath && !imgError ? (
           <img
             src={convertFileSrc(asset.filePath)}
             alt={asset.fileName}
@@ -138,7 +144,7 @@ export const AssetCard = memo(function AssetCard({
             loading="lazy"
             onError={() => setImgError(true)}
           />
-        ) : (asset.kind === 'video' && asset.filePath && !imgError) ? (
+        ) : asset.kind === 'video' && asset.filePath && !imgError ? (
           <div className={styles.videoThumbWrapper}>
             <video
               src={convertFileSrc(asset.filePath)}
@@ -241,14 +247,18 @@ export const AssetCard = memo(function AssetCard({
                   styles.chip,
                   chip.type === 'collection' ? styles.collectionChip : styles.tagChip
                 )}
-                title={chip.type === 'collection' ? `Collection: ${chip.name}` : `Tag: ${chip.name}`}
+                title={
+                  chip.type === 'collection' ? `Collection: ${chip.name}` : `Tag: ${chip.name}`
+                }
               >
                 {chip.type === 'collection' ? (
                   <IconCollection size={9} className={styles.chipIcon} />
                 ) : (
                   <span
                     className={styles.chipDot}
-                    style={{ background: chip.color ? `var(--swatch-${chip.color})` : 'hsl(220 85% 60%)' }}
+                    style={{
+                      background: chip.color ? `var(--swatch-${chip.color})` : 'hsl(220 85% 60%)',
+                    }}
                   />
                 )}
                 <span className={styles.chipText}>{chip.name}</span>

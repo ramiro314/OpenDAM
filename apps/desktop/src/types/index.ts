@@ -52,7 +52,7 @@ export interface Asset {
   colorLabel: ColorLabel;
   isFavorite: boolean;
   description: string;
-  tags: string[];       // tag IDs
+  tags: string[]; // tag IDs
   collections?: string[]; // collection IDs
   /** Relative path to cached thumbnail (inside DAM cache dir) */
   thumbnailPath?: string;

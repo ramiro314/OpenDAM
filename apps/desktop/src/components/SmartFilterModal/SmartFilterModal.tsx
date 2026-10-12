@@ -2,7 +2,15 @@ import React, { useState, useMemo } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useTagStore, useCollectionStore } from '../../store';
 import type { FilterSpec, ColorLabel, Collection } from '../../types';
-import { IconFilter, IconX, IconStar, IconFolder, IconCheck, IconCollection, IconHeartFilled } from '../Icons';
+import {
+  IconFilter,
+  IconX,
+  IconStar,
+  IconFolder,
+  IconCheck,
+  IconCollection,
+  IconHeartFilled,
+} from '../Icons';
 import styles from './SmartFilterModal.module.css';
 
 interface SmartFilterModalProps {
@@ -12,10 +20,22 @@ interface SmartFilterModalProps {
 }
 
 const COMMON_EXTENSIONS = [
-  'jpg', 'png', 'gif', 'svg', 'webp', 'psd',
-  'mp4', 'mov', 'mkv',
-  'obj', 'fbx', 'gltf', 'blend',
-  'pdf', 'mp3', 'wav',
+  'jpg',
+  'png',
+  'gif',
+  'svg',
+  'webp',
+  'psd',
+  'mp4',
+  'mov',
+  'mkv',
+  'obj',
+  'fbx',
+  'gltf',
+  'blend',
+  'pdf',
+  'mp3',
+  'wav',
 ];
 
 const COLOR_OPTIONS: { label: ColorLabel; hex: string }[] = [
@@ -173,13 +193,7 @@ export function SmartFilterModal({ isOpen, onClose, onCreated }: SmartFilterModa
         filterSpec.includeSubcollections = includeSubcollections;
       }
 
-      await createCollection(
-        name.trim(),
-        undefined,
-        undefined,
-        true,
-        JSON.stringify(filterSpec)
-      );
+      await createCollection(name.trim(), undefined, undefined, true, JSON.stringify(filterSpec));
 
       setName('');
       setDirectory('');
@@ -331,7 +345,9 @@ export function SmartFilterModal({ isOpen, onClose, onCreated }: SmartFilterModa
               <div className={styles.field}>
                 <label className={styles.label}>
                   <span>Minimum Rating</span>
-                  <span className={styles.optional}>{ratingMin > 0 ? `${ratingMin}+ stars` : 'Any'}</span>
+                  <span className={styles.optional}>
+                    {ratingMin > 0 ? `${ratingMin}+ stars` : 'Any'}
+                  </span>
                 </label>
                 <div className={styles.starRow}>
                   {[1, 2, 3, 4, 5].map((star) => (
@@ -427,8 +443,8 @@ export function SmartFilterModal({ isOpen, onClose, onCreated }: SmartFilterModa
                   {tagMode === 'none'
                     ? 'Matches untagged items'
                     : tagMode === 'specific'
-                    ? `${selectedTags.length} selected (${tagLogic.toUpperCase()})`
-                    : 'Any'}
+                      ? `${selectedTags.length} selected (${tagLogic.toUpperCase()})`
+                      : 'Any'}
                 </span>
               </div>
 
@@ -511,7 +527,9 @@ export function SmartFilterModal({ isOpen, onClose, onCreated }: SmartFilterModa
                               width: 6,
                               height: 6,
                               borderRadius: '50%',
-                              backgroundColor: t.color ? `var(--swatch-${t.color})` : 'hsl(220 85% 60%)',
+                              backgroundColor: t.color
+                                ? `var(--swatch-${t.color})`
+                                : 'hsl(220 85% 60%)',
                             }}
                           />
                           <span>{t.name}</span>
@@ -532,8 +550,8 @@ export function SmartFilterModal({ isOpen, onClose, onCreated }: SmartFilterModa
                   {collectionMode === 'none'
                     ? 'Matches unorganized items'
                     : collectionMode === 'specific'
-                    ? `${selectedCollections.length} selected (${collectionLogic.toUpperCase()})`
-                    : 'Any'}
+                      ? `${selectedCollections.length} selected (${collectionLogic.toUpperCase()})`
+                      : 'Any'}
                 </span>
               </div>
 
@@ -598,7 +616,9 @@ export function SmartFilterModal({ isOpen, onClose, onCreated }: SmartFilterModa
                   {/* Hierarchical scrollable selector showing Parent / Sub-collection */}
                   <div className={styles.multiSelectBox}>
                     {collectionListWithPaths.length === 0 && (
-                      <span style={{ fontSize: 11.5, color: 'var(--color-text-disabled)', padding: 6 }}>
+                      <span
+                        style={{ fontSize: 11.5, color: 'var(--color-text-disabled)', padding: 6 }}
+                      >
                         No collections created yet.
                       </span>
                     )}
@@ -632,7 +652,16 @@ export function SmartFilterModal({ isOpen, onClose, onCreated }: SmartFilterModa
                     })}
                   </div>
 
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--color-text-secondary)', marginTop: 2 }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      fontSize: 12,
+                      color: 'var(--color-text-secondary)',
+                      marginTop: 2,
+                    }}
+                  >
                     <input
                       type="checkbox"
                       id="smart-subcol"

@@ -14,7 +14,7 @@ interface QuickLookModalProps {
 const VIDEO_STEPS = [
   { label: '0%', factor: 0.0 },
   { label: '25%', factor: 0.25 },
-  { label: '50%', factor: 0.50 },
+  { label: '50%', factor: 0.5 },
   { label: '75%', factor: 0.75 },
   { label: '100%', factor: 1.0 },
 ];
@@ -86,7 +86,8 @@ function VideoQuickLook({ filePath }: { filePath: string }) {
               onClick={() => {
                 if (videoRef.current && duration > 0) {
                   setActiveStep(idx);
-                  const target = st.factor === 1.0 ? Math.max(0, duration - 1.0) : duration * st.factor;
+                  const target =
+                    st.factor === 1.0 ? Math.max(0, duration - 1.0) : duration * st.factor;
                   videoRef.current.currentTime = target;
                 }
               }}
@@ -98,17 +99,16 @@ function VideoQuickLook({ filePath }: { filePath: string }) {
           ))}
         </div>
         <div className={styles.videoTimeBadge}>
-          <span>{formatTime(currentTime)} / {formatTime(duration)}</span>
+          <span>
+            {formatTime(currentTime)} / {formatTime(duration)}
+          </span>
         </div>
       </div>
     </div>
   );
 }
 
-export const QuickLookModal = memo(function QuickLookModal({
-  asset,
-  isOpen,
-}: QuickLookModalProps) {
+export const QuickLookModal = memo(function QuickLookModal({ asset, isOpen }: QuickLookModalProps) {
   if (!isOpen || !asset) return null;
 
   const modelPath =
@@ -126,10 +126,10 @@ export const QuickLookModal = memo(function QuickLookModal({
   const imagePath = isNativeImg
     ? asset.filePath
     : asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb')
-    ? asset.thumbnailPath
-    : ['image', 'texture'].includes(asset.kind)
-    ? asset.filePath
-    : undefined;
+      ? asset.thumbnailPath
+      : ['image', 'texture'].includes(asset.kind)
+        ? asset.filePath
+        : undefined;
 
   const formatSize = (bytes: number): string => {
     if (bytes < 1024) return `${bytes} B`;

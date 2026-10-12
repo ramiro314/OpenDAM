@@ -68,11 +68,9 @@ export const useUIStore = create<UIState>()(
           return { selectedAssetIds: new Set([id]), focusedAssetId: id };
         }),
 
-      selectAll: (ids) =>
-        set({ selectedAssetIds: new Set(ids) }),
+      selectAll: (ids) => set({ selectedAssetIds: new Set(ids) }),
 
-      clearSelection: () =>
-        set({ selectedAssetIds: new Set(), focusedAssetId: null }),
+      clearSelection: () => set({ selectedAssetIds: new Set(), focusedAssetId: null }),
 
       focusAsset: (id) => set({ focusedAssetId: id }),
 
@@ -96,8 +94,7 @@ export const useUIStore = create<UIState>()(
           };
         }),
 
-      clearLibrarySelection: () =>
-        set({ selectedLibraryIds: [], activeLibraryId: null }),
+      clearLibrarySelection: () => set({ selectedLibraryIds: [], activeLibraryId: null }),
 
       setActiveLibrary: (id) =>
         set({ activeLibraryId: id, selectedLibraryIds: id ? [id] : [], activeCollectionId: null }),
@@ -238,7 +235,8 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
           ...s.query,
           sort: {
             field,
-            order: order ?? (field === s.query.sort.field && currentOrder === 'desc' ? 'asc' : 'desc'),
+            order:
+              order ?? (field === s.query.sort.field && currentOrder === 'desc' ? 'asc' : 'desc'),
           },
         },
         page: 0,
@@ -350,7 +348,9 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
         ...asset,
         thumbnailPath: thumbnailPath || asset.thumbnailPath,
         previewStatus: 'done',
-        metadata: previewModel ? { ...asset.metadata, preview_model: previewModel } : asset.metadata,
+        metadata: previewModel
+          ? { ...asset.metadata, preview_model: previewModel }
+          : asset.metadata,
       };
       return {
         assets: s.assets.map((a) => (a.id === id ? updated : a)),
@@ -419,7 +419,7 @@ interface CollectionStore {
     description?: string,
     parentId?: string,
     isSmart?: boolean,
-    filterSpec?: string,
+    filterSpec?: string
   ) => Promise<void>;
   addToCollection: (collectionId: string, assetIds: string[]) => Promise<void>;
   removeFromCollection: (collectionId: string, assetIds: string[]) => Promise<void>;
@@ -443,9 +443,7 @@ export const useCollectionStore = create<CollectionStore>()((set) => ({
     await api.addToCollection(collectionId, assetIds);
     set((s) => ({
       collections: s.collections.map((c) =>
-        c.id === collectionId
-          ? { ...c, assetIds: [...new Set([...c.assetIds, ...assetIds])] }
-          : c
+        c.id === collectionId ? { ...c, assetIds: [...new Set([...c.assetIds, ...assetIds])] } : c
       ),
     }));
     useAssetStore.setState((s) => {

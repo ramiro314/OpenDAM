@@ -12,11 +12,11 @@ updates:
       interval: weekly
     groups:
       tauri:
-        patterns: ["tauri", "tauri-*"]
-        update-types: ["minor", "patch"]
+        patterns: ['tauri', 'tauri-*']
+        update-types: ['minor', 'patch']
       cargo:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
+        patterns: ['*']
+        update-types: ['minor', 'patch']
 
   - package-ecosystem: bun # bun workspace (bun.lock)
     directory: /
@@ -24,11 +24,11 @@ updates:
       interval: weekly
     groups:
       tauri:
-        patterns: ["@tauri-apps/*"]
-        update-types: ["minor", "patch"]
+        patterns: ['@tauri-apps/*']
+        update-types: ['minor', 'patch']
       bun:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
+        patterns: ['*']
+        update-types: ['minor', 'patch']
 
   - package-ecosystem: uv
     directory: /packages/preview-engine
@@ -36,8 +36,8 @@ updates:
       interval: weekly
     groups:
       uv:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
+        patterns: ['*']
+        update-types: ['minor', 'patch']
 
   - package-ecosystem: github-actions
     directory: /
@@ -45,5 +45,5 @@ updates:
       interval: weekly
     groups:
       actions:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
+        patterns: ['*']
+        update-types: ['minor', 'patch']

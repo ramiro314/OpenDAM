@@ -3,7 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "description": "Open-source digital asset manager for 3D/AEC/design files",
-  "workspaces": ["apps/desktop"],
+  "workspaces": [
+    "apps/desktop"
+  ],
   "scripts": {
     "dev": "bun run --filter @opendam/desktop dev",
     "build": "bun run --filter @opendam/desktop build",

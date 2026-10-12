@@ -66,8 +66,9 @@ export function startModelThumbnailer(): () => void {
     const skipped = new Set<string>();
 
     while (!stopped) {
-      const batch = (await api.listPendingModelThumbnails(BATCH + skipped.size).catch(() => []))
-        .filter((item) => !skipped.has(item.assetId));
+      const batch = (
+        await api.listPendingModelThumbnails(BATCH + skipped.size).catch(() => [])
+      ).filter((item) => !skipped.has(item.assetId));
       if (batch.length === 0) {
         await sleep(IDLE_POLL_MS);
         continue;
@@ -103,7 +104,11 @@ function disposeObject(object: THREE.Object3D) {
   object.traverse((child) => {
     const mesh = child as THREE.Mesh;
     mesh.geometry?.dispose();
-    const materials = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : [];
+    const materials = Array.isArray(mesh.material)
+      ? mesh.material
+      : mesh.material
+        ? [mesh.material]
+        : [];
     for (const material of materials) {
       for (const value of Object.values(material)) {
         if (value instanceof THREE.Texture) value.dispose();
