@@ -74,7 +74,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # astral-sh/ruff-action downloads a precompiled standalone binary in ~1s
-      # without needing python setup or pip install
+      # without needing python setup or pip install.
+      # Paths go in `src`: the action appends `src` (default: repo root) to `args`.
       - uses: astral-sh/ruff-action@v3
         with:
-          args: "check packages/preview-engine/"
+          args: check
+          src: packages/preview-engine
