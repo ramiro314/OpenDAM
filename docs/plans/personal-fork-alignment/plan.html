@@ -49,6 +49,17 @@ and <code>make install</code>/<code>make uninstall</code> to the docs.</li>
 <li>Step 1's &quot;no Windows/pnpm references&quot; exit check is now an exact command. Step 2 extends it to
 the README and <code>CONTRIBUTING.md</code>.</li>
 </ul>
+<p>Revised again after repair round 2. These are validation repairs only, so every regression test
+fails on <code>main</code> and every check can actually be carried out:</p>
+<ul>
+<li><strong>#2:</strong> the regression test now reads <code>[profile.release]</code>. The test profile never aborts, so a
+decoder unit test would pass on <code>main</code>.</li>
+<li><strong>#6:</strong> the test tags an asset in each library, seeds a divergent definition, and pins
+<code>foreign_keys</code> off in its fixture, so it fails on <code>main</code> whatever order the HashMap is in.</li>
+<li><strong>Step 3:</strong> first probes what each runner's JUnit records for a test's file. bun's is verified;
+nextest's is listed as unverified.</li>
+<li><strong>#5:</strong> the release-build check is visual, since D20 leaves no devtools console in release.</li>
+</ul>
 <h2 id="summary">Summary</h2>
 <p><code>ramiro314/OpenDAM</code> is now a <strong>hard fork</strong>. It is a personal, <strong>Linux-only</strong> asset manager for
 <strong>game-dev assets</strong>, built and maintained by agents that Mission Control dispatches. This plan does
@@ -204,6 +215,7 @@ D22-D23 at plan review.</p>
 <li><strong>Libraries.</strong> Only one library is registered in the master DB (<code>~/.local/share/com.opendam.desktop/opendam.sqlite</code>), so bug #1 is latent today.</li>
 <li><strong>Tauri version check.</strong> <code>.github/scripts/check-tauri-versions.mjs</code> (PR #10) parses <code>pnpm-lock.yaml</code>, so the bun migration has to port it to <code>bun.lock</code>.</li>
 <li><strong>Screenshots.</strong> The desktop is KDE Plasma, and <code>spectacle</code> is the available screenshot tool.</li>
+<li><strong>bun JUnit.</strong> <code>bun test</code> 1.4.2's JUnit reporter writes <code>file=&quot;&lt;path&gt;&quot;</code> and <code>line</code> on every <code>&lt;testcase&gt;</code>. I probed this with a throwaway test outside the repo. cargo-nextest isn't installed here, so its JUnit output is unverified (see step 3).</li>
 </ul>
 <h2 id="review-findings">Review findings</h2>
 <p>A read-only review of <code>origin/main</code> at <code>0af38c8</code>. Items marked ✔ were confirmed by reading the code
@@ -313,7 +325,7 @@ during shaping. The rest come from the review pass.</p>
 <li><strong>Linux only.</strong> Nothing for Windows or macOS remains, and CI is ubuntu-only.</li>
 <li><strong>Agent context.</strong> <code>AGENTS.md</code> gives an agent everything it needs: commands, layout, invariants, and how to run and screenshot the app.</li>
 <li><strong>Tests.</strong> Rust and TypeScript tests run with JUnit output, ready for Mission Control's testing contract.</li>
-<li><strong>Bugs.</strong> #1-#7 are fixed, and #1-#6 each have an automated regression test (for #5, a test of the shipped security configuration).</li>
+<li><strong>Bugs.</strong> #1-#7 are fixed, and #1-#6 each have an automated regression test (for #2 and #5, a test of the shipped configuration).</li>
 <li><strong>Install.</strong> <code>make install</code> puts a release OpenDAM in your app launcher, and it renders Python-backed previews.</li>
 </ul>
 <h2 id="flows-that-change">Flows that change</h2>
@@ -481,6 +493,13 @@ into dependency-linked tasks. A step may become several tickets.</p>
 </ul>
 <h3 id="step-3-test-runners">Step 3: Test runners</h3>
 <ul>
+<li><strong>JUnit file probe (do this first):</strong> once each runner works, run it on a seed test and inspect the XML for the attribute that identifies the test's source file. Mission Control's testing contract needs this to rerun a failed file.
+<ul>
+<li><strong>bun:</strong> already verified to write <code>file</code> on each <code>&lt;testcase&gt;</code>.</li>
+<li><strong>nextest:</strong> identifies tests by binary and module path, and Rust unit tests live inside source modules, so its XML may not name a source file.</li>
+<li><strong>Fallback:</strong> if it doesn't, record which attributes identify a Rust test (for example the binary in <code>classname</code> and the module path in <code>name</code>) and how that maps to a file.</li>
+</ul>
+</li>
 <li><strong>Rust:</strong> cargo-nextest with a <code>ci</code> profile that writes JUnit (<code>apps/desktop/src-tauri/.config/nextest.toml</code>). Seed it with unit tests for pure helpers (<code>resolve_path</code>, <code>make_relative_path</code>) and one in-memory SQLite test (<code>sqlite::memory:</code> with <code>002_library_schema.sql</code>), which proves step 4 can test DB behaviour.</li>
 <li><strong>TypeScript:</strong> <code>bun test</code> (with <code>@types/bun</code>), JUnit via <code>--reporter=junit --reporter-outfile</code>. Seed it with a test of an existing pure frontend helper.</li>
 <li><strong><code>make test</code></strong> runs both. CI gets a test job.</li>
@@ -489,7 +508,8 @@ into dependency-linked tasks. A step may become several tickets.</p>
 <p><strong>Done when</strong></p>
 <ul>
 <li><code>make test</code> passes locally and in CI.</li>
-<li>Both runners can emit JUnit XML that names the test's file.</li>
+<li>Both runners emit JUnit XML.</li>
+<li>The step records, for each runner, the attribute that names a test's file. For nextest, if no attribute does, it records how a test maps back to its file. That note goes to the &quot;Set up testing&quot; task (manual step 3).</li>
 <li><code>AGENTS.md</code> and the allowlist list <code>make test</code>.</li>
 </ul>
 <h3 id="step-4-fixes-1-6-each-with-a-regression-test">Step 4: Fixes #1-#6, each with a regression test</h3>
@@ -506,7 +526,8 @@ into dependency-linked tasks. A step may become several tickets.</p>
 <ul>
 <li>Remove <code>panic = &quot;abort&quot;</code> from <code>[profile.release]</code>.</li>
 <li>Factor the guarded decode into one function.</li>
-<li><em>Test:</em> a panicking decoder yields <code>Err</code>, not a crash.</li>
+<li><em>Test:</em> the Rust config test <code>apps/desktop/src-tauri/tests/security_config.rs</code> asserts that <code>[profile.release]</code> doesn't set <code>panic = &quot;abort&quot;</code>. Whichever of #2 and #5 lands first creates the file. The test fails on <code>main</code>, where <code>Cargo.toml:40</code> sets it.</li>
+<li><em>Guard, not the regression test:</em> a unit test that a panicking decoder yields <code>Err</code> from the factored function. It passes on <code>main</code> too, because the test profile unwinds whatever <code>[profile.release]</code> says.</li>
 </ul>
 </li>
 <li><strong>#3 FTS input.</strong>
@@ -537,7 +558,7 @@ into dependency-linked tasks. A step may become several tickets.</p>
 <p><strong>Devtools:</strong> the <code>devtools</code> feature is dropped (D20).</p>
 </li>
 <li>
-<p><em>Test:</em> a Rust integration test (for example <code>apps/desktop/src-tauri/tests/security_config.rs</code>) parses the shipped <code>tauri.conf.json</code>, <code>capabilities/*.json</code> and <code>Cargo.toml</code>. It asserts:</p>
+<p><em>Test:</em> the Rust config test <code>apps/desktop/src-tauri/tests/security_config.rs</code> (shared with #2) parses the shipped <code>tauri.conf.json</code>, <code>capabilities/*.json</code> and <code>Cargo.toml</code>. It asserts:</p>
 <ul>
 <li><code>app.security.csp</code> is a non-null policy with a <code>default-src</code>.</li>
 <li>The asset protocol's static scope has no <code>**</code>, <code>**/*</code>, <code>$HOME/**</code> or <code>$DESKTOP/**</code> entry.</li>
@@ -547,7 +568,11 @@ into dependency-linked tasks. A step may become several tickets.</p>
 <p>It fails on <code>main</code> before this fix, because the scope is <code>**</code>, <code>csp</code> is <code>null</code> and <code>devtools</code> is enabled.</p>
 </li>
 <li>
-<p><em>Check (manual, in addition to the test):</em> thumbnails, the 3D viewer, video previews, and Quick Look work in <code>make dev</code> and in the release build with no CSP violations in the console.</p>
+<p><em>Check (manual, in addition to the test):</em> exercise thumbnails, the 3D viewer, video previews, and Quick Look.</p>
+<ul>
+<li>In <code>make dev</code>, the devtools console shows no CSP violations.</li>
+<li>In the release build, which has no devtools (D20) and serves the embedded <code>frontendDist</code> instead of <code>devUrl</code>, check by eye that all four render.</li>
+</ul>
 </li>
 </ul>
 </li>
@@ -559,7 +584,13 @@ into dependency-linked tasks. A step may become several tickets.</p>
 <li><strong>Removals:</strong> <code>get_active_pool</code> and the <code>libs.values().next()</code> fallback are removed. Every caller passes an explicit library or iterates all of them.</li>
 <li><strong>Library open:</strong> opening a library upserts its mirrored definitions into master, so a library folder brought from another machine brings its tags.</li>
 <li><strong>Cleanup:</strong> an idempotent pass removes orphan membership rows whose asset isn't in that library.</li>
-<li><em>Test:</em> two libraries. Tagging an asset in B writes only to B, and <code>list_tags</code> is deterministic.</li>
+<li><em>Test:</em> two libraries, A and B, both open.
+<ul>
+<li><strong>Fixture:</strong> the fixture opens each library pool with <code>foreign_keys</code> off in its connect options. On <code>main</code>, <code>connect_library_sqlite</code> (<code>db.rs:43-51</code>) turns foreign keys off with a <code>PRAGMA</code> that reaches only the one pooled connection running it, while sqlx-sqlite 0.8.6 turns them on for every new connection. So a stray <code>asset_tags</code> insert for an asset the library doesn't hold can be silently rejected, depending on which connection runs it. Pinning the setting off makes the stray row land every time on <code>main</code>.</li>
+<li><strong>Memberships:</strong> tag one asset in A and another in B. Each <code>asset_tags</code> row exists only in its own library's DB. This fails on <code>main</code> whatever order the HashMap is in: the &quot;active&quot; library is always one of the two, so it receives the other library's row.</li>
+<li><strong>Reads:</strong> with both libraries open, give a tag a different name in master than in both mirrors. <code>list_tags</code> returns master's name. On <code>main</code> it returns a mirror's name.</li>
+</ul>
+</li>
 <li>After this lands, <code>AGENTS.md</code> records the rule.</li>
 </ul>
 </li>
@@ -619,11 +650,13 @@ into dependency-linked tasks. A step may become several tickets.</p>
 <li><strong>Kept but unmaintained.</strong> The AEC format code stays but isn't maintained or advertised. <code>docs/adr</code>/<code>docs/specs</code> stay as they are, and ADR-001 still describes a cross-platform target.</li>
 <li><strong>File size.</strong> <code>DetailPanel.tsx</code> (711 lines) and <code>SmartFilterModal.tsx</code> (673 lines) aren't split.</li>
 <li><strong>Deleted tags can come back.</strong> A tag deleted while a library is offline survives in that library's mirror and comes back into master the next time the library opens. This is accepted for now, with no tombstones.</li>
+<li><strong>Per-connection foreign keys.</strong> Library DBs enforce foreign keys on some pooled connections and not others: <code>connect_library_sqlite</code> turns them off with a <code>PRAGMA</code> on one connection, while sqlx turns them on for every new connection. I found this while validating fix #6's test. It isn't one of the seven findings you scoped (D8), so it should become a GitHub issue rather than part of this plan.</li>
 <li><strong>Fork network.</strong> The repo stays in GitHub's fork network. <code>gh</code> already defaults to <code>ramiro314/OpenDAM</code>.</li>
 <li><strong>Unverified.</strong>
 <ul>
 <li>Whether <code>tauri-plugin-opener</code> selects the file on KDE; the fallback is defined.</li>
 <li>Whether mise can install cargo-nextest; the fallback is defined.</li>
+<li>Whether cargo-nextest's JUnit names each test's source file. bun's does (verified). Step 3 probes nextest first, and its fallback records how a Rust test maps to its file for the &quot;Set up testing&quot; task.</li>
 <li>The exact CSP sources three.js needs; step 4 finds them.</li>
 </ul>
 </li>

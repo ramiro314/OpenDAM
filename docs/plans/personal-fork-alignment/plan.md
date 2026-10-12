@@ -12,6 +12,16 @@ approved decisions, not new decisions:
 - Step 1's "no Windows/pnpm references" exit check is now an exact command. Step 2 extends it to
   the README and `CONTRIBUTING.md`.
 
+Revised again after repair round 2. These are validation repairs only, so every regression test
+fails on `main` and every check can actually be carried out:
+- **#2:** the regression test now reads `[profile.release]`. The test profile never aborts, so a
+  decoder unit test would pass on `main`.
+- **#6:** the test tags an asset in each library, seeds a divergent definition, and pins
+  `foreign_keys` off in its fixture, so it fails on `main` whatever order the HashMap is in.
+- **Step 3:** first probes what each runner's JUnit records for a test's file. bun's is verified;
+  nextest's is listed as unverified.
+- **#5:** the release-build check is visual, since D20 leaves no devtools console in release.
+
 ## Summary
 
 `ramiro314/OpenDAM` is now a **hard fork**. It is a personal, **Linux-only** asset manager for
@@ -72,6 +82,7 @@ Facts checked while shaping (not decisions):
 - **Libraries.** Only one library is registered in the master DB (`~/.local/share/com.opendam.desktop/opendam.sqlite`), so bug #1 is latent today.
 - **Tauri version check.** `.github/scripts/check-tauri-versions.mjs` (PR #10) parses `pnpm-lock.yaml`, so the bun migration has to port it to `bun.lock`.
 - **Screenshots.** The desktop is KDE Plasma, and `spectacle` is the available screenshot tool.
+- **bun JUnit.** `bun test` 1.4.2's JUnit reporter writes `file="<path>"` and `line` on every `<testcase>`. I probed this with a throwaway test outside the repo. cargo-nextest isn't installed here, so its JUnit output is unverified (see step 3).
 
 ## Review findings
 
@@ -153,7 +164,7 @@ during shaping. The rest come from the review pass.
 - **Linux only.** Nothing for Windows or macOS remains, and CI is ubuntu-only.
 - **Agent context.** `AGENTS.md` gives an agent everything it needs: commands, layout, invariants, and how to run and screenshot the app.
 - **Tests.** Rust and TypeScript tests run with JUnit output, ready for Mission Control's testing contract.
-- **Bugs.** #1-#7 are fixed, and #1-#6 each have an automated regression test (for #5, a test of the shipped security configuration).
+- **Bugs.** #1-#7 are fixed, and #1-#6 each have an automated regression test (for #2 and #5, a test of the shipped configuration).
 - **Install.** `make install` puts a release OpenDAM in your app launcher, and it renders Python-backed previews.
 
 ## Flows that change
@@ -304,6 +315,10 @@ into dependency-linked tasks. A step may become several tickets.
 
 ### Step 3: Test runners
 
+- **JUnit file probe (do this first):** once each runner works, run it on a seed test and inspect the XML for the attribute that identifies the test's source file. Mission Control's testing contract needs this to rerun a failed file.
+  - **bun:** already verified to write `file` on each `<testcase>`.
+  - **nextest:** identifies tests by binary and module path, and Rust unit tests live inside source modules, so its XML may not name a source file.
+  - **Fallback:** if it doesn't, record which attributes identify a Rust test (for example the binary in `classname` and the module path in `name`) and how that maps to a file.
 - **Rust:** cargo-nextest with a `ci` profile that writes JUnit (`apps/desktop/src-tauri/.config/nextest.toml`). Seed it with unit tests for pure helpers (`resolve_path`, `make_relative_path`) and one in-memory SQLite test (`sqlite::memory:` with `002_library_schema.sql`), which proves step 4 can test DB behaviour.
 - **TypeScript:** `bun test` (with `@types/bun`), JUnit via `--reporter=junit --reporter-outfile`. Seed it with a test of an existing pure frontend helper.
 - **`make test`** runs both. CI gets a test job.
@@ -311,7 +326,8 @@ into dependency-linked tasks. A step may become several tickets.
 
 **Done when**
 - `make test` passes locally and in CI.
-- Both runners can emit JUnit XML that names the test's file.
+- Both runners emit JUnit XML.
+- The step records, for each runner, the attribute that names a test's file. For nextest, if no attribute does, it records how a test maps back to its file. That note goes to the "Set up testing" task (manual step 3).
 - `AGENTS.md` and the allowlist list `make test`.
 
 ### Step 4: Fixes #1-#6, each with a regression test
@@ -324,7 +340,8 @@ into dependency-linked tasks. A step may become several tickets.
 2. **#2 Panic abort.**
    - Remove `panic = "abort"` from `[profile.release]`.
    - Factor the guarded decode into one function.
-   - *Test:* a panicking decoder yields `Err`, not a crash.
+   - *Test:* the Rust config test `apps/desktop/src-tauri/tests/security_config.rs` asserts that `[profile.release]` doesn't set `panic = "abort"`. Whichever of #2 and #5 lands first creates the file. The test fails on `main`, where `Cargo.toml:40` sets it.
+   - *Guard, not the regression test:* a unit test that a panicking decoder yields `Err` from the factored function. It passes on `main` too, because the test profile unwinds whatever `[profile.release]` says.
 3. **#3 FTS input.**
    - Build the `MATCH` expression from the user's text: split on whitespace, wrap each term as an FTS5 string with embedded `"` doubled, and add a prefix `*` to each term.
    - Search failures show in the UI instead of leaving stale results.
@@ -337,14 +354,16 @@ into dependency-linked tasks. A step may become several tickets.
    - **Capabilities:** only `core:default`, `dialog:default`, and opener's minimal permissions.
    - **CSP:** a real CSP that allows `'self'`, `asset:`/`http://asset.localhost`, `ipc:`/`http://ipc.localhost`, and `blob:`/`data:` only where three.js and video previews need them.
    - **Devtools:** the `devtools` feature is dropped (D20).
-   - *Test:* a Rust integration test (for example `apps/desktop/src-tauri/tests/security_config.rs`) parses the shipped `tauri.conf.json`, `capabilities/*.json` and `Cargo.toml`. It asserts:
+   - *Test:* the Rust config test `apps/desktop/src-tauri/tests/security_config.rs` (shared with #2) parses the shipped `tauri.conf.json`, `capabilities/*.json` and `Cargo.toml`. It asserts:
      - `app.security.csp` is a non-null policy with a `default-src`.
      - The asset protocol's static scope has no `**`, `**/*`, `$HOME/**` or `$DESKTOP/**` entry.
      - No capability grants a `**` path or any `fs:`/`shell:` permission.
      - The `tauri` dependency's features don't include `devtools`.
 
      It fails on `main` before this fix, because the scope is `**`, `csp` is `null` and `devtools` is enabled.
-   - *Check (manual, in addition to the test):* thumbnails, the 3D viewer, video previews, and Quick Look work in `make dev` and in the release build with no CSP violations in the console.
+   - *Check (manual, in addition to the test):* exercise thumbnails, the 3D viewer, video previews, and Quick Look.
+     - In `make dev`, the devtools console shows no CSP violations.
+     - In the release build, which has no devtools (D20) and serves the embedded `frontendDist` instead of `devUrl`, check by eye that all four render.
 6. **#6 Tag/collection model (D17).**
    - **Reads:** `list_tags` and the collection reads come from the master DB.
    - **Definitions:** create, update, and delete write to master and mirror to every open library (as today).
@@ -352,7 +371,10 @@ into dependency-linked tasks. A step may become several tickets.
    - **Removals:** `get_active_pool` and the `libs.values().next()` fallback are removed. Every caller passes an explicit library or iterates all of them.
    - **Library open:** opening a library upserts its mirrored definitions into master, so a library folder brought from another machine brings its tags.
    - **Cleanup:** an idempotent pass removes orphan membership rows whose asset isn't in that library.
-   - *Test:* two libraries. Tagging an asset in B writes only to B, and `list_tags` is deterministic.
+   - *Test:* two libraries, A and B, both open.
+     - **Fixture:** the fixture opens each library pool with `foreign_keys` off in its connect options. On `main`, `connect_library_sqlite` (`db.rs:43-51`) turns foreign keys off with a `PRAGMA` that reaches only the one pooled connection running it, while sqlx-sqlite 0.8.6 turns them on for every new connection. So a stray `asset_tags` insert for an asset the library doesn't hold can be silently rejected, depending on which connection runs it. Pinning the setting off makes the stray row land every time on `main`.
+     - **Memberships:** tag one asset in A and another in B. Each `asset_tags` row exists only in its own library's DB. This fails on `main` whatever order the HashMap is in: the "active" library is always one of the two, so it receives the other library's row.
+     - **Reads:** with both libraries open, give a tag a different name in master than in both mirrors. `list_tags` returns master's name. On `main` it returns a mirror's name.
    - After this lands, `AGENTS.md` records the rule.
 
 **Done when** each fix's regression test fails on `main` before the fix and passes after it, and `make lint check test build` is green.
@@ -403,8 +425,10 @@ into dependency-linked tasks. A step may become several tickets.
 - **Kept but unmaintained.** The AEC format code stays but isn't maintained or advertised. `docs/adr`/`docs/specs` stay as they are, and ADR-001 still describes a cross-platform target.
 - **File size.** `DetailPanel.tsx` (711 lines) and `SmartFilterModal.tsx` (673 lines) aren't split.
 - **Deleted tags can come back.** A tag deleted while a library is offline survives in that library's mirror and comes back into master the next time the library opens. This is accepted for now, with no tombstones.
+- **Per-connection foreign keys.** Library DBs enforce foreign keys on some pooled connections and not others: `connect_library_sqlite` turns them off with a `PRAGMA` on one connection, while sqlx turns them on for every new connection. I found this while validating fix #6's test. It isn't one of the seven findings you scoped (D8), so it should become a GitHub issue rather than part of this plan.
 - **Fork network.** The repo stays in GitHub's fork network. `gh` already defaults to `ramiro314/OpenDAM`.
 - **Unverified.**
   - Whether `tauri-plugin-opener` selects the file on KDE; the fallback is defined.
   - Whether mise can install cargo-nextest; the fallback is defined.
+  - Whether cargo-nextest's JUnit names each test's source file. bun's does (verified). Step 3 probes nextest first, and its fallback records how a Rust test maps to its file for the "Set up testing" task.
   - The exact CSP sources three.js needs; step 4 finds them.
