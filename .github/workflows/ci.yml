@@ -35,9 +35,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # tauri build refuses mismatched Rust/JS Tauri versions, and nothing else
+      # in CI runs it. Only reads the lockfiles, so it fails fast.
+      - name: Check Tauri crate and npm package versions match
+        run: node .github/scripts/check-tauri-versions.mjs
+      # pnpm version comes from "packageManager" in the root package.json
       - uses: pnpm/action-setup@v4
-        with:
-          version: 12
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -63,8 +66,9 @@ jobs:
           workspaces: 'apps/desktop/src-tauri -> target'
       # cargo clippy already performs full typechecking + borrow checking;
       # running cargo check right before it is redundant compilation work.
+      # --locked fails if Cargo.lock is out of date with Cargo.toml.
       - name: Cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
         working-directory: apps/desktop/src-tauri
 
   # ── Python preview engine ────────────────────────────────────────────────

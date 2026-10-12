@@ -16,7 +16,8 @@ gen/
 
 # ── Rust & Cargo ───────────────────────────────────────────────────────────
 *.rs.bk
-Cargo.lock
+# Cargo.lock is committed: this is an application, and it pins the Tauri crates
+# to the same versions as the @tauri-apps npm packages.
 
 # ── Python & Preview Worker ────────────────────────────────────────────────
 __pycache__/
