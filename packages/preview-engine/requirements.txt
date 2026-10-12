@@ -1,5 +1,10 @@
 Pillow>=10.4.0
-olefile>=0.46          # Phase 2: .max thumbnail extraction
-pyassimp>=4.1.6        # Phase 2: 3D model loading
-OpenImageIO>=2.5.0     # Phase 2: EXR, HDR, PSD
-trimesh>=4.4.0         # Phase 2: geometry analysis
+numpy>=1.26
+olefile>=0.46          # .max embedded thumbnail extraction
+trimesh>=4.4.0         # OBJ/STL/PLY/glTF loading and GLB export
+pycollada>=0.8         # trimesh .dae loader
+assimp-py>=1.0.7       # FBX/3DS import (imported as assimp_py)
+rhino3dm>=8.0.0        # .3dm
+pypdfium2>=4.30.0      # .ai (PDF-compatible) previews
+imageio>=2.34          # HDR reader
+openexr-numpy>=0.0.6   # EXR reader
