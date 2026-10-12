@@ -78,13 +78,6 @@ check_db.py
 queue_previews.py
 
 # ── OS Generated Files ─────────────────────────────────────────────────────
-Thumbs.db
-Thumbs.db:encryptable
-ehthumbs.db
-ehthumbs_vista.db
-*.stackdump
-Desktop.ini
-[Dd]esktop.ini
 .DS_Store
 .Spotlight-V100
 .Trashes
