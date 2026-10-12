@@ -29,7 +29,8 @@
   background: linear-gradient(180deg, hsl(220 18% 10%) 0%, hsl(220 18% 8%) 100%);
 }
 
-.left, .right {
+.left,
+.right {
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -259,7 +260,11 @@
 }
 
 /* Color buttons */
-.colorRow { display: flex; gap: 4px; align-items: center; }
+.colorRow {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
 
 .colorBtn {
   width: 14px;
@@ -267,9 +272,13 @@
   border-radius: 50%;
   border: 2px solid transparent;
   cursor: pointer;
-  transition: transform var(--transition-fast), border-color var(--transition-fast);
+  transition:
+    transform var(--transition-fast),
+    border-color var(--transition-fast);
 }
-.colorBtn:hover { transform: scale(1.25); }
+.colorBtn:hover {
+  transform: scale(1.25);
+}
 .colorActive {
   border-color: #fff;
   transform: scale(1.15);
@@ -287,7 +296,10 @@
   font-size: 11.5px;
   cursor: pointer;
 }
-.select:focus { outline: none; border-color: var(--color-border-focus); }
+.select:focus {
+  outline: none;
+  border-color: var(--color-border-focus);
+}
 
 /* Sort order */
 .sortOrderBtn {
@@ -302,9 +314,14 @@
   color: var(--color-text-secondary);
   font-size: 13px;
   cursor: pointer;
-  transition: color var(--transition-fast), background var(--transition-fast);
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast);
 }
-.sortOrderBtn:hover { color: var(--color-text-primary); background: var(--color-bg-overlay); }
+.sortOrderBtn:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-overlay);
+}
 
 /* Clear btn */
 .clearBtn {
@@ -321,7 +338,9 @@
   cursor: pointer;
   transition: background var(--transition-fast);
 }
-.clearBtn:hover { background: hsl(4 84% 55% / 0.22); }
+.clearBtn:hover {
+  background: hsl(4 84% 55% / 0.22);
+}
 
 /* Secondary active tag */
 .activeBadge {

@@ -3,20 +3,42 @@ import clsx from 'clsx';
 import { useUIStore, useAssetStore, useTagStore, useCollectionStore } from '../../store';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import type { Asset, ColorLabel, Collection } from '../../types';
-import { IconStar, IconX, IconExternal, IconEye, IconInfo, IconCopy, IconCheck, IconRefresh, IconEdit, IconTrash, IconHeart, IconHeartFilled } from '../Icons';
+import {
+  IconStar,
+  IconX,
+  IconExternal,
+  IconEye,
+  IconInfo,
+  IconCopy,
+  IconCheck,
+  IconRefresh,
+  IconEdit,
+  IconTrash,
+  IconHeart,
+  IconHeartFilled,
+} from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { api } from '../../api';
 import { ThreeViewer } from './ThreeViewer';
 import styles from './DetailPanel.module.css';
 
 const COLOR_LABELS: ColorLabel[] = [
-  'red', 'orange', 'yellow', 'green', 'teal', 'blue', 'purple', 'pink',
+  'red',
+  'orange',
+  'yellow',
+  'green',
+  'teal',
+  'blue',
+  'purple',
+  'pink',
 ];
 
 export function DetailPanel() {
   const focusedAssetId = useUIStore((s) => s.focusedAssetId);
   const asset = useAssetStore((s) =>
-    focusedAssetId ? s.assets.find((a) => a.id === focusedAssetId) ?? s.assetMap.get(focusedAssetId) ?? null : null
+    focusedAssetId
+      ? (s.assets.find((a) => a.id === focusedAssetId) ?? s.assetMap.get(focusedAssetId) ?? null)
+      : null
   );
   const patchAsset = useAssetStore((s) => s.patchAsset);
   const deleteAsset = useAssetStore((s) => s.deleteAsset);
@@ -38,7 +60,7 @@ export function DetailPanel() {
     if (asset) {
       setEditingName(asset.fileName);
     }
-  }, [asset?.id]);
+  }, [asset?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const setRating = useCallback(
     (rating: number) => asset && patchAsset(asset.id, { rating }),
@@ -46,7 +68,8 @@ export function DetailPanel() {
   );
 
   const setColorLabel = useCallback(
-    (label: ColorLabel) => asset && patchAsset(asset.id, { colorLabel: label === asset.colorLabel ? 'none' : label }),
+    (label: ColorLabel) =>
+      asset && patchAsset(asset.id, { colorLabel: label === asset.colorLabel ? 'none' : label }),
     [asset, patchAsset]
   );
 
@@ -130,13 +153,27 @@ export function DetailPanel() {
     <aside className={styles.panel} id="detail-panel">
       {/* Preview thumbnail */}
       <div className={styles.thumbArea}>
-        {['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'svg'].includes(asset.extension.toLowerCase()) ? (
-          <img src={convertFileSrc(asset.filePath)} alt={asset.fileName} className={styles.thumbImg} />
+        {['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'svg'].includes(
+          asset.extension.toLowerCase()
+        ) ? (
+          <img
+            src={convertFileSrc(asset.filePath)}
+            alt={asset.fileName}
+            className={styles.thumbImg}
+          />
         ) : asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb') ? (
-          <img src={convertFileSrc(asset.thumbnailPath)} alt={asset.fileName} className={styles.thumbImg} />
-        ) : (['image', 'texture'].includes(asset.kind) && asset.filePath) ? (
-          <img src={convertFileSrc(asset.filePath)} alt={asset.fileName} className={styles.thumbImg} />
-        ) : (asset.kind === 'video' && asset.filePath) ? (
+          <img
+            src={convertFileSrc(asset.thumbnailPath)}
+            alt={asset.fileName}
+            className={styles.thumbImg}
+          />
+        ) : ['image', 'texture'].includes(asset.kind) && asset.filePath ? (
+          <img
+            src={convertFileSrc(asset.filePath)}
+            alt={asset.fileName}
+            className={styles.thumbImg}
+          />
+        ) : asset.kind === 'video' && asset.filePath ? (
           <video
             src={convertFileSrc(asset.filePath)}
             preload="metadata"
@@ -146,11 +183,15 @@ export function DetailPanel() {
             className={styles.thumbImg}
             style={{ objectFit: 'contain' }}
             onLoadedMetadata={(e) => {
-              try { e.currentTarget.currentTime = 0.1; } catch {}
+              try {
+                e.currentTarget.currentTime = 0.1;
+              } catch {}
             }}
           />
-        ) : (asset.metadata?.preview_model || asset.thumbnailPath?.endsWith('.glb')) ? (
-          <ThreeViewer modelPath={(asset.metadata?.preview_model as string) || asset.thumbnailPath!} />
+        ) : asset.metadata?.preview_model || asset.thumbnailPath?.endsWith('.glb') ? (
+          <ThreeViewer
+            modelPath={(asset.metadata?.preview_model as string) || asset.thumbnailPath!}
+          />
         ) : (
           <div className={styles.thumbPlaceholder}>
             <span className={styles.thumbExt}>.{asset.extension}</span>
@@ -158,7 +199,7 @@ export function DetailPanel() {
               className={styles.thumbGenerateBtn}
               onClick={handleGeneratePreview}
               disabled={isPending}
-              title={isError ? "Preview failed. Click to retry" : "Generate preview"}
+              title={isError ? 'Preview failed. Click to retry' : 'Generate preview'}
             >
               <IconRefresh size={12} className={clsx(isPending && 'animate-spin')} />
               <span>{isPending ? 'Generating…' : isError ? 'Retry' : 'Generate'}</span>
@@ -247,7 +288,7 @@ export function DetailPanel() {
           <button
             id="detail-gen-preview-header"
             className={clsx(styles.actionBtn, isPending && styles.actionBtnLoading)}
-            title={isPending ? "Generating preview…" : "Generate/Regenerate preview"}
+            title={isPending ? 'Generating preview…' : 'Generate/Regenerate preview'}
             onClick={handleGeneratePreview}
             disabled={isPending}
           >
@@ -301,7 +342,14 @@ export function DetailPanel() {
       </div>
 
       {nameError && (
-        <div style={{ color: '#ef4444', fontSize: '11px', padding: '2px 16px', background: 'rgba(239, 68, 68, 0.1)' }}>
+        <div
+          style={{
+            color: '#ef4444',
+            fontSize: '11px',
+            padding: '2px 16px',
+            background: 'rgba(239, 68, 68, 0.1)',
+          }}
+        >
           {nameError}
         </div>
       )}
@@ -329,9 +377,7 @@ export function DetailPanel() {
             onFavoriteChange={toggleFavorite}
           />
         )}
-        {tab === 'tags' && (
-          <TagsTab asset={asset} tags={tags} onToggle={toggleTag} />
-        )}
+        {tab === 'tags' && <TagsTab asset={asset} tags={tags} onToggle={toggleTag} />}
         {tab === 'collections' && (
           <CollectionsTab
             asset={asset}
@@ -364,7 +410,10 @@ export function DetailPanel() {
 
 // ── Info Tab ──────────────────────────────────────────────────────────────
 function InfoTab({
-  asset, onRatingChange, onColorLabelChange, onFavoriteChange,
+  asset,
+  onRatingChange,
+  onColorLabelChange,
+  onFavoriteChange,
 }: {
   asset: Asset;
   onRatingChange: (r: number) => void;
@@ -406,10 +455,7 @@ function InfoTab({
             <button
               key={n}
               id={`detail-star-${n}`}
-              className={clsx(
-                styles.starBtn,
-                (hoverRating || asset.rating) >= n && styles.starOn
-              )}
+              className={clsx(styles.starBtn, (hoverRating || asset.rating) >= n && styles.starOn)}
               onMouseEnter={() => setHoverRating(n)}
               onMouseLeave={() => setHoverRating(0)}
               onClick={() => onRatingChange(asset.rating === n ? 0 : n)}
@@ -424,7 +470,10 @@ function InfoTab({
       <label className={styles.infoLabel}>Label</label>
       <div className={styles.colorRow}>
         <button
-          className={clsx(styles.colorNoneBtn, asset.colorLabel === 'none' && styles.colorNoneActive)}
+          className={clsx(
+            styles.colorNoneBtn,
+            asset.colorLabel === 'none' && styles.colorNoneActive
+          )}
           onClick={() => onColorLabelChange('none')}
           title="No label"
         >
@@ -471,14 +520,10 @@ function InfoTab({
       </span>
 
       <label className={styles.infoLabel}>Modified</label>
-      <span className={styles.infoValue}>
-        {new Date(asset.modifiedAt).toLocaleDateString()}
-      </span>
+      <span className={styles.infoValue}>{new Date(asset.modifiedAt).toLocaleDateString()}</span>
 
       <label className={styles.infoLabel}>Added</label>
-      <span className={styles.infoValue}>
-        {new Date(asset.indexedAt).toLocaleDateString()}
-      </span>
+      <span className={styles.infoValue}>{new Date(asset.indexedAt).toLocaleDateString()}</span>
 
       {/* Extracted metadata */}
       {Object.entries(asset.metadata).length > 0 && (
@@ -488,7 +533,9 @@ function InfoTab({
           <div />
           {Object.entries(asset.metadata).map(([k, v]) => (
             <>
-              <label key={`k-${k}`} className={clsx(styles.infoLabel, styles.metaKey)}>{k}</label>
+              <label key={`k-${k}`} className={clsx(styles.infoLabel, styles.metaKey)}>
+                {k}
+              </label>
               <span key={`v-${k}`} className={clsx(styles.infoValue, styles.mono)}>
                 {String(v)}
               </span>
@@ -502,7 +549,9 @@ function InfoTab({
 
 // ── Tags Tab ──────────────────────────────────────────────────────────────
 function TagsTab({
-  asset, tags, onToggle,
+  asset,
+  tags,
+  onToggle,
 }: {
   asset: Asset;
   tags: import('../../types').Tag[];
@@ -531,7 +580,11 @@ function TagsTab({
               >
                 <span
                   className={styles.tagDot}
-                  style={{ background: tag.color ? `var(--swatch-${tag.color})` : 'var(--color-text-muted)' }}
+                  style={{
+                    background: tag.color
+                      ? `var(--swatch-${tag.color})`
+                      : 'var(--color-text-muted)',
+                  }}
                 />
                 <span className={styles.tagPillName}>{tag.name}</span>
                 <IconCheck size={11} className={styles.tagCheckIcon} />
@@ -555,7 +608,11 @@ function TagsTab({
               >
                 <span
                   className={styles.tagDot}
-                  style={{ background: tag.color ? `var(--swatch-${tag.color})` : 'var(--color-text-muted)' }}
+                  style={{
+                    background: tag.color
+                      ? `var(--swatch-${tag.color})`
+                      : 'var(--color-text-muted)',
+                  }}
                 />
                 <span className={styles.tagPillName}>{tag.name}</span>
               </button>
@@ -569,7 +626,10 @@ function TagsTab({
 
 // ── Collections Tab ───────────────────────────────────────────────────────
 function CollectionsTab({
-  asset, collections, onAdd, onRemove,
+  asset,
+  collections,
+  onAdd,
+  onRemove,
 }: {
   asset: Asset;
   collections: Collection[];
@@ -599,14 +659,16 @@ function CollectionsTab({
         <p className={styles.noTags}>No collections yet. Create collections in the sidebar.</p>
       )}
       {regularCollections.map((col: Collection) => {
-        const isMember = (col.assetIds && col.assetIds.includes(asset.id)) || (asset.collections?.includes(col.id) ?? false);
+        const isMember =
+          (col.assetIds && col.assetIds.includes(asset.id)) ||
+          (asset.collections?.includes(col.id) ?? false);
         const pathName = getCollectionPath(col);
         return (
           <button
             key={col.id}
             id={`detail-col-${col.id}`}
             className={clsx(styles.tagPill, isMember && styles.tagActive)}
-            onClick={() => isMember ? onRemove(col.id) : onAdd(col.id)}
+            onClick={() => (isMember ? onRemove(col.id) : onAdd(col.id))}
             title={pathName}
           >
             <span className={styles.tagDot} style={{ background: 'var(--color-accent)' }} />
@@ -620,15 +682,16 @@ function CollectionsTab({
 }
 
 // ── Preview Tab ───────────────────────────────────────────────────────────
-function PreviewTab({
-  asset,
-  onGeneratePreview,
-}: {
-  asset: Asset;
-  onGeneratePreview: () => void;
-}) {
-  const modelPath = (asset.metadata?.preview_model as string) || (asset.thumbnailPath?.endsWith('.glb') ? asset.thumbnailPath : undefined);
-  const imagePath = asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb') ? asset.thumbnailPath : (['image', 'texture'].includes(asset.kind) ? asset.filePath : undefined);
+function PreviewTab({ asset, onGeneratePreview }: { asset: Asset; onGeneratePreview: () => void }) {
+  const modelPath =
+    (asset.metadata?.preview_model as string) ||
+    (asset.thumbnailPath?.endsWith('.glb') ? asset.thumbnailPath : undefined);
+  const imagePath =
+    asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb')
+      ? asset.thumbnailPath
+      : ['image', 'texture'].includes(asset.kind)
+        ? asset.filePath
+        : undefined;
   const isPending = asset.previewStatus === 'pending' || asset.previewStatus === 'generating';
   const isError = asset.previewStatus === 'error';
 
@@ -647,7 +710,7 @@ function PreviewTab({
             <span>{isPending ? 'Generating…' : 'Regenerate Preview'}</span>
           </button>
         </div>
-      ) : (asset.kind === 'video' && asset.filePath) ? (
+      ) : asset.kind === 'video' && asset.filePath ? (
         <div className={styles.previewViewerWrapper}>
           <video
             src={convertFileSrc(asset.filePath)}
@@ -687,8 +750,8 @@ function PreviewTab({
             {isPending
               ? 'Generating preview…'
               : isError
-              ? 'Preview generation failed previously'
-              : 'No preview available'}
+                ? 'Preview generation failed previously'
+                : 'No preview available'}
           </p>
           <p className={styles.emptyStatusSub}>
             {isPending
@@ -702,7 +765,9 @@ function PreviewTab({
             disabled={isPending}
           >
             <IconRefresh size={14} className={clsx(isPending && 'animate-spin')} />
-            <span>{isPending ? 'Generating…' : isError ? 'Retry Generate Preview' : 'Generate Preview'}</span>
+            <span>
+              {isPending ? 'Generating…' : isError ? 'Retry Generate Preview' : 'Generate Preview'}
+            </span>
           </button>
         </div>
       )}

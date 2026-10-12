@@ -3,15 +3,28 @@ import { useUIStore, useAssetStore, useLibraryStore } from '../../store';
 import { api } from '../../api';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
-  IconGrid, IconList, IconSearch, IconSidebar,
-  IconPanel, IconRefresh, IconPlus,
+  IconGrid,
+  IconList,
+  IconSearch,
+  IconSidebar,
+  IconPanel,
+  IconRefresh,
+  IconPlus,
 } from '../Icons';
 import styles from './Toolbar.module.css';
 import clsx from 'clsx';
 
 export function Toolbar() {
-  const { viewMode, gridSize, sidebarOpen, detailPanelOpen,
-          setViewMode, setGridSize, toggleSidebar, toggleDetailPanel } = useUIStore();
+  const {
+    viewMode,
+    gridSize,
+    sidebarOpen,
+    detailPanelOpen,
+    setViewMode,
+    setGridSize,
+    toggleSidebar,
+    toggleDetailPanel,
+  } = useUIStore();
   const { query, setQuery, search, loading } = useAssetStore();
   const { addLibrary } = useLibraryStore();
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -33,7 +46,7 @@ export function Toolbar() {
       const selectedPath = await open({
         directory: true,
         multiple: false,
-        title: 'Select Library Folder'
+        title: 'Select Library Folder',
       });
       if (selectedPath && typeof selectedPath === 'string') {
         const name = selectedPath.split(/[/\\]/).pop() || 'New Library';
@@ -58,8 +71,13 @@ export function Toolbar() {
       <div className={styles.brand}>
         <div className={styles.logo}>
           <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M12 2L4 6v12l8 4 8-4V6L12 2Z" fill="hsl(220 85% 50%)" opacity="0.9"/>
-            <path d="M12 2v18M4 6l8 4 8-4" stroke="hsl(220 85% 70%)" strokeWidth="1.5" strokeLinecap="round"/>
+            <path d="M12 2L4 6v12l8 4 8-4V6L12 2Z" fill="hsl(220 85% 50%)" opacity="0.9" />
+            <path
+              d="M12 2v18M4 6l8 4 8-4"
+              stroke="hsl(220 85% 70%)"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+            />
           </svg>
         </div>
         <span className={styles.appName}>OpenDAM</span>
@@ -90,7 +108,14 @@ export function Toolbar() {
           />
           <span className={styles.subcollectionsCheckboxCustom}>
             {query.includeSubcollections !== false && (
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={3} strokeLinecap="round" strokeLinejoin="round">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={3}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
                 <polyline points="20 6 9 17 4 12" />
               </svg>
             )}
@@ -127,7 +152,12 @@ export function Toolbar() {
                 onClick={() => setGridSize(size)}
                 title={`Grid size: ${size}`}
               >
-                <span className={styles.gridSizeDot} style={{ fontSize: size === 'sm' ? 8 : size === 'md' ? 10 : 12 }}>⬛</span>
+                <span
+                  className={styles.gridSizeDot}
+                  style={{ fontSize: size === 'sm' ? 8 : size === 'md' ? 10 : 12 }}
+                >
+                  ⬛
+                </span>
               </button>
             ))}
           </div>

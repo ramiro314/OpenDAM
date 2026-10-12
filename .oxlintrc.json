@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "react", "oxc", "unicorn"],
+  // Correctness only: the formatter owns style, so a lint failure should mean a defect.
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    // React Compiler rules. The app doesn't use the compiler, and the code they
+    // flag (resetting edit state on selection change, Date.now() in date filters) is intended.
+    "react/purity": "off",
+    "react/set-state-in-effect": "off"
+  }
+}

@@ -24,7 +24,9 @@ function isEditingText(): boolean {
 export default function App() {
   const { sidebarOpen, detailPanelOpen, focusedAssetId } = useUIStore();
   const focusedAsset = useAssetStore((s) =>
-    focusedAssetId ? s.assets.find((a) => a.id === focusedAssetId) ?? s.assetMap.get(focusedAssetId) ?? null : null
+    focusedAssetId
+      ? (s.assets.find((a) => a.id === focusedAssetId) ?? s.assetMap.get(focusedAssetId) ?? null)
+      : null
   );
   const fetchLibraries = useLibraryStore((s) => s.fetchLibraries);
   const fetchTags = useTagStore((s) => s.fetchTags);
@@ -39,28 +41,25 @@ export default function App() {
 
   useEffect(() => {
     // Bootstrap data on mount
-    Promise.all([fetchLibraries(), fetchTags(), fetchCollections()]).then(
-      () => search()
-    );
+    Promise.all([fetchLibraries(), fetchTags(), fetchCollections()]).then(() => search());
 
     // Real-time preview updates from background engine
     const unlistenDone = listen<{ assetId: string; thumbnailPath?: string; previewModel?: string }>(
       'preview:done',
       (event) => {
-        useAssetStore.getState().updateAssetPreview(
-          event.payload.assetId,
-          event.payload.thumbnailPath,
-          event.payload.previewModel
-        );
+        useAssetStore
+          .getState()
+          .updateAssetPreview(
+            event.payload.assetId,
+            event.payload.thumbnailPath,
+            event.payload.previewModel
+          );
       }
     );
 
-    const unlistenError = listen<{ assetId: string }>(
-      'preview:error',
-      (event) => {
-        useAssetStore.getState().setPreviewStatus(event.payload.assetId, 'error');
-      }
-    );
+    const unlistenError = listen<{ assetId: string }>('preview:error', (event) => {
+      useAssetStore.getState().setPreviewStatus(event.payload.assetId, 'error');
+    });
 
     // Render grid thumbnails for 3D models the preview engine converted to .glb
     const stopModelThumbnailer = startModelThumbnailer();
@@ -75,10 +74,13 @@ export default function App() {
       // Refresh
       if (e.key === 'F5' || (e.ctrlKey && e.key.toLowerCase() === 'r')) {
         e.preventDefault();
-        api.refreshAllLibraries().then(() => {
-          useAssetStore.getState().search();
-          useLibraryStore.getState().fetchLibraries();
-        }).catch(console.error);
+        api
+          .refreshAllLibraries()
+          .then(() => {
+            useAssetStore.getState().search();
+            useLibraryStore.getState().fetchLibraries();
+          })
+          .catch(console.error);
         return;
       }
 
@@ -106,7 +108,13 @@ export default function App() {
       }
 
       // Toggle favorite on focused/selected asset(s) with 'f' or 'F'
-      if ((e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey && !e.altKey && !isEditingText()) {
+      if (
+        (e.key === 'f' || e.key === 'F') &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !isEditingText()
+      ) {
         const selectedIds = useUIStore.getState().selectedAssetIds;
         const focusedId = useUIStore.getState().focusedAssetId;
         const ids = selectedIds.size > 0 ? Array.from(selectedIds) : focusedId ? [focusedId] : [];
@@ -120,8 +128,12 @@ export default function App() {
           }
           setCopyToast(
             ids.length === 1
-              ? newFav ? 'Added to favorites' : 'Removed from favorites'
-              : newFav ? `Added ${ids.length} assets to favorites` : `Removed ${ids.length} assets from favorites`
+              ? newFav
+                ? 'Added to favorites'
+                : 'Removed from favorites'
+              : newFav
+                ? `Added ${ids.length} assets to favorites`
+                : `Removed ${ids.length} assets from favorites`
           );
           if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
           toastTimeoutRef.current = window.setTimeout(() => setCopyToast(null), 2200);
@@ -201,7 +213,9 @@ export default function App() {
     setDeleteDialogOpen(false);
     try {
       await useAssetStore.getState().deleteAssets(assetsToDelete, true);
-      setCopyToast(count === 1 ? 'Moved file to Recycle Bin' : `Moved ${count} files to Recycle Bin`);
+      setCopyToast(
+        count === 1 ? 'Moved file to Recycle Bin' : `Moved ${count} files to Recycle Bin`
+      );
       if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
       toastTimeoutRef.current = window.setTimeout(() => setCopyToast(null), 2200);
     } catch (err) {

@@ -25,7 +25,9 @@ function formatDate(ms: number): string {
 }
 
 export const AssetListRow = memo(function AssetListRow({
-  asset, selected, onClick,
+  asset,
+  selected,
+  onClick,
 }: AssetListRowProps) {
   const patchAsset = useAssetStore((s) => s.patchAsset);
 
@@ -82,9 +84,19 @@ export const AssetListRow = memo(function AssetListRow({
       {/* Thumbnail */}
       <div className={styles.thumb}>
         {asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb') ? (
-          <img src={convertFileSrc(asset.thumbnailPath)} alt={asset.fileName} className={styles.thumbImg} loading="lazy" />
-        ) : (['image', 'texture'].includes(asset.kind) && asset.filePath) ? (
-          <img src={convertFileSrc(asset.filePath)} alt={asset.fileName} className={styles.thumbImg} loading="lazy" />
+          <img
+            src={convertFileSrc(asset.thumbnailPath)}
+            alt={asset.fileName}
+            className={styles.thumbImg}
+            loading="lazy"
+          />
+        ) : ['image', 'texture'].includes(asset.kind) && asset.filePath ? (
+          <img
+            src={convertFileSrc(asset.filePath)}
+            alt={asset.fileName}
+            className={styles.thumbImg}
+            loading="lazy"
+          />
         ) : (
           <div className={styles.thumbPlaceholder}>
             {asset.kind === 'video' ? <IconVideo size={14} /> : <IconImage size={14} />}
@@ -112,7 +124,11 @@ export const AssetListRow = memo(function AssetListRow({
       {/* Rating */}
       <div className={styles.stars}>
         {Array.from({ length: 5 }).map((_, i) => (
-          <IconStar key={i} size={10} className={clsx(styles.star, i < asset.rating && styles.starFilled)} />
+          <IconStar
+            key={i}
+            size={10}
+            className={clsx(styles.star, i < asset.rating && styles.starFilled)}
+          />
         ))}
       </div>
 

@@ -1,13 +1,13 @@
-use std::sync::Arc;
-use serde::Serialize;
-use tauri::State;
-use tauri::ipc::InvokeBody;
-use uuid::Uuid;
 use chrono::Utc;
+use serde::Serialize;
+use std::sync::Arc;
+use tauri::ipc::InvokeBody;
+use tauri::State;
+use uuid::Uuid;
 
-use crate::AppState;
-use crate::models::PreviewJob;
 use crate::db::resolve_path;
+use crate::models::PreviewJob;
+use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -54,7 +54,9 @@ pub async fn request_preview(
 
         // Mark asset as generating / pending
         let _ = sqlx::query("UPDATE assets SET preview_status = 'pending' WHERE id = ?")
-            .bind(asset_id).execute(&pool).await;
+            .bind(asset_id)
+            .execute(&pool)
+            .await;
     }
     Ok(())
 }
@@ -98,17 +100,20 @@ pub async fn list_pending_model_thumbnails(
     let mut pending = Vec::new();
     for lib in state.db.get_all_libraries().await {
         let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, thumbnail_path FROM assets WHERE thumbnail_path LIKE '%.glb' LIMIT ?"
+            "SELECT id, thumbnail_path FROM assets WHERE thumbnail_path LIKE '%.glb' LIMIT ?",
         )
         .bind(limit - pending.len() as i64)
         .fetch_all(&lib.pool)
         .await
         .map_err(|e| e.to_string())?;
 
-        pending.extend(rows.into_iter().map(|(asset_id, thumb)| PendingModelThumbnail {
-            asset_id,
-            model_path: resolve_path(&lib.root_path, &thumb),
-        }));
+        pending.extend(
+            rows.into_iter()
+                .map(|(asset_id, thumb)| PendingModelThumbnail {
+                    asset_id,
+                    model_path: resolve_path(&lib.root_path, &thumb),
+                }),
+        );
         if pending.len() as i64 >= limit {
             break;
         }
@@ -147,7 +152,9 @@ pub async fn save_model_thumbnail(
         // The id was just matched against the DB, so it's safe to use as a file name.
         let rel_thumb = format!(".opendam/thumbs/{}_thumb.png", asset_id);
         let abs_thumb = resolve_path(&lib.root_path, &rel_thumb);
-        tokio::fs::write(&abs_thumb, png).await.map_err(|e| e.to_string())?;
+        tokio::fs::write(&abs_thumb, png)
+            .await
+            .map_err(|e| e.to_string())?;
         sqlx::query("UPDATE assets SET thumbnail_path = ? WHERE id = ?")
             .bind(&rel_thumb)
             .bind(asset_id)
@@ -174,15 +181,16 @@ pub async fn get_preview_progress(state: State<'_, Arc<AppState>>) -> Result<Pre
     let mut progress = PreviewProgress::default();
     for lib in state.db.get_all_libraries().await {
         let (total, finished): (i64, i64) = sqlx::query_as(
-            "SELECT count(*), coalesce(sum(status IN ('done', 'error')), 0) FROM preview_jobs"
+            "SELECT count(*), coalesce(sum(status IN ('done', 'error')), 0) FROM preview_jobs",
         )
         .fetch_one(&lib.pool)
         .await
         .map_err(|e| e.to_string())?;
-        let (awaiting,): (i64,) = sqlx::query_as("SELECT count(*) FROM assets WHERE thumbnail_path LIKE '%.glb'")
-            .fetch_one(&lib.pool)
-            .await
-            .map_err(|e| e.to_string())?;
+        let (awaiting,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM assets WHERE thumbnail_path LIKE '%.glb'")
+                .fetch_one(&lib.pool)
+                .await
+                .map_err(|e| e.to_string())?;
         progress.total += total;
         progress.finished += finished;
         progress.models_awaiting_render += awaiting;

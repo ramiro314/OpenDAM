@@ -2,16 +2,32 @@ import { useState } from 'react';
 import clsx from 'clsx';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
-  useLibraryStore, useCollectionStore, useTagStore,
-  useUIStore, useAssetStore,
+  useLibraryStore,
+  useCollectionStore,
+  useTagStore,
+  useUIStore,
+  useAssetStore,
 } from '../../store';
 import type { FilterSpec, ColorLabel } from '../../types';
 import {
-  IconFolder, IconCollection, IconTag,
-  IconChevronDown, IconChevronRight, IconPlus,
-  IconCheck, IconX, IconTrash, IconInbox, IconFilter,
-  IconHeartFilled, IconStar, IconLayers, IconModel3D,
-  IconImage, IconVideo, IconEye,
+  IconFolder,
+  IconCollection,
+  IconTag,
+  IconChevronDown,
+  IconChevronRight,
+  IconPlus,
+  IconCheck,
+  IconX,
+  IconTrash,
+  IconInbox,
+  IconFilter,
+  IconHeartFilled,
+  IconStar,
+  IconLayers,
+  IconModel3D,
+  IconImage,
+  IconVideo,
+  IconEye,
 } from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { SmartFilterModal } from '../SmartFilterModal';
@@ -114,8 +130,7 @@ export function Sidebar() {
     type: 'tag' | 'collection' | 'library';
   } | null>(null);
 
-  const toggle = (key: keyof typeof expanded) =>
-    setExpanded((e) => ({ ...e, [key]: !e[key] }));
+  const toggle = (key: keyof typeof expanded) => setExpanded((e) => ({ ...e, [key]: !e[key] }));
 
   const handleAddLibrary = async () => {
     try {
@@ -142,9 +157,7 @@ export function Sidebar() {
       return;
     }
 
-    const isDuplicate = tags.some(
-      (t) => t.name.trim().toLowerCase() === name.toLowerCase()
-    );
+    const isDuplicate = tags.some((t) => t.name.trim().toLowerCase() === name.toLowerCase());
     if (isDuplicate) {
       setTagError(`Tag "${name}" already exists`);
       return;
@@ -314,7 +327,9 @@ export function Sidebar() {
 
   const handleDropOnCollection = async (e: React.DragEvent, colId: string) => {
     e.preventDefault();
-    const rawData = e.dataTransfer.getData('application/opendam-asset-id') || e.dataTransfer.getData('text/plain');
+    const rawData =
+      e.dataTransfer.getData('application/opendam-asset-id') ||
+      e.dataTransfer.getData('text/plain');
     if (!rawData) return;
 
     let assetId = rawData;
@@ -480,9 +495,7 @@ export function Sidebar() {
         onToggle={() => toggle('libraries')}
         onAdd={handleAddLibrary}
       >
-        {libraries.length === 0 && (
-          <p className={styles.empty}>No libraries yet</p>
-        )}
+        {libraries.length === 0 && <p className={styles.empty}>No libraries yet</p>}
         {libraries.length > 1 && (
           <div
             id="lib-all"
@@ -493,7 +506,10 @@ export function Sidebar() {
             title="Search across all libraries (none selected)"
           >
             <IconFolder size={13} />
-            <span className={clsx(styles.itemName, 'truncate')} style={{ fontWeight: selectedLibraryIds.length === 0 ? 600 : 400 }}>
+            <span
+              className={clsx(styles.itemName, 'truncate')}
+              style={{ fontWeight: selectedLibraryIds.length === 0 ? 600 : 400 }}
+            >
               All Libraries
             </span>
             <span className={styles.badge}>
@@ -685,9 +701,7 @@ export function Sidebar() {
           </div>
         )}
 
-        {tags.length === 0 && !isCreatingTag && (
-          <p className={styles.empty}>No tags yet</p>
-        )}
+        {tags.length === 0 && !isCreatingTag && <p className={styles.empty}>No tags yet</p>}
         {tags.map((tag) => {
           const isActiveFilter = activeTagId === tag.id;
           return (
@@ -702,12 +716,12 @@ export function Sidebar() {
             >
               <span
                 className={styles.tagDot}
-                style={{ background: tag.color ? `var(--swatch-${tag.color})` : 'hsl(220 85% 60%)' }}
+                style={{
+                  background: tag.color ? `var(--swatch-${tag.color})` : 'hsl(220 85% 60%)',
+                }}
               />
               <span className={clsx(styles.itemName, 'truncate')}>{tag.name}</span>
-              {isActiveFilter && (
-                <span className={styles.filterActiveChip}>●</span>
-              )}
+              {isActiveFilter && <span className={styles.filterActiveChip}>●</span>}
               <span
                 className={clsx(styles.itemActionBtn, styles.itemActionBtnDanger)}
                 onClick={(e) => handleDeleteTag(e, tag.id, tag.name)}
@@ -854,7 +868,11 @@ export function Sidebar() {
             onClick={() => toggleFilterSub('types')}
           >
             <span className={styles.subGroupTitle}>
-              {filterSubExpanded.types ? <IconChevronDown size={10} /> : <IconChevronRight size={10} />}
+              {filterSubExpanded.types ? (
+                <IconChevronDown size={10} />
+              ) : (
+                <IconChevronRight size={10} />
+              )}
               <span>Types</span>
               {currentFilter.kinds && currentFilter.kinds.length > 0 && (
                 <span className={styles.filterActiveChip}>●</span>
@@ -877,14 +895,14 @@ export function Sidebar() {
           </button>
           {filterSubExpanded.types && (
             <div className={styles.subGroupBody}>
-              {([
+              {[
                 { kind: '3d_model' as const, label: '3D Models', icon: <IconModel3D size={13} /> },
                 { kind: 'material' as const, label: 'Materials', icon: <IconLayers size={13} /> },
                 { kind: 'texture' as const, label: 'Textures', icon: <IconImage size={13} /> },
                 { kind: 'hdri' as const, label: 'HDRI', icon: <IconImage size={13} /> },
                 { kind: 'image' as const, label: 'Images', icon: <IconImage size={13} /> },
                 { kind: 'video' as const, label: 'Video', icon: <IconVideo size={13} /> },
-              ]).map(({ kind, label, icon }) => {
+              ].map(({ kind, label, icon }) => {
                 const isActive = currentFilter.kinds?.includes(kind);
                 return (
                   <button
@@ -921,7 +939,11 @@ export function Sidebar() {
             onClick={() => toggleFilterSub('ratings')}
           >
             <span className={styles.subGroupTitle}>
-              {filterSubExpanded.ratings ? <IconChevronDown size={10} /> : <IconChevronRight size={10} />}
+              {filterSubExpanded.ratings ? (
+                <IconChevronDown size={10} />
+              ) : (
+                <IconChevronRight size={10} />
+              )}
               <span>Ratings</span>
               {currentFilter.rating && <span className={styles.filterActiveChip}>●</span>}
             </span>
@@ -948,7 +970,8 @@ export function Sidebar() {
                 { label: '3+ Stars', min: 3, max: 5 },
                 { label: '1+ Stars', min: 1, max: 5 },
               ].map(({ label, min, max }) => {
-                const isActive = currentFilter.rating?.min === min && currentFilter.rating?.max === max;
+                const isActive =
+                  currentFilter.rating?.min === min && currentFilter.rating?.max === max;
                 return (
                   <button
                     key={label}
@@ -984,7 +1007,11 @@ export function Sidebar() {
             onClick={() => toggleFilterSub('colors')}
           >
             <span className={styles.subGroupTitle}>
-              {filterSubExpanded.colors ? <IconChevronDown size={10} /> : <IconChevronRight size={10} />}
+              {filterSubExpanded.colors ? (
+                <IconChevronDown size={10} />
+              ) : (
+                <IconChevronRight size={10} />
+              )}
               <span>Color Labels</span>
               {currentFilter.colorLabels && currentFilter.colorLabels.length > 0 && (
                 <span className={styles.filterActiveChip}>●</span>
@@ -1042,7 +1069,11 @@ export function Sidebar() {
             onClick={() => toggleFilterSub('dateAdded')}
           >
             <span className={styles.subGroupTitle}>
-              {filterSubExpanded.dateAdded ? <IconChevronDown size={10} /> : <IconChevronRight size={10} />}
+              {filterSubExpanded.dateAdded ? (
+                <IconChevronDown size={10} />
+              ) : (
+                <IconChevronRight size={10} />
+              )}
               <span>Date Added</span>
               {currentFilter.dateRange && <span className={styles.filterActiveChip}>●</span>}
             </span>
@@ -1070,8 +1101,13 @@ export function Sidebar() {
 
                 const curFrom = currentFilter.dateRange?.from;
                 const isTodayActive = curFrom !== undefined && curFrom >= todayStart;
-                const is7DaysActive = curFrom !== undefined && !isTodayActive && curFrom >= sevenDaysAgo - 10000;
-                const is30DaysActive = curFrom !== undefined && !isTodayActive && !is7DaysActive && curFrom >= thirtyDaysAgo - 10000;
+                const is7DaysActive =
+                  curFrom !== undefined && !isTodayActive && curFrom >= sevenDaysAgo - 10000;
+                const is30DaysActive =
+                  curFrom !== undefined &&
+                  !isTodayActive &&
+                  !is7DaysActive &&
+                  curFrom >= thirtyDaysAgo - 10000;
 
                 return [
                   { label: 'Today', from: todayStart, active: isTodayActive },
@@ -1110,7 +1146,11 @@ export function Sidebar() {
             onClick={() => toggleFilterSub('fileSize')}
           >
             <span className={styles.subGroupTitle}>
-              {filterSubExpanded.fileSize ? <IconChevronDown size={10} /> : <IconChevronRight size={10} />}
+              {filterSubExpanded.fileSize ? (
+                <IconChevronDown size={10} />
+              ) : (
+                <IconChevronRight size={10} />
+              )}
               <span>File Size</span>
               {currentFilter.sizeRange && <span className={styles.filterActiveChip}>●</span>}
             </span>
@@ -1171,7 +1211,11 @@ export function Sidebar() {
             onClick={() => toggleFilterSub('previewStatus')}
           >
             <span className={styles.subGroupTitle}>
-              {filterSubExpanded.previewStatus ? <IconChevronDown size={10} /> : <IconChevronRight size={10} />}
+              {filterSubExpanded.previewStatus ? (
+                <IconChevronDown size={10} />
+              ) : (
+                <IconChevronRight size={10} />
+              )}
               <span>Preview Status</span>
               {currentFilter.previewStatus && <span className={styles.filterActiveChip}>●</span>}
             </span>
@@ -1225,7 +1269,6 @@ export function Sidebar() {
         </div>
       </SidebarSection>
 
-
       <ConfirmDeleteDialog
         isOpen={Boolean(deleteTarget)}
         itemType={deleteTarget?.type ?? 'tag'}
@@ -1251,9 +1294,7 @@ interface SidebarSectionProps {
   children: React.ReactNode;
 }
 
-function SidebarSection({
-  label, icon, expanded, onToggle, onAdd, children,
-}: SidebarSectionProps) {
+function SidebarSection({ label, icon, expanded, onToggle, onAdd, children }: SidebarSectionProps) {
   return (
     <div className={styles.section}>
       <div className={styles.sectionHeader}>
@@ -1263,7 +1304,12 @@ function SidebarSection({
           <span className={styles.sectionLabel}>{label}</span>
         </button>
         {onAdd && (
-          <button className={styles.addBtn} onClick={onAdd} title={`Add ${label}`} id={`add-${label.toLowerCase()}`}>
+          <button
+            className={styles.addBtn}
+            onClick={onAdd}
+            title={`Add ${label}`}
+            id={`add-${label.toLowerCase()}`}
+          >
             <IconPlus size={12} />
           </button>
         )}

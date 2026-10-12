@@ -13,7 +13,8 @@ function usePreviewProgress(): PreviewProgress | null {
   useEffect(() => {
     let cancelled = false;
     const poll = () =>
-      api.getPreviewProgress()
+      api
+        .getPreviewProgress()
         .then((p) => {
           if (cancelled) return;
           const busy = p.finished < p.total || p.modelsAwaitingRender > 0;
@@ -56,7 +57,9 @@ export function StatusBar() {
           <span className={styles.item}>
             {previewProgress.finished < previewProgress.total &&
               `Generating previews: ${previewProgress.finished.toLocaleString()} / ${previewProgress.total.toLocaleString()}`}
-            {previewProgress.finished < previewProgress.total && previewProgress.modelsAwaitingRender > 0 && ' · '}
+            {previewProgress.finished < previewProgress.total &&
+              previewProgress.modelsAwaitingRender > 0 &&
+              ' · '}
             {previewProgress.modelsAwaitingRender > 0 &&
               `${previewProgress.modelsAwaitingRender.toLocaleString()} model${previewProgress.modelsAwaitingRender !== 1 ? 's' : ''} to render`}
           </span>
