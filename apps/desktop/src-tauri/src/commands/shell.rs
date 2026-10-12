@@ -11,9 +11,10 @@ pub async fn reveal_in_file_manager(file_path: String) -> Result<()> {
     // keep it off the async runtime's workers. A sync command would block the
     // main thread instead.
     tauri::async_runtime::spawn_blocking(move || {
-        if tauri_plugin_opener::reveal_item_in_dir(&file_path).is_ok() {
+        let Err(e) = tauri_plugin_opener::reveal_item_in_dir(&file_path) else {
             return Ok(());
-        }
+        };
+        tracing::warn!("Reveal of {file_path} failed ({e}), opening its parent folder instead");
         let parent = Path::new(&file_path)
             .parent()
             .ok_or("File has no parent folder")?;
