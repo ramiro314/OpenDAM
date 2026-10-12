@@ -38,7 +38,7 @@ export function DetailPanel() {
     if (asset) {
       setEditingName(asset.fileName);
     }
-  }, [asset?.id]);
+  }, [asset?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const setRating = useCallback(
     (rating: number) => asset && patchAsset(asset.id, { rating }),
