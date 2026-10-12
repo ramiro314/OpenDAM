@@ -28,16 +28,19 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": [
-          "**",
-          "**/*",
-          "$APPDATA/**",
-          "$APPDATA/**/*",
-          "$HOME/**",
-          "$HOME/**/*",
-          "$DESKTOP/**",
-          "$DESKTOP/**/*"
-        ]
+        "scope": {
+          "requireLiteralLeadingDot": false,
+          "allow": [
+            "**",
+            "**/*",
+            "$APPDATA/**",
+            "$APPDATA/**/*",
+            "$HOME/**",
+            "$HOME/**/*",
+            "$DESKTOP/**",
+            "$DESKTOP/**/*"
+          ]
+        }
       }
     }
   },
