@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import clsx from 'clsx';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useUIStore, useAssetStore, useLibraryStore } from '../../store';
@@ -16,9 +16,27 @@ const GRID_COLS: Record<'sm' | 'md' | 'lg', number> = {
 
 export function AssetGrid() {
   const { viewMode, gridSize, selectedAssetIds, selectAsset, clearSelection } = useUIStore();
-  const { assets, loading, total } = useAssetStore();
+  const { assets, loading, total, loadMore } = useAssetStore();
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const hasMore = assets.length < total;
 
   const tileSize = GRID_COLS[gridSize];
+
+  // Infinite scroll: load the next page when the end of the grid comes within reach.
+  // Re-observing after each page fires again if the sentinel is still in view (tall windows).
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel || !hasMore) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting) loadMore();
+      },
+      { root: scrollRef.current, rootMargin: '0px 0px 1200px 0px' }
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [assets.length, hasMore, loadMore]);
 
   const handleBackdropClick = useCallback(
     (e: React.MouseEvent) => {
@@ -59,7 +77,7 @@ export function AssetGrid() {
   return (
     <div className={styles.container}>
       <FilterBar />
-      <div className={styles.scrollArea} onClick={handleBackdropClick}>
+      <div className={styles.scrollArea} onClick={handleBackdropClick} ref={scrollRef}>
         {viewMode === 'grid' ? (
           <div
             className={styles.grid}
@@ -86,10 +104,11 @@ export function AssetGrid() {
             ))}
           </div>
         )}
+        {hasMore && <div ref={sentinelRef} aria-hidden />}
       </div>
       <div className={styles.footer}>
         <span className={styles.footerCount}>
-          {assets.length} of {total.toLocaleString()} assets
+          {assets.length.toLocaleString()} of {total.toLocaleString()} assets
         </span>
       </div>
     </div>

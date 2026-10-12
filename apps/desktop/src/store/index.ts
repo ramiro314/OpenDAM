@@ -154,9 +154,11 @@ export const useLibraryStore = create<LibraryStore>()((set) => ({
 interface AssetStore {
   assets: Asset[];
   total: number;
+  /** Last page loaded into `assets` (pages are appended as the grid scrolls) */
   page: number;
   pageSize: number;
   loading: boolean;
+  loadingMore: boolean;
   query: SearchQuery;
   assetMap: Map<string, Asset>;
 
@@ -166,8 +168,12 @@ interface AssetStore {
   resetFilter: () => void;
   clearFilter: (key: keyof FilterSpec) => void;
   setSort: (field: SortField, order?: SortOrder) => void;
-  setPage: (page: number) => void;
+  /** Runs the query from the first page, replacing the loaded assets */
   search: () => Promise<void>;
+  /** Appends the next page, if there is one */
+  loadMore: () => Promise<void>;
+  /** Re-fetches every page loaded so far, keeping the grid's scroll position */
+  refresh: () => Promise<void>;
   patchAsset: (id: string, patch: Partial<Asset>) => Promise<void>;
   deleteAsset: (id: string, deleteFile?: boolean) => Promise<void>;
   deleteAssets: (ids: string[], deleteFile?: boolean) => Promise<void>;
@@ -184,12 +190,16 @@ const defaultQuery: SearchQuery = {
   includeSubcollections: true,
 };
 
+// Bumped by every search/refresh so a slower loadMore can't append results from an older query.
+let queryGeneration = 0;
+
 export const useAssetStore = create<AssetStore>()((set, get) => ({
   assets: [],
   total: 0,
   page: 0,
   pageSize: 100,
   loading: false,
+  loadingMore: false,
   query: defaultQuery,
   assetMap: new Map(),
 
@@ -235,18 +245,48 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       };
     }),
 
-  setPage: (page) => set({ page }),
-
   search: async () => {
-    const { query, page, pageSize } = get();
-    set({ loading: true });
+    const { query, pageSize } = get();
+    const generation = ++queryGeneration;
+    set({ loading: true, page: 0 });
     try {
-      const result = await api.searchAssets({ query, page, pageSize });
+      const result = await api.searchAssets({ query, page: 0, pageSize });
+      if (generation !== queryGeneration) return;
       const assetMap = new Map(result.assets.map((a) => [a.id, a]));
       set({ assets: result.assets, total: result.total, assetMap });
     } finally {
-      set({ loading: false });
+      if (generation === queryGeneration) set({ loading: false });
     }
+  },
+
+  loadMore: async () => {
+    const { query, page, pageSize, assets, total, loading, loadingMore } = get();
+    if (loading || loadingMore || assets.length >= total) return;
+    const generation = queryGeneration;
+    set({ loadingMore: true });
+    try {
+      const result = await api.searchAssets({ query, page: page + 1, pageSize });
+      if (generation !== queryGeneration) return;
+      set((s) => {
+        // Pages can shift if assets change between requests; skip ones already shown.
+        const assetMap = new Map(s.assetMap);
+        const added = result.assets.filter((a) => !assetMap.has(a.id));
+        for (const a of added) assetMap.set(a.id, a);
+        return { assets: [...s.assets, ...added], total: result.total, page: page + 1, assetMap };
+      });
+    } finally {
+      set({ loadingMore: false });
+    }
+  },
+
+  refresh: async () => {
+    const { query, page, pageSize } = get();
+    const generation = ++queryGeneration;
+    // One request covering every loaded page, so the grid keeps its length and scroll position.
+    const result = await api.searchAssets({ query, page: 0, pageSize: (page + 1) * pageSize });
+    if (generation !== queryGeneration) return;
+    const assetMap = new Map(result.assets.map((a) => [a.id, a]));
+    set({ assets: result.assets, total: result.total, assetMap });
   },
 
   patchAsset: async (id, patch) => {

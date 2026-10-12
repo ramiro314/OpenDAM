@@ -66,7 +66,7 @@ export default function App() {
     const stopModelThumbnailer = startModelThumbnailer();
 
     const unlistenLib = listen('library:updated', () => {
-      useAssetStore.getState().search();
+      useAssetStore.getState().refresh();
       useLibraryStore.getState().fetchLibraries();
     });
 
