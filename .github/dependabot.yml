@@ -1,0 +1,49 @@
+# Weekly dependency update PRs, grouped per ecosystem to keep the PR count low.
+# Grouped PRs only carry minor/patch bumps; each major bump gets its own PR.
+#
+# Tauri's Rust crates and npm packages are versioned together, and `tauri build`
+# refuses mismatched minor versions. They get their own "tauri" group in both
+# cargo and npm: merge those two PRs together.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /apps/desktop/src-tauri
+    schedule:
+      interval: weekly
+    groups:
+      tauri:
+        patterns: ["tauri", "tauri-*"]
+        update-types: ["minor", "patch"]
+      cargo:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: npm # pnpm workspace (pnpm-lock.yaml)
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      tauri:
+        patterns: ["@tauri-apps/*"]
+        update-types: ["minor", "patch"]
+      npm:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: pip
+    directory: /packages/preview-engine
+    schedule:
+      interval: weekly
+    groups:
+      pip:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
