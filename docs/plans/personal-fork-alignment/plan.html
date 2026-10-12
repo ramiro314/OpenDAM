@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Personal fork alignment: Linux-only, bun, Claude and Mission Control</title><style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#59636e;--border:#d1d9e0;--code:#f6f8fa;--accent:#0969da;
+--box:#f6f8fa;--boxs:#8c959f;--hl:#ddf4ff;--hls:#0969da;--bad:#ffebe9;--bads:#cf222e;--q:#fff8c5;--qs:#9a6700}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9198a1;--border:#3d444d;--code:#151b23;
+--accent:#4493f8;--box:#151b23;--boxs:#656c76;--hl:#0c2d6b;--hls:#4493f8;--bad:#3c1618;--bads:#f85149;--q:#272115;--qs:#d29922}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;overflow-x:hidden}
+main{max-width:980px;margin:0 auto;padding:32px 24px 64px}
+h1,h2,h3{line-height:1.25;margin:1.6em 0 .6em}
+h1{font-size:2em;border-bottom:1px solid var(--border);padding-bottom:.3em;margin-top:0}
+h2{font-size:1.5em;border-bottom:1px solid var(--border);padding-bottom:.3em}
+h3{font-size:1.2em}
+a{color:var(--accent)}
+code{font:.88em/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code);padding:.15em .35em;border-radius:5px}
+pre{background:var(--code);padding:14px 16px;border-radius:8px;overflow-x:auto;border:1px solid var(--border)}
+pre code{padding:0;background:none}
+table{display:block;overflow-x:auto;border-collapse:collapse;max-width:100%;margin:1em 0}
+th,td{border:1px solid var(--border);padding:6px 12px;vertical-align:top;text-align:left}
+th{background:var(--code)}
+li{margin:.25em 0}
+.diagram{margin:1em 0;overflow-x:auto;border:1px solid var(--border);border-radius:10px;padding:12px;background:var(--bg)}
+.diagram svg{min-width:720px;width:100%;height:auto;display:block}
+.diagram .box{fill:var(--box);stroke:var(--boxs);stroke-width:1.2}
+.diagram .hl{fill:var(--hl);stroke:var(--hls)}
+.diagram .bad{fill:var(--bad);stroke:var(--bads)}
+.diagram .q{fill:var(--q);stroke:var(--qs)}
+.diagram .t{fill:var(--fg);font-size:12.5px}
+.diagram .strong{font-weight:600;font-size:13.5px}
+.diagram .lbl{fill:var(--muted);font-size:12px}
+.diagram .edge{stroke:var(--muted);stroke-width:1.5}
+.diagram .ah{fill:var(--muted)}
+.diagram .sep{stroke:var(--border);stroke-dasharray:4 4}
+details{margin:.4em 0 1.2em;color:var(--muted)}
+summary{cursor:pointer;font-size:.9em}
+</style></head>
+<body><main>
+<h1 id="personal-fork-alignment-linux-only-bun-claude-and-mission-control">Personal fork alignment: Linux-only, bun, Claude and Mission Control</h1>
+<p>Status: approved 2026-10-12. Shaped in a three-round interview and approved at review with two
+additions (D22, D23). Follow-up: once this plan merges, Mission Control slices it into
+dependency-linked tickets.</p>
+<p>Revised 2026-10-12 after Plan Validation repair round 1. These are consistency repairs inside the
+approved decisions, not new decisions:</p>
+<ul>
+<li>Fix #5 gets an automated regression test, so every fix #1-#6 really has one.</li>
+<li>Step 2 documents only the make targets that exist when it lands. Steps 3 and 5 add <code>make test</code>
+and <code>make install</code>/<code>make uninstall</code> to the docs.</li>
+<li>Step 1's &quot;no Windows/pnpm references&quot; exit check is now an exact command. Step 2 extends it to
+the README and <code>CONTRIBUTING.md</code>.</li>
+</ul>
+<p>Revised again after repair round 2. These are validation repairs only, so every regression test
+fails on <code>main</code> and every check can actually be carried out:</p>
+<ul>
+<li><strong>#2:</strong> the regression test now reads <code>[profile.release]</code>. The test profile never aborts, so a
+decoder unit test would pass on <code>main</code>.</li>
+<li><strong>#6:</strong> the test tags an asset in each library, seeds a divergent definition, and pins
+<code>foreign_keys</code> off in its fixture, so it fails on <code>main</code> whatever order the HashMap is in.</li>
+<li><strong>Step 3:</strong> first probes what each runner's JUnit records for a test's file. bun's is verified;
+nextest's is listed as unverified.</li>
+<li><strong>#5:</strong> the release-build check is visual, since D20 leaves no devtools console in release.</li>
+</ul>
+<p>Revised after the GitHub Inspector review on PR #11:</p>
+<ul>
+<li><strong>Fix #6's library open is insert-only, master wins.</strong> It adds definitions master lacks, as <code>main</code>'s
+sync already does. It then copies master's definitions down to the opened library's mirror, in
+a stable library order. The plan had said &quot;upsert&quot;, which would revert renames made while a
+library was offline and would make master depend on open order.</li>
+<li><strong>The flow diagrams' labels now match their mermaid source word for word.</strong> I checked this with a
+comparison script when the plan was written. That script isn't committed, so <code>plan.html</code> is a
+snapshot: if <code>plan.md</code> changes, re-render <code>plan.html</code> from it or delete it.</li>
+<li><strong>Fix #6's mirror overwrite is an <code>UPDATE</code>, never <code>REPLACE</code></strong> (Inspector round 2). REPLACE
+deletes the old row, and the schema's <code>ON DELETE CASCADE</code> foreign keys would wipe the library's
+memberships and child collections. A new test with foreign keys on proves they survive an open.</li>
+</ul>
+<h2 id="summary">Summary</h2>
+<p><code>ramiro314/OpenDAM</code> is now a <strong>hard fork</strong>. It is a personal, <strong>Linux-only</strong> asset manager for
+<strong>game-dev assets</strong>, built and maintained by agents that Mission Control dispatches. This plan does
+six things, in this order:</p>
+<ol>
+<li>Moves the toolchain to mise + bun + uv behind one Makefile.</li>
+<li>Strips the Windows and upstream-community weight.</li>
+<li>Gives agents a root instructions file.</li>
+<li>Adds the first test runners.</li>
+<li>Fixes all seven review findings. Fixes #1-#6 each get an automated regression test, and those
+tests guard #7's refactors.</li>
+<li>Ships a <code>make install</code> that gives you a working release build in <code>~/.local</code>.</li>
+</ol>
+<h2 id="context">Context</h2>
+<p>The upstream project (LawLaw09/OpenDAM) is a Windows-first AEC/archviz DAM: an NSIS installer,
+CI on <code>windows-latest</code>, Explorer integration, and a Connecter-parity roadmap. The fork already
+has merged PRs #1-#10 (preview fixes, 3D grid thumbnails, infinite scroll, Dependabot, pinned
+Tauri crates with a committed <code>Cargo.lock</code>). You run it on Arch (KDE Plasma, Wayland, NVIDIA RTX
+5080) against one library, <code>~/Documents/Kenney/Assets</code>.</p>
+<h2 id="decisions">Decisions</h2>
+<p>Every decision below was made by you: D1-D21 in the shaping interview (rounds 1-3, 2026-10-12),
+D22-D23 at plan review.</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Decision</th>
+<th>Answer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>D1</td>
+<td>Relationship to upstream</td>
+<td>Hard fork: diverge freely, drop the <code>upstream</code> remote, port fixes by hand if ever. The repo stays in GitHub's fork network.</td>
+</tr>
+<tr>
+<td>D2</td>
+<td>Primary use</td>
+<td>Game-dev assets (glTF/FBX/OBJ models, PNG sprites/textures)</td>
+</tr>
+<tr>
+<td>D3</td>
+<td>Name and identifier</td>
+<td>Keep &quot;OpenDAM&quot; and <code>com.opendam.desktop</code> (no app-data migration)</td>
+</tr>
+<tr>
+<td>D4</td>
+<td>Daily use</td>
+<td>Release build installed to <code>~/.local</code> by one script (<code>make install</code>), no packaging format</td>
+</tr>
+<tr>
+<td>D5</td>
+<td>Wayland/NVIDIA crash workaround</td>
+<td><code>main.rs</code> sets <code>WEBKIT_DISABLE_DMABUF_RENDERER=1</code> at startup when it is unset</td>
+</tr>
+<tr>
+<td>D6</td>
+<td>Toolchain pinning</td>
+<td>Repo <code>mise.toml</code> pins bun and rust stable</td>
+</tr>
+<tr>
+<td>D7</td>
+<td>Python environment</td>
+<td>uv: dependencies in <code>pyproject.toml</code> + <code>uv.lock</code>, pinned Python version</td>
+</tr>
+<tr>
+<td>D8</td>
+<td>Review fixes in scope</td>
+<td>All seven: #1-#7 (see <a href="#review-findings">Review findings</a>)</td>
+</tr>
+<tr>
+<td>D9</td>
+<td>Pruning</td>
+<td>Delete community scaffolding, the upstream roadmap, dead code, and unused dependencies, and rewrite the README. <strong>Keep</strong> <code>docs/adr</code>, <code>docs/specs</code>, and the AEC format code.</td>
+</tr>
+<tr>
+<td>D10</td>
+<td>Bun depth</td>
+<td>bun replaces pnpm (installs, lockfile, scripts). Node still runs vite and the tauri CLI.</td>
+</tr>
+<tr>
+<td>D11</td>
+<td>Workspace shape</td>
+<td>Keep <code>apps/desktop</code> + <code>packages/preview-engine</code>, with a root <code>package.json</code> using bun workspaces</td>
+</tr>
+<tr>
+<td>D12</td>
+<td>Agent instructions file</td>
+<td><code>AGENTS.md</code>, with <code>CLAUDE.md</code> as a symlink to it</td>
+</tr>
+<tr>
+<td>D13</td>
+<td>Other agent setup</td>
+<td>Project <code>.claude/settings.json</code> with a small allowlist, plus <code>docs/agents/running-the-app.md</code>. No <code>.agents/memory</code> seed: the first retro creates it.</td>
+</tr>
+<tr>
+<td>D14</td>
+<td>Mission Control integration</td>
+<td>A Makefile (<code>deps</code> stamp, <code>dev</code>, <code>lint</code>, <code>check</code>, <code>test</code>, <code>build</code>, <code>install</code>, <code>uninstall</code>). CI runs the same targets. You set the worktree-pool <code>setupArgv</code> to <code>make deps</code> by hand. Mission Control's &quot;Set up testing&quot; task runs after the test runners land.</td>
+</tr>
+<tr>
+<td>D15</td>
+<td>Test runners</td>
+<td>Rust: <code>cargo test</code> through cargo-nextest (JUnit). TypeScript: <code>bun test</code> (JUnit reporter). No Python tests yet.</td>
+</tr>
+<tr>
+<td>D16</td>
+<td>Where the installed app finds the preview engine</td>
+<td><code>~/.local/share/opendam/preview-engine</code> (worker + uv venv), after the <code>OPENDAM_*</code> env overrides</td>
+</tr>
+<tr>
+<td>D17</td>
+<td>Tag/collection data model (fix #6)</td>
+<td>The master DB is the catalog. Each library DB keeps a mirror of the definitions plus its own membership rows. <code>get_active_pool</code> goes away.</td>
+</tr>
+<tr>
+<td>D18</td>
+<td>TypeScript lint/format</td>
+<td>oxlint + oxfmt (as in metalmind), replacing eslint, typescript-eslint, and prettier</td>
+</tr>
+<tr>
+<td>D19</td>
+<td>Formatting</td>
+<td>Enforced: one mechanical reformat commit per language, after which <code>make lint</code> checks formatting</td>
+</tr>
+<tr>
+<td>D20</td>
+<td>Devtools</td>
+<td>Dev builds only; the release build drops the <code>devtools</code> feature</td>
+</tr>
+<tr>
+<td>D21</td>
+<td>Order</td>
+<td>Foundation → agent docs → test runners → fixes #1-#6 → install → refactors (#7)</td>
+</tr>
+<tr>
+<td>D22</td>
+<td>Commit attribution</td>
+<td>Agents are never added as commit co-authors: no <code>Co-Authored-By</code> trailer naming an agent, in this plan's commit or any later one. <code>AGENTS.md</code> states the rule explicitly.</td>
+</tr>
+<tr>
+<td>D23</td>
+<td>Writing style</td>
+<td>Plain dashes only, never em dashes. <code>AGENTS.md</code> states the rule.</td>
+</tr>
+</tbody>
+</table>
+<p>Facts checked while shaping (not decisions):</p>
+<ul>
+<li><strong>Python.</strong> Every preview-engine dependency has Python 3.14 wheels for Linux x86_64 (binary-only <code>uv pip compile</code>), so uv pins <strong>3.14</strong>. That matches the system Python.</li>
+<li><strong>Formatting debt.</strong> <code>rustfmt --check</code> reports 299 diffs in <code>src-tauri</code>, and prettier flags 18 TS files. <code>worker.py</code> already passes <code>ruff format</code> and <code>ruff check</code>.</li>
+<li><strong>Libraries.</strong> Only one library is registered in the master DB (<code>~/.local/share/com.opendam.desktop/opendam.sqlite</code>), so bug #1 is latent today.</li>
+<li><strong>Tauri version check.</strong> <code>.github/scripts/check-tauri-versions.mjs</code> (PR #10) parses <code>pnpm-lock.yaml</code>, so the bun migration has to port it to <code>bun.lock</code>.</li>
+<li><strong>Screenshots.</strong> The desktop is KDE Plasma, and <code>spectacle</code> is the available screenshot tool.</li>
+<li><strong>bun JUnit.</strong> <code>bun test</code> 1.4.2's JUnit reporter writes <code>file=&quot;&lt;path&gt;&quot;</code> and <code>line</code> on every <code>&lt;testcase&gt;</code>. I probed this with a throwaway test outside the repo. cargo-nextest isn't installed here, so its JUnit output is unverified (see step 3).</li>
+</ul>
+<h2 id="review-findings">Review findings</h2>
+<p>A read-only review of <code>origin/main</code> at <code>0af38c8</code>. Items marked ✔ were confirmed by reading the code
+during shaping. The rest come from the review pass.</p>
+<h3 id="platform-windowsmacos-weight">Platform (Windows/macOS weight)</h3>
+<ul>
+<li><strong>Windows-only files.</strong>
+<ul>
+<li><code>apps/desktop/src-tauri/installer.nsi</code>: a 934-line NSIS template.</li>
+<li><code>tauri.windows.conf.json</code>: C:/D:/E: asset scopes.</li>
+<li><code>icons/icon.ico</code>.</li>
+<li><code>icons/icon32.png</code>: a byte-identical copy of <code>32x32.png</code>, unreferenced.</li>
+<li><code>tools/cleanup/</code>: a Windows post-uninstall cleaner using <code>taskkill</code>, <code>reg delete</code>, and %APPDATA%. Nothing references it.</li>
+</ul>
+</li>
+<li><strong><code>tauri.conf.json</code>:</strong> <code>bundle.targets: [&quot;nsis&quot;]</code> (:49), a missing <code>icons/icon.icns</code> (:54), <code>icon.ico</code> (:55), and the <code>bundle.windows.nsis</code> block.</li>
+<li>✔ <strong>Platform branches in Rust.</strong>
+<ul>
+<li><code>main.rs:2</code> <code>windows_subsystem</code>.</li>
+<li><code>commands/shell.rs</code>: Windows <code>explorer</code>/<code>raw_arg</code>/<code>CREATE_NO_WINDOW</code> blocks (:5-28, :52-61) and macOS blocks (:29-35, :62-68). The Linux <code>xdg-open</code> branches (:36-50, :69-76) work, but &quot;reveal&quot; only opens the parent folder.</li>
+<li><code>preview.rs:66-67</code> <code>cfg(windows)</code>, <code>:141-145</code> <code>venv\Scripts\python(w).exe</code> candidates, and the <code>:154</code> <code>pythonw</code> fallback.</li>
+</ul>
+</li>
+<li>✔ <strong>Windows path handling.</strong> <code>\</code>→<code>/</code> rewrites at <code>db.rs:336,338</code>, <code>watcher.rs:167</code>, and <code>asset.rs:379</code> would corrupt Linux filenames that contain a backslash. The rename validation at <code>asset.rs:760</code> rejects <code>: * ? &quot; &lt; &gt; |</code>, which are all legal on Linux.</li>
+<li>✔ <strong>UI and CI.</strong> The UI says &quot;Reveal in Explorer&quot; (<code>DetailPanel.tsx:273,449</code>, <code>api/index.ts:79</code>). CI's Rust job runs on <code>windows-latest</code>.</li>
+</ul>
+<h3 id="tooling">Tooling</h3>
+<ul>
+<li><strong>pnpm coupling.</strong>
+<ul>
+<li>Root <code>package.json</code> scripts use <code>pnpm --filter</code> and <code>pnpm -r</code>, and set <code>packageManager: pnpm@12.11.2</code>.</li>
+<li><code>pnpm-workspace.yaml</code> and <code>.npmrc</code> hold build allowances for esbuild and <strong>sharp</strong>. sharp isn't in the lockfile.</li>
+<li><code>tauri.conf.json</code> calls <code>pnpm vite:dev</code> / <code>pnpm vite:build</code>.</li>
+<li>Also coupled: the CI pnpm steps, Dependabot's <code>npm</code> ecosystem, and the Tauri version-check script.</li>
+</ul>
+</li>
+<li><strong>No tests anywhere.</strong>
+<ul>
+<li>Rust has no <code>#[test]</code> and the TypeScript side has no runner.</li>
+<li><code>packages/preview-engine/test_max.py</code> is a scratch CLI script that asserts nothing.</li>
+<li><code>pnpm -r test</code> runs nothing.</li>
+</ul>
+</li>
+<li><strong>ESLint is broken.</strong> There is no <code>eslint.config.*</code>, and eslint 9 rejects the <code>--ext</code> flag in <code>apps/desktop</code>'s <code>lint</code> script. <code>@typescript-eslint/*</code> and prettier are installed but never run in CI.</li>
+<li><strong>What CI actually checks:</strong> <code>tsc -b &amp;&amp; vite build</code>, <code>cargo clippy -D warnings</code>, and <code>ruff check packages/preview-engine</code>.</li>
+</ul>
+<h3 id="dead-weight">Dead weight</h3>
+<ul>
+<li><strong>Unused packages.</strong>
+<ul>
+<li><code>packages/dcc-bridge</code>: WebSocket protocol types. Nothing imports it, and nothing serves port 37520.</li>
+<li><code>plugins/blender</code>: posts to that same unserved port.</li>
+</ul>
+</li>
+<li><strong>Unused code.</strong> <code>migrations/001_initial.sql</code> is unused; only <code>002</code> is <code>include_str!</code>'d. <code>LibraryWatcher</code> (<code>watcher.rs:390-398</code>) is an empty placeholder held in <code>AppState</code>.</li>
+<li><strong>Unused JS deps:</strong> <code>react-router-dom</code>, <code>react-virtual</code>, <code>@tauri-apps/plugin-fs</code>, <code>@tauri-apps/plugin-shell</code>. Only <code>plugin-dialog</code> is imported.</li>
+<li>✔ <strong>Unused Rust deps:</strong> <code>notify</code>, <code>mime_guess</code>, <code>thiserror</code>, <code>dirs</code>, and sqlx's <code>migrate</code> feature. <code>tauri-plugin-fs</code> and <code>tauri-plugin-shell</code> are initialised (<code>lib.rs:31,33</code>) but never called; reveal and open use <code>std::process::Command</code>.</li>
+<li><strong>Upstream community material:</strong> <code>CODE_OF_CONDUCT.md</code>, <code>CONTRIBUTING.md</code>, issue and PR templates, <code>opendam_implementation_plan.md</code> (the Connecter-parity AEC roadmap), and README marketing.
+<ul>
+<li><strong>Before deleting <code>CONTRIBUTING.md</code>:</strong> it holds the only venv setup steps and the project's design rules. Those move to <code>AGENTS.md</code> first.</li>
+</ul>
+</li>
+</ul>
+<h3 id="bugs-fixed-by-this-plan">Bugs (fixed by this plan)</h3>
+<ol>
+<li>✔ <strong>#1 An offline library wipes another library's assets.</strong>
+<ul>
+<li><strong>Cause:</strong> <code>Database::get_library_handle(Some(id))</code> falls back to <code>libs.values().next()</code> when <code>id</code> isn't open (<code>db.rs:291-299</code>). Libraries whose root is missing are never opened (<code>db.rs:168</code>), yet the startup re-index (<code>lib.rs:63-78</code>) and F5 still call <code>watcher::index_paths</code> for them.</li>
+<li><strong>What happens:</strong> <code>index_paths</code> (<code>watcher.rs:136-144</code>) receives <em>another</em> library's pool, walks the missing paths, finds nothing, and deletes every asset row in that other library (<code>watcher.rs:292-307</code>). Its tags, ratings, and collection memberships go with them.</li>
+<li><strong>Trigger:</strong> two or more libraries with one unmounted.</li>
+</ul>
+</li>
+<li>✔ <strong>#2 One malformed image kills the release app.</strong> <code>panic = &quot;abort&quot;</code> (<code>Cargo.toml:40</code>) defeats the <code>catch_unwind</code> around image decoding (<code>preview.rs:323-327</code>).</li>
+<li>✔ <strong>#3 Search errors on ordinary input.</strong> Raw text goes into FTS5 <code>MATCH</code> as <code>&quot;{text}*&quot;</code> (<code>asset.rs:126-129</code>), so <code>low-poly</code> or <code>tree.glb</code> is a syntax error. The frontend store doesn't catch the error and the grid keeps stale results.</li>
+<li>✔ <strong>#4 A failed trash becomes a permanent delete.</strong> When <code>trash::delete</code> fails, <code>asset.rs:716-719</code> silently calls <code>std::fs::remove_file</code>.</li>
+<li><strong>#5 Wide-open security surface.</strong> The asset protocol scope is <code>**</code>, <code>$HOME/**</code>, and <code>$DESKTOP/**</code>. The capabilities include <code>fs:allow-read</code> on <code>**</code>, <code>csp</code> is <code>null</code> (<code>tauri.conf.json:28</code>), and release builds ship the <code>devtools</code> feature (<code>Cargo.toml:18</code>). There is no remote content or <code>innerHTML</code>, so it isn't exploitable today, but it is cheap to close.</li>
+<li>✔ <strong>#6 The &quot;active library&quot; is whichever HashMap entry comes first.</strong>
+<ul>
+<li><strong>How tags and collections work today:</strong> their definitions are copied into every library DB and the master DB.</li>
+<li><strong>Reads are arbitrary:</strong> <code>list_tags</code>, the collection commands, and several fallbacks read through <code>get_active_pool()</code> (<code>db.rs:313</code>; <code>tag.rs</code>, <code>collection.rs</code>, <code>preview.rs:39</code>, <code>asset.rs:106,562,617,709,827</code>).</li>
+<li><strong>Writes land in the wrong library:</strong> <code>update_asset</code> also writes <code>asset_tags</code> into that pool even when the asset lives in another library (<code>asset.rs:617-618</code>), leaving orphan rows.</li>
+</ul>
+</li>
+<li><strong>#7 Oversized files.</strong>
+<ul>
+<li><code>Sidebar.tsx</code> is 1274 lines.</li>
+<li><code>search_assets</code> (<code>asset.rs:79</code>, about 450 lines) repeats the same <code>WITH RECURSIVE col_tree</code> CTE five times (<code>asset.rs:271-354</code>).</li>
+</ul>
+</li>
+</ol>
+<h3 id="preview-worker-at-runtime">Preview worker at runtime</h3>
+<ul>
+<li><strong>How it runs:</strong> the Python worker is spawned once as a JSON-over-stdio daemon for formats Rust can't decode (<code>model_meta</code>; <code>preview.rs:366+</code>).</li>
+<li><strong>Python lookup order:</strong> <code>OPENDAM_PYTHON</code>, then <code>{cwd, exe dir, and up to 4 parents of each}/packages/preview-engine/venv/bin/python</code>, then <code>…/venv/bin/python</code>, then a bare <code>python</code> checked against the <em>cwd</em> rather than <code>PATH</code> (<code>preview.rs:108-176</code>). The script lookup uses <code>OPENDAM_WORKER</code> or the same roots.</li>
+<li><strong>Problems:</strong>
+<ul>
+<li>Nothing is bundled, so a release build outside the repo has no 3D/CAD previews.</li>
+<li>uv's default <code>.venv</code> is never searched.</li>
+<li>The worker's stderr is discarded (<code>preview.rs:62</code>).</li>
+</ul>
+</li>
+</ul>
+<h2 id="target-state">Target state</h2>
+<ul>
+<li><strong>Toolchain.</strong> <code>mise install &amp;&amp; make deps</code> sets up a fresh checkout or a Mission Control worktree with no shims failing. bun, rust, and uv's Python are pinned.</li>
+<li><strong>One command surface.</strong> <code>make lint check test build</code> is what Mission Control's Commands, CI, and agents all run.</li>
+<li><strong>Linux only.</strong> Nothing for Windows or macOS remains, and CI is ubuntu-only.</li>
+<li><strong>Agent context.</strong> <code>AGENTS.md</code> gives an agent everything it needs: commands, layout, invariants, and how to run and screenshot the app.</li>
+<li><strong>Tests.</strong> Rust and TypeScript tests run with JUnit output, ready for Mission Control's testing contract.</li>
+<li><strong>Bugs.</strong> #1-#7 are fixed, and #1-#6 each have an automated regression test (for #2 and #5, a test of the shipped configuration).</li>
+<li><strong>Install.</strong> <code>make install</code> puts a release OpenDAM in your app launcher, and it renders Python-backed previews.</li>
+</ul>
+<h2 id="flows-that-change">Flows that change</h2>
+<h3 id="checks-mission-control-ci-and-agents-share-one-entry-point">Checks: Mission Control, CI and agents share one entry point</h3>
+<div class="flow"><figure class="diagram"><svg viewBox="0 0 830 260" role="img" aria-label="Mission Control, CI and agents all call the Makefile, which drives bun, cargo and uv" xmlns="http://www.w3.org/2000/svg"><defs><marker id="ah1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker></defs><rect x="10" y="20" width="240" height="50" rx="8" class="box"/><text x="130.0" y="42.0" text-anchor="middle" class="t strong">Mission Control Commands</text><text x="130.0" y="58.0" text-anchor="middle" class="t">(make test / lint / check / build)</text><rect x="10" y="105" width="240" height="50" rx="8" class="box"/><text x="130.0" y="135.0" text-anchor="middle" class="t strong">GitHub Actions (ubuntu)</text><rect x="10" y="190" width="240" height="50" rx="8" class="box"/><text x="130.0" y="212.0" text-anchor="middle" class="t strong">Agents in worktrees</text><text x="130.0" y="228.0" text-anchor="middle" class="t">(setupArgv: make deps)</text><rect x="330" y="105" width="120" height="50" rx="8" class="box hl"/><text x="390.0" y="135.0" text-anchor="middle" class="t strong">Makefile</text><rect x="530" y="20" width="290" height="50" rx="8" class="box"/><text x="675.0" y="42.0" text-anchor="middle" class="t strong">bun (pinned by mise.toml)</text><text x="675.0" y="58.0" text-anchor="middle" class="t">oxlint, oxfmt, tsc, vite, bun test</text><rect x="530" y="105" width="290" height="50" rx="8" class="box"/><text x="675.0" y="127.0" text-anchor="middle" class="t strong">cargo (rust stable via mise.toml)</text><text x="675.0" y="143.0" text-anchor="middle" class="t">fmt, clippy, nextest, build</text><rect x="530" y="190" width="290" height="50" rx="8" class="box"/><text x="675.0" y="212.0" text-anchor="middle" class="t strong">uv (Python 3.14)</text><text x="675.0" y="228.0" text-anchor="middle" class="t">ruff, uv sync</text><line x1="250" y1="45" x2="328" y2="130" class="edge" marker-end="url(#ah1)"/><line x1="250" y1="130" x2="328" y2="130" class="edge" marker-end="url(#ah1)"/><line x1="250" y1="215" x2="328" y2="130" class="edge" marker-end="url(#ah1)"/><line x1="450" y1="130" x2="528" y2="45" class="edge" marker-end="url(#ah1)"/><line x1="450" y1="130" x2="528" y2="130" class="edge" marker-end="url(#ah1)"/><line x1="450" y1="130" x2="528" y2="215" class="edge" marker-end="url(#ah1)"/></svg></figure><details><summary>Diagram source (mermaid, as in plan.md)</summary><pre><code>flowchart LR
+  MC["Mission Control Commands&lt;br/&gt;(make test / lint / check / build)"] --&gt; MK[Makefile]
+  CI["GitHub Actions (ubuntu)"] --&gt; MK
+  AG["Agents in worktrees&lt;br/&gt;(setupArgv: make deps)"] --&gt; MK
+  MK --&gt; BUN["bun (pinned by mise.toml)&lt;br/&gt;oxlint, oxfmt, tsc, vite, bun test"]
+  MK --&gt; CARGO["cargo (rust stable via mise.toml)&lt;br/&gt;fmt, clippy, nextest, build"]
+  MK --&gt; UV["uv (Python 3.14)&lt;br/&gt;ruff, uv sync"]
+</code></pre></details></div>
+<p><strong>Before:</strong> CI calls <code>pnpm</code>, <code>cargo clippy</code> (on Windows), and the ruff action directly. Mission Control's default <code>make</code> Commands have no Makefile to run, and the mise shims for <code>cargo</code>/<code>pnpm</code> fail.</p>
+<h3 id="preview-engine-lookup">Preview engine lookup</h3>
+<div class="flow"><figure class="diagram"><svg viewBox="0 0 920 160" role="img" aria-label="Preview engine lookup order: env override, installed XDG location, then dev repo venv" xmlns="http://www.w3.org/2000/svg"><defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker></defs><rect x="10" y="95" width="130" height="50" rx="8" class="box"/><text x="75.0" y="125.0" text-anchor="middle" class="t strong">OpenDAM binary</text><rect x="185" y="95" width="170" height="50" rx="8" class="box q"/><text x="270.0" y="117.0" text-anchor="middle" class="t strong">OPENDAM_PYTHON /</text><text x="270.0" y="133.0" text-anchor="middle" class="t">OPENDAM_WORKER set?</text><rect x="185" y="10" width="170" height="44" rx="8" class="box"/><text x="270.0" y="37.0" text-anchor="middle" class="t strong">env paths</text><rect x="400" y="95" width="200" height="50" rx="8" class="box q"/><text x="500.0" y="117.0" text-anchor="middle" class="t strong">~/.local/share/opendam/</text><text x="500.0" y="133.0" text-anchor="middle" class="t">preview-engine exists?</text><rect x="400" y="10" width="200" height="44" rx="8" class="box hl"/><text x="500.0" y="29.0" text-anchor="middle" class="t strong">installed worker.py + .venv</text><text x="500.0" y="45.0" text-anchor="middle" class="t">(make install)</text><rect x="645" y="95" width="265" height="50" rx="8" class="box"/><text x="777.5" y="117.0" text-anchor="middle" class="t strong">repo packages/preview-engine/.venv</text><text x="777.5" y="133.0" text-anchor="middle" class="t">(dev, found from cwd/exe ancestors)</text><line x1="140" y1="120" x2="183" y2="120" class="edge" marker-end="url(#ah2)"/><line x1="270" y1="95" x2="270" y2="56" class="edge" marker-end="url(#ah2)"/><text x="290" y="80" text-anchor="middle" class="lbl">yes</text><line x1="355" y1="120" x2="398" y2="120" class="edge" marker-end="url(#ah2)"/><text x="376" y="112" text-anchor="middle" class="lbl">no</text><line x1="500" y1="95" x2="500" y2="56" class="edge" marker-end="url(#ah2)"/><text x="520" y="80" text-anchor="middle" class="lbl">yes</text><line x1="600" y1="120" x2="643" y2="120" class="edge" marker-end="url(#ah2)"/><text x="621" y="112" text-anchor="middle" class="lbl">no</text></svg></figure><details><summary>Diagram source (mermaid, as in plan.md)</summary><pre><code>flowchart LR
+  APP[OpenDAM binary] --&gt; E{"OPENDAM_PYTHON /&lt;br/&gt;OPENDAM_WORKER set?"}
+  E -- yes --&gt; ENV[env paths]
+  E -- no --&gt; XDG{"~/.local/share/opendam/&lt;br/&gt;preview-engine exists?"}
+  XDG -- yes --&gt; INST["installed worker.py + .venv&lt;br/&gt;(make install)"]
+  XDG -- no --&gt; REPO["repo packages/preview-engine/.venv&lt;br/&gt;(dev, found from cwd/exe ancestors)"]
+</code></pre></details></div>
+<p><strong>Before:</strong> only <code>venv/</code> folders under the cwd, the exe dir, and their ancestors (plus Windows <code>Scripts\</code> candidates). The installed binary never found the worker.</p>
+<h3 id="tags-and-collections-fix-6">Tags and collections (fix #6)</h3>
+<div class="flow"><figure class="diagram"><svg viewBox="0 0 890 400" role="img" aria-label="Tags and collections: before, reads and asset_tags writes go to an arbitrary library; after, reads come from the master catalog, memberships go to the asset's own library, and library open only adds definitions master lacks and then copies master's definitions down" xmlns="http://www.w3.org/2000/svg"><defs><marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker></defs><text x="10" y="18" class="t strong">Before</text><rect x="10" y="50" width="200" height="44" rx="8" class="box"/><text x="110.0" y="77.0" text-anchor="middle" class="t strong">tag / collection commands</text><rect x="340" y="20" width="240" height="50" rx="8" class="box bad"/><text x="460.0" y="42.0" text-anchor="middle" class="t strong">get_active_pool()</text><text x="460.0" y="58.0" text-anchor="middle" class="t">= first HashMap entry</text><rect x="340" y="110" width="240" height="40" rx="8" class="box"/><text x="460.0" y="135.0" text-anchor="middle" class="t strong">master + every library</text><line x1="210" y1="62" x2="338" y2="40" class="edge" marker-end="url(#ah3)"/><text x="270" y="44" text-anchor="middle" class="lbl">reads</text><line x1="210" y1="72" x2="338" y2="60" class="edge" marker-end="url(#ah3)"/><text x="280" y="84" text-anchor="middle" class="lbl">asset_tags writes</text><line x1="210" y1="84" x2="338" y2="128" class="edge" marker-end="url(#ah3)"/><text x="246" y="124" text-anchor="middle" class="lbl">definitions</text><line x1="10" y1="170" x2="880" y2="170" class="sep"/><text x="10" y="195" class="t strong">After</text><rect x="10" y="265" width="200" height="44" rx="8" class="box"/><text x="110.0" y="292.0" text-anchor="middle" class="t strong">tag / collection commands</text><rect x="340" y="215" width="290" height="40" rx="8" class="box hl"/><text x="485.0" y="240.0" text-anchor="middle" class="t strong">master DB catalog</text><rect x="340" y="280" width="290" height="40" rx="8" class="box"/><text x="485.0" y="305.0" text-anchor="middle" class="t strong">master + mirror in every open library</text><rect x="340" y="345" width="290" height="40" rx="8" class="box hl"/><text x="485.0" y="370.0" text-anchor="middle" class="t strong">the asset's own library DB</text><rect x="720" y="215" width="150" height="40" rx="8" class="box"/><text x="795.0" y="240.0" text-anchor="middle" class="t strong">library open</text><line x1="210" y1="277" x2="338" y2="235" class="edge" marker-end="url(#ah3)"/><text x="262" y="243" text-anchor="middle" class="lbl">reads</text><line x1="210" y1="287" x2="338" y2="300" class="edge" marker-end="url(#ah3)"/><text x="275" y="286" text-anchor="middle" class="lbl">definitions</text><line x1="210" y1="297" x2="338" y2="365" class="edge" marker-end="url(#ah3)"/><text x="232" y="358" text-anchor="middle" class="lbl">memberships</text><line x1="720" y1="228" x2="632" y2="228" class="edge" marker-end="url(#ah3)"/><text x="676" y="206" text-anchor="middle" class="lbl">adds only definitions master lacks</text><line x1="632" y1="244" x2="718" y2="244" class="edge" marker-end="url(#ah3)"/><text x="676" y="272" text-anchor="middle" class="lbl">copies master's definitions to its mirror</text></svg></figure><details><summary>Diagram source (mermaid, as in plan.md)</summary><pre><code>flowchart LR
+  subgraph Before
+    C1[tag / collection commands] --&gt;|reads| AP["get_active_pool()&lt;br/&gt;= first HashMap entry"]
+    C1 --&gt;|asset_tags writes| AP
+    C1 --&gt;|definitions| ALL1[master + every library]
+  end
+  subgraph After
+    C2[tag / collection commands] --&gt;|reads| M[(master DB catalog)]
+    C2 --&gt;|definitions| ALL2["master + mirror in every open library"]
+    C2 --&gt;|memberships| OWN[("the asset's own library DB")]
+    OPEN[library open] --&gt;|adds only definitions master lacks| M
+    M --&gt;|copies master's definitions to its mirror| OPEN
+  end
+</code></pre></details></div>
+<h2 id="work-in-order">Work, in order</h2>
+<p>Each step lists its scope and what done means. Ticket slicing (after this plan merges) turns these
+into dependency-linked tasks. A step may become several tickets.</p>
+<h3 id="step-1-foundation-toolchain-bun-uv-makefile-ci-linux-only-pruning-formatting">Step 1: Foundation (toolchain, bun, uv, Makefile, CI, Linux-only, pruning, formatting)</h3>
+<p><strong>Toolchain</strong></p>
+<ul>
+<li><strong><code>mise.toml</code></strong> at the repo root: <code>bun</code> (pinned to the version the lockfile is created with), <code>rust = &quot;stable&quot;</code>, and <code>cargo-nextest</code> if mise can provide it (otherwise <code>make deps</code> installs it). With this file the <code>cargo</code> shim works in every checkout and worktree.</li>
+<li><strong><code>packages/preview-engine/pyproject.toml</code></strong> gets <code>[project]</code> with the dependencies from <code>requirements.txt</code>, <code>requires-python = &quot;&gt;=3.14&quot;</code>, and ruff as a dev dependency. Commit <code>uv.lock</code> and <code>.python-version</code> (<code>3.14</code>), and delete <code>requirements.txt</code>. The dev venv is <code>packages/preview-engine/.venv</code>.</li>
+</ul>
+<p><strong>bun</strong></p>
+<ul>
+<li>Root <code>package.json</code> gets <code>&quot;workspaces&quot;: [&quot;apps/desktop&quot;]</code> and <code>&quot;packageManager&quot;: &quot;bun@&lt;pinned&gt;&quot;</code>. Its scripts use <code>bun run --filter</code>.</li>
+<li>Delete <code>pnpm-lock.yaml</code>, <code>pnpm-workspace.yaml</code>, and <code>.npmrc</code>, and commit <code>bun.lock</code>. Add esbuild to <code>trustedDependencies</code> only if bun needs it.</li>
+<li><code>tauri.conf.json</code> runs <code>bun run vite:dev</code> / <code>bun run vite:build</code>.</li>
+<li>Port <code>.github/scripts/check-tauri-versions.mjs</code> to read <code>bun.lock</code>.</li>
+</ul>
+<p><strong>Makefile</strong></p>
+<ul>
+<li><strong><code>deps</code></strong> is a stamp target that reruns <code>bun install --frozen-lockfile</code> when <code>package.json</code>/<code>bun.lock</code> change and <code>uv sync --frozen</code> when <code>pyproject.toml</code>/<code>uv.lock</code> change.</li>
+<li><strong>Other targets:</strong>
+<ul>
+<li><code>dev</code>: tauri dev.</li>
+<li><code>lint</code>: oxlint, oxfmt check, <code>cargo fmt --check</code>, <code>cargo clippy --locked --all-targets -D warnings</code>, <code>ruff check</code>, and <code>ruff format --check</code>.</li>
+<li><code>check</code>: <code>tsc</code> and <code>cargo check --locked</code>.</li>
+<li><code>build</code>: vite build plus <code>tauri build --no-bundle</code>.</li>
+</ul>
+</li>
+<li><strong>Later targets:</strong> <code>test</code> arrives in step 3, and <code>install</code>/<code>uninstall</code> in step 5.</li>
+</ul>
+<p><strong>CI and Dependabot</strong></p>
+<ul>
+<li><strong>CI:</strong> all jobs run on <code>ubuntu-latest</code> and call <code>make</code> targets. The Rust job installs Tauri's documented Debian prerequisites (webkit2gtk-4.1, etc.). Setup uses <code>oven-sh/setup-bun</code> (reads <code>packageManager</code>) and <code>astral-sh/setup-uv</code>. The Tauri version check stays.</li>
+<li><strong>Dependabot:</strong> <code>npm</code> → <code>bun</code>, <code>pip</code> → <code>uv</code>, <code>cargo</code> unchanged.</li>
+</ul>
+<p><strong>Lint and format</strong></p>
+<ul>
+<li>Replace eslint, <code>@typescript-eslint/*</code>, and prettier with oxlint + oxfmt. Carry <code>.prettierrc</code>'s options (single quotes, width 100, es5 trailing commas) into oxfmt's config, then delete <code>.prettierrc</code>.</li>
+<li>Three mechanical reformat commits, one each for <code>cargo fmt</code>, oxfmt, and ruff format, with no other change in them. Python is already clean, so it may produce no commit.</li>
+</ul>
+<p><strong>Linux-only cleanup</strong></p>
+<ul>
+<li><strong>Delete:</strong> <code>installer.nsi</code>, <code>tauri.windows.conf.json</code>, <code>icons/icon.ico</code>, <code>icons/icon32.png</code>, and <code>tools/cleanup/</code>.</li>
+<li><strong><code>tauri.conf.json</code>:</strong> no bundling (<code>bundle.active: false</code>). Drop the icns/ico/nsis entries.</li>
+<li><strong><code>main.rs</code>:</strong> remove <code>windows_subsystem</code>. At the top of <code>main</code>, before Tauri starts, set <code>WEBKIT_DISABLE_DMABUF_RENDERER=1</code> if it is unset (D5).</li>
+<li><strong>Reveal and open:</strong> replace <code>commands/shell.rs</code> with <code>tauri-plugin-opener</code> (<code>reveal_item_in_dir</code>, <code>open_path</code>). If opener's Linux reveal can't select the file, keep <code>xdg-open</code> on the parent folder. Rename the command and UI strings to &quot;Reveal in file manager&quot;.</li>
+<li><strong><code>preview.rs</code>:</strong> remove <code>cfg(windows)</code>, the <code>Scripts\</code> candidates, and <code>pythonw</code>. The dev lookup searches <code>packages/preview-engine/.venv/bin/python</code>.</li>
+<li><strong>Paths:</strong> remove the <code>\</code>→<code>/</code> rewrites (<code>db.rs:336,338</code>, <code>watcher.rs:167</code>, <code>asset.rs:379</code>). Rename validation rejects only <code>/</code>, NUL, empty, <code>.</code>, and <code>..</code>.</li>
+</ul>
+<p><strong>Pruning (D9)</strong></p>
+<ul>
+<li><strong>Delete:</strong> <code>CODE_OF_CONDUCT.md</code>, <code>.github/ISSUE_TEMPLATE/</code>, <code>.github/PULL_REQUEST_TEMPLATE.md</code>, <code>opendam_implementation_plan.md</code>, <code>packages/dcc-bridge/</code>, <code>plugins/blender/</code>, <code>packages/preview-engine/test_max.py</code>, <code>migrations/001_initial.sql</code>, and <code>LibraryWatcher</code> (with its <code>AppState.watcher</code> field).</li>
+<li><strong>Unused dependencies:</strong>
+<ul>
+<li>JS: <code>react-router-dom</code>, <code>react-virtual</code>, <code>@tauri-apps/plugin-fs</code>, <code>@tauri-apps/plugin-shell</code>.</li>
+<li>Rust: <code>notify</code>, <code>mime_guess</code>, <code>thiserror</code>, <code>dirs</code>, sqlx <code>migrate</code>, <code>tauri-plugin-fs</code>, <code>tauri-plugin-shell</code>.</li>
+<li>Also remove their capability entries (<code>fs:*</code>, <code>shell:*</code>) and the <code>plugins.shell</code> config.</li>
+</ul>
+</li>
+<li><strong><code>.gitignore</code>:</strong> drop the pnpm and Windows-only entries.</li>
+<li><strong>Keep:</strong> <code>docs/adr</code>, <code>docs/specs</code>, and the AEC format code.</li>
+</ul>
+<p><strong>Done when</strong></p>
+<ul>
+<li>On a fresh clone or a new worktree, <code>mise install &amp;&amp; make deps &amp;&amp; make lint check build</code> passes.</li>
+<li>CI is green on ubuntu-only jobs that call <code>make</code>.</li>
+<li>None of the paths listed under <strong>Delete</strong> above exist.</li>
+<li>No Windows, macOS or pnpm reference remains. This command prints nothing:<pre><code class="language-sh">git grep -n -P '\bpnpm\b|\bnsis\b|\bNSIS\b|pythonw|[Ee]xplorer|cfg\(windows\)|target_os = &quot;(windows|macos)&quot;|windows_subsystem|windows-latest|tauri\.windows|&quot;Scripts&quot;|CREATE_NO_WINDOW|creation_flags|raw_arg|icon\.(ico|icns)\b' \
+  -- . ':!docs/plans' ':!docs/adr' ':!README.md' ':!CONTRIBUTING.md' ':!*.lock'
+</code></pre>
+<ul>
+<li><strong>Exact patterns, not bare words.</strong> A bare word like <code>windows</code> or <code>nsis</code> matches things that legitimately stay: Tauri's <code>&quot;windows&quot;</code> key for app windows (<code>tauri.conf.json</code>, the capabilities file), a &quot;tall windows&quot; code comment, and &quot;consistent&quot; in <code>db.rs</code>.</li>
+<li><strong>Exclusions:</strong>
+<ul>
+<li><code>*.lock</code>: <code>Cargo.lock</code> lists transitive <code>windows-*</code> crates.</li>
+<li><code>docs/plans</code> and <code>docs/adr</code>: kept as history (D9).</li>
+<li><code>README.md</code> and <code>CONTRIBUTING.md</code>: step 2 rewrites or deletes them and carries this check over to them.</li>
+</ul>
+</li>
+<li><strong><code>docs/specs</code></strong> stays in scope. It has no matches today.</li>
+</ul>
+</li>
+<li><code>make dev</code> launches the app on your machine without exporting <code>WEBKIT_DISABLE_DMABUF_RENDERER</code>.</li>
+<li>Reveal works from the detail panel.</li>
+</ul>
+<h3 id="step-2-agent-docs">Step 2: Agent docs</h3>
+<ul>
+<li>
+<p><strong><code>AGENTS.md</code></strong> (<code>CLAUDE.md</code> → symlink) stays well under Mission Control's 24 KB standards-bundle cap. Sections:</p>
+<ul>
+<li>what this fork is (D1, D2)</li>
+<li>commands: only the make targets that exist when step 2 lands (<code>deps</code>, <code>dev</code>, <code>lint</code>, <code>check</code>, <code>build</code>). Step 3 adds <code>make test</code>, and step 5 adds <code>make install</code>/<code>make uninstall</code>, the same way the D17 rule is deferred to step 4.</li>
+<li>repository layout</li>
+<li>architecture invariants carried over from <code>CONTRIBUTING.md</code>: relative paths in library DBs, <code>DELETE</code> journaling on library DBs, batched writes, Rust-native raster decoding, the persistent Python worker, zero telemetry</li>
+<li>the tag/collection rule from D17, written when step 4 lands</li>
+<li>working rules: conventional commits, <code>feat/</code>/<code>fix/</code>/<code>chore/</code> branches, never merge, tests run by file</li>
+<li>commit attribution (D22): never add an agent as a commit co-author. No <code>Co-Authored-By</code> trailer naming Claude or any other agent, whatever a harness's default attribution says.</li>
+<li>writing style (D23): plain dashes only, never em dashes, in code, docs, commit messages, and PR text</li>
+</ul>
+</li>
+<li>
+<p><strong><code>docs/agents/running-the-app.md</code>:</strong></p>
+<ul>
+<li><code>make dev</code></li>
+<li>where the app data and library DBs live</li>
+<li>read-only sqlite inspection while the app holds the DB (<code>sqlite3 -readonly -cmd &quot;.timeout 20000&quot;</code>)</li>
+<li>capturing the window for workflow evidence on KDE with <code>spectacle -b -n -a -o &lt;file&gt;.png</code>, into a gitignored path</li>
+</ul>
+</li>
+<li>
+<p><strong><code>.claude/settings.json</code>:</strong> a small allowlist with <code>make lint/check/build</code>, read-only <code>git</code>/<code>bun</code>/<code>cargo</code>/<code>uv</code> queries, and <code>gh pr checks</code>/<code>gh pr view</code>. Step 3 adds <code>make test</code>. <code>.gitignore</code> gets <code>.claude/settings.local.json</code> and <code>.claude/worktrees/</code>.</p>
+</li>
+<li>
+<p><strong>README:</strong> a short personal README covering:</p>
+<ul>
+<li>what it is</li>
+<li>how to set it up and run it from a checkout on Linux (<code>mise install &amp;&amp; make deps &amp;&amp; make dev</code>)</li>
+<li>credit to LawLaw09/OpenDAM, with the MIT notice</li>
+</ul>
+<p>Step 5 adds the install section. Then delete <code>CONTRIBUTING.md</code>.</p>
+</li>
+</ul>
+<p><strong>Done when</strong></p>
+<ul>
+<li><code>AGENTS.md</code> and <code>CLAUDE.md</code> resolve to the same content.</li>
+<li><code>AGENTS.md</code> states the no-agent-co-author rule (D22) and the plain-dashes rule (D23), and contains no em dashes.</li>
+<li>Every command in <code>AGENTS.md</code>, the README and the running-the-app doc runs as written. None of them names a make target that doesn't exist yet.</li>
+<li>The running-the-app doc's screenshot command produces a PNG of the app window.</li>
+<li><code>CONTRIBUTING.md</code> is gone, and step 1's reference check passes without the <code>':!README.md' ':!CONTRIBUTING.md'</code> exclusions.</li>
+</ul>
+<h3 id="step-3-test-runners">Step 3: Test runners</h3>
+<ul>
+<li><strong>JUnit file probe (do this first):</strong> once each runner works, run it on a seed test and inspect the XML for the attribute that identifies the test's source file. Mission Control's testing contract needs this to rerun a failed file.
+<ul>
+<li><strong>bun:</strong> already verified to write <code>file</code> on each <code>&lt;testcase&gt;</code>.</li>
+<li><strong>nextest:</strong> identifies tests by binary and module path, and Rust unit tests live inside source modules, so its XML may not name a source file.</li>
+<li><strong>Fallback:</strong> if it doesn't, record which attributes identify a Rust test (for example the binary in <code>classname</code> and the module path in <code>name</code>) and how that maps to a file.</li>
+</ul>
+</li>
+<li><strong>Rust:</strong> cargo-nextest with a <code>ci</code> profile that writes JUnit (<code>apps/desktop/src-tauri/.config/nextest.toml</code>). Seed it with unit tests for pure helpers (<code>resolve_path</code>, <code>make_relative_path</code>) and one in-memory SQLite test (<code>sqlite::memory:</code> with <code>002_library_schema.sql</code>), which proves step 4 can test DB behaviour.</li>
+<li><strong>TypeScript:</strong> <code>bun test</code> (with <code>@types/bun</code>), JUnit via <code>--reporter=junit --reporter-outfile</code>. Seed it with a test of an existing pure frontend helper.</li>
+<li><strong><code>make test</code></strong> runs both. CI gets a test job.</li>
+<li><strong>Docs:</strong> add <code>make test</code> to <code>AGENTS.md</code>'s commands and to the <code>.claude/settings.json</code> allowlist.</li>
+</ul>
+<p><strong>Done when</strong></p>
+<ul>
+<li><code>make test</code> passes locally and in CI.</li>
+<li>Both runners emit JUnit XML.</li>
+<li>The step records, for each runner, the attribute that names a test's file. For nextest, if no attribute does, it records how a test maps back to its file. That note goes to the &quot;Set up testing&quot; task (manual step 3).</li>
+<li><code>AGENTS.md</code> and the allowlist list <code>make test</code>.</li>
+</ul>
+<h3 id="step-4-fixes-1-6-each-with-a-regression-test">Step 4: Fixes #1-#6, each with a regression test</h3>
+<ol>
+<li><strong>#1 Offline library.</strong>
+<ul>
+<li><code>get_library_handle(Some(id))</code> returns <code>None</code> when <code>id</code> isn't open, with no fallback.</li>
+<li><code>index_paths</code> returns without touching any DB when the library isn't open or its root is missing.</li>
+<li>Startup re-index and F5 skip offline libraries.</li>
+<li><em>Test:</em> two libraries, one with a missing root. Indexing the missing one leaves the other's rows intact.</li>
+</ul>
+</li>
+<li><strong>#2 Panic abort.</strong>
+<ul>
+<li>Remove <code>panic = &quot;abort&quot;</code> from <code>[profile.release]</code>.</li>
+<li>Factor the guarded decode into one function.</li>
+<li><em>Test:</em> the Rust config test <code>apps/desktop/src-tauri/tests/security_config.rs</code> asserts that <code>[profile.release]</code> doesn't set <code>panic = &quot;abort&quot;</code>. Whichever of #2 and #5 lands first creates the file. The test fails on <code>main</code>, where <code>Cargo.toml:40</code> sets it.</li>
+<li><em>Guard, not the regression test:</em> a unit test that a panicking decoder yields <code>Err</code> from the factored function. It passes on <code>main</code> too, because the test profile unwinds whatever <code>[profile.release]</code> says.</li>
+</ul>
+</li>
+<li><strong>#3 FTS input.</strong>
+<ul>
+<li>Build the <code>MATCH</code> expression from the user's text: split on whitespace, wrap each term as an FTS5 string with embedded <code>&quot;</code> doubled, and add a prefix <code>*</code> to each term.</li>
+<li>Search failures show in the UI instead of leaving stale results.</li>
+<li><em>Test:</em> <code>low-poly</code>, <code>tree.glb</code>, <code>&quot;</code>, <code>AND</code>, and <code>(</code> neither error nor miss the expected rows.</li>
+</ul>
+</li>
+<li><strong>#4 Trash.</strong>
+<ul>
+<li>No <code>remove_file</code> fallback. A failed trash returns an error to the UI, and the asset row stays.</li>
+<li><em>Test:</em> an injected failing trash function returns <code>Err</code>, and the file still exists.</li>
+</ul>
+</li>
+<li><strong>#5 Security surface.</strong>
+<ul>
+<li>
+<p><strong>Asset protocol scope:</strong> the static scope is reduced to app data. Each library root is added at runtime with <code>asset_protocol_scope().allow_directory(root, true)</code> on startup and on library add.</p>
+</li>
+<li>
+<p><strong>Capabilities:</strong> only <code>core:default</code>, <code>dialog:default</code>, and opener's minimal permissions.</p>
+</li>
+<li>
+<p><strong>CSP:</strong> a real CSP that allows <code>'self'</code>, <code>asset:</code>/<code>http://asset.localhost</code>, <code>ipc:</code>/<code>http://ipc.localhost</code>, and <code>blob:</code>/<code>data:</code> only where three.js and video previews need them.</p>
+</li>
+<li>
+<p><strong>Devtools:</strong> the <code>devtools</code> feature is dropped (D20).</p>
+</li>
+<li>
+<p><em>Test:</em> the Rust config test <code>apps/desktop/src-tauri/tests/security_config.rs</code> (shared with #2) parses the shipped <code>tauri.conf.json</code>, <code>capabilities/*.json</code> and <code>Cargo.toml</code>. It asserts:</p>
+<ul>
+<li><code>app.security.csp</code> is a non-null policy with a <code>default-src</code>.</li>
+<li>The asset protocol's static scope has no <code>**</code>, <code>**/*</code>, <code>$HOME/**</code> or <code>$DESKTOP/**</code> entry.</li>
+<li>No capability grants a <code>**</code> path or any <code>fs:</code>/<code>shell:</code> permission.</li>
+<li>The <code>tauri</code> dependency's features don't include <code>devtools</code>.</li>
+</ul>
+<p>It fails on <code>main</code> before this fix, because the scope is <code>**</code>, <code>csp</code> is <code>null</code> and <code>devtools</code> is enabled.</p>
+</li>
+<li>
+<p><em>Check (manual, in addition to the test):</em> exercise thumbnails, the 3D viewer, video previews, and Quick Look.</p>
+<ul>
+<li>In <code>make dev</code>, the devtools console shows no CSP violations.</li>
+<li>In the release build, which has no devtools (D20) and serves the embedded <code>frontendDist</code> instead of <code>devUrl</code>, check by eye that all four render.</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>#6 Tag/collection model (D17).</strong>
+<ul>
+<li><strong>Reads:</strong> <code>list_tags</code> and the collection reads come from the master DB.</li>
+<li><strong>Definitions:</strong> create, update, and delete write to master and mirror to every open library (as today).</li>
+<li><strong>Memberships:</strong> <code>asset_tags</code> and <code>collection_assets</code> rows are written only to the asset's own library, resolved explicitly.</li>
+<li><strong>Removals:</strong> <code>get_active_pool</code> and the <code>libs.values().next()</code> fallback are removed. Every caller passes an explicit library or iterates all of them.</li>
+<li><strong>Library open (insert-only, master wins):</strong>
+<ul>
+<li><strong>Keep <code>main</code>'s <code>sync_library_metadata</code></strong> (<code>db.rs:215-259</code>). It runs at startup and on library add, and only inserts missing rows (<code>INSERT OR IGNORE</code>). Master gains the definitions it lacks, so a library folder brought from another machine still brings its new tags. A mirror never overwrites a definition master already has, so a rename or recolour made while a library was offline is kept.</li>
+<li><strong>New in this fix:</strong> after that insert, master's definitions overwrite the opened library's mirror, so mirrors converge on master.
+<ul>
+<li><strong>Mechanism:</strong> the overwrite updates the existing row in place: <code>UPDATE tags SET name = ?, color = ?, parent_id = ? WHERE id = ?</code>, and <code>UPDATE collections SET name = ?, description = ?, parent_id = ?, is_smart = ?, filter_spec = ? WHERE id = ?</code>. An <code>INSERT ... ON CONFLICT(id) DO UPDATE</code> is equivalent.</li>
+<li><strong>Never <code>REPLACE</code> or <code>INSERT OR REPLACE</code>.</strong> REPLACE deletes the old row before inserting. On a connection with foreign keys on, <code>ON DELETE CASCADE</code> on <code>asset_tags.tag_id</code>, <code>collection_assets.collection_id</code> and <code>collections.parent_id</code> (and <code>ON DELETE SET NULL</code> on <code>tags.parent_id</code>) would then wipe the library's memberships and child collections.</li>
+<li><strong>Name collisions:</strong> <code>tags.name</code> is <code>UNIQUE</code>. If master's name for a tag collides with a different tag's name in the mirror, that row's update fails. Log it and leave the row; never delete either tag to make room.</li>
+</ul>
+</li>
+<li><strong>Stable order:</strong> startup syncs libraries in library-id order. When two mirrors disagree about a definition master lacks, the winner then doesn't depend on HashMap order.</li>
+</ul>
+</li>
+<li><strong>Cleanup:</strong> an idempotent pass removes orphan membership rows whose asset isn't in that library.</li>
+<li><em>Test:</em> two libraries, A and B, both open.
+<ul>
+<li><strong>Fixture:</strong> the fixture opens each library pool with <code>foreign_keys</code> off in its connect options. On <code>main</code>, <code>connect_library_sqlite</code> (<code>db.rs:43-51</code>) turns foreign keys off with a <code>PRAGMA</code> that reaches only the one pooled connection running it, while sqlx-sqlite 0.8.6 turns them on for every new connection. So a stray <code>asset_tags</code> insert for an asset the library doesn't hold can be silently rejected, depending on which connection runs it. Pinning the setting off makes the stray row land every time on <code>main</code>.</li>
+<li><strong>Memberships:</strong> tag one asset in A and another in B. Each <code>asset_tags</code> row exists only in its own library's DB. This fails on <code>main</code> whatever order the HashMap is in: the &quot;active&quot; library is always one of the two, so it receives the other library's row.</li>
+<li><strong>Reads:</strong> with both libraries open, give a tag a different name in master than in both mirrors. <code>list_tags</code> returns master's name. On <code>main</code> it returns a mirror's name.</li>
+<li><strong>Open:</strong> master names tag T &quot;new&quot;. A's mirror names T &quot;old&quot; and also holds a tag U that master lacks. After A opens, master still says &quot;new&quot; and has gained U, and A's mirror now says &quot;new&quot;. On <code>main</code> the mirror still says &quot;old&quot;, because the sync only inserts missing rows.</li>
+<li><strong>Open keeps memberships (foreign keys on):</strong> a separate fixture opens A's pool with <code>foreign_keys</code> on, as most production connections are.
+<ul>
+<li><strong>Setup:</strong> in A, an asset is tagged T and is in collection C, and C has a child collection C2. Master renames T and C.</li>
+<li><strong>Assertions:</strong> after A opens, A's mirror shows both new names, and the asset's <code>asset_tags</code> and <code>collection_assets</code> rows and C2 are all still there.</li>
+<li><strong>Why it fails on <code>main</code>:</strong> the mirror keeps the old names. A <code>REPLACE</code>-based fix would also fail it, by cascade-deleting those rows.</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>After this lands, <code>AGENTS.md</code> records the rule.</li>
+</ul>
+</li>
+</ol>
+<p><strong>Done when</strong> each fix's regression test fails on <code>main</code> before the fix and passes after it, and <code>make lint check test build</code> is green.</p>
+<h3 id="step-5-make-install--make-uninstall">Step 5: <code>make install</code> / <code>make uninstall</code></h3>
+<ul>
+<li><strong><code>make install</code></strong> builds the release binary (<code>tauri build --no-bundle</code>) and installs:
+<ul>
+<li><code>~/.local/bin/opendam</code></li>
+<li><code>~/.local/share/applications/opendam.desktop</code></li>
+<li><code>~/.local/share/icons/hicolor/128x128/apps/opendam.png</code></li>
+<li><code>~/.local/share/opendam/preview-engine/</code> (<code>worker.py</code>, <code>pyproject.toml</code>, <code>uv.lock</code>, then <code>uv sync --frozen --no-dev</code> there)</li>
+</ul>
+</li>
+<li><strong><code>preview.rs</code> lookup order:</strong>
+<ol>
+<li><code>OPENDAM_PYTHON</code>/<code>OPENDAM_WORKER</code></li>
+<li><code>${XDG_DATA_HOME:-~/.local/share}/opendam/preview-engine/{.venv/bin/python,worker.py}</code></li>
+<li>the dev repo <code>.venv</code></li>
+</ol>
+</li>
+<li><strong>Worker robustness:</strong> the bare-name fallback resolves <code>python3</code> on <code>PATH</code>, and the worker's stderr goes to <code>tracing</code> instead of <code>/dev/null</code>.</li>
+<li><strong><code>make uninstall</code></strong> removes exactly what <code>install</code> created. It never touches <code>~/.local/share/com.opendam.desktop</code> (master DB) or a library's <code>.opendam/</code> folder.</li>
+<li><strong>Docs:</strong>
+<ul>
+<li>add <code>make install</code>/<code>make uninstall</code> to <code>AGENTS.md</code>'s commands</li>
+<li>add an install section to the README: <code>make install</code>, how to update by re-running it, <code>make uninstall</code>, and what uninstall leaves in place</li>
+</ul>
+</li>
+</ul>
+<p><strong>Done when</strong> OpenDAM launched from the KDE launcher (not a terminal):</p>
+<ul>
+<li>shows the existing Kenney library</li>
+<li>generates a Python-backed preview for a non-native model format, for example FBX</li>
+<li>survives a corrupt PNG</li>
+</ul>
+<p><code>make uninstall</code> then leaves no installed files behind. <code>AGENTS.md</code> and the README document both targets, and their commands run as written.</p>
+<h3 id="step-6-refactors-7">Step 6: Refactors (#7)</h3>
+<ul>
+<li>Split <code>Sidebar.tsx</code> into one component per section (libraries, collection tree, tags, smart filters) with no behaviour change.</li>
+<li>Replace the five copies of the <code>col_tree</code> recursive CTE in <code>search_assets</code> with one SQL builder. Step 4's search tests guard it.</li>
+</ul>
+<p><strong>Done when</strong> no behaviour changes, <code>make lint check test build</code> is green, and <code>Sidebar.tsx</code> and <code>search_assets</code> each shrink to a readable size.</p>
+<h2 id="manual-steps-for-you">Manual steps for you</h2>
+<ol>
+<li><strong>After step 1 merges:</strong> Mission Control → Settings → Worktrees → the OpenDAM pool → setup argv <code>make deps</code>.</li>
+<li><strong>Any time:</strong> run <code>git remote remove upstream</code> in <code>~/Dev/OpenDAM</code> (and any other clone).</li>
+<li><strong>After step 3 merges:</strong> Mission Control → Settings → Trust → <strong>Set up testing</strong> for OpenDAM. That task owns <code>.mission/testing.json</code>, the <code>mission-flake-report</code> action, and the affected-tests Command.</li>
+<li><strong>After step 2 merges:</strong> delete the personal Claude memory note <code>running-opendam-dev</code>. <code>docs/agents/running-the-app.md</code> supersedes it.</li>
+<li><strong>Until step 4's fix #1 merges:</strong> don't register a second library.</li>
+</ol>
+<h2 id="out-of-scope-and-known-gaps">Out of scope and known gaps</h2>
+<ul>
+<li><strong>Packaging.</strong> No Python tests, and no AppImage, .deb, or PKGBUILD.</li>
+<li><strong>Watching.</strong> No live filesystem watching. The empty <code>LibraryWatcher</code> is removed, not implemented.</li>
+<li><strong>Kept but unmaintained.</strong> The AEC format code stays but isn't maintained or advertised. <code>docs/adr</code>/<code>docs/specs</code> stay as they are, and ADR-001 still describes a cross-platform target.</li>
+<li><strong>File size.</strong> <code>DetailPanel.tsx</code> (711 lines) and <code>SmartFilterModal.tsx</code> (673 lines) aren't split.</li>
+<li><strong>Deleted tags can come back.</strong> A tag deleted while a library is offline survives in that library's mirror. Because library open adds what master lacks, the tag comes back into master the next time that library opens. This is accepted for now, with no tombstones. Renames and recolours made while a library is offline are not affected: master wins and overwrites that library's mirror on open.</li>
+<li><strong>Per-connection foreign keys.</strong> Library DBs enforce foreign keys on some pooled connections and not others: <code>connect_library_sqlite</code> turns them off with a <code>PRAGMA</code> on one connection, while sqlx turns them on for every new connection. I found this while validating fix #6's test. It isn't one of the seven findings you scoped (D8), so it should become a GitHub issue rather than part of this plan.</li>
+<li><strong>Fork network.</strong> The repo stays in GitHub's fork network. <code>gh</code> already defaults to <code>ramiro314/OpenDAM</code>.</li>
+<li><strong>Unverified.</strong>
+<ul>
+<li>Whether <code>tauri-plugin-opener</code> selects the file on KDE; the fallback is defined.</li>
+<li>Whether mise can install cargo-nextest; the fallback is defined.</li>
+<li>Whether cargo-nextest's JUnit names each test's source file. bun's does (verified). Step 3 probes nextest first, and its fallback records how a Rust test maps to its file for the &quot;Set up testing&quot; task.</li>
+<li>The exact CSP sources three.js needs; step 4 finds them.</li>
+</ul>
+</li>
+</ul>
+
+<hr><p style="color:var(--muted);font-size:.85em">Rendered from <code>docs/plans/personal-fork-alignment/plan.md</code>, which is the source of truth.</p>
+</main></body></html>
