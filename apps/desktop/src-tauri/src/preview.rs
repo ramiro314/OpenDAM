@@ -45,6 +45,13 @@ pub fn generate_image_thumb(source: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Runs `decode`, turning a panic into `Err`: a malformed file can panic inside
+/// the decoder, and that should fail one image, not the app. Relies on
+/// `[profile.release]` unwinding on panic.
+fn catch_decoder_panic(decode: impl FnOnce() -> Result<()> + std::panic::UnwindSafe) -> Result<()> {
+    std::panic::catch_unwind(decode).unwrap_or_else(|_| Err(anyhow!("image decoder panicked")))
+}
+
 /// Persistent Python worker process communicating over JSON-RPC on stdin/stdout.
 /// Stays alive across requests to eliminate Python cold-start overhead (200-500ms per file).
 struct PythonWorker {
@@ -347,9 +354,7 @@ async fn run_image_queue(state: Arc<AppState>) {
                 let dest = thumb_dir.join(&thumb_file_name);
 
                 tasks.spawn_blocking(move || {
-                    // A malformed file can panic inside the decoder; treat that as a failure.
-                    let res = std::panic::catch_unwind(|| generate_image_thumb(&source, &dest))
-                        .unwrap_or_else(|_| Err(anyhow!("image decoder panicked")))
+                    let res = catch_decoder_panic(|| generate_image_thumb(&source, &dest))
                         .map_err(|e| format!("{}: {}", source.display(), e));
                     (job_id, asset_id, thumb_file_name, res)
                 });
@@ -527,5 +532,23 @@ async fn run_python_queue(state: Arc<AppState>, py_exec: PathBuf, worker_py: Pat
         if !processed_any {
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoder_panic_becomes_err() {
+        let res = catch_decoder_panic(|| panic!("malformed image"));
+        assert_eq!(res.unwrap_err().to_string(), "image decoder panicked");
+    }
+
+    #[test]
+    fn decoder_result_passes_through() {
+        assert!(catch_decoder_panic(|| Ok(())).is_ok());
+        let res = catch_decoder_panic(|| Err(anyhow!("bad header")));
+        assert_eq!(res.unwrap_err().to_string(), "bad header");
     }
 }

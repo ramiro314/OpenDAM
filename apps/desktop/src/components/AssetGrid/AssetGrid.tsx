@@ -16,7 +16,7 @@ const GRID_COLS: Record<'sm' | 'md' | 'lg', number> = {
 
 export function AssetGrid() {
   const { viewMode, gridSize, selectedAssetIds, selectAsset, clearSelection } = useUIStore();
-  const { assets, loading, total, loadMore } = useAssetStore();
+  const { assets, loading, total, loadMore, searchError } = useAssetStore();
   const scrollRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const hasMore = assets.length < total;
@@ -51,6 +51,18 @@ export function AssetGrid() {
     },
     [selectAsset]
   );
+
+  if (searchError && !loading) {
+    return (
+      <div className={styles.container}>
+        <FilterBar />
+        <div className={styles.empty} role="alert">
+          <div className={styles.emptyTitle}>Search failed</div>
+          <div className={styles.emptyText}>{searchError}</div>
+        </div>
+      </div>
+    );
+  }
 
   if (loading && assets.length === 0) {
     return (
