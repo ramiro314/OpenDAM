@@ -2,7 +2,7 @@ use chrono::Utc;
 use serde_json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::{Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 use crate::models::{AddLibraryPayload, Library};
@@ -10,6 +10,17 @@ use crate::watcher;
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
+
+/// Lets the webview load files under a library's roots through the asset protocol, whose static
+/// scope in `tauri.conf.json` covers only app data.
+pub fn allow_library_roots(app: &AppHandle, root_paths: &[String]) {
+    let scope = app.asset_protocol_scope();
+    for root in root_paths {
+        if let Err(e) = scope.allow_directory(root, true) {
+            tracing::error!("Failed to allow asset access to {}: {}", root, e);
+        }
+    }
+}
 
 #[tauri::command]
 pub async fn add_library(
@@ -29,6 +40,7 @@ pub async fn add_library(
         .register_library(&id, &payload.name, &root_path)
         .await
         .map_err(|e| e.to_string())?;
+    allow_library_roots(&state.app_handle, &payload.root_paths);
 
     // Record in master database
     sqlx::query(

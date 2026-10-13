@@ -15,7 +15,7 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset", "devtools"] }
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
@@ -30,6 +30,9 @@ image = { version = "0.25", features = ["jpeg", "png", "tiff", "bmp", "gif", "tg
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trash = "5"
+
+[dev-dependencies]
+toml = "0.8"
 
 [profile.release]
 panic = "abort"

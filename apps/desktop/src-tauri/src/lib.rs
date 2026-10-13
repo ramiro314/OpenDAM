@@ -38,11 +38,36 @@ pub fn run() {
             let db_path = app_data_dir.join("opendam.sqlite");
 
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            let db = rt.block_on(async {
-                Database::new(db_path.to_str().unwrap())
+            let (db, libraries) = rt.block_on(async {
+                let db = Database::new(db_path.to_str().unwrap())
                     .await
-                    .expect("Failed to initialize database")
+                    .expect("Failed to initialize database");
+                let libraries =
+                    sqlx::query_as::<_, (String, String)>("SELECT id, root_paths FROM libraries")
+                        .fetch_all(&db.master_pool)
+                        .await;
+                (db, libraries)
             });
+            let libraries: Vec<(String, Vec<String>)> = match libraries {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|(id, root_paths_json)| {
+                        (
+                            id,
+                            serde_json::from_str(&root_paths_json).unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
+                Err(e) => {
+                    tracing::error!("Failed to list libraries: {}", e);
+                    Vec::new()
+                }
+            };
+
+            // Before the webview asks for any thumbnail
+            for (_, paths) in &libraries {
+                commands::library::allow_library_roots(app.handle(), paths);
+            }
 
             let state = Arc::new(AppState {
                 db,
@@ -57,19 +82,10 @@ pub fn run() {
             // Re-index all existing libraries on startup in background
             let startup_state = state.clone();
             tauri::async_runtime::spawn(async move {
-                let rows =
-                    sqlx::query_as::<_, (String, String)>("SELECT id, root_paths FROM libraries")
-                        .fetch_all(&startup_state.db.master_pool)
-                        .await;
-
-                if let Ok(libraries) = rows {
-                    for (id, root_paths_json) in libraries {
-                        let paths: Vec<String> =
-                            serde_json::from_str(&root_paths_json).unwrap_or_default();
-                        let _ = watcher::index_paths(&startup_state.db, &id, &paths).await;
-                    }
-                    let _ = startup_state.app_handle.emit("library:updated", ());
+                for (id, paths) in libraries {
+                    let _ = watcher::index_paths(&startup_state.db, &id, &paths).await;
                 }
+                let _ = startup_state.app_handle.emit("library:updated", ());
             });
 
             // ── Cross-machine NAS change detection ───────────────────────────────
