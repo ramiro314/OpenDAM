@@ -512,4 +512,25 @@ mod tests {
 
         assert_eq!(asset_count(&pool).await, 1);
     }
+
+    #[tokio::test]
+    async fn indexing_an_open_library_whose_root_exists_still_reindexes_it() {
+        let root = std::env::temp_dir().join(format!("opendam-mounted-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".opendam")).unwrap();
+        std::fs::write(root.join("notes.txt"), "hello").unwrap();
+        // The seeded models/tree.glb row has no file on disk, so a re-index removes it.
+        let mounted = library_with_one_asset("mounted", root.clone()).await;
+        let pool = mounted.pool.clone();
+        let db = database_with(vec![mounted]).await;
+
+        let result = index_paths(&db, "mounted", &[root.to_string_lossy().to_string()]).await;
+        let file_paths: Vec<String> = sqlx::query_scalar("SELECT file_path FROM assets")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        result.unwrap();
+        assert_eq!(file_paths, ["notes.txt"]);
+    }
 }
