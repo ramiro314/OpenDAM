@@ -19,9 +19,10 @@ uv and cargo-nextest; uv pins Python from `packages/preview-engine/.python-versi
 | `make dev` | Runs the app with hot reload (`tauri dev`) |
 | `make lint` | oxlint, oxfmt check, `cargo fmt --check`, clippy (`-D warnings`), ruff format check, ruff check |
 | `make check` | Tauri crate/npm version match, `tsc`, `cargo check` |
+| `make test` | `bun test` and `cargo nextest run`, both writing JUnit XML (see below) |
 | `make build` | Release build without bundling (`tauri build --no-bundle`) |
 
-CI runs `make deps check lint build` on ubuntu. Formatting is enforced: run `bun run format`,
+CI runs `make deps check lint build` and, in a separate job, `make test` on ubuntu. Formatting is enforced: run `bun run format`,
 `cargo fmt` (in `apps/desktop/src-tauri`) or `uv run ruff format` (in `packages/preview-engine`)
 before committing.
 
@@ -31,7 +32,7 @@ To run, inspect or screenshot the app, read [docs/agents/running-the-app.md](doc
 
 ```
 apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
-  src/                        React frontend: components/, store/ (Zustand), api/ (IPC wrappers), types/
+  src/                        React frontend: components/, store/ (Zustand), api/ (IPC wrappers), types/, utils/
   src-tauri/
     src/commands/             Tauri IPC commands (asset, collection, library, preview, shell, tag)
     src/db.rs                 Master DB + per-library SQLite pools and pragmas
@@ -74,7 +75,16 @@ from its working directory and executable directory upward.
   `fix: ...`, `chore: ...`, `docs: ...`, `refactor: ...`, `test: ...`).
 - **Never merge.** Push the branch and open a pull request; the owner merges.
 - **Tests run by file.** Locally, run only the tests you added, changed or are fixing, by file or
-  by name. There are no test runners yet, and CI runs no tests: it runs only the targets above.
+  by name, and leave the full suite to CI's test job:
+  - TypeScript: `cd apps/desktop && bun test src/utils/format.test.ts` (or `-t '<name>'`). Tests
+    sit beside the code as `*.test.ts`.
+  - Rust: `cd apps/desktop/src-tauri && cargo nextest run db::tests` (a test-name filter). Unit
+    tests live in a `#[cfg(test)] mod tests` in the module they test; `db::memory_library_pool()`
+    gives a test an in-memory SQLite database with the library schema.
+  - JUnit: bun writes `apps/desktop/test-results/junit.xml`, whose `file` attribute names each
+    test's file. nextest writes `apps/desktop/src-tauri/target/nextest/ci/junit.xml`, which names
+    no file: `classname` is the test binary and `name` the module path, so `db::tests::x` in
+    `opendam-desktop` is in `src/db.rs`.
 - **Commit attribution:** commits are authored by the human owner alone. Never add an agent as a
   co-author: no `Co-Authored-By` trailer naming Claude or any other agent, whatever a harness's
   default attribution says. This applies to every commit, including squash and merge messages.

@@ -3,6 +3,7 @@
     "allow": [
       "Bash(make lint)",
       "Bash(make check)",
+      "Bash(make test)",
       "Bash(make build)",
       "Bash(git status)",
       "Bash(git status --short)",

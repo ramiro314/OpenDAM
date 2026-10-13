@@ -361,3 +361,83 @@ pub fn make_relative_path(root: &Path, p: &Path) -> String {
         .to_string_lossy()
         .into_owned()
 }
+
+/// An in-memory database with the library schema, for tests. One connection,
+/// since every connection to `sqlite::memory:` opens its own empty database.
+#[cfg(test)]
+pub(crate) async fn memory_library_pool() -> Pool<Sqlite> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::query(include_str!("../migrations/002_library_schema.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_path_joins_relative_paths_to_the_root() {
+        let root = Path::new("/mnt/assets");
+        assert_eq!(
+            resolve_path(root, "textures/rock.png"),
+            "/mnt/assets/textures/rock.png"
+        );
+    }
+
+    #[test]
+    fn resolve_path_keeps_absolute_paths() {
+        let root = Path::new("/mnt/assets");
+        assert_eq!(resolve_path(root, "/tmp/rock.png"), "/tmp/rock.png");
+    }
+
+    #[test]
+    fn make_relative_path_strips_the_root() {
+        let root = Path::new("/mnt/assets");
+        assert_eq!(
+            make_relative_path(root, Path::new("/mnt/assets/textures/rock.png")),
+            "textures/rock.png"
+        );
+    }
+
+    #[test]
+    fn make_relative_path_keeps_paths_outside_the_root() {
+        let root = Path::new("/mnt/assets");
+        assert_eq!(
+            make_relative_path(root, Path::new("/tmp/rock.png")),
+            "/tmp/rock.png"
+        );
+    }
+
+    #[test]
+    fn relative_paths_round_trip() {
+        let root = Path::new("/mnt/assets");
+        let rel = make_relative_path(root, Path::new("/mnt/assets/models/tree.glb"));
+        assert_eq!(resolve_path(root, &rel), "/mnt/assets/models/tree.glb");
+    }
+
+    #[tokio::test]
+    async fn library_schema_indexes_assets_for_full_text_search() {
+        let pool = memory_library_pool().await;
+        sqlx::query(
+            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+             VALUES ('a1', 'models/tree.glb', 'tree.glb', 'glb', 'model', 1024, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM assets_fts WHERE assets_fts MATCH 'tree*'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ids, ["a1"]);
+    }
+}

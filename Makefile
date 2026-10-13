@@ -15,7 +15,7 @@ PY_STAMP := $(PREVIEW)/.venv/.deps-stamp
 # for make's own commands, and `make deps` persists the trust for the shell.
 export MISE_TRUSTED_CONFIG_PATHS := $(CURDIR)
 
-.PHONY: deps dev lint check build
+.PHONY: deps dev lint check test build
 
 deps: $(JS_STAMP) $(PY_STAMP)
 	@if command -v mise >/dev/null; then env -u MISE_TRUSTED_CONFIG_PATHS mise trust --quiet; fi
@@ -43,6 +43,14 @@ check: deps
 	bun .github/scripts/check-tauri-versions.mjs
 	cd $(DESKTOP) && bun run typecheck
 	cd $(TAURI) && cargo check --locked
+
+# Both runners write JUnit: bun to apps/desktop/test-results/junit.xml,
+# nextest's ci profile to apps/desktop/src-tauri/target/nextest/ci/junit.xml.
+# bun neither creates the report's directory nor fails when it can't write it.
+test: deps
+	mkdir -p $(DESKTOP)/test-results
+	cd $(DESKTOP) && bun test --reporter=junit --reporter-outfile=test-results/junit.xml
+	cd $(TAURI) && cargo nextest run --locked --profile ci
 
 # tauri build runs the vite build first (beforeBuildCommand in tauri.conf.json).
 build: deps
