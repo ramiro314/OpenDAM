@@ -51,12 +51,12 @@ export function DetailPanel() {
 
   const [isEditingName, setIsEditingName] = useState(false);
   const [editingName, setEditingName] = useState('');
-  const [nameError, setNameError] = useState<string | null>(null);
+  const [panelError, setPanelError] = useState<string | null>(null);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
 
   useEffect(() => {
     setIsEditingName(false);
-    setNameError(null);
+    setPanelError(null);
     if (asset) {
       setEditingName(asset.fileName);
     }
@@ -105,7 +105,7 @@ export function DetailPanel() {
     if (!asset) return;
     setIsEditingName(true);
     setEditingName(asset.fileName);
-    setNameError(null);
+    setPanelError(null);
   };
 
   const handleSaveRename = async () => {
@@ -113,15 +113,15 @@ export function DetailPanel() {
     const trimmed = editingName.trim();
     if (!trimmed || trimmed === asset.fileName) {
       setIsEditingName(false);
-      setNameError(null);
+      setPanelError(null);
       return;
     }
     try {
       await renameAsset(asset.id, trimmed);
       setIsEditingName(false);
-      setNameError(null);
+      setPanelError(null);
     } catch (err: any) {
-      setNameError(err?.message || String(err));
+      setPanelError(err?.message || String(err));
     }
   };
 
@@ -130,8 +130,8 @@ export function DetailPanel() {
     setIsDeleteDialogOpen(false);
     try {
       await deleteAsset(asset.id, true);
-    } catch (err) {
-      console.error('Failed to delete asset:', err);
+    } catch (err: any) {
+      setPanelError(err?.message || String(err));
     }
   };
 
@@ -225,12 +225,12 @@ export function DetailPanel() {
               value={editingName}
               onChange={(e) => {
                 setEditingName(e.target.value);
-                if (nameError) setNameError(null);
+                if (panelError) setPanelError(null);
               }}
               onKeyDown={(e) => {
                 if (e.key === 'Escape') {
                   setIsEditingName(false);
-                  setNameError(null);
+                  setPanelError(null);
                 }
               }}
             />
@@ -246,7 +246,7 @@ export function DetailPanel() {
               className={clsx(styles.nameActionBtn, styles.nameActionBtnCancel)}
               onClick={() => {
                 setIsEditingName(false);
-                setNameError(null);
+                setPanelError(null);
               }}
               title="Cancel"
             >
@@ -341,7 +341,7 @@ export function DetailPanel() {
         </div>
       </div>
 
-      {nameError && (
+      {panelError && (
         <div
           style={{
             color: '#ef4444',
@@ -350,7 +350,7 @@ export function DetailPanel() {
             background: 'rgba(239, 68, 68, 0.1)',
           }}
         >
-          {nameError}
+          {panelError}
         </div>
       )}
 
