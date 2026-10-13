@@ -80,6 +80,20 @@ fn row_to_asset(root: Option<&Path>, row: RawAssetRow) -> Asset {
     }
 }
 
+/// Builds an FTS5 `MATCH` expression from free search text. Each whitespace-separated term
+/// becomes a quoted FTS5 string (embedded `"` doubled) with a prefix `*`, so input like
+/// `low-poly`, `tree.glb` or `AND` is matched literally instead of parsed as FTS5 syntax.
+/// Terms with no letters or digits (`"`, `(`) would tokenize to nothing and match no row, so
+/// they are dropped; `None` means there is nothing to match on.
+fn fts_match_expression(text: &str) -> Option<String> {
+    let terms: Vec<String> = text
+        .split_whitespace()
+        .filter(|t| t.chars().any(char::is_alphanumeric))
+        .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
 #[tauri::command]
 pub async fn search_assets(
     payload: SearchPayload,
@@ -121,18 +135,24 @@ pub async fn search_assets(
         list
     };
 
+    search_libraries(&payload, &target_libs).await
+}
+
+async fn search_libraries(
+    payload: &SearchPayload,
+    target_libs: &[(sqlx::Pool<sqlx::Sqlite>, Option<std::path::PathBuf>)],
+) -> Result<SearchResult> {
     let offset = payload.page * payload.page_size;
     let limit = payload.page_size;
 
-    let has_fts = !payload.query.text.trim().is_empty();
     let f = &payload.query.filter;
 
     let mut conditions: Vec<String> = Vec::new();
     let mut binds: Vec<String> = Vec::new();
 
-    if has_fts {
+    if let Some(fts) = fts_match_expression(&payload.query.text) {
         conditions.push("a.id IN (SELECT id FROM assets_fts WHERE assets_fts MATCH ?)".into());
-        binds.push(format!("{}*", payload.query.text.trim()));
+        binds.push(fts);
     }
 
     if let Some(kinds) = &f.kinds {
@@ -527,7 +547,7 @@ pub async fn search_assets(
     let mut total: i64 = 0;
     let mut all_assets: Vec<Asset> = Vec::new();
 
-    for (pool, root_opt) in &target_libs {
+    for (pool, root_opt) in target_libs {
         let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
         for b in &binds {
             count_query = count_query.bind(b.clone());
@@ -948,4 +968,85 @@ pub async fn rename_asset(
 
     let _ = state.app_handle.emit("library:updated", ());
     get_asset(id, state).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::memory_library_pool;
+
+    #[test]
+    fn fts_match_expression_quotes_each_term_as_a_prefix_string() {
+        assert_eq!(
+            fts_match_expression("low-poly tree.glb").as_deref(),
+            Some(r#""low-poly"* "tree.glb"*"#)
+        );
+        assert_eq!(fts_match_expression("AND").as_deref(), Some(r#""AND"*"#));
+        assert_eq!(
+            fts_match_expression(r#"say"hi"#).as_deref(),
+            Some(r#""say""hi"*"#)
+        );
+    }
+
+    #[test]
+    fn fts_match_expression_drops_terms_without_letters_or_digits() {
+        assert_eq!(fts_match_expression(""), None);
+        assert_eq!(fts_match_expression("  \" ( "), None);
+        assert_eq!(
+            fts_match_expression("( tree").as_deref(),
+            Some(r#""tree"*"#)
+        );
+    }
+
+    async fn search_names(pool: &sqlx::Pool<sqlx::Sqlite>, text: &str) -> Vec<String> {
+        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+            "query": {
+                "text": text,
+                "filter": {},
+                "sort": { "field": "name", "order": "asc" },
+            },
+            "page": 0,
+            "pageSize": 100,
+        }))
+        .unwrap();
+        let result = search_libraries(&payload, &[(pool.clone(), None)])
+            .await
+            .unwrap_or_else(|e| panic!("search for {text:?} failed: {e}"));
+        result.assets.into_iter().map(|a| a.file_name).collect()
+    }
+
+    #[tokio::test]
+    async fn search_matches_ordinary_text_that_is_fts5_syntax() {
+        let pool = memory_library_pool().await;
+        for name in [
+            "brick.png",
+            "low-poly-rock.fbx",
+            "rock_and_moss.png",
+            "tree.glb",
+        ] {
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+                 VALUES (?, ?, ?, '', 'texture', 0, 0, 0)",
+            )
+            .bind(name)
+            .bind(name)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let all = [
+            "brick.png",
+            "low-poly-rock.fbx",
+            "rock_and_moss.png",
+            "tree.glb",
+        ];
+
+        assert_eq!(search_names(&pool, "low-poly").await, ["low-poly-rock.fbx"]);
+        assert_eq!(search_names(&pool, "tree.glb").await, ["tree.glb"]);
+        assert_eq!(search_names(&pool, "AND").await, ["rock_and_moss.png"]);
+        assert_eq!(search_names(&pool, "\"").await, all);
+        assert_eq!(search_names(&pool, "(").await, all);
+        assert_eq!(search_names(&pool, "( tree").await, ["tree.glb"]);
+    }
 }
