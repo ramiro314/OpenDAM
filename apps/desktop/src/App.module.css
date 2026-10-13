@@ -49,6 +49,26 @@
   color: hsl(142 65% 55%);
 }
 
+/* Sits above the copy toast's spot so both stay readable while the error waits for Dismiss. */
+.errorToast {
+  bottom: 76px;
+  max-width: 80vw;
+  border-color: rgba(239, 68, 68, 0.6);
+  color: #ef4444;
+  pointer-events: auto;
+}
+
+.toastDismiss {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  background: none;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-full);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
 @keyframes toastIn {
   from {
     opacity: 0;

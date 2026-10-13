@@ -21,6 +21,8 @@ uv and cargo-nextest; uv pins Python from `packages/preview-engine/.python-versi
 | `make check` | Tauri crate/npm version match, `tsc`, `cargo check` |
 | `make test` | `bun test` and `cargo nextest run`, both writing JUnit XML (see below) |
 | `make build` | Release build without bundling (`tauri build --no-bundle`) |
+| `make install` | `make build`, then installs `~/.local/bin/opendam`, a desktop entry, an icon and the preview engine under `~/.local/share/opendam/preview-engine` |
+| `make uninstall` | Removes exactly what `make install` created, never the master DB or a library's `.opendam/` |
 
 CI runs `make deps check lint build` and, in a separate job, the same bun test and nextest runs as `make test`, as separate steps so failed TypeScript test files are rerun once to tell flakes from failures (`.github/actions/mission-flake-report`, settings in `.mission/testing.json`). Formatting is enforced: run `bun run format`,
 `cargo fmt` (in `apps/desktop/src-tauri`) or `uv run ruff format` (in `packages/preview-engine`)
@@ -58,14 +60,33 @@ docs/plans                    Plans for this fork
 - **One persistent Python worker.** The worker is a long-lived JSON-over-stdio daemon. Send it
   requests over the existing stream; one process serves every file.
 - **Zero telemetry.** The app makes no network calls to analytics or tracking services.
+- **Master DB is the tag and collection catalog.** Tag and collection lists are read from master.
+  Definition create, update and delete write to master, then mirror to every open library DB.
+  `asset_tags` and `collection_assets` rows go only to the asset's own library
+  (`Database::library_of_asset`). There is no "active library": every caller names a library or
+  iterates all of them (`get_all_libraries`, in library-id order). When libraries open
+  (`Database::sync_open_libraries`), master first gains the definitions it lacks from every open
+  library (insert-only), then every mirror is overwritten from master and drops memberships for
+  assets its library doesn't hold. Mirror writes update rows in place (`db::upsert_tag`,
+  `db::upsert_collection`), never `REPLACE`, which cascade-deletes memberships and child
+  collections.
 
 ## Python preview worker
 
 `make deps` creates the dev venv at `packages/preview-engine/.venv` with `uv sync --frozen`.
 Dependencies live in `pyproject.toml` and `uv.lock`: change them with `uv add`/`uv remove` in that
-directory and commit the lockfile. The app finds the worker through `OPENDAM_PYTHON` and
-`OPENDAM_WORKER` if set, otherwise by searching for `packages/preview-engine/.venv/bin/python`
-from its working directory and executable directory upward.
+directory and commit the lockfile. The app finds the worker in this order (`find_preview_worker`
+in `preview.rs`):
+
+1. `OPENDAM_PYTHON` and `OPENDAM_WORKER`, if set.
+2. The installed engine, `${XDG_DATA_HOME:-~/.local/share}/opendam/preview-engine`.
+3. `packages/preview-engine` in a checkout, searched from the working directory and the executable
+   directory upward.
+
+The engine's `.venv/bin/python` runs `worker.py`, or `python3` on `PATH` if it has no `.venv`.
+After `make install`, `make dev` also runs the installed engine, so to test changes to `worker.py`,
+run `make uninstall` or set `OPENDAM_WORKER` and `OPENDAM_PYTHON` to the checkout's files. The
+worker's stderr goes to the app log under the `preview_worker` target.
 
 ## Working rules
 

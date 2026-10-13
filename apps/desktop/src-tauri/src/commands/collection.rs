@@ -1,8 +1,10 @@
 use chrono::Utc;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tauri::State;
 use uuid::Uuid;
 
+use crate::db::{upsert_collection, CollectionRow, Database};
 use crate::models::Collection;
 use crate::AppState;
 
@@ -10,63 +12,52 @@ type Result<T> = std::result::Result<T, String>;
 
 #[tauri::command]
 pub async fn list_collections(state: State<'_, Arc<AppState>>) -> Result<Vec<Collection>> {
-    let pool = state.db.get_active_pool().await;
-    let mut rows = sqlx::query_as::<_, (String, String, String, Option<String>, bool, Option<String>, i64)>(
+    list_collections_in(&state.db).await
+}
+
+/// Definitions come from the master catalog; each collection's assets are the membership rows
+/// of every open library.
+async fn list_collections_in(db: &Database) -> Result<Vec<Collection>> {
+    let rows = sqlx::query_as::<_, CollectionRow>(
         "SELECT id, name, description, parent_id, is_smart, filter_spec, created_at FROM collections ORDER BY created_at ASC"
     )
-    .fetch_all(&state.db.master_pool).await.unwrap_or_default();
+    .fetch_all(&db.master_pool)
+    .await
+    .map_err(|e| e.to_string())?;
 
-    if rows.is_empty() {
-        rows = sqlx::query_as::<_, (String, String, String, Option<String>, bool, Option<String>, i64)>(
-            "SELECT id, name, description, parent_id, is_smart, filter_spec, created_at FROM collections ORDER BY created_at ASC"
+    // A set per collection: an asset id held by two libraries is listed once.
+    let mut members: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for lib in db.get_all_libraries().await {
+        let pairs = sqlx::query_as::<_, (String, String)>(
+            "SELECT collection_id, asset_id FROM collection_assets",
         )
-        .fetch_all(&pool).await.unwrap_or_default();
-    }
-
-    let libs = state.db.get_all_libraries().await;
-    let mut collections = Vec::new();
-    for (id, name, description, parent_id, is_smart, filter_spec, created_at) in rows {
-        let mut asset_ids_set = std::collections::HashSet::new();
-
-        // Gather asset_ids from all open libraries
-        for lib in &libs {
-            if let Ok(a_rows) = sqlx::query_as::<_, (String,)>(
-                "SELECT asset_id FROM collection_assets WHERE collection_id = ?",
-            )
-            .bind(&id)
-            .fetch_all(&lib.pool)
-            .await
-            {
-                for (aid,) in a_rows {
-                    asset_ids_set.insert(aid);
-                }
-            }
-        }
-        if let Ok(a_rows) = sqlx::query_as::<_, (String,)>(
-            "SELECT asset_id FROM collection_assets WHERE collection_id = ?",
-        )
-        .bind(&id)
-        .fetch_all(&state.db.master_pool)
+        .fetch_all(&lib.pool)
         .await
-        {
-            for (aid,) in a_rows {
-                asset_ids_set.insert(aid);
-            }
+        .map_err(|e| format!("Could not read collections in library {}: {}", lib.name, e))?;
+        for (collection_id, asset_id) in pairs {
+            members.entry(collection_id).or_default().insert(asset_id);
         }
-
-        let asset_ids = asset_ids_set.into_iter().collect();
-        collections.push(Collection {
-            id,
-            name,
-            description,
-            parent_id,
-            asset_ids,
-            is_smart,
-            filter_spec,
-            created_at,
-        });
     }
-    Ok(collections)
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, name, description, parent_id, is_smart, filter_spec, created_at)| Collection {
+                asset_ids: members
+                    .remove(&id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                id,
+                name,
+                description,
+                parent_id,
+                is_smart,
+                filter_spec,
+                created_at,
+            },
+        )
+        .collect())
 }
 
 #[tauri::command]
@@ -78,41 +69,62 @@ pub async fn create_collection(
     filter_spec: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Collection> {
-    let id = Uuid::new_v4().to_string();
-    let now = Utc::now().timestamp_millis();
-    let desc = description.unwrap_or_default();
-    let smart = is_smart.unwrap_or(false);
-    let pool = state.db.get_active_pool().await;
+    create_collection_in(
+        &state.db,
+        name,
+        description,
+        parent_id,
+        is_smart,
+        filter_spec,
+    )
+    .await
+}
+
+/// Writes the definition to master, then mirrors it to every open library.
+async fn create_collection_in(
+    db: &Database,
+    name: String,
+    description: Option<String>,
+    parent_id: Option<String>,
+    is_smart: Option<bool>,
+    filter_spec: Option<String>,
+) -> Result<Collection> {
+    let row: CollectionRow = (
+        Uuid::new_v4().to_string(),
+        name,
+        description.unwrap_or_default(),
+        parent_id,
+        is_smart.unwrap_or(false),
+        filter_spec,
+        Utc::now().timestamp_millis(),
+    );
     sqlx::query(
         "INSERT INTO collections (id, name, description, parent_id, is_smart, filter_spec, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
     )
-    .bind(&id).bind(&name).bind(&desc).bind(&parent_id).bind(smart).bind(&filter_spec).bind(now)
-    .execute(&pool).await.map_err(|e| e.to_string())?;
+    .bind(&row.0).bind(&row.1).bind(&row.2).bind(&row.3).bind(row.4).bind(&row.5).bind(row.6)
+    .execute(&db.master_pool).await.map_err(|e| e.to_string())?;
 
-    // Also sync to all open library pools and master pool
-    let libs = state.db.get_all_libraries().await;
-    for lib in libs {
-        let _ = sqlx::query(
-            "INSERT OR IGNORE INTO collections (id, name, description, parent_id, is_smart, filter_spec, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(&id).bind(&name).bind(&desc).bind(&parent_id).bind(smart).bind(&filter_spec).bind(now)
-        .execute(&lib.pool).await;
+    for lib in db.get_all_libraries().await {
+        if let Err(e) = upsert_collection(&lib.pool, &row).await {
+            tracing::warn!(
+                "Failed to mirror collection {} to library {}: {}",
+                row.0,
+                lib.id,
+                e
+            );
+        }
     }
-    let _ = sqlx::query(
-        "INSERT OR IGNORE INTO collections (id, name, description, parent_id, is_smart, filter_spec, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-    )
-    .bind(&id).bind(&name).bind(&desc).bind(&parent_id).bind(smart).bind(&filter_spec).bind(now)
-    .execute(&state.db.master_pool).await;
 
+    let (id, name, description, parent_id, is_smart, filter_spec, created_at) = row;
     Ok(Collection {
         id,
         name,
-        description: desc,
+        description,
         parent_id,
         asset_ids: vec![],
-        is_smart: smart,
+        is_smart,
         filter_spec,
-        created_at: now,
+        created_at,
     })
 }
 
@@ -122,90 +134,48 @@ pub async fn add_to_collection(
     asset_ids: Vec<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
-    let libs = state.db.get_all_libraries().await;
+    add_assets_to_collection(&state.db, &collection_id, &asset_ids).await
+}
 
-    // Fetch collection info from master_pool or any lib pool
-    let mut col_info = sqlx::query_as::<_, (String, String, String, Option<String>, bool, Option<String>, i64)>(
-        "SELECT id, name, description, parent_id, is_smart, filter_spec, created_at FROM collections WHERE id = ?"
-    )
-    .bind(&collection_id)
-    .fetch_optional(&state.db.master_pool)
-    .await
-    .unwrap_or(None);
-
-    if col_info.is_none() {
-        for lib in &libs {
-            col_info = sqlx::query_as::<_, (String, String, String, Option<String>, bool, Option<String>, i64)>(
-                "SELECT id, name, description, parent_id, is_smart, filter_spec, created_at FROM collections WHERE id = ?"
-            )
-            .bind(&collection_id)
-            .fetch_optional(&lib.pool)
-            .await
-            .unwrap_or(None);
-            if col_info.is_some() {
-                break;
-            }
-        }
+/// Each membership row goes to the asset's own library only. The collection must be in the
+/// master catalog; it is copied, ancestors first, into that library's mirror before the
+/// membership, since a mirror can lack it after a failed mirror write.
+async fn add_assets_to_collection(
+    db: &Database,
+    collection_id: &str,
+    asset_ids: &[String],
+) -> Result<()> {
+    let chain = db
+        .collection_with_ancestors(collection_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if chain.is_empty() {
+        return Err(format!("Collection not found: {}", collection_id));
     }
-
-    // Ensure collection exists in master_pool and all open library pools
-    if let Some((ref cid, ref cname, ref cdesc, ref cpid, csmart, ref cfspec, ctime)) = col_info {
-        let _ = sqlx::query(
-            "INSERT OR IGNORE INTO collections (id, name, description, parent_id, is_smart, filter_spec, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(cid).bind(cname).bind(cdesc).bind(cpid).bind(csmart).bind(cfspec).bind(ctime)
-        .execute(&state.db.master_pool).await;
-
-        for lib in &libs {
-            let _ = sqlx::query(
-                "INSERT OR IGNORE INTO collections (id, name, description, parent_id, is_smart, filter_spec, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-            )
-            .bind(cid).bind(cname).bind(cdesc).bind(cpid).bind(csmart).bind(cfspec).bind(ctime)
-            .execute(&lib.pool).await;
-        }
-    }
-
-    let active_pool = state.db.get_active_pool().await;
-
-    for aid in &asset_ids {
-        let mut found_in_lib = false;
-        for lib in &libs {
-            let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM assets WHERE id = ?")
-                .bind(aid)
-                .fetch_optional(&lib.pool)
-                .await
-                .unwrap_or(None);
-            if exists.is_some() {
-                found_in_lib = true;
-                let _ = sqlx::query("INSERT OR IGNORE INTO collection_assets (collection_id, asset_id) VALUES (?, ?)")
-                    .bind(&collection_id)
-                    .bind(aid)
-                    .execute(&lib.pool)
-                    .await;
+    for aid in asset_ids {
+        let Some(lib) = db.library_of_asset(aid).await.map_err(|e| e.to_string())? else {
+            tracing::warn!(
+                "Asset {} is in no open library, not adding it to a collection",
+                aid
+            );
+            continue;
+        };
+        let add = async {
+            let mut tx = lib.pool.begin().await?;
+            for definition in &chain {
+                upsert_collection(&mut *tx, definition).await?;
             }
-        }
-
-        // Always record in master_pool
-        let _ = sqlx::query(
-            "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
-        )
-        .bind(&collection_id)
-        .bind(aid)
-        .execute(&state.db.master_pool)
-        .await;
-
-        // If not found in any library pool, record in active pool
-        if !found_in_lib {
-            let _ = sqlx::query(
+            sqlx::query(
                 "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
             )
-            .bind(&collection_id)
+            .bind(collection_id)
             .bind(aid)
-            .execute(&active_pool)
-            .await;
-        }
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await
+        };
+        add.await.map_err(|e| e.to_string())?;
     }
-
     Ok(())
 }
 
@@ -215,47 +185,45 @@ pub async fn remove_from_collection(
     asset_ids: Vec<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
-    let libs = state.db.get_all_libraries().await;
-    let active_pool = state.db.get_active_pool().await;
+    remove_assets_from_collection(&state.db, &collection_id, &asset_ids).await
+}
 
-    for aid in &asset_ids {
-        for lib in &libs {
-            let _ = sqlx::query(
-                "DELETE FROM collection_assets WHERE collection_id = ? AND asset_id = ?",
-            )
-            .bind(&collection_id)
-            .bind(aid)
-            .execute(&lib.pool)
-            .await;
+/// Each membership row is removed from the asset's own library.
+async fn remove_assets_from_collection(
+    db: &Database,
+    collection_id: &str,
+    asset_ids: &[String],
+) -> Result<()> {
+    for aid in asset_ids {
+        if let Some(lib) = db.library_of_asset(aid).await.map_err(|e| e.to_string())? {
+            sqlx::query("DELETE FROM collection_assets WHERE collection_id = ? AND asset_id = ?")
+                .bind(collection_id)
+                .bind(aid)
+                .execute(&lib.pool)
+                .await
+                .map_err(|e| e.to_string())?;
         }
-        let _ =
-            sqlx::query("DELETE FROM collection_assets WHERE collection_id = ? AND asset_id = ?")
-                .bind(&collection_id)
-                .bind(aid)
-                .execute(&state.db.master_pool)
-                .await;
-        let _ =
-            sqlx::query("DELETE FROM collection_assets WHERE collection_id = ? AND asset_id = ?")
-                .bind(&collection_id)
-                .bind(aid)
-                .execute(&active_pool)
-                .await;
     }
     Ok(())
 }
 
 #[tauri::command]
 pub async fn delete_collection(id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
-    let pool = state.db.get_active_pool().await;
-    // Recursively collect all descendant collection IDs
-    let mut to_delete = vec![id.clone()];
+    delete_collection_in(&state.db, &id).await
+}
+
+/// Deletes the collection and its descendants, walked in the master catalog, from master and
+/// every open library, with their memberships.
+async fn delete_collection_in(db: &Database, id: &str) -> Result<()> {
+    // Recursively collect all descendant collection IDs from the catalog
+    let mut to_delete = vec![id.to_string()];
     let mut idx = 0;
     while idx < to_delete.len() {
         let cur_id = &to_delete[idx];
         let sub_rows =
             sqlx::query_as::<_, (String,)>("SELECT id FROM collections WHERE parent_id = ?")
                 .bind(cur_id)
-                .fetch_all(&pool)
+                .fetch_all(&db.master_pool)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -267,34 +235,296 @@ pub async fn delete_collection(id: String, state: State<'_, Arc<AppState>>) -> R
         idx += 1;
     }
 
-    let libs = state.db.get_all_libraries().await;
-    for cid in &to_delete {
-        let _ = sqlx::query("DELETE FROM collection_assets WHERE collection_id = ?")
-            .bind(cid)
-            .execute(&pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM collections WHERE id = ?")
-            .bind(cid)
-            .execute(&pool)
-            .await;
-        for lib in &libs {
-            let _ = sqlx::query("DELETE FROM collection_assets WHERE collection_id = ?")
-                .bind(cid)
-                .execute(&lib.pool)
-                .await;
-            let _ = sqlx::query("DELETE FROM collections WHERE id = ?")
-                .bind(cid)
-                .execute(&lib.pool)
-                .await;
-        }
-        let _ = sqlx::query("DELETE FROM collection_assets WHERE collection_id = ?")
-            .bind(cid)
-            .execute(&state.db.master_pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM collections WHERE id = ?")
-            .bind(cid)
-            .execute(&state.db.master_pool)
-            .await;
+    // Mirrors first, each in one transaction, and master last: if a library can't take the
+    // delete, master keeps the collections, so the next open doesn't bring them back.
+    for lib in db.get_all_libraries().await {
+        let delete = async {
+            let mut tx = lib.pool.begin().await?;
+            for cid in &to_delete {
+                sqlx::query("DELETE FROM collection_assets WHERE collection_id = ?")
+                    .bind(cid)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM collections WHERE id = ?")
+                    .bind(cid)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await
+        };
+        delete.await.map_err(|e| {
+            format!(
+                "Could not delete the collection from library {}: {}",
+                lib.name, e
+            )
+        })?;
     }
-    Ok(())
+
+    let mut tx = db.master_pool.begin().await.map_err(|e| e.to_string())?;
+    for cid in &to_delete {
+        sqlx::query("DELETE FROM collections WHERE id = ?")
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{
+        insert_asset, insert_collection, memory_database, memory_library, memory_library_pool,
+        memory_library_pool_enforcing_foreign_keys,
+    };
+
+    async fn collected(pool: &sqlx::Pool<sqlx::Sqlite>) -> Vec<String> {
+        sqlx::query_scalar("SELECT asset_id FROM collection_assets ORDER BY asset_id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn collecting_assets_writes_each_membership_only_to_the_assets_own_library() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        insert_asset(&a, "in-a").await;
+        insert_asset(&b, "in-b").await;
+        let db = memory_database(vec![
+            memory_library("a", a.clone()),
+            memory_library("b", b.clone()),
+        ])
+        .await;
+        for pool in [&db.master_pool, &a, &b] {
+            insert_collection(pool, "c", "props", None).await;
+        }
+
+        add_assets_to_collection(&db, "c", &["in-a".into(), "in-b".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(collected(&a).await, ["in-a"]);
+        assert_eq!(collected(&b).await, ["in-b"]);
+        assert!(collected(&db.master_pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_collections_reads_master_definitions_and_every_librarys_memberships() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        for (pool, asset) in [(&a, "in-a"), (&b, "in-b")] {
+            insert_asset(pool, asset).await;
+            insert_collection(pool, "c", "mirror name", None).await;
+            sqlx::query("INSERT INTO collection_assets (collection_id, asset_id) VALUES ('c', ?)")
+                .bind(asset)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        let db = memory_database(vec![memory_library("a", a), memory_library("b", b)]).await;
+        insert_collection(&db.master_pool, "c", "master name", None).await;
+
+        let collections = list_collections_in(&db).await.unwrap();
+
+        assert_eq!(collections.len(), 1);
+        assert_eq!(collections[0].name, "master name");
+        assert_eq!(collections[0].asset_ids, ["in-a", "in-b"]);
+    }
+
+    async fn collection_ids(pool: &sqlx::Pool<sqlx::Sqlite>) -> Vec<String> {
+        sqlx::query_scalar("SELECT id FROM collections ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn collect(pool: &sqlx::Pool<sqlx::Sqlite>, collection_id: &str, asset_id: &str) {
+        sqlx::query("INSERT INTO collection_assets (collection_id, asset_id) VALUES (?, ?)")
+            .bind(collection_id)
+            .bind(asset_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_collection_writes_master_and_every_open_library() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        let db = memory_database(vec![
+            memory_library("a", a.clone()),
+            memory_library("b", b.clone()),
+        ])
+        .await;
+
+        let created = create_collection_in(&db, "props".into(), None, None, None, None)
+            .await
+            .unwrap();
+
+        for pool in [&db.master_pool, &a, &b] {
+            assert_eq!(collection_ids(pool).await, [created.id.as_str()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_collection_removes_its_master_descendants_and_memberships_everywhere() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        for (pool, asset) in [(&a, "in-a"), (&b, "in-b")] {
+            insert_asset(pool, asset).await;
+            // The mirrors are stale: only master knows "child" sits under "parent".
+            insert_collection(pool, "parent", "parent", None).await;
+            insert_collection(pool, "child", "child", None).await;
+            collect(pool, "parent", asset).await;
+            collect(pool, "child", asset).await;
+        }
+        let db = memory_database(vec![
+            memory_library("a", a.clone()),
+            memory_library("b", b.clone()),
+        ])
+        .await;
+        insert_collection(&db.master_pool, "parent", "parent", None).await;
+        insert_collection(&db.master_pool, "child", "child", Some("parent")).await;
+
+        delete_collection_in(&db, "parent").await.unwrap();
+
+        for pool in [&db.master_pool, &a, &b] {
+            assert!(collection_ids(pool).await.is_empty());
+            assert!(collected(pool).await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_from_collection_removes_only_the_named_assets_membership() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        for (pool, asset) in [(&a, "in-a"), (&b, "in-b")] {
+            insert_asset(pool, asset).await;
+            insert_collection(pool, "c", "props", None).await;
+            collect(pool, "c", asset).await;
+        }
+        let db = memory_database(vec![
+            memory_library("a", a.clone()),
+            memory_library("b", b.clone()),
+        ])
+        .await;
+
+        remove_assets_from_collection(&db, "c", &["in-a".into()])
+            .await
+            .unwrap();
+
+        assert!(collected(&a).await.is_empty());
+        assert_eq!(collected(&b).await, ["in-b"]);
+    }
+
+    #[tokio::test]
+    async fn collecting_an_asset_in_no_open_library_writes_nothing() {
+        let a = memory_library_pool().await;
+        insert_collection(&a, "c", "props", None).await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_collection(&db.master_pool, "c", "props", None).await;
+
+        add_assets_to_collection(&db, "c", &["nowhere".into()])
+            .await
+            .unwrap();
+
+        assert!(collected(&a).await.is_empty());
+        assert!(collected(&db.master_pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collecting_reports_a_library_it_cannot_read_instead_of_skipping_it() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        insert_asset(&b, "in-b").await;
+        let db = memory_database(vec![
+            memory_library("a", a.clone()),
+            memory_library("b", b.clone()),
+        ])
+        .await;
+        insert_collection(&db.master_pool, "c", "props", None).await;
+        a.close().await;
+
+        let result = add_assets_to_collection(&db, "c", &["in-b".into()]).await;
+
+        assert!(result.is_err());
+        assert!(collected(&b).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_collection_that_a_library_cannot_take_is_an_error_and_keeps_master() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        insert_collection(&a, "c", "props", None).await;
+        insert_collection(&b, "c", "props", None).await;
+        let db = memory_database(vec![
+            memory_library("a", a.clone()),
+            memory_library("b", b.clone()),
+        ])
+        .await;
+        insert_collection(&db.master_pool, "c", "props", None).await;
+        b.close().await;
+
+        let result = delete_collection_in(&db, "c").await;
+
+        assert!(result.is_err());
+        assert_eq!(collection_ids(&db.master_pool).await, ["c"]);
+    }
+
+    #[tokio::test]
+    async fn list_collections_reports_a_library_it_cannot_read() {
+        let a = memory_library_pool().await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_collection(&db.master_pool, "c", "props", None).await;
+        a.close().await;
+
+        assert!(list_collections_in(&db).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_collections_lists_an_asset_id_held_by_two_libraries_once() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        for pool in [&a, &b] {
+            insert_asset(pool, "same").await;
+            insert_collection(pool, "c", "props", None).await;
+            collect(pool, "c", "same").await;
+        }
+        let db = memory_database(vec![memory_library("a", a), memory_library("b", b)]).await;
+        insert_collection(&db.master_pool, "c", "props", None).await;
+
+        let collections = list_collections_in(&db).await.unwrap();
+
+        assert_eq!(collections[0].asset_ids, ["same"]);
+    }
+
+    #[tokio::test]
+    async fn collecting_into_a_collection_its_mirror_lacks_copies_it_and_its_ancestors() {
+        let a = memory_library_pool_enforcing_foreign_keys().await;
+        insert_asset(&a, "in-a").await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_collection(&db.master_pool, "parent", "props", None).await;
+        insert_collection(&db.master_pool, "child", "rocks", Some("parent")).await;
+
+        add_assets_to_collection(&db, "child", &["in-a".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(collected(&a).await, ["in-a"]);
+        assert_eq!(collection_ids(&a).await, ["child", "parent"]);
+    }
+
+    #[tokio::test]
+    async fn collecting_into_a_collection_master_lacks_is_an_error_and_writes_nothing() {
+        let a = memory_library_pool().await;
+        insert_asset(&a, "in-a").await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+
+        let result = add_assets_to_collection(&db, "gone", &["in-a".into()]).await;
+
+        assert!(result.is_err());
+        assert!(collected(&a).await.is_empty());
+    }
 }

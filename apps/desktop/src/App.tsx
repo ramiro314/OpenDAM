@@ -35,6 +35,7 @@ export default function App() {
 
   const [quickLookOpen, setQuickLookOpen] = useState(false);
   const [copyToast, setCopyToast] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [assetsToDelete, setAssetsToDelete] = useState<string[]>([]);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const toastTimeoutRef = useRef<number | null>(null);
@@ -211,6 +212,7 @@ export default function App() {
     if (assetsToDelete.length === 0) return;
     const count = assetsToDelete.length;
     setDeleteDialogOpen(false);
+    setDeleteError(null);
     try {
       await useAssetStore.getState().deleteAssets(assetsToDelete, true);
       setCopyToast(
@@ -218,8 +220,8 @@ export default function App() {
       );
       if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
       toastTimeoutRef.current = window.setTimeout(() => setCopyToast(null), 2200);
-    } catch (err) {
-      console.error('Failed to delete assets:', err);
+    } catch (err: any) {
+      setDeleteError(err?.message || String(err));
     } finally {
       setAssetsToDelete([]);
     }
@@ -261,6 +263,15 @@ export default function App() {
         <div className={styles.copyToast}>
           <IconCheck size={14} className={styles.toastCheck} />
           <span>{copyToast}</span>
+        </div>
+      )}
+
+      {deleteError && (
+        <div className={`${styles.copyToast} ${styles.errorToast}`} role="alert">
+          <span>{deleteError}</span>
+          <button className={styles.toastDismiss} onClick={() => setDeleteError(null)}>
+            Dismiss
+          </button>
         </div>
       )}
     </div>

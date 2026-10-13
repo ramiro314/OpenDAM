@@ -1,6 +1,6 @@
-//! Checks the shipped Tauri config, capabilities and Cargo manifest for a wide-open security
-//! surface: a missing CSP, an asset protocol that serves the whole disk, broad capabilities, or
-//! devtools in release builds.
+//! Checks the shipped Tauri config, capabilities and Cargo manifest, which no unit test
+//! exercises: a missing CSP, an asset protocol that serves the whole disk, broad capabilities,
+//! devtools in release builds, or a release profile that aborts on panic.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -102,5 +102,22 @@ fn tauri_dependency_has_no_devtools_feature() {
     assert!(
         !features.iter().any(|f| f.as_str() == Some("devtools")),
         "tauri is built with the devtools feature: {features:?}"
+    );
+}
+
+/// `panic = "abort"` would kill the app on a decoder panic instead of letting
+/// `catch_unwind` fail that one image.
+#[test]
+fn release_profile_unwinds_on_panic() {
+    let manifest = cargo_manifest();
+    let panic = manifest
+        .get("profile")
+        .and_then(|p| p.get("release"))
+        .and_then(|r| r.get("panic"))
+        .and_then(|v| v.as_str());
+    assert_ne!(
+        panic,
+        Some("abort"),
+        "[profile.release] sets panic = \"abort\""
     );
 }

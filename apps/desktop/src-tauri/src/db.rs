@@ -14,10 +14,98 @@ pub struct LibraryHandle {
     pub pool: Pool<Sqlite>,
 }
 
+/// The master DB is the tag and collection catalog. Each library DB keeps a mirror of those
+/// definitions plus its own `asset_tags` and `collection_assets` rows, for its own assets only.
 pub struct Database {
     pub master_pool: Pool<Sqlite>,
     pub libraries: Arc<RwLock<HashMap<String, LibraryHandle>>>,
-    pub pool: Pool<Sqlite>,
+}
+
+/// A collection definition as stored: id, name, description, parent_id, is_smart, filter_spec,
+/// created_at.
+pub type CollectionRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    bool,
+    Option<String>,
+    i64,
+);
+
+/// A tag definition as stored: id, name, color, parent_id.
+pub type TagRow = (String, String, Option<String>, Option<String>);
+
+/// Writes a tag definition to a mirror, updating an existing row in place. Never `REPLACE`:
+/// it deletes the old row first, and `ON DELETE CASCADE` would take the library's memberships.
+pub async fn upsert_tag<'e, E: sqlx::Executor<'e, Database = Sqlite>>(
+    executor: E,
+    (id, name, color, parent_id): &TagRow,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO tags (id, name, color, parent_id) VALUES (?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+             name = excluded.name, color = excluded.color, parent_id = excluded.parent_id",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(color)
+    .bind(parent_id)
+    .execute(executor)
+    .await
+    .map(|_| ())
+}
+
+/// Writes a collection definition to a mirror, updating an existing row in place (see
+/// `upsert_tag` for why it is never `REPLACE`).
+pub async fn upsert_collection<'e, E: sqlx::Executor<'e, Database = Sqlite>>(
+    executor: E,
+    (id, name, description, parent_id, is_smart, filter_spec, created_at): &CollectionRow,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO collections (id, name, description, parent_id, is_smart, filter_spec, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+             name = excluded.name, description = excluded.description,
+             parent_id = excluded.parent_id, is_smart = excluded.is_smart,
+             filter_spec = excluded.filter_spec",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(description)
+    .bind(parent_id)
+    .bind(is_smart)
+    .bind(filter_spec)
+    .bind(created_at)
+    .execute(executor)
+    .await
+    .map(|_| ())
+}
+
+/// Orders definitions so every parent comes before its children, so writing them in order
+/// never trips a `parent_id` foreign key. Rows in a parent cycle go last.
+fn parents_first<T>(rows: Vec<T>, id_and_parent: impl Fn(&T) -> (&str, Option<&str>)) -> Vec<T> {
+    let parents: HashMap<&str, Option<&str>> = rows.iter().map(&id_and_parent).collect();
+    let depth = |row: &T| {
+        let mut parent = id_and_parent(row).1;
+        let mut depth = 0;
+        while let Some(p) = parent.filter(|_| depth <= rows.len()) {
+            depth += 1;
+            parent = parents.get(p).copied().flatten();
+        }
+        depth
+    };
+    let mut keyed: Vec<(usize, usize)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (depth(r), i))
+        .collect();
+    keyed.sort();
+    let mut slots: Vec<Option<T>> = rows.into_iter().map(Some).collect();
+    keyed
+        .into_iter()
+        .filter_map(|(_, i)| slots[i].take())
+        .collect()
 }
 
 /// Connect to a per-library SQLite database with NAS-safe settings.
@@ -149,11 +237,10 @@ impl Database {
                 .await;
 
         let mut open_libraries = HashMap::new();
-        let mut first_pool: Option<Pool<Sqlite>> = None;
 
         // Load all registered libraries and open their per-library SQLite pools
         if let Ok(rows) = sqlx::query_as::<_, (String, String, String)>(
-            "SELECT id, name, root_paths FROM libraries",
+            "SELECT id, name, root_paths FROM libraries ORDER BY id",
         )
         .fetch_all(&master_pool)
         .await
@@ -170,9 +257,6 @@ impl Database {
                         let lib_db_file = opendam_dir.join("library.sqlite");
                         match connect_library_sqlite(&lib_db_file).await {
                             Ok(lib_pool) => {
-                                if first_pool.is_none() {
-                                    first_pool = Some(lib_pool.clone());
-                                }
                                 open_libraries.insert(
                                     id.clone(),
                                     LibraryHandle {
@@ -196,50 +280,37 @@ impl Database {
             }
         }
 
-        let fallback_pool = first_pool.unwrap_or_else(|| master_pool.clone());
-        let libraries = Arc::new(RwLock::new(open_libraries));
-
         let db = Self {
             master_pool,
-            libraries,
-            pool: fallback_pool,
+            libraries: Arc::new(RwLock::new(open_libraries)),
         };
 
-        // Sync metadata across all open libraries
-        for lib in db.get_all_libraries().await {
-            db.sync_library_metadata(&lib.pool).await;
-        }
+        db.sync_open_libraries().await;
 
         Ok(db)
     }
 
-    pub async fn sync_library_metadata(&self, lib_pool: &Pool<Sqlite>) {
-        // 1. Sync tags from master_pool to lib_pool
-        if let Ok(tags) = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
-            "SELECT id, name, color, parent_id FROM tags",
-        )
-        .fetch_all(&self.master_pool)
-        .await
-        {
-            for (id, name, color, parent_id) in tags {
-                let _ = sqlx::query(
-                    "INSERT OR IGNORE INTO tags (id, name, color, parent_id) VALUES (?, ?, ?, ?)",
-                )
-                .bind(&id)
-                .bind(&name)
-                .bind(&color)
-                .bind(&parent_id)
-                .execute(lib_pool)
-                .await;
+    /// Runs when libraries open. Master first gains the definitions it lacks from every open
+    /// library's mirror, in library-id order so the winner between two mirrors doesn't depend
+    /// on HashMap order (insert-only, so a rename made while a library was offline is kept).
+    /// Only then is every mirror overwritten from master and cleared of memberships for assets
+    /// its library doesn't hold, so no mirror misses a definition a later library brought.
+    pub async fn sync_open_libraries(&self) {
+        let libs = self.get_all_libraries().await;
+        for lib in &libs {
+            self.add_definitions_master_lacks(&lib.pool).await;
+        }
+        for lib in &libs {
+            if let Err(e) = self.converge_mirror(&lib.pool).await {
+                tracing::error!("Failed to update library {}'s mirror: {}", lib.id, e);
             }
         }
+    }
 
-        // 2. Sync tags from lib_pool to master_pool
-        if let Ok(tags) = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
-            "SELECT id, name, color, parent_id FROM tags",
-        )
-        .fetch_all(lib_pool)
-        .await
+    async fn add_definitions_master_lacks(&self, lib_pool: &Pool<Sqlite>) {
+        if let Ok(tags) = sqlx::query_as::<_, TagRow>("SELECT id, name, color, parent_id FROM tags")
+            .fetch_all(lib_pool)
+            .await
         {
             for (id, name, color, parent_id) in tags {
                 let _ = sqlx::query(
@@ -254,19 +325,7 @@ impl Database {
             }
         }
 
-        // 3. Sync collections from master_pool to lib_pool
-        if let Ok(cols) = sqlx::query_as::<_, (String, String, String, Option<String>, bool, Option<String>, i64)>(
-            "SELECT id, name, description, parent_id, is_smart, filter_spec, created_at FROM collections"
-        ).fetch_all(&self.master_pool).await {
-            for (id, name, desc, parent_id, is_smart, filter_spec, created_at) in cols {
-                let _ = sqlx::query("INSERT OR IGNORE INTO collections (id, name, description, parent_id, is_smart, filter_spec, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-                    .bind(&id).bind(&name).bind(&desc).bind(&parent_id).bind(is_smart).bind(&filter_spec).bind(created_at)
-                    .execute(lib_pool).await;
-            }
-        }
-
-        // 4. Sync collections from lib_pool to master_pool
-        if let Ok(cols) = sqlx::query_as::<_, (String, String, String, Option<String>, bool, Option<String>, i64)>(
+        if let Ok(cols) = sqlx::query_as::<_, CollectionRow>(
             "SELECT id, name, description, parent_id, is_smart, filter_spec, created_at FROM collections"
         ).fetch_all(lib_pool).await {
             for (id, name, desc, parent_id, is_smart, filter_spec, created_at) in cols {
@@ -275,6 +334,37 @@ impl Database {
                     .execute(&self.master_pool).await;
             }
         }
+    }
+
+    async fn converge_mirror(&self, lib_pool: &Pool<Sqlite>) -> sqlx::Result<()> {
+        let tags = sqlx::query_as::<_, TagRow>("SELECT id, name, color, parent_id FROM tags")
+            .fetch_all(&self.master_pool)
+            .await?;
+        let cols = sqlx::query_as::<_, CollectionRow>(
+            "SELECT id, name, description, parent_id, is_smart, filter_spec, created_at FROM collections",
+        )
+        .fetch_all(&self.master_pool)
+        .await?;
+
+        let mut tx = lib_pool.begin().await?;
+        for tag in parents_first(tags, |t| (&t.0, t.3.as_deref())) {
+            // `tags.name` is unique: if master's name is another mirror tag's, leave both.
+            if let Err(e) = upsert_tag(&mut *tx, &tag).await {
+                tracing::warn!("Left mirror tag {} ({:?}) as it was: {}", tag.0, tag.1, e);
+            }
+        }
+        for col in parents_first(cols, |c| (&c.0, c.3.as_deref())) {
+            if let Err(e) = upsert_collection(&mut *tx, &col).await {
+                tracing::warn!("Left mirror collection {} as it was: {}", col.0, e);
+            }
+        }
+        sqlx::query("DELETE FROM asset_tags WHERE asset_id NOT IN (SELECT id FROM assets)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM collection_assets WHERE asset_id NOT IN (SELECT id FROM assets)")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
     }
 
     pub async fn register_library(
@@ -290,9 +380,6 @@ impl Database {
         let lib_db_file = opendam_dir.join("library.sqlite");
         let lib_pool = connect_library_sqlite(&lib_db_file).await?;
 
-        // Sync metadata immediately
-        self.sync_library_metadata(&lib_pool).await;
-
         let handle = LibraryHandle {
             id: id.to_string(),
             name: name.to_string(),
@@ -300,8 +387,13 @@ impl Database {
             pool: lib_pool,
         };
 
-        let mut libs = self.libraries.write().await;
-        libs.insert(id.to_string(), handle.clone());
+        self.libraries
+            .write()
+            .await
+            .insert(id.to_string(), handle.clone());
+        // The new library may bring definitions master lacked; the other open mirrors get
+        // them too, so tagging an asset elsewhere never names a tag its mirror doesn't have.
+        self.sync_open_libraries().await;
 
         Ok(handle)
     }
@@ -312,34 +404,73 @@ impl Database {
         Ok(())
     }
 
-    /// `Some(id)` returns that library only if it is open, never another one: libraries whose
-    /// root is missing are not opened, and handing their callers another library's pool lets
-    /// a re-index delete that library's rows. `None` returns any open library.
-    pub async fn get_library_handle(&self, id: Option<&str>) -> Option<LibraryHandle> {
-        let libs = self.libraries.read().await;
-        match id {
-            Some(target_id) => libs.get(target_id).cloned(),
-            None => libs.values().next().cloned(),
-        }
+    /// Returns library `id` only if it is open, never another one: libraries whose root is
+    /// missing are not opened, and handing their callers another library's pool lets a
+    /// re-index delete that library's rows.
+    pub async fn get_library_handle(&self, id: &str) -> Option<LibraryHandle> {
+        self.libraries.read().await.get(id).cloned()
     }
 
-    pub async fn get_library_root(&self, id: Option<&str>) -> Option<PathBuf> {
-        self.get_library_handle(id).await.map(|h| h.root_path)
-    }
-
-    /// Any open library's pool, or the fallback pool when none is open. It takes no library
-    /// id on purpose: a specific library's pool comes from `get_library_handle(Some(id))`,
-    /// which never substitutes another library.
-    pub async fn get_active_pool(&self) -> Pool<Sqlite> {
-        match self.get_library_handle(None).await {
-            Some(h) => h.pool,
-            None => self.pool.clone(),
-        }
-    }
-
+    /// Every open library, in library-id order.
     pub async fn get_all_libraries(&self) -> Vec<LibraryHandle> {
-        let libs = self.libraries.read().await;
-        libs.values().cloned().collect()
+        let mut libs: Vec<LibraryHandle> = self.libraries.read().await.values().cloned().collect();
+        libs.sort_by(|a, b| a.id.cmp(&b.id));
+        libs
+    }
+
+    /// Tag `id` and its ancestors from the master catalog, root first and the tag itself last,
+    /// so writing them in order never trips `parent_id`. Empty when master lacks the tag.
+    pub async fn tag_with_ancestors(&self, id: &str) -> sqlx::Result<Vec<TagRow>> {
+        sqlx::query_as(
+            "WITH RECURSIVE chain(id, name, color, parent_id, depth) AS (
+                 SELECT id, name, color, parent_id, 0 FROM tags WHERE id = ?
+                 UNION ALL
+                 SELECT t.id, t.name, t.color, t.parent_id, chain.depth + 1
+                 FROM tags t JOIN chain ON t.id = chain.parent_id
+                 WHERE chain.depth < 64
+             )
+             SELECT id, name, color, parent_id FROM chain ORDER BY depth DESC",
+        )
+        .bind(id)
+        .fetch_all(&self.master_pool)
+        .await
+    }
+
+    /// Collection `id` and its ancestors from the master catalog, root first, like
+    /// `tag_with_ancestors`. Empty when master lacks the collection.
+    pub async fn collection_with_ancestors(&self, id: &str) -> sqlx::Result<Vec<CollectionRow>> {
+        sqlx::query_as(
+            "WITH RECURSIVE chain(id, name, description, parent_id, is_smart, filter_spec, created_at, depth) AS (
+                 SELECT id, name, description, parent_id, is_smart, filter_spec, created_at, 0
+                 FROM collections WHERE id = ?
+                 UNION ALL
+                 SELECT c.id, c.name, c.description, c.parent_id, c.is_smart, c.filter_spec,
+                        c.created_at, chain.depth + 1
+                 FROM collections c JOIN chain ON c.id = chain.parent_id
+                 WHERE chain.depth < 64
+             )
+             SELECT id, name, description, parent_id, is_smart, filter_spec, created_at
+             FROM chain ORDER BY depth DESC",
+        )
+        .bind(id)
+        .fetch_all(&self.master_pool)
+        .await
+    }
+
+    /// The open library that holds asset `asset_id`: the only library its tag and collection
+    /// memberships are written to. A library that can't be read is an error rather than a
+    /// "not here", so a busy NAS never sends a write to another library or drops it.
+    pub async fn library_of_asset(&self, asset_id: &str) -> sqlx::Result<Option<LibraryHandle>> {
+        for lib in self.get_all_libraries().await {
+            let found: Option<String> = sqlx::query_scalar("SELECT id FROM assets WHERE id = ?")
+                .bind(asset_id)
+                .fetch_optional(&lib.pool)
+                .await?;
+            if found.is_some() {
+                return Ok(Some(lib));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -361,20 +492,108 @@ pub fn make_relative_path(root: &Path, p: &Path) -> String {
         .into_owned()
 }
 
-/// An in-memory database with the library schema, for tests. One connection,
-/// since every connection to `sqlite::memory:` opens its own empty database.
+/// An in-memory database with the library schema, for tests, with `foreign_keys` pinned off.
+/// One connection, since every connection to `sqlite::memory:` opens its own empty database.
 #[cfg(test)]
 pub(crate) async fn memory_library_pool() -> Pool<Sqlite> {
+    memory_pool(false).await
+}
+
+/// Like `memory_library_pool`, but enforcing foreign keys as most production connections do.
+#[cfg(test)]
+pub(crate) async fn memory_library_pool_enforcing_foreign_keys() -> Pool<Sqlite> {
+    memory_pool(true).await
+}
+
+#[cfg(test)]
+async fn memory_pool(foreign_keys: bool) -> Pool<Sqlite> {
+    use std::str::FromStr;
+    let options = SqliteConnectOptions::from_str("sqlite::memory:")
+        .unwrap()
+        .foreign_keys(foreign_keys);
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
-        .connect("sqlite::memory:")
+        .connect_with(options)
         .await
         .unwrap();
     sqlx::query(include_str!("../migrations/002_library_schema.sql"))
         .execute(&pool)
         .await
         .unwrap();
+    // The schema script sets the pragma itself, so pin it again afterwards.
+    sqlx::query(&format!(
+        "PRAGMA foreign_keys = {}",
+        if foreign_keys { "ON" } else { "OFF" }
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
     pool
+}
+
+/// A database over an in-memory master and the given open libraries, for tests.
+#[cfg(test)]
+pub(crate) async fn memory_database(libraries: Vec<LibraryHandle>) -> Database {
+    Database {
+        master_pool: memory_library_pool().await,
+        libraries: Arc::new(RwLock::new(
+            libraries.into_iter().map(|h| (h.id.clone(), h)).collect(),
+        )),
+    }
+}
+
+/// An open library over `pool`, for tests.
+#[cfg(test)]
+pub(crate) fn memory_library(id: &str, pool: Pool<Sqlite>) -> LibraryHandle {
+    LibraryHandle {
+        id: id.to_string(),
+        name: id.to_string(),
+        root_path: PathBuf::from(format!("/mnt/{id}")),
+        pool,
+    }
+}
+
+/// Inserts an asset row with `id`, for tests.
+#[cfg(test)]
+pub(crate) async fn insert_asset(pool: &Pool<Sqlite>, id: &str) {
+    sqlx::query(
+        "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+         VALUES (?, ?, ?, 'glb', 'model', 0, 0, 0)",
+    )
+    .bind(id)
+    .bind(format!("models/{id}.glb"))
+    .bind(format!("{id}.glb"))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Inserts a tag definition, for tests.
+#[cfg(test)]
+pub(crate) async fn insert_tag(pool: &Pool<Sqlite>, id: &str, name: &str) {
+    sqlx::query("INSERT INTO tags (id, name) VALUES (?, ?)")
+        .bind(id)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Inserts a collection definition, for tests.
+#[cfg(test)]
+pub(crate) async fn insert_collection(
+    pool: &Pool<Sqlite>,
+    id: &str,
+    name: &str,
+    parent_id: Option<&str>,
+) {
+    sqlx::query("INSERT INTO collections (id, name, parent_id, created_at) VALUES (?, ?, ?, 0)")
+        .bind(id)
+        .bind(name)
+        .bind(parent_id)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 #[cfg(test)]
@@ -442,24 +661,225 @@ mod tests {
 
     #[tokio::test]
     async fn get_library_handle_does_not_fall_back_to_another_library() {
-        let pool = memory_library_pool().await;
-        let open = LibraryHandle {
-            id: "open".into(),
-            name: "open".into(),
-            root_path: PathBuf::from("/mnt/assets"),
-            pool: pool.clone(),
-        };
-        let db = Database {
-            master_pool: memory_library_pool().await,
-            libraries: Arc::new(RwLock::new(HashMap::from([("open".into(), open)]))),
-            pool,
-        };
+        let db = memory_database(vec![memory_library("open", memory_library_pool().await)]).await;
 
-        assert!(db.get_library_handle(Some("offline")).await.is_none());
+        assert!(db.get_library_handle("offline").await.is_none());
+        assert_eq!(db.get_library_handle("open").await.unwrap().id, "open");
+    }
+
+    async fn tag_name(pool: &Pool<Sqlite>, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT name FROM tags WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn collection_name(pool: &Pool<Sqlite>, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT name FROM collections WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn count(pool: &Pool<Sqlite>, sql: &str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn opening_a_library_adds_what_master_lacks_then_overwrites_its_mirror_from_master() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        let db =
+            memory_database(vec![memory_library("a", a.clone()), memory_library("b", b)]).await;
+        insert_tag(&db.master_pool, "t", "new").await;
+        insert_tag(&a, "t", "old").await;
+        insert_tag(&a, "u", "only-in-a").await;
+
+        db.sync_open_libraries().await;
+
+        assert_eq!(tag_name(&db.master_pool, "t").await.as_deref(), Some("new"));
         assert_eq!(
-            db.get_library_handle(Some("open")).await.unwrap().id,
-            "open"
+            tag_name(&db.master_pool, "u").await.as_deref(),
+            Some("only-in-a")
         );
-        assert_eq!(db.get_library_handle(None).await.unwrap().id, "open");
+        assert_eq!(tag_name(&a, "t").await.as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn opening_a_library_keeps_its_memberships_and_child_collections() {
+        let a = memory_library_pool_enforcing_foreign_keys().await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_asset(&a, "asset").await;
+        insert_tag(&a, "t", "old tag").await;
+        insert_collection(&a, "c", "old collection", None).await;
+        insert_collection(&a, "c2", "child", Some("c")).await;
+        sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES ('asset', 't')")
+            .execute(&a)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO collection_assets (collection_id, asset_id) VALUES ('c', 'asset')",
+        )
+        .execute(&a)
+        .await
+        .unwrap();
+        insert_tag(&db.master_pool, "t", "new tag").await;
+        insert_collection(&db.master_pool, "c", "new collection", None).await;
+
+        db.sync_open_libraries().await;
+
+        assert_eq!(tag_name(&a, "t").await.as_deref(), Some("new tag"));
+        assert_eq!(
+            collection_name(&a, "c").await.as_deref(),
+            Some("new collection")
+        );
+        assert_eq!(count(&a, "SELECT COUNT(*) FROM asset_tags").await, 1);
+        assert_eq!(count(&a, "SELECT COUNT(*) FROM collection_assets").await, 1);
+        assert_eq!(collection_name(&a, "c2").await.as_deref(), Some("child"));
+    }
+
+    #[tokio::test]
+    async fn opening_a_library_mirrors_a_child_collection_master_stores_before_its_parent() {
+        let a = memory_library_pool_enforcing_foreign_keys().await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_collection(&db.master_pool, "child", "child", Some("parent")).await;
+        insert_collection(&db.master_pool, "parent", "parent", None).await;
+
+        db.sync_open_libraries().await;
+
+        assert_eq!(
+            collection_name(&a, "parent").await.as_deref(),
+            Some("parent")
+        );
+        assert_eq!(collection_name(&a, "child").await.as_deref(), Some("child"));
+    }
+
+    #[tokio::test]
+    async fn opening_a_library_leaves_a_tag_whose_master_name_collides_in_its_mirror() {
+        let a = memory_library_pool().await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_tag(&a, "t", "rock").await;
+        insert_tag(&a, "u", "stone").await;
+        insert_tag(&db.master_pool, "t", "stone").await;
+
+        db.sync_open_libraries().await;
+
+        assert_eq!(tag_name(&a, "t").await.as_deref(), Some("rock"));
+        assert_eq!(tag_name(&a, "u").await.as_deref(), Some("stone"));
+    }
+
+    #[tokio::test]
+    async fn opening_a_library_removes_memberships_whose_asset_it_does_not_hold() {
+        let a = memory_library_pool().await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_asset(&a, "here").await;
+        insert_tag(&a, "t", "rock").await;
+        insert_collection(&a, "c", "props", None).await;
+        for asset in ["here", "elsewhere"] {
+            sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES (?, 't')")
+                .bind(asset)
+                .execute(&a)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO collection_assets (collection_id, asset_id) VALUES ('c', ?)")
+                .bind(asset)
+                .execute(&a)
+                .await
+                .unwrap();
+        }
+
+        db.sync_open_libraries().await;
+        db.sync_open_libraries().await;
+
+        let tagged: Vec<String> = sqlx::query_scalar("SELECT asset_id FROM asset_tags")
+            .fetch_all(&a)
+            .await
+            .unwrap();
+        let collected: Vec<String> = sqlx::query_scalar("SELECT asset_id FROM collection_assets")
+            .fetch_all(&a)
+            .await
+            .unwrap();
+        assert_eq!(tagged, ["here"]);
+        assert_eq!(collected, ["here"]);
+    }
+
+    #[tokio::test]
+    async fn registering_a_library_mirrors_its_new_definitions_to_the_other_open_libraries() {
+        let root = std::env::temp_dir().join(format!("opendam-new-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".opendam")).unwrap();
+        let existing = connect_library_sqlite(&root.join(".opendam").join("library.sqlite"))
+            .await
+            .unwrap();
+        insert_tag(&existing, "u", "brought along").await;
+        existing.close().await;
+        let a = memory_library_pool().await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+
+        let result = db.register_library("new", "new", &root).await;
+        std::fs::remove_dir_all(&root).unwrap();
+
+        result.unwrap();
+        assert_eq!(
+            tag_name(&db.master_pool, "u").await.as_deref(),
+            Some("brought along")
+        );
+        assert_eq!(tag_name(&a, "u").await.as_deref(), Some("brought along"));
+    }
+
+    #[tokio::test]
+    async fn startup_mirrors_a_later_librarys_new_definitions_to_an_earlier_library() {
+        let dir = std::env::temp_dir().join(format!("opendam-startup-{}", uuid::Uuid::new_v4()));
+        let master = dir.join("master.sqlite");
+        for id in ["a", "b"] {
+            std::fs::create_dir_all(dir.join(id).join(".opendam")).unwrap();
+        }
+        let b = connect_library_sqlite(&dir.join("b/.opendam/library.sqlite"))
+            .await
+            .unwrap();
+        insert_tag(&b, "u", "brought by b").await;
+        insert_collection(&b, "c", "brought by b", None).await;
+        b.close().await;
+        let first_run = Database::new(master.to_str().unwrap()).await.unwrap();
+        for id in ["a", "b"] {
+            sqlx::query(
+                "INSERT INTO libraries (id, name, root_paths, created_at) VALUES (?, ?, ?, 0)",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(serde_json::json!([dir.join(id)]).to_string())
+            .execute(&first_run.master_pool)
+            .await
+            .unwrap();
+        }
+        first_run.master_pool.close().await;
+
+        let db = Database::new(master.to_str().unwrap()).await.unwrap();
+        let a = db.get_library_handle("a").await.unwrap().pool;
+        let mirrored = (tag_name(&a, "u").await, collection_name(&a, "c").await);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            mirrored,
+            (Some("brought by b".into()), Some("brought by b".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_all_libraries_lists_libraries_in_id_order() {
+        let mut libraries = Vec::new();
+        for id in ["d", "b", "e", "a", "c"] {
+            libraries.push(memory_library(id, memory_library_pool().await));
+        }
+        let db = memory_database(libraries).await;
+
+        let ids: Vec<String> = db
+            .get_all_libraries()
+            .await
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        assert_eq!(ids, ["a", "b", "c", "d", "e"]);
     }
 }

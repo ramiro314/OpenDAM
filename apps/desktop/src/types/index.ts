@@ -153,6 +153,12 @@ export interface SearchPayload {
   pageSize: number;
 }
 
+/** How `delete_assets` rejects when some assets were not deleted; the rest were. */
+export interface DeleteAssetsError {
+  message: string;
+  failedIds: string[];
+}
+
 export interface SearchResult {
   assets: Asset[];
   total: number;

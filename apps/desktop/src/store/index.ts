@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type {
   Asset,
+  DeleteAssetsError,
   Library,
   Collection,
   Tag,
@@ -156,6 +157,8 @@ interface AssetStore {
   pageSize: number;
   loading: boolean;
   loadingMore: boolean;
+  /** Why the last search failed; the grid shows it instead of results */
+  searchError: string | null;
   query: SearchQuery;
   assetMap: Map<string, Asset>;
 
@@ -180,12 +183,27 @@ interface AssetStore {
   getById: (id: string) => Asset | undefined;
 }
 
+/** Drops deleted assets from the selection and the focus. */
+function deselectAssets(ids: string[]) {
+  const idSet = new Set(ids);
+  const ui = useUIStore.getState();
+  if (ui.focusedAssetId && idSet.has(ui.focusedAssetId)) {
+    ui.focusAsset(null);
+  }
+  ui.selectAll(Array.from(ui.selectedAssetIds).filter((id) => !idSet.has(id)));
+}
+
 const defaultQuery: SearchQuery = {
   text: '',
   filter: {},
   sort: { field: 'date', order: 'desc' },
   includeSubcollections: true,
 };
+
+/** Clears the grid so a failed search can't leave results from an earlier query on screen */
+function failedSearch(e: unknown): Partial<AssetStore> {
+  return { assets: [], total: 0, page: 0, assetMap: new Map(), searchError: String(e) };
+}
 
 // Bumped by every search/refresh so a slower loadMore can't append results from an older query.
 let queryGeneration = 0;
@@ -197,6 +215,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
   pageSize: 100,
   loading: false,
   loadingMore: false,
+  searchError: null,
   query: defaultQuery,
   assetMap: new Map(),
 
@@ -251,7 +270,9 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       const result = await api.searchAssets({ query, page: 0, pageSize });
       if (generation !== queryGeneration) return;
       const assetMap = new Map(result.assets.map((a) => [a.id, a]));
-      set({ assets: result.assets, total: result.total, assetMap });
+      set({ assets: result.assets, total: result.total, assetMap, searchError: null });
+    } catch (e) {
+      if (generation === queryGeneration) set(failedSearch(e));
     } finally {
       if (generation === queryGeneration) set({ loading: false });
     }
@@ -281,10 +302,15 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
     const { query, page, pageSize } = get();
     const generation = ++queryGeneration;
     // One request covering every loaded page, so the grid keeps its length and scroll position.
-    const result = await api.searchAssets({ query, page: 0, pageSize: (page + 1) * pageSize });
-    if (generation !== queryGeneration) return;
-    const assetMap = new Map(result.assets.map((a) => [a.id, a]));
-    set({ assets: result.assets, total: result.total, assetMap });
+    try {
+      const result = await api.searchAssets({ query, page: 0, pageSize: (page + 1) * pageSize });
+      if (generation !== queryGeneration) return;
+      const assetMap = new Map(result.assets.map((a) => [a.id, a]));
+      set({ assets: result.assets, total: result.total, assetMap, searchError: null });
+    } catch (e) {
+      // The loaded results belong to this same query, so keep them; the next event or search retries.
+      console.error('Failed to refresh assets:', e);
+    }
   },
 
   patchAsset: async (id, patch) => {
@@ -315,20 +341,26 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
   },
 
   deleteAssets: async (ids, deleteFile = true) => {
-    await api.deleteAssets(ids, deleteFile);
-    const idSet = new Set(ids);
-    set((s) => {
-      const assets = s.assets.filter((a) => !idSet.has(a.id));
-      const assetMap = new Map(s.assetMap);
-      for (const id of ids) assetMap.delete(id);
-      return { assets, total: Math.max(0, s.total - ids.length), assetMap };
-    });
-    const ui = useUIStore.getState();
-    if (ui.focusedAssetId && idSet.has(ui.focusedAssetId)) {
-      ui.focusAsset(null);
+    const remove = (gone: string[]) => {
+      const goneSet = new Set(gone);
+      set((s) => {
+        const assets = s.assets.filter((a) => !goneSet.has(a.id));
+        const assetMap = new Map(s.assetMap);
+        for (const id of gone) assetMap.delete(id);
+        return { assets, total: Math.max(0, s.total - gone.length), assetMap };
+      });
+      deselectAssets(gone);
+    };
+    try {
+      await api.deleteAssets(ids, deleteFile);
+    } catch (err) {
+      // A partial failure names the assets that were not deleted; the rest are gone, so drop
+      // them now rather than leave them selected for a second delete to send again.
+      const failed = new Set((err as Partial<DeleteAssetsError> | null)?.failedIds ?? ids);
+      remove(ids.filter((id) => !failed.has(id)));
+      throw err;
     }
-    const next = new Set(Array.from(ui.selectedAssetIds).filter((id) => !idSet.has(id)));
-    ui.selectAll(Array.from(next));
+    remove(ids);
   },
 
   renameAsset: async (id, newName) => {
