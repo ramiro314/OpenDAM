@@ -327,16 +327,14 @@ impl Database {
         self.get_library_handle(id).await.map(|h| h.root_path)
     }
 
-    pub async fn get_pool(&self, id: Option<&str>) -> Pool<Sqlite> {
-        if let Some(h) = self.get_library_handle(id).await {
-            h.pool
-        } else {
-            self.pool.clone()
-        }
-    }
-
+    /// Any open library's pool, or the fallback pool when none is open. It takes no library
+    /// id on purpose: a specific library's pool comes from `get_library_handle(Some(id))`,
+    /// which never substitutes another library.
     pub async fn get_active_pool(&self) -> Pool<Sqlite> {
-        self.get_pool(None).await
+        match self.get_library_handle(None).await {
+            Some(h) => h.pool,
+            None => self.pool.clone(),
+        }
     }
 
     pub async fn get_all_libraries(&self) -> Vec<LibraryHandle> {
