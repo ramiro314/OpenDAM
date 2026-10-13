@@ -971,8 +971,8 @@ pub async fn rename_asset(
 mod tests {
     use super::*;
     use crate::db::{
-        insert_asset, insert_tag, memory_database, memory_library, memory_library_pool,
-        memory_library_pool_enforcing_foreign_keys, LibraryHandle,
+        insert_asset, insert_collection, insert_tag, memory_database, memory_library,
+        memory_library_pool, memory_library_pool_enforcing_foreign_keys, LibraryHandle,
     };
     use sqlx::{Pool, Sqlite};
     use std::cell::RefCell;
@@ -1051,6 +1051,568 @@ mod tests {
         assert_eq!(search_names(&pool, "\"").await, all);
         assert_eq!(search_names(&pool, "(").await, all);
         assert_eq!(search_names(&pool, "( tree").await, ["tree.glb"]);
+    }
+
+    /// A library with this collection tree, each asset (named for its id) in the collections
+    /// listed after it:
+    ///
+    /// ```text
+    /// props            crate
+    ///   furniture      sofa, log
+    ///     chairs       stool
+    /// nature           rock
+    ///   trees          oak, log
+    /// empty
+    /// (none)           loose
+    /// ```
+    async fn collection_library() -> Pool<Sqlite> {
+        let pool = memory_library_pool().await;
+        for (id, parent) in [
+            ("props", None),
+            ("furniture", Some("props")),
+            ("chairs", Some("furniture")),
+            ("nature", None),
+            ("trees", Some("nature")),
+            ("empty", None),
+        ] {
+            insert_collection(&pool, id, id, parent).await;
+        }
+        for (asset, collections) in [
+            ("crate", &["props"][..]),
+            ("sofa", &["furniture"]),
+            ("stool", &["chairs"]),
+            ("rock", &["nature"]),
+            ("oak", &["trees"]),
+            ("log", &["furniture", "trees"]),
+            ("loose", &[]),
+        ] {
+            insert_asset(&pool, asset).await;
+            for collection in collections {
+                sqlx::query(
+                    "INSERT INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
+                )
+                .bind(collection)
+                .bind(asset)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+        pool
+    }
+
+    /// The ids of the assets in `pools` matching `query` (a JSON `SearchQuery` without its
+    /// sort, which is by name), in name order.
+    async fn search_ids(pools: &[Pool<Sqlite>], query: serde_json::Value) -> Vec<String> {
+        search_page(pools, query, 0, 100).await.0
+    }
+
+    /// Page `page` of `page_size` assets in `pools` matching `query` (as for `search_ids`): their
+    /// ids in name order, and the total number of matches.
+    async fn search_page(
+        pools: &[Pool<Sqlite>],
+        query: serde_json::Value,
+        page: i64,
+        page_size: i64,
+    ) -> (Vec<String>, i64) {
+        let mut query = query;
+        query["sort"] = serde_json::json!({ "field": "name", "order": "asc" });
+        if query.get("text").is_none() {
+            query["text"] = "".into();
+        }
+        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+            "query": query,
+            "page": page,
+            "pageSize": page_size,
+        }))
+        .unwrap();
+        let libs: Vec<_> = pools.iter().map(|p| (p.clone(), None)).collect();
+        let result = search_libraries(&payload, &libs)
+            .await
+            .unwrap_or_else(|e| panic!("search for {query} failed: {e}"));
+        (
+            result.assets.into_iter().map(|a| a.id).collect(),
+            result.total,
+        )
+    }
+
+    /// The ids matching a filter on `collectionIds` with `logic`, with or without subcollections.
+    async fn in_collections(
+        pool: &Pool<Sqlite>,
+        ids: &[&str],
+        logic: &str,
+        include_sub: bool,
+    ) -> Vec<String> {
+        let filter = serde_json::json!({
+            "collectionIds": ids,
+            "collectionLogic": logic,
+            "includeSubcollections": include_sub,
+        });
+        search_ids(
+            std::slice::from_ref(pool),
+            serde_json::json!({ "filter": filter }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn searching_a_collection_includes_its_nested_subcollections_by_default() {
+        let pool = collection_library().await;
+        let search = |query| search_ids(std::slice::from_ref(&pool), query);
+
+        assert_eq!(
+            search(serde_json::json!({ "filter": {}, "collectionId": "props" })).await,
+            ["crate", "log", "sofa", "stool"]
+        );
+        assert_eq!(
+            search(serde_json::json!({ "filter": { "collectionId": "props" } })).await,
+            ["crate", "log", "sofa", "stool"]
+        );
+        assert_eq!(
+            search(serde_json::json!({ "filter": {}, "collectionId": "empty" })).await,
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn searching_a_collection_without_subcollections_matches_only_its_own_assets() {
+        let pool = collection_library().await;
+        let search = |query| search_ids(std::slice::from_ref(&pool), query);
+
+        assert_eq!(
+            search(serde_json::json!({
+                "filter": {},
+                "collectionId": "props",
+                "includeSubcollections": false,
+            }))
+            .await,
+            ["crate"]
+        );
+        // The filter's setting wins over the query's.
+        assert_eq!(
+            search(serde_json::json!({
+                "filter": { "includeSubcollections": false },
+                "collectionId": "props",
+                "includeSubcollections": true,
+            }))
+            .await,
+            ["crate"]
+        );
+        assert_eq!(
+            search(serde_json::json!({
+                "filter": { "includeSubcollections": true },
+                "collectionId": "props",
+                "includeSubcollections": false,
+            }))
+            .await,
+            ["crate", "log", "sofa", "stool"]
+        );
+    }
+
+    #[tokio::test]
+    async fn searching_any_of_several_collections_matches_assets_in_one_of_them() {
+        let pool = collection_library().await;
+
+        assert_eq!(
+            in_collections(&pool, &["furniture", "nature"], "or", true).await,
+            ["log", "oak", "rock", "sofa", "stool"]
+        );
+        assert_eq!(
+            in_collections(&pool, &["furniture", "nature"], "or", false).await,
+            ["log", "rock", "sofa"]
+        );
+        // "or" is the default logic.
+        assert_eq!(
+            search_ids(
+                std::slice::from_ref(&pool),
+                serde_json::json!({ "filter": { "collectionIds": ["chairs", "trees"] } })
+            )
+            .await,
+            ["log", "oak", "stool"]
+        );
+    }
+
+    #[tokio::test]
+    async fn searching_all_of_several_collections_matches_assets_in_every_one() {
+        let pool = collection_library().await;
+
+        assert_eq!(
+            in_collections(&pool, &["props", "nature"], "and", true).await,
+            ["log"]
+        );
+        assert_eq!(
+            in_collections(&pool, &["props", "nature"], "and", false).await,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            in_collections(&pool, &["furniture", "trees"], "and", false).await,
+            ["log"]
+        );
+        assert_eq!(
+            in_collections(&pool, &["props"], "and", true).await,
+            ["crate", "log", "sofa", "stool"]
+        );
+    }
+
+    #[tokio::test]
+    async fn searching_a_primary_collection_and_any_other_matches_assets_in_both() {
+        let pool = collection_library().await;
+
+        assert_eq!(
+            in_collections(&pool, &["props", "chairs", "nature"], "and_or", true).await,
+            ["log", "stool"]
+        );
+        assert_eq!(
+            in_collections(&pool, &["props", "chairs", "nature"], "and_or", false).await,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            in_collections(&pool, &["furniture", "chairs", "trees"], "and_or", false).await,
+            ["log"]
+        );
+        assert_eq!(
+            in_collections(&pool, &["furniture"], "and_or", true).await,
+            ["log", "sofa", "stool"]
+        );
+        assert_eq!(
+            in_collections(&pool, &["furniture"], "and_or", false).await,
+            ["log", "sofa"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_query_collection_and_filter_collections_combine_without_duplicates() {
+        let pool = collection_library().await;
+        let search = |query| search_ids(std::slice::from_ref(&pool), query);
+
+        // props is the primary collection once, not also one of the others.
+        assert_eq!(
+            search(serde_json::json!({
+                "filter": { "collectionIds": ["props", "nature"], "collectionLogic": "and_or" },
+                "collectionId": "props",
+            }))
+            .await,
+            ["log"]
+        );
+        assert_eq!(
+            search(serde_json::json!({
+                "filter": { "collectionIds": ["", "trees"], "collectionLogic": "and" },
+                "collectionId": "furniture",
+            }))
+            .await,
+            ["log"]
+        );
+    }
+
+    #[tokio::test]
+    async fn searching_unorganized_assets_matches_assets_in_no_collection() {
+        let pool = collection_library().await;
+        let search = |query| search_ids(std::slice::from_ref(&pool), query);
+
+        assert_eq!(
+            in_collections(&pool, &["props"], "none", true).await,
+            ["loose"]
+        );
+        assert_eq!(
+            search(serde_json::json!({
+                "filter": { "unorganized": true, "collectionIds": ["props"] },
+            }))
+            .await,
+            ["loose"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_collection_filter_combines_with_text_tag_and_name_filters() {
+        let pool = collection_library().await;
+        insert_tag(&pool, "wood", "wood").await;
+        for asset in ["log", "oak", "sofa"] {
+            sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES (?, 'wood')")
+                .bind(asset)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let search = |query| search_ids(std::slice::from_ref(&pool), query);
+
+        assert_eq!(
+            search(serde_json::json!({
+                "text": "sofa",
+                "filter": {
+                    "tags": ["wood"],
+                    "collectionIds": ["props", "furniture"],
+                    "collectionLogic": "and_or",
+                    "nameSuffix": ".glb",
+                },
+            }))
+            .await,
+            ["sofa"]
+        );
+        assert_eq!(
+            search(serde_json::json!({
+                "text": "oak",
+                "filter": {
+                    "tags": ["wood"],
+                    "collectionIds": ["nature"],
+                    "namePrefix": "o",
+                },
+            }))
+            .await,
+            ["oak"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_collection_filter_applies_to_each_library_searched() {
+        let a = collection_library().await;
+        let b = collection_library().await;
+
+        let ids = search_ids(
+            &[a, b],
+            serde_json::json!({ "filter": {}, "collectionId": "furniture" }),
+        )
+        .await;
+
+        assert_eq!(ids, ["log", "log", "sofa", "sofa", "stool", "stool"]);
+    }
+
+    /// A library with assets `a` to `f` (named for their ids) tagged with:
+    ///
+    /// ```text
+    /// a   (none)
+    /// b   stone
+    /// c   stone, moss
+    /// d   moss, wet
+    /// e   stone, moss, wet
+    /// f   wet
+    /// ```
+    async fn tag_library() -> Pool<Sqlite> {
+        let pool = memory_library_pool().await;
+        for tag in ["stone", "moss", "wet"] {
+            insert_tag(&pool, tag, tag).await;
+        }
+        for (asset, tags) in [
+            ("a", &[][..]),
+            ("b", &["stone"]),
+            ("c", &["stone", "moss"]),
+            ("d", &["moss", "wet"]),
+            ("e", &["stone", "moss", "wet"]),
+            ("f", &["wet"]),
+        ] {
+            insert_asset(&pool, asset).await;
+            for tag in tags {
+                sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
+                    .bind(asset)
+                    .bind(tag)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        pool
+    }
+
+    #[tokio::test]
+    async fn searching_by_tag_follows_the_tag_logic() {
+        let pool = tag_library().await;
+        let tagged_with = |tags: &[&str], logic: Option<&str>| {
+            let mut filter = serde_json::json!({ "tags": tags });
+            if let Some(logic) = logic {
+                filter["tagLogic"] = logic.into();
+            }
+            search_ids(
+                std::slice::from_ref(&pool),
+                serde_json::json!({ "filter": filter }),
+            )
+        };
+
+        // "or" (the default): any of the tags.
+        assert_eq!(tagged_with(&["wet"], None).await, ["d", "e", "f"]);
+        assert_eq!(
+            tagged_with(&["stone", "wet"], Some("or")).await,
+            ["b", "c", "d", "e", "f"]
+        );
+        // "and" should match assets with every tag (c and e for stone and moss), but the tag
+        // count is bound as text and SQLite never finds COUNT(...) equal to text, so it
+        // matches nothing. This pins today's behaviour; fixing it is a separate change.
+        let none = Vec::<String>::new();
+        assert_eq!(tagged_with(&["stone", "moss"], Some("and")).await, none);
+        assert_eq!(tagged_with(&["moss", "wet"], Some("and")).await, none);
+        assert_eq!(
+            tagged_with(&["stone", "moss", "wet"], Some("and")).await,
+            none
+        );
+        // "and_or": the first tag and any of the rest.
+        assert_eq!(
+            tagged_with(&["moss"], Some("and_or")).await,
+            ["c", "d", "e"]
+        );
+        assert_eq!(
+            tagged_with(&["stone", "moss", "wet"], Some("and_or")).await,
+            ["c", "e"]
+        );
+        assert_eq!(
+            tagged_with(&["wet", "stone", "moss"], Some("and_or")).await,
+            ["d", "e"]
+        );
+        // "none": untagged, whatever tags are given.
+        assert_eq!(tagged_with(&[], Some("none")).await, ["a"]);
+        assert_eq!(tagged_with(&["stone"], Some("none")).await, ["a"]);
+        // No tags with any other logic filters nothing.
+        assert_eq!(
+            tagged_with(&[], Some("and")).await,
+            ["a", "b", "c", "d", "e", "f"]
+        );
+    }
+
+    /// A library with these assets, named `<id>.<extension>` and stored under `<kind>s/`:
+    ///
+    /// ```text
+    /// id  kind     ext  color  fav  preview     rating  size  modified
+    /// m1  model    glb  red    0    error       1       300   30
+    /// m2  model    fbx  blue   1    done        0       400   40
+    /// m3  model    glb  none   0    processing  2       500   50
+    /// p1  texture  png  red    1    done        5       100   10
+    /// p2  texture  png  none   0    none        3       200   20
+    /// ```
+    async fn attribute_library() -> Pool<Sqlite> {
+        let pool = memory_library_pool().await;
+        for (id, kind, ext, color, fav, preview, rating, size, modified) in [
+            ("m1", "model", "glb", "red", 0, "error", 1, 300, 30),
+            ("m2", "model", "fbx", "blue", 1, "done", 0, 400, 40),
+            ("m3", "model", "glb", "none", 0, "processing", 2, 500, 50),
+            ("p1", "texture", "png", "red", 1, "done", 5, 100, 10),
+            ("p2", "texture", "png", "none", 0, "none", 3, 200, 20),
+        ] {
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, color_label, is_favorite,
+                                     preview_status, rating, size_bytes, modified_at, indexed_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            )
+            .bind(id)
+            .bind(format!("{kind}s/{id}.{ext}"))
+            .bind(format!("{id}.{ext}"))
+            .bind(ext)
+            .bind(kind)
+            .bind(color)
+            .bind(fav)
+            .bind(preview)
+            .bind(rating)
+            .bind(size)
+            .bind(modified)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool
+    }
+
+    #[tokio::test]
+    async fn searching_by_asset_attributes_matches_each_filter() {
+        let pool = attribute_library().await;
+        let search = |filter| {
+            search_ids(
+                std::slice::from_ref(&pool),
+                serde_json::json!({ "filter": filter }),
+            )
+        };
+        use serde_json::json;
+
+        assert_eq!(
+            search(json!({ "kinds": ["model"] })).await,
+            ["m1", "m2", "m3"]
+        );
+        assert_eq!(
+            search(json!({ "colorLabels": ["red", "blue"] })).await,
+            ["m1", "m2", "p1"]
+        );
+        assert_eq!(
+            search(json!({ "extensions": ["png", "fbx"] })).await,
+            ["m2", "p1", "p2"]
+        );
+        assert_eq!(search(json!({ "isFavorite": true })).await, ["m2", "p1"]);
+        assert_eq!(
+            search(json!({ "isFavorite": false })).await,
+            ["m1", "m3", "p2"]
+        );
+        assert_eq!(
+            search(json!({ "previewStatus": "missing" })).await,
+            ["m1", "p2"]
+        );
+        assert_eq!(
+            search(json!({ "previewStatus": "needs_preview" })).await,
+            ["m1", "p2"]
+        );
+        assert_eq!(
+            search(json!({ "previewStatus": "has_preview" })).await,
+            ["m2", "p1"]
+        );
+        assert_eq!(
+            search(json!({ "previewStatus": "processing" })).await,
+            ["m3"]
+        );
+        assert_eq!(
+            search(json!({ "previewStatus": "" })).await,
+            ["m1", "m2", "m3", "p1", "p2"]
+        );
+        assert_eq!(
+            search(json!({ "rating": { "min": 2, "max": 3 } })).await,
+            ["m3", "p2"]
+        );
+        assert_eq!(
+            search(json!({ "dateRange": { "from": 20, "to": 40 } })).await,
+            ["m1", "m2", "p2"]
+        );
+        assert_eq!(
+            search(json!({ "sizeRange": { "min": 250, "max": 450 } })).await,
+            ["m1", "m2"]
+        );
+        assert_eq!(
+            search(json!({ "directory": " textures " })).await,
+            ["p1", "p2"]
+        );
+        assert_eq!(
+            search(json!({ "kinds": [], "colorLabels": [], "extensions": [] })).await,
+            ["m1", "m2", "m3", "p1", "p2"]
+        );
+        assert_eq!(
+            search(json!({
+                "kinds": ["model"],
+                "isFavorite": false,
+                "previewStatus": "missing",
+                "extensions": ["glb"],
+            }))
+            .await,
+            ["m1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_page_skips_the_earlier_pages() {
+        let pool = attribute_library().await;
+        let page = |query, page, size| search_page(std::slice::from_ref(&pool), query, page, size);
+        let all = serde_json::json!({ "filter": {} });
+        let models = serde_json::json!({ "filter": { "kinds": ["model"] } });
+
+        assert_eq!(page(all.clone(), 0, 2).await, (ids(&["m1", "m2"]), 5));
+        assert_eq!(page(all.clone(), 1, 2).await, (ids(&["m3", "p1"]), 5));
+        assert_eq!(page(all, 2, 2).await, (ids(&["p2"]), 5));
+        assert_eq!(page(models.clone(), 1, 2).await, (ids(&["m3"]), 3));
+        assert_eq!(page(models, 2, 2).await, (vec![], 3));
+    }
+
+    #[tokio::test]
+    async fn a_later_page_over_several_libraries_skips_the_earlier_pages() {
+        let a = attribute_library().await;
+        let b = attribute_library().await;
+        let both = [a, b];
+        let all = serde_json::json!({ "filter": {} });
+
+        assert_eq!(
+            search_page(&both, all.clone(), 1, 3).await,
+            (ids(&["m2", "m3", "m3"]), 10)
+        );
+        assert_eq!(search_page(&both, all, 3, 3).await, (ids(&["p2"]), 10));
     }
 
     async fn tagged(pool: &sqlx::Pool<sqlx::Sqlite>) -> Vec<(String, String)> {
