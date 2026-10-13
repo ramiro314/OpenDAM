@@ -693,17 +693,24 @@ async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Resul
             .await
             .map_err(|e| e.to_string())?;
         for tag_id in tags {
-            // Copy master's definition into the mirror first: a mirror can lack it after a
-            // skipped name collision or a failed mirror write, and a foreign-key-enforcing
-            // connection would then reject the membership.
-            let Some(tag) = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
-                "SELECT id, name, color, parent_id FROM tags WHERE id = ?",
+            // Copy master's definition, and its ancestors root first, into the mirror: a
+            // mirror can lack them after a skipped name collision or a failed mirror write, and
+            // a foreign-key-enforcing connection would then reject the membership or the tag.
+            let chain = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
+                "WITH RECURSIVE chain(id, name, color, parent_id, depth) AS (
+                     SELECT id, name, color, parent_id, 0 FROM tags WHERE id = ?
+                     UNION ALL
+                     SELECT t.id, t.name, t.color, t.parent_id, chain.depth + 1
+                     FROM tags t JOIN chain ON t.id = chain.parent_id
+                     WHERE chain.depth < 64
+                 )
+                 SELECT id, name, color, parent_id FROM chain ORDER BY depth DESC",
             )
             .bind(tag_id)
-            .fetch_optional(&db.master_pool)
+            .fetch_all(&db.master_pool)
             .await
-            .map_err(|e| e.to_string())?
-            else {
+            .map_err(|e| e.to_string())?;
+            let Some(tag) = chain.last() else {
                 tracing::warn!(
                     "Tag {} is not in the catalog, not tagging {} with it",
                     tag_id,
@@ -711,9 +718,11 @@ async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Resul
                 );
                 continue;
             };
-            upsert_tag(&mut *tx, &tag)
-                .await
-                .map_err(|e| format!("Could not tag the asset with '{}': {}", tag.1, e))?;
+            for definition in &chain {
+                upsert_tag(&mut *tx, definition)
+                    .await
+                    .map_err(|e| format!("Could not tag the asset with '{}': {}", tag.1, e))?;
+            }
             sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
                 .bind(id)
                 .bind(tag_id)
@@ -1091,6 +1100,34 @@ mod tests {
         apply_asset_patch(&db, "in-a", &patch).await.unwrap();
 
         assert_eq!(tagged(&a).await, [("in-a".to_string(), "t".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn tagging_with_a_child_tag_copies_its_missing_ancestors_into_the_mirror() {
+        let a = memory_library_pool_enforcing_foreign_keys().await;
+        insert_asset(&a, "in-a").await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_tag(&db.master_pool, "root", "nature").await;
+        for (id, name, parent) in [("mid", "plants", "root"), ("leaf", "trees", "mid")] {
+            sqlx::query("INSERT INTO tags (id, name, parent_id) VALUES (?, ?, ?)")
+                .bind(id)
+                .bind(name)
+                .bind(parent)
+                .execute(&db.master_pool)
+                .await
+                .unwrap();
+        }
+        let patch: AssetPatch =
+            serde_json::from_value(serde_json::json!({ "tags": ["leaf"] })).unwrap();
+
+        apply_asset_patch(&db, "in-a", &patch).await.unwrap();
+
+        assert_eq!(tagged(&a).await, [("in-a".to_string(), "leaf".to_string())]);
+        let mirrored: Vec<String> = sqlx::query_scalar("SELECT id FROM tags ORDER BY id")
+            .fetch_all(&a)
+            .await
+            .unwrap();
+        assert_eq!(mirrored, ["leaf", "mid", "root"]);
     }
 
     #[tokio::test]
