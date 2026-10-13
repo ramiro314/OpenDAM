@@ -312,30 +312,29 @@ impl Database {
         Ok(())
     }
 
+    /// `Some(id)` returns that library only if it is open, never another one: libraries whose
+    /// root is missing are not opened, and handing their callers another library's pool lets
+    /// a re-index delete that library's rows. `None` returns any open library.
     pub async fn get_library_handle(&self, id: Option<&str>) -> Option<LibraryHandle> {
         let libs = self.libraries.read().await;
-        if let Some(target_id) = id {
-            if let Some(h) = libs.get(target_id) {
-                return Some(h.clone());
-            }
+        match id {
+            Some(target_id) => libs.get(target_id).cloned(),
+            None => libs.values().next().cloned(),
         }
-        libs.values().next().cloned()
     }
 
     pub async fn get_library_root(&self, id: Option<&str>) -> Option<PathBuf> {
         self.get_library_handle(id).await.map(|h| h.root_path)
     }
 
-    pub async fn get_pool(&self, id: Option<&str>) -> Pool<Sqlite> {
-        if let Some(h) = self.get_library_handle(id).await {
-            h.pool
-        } else {
-            self.pool.clone()
-        }
-    }
-
+    /// Any open library's pool, or the fallback pool when none is open. It takes no library
+    /// id on purpose: a specific library's pool comes from `get_library_handle(Some(id))`,
+    /// which never substitutes another library.
     pub async fn get_active_pool(&self) -> Pool<Sqlite> {
-        self.get_pool(None).await
+        match self.get_library_handle(None).await {
+            Some(h) => h.pool,
+            None => self.pool.clone(),
+        }
     }
 
     pub async fn get_all_libraries(&self) -> Vec<LibraryHandle> {
@@ -439,5 +438,28 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(ids, ["a1"]);
+    }
+
+    #[tokio::test]
+    async fn get_library_handle_does_not_fall_back_to_another_library() {
+        let pool = memory_library_pool().await;
+        let open = LibraryHandle {
+            id: "open".into(),
+            name: "open".into(),
+            root_path: PathBuf::from("/mnt/assets"),
+            pool: pool.clone(),
+        };
+        let db = Database {
+            master_pool: memory_library_pool().await,
+            libraries: Arc::new(RwLock::new(HashMap::from([("open".into(), open)]))),
+            pool,
+        };
+
+        assert!(db.get_library_handle(Some("offline")).await.is_none());
+        assert_eq!(
+            db.get_library_handle(Some("open")).await.unwrap().id,
+            "open"
+        );
+        assert_eq!(db.get_library_handle(None).await.unwrap().id, "open");
     }
 }
