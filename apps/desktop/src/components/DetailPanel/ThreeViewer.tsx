@@ -1,7 +1,7 @@
 import { Canvas, useThree } from '@react-three/fiber';
 import { useGLTF, Stage, PresentationControls, Environment } from '@react-three/drei';
-import { Suspense, Component, useEffect, useMemo, type ReactNode } from 'react';
-import { PMREMGenerator } from 'three';
+import { Suspense, Component, useEffect, useState, type ReactNode } from 'react';
+import { PMREMGenerator, type Texture } from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { convertFileSrc } from '@tauri-apps/api/core';
 
@@ -46,14 +46,22 @@ function Model({ url }: { url: string }) {
 /** Lights the scene with a generated room, as the thumbnailer does, instead of a downloaded HDR. */
 function RoomLighting() {
   const gl = useThree((state) => state.gl);
-  const map = useMemo(() => {
+  const [map, setMap] = useState<Texture | null>(null);
+  // Created in the effect, not memoized, so each mount (StrictMode mounts twice) owns and frees
+  // its own render target.
+  useEffect(() => {
     const pmrem = new PMREMGenerator(gl);
-    const texture = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    const room = new RoomEnvironment();
+    const target = pmrem.fromScene(room, 0.04);
+    room.dispose();
     pmrem.dispose();
-    return texture;
+    setMap(target.texture);
+    return () => {
+      setMap(null);
+      target.dispose();
+    };
   }, [gl]);
-  useEffect(() => () => map.dispose(), [map]);
-  return <Environment map={map} />;
+  return map ? <Environment map={map} /> : null;
 }
 
 export function ThreeViewer({ modelPath }: { modelPath: string }) {
