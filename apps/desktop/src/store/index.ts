@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type {
   Asset,
+  DeleteAssetsError,
   Library,
   Collection,
   Tag,
@@ -340,24 +341,26 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
   },
 
   deleteAssets: async (ids, deleteFile = true) => {
+    const remove = (gone: string[]) => {
+      const goneSet = new Set(gone);
+      set((s) => {
+        const assets = s.assets.filter((a) => !goneSet.has(a.id));
+        const assetMap = new Map(s.assetMap);
+        for (const id of gone) assetMap.delete(id);
+        return { assets, total: Math.max(0, s.total - gone.length), assetMap };
+      });
+      deselectAssets(gone);
+    };
     try {
       await api.deleteAssets(ids, deleteFile);
     } catch (err) {
-      // Some files may have been trashed before others failed: reload, then deselect the
-      // ids that are gone so a second delete doesn't send them again.
-      await get().refresh();
-      const { assetMap } = get();
-      deselectAssets(ids.filter((id) => !assetMap.has(id)));
+      // A partial failure names the assets that were not deleted; the rest are gone, so drop
+      // them now rather than leave them selected for a second delete to send again.
+      const failed = new Set((err as Partial<DeleteAssetsError> | null)?.failedIds ?? ids);
+      remove(ids.filter((id) => !failed.has(id)));
       throw err;
     }
-    const idSet = new Set(ids);
-    set((s) => {
-      const assets = s.assets.filter((a) => !idSet.has(a.id));
-      const assetMap = new Map(s.assetMap);
-      for (const id of ids) assetMap.delete(id);
-      return { assets, total: Math.max(0, s.total - ids.length), assetMap };
-    });
-    deselectAssets(ids);
+    remove(ids);
   },
 
   renameAsset: async (id, newName) => {

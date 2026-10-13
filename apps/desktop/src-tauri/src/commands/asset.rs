@@ -872,7 +872,7 @@ pub async fn delete_assets(
     ids: Vec<String>,
     delete_file: Option<bool>,
     state: State<'_, Arc<AppState>>,
-) -> Result<()> {
+) -> std::result::Result<(), DeleteAssetsError> {
     let result = delete_assets_with(&state.db, &ids, delete_file.unwrap_or(true), |path| {
         trash::delete(path)
     })
@@ -882,25 +882,38 @@ pub async fn delete_assets(
     result
 }
 
-/// Deletes each asset with `delete_asset_with`, carrying on past failures, and reports them:
-/// the error itself for one failure, a count and the first error for several.
+/// A multi-delete where some assets were not deleted. `message` is for the user: the error
+/// itself for one failure, a count and the first error for several. `failed_ids` lets the UI
+/// drop the assets that were deleted and keep the rest.
+#[derive(Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteAssetsError {
+    message: String,
+    failed_ids: Vec<String>,
+}
+
+/// Deletes each asset with `delete_asset_with`, carrying on past failures, and reports them.
 async fn delete_assets_with<E: std::fmt::Display>(
     db: &Database,
     ids: &[String],
     delete_file: bool,
     trash: impl Fn(&Path) -> std::result::Result<(), E>,
-) -> Result<()> {
-    let mut errors = Vec::new();
+) -> std::result::Result<(), DeleteAssetsError> {
+    let mut failures = Vec::new();
     for id in ids {
         if let Err(e) = delete_asset_with(db, id, delete_file, &trash).await {
-            errors.push(e);
+            failures.push((id.clone(), e));
         }
     }
-    match errors.len() {
-        0 => Ok(()),
-        1 => Err(errors.remove(0)),
-        n => Err(format!("{} files were not deleted. {}", n, errors[0])),
-    }
+    let message = match failures.len() {
+        0 => return Ok(()),
+        1 => failures[0].1.clone(),
+        n => format!("{} files were not deleted. {}", n, failures[0].1),
+    };
+    Err(DeleteAssetsError {
+        message,
+        failed_ids: failures.into_iter().map(|(id, _)| id).collect(),
+    })
 }
 
 #[tauri::command]
@@ -1217,7 +1230,13 @@ mod tests {
 
         let rows_kept = [has_row(&pool, "tree").await, has_row(&pool, "rock").await];
         std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(result, Err(trash_error(&root, "rock")));
+        assert_eq!(
+            result,
+            Err(DeleteAssetsError {
+                message: trash_error(&root, "rock"),
+                failed_ids: ids(&["rock"]),
+            })
+        );
         assert_eq!(rows_kept, [false, true]);
     }
 
@@ -1241,11 +1260,26 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(
             result,
-            Err(format!(
-                "2 files were not deleted. {}",
-                trash_error(&root, "tree")
-            ))
+            Err(DeleteAssetsError {
+                message: format!("2 files were not deleted. {}", trash_error(&root, "tree")),
+                failed_ids: ids(&["tree", "bush"]),
+            })
         );
         assert_eq!(rows_kept, [true, false, true]);
+    }
+
+    #[test]
+    fn delete_assets_error_serializes_as_the_frontend_expects() {
+        let error = DeleteAssetsError {
+            message: "2 files were not deleted.".to_string(),
+            failed_ids: ids(&["tree", "bush"]),
+        };
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            serde_json::json!({
+                "message": "2 files were not deleted.",
+                "failedIds": ["tree", "bush"],
+            })
+        );
     }
 }

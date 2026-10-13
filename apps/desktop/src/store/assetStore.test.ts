@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { api } from '../api';
 import { useAssetStore, useUIStore } from '.';
-import type { Asset, SearchResult } from '../types';
+import type { Asset, DeleteAssetsError, SearchResult } from '../types';
 
 const realSearch = api.searchAssets;
 const realDeleteAssets = api.deleteAssets;
@@ -60,7 +60,7 @@ describe('useAssetStore search errors', () => {
 });
 
 describe('useAssetStore deleteAssets', () => {
-  test('after a partial failure, rethrows and deselects only the assets that are gone', async () => {
+  test('after a partial failure, rethrows and drops only the assets that were deleted', async () => {
     const named = (id: string) => ({ id, fileName: `${id}.png` }) as Asset;
     const before = ['a', 'b', 'c', 'd'].map(named);
     useAssetStore.setState({
@@ -70,19 +70,38 @@ describe('useAssetStore deleteAssets', () => {
     });
     useUIStore.getState().selectAll(['a', 'b', 'c']);
     useUIStore.getState().focusAsset('a');
-    // The backend after deleting a, b and c where only b's trash failed.
-    const after = ['b', 'd'].map(named);
-    api.deleteAssets = async () => {
-      throw 'Could not move b.png to the trash, so it was not deleted: denied';
+    const failure: DeleteAssetsError = {
+      message: 'Could not move b.png to the trash, so it was not deleted: denied',
+      failedIds: ['b'],
     };
-    api.searchAssets = async () => ({ assets: after, total: after.length, page: 0, pageSize: 100 });
+    api.deleteAssets = async () => {
+      throw failure;
+    };
 
-    await expect(useAssetStore.getState().deleteAssets(['a', 'b', 'c'])).rejects.toBe(
-      'Could not move b.png to the trash, so it was not deleted: denied'
-    );
+    await expect(useAssetStore.getState().deleteAssets(['a', 'b', 'c'])).rejects.toEqual(failure);
 
     expect(Array.from(useUIStore.getState().selectedAssetIds)).toEqual(['b']);
     expect(useUIStore.getState().focusedAssetId).toBeNull();
-    expect(useAssetStore.getState().assets).toEqual(after);
+    expect(useAssetStore.getState().assets.map((a) => a.id)).toEqual(['b', 'd']);
+    expect(useAssetStore.getState().total).toBe(2);
+  });
+
+  test('a rejection without failed ids keeps every asset', async () => {
+    const named = (id: string) => ({ id, fileName: `${id}.png` }) as Asset;
+    const before = ['a', 'b'].map(named);
+    useAssetStore.setState({
+      assets: before,
+      total: before.length,
+      assetMap: new Map(before.map((a) => [a.id, a])),
+    });
+    useUIStore.getState().selectAll(['a', 'b']);
+    api.deleteAssets = async () => {
+      throw 'IPC failed';
+    };
+
+    await expect(useAssetStore.getState().deleteAssets(['a', 'b'])).rejects.toBe('IPC failed');
+
+    expect(Array.from(useUIStore.getState().selectedAssetIds)).toEqual(['a', 'b']);
+    expect(useAssetStore.getState().assets).toEqual(before);
   });
 });
