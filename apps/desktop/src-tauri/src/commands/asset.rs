@@ -1004,4 +1004,19 @@ mod tests {
         assert_eq!(tagged(&a).await, [("in-a".to_string(), "t".to_string())]);
         assert_eq!(tagged(&b).await, [("in-b".to_string(), "t".to_string())]);
     }
+
+    #[tokio::test]
+    async fn patching_an_asset_in_no_open_library_is_an_error_and_writes_nothing() {
+        let a = memory_library_pool().await;
+        insert_tag(&a, "t", "rock").await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        let patch: AssetPatch =
+            serde_json::from_value(serde_json::json!({ "tags": ["t"] })).unwrap();
+
+        let result = apply_asset_patch(&db, "nowhere", &patch).await;
+
+        assert!(result.is_err());
+        assert!(tagged(&a).await.is_empty());
+        assert!(tagged(&db.master_pool).await.is_empty());
+    }
 }
