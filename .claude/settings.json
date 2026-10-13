@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make lint)",
+      "Bash(make check)",
+      "Bash(make build)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch --show-current)",
+      "Bash(git branch --list:*)",
+      "Bash(git grep:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(bun --version)",
+      "Bash(bun pm ls:*)",
+      "Bash(bun outdated:*)",
+      "Bash(cargo --version)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo metadata:*)",
+      "Bash(uv --version)",
+      "Bash(uv tree:*)",
+      "Bash(uv pip list:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh pr view:*)"
+    ]
+  }
+}
