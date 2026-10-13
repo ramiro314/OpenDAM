@@ -140,7 +140,7 @@ async fn add_assets_to_collection(
     asset_ids: &[String],
 ) -> Result<()> {
     for aid in asset_ids {
-        let Some(lib) = db.library_of_asset(aid).await else {
+        let Some(lib) = db.library_of_asset(aid).await.map_err(|e| e.to_string())? else {
             tracing::warn!(
                 "Asset {} is in no open library, not adding it to a collection",
                 aid
@@ -175,7 +175,7 @@ async fn remove_assets_from_collection(
     asset_ids: &[String],
 ) -> Result<()> {
     for aid in asset_ids {
-        if let Some(lib) = db.library_of_asset(aid).await {
+        if let Some(lib) = db.library_of_asset(aid).await.map_err(|e| e.to_string())? {
             sqlx::query("DELETE FROM collection_assets WHERE collection_id = ? AND asset_id = ?")
                 .bind(collection_id)
                 .bind(aid)
@@ -394,5 +394,23 @@ mod tests {
 
         assert!(collected(&a).await.is_empty());
         assert!(collected(&db.master_pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collecting_reports_a_library_it_cannot_read_instead_of_skipping_it() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        insert_asset(&b, "in-b").await;
+        let db = memory_database(vec![
+            memory_library("a", a.clone()),
+            memory_library("b", b.clone()),
+        ])
+        .await;
+        a.close().await;
+
+        let result = add_assets_to_collection(&db, "c", &["in-b".into()]).await;
+
+        assert!(result.is_err());
+        assert!(collected(&b).await.is_empty());
     }
 }

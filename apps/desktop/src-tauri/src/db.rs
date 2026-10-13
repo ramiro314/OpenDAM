@@ -418,20 +418,19 @@ impl Database {
     }
 
     /// The open library that holds asset `asset_id`: the only library its tag and collection
-    /// memberships are written to.
-    pub async fn library_of_asset(&self, asset_id: &str) -> Option<LibraryHandle> {
+    /// memberships are written to. A library that can't be read is an error rather than a
+    /// "not here", so a busy NAS never sends a write to another library or drops it.
+    pub async fn library_of_asset(&self, asset_id: &str) -> sqlx::Result<Option<LibraryHandle>> {
         for lib in self.get_all_libraries().await {
             let found: Option<String> = sqlx::query_scalar("SELECT id FROM assets WHERE id = ?")
                 .bind(asset_id)
                 .fetch_optional(&lib.pool)
-                .await
-                .ok()
-                .flatten();
+                .await?;
             if found.is_some() {
-                return Some(lib);
+                return Ok(Some(lib));
             }
         }
-        None
+        Ok(None)
     }
 }
 

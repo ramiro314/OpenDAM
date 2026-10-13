@@ -19,7 +19,12 @@ pub async fn request_preview(
     let now = Utc::now().timestamp_millis();
 
     for asset_id in &asset_ids {
-        let Some(lib) = state.db.library_of_asset(asset_id).await else {
+        let Some(lib) = state
+            .db
+            .library_of_asset(asset_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
             tracing::warn!(
                 "Asset {} is in no open library, not queueing a preview",
                 asset_id

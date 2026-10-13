@@ -638,55 +638,62 @@ async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Resul
     let lib = db
         .library_of_asset(id)
         .await
+        .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Asset not found: {}", id))?;
-    let pool = &lib.pool;
+    // One transaction, so a patch whose tags fail saves none of its other fields either.
+    let mut tx = lib.pool.begin().await.map_err(|e| e.to_string())?;
 
     if let Some(rating) = patch.rating {
-        let _ = sqlx::query("UPDATE assets SET rating = ? WHERE id = ?")
+        sqlx::query("UPDATE assets SET rating = ? WHERE id = ?")
             .bind(rating)
             .bind(id)
-            .execute(pool)
-            .await;
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     if let Some(ref color_label) = patch.color_label {
-        let _ = sqlx::query("UPDATE assets SET color_label = ? WHERE id = ?")
+        sqlx::query("UPDATE assets SET color_label = ? WHERE id = ?")
             .bind(color_label)
             .bind(id)
-            .execute(pool)
-            .await;
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     if let Some(is_fav) = patch.is_favorite {
         let fav_int: i64 = if is_fav { 1 } else { 0 };
-        let _ = sqlx::query("UPDATE assets SET is_favorite = ? WHERE id = ?")
+        sqlx::query("UPDATE assets SET is_favorite = ? WHERE id = ?")
             .bind(fav_int)
             .bind(id)
-            .execute(pool)
-            .await;
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     if let Some(ref description) = patch.description {
-        let _ = sqlx::query("UPDATE assets SET description = ? WHERE id = ?")
+        sqlx::query("UPDATE assets SET description = ? WHERE id = ?")
             .bind(description)
             .bind(id)
-            .execute(pool)
-            .await;
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     if let Some(ref thumbnail_path) = patch.thumbnail_path {
         let rel_thumb = make_relative_path(&lib.root_path, Path::new(thumbnail_path));
-        let _ = sqlx::query("UPDATE assets SET thumbnail_path = ? WHERE id = ?")
+        sqlx::query("UPDATE assets SET thumbnail_path = ? WHERE id = ?")
             .bind(rel_thumb)
             .bind(id)
-            .execute(pool)
-            .await;
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     if let Some(ref preview_status) = patch.preview_status {
-        let _ = sqlx::query("UPDATE assets SET preview_status = ? WHERE id = ?")
+        sqlx::query("UPDATE assets SET preview_status = ? WHERE id = ?")
             .bind(preview_status)
             .bind(id)
-            .execute(pool)
-            .await;
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     if let Some(ref tags) = patch.tags {
-        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
         sqlx::query("DELETE FROM asset_tags WHERE asset_id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -730,10 +737,9 @@ async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Resul
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        tx.commit().await.map_err(|e| e.to_string())?;
     }
 
-    Ok(())
+    tx.commit().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1128,6 +1134,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mirrored, ["leaf", "mid", "root"]);
+    }
+
+    #[tokio::test]
+    async fn a_patch_whose_tags_fail_saves_none_of_its_fields() {
+        let a = memory_library_pool_enforcing_foreign_keys().await;
+        insert_asset(&a, "in-a").await;
+        insert_tag(&a, "other", "rock").await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_tag(&db.master_pool, "t", "rock").await;
+        let patch: AssetPatch =
+            serde_json::from_value(serde_json::json!({ "rating": 5, "tags": ["t"] })).unwrap();
+
+        let result = apply_asset_patch(&db, "in-a", &patch).await;
+
+        assert!(result.is_err());
+        let rating: i64 = sqlx::query_scalar("SELECT rating FROM assets WHERE id = 'in-a'")
+            .fetch_one(&a)
+            .await
+            .unwrap();
+        assert_eq!(rating, 0);
     }
 
     #[tokio::test]
