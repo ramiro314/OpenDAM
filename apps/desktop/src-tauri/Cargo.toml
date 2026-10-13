@@ -32,8 +32,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trash = "5"
 
 [profile.release]
-panic = "abort"
 codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+
+[dev-dependencies]
+toml = "0.8"
