@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::Emitter;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 pub const THUMB_SIZE: u32 = 512;
@@ -53,6 +53,25 @@ fn catch_decoder_panic(decode: impl FnOnce() -> Result<()> + std::panic::UnwindS
     std::panic::catch_unwind(decode).unwrap_or_else(|_| Err(anyhow!("image decoder panicked")))
 }
 
+/// Passes each line of `reader` to `log` until EOF. Bytes that aren't UTF-8,
+/// such as raw output from a native extension, are decoded lossily so the pipe
+/// keeps draining and the worker never writes into a closed pipe.
+async fn forward_lines(reader: impl AsyncRead + Unpin, mut log: impl FnMut(&str)) {
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) => return,
+            Ok(_) => log(String::from_utf8_lossy(&buf).trim_end()),
+            Err(e) => {
+                tracing::warn!("Stopped reading Python worker stderr: {}", e);
+                return;
+            }
+        }
+    }
+}
+
 /// Persistent Python worker process communicating over JSON-RPC on stdin/stdout.
 /// Stays alive across requests to eliminate Python cold-start overhead (200-500ms per file).
 struct PythonWorker {
@@ -84,12 +103,10 @@ impl PythonWorker {
 
         // Python tracebacks and library warnings land in the app log.
         if let Some(stderr) = child.stderr.take() {
-            tauri::async_runtime::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::warn!(target: "preview_worker", "{}", line);
-                }
-            });
+            tauri::async_runtime::spawn(forward_lines(
+                stderr,
+                |line| tracing::warn!(target: "preview_worker", "{}", line),
+            ));
         }
 
         Ok(Self {
@@ -622,6 +639,16 @@ mod tests {
         assert_eq!(worker, bare.join("worker.py"));
 
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn forward_lines_survives_invalid_utf8() {
+        let mut lines = Vec::new();
+        forward_lines(&b"first\nbad \xff byte\r\nlast"[..], |l| {
+            lines.push(l.to_string())
+        })
+        .await;
+        assert_eq!(lines, ["first", "bad \u{fffd} byte", "last"]);
     }
 
     #[test]
