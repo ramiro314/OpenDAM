@@ -32,6 +32,12 @@ packages/preview-engine/venv/
 .env.local
 .env.*.local
 
+# ── Agents ─────────────────────────────────────────────────────────────────
+.claude/settings.local.json
+.claude/worktrees/
+# Screenshots and logs captured as workflow evidence (docs/agents/running-the-app.md)
+.evidence/
+
 # ── User Data, Databases & Libraries (NEVER COMMIT) ────────────────────────
 *.sqlite
 *.sqlite-journal
