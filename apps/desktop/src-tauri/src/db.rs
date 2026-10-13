@@ -284,26 +284,25 @@ impl Database {
             libraries: Arc::new(RwLock::new(open_libraries)),
         };
 
-        // In library-id order, so when two mirrors hold different definitions master lacks,
-        // which one master keeps doesn't depend on HashMap order.
-        for lib in db.get_all_libraries().await {
-            db.sync_library_metadata(&lib.pool).await;
-        }
+        db.sync_open_libraries().await;
 
         Ok(db)
     }
 
-    /// Runs when a library opens. Master gains the definitions it lacks from the library's
-    /// mirror (insert-only, so a rename made while the library was offline is kept), then the
-    /// mirror is overwritten from master, then memberships for assets the library doesn't hold
-    /// are removed.
-    pub async fn sync_library_metadata(&self, lib_pool: &Pool<Sqlite>) {
-        self.add_definitions_master_lacks(lib_pool).await;
-        if let Err(e) = self.converge_mirror(lib_pool).await {
-            tracing::error!(
-                "Failed to update a library's tag and collection mirror: {}",
-                e
-            );
+    /// Runs when libraries open. Master first gains the definitions it lacks from every open
+    /// library's mirror, in library-id order so the winner between two mirrors doesn't depend
+    /// on HashMap order (insert-only, so a rename made while a library was offline is kept).
+    /// Only then is every mirror overwritten from master and cleared of memberships for assets
+    /// its library doesn't hold, so no mirror misses a definition a later library brought.
+    pub async fn sync_open_libraries(&self) {
+        let libs = self.get_all_libraries().await;
+        for lib in &libs {
+            self.add_definitions_master_lacks(&lib.pool).await;
+        }
+        for lib in &libs {
+            if let Err(e) = self.converge_mirror(&lib.pool).await {
+                tracing::error!("Failed to update library {}'s mirror: {}", lib.id, e);
+            }
         }
     }
 
@@ -380,15 +379,6 @@ impl Database {
         let lib_db_file = opendam_dir.join("library.sqlite");
         let lib_pool = connect_library_sqlite(&lib_db_file).await?;
 
-        // The new library may bring definitions master lacked; the other open mirrors get
-        // them too, so tagging an asset elsewhere never names a tag its mirror doesn't have.
-        self.sync_library_metadata(&lib_pool).await;
-        for lib in self.get_all_libraries().await {
-            if let Err(e) = self.converge_mirror(&lib.pool).await {
-                tracing::error!("Failed to update library {}'s mirror: {}", lib.id, e);
-            }
-        }
-
         let handle = LibraryHandle {
             id: id.to_string(),
             name: name.to_string(),
@@ -396,8 +386,13 @@ impl Database {
             pool: lib_pool,
         };
 
-        let mut libs = self.libraries.write().await;
-        libs.insert(id.to_string(), handle.clone());
+        self.libraries
+            .write()
+            .await
+            .insert(id.to_string(), handle.clone());
+        // The new library may bring definitions master lacked; the other open mirrors get
+        // them too, so tagging an asset elsewhere never names a tag its mirror doesn't have.
+        self.sync_open_libraries().await;
 
         Ok(handle)
     }
@@ -663,7 +658,7 @@ mod tests {
         insert_tag(&a, "t", "old").await;
         insert_tag(&a, "u", "only-in-a").await;
 
-        db.sync_library_metadata(&a).await;
+        db.sync_open_libraries().await;
 
         assert_eq!(tag_name(&db.master_pool, "t").await.as_deref(), Some("new"));
         assert_eq!(
@@ -694,7 +689,7 @@ mod tests {
         insert_tag(&db.master_pool, "t", "new tag").await;
         insert_collection(&db.master_pool, "c", "new collection", None).await;
 
-        db.sync_library_metadata(&a).await;
+        db.sync_open_libraries().await;
 
         assert_eq!(tag_name(&a, "t").await.as_deref(), Some("new tag"));
         assert_eq!(
@@ -713,7 +708,7 @@ mod tests {
         insert_collection(&db.master_pool, "child", "child", Some("parent")).await;
         insert_collection(&db.master_pool, "parent", "parent", None).await;
 
-        db.sync_library_metadata(&a).await;
+        db.sync_open_libraries().await;
 
         assert_eq!(
             collection_name(&a, "parent").await.as_deref(),
@@ -730,7 +725,7 @@ mod tests {
         insert_tag(&a, "u", "stone").await;
         insert_tag(&db.master_pool, "t", "stone").await;
 
-        db.sync_library_metadata(&a).await;
+        db.sync_open_libraries().await;
 
         assert_eq!(tag_name(&a, "t").await.as_deref(), Some("rock"));
         assert_eq!(tag_name(&a, "u").await.as_deref(), Some("stone"));
@@ -756,8 +751,8 @@ mod tests {
                 .unwrap();
         }
 
-        db.sync_library_metadata(&a).await;
-        db.sync_library_metadata(&a).await;
+        db.sync_open_libraries().await;
+        db.sync_open_libraries().await;
 
         let tagged: Vec<String> = sqlx::query_scalar("SELECT asset_id FROM asset_tags")
             .fetch_all(&a)
@@ -792,6 +787,44 @@ mod tests {
             Some("brought along")
         );
         assert_eq!(tag_name(&a, "u").await.as_deref(), Some("brought along"));
+    }
+
+    #[tokio::test]
+    async fn startup_mirrors_a_later_librarys_new_definitions_to_an_earlier_library() {
+        let dir = std::env::temp_dir().join(format!("opendam-startup-{}", uuid::Uuid::new_v4()));
+        let master = dir.join("master.sqlite");
+        for id in ["a", "b"] {
+            std::fs::create_dir_all(dir.join(id).join(".opendam")).unwrap();
+        }
+        let b = connect_library_sqlite(&dir.join("b/.opendam/library.sqlite"))
+            .await
+            .unwrap();
+        insert_tag(&b, "u", "brought by b").await;
+        insert_collection(&b, "c", "brought by b", None).await;
+        b.close().await;
+        let first_run = Database::new(master.to_str().unwrap()).await.unwrap();
+        for id in ["a", "b"] {
+            sqlx::query(
+                "INSERT INTO libraries (id, name, root_paths, created_at) VALUES (?, ?, ?, 0)",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(serde_json::json!([dir.join(id)]).to_string())
+            .execute(&first_run.master_pool)
+            .await
+            .unwrap();
+        }
+        first_run.master_pool.close().await;
+
+        let db = Database::new(master.to_str().unwrap()).await.unwrap();
+        let a = db.get_library_handle("a").await.unwrap().pool;
+        let mirrored = (tag_name(&a, "u").await, collection_name(&a, "c").await);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            mirrored,
+            (Some("brought by b".into()), Some("brought by b".into()))
+        );
     }
 
     #[tokio::test]

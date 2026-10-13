@@ -62,9 +62,10 @@ docs/plans                    Plans for this fork
   Definition create, update and delete write to master, then mirror to every open library DB.
   `asset_tags` and `collection_assets` rows go only to the asset's own library
   (`Database::library_of_asset`). There is no "active library": every caller names a library or
-  iterates all of them (`get_all_libraries`, in library-id order). Opening a library adds the
-  definitions master lacks (insert-only), overwrites its mirror from master and drops memberships
-  for assets it doesn't hold. Mirror writes update rows in place (`db::upsert_tag`,
+  iterates all of them (`get_all_libraries`, in library-id order). When libraries open
+  (`Database::sync_open_libraries`), master first gains the definitions it lacks from every open
+  library (insert-only), then every mirror is overwritten from master and drops memberships for
+  assets its library doesn't hold. Mirror writes update rows in place (`db::upsert_tag`,
   `db::upsert_collection`), never `REPLACE`, which cascade-deletes memberships and child
   collections.
 
