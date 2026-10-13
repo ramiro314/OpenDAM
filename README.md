@@ -23,6 +23,39 @@ mise install && make deps && make dev
 The first `make dev` compiles the Rust backend, which takes several minutes. Then click **Add
 Library** and choose a folder of assets.
 
+## Install
+
+To use OpenDAM day to day, install a release build into `~/.local` from a checkout set up as
+above:
+
+```sh
+make install
+```
+
+This builds the release binary and installs:
+
+- `~/.local/bin/opendam`
+- `~/.local/share/applications/opendam.desktop`, which puts OpenDAM in the app launcher
+- `~/.local/share/icons/hicolor/128x128/apps/opendam.png`
+- `~/.local/share/opendam/preview-engine/`, the Python preview worker and its own uv environment
+
+If `XDG_DATA_HOME` is set, everything except the binary goes there instead of `~/.local/share`.
+
+To update, pull and run `make install` again. It overwrites the installed files and syncs the
+preview engine's environment.
+
+To remove it:
+
+```sh
+make uninstall
+```
+
+This deletes the files listed above and nothing else. It leaves in place:
+
+- your libraries and tags in `~/.local/share/com.opendam.desktop/`
+- each library's `.opendam/` folder (its database and thumbnails)
+- uv's cache and any Python that uv downloaded
+
 ## Credit and license
 
 OpenDAM was created by [LawLaw09/OpenDAM](https://github.com/LawLaw09/OpenDAM). This fork keeps
