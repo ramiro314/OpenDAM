@@ -1,8 +1,10 @@
 use chrono::Utc;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::State;
 use uuid::Uuid;
 
+use crate::db::{upsert_collection, CollectionRow, Database};
 use crate::models::Collection;
 use crate::AppState;
 
@@ -10,63 +12,48 @@ type Result<T> = std::result::Result<T, String>;
 
 #[tauri::command]
 pub async fn list_collections(state: State<'_, Arc<AppState>>) -> Result<Vec<Collection>> {
-    let pool = state.db.get_active_pool().await;
-    let mut rows = sqlx::query_as::<_, (String, String, String, Option<String>, bool, Option<String>, i64)>(
+    list_collections_in(&state.db).await
+}
+
+/// Definitions come from the master catalog; each collection's assets are the membership rows
+/// of every open library.
+async fn list_collections_in(db: &Database) -> Result<Vec<Collection>> {
+    let rows = sqlx::query_as::<_, CollectionRow>(
         "SELECT id, name, description, parent_id, is_smart, filter_spec, created_at FROM collections ORDER BY created_at ASC"
     )
-    .fetch_all(&state.db.master_pool).await.unwrap_or_default();
+    .fetch_all(&db.master_pool)
+    .await
+    .map_err(|e| e.to_string())?;
 
-    if rows.is_empty() {
-        rows = sqlx::query_as::<_, (String, String, String, Option<String>, bool, Option<String>, i64)>(
-            "SELECT id, name, description, parent_id, is_smart, filter_spec, created_at FROM collections ORDER BY created_at ASC"
+    let mut members: HashMap<String, Vec<String>> = HashMap::new();
+    for lib in db.get_all_libraries().await {
+        if let Ok(pairs) = sqlx::query_as::<_, (String, String)>(
+            "SELECT collection_id, asset_id FROM collection_assets",
         )
-        .fetch_all(&pool).await.unwrap_or_default();
-    }
-
-    let libs = state.db.get_all_libraries().await;
-    let mut collections = Vec::new();
-    for (id, name, description, parent_id, is_smart, filter_spec, created_at) in rows {
-        let mut asset_ids_set = std::collections::HashSet::new();
-
-        // Gather asset_ids from all open libraries
-        for lib in &libs {
-            if let Ok(a_rows) = sqlx::query_as::<_, (String,)>(
-                "SELECT asset_id FROM collection_assets WHERE collection_id = ?",
-            )
-            .bind(&id)
-            .fetch_all(&lib.pool)
-            .await
-            {
-                for (aid,) in a_rows {
-                    asset_ids_set.insert(aid);
-                }
-            }
-        }
-        if let Ok(a_rows) = sqlx::query_as::<_, (String,)>(
-            "SELECT asset_id FROM collection_assets WHERE collection_id = ?",
-        )
-        .bind(&id)
-        .fetch_all(&state.db.master_pool)
+        .fetch_all(&lib.pool)
         .await
         {
-            for (aid,) in a_rows {
-                asset_ids_set.insert(aid);
+            for (collection_id, asset_id) in pairs {
+                members.entry(collection_id).or_default().push(asset_id);
             }
         }
-
-        let asset_ids = asset_ids_set.into_iter().collect();
-        collections.push(Collection {
-            id,
-            name,
-            description,
-            parent_id,
-            asset_ids,
-            is_smart,
-            filter_spec,
-            created_at,
-        });
     }
-    Ok(collections)
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, name, description, parent_id, is_smart, filter_spec, created_at)| Collection {
+                asset_ids: members.remove(&id).unwrap_or_default(),
+                id,
+                name,
+                description,
+                parent_id,
+                is_smart,
+                filter_spec,
+                created_at,
+            },
+        )
+        .collect())
 }
 
 #[tauri::command]
@@ -78,41 +65,42 @@ pub async fn create_collection(
     filter_spec: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Collection> {
-    let id = Uuid::new_v4().to_string();
-    let now = Utc::now().timestamp_millis();
-    let desc = description.unwrap_or_default();
-    let smart = is_smart.unwrap_or(false);
-    let pool = state.db.get_active_pool().await;
+    let row: CollectionRow = (
+        Uuid::new_v4().to_string(),
+        name,
+        description.unwrap_or_default(),
+        parent_id,
+        is_smart.unwrap_or(false),
+        filter_spec,
+        Utc::now().timestamp_millis(),
+    );
     sqlx::query(
         "INSERT INTO collections (id, name, description, parent_id, is_smart, filter_spec, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
     )
-    .bind(&id).bind(&name).bind(&desc).bind(&parent_id).bind(smart).bind(&filter_spec).bind(now)
-    .execute(&pool).await.map_err(|e| e.to_string())?;
+    .bind(&row.0).bind(&row.1).bind(&row.2).bind(&row.3).bind(row.4).bind(&row.5).bind(row.6)
+    .execute(&state.db.master_pool).await.map_err(|e| e.to_string())?;
 
-    // Also sync to all open library pools and master pool
-    let libs = state.db.get_all_libraries().await;
-    for lib in libs {
-        let _ = sqlx::query(
-            "INSERT OR IGNORE INTO collections (id, name, description, parent_id, is_smart, filter_spec, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(&id).bind(&name).bind(&desc).bind(&parent_id).bind(smart).bind(&filter_spec).bind(now)
-        .execute(&lib.pool).await;
+    for lib in state.db.get_all_libraries().await {
+        if let Err(e) = upsert_collection(&lib.pool, &row).await {
+            tracing::warn!(
+                "Failed to mirror collection {} to library {}: {}",
+                row.0,
+                lib.id,
+                e
+            );
+        }
     }
-    let _ = sqlx::query(
-        "INSERT OR IGNORE INTO collections (id, name, description, parent_id, is_smart, filter_spec, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-    )
-    .bind(&id).bind(&name).bind(&desc).bind(&parent_id).bind(smart).bind(&filter_spec).bind(now)
-    .execute(&state.db.master_pool).await;
 
+    let (id, name, description, parent_id, is_smart, filter_spec, created_at) = row;
     Ok(Collection {
         id,
         name,
-        description: desc,
+        description,
         parent_id,
         asset_ids: vec![],
-        is_smart: smart,
+        is_smart,
         filter_spec,
-        created_at: now,
+        created_at,
     })
 }
 
@@ -122,90 +110,32 @@ pub async fn add_to_collection(
     asset_ids: Vec<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
-    let libs = state.db.get_all_libraries().await;
+    add_assets_to_collection(&state.db, &collection_id, &asset_ids).await
+}
 
-    // Fetch collection info from master_pool or any lib pool
-    let mut col_info = sqlx::query_as::<_, (String, String, String, Option<String>, bool, Option<String>, i64)>(
-        "SELECT id, name, description, parent_id, is_smart, filter_spec, created_at FROM collections WHERE id = ?"
-    )
-    .bind(&collection_id)
-    .fetch_optional(&state.db.master_pool)
-    .await
-    .unwrap_or(None);
-
-    if col_info.is_none() {
-        for lib in &libs {
-            col_info = sqlx::query_as::<_, (String, String, String, Option<String>, bool, Option<String>, i64)>(
-                "SELECT id, name, description, parent_id, is_smart, filter_spec, created_at FROM collections WHERE id = ?"
-            )
-            .bind(&collection_id)
-            .fetch_optional(&lib.pool)
-            .await
-            .unwrap_or(None);
-            if col_info.is_some() {
-                break;
-            }
-        }
-    }
-
-    // Ensure collection exists in master_pool and all open library pools
-    if let Some((ref cid, ref cname, ref cdesc, ref cpid, csmart, ref cfspec, ctime)) = col_info {
-        let _ = sqlx::query(
-            "INSERT OR IGNORE INTO collections (id, name, description, parent_id, is_smart, filter_spec, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(cid).bind(cname).bind(cdesc).bind(cpid).bind(csmart).bind(cfspec).bind(ctime)
-        .execute(&state.db.master_pool).await;
-
-        for lib in &libs {
-            let _ = sqlx::query(
-                "INSERT OR IGNORE INTO collections (id, name, description, parent_id, is_smart, filter_spec, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-            )
-            .bind(cid).bind(cname).bind(cdesc).bind(cpid).bind(csmart).bind(cfspec).bind(ctime)
-            .execute(&lib.pool).await;
-        }
-    }
-
-    let active_pool = state.db.get_active_pool().await;
-
-    for aid in &asset_ids {
-        let mut found_in_lib = false;
-        for lib in &libs {
-            let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM assets WHERE id = ?")
-                .bind(aid)
-                .fetch_optional(&lib.pool)
-                .await
-                .unwrap_or(None);
-            if exists.is_some() {
-                found_in_lib = true;
-                let _ = sqlx::query("INSERT OR IGNORE INTO collection_assets (collection_id, asset_id) VALUES (?, ?)")
-                    .bind(&collection_id)
-                    .bind(aid)
-                    .execute(&lib.pool)
-                    .await;
-            }
-        }
-
-        // Always record in master_pool
-        let _ = sqlx::query(
+/// Each membership row goes to the asset's own library only.
+async fn add_assets_to_collection(
+    db: &Database,
+    collection_id: &str,
+    asset_ids: &[String],
+) -> Result<()> {
+    for aid in asset_ids {
+        let Some(lib) = db.library_of_asset(aid).await else {
+            tracing::warn!(
+                "Asset {} is in no open library, not adding it to a collection",
+                aid
+            );
+            continue;
+        };
+        sqlx::query(
             "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
         )
-        .bind(&collection_id)
+        .bind(collection_id)
         .bind(aid)
-        .execute(&state.db.master_pool)
-        .await;
-
-        // If not found in any library pool, record in active pool
-        if !found_in_lib {
-            let _ = sqlx::query(
-                "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
-            )
-            .bind(&collection_id)
-            .bind(aid)
-            .execute(&active_pool)
-            .await;
-        }
+        .execute(&lib.pool)
+        .await
+        .map_err(|e| e.to_string())?;
     }
-
     Ok(())
 }
 
@@ -215,39 +145,22 @@ pub async fn remove_from_collection(
     asset_ids: Vec<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
-    let libs = state.db.get_all_libraries().await;
-    let active_pool = state.db.get_active_pool().await;
-
     for aid in &asset_ids {
-        for lib in &libs {
-            let _ = sqlx::query(
-                "DELETE FROM collection_assets WHERE collection_id = ? AND asset_id = ?",
-            )
-            .bind(&collection_id)
-            .bind(aid)
-            .execute(&lib.pool)
-            .await;
+        if let Some(lib) = state.db.library_of_asset(aid).await {
+            sqlx::query("DELETE FROM collection_assets WHERE collection_id = ? AND asset_id = ?")
+                .bind(&collection_id)
+                .bind(aid)
+                .execute(&lib.pool)
+                .await
+                .map_err(|e| e.to_string())?;
         }
-        let _ =
-            sqlx::query("DELETE FROM collection_assets WHERE collection_id = ? AND asset_id = ?")
-                .bind(&collection_id)
-                .bind(aid)
-                .execute(&state.db.master_pool)
-                .await;
-        let _ =
-            sqlx::query("DELETE FROM collection_assets WHERE collection_id = ? AND asset_id = ?")
-                .bind(&collection_id)
-                .bind(aid)
-                .execute(&active_pool)
-                .await;
     }
     Ok(())
 }
 
 #[tauri::command]
 pub async fn delete_collection(id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
-    let pool = state.db.get_active_pool().await;
-    // Recursively collect all descendant collection IDs
+    // Recursively collect all descendant collection IDs from the catalog
     let mut to_delete = vec![id.clone()];
     let mut idx = 0;
     while idx < to_delete.len() {
@@ -255,7 +168,7 @@ pub async fn delete_collection(id: String, state: State<'_, Arc<AppState>>) -> R
         let sub_rows =
             sqlx::query_as::<_, (String,)>("SELECT id FROM collections WHERE parent_id = ?")
                 .bind(cur_id)
-                .fetch_all(&pool)
+                .fetch_all(&state.db.master_pool)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -269,13 +182,9 @@ pub async fn delete_collection(id: String, state: State<'_, Arc<AppState>>) -> R
 
     let libs = state.db.get_all_libraries().await;
     for cid in &to_delete {
-        let _ = sqlx::query("DELETE FROM collection_assets WHERE collection_id = ?")
-            .bind(cid)
-            .execute(&pool)
-            .await;
         let _ = sqlx::query("DELETE FROM collections WHERE id = ?")
             .bind(cid)
-            .execute(&pool)
+            .execute(&state.db.master_pool)
             .await;
         for lib in &libs {
             let _ = sqlx::query("DELETE FROM collection_assets WHERE collection_id = ?")
@@ -287,14 +196,68 @@ pub async fn delete_collection(id: String, state: State<'_, Arc<AppState>>) -> R
                 .execute(&lib.pool)
                 .await;
         }
-        let _ = sqlx::query("DELETE FROM collection_assets WHERE collection_id = ?")
-            .bind(cid)
-            .execute(&state.db.master_pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM collections WHERE id = ?")
-            .bind(cid)
-            .execute(&state.db.master_pool)
-            .await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{
+        insert_asset, insert_collection, memory_database, memory_library, memory_library_pool,
+    };
+
+    async fn collected(pool: &sqlx::Pool<sqlx::Sqlite>) -> Vec<String> {
+        sqlx::query_scalar("SELECT asset_id FROM collection_assets ORDER BY asset_id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn collecting_assets_writes_each_membership_only_to_the_assets_own_library() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        insert_asset(&a, "in-a").await;
+        insert_asset(&b, "in-b").await;
+        let db = memory_database(vec![
+            memory_library("a", a.clone()),
+            memory_library("b", b.clone()),
+        ])
+        .await;
+        for pool in [&db.master_pool, &a, &b] {
+            insert_collection(pool, "c", "props", None).await;
+        }
+
+        add_assets_to_collection(&db, "c", &["in-a".into(), "in-b".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(collected(&a).await, ["in-a"]);
+        assert_eq!(collected(&b).await, ["in-b"]);
+        assert!(collected(&db.master_pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_collections_reads_master_definitions_and_every_librarys_memberships() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        for (pool, asset) in [(&a, "in-a"), (&b, "in-b")] {
+            insert_asset(pool, asset).await;
+            insert_collection(pool, "c", "mirror name", None).await;
+            sqlx::query("INSERT INTO collection_assets (collection_id, asset_id) VALUES ('c', ?)")
+                .bind(asset)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        let db = memory_database(vec![memory_library("a", a), memory_library("b", b)]).await;
+        insert_collection(&db.master_pool, "c", "master name", None).await;
+
+        let collections = list_collections_in(&db).await.unwrap();
+
+        assert_eq!(collections.len(), 1);
+        assert_eq!(collections[0].name, "master name");
+        assert_eq!(collections[0].asset_ids, ["in-a", "in-b"]);
+    }
 }

@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tauri::{Emitter, State};
 
-use crate::db::{make_relative_path, resolve_path};
+use crate::db::{make_relative_path, resolve_path, Database};
 use crate::models::{Asset, AssetPatch, SearchPayload, SearchResult};
 use crate::AppState;
 
@@ -121,15 +121,8 @@ pub async fn search_assets(
         }
 
         if list.is_empty() {
-            if all_libs.is_empty() {
-                list.push((
-                    state.db.get_active_pool().await,
-                    state.db.get_library_root(None).await,
-                ));
-            } else {
-                for lib in &all_libs {
-                    list.push((lib.pool.clone(), Some(lib.root_path.clone())));
-                }
+            for lib in &all_libs {
+                list.push((lib.pool.clone(), Some(lib.root_path.clone())));
             }
         }
         list
@@ -627,29 +620,7 @@ pub async fn get_asset(id: String, state: State<'_, Arc<AppState>>) -> Result<As
         }
     }
 
-    // Fallback to active/default pool
-    let fallback_pool = state.db.get_active_pool().await;
-    let row = sqlx::query_as::<_, RawAssetRow>(
-        r#"SELECT a.id, a.file_path, a.file_name, a.extension, a.kind,
-           a.size_bytes, a.modified_at, a.indexed_at, a.rating,
-           a.color_label, a.is_favorite, a.description, a.thumbnail_path,
-           a.preview_status, a.metadata,
-           (SELECT json_group_array(tag_id) FROM asset_tags WHERE asset_id = a.id) AS tags,
-           (SELECT json_group_array(collection_id) FROM collection_assets WHERE asset_id = a.id) AS collections
-           FROM assets a WHERE a.id = ?"#,
-    )
-    .bind(&id)
-    .fetch_optional(&fallback_pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    match row {
-        Some(r) => {
-            let root_opt = state.db.get_library_root(None).await;
-            Ok(row_to_asset(root_opt.as_deref(), r))
-        }
-        None => Err(format!("Asset not found: {}", id)),
-    }
+    Err(format!("Asset not found: {}", id))
 }
 
 #[tauri::command]
@@ -658,125 +629,81 @@ pub async fn update_asset(
     patch: AssetPatch,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Asset> {
-    let libs = state.db.get_all_libraries().await;
-    let mut pools_to_update: Vec<(sqlx::Pool<sqlx::Sqlite>, Option<std::path::PathBuf>)> =
-        Vec::new();
-
-    for lib in &libs {
-        let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM assets WHERE id = ?")
-            .bind(&id)
-            .fetch_optional(&lib.pool)
-            .await
-            .unwrap_or(None);
-
-        if exists.is_some() {
-            pools_to_update.push((lib.pool.clone(), Some(lib.root_path.clone())));
-        }
-    }
-
-    let master_exists: Option<(String,)> = sqlx::query_as("SELECT id FROM assets WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(&state.db.master_pool)
-        .await
-        .unwrap_or(None);
-
-    if master_exists.is_some() || pools_to_update.is_empty() {
-        pools_to_update.push((
-            state.db.master_pool.clone(),
-            state.db.get_library_root(None).await,
-        ));
-    }
-
-    let active_pool = state.db.get_active_pool().await;
-    pools_to_update.push((active_pool, state.db.get_library_root(None).await));
-
-    for (pool, root) in &pools_to_update {
-        if let Some(rating) = patch.rating {
-            let _ = sqlx::query("UPDATE assets SET rating = ? WHERE id = ?")
-                .bind(rating)
-                .bind(&id)
-                .execute(pool)
-                .await;
-        }
-        if let Some(ref color_label) = patch.color_label {
-            let _ = sqlx::query("UPDATE assets SET color_label = ? WHERE id = ?")
-                .bind(color_label)
-                .bind(&id)
-                .execute(pool)
-                .await;
-        }
-        if let Some(is_fav) = patch.is_favorite {
-            let fav_int: i64 = if is_fav { 1 } else { 0 };
-            let _ = sqlx::query("UPDATE assets SET is_favorite = ? WHERE id = ?")
-                .bind(fav_int)
-                .bind(&id)
-                .execute(pool)
-                .await;
-        }
-        if let Some(ref description) = patch.description {
-            let _ = sqlx::query("UPDATE assets SET description = ? WHERE id = ?")
-                .bind(description)
-                .bind(&id)
-                .execute(pool)
-                .await;
-        }
-        if let Some(ref thumbnail_path) = patch.thumbnail_path {
-            let rel_thumb = match root {
-                Some(r) => make_relative_path(r, Path::new(thumbnail_path)),
-                None => thumbnail_path.clone(),
-            };
-            let _ = sqlx::query("UPDATE assets SET thumbnail_path = ? WHERE id = ?")
-                .bind(rel_thumb)
-                .bind(&id)
-                .execute(pool)
-                .await;
-        }
-        if let Some(ref preview_status) = patch.preview_status {
-            let _ = sqlx::query("UPDATE assets SET preview_status = ? WHERE id = ?")
-                .bind(preview_status)
-                .bind(&id)
-                .execute(pool)
-                .await;
-        }
-        if let Some(ref tags) = patch.tags {
-            let _ = sqlx::query("DELETE FROM asset_tags WHERE asset_id = ?")
-                .bind(&id)
-                .execute(pool)
-                .await;
-            for tag_id in tags {
-                let tag_def =
-                    sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
-                        "SELECT id, name, color, parent_id FROM tags WHERE id = ?",
-                    )
-                    .bind(tag_id)
-                    .fetch_optional(&state.db.master_pool)
-                    .await
-                    .unwrap_or(None);
-
-                if let Some((tid, tname, tcolor, tparent)) = tag_def {
-                    let _ = sqlx::query("INSERT OR IGNORE INTO tags (id, name, color, parent_id) VALUES (?, ?, ?, ?)")
-                        .bind(&tid).bind(&tname).bind(&tcolor).bind(&tparent)
-                        .execute(pool).await;
-                } else {
-                    let _ = sqlx::query("INSERT OR IGNORE INTO tags (id, name) VALUES (?, ?)")
-                        .bind(tag_id)
-                        .bind(tag_id)
-                        .execute(pool)
-                        .await;
-                }
-
-                let _ = sqlx::query(
-                    "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)",
-                )
-                .bind(&id)
-                .bind(tag_id)
-                .execute(pool)
-                .await;
-            }
-        }
-    }
-
+    apply_asset_patch(&state.db, &id, &patch).await?;
     get_asset(id, state).await
+}
+
+/// Writes the patch to the asset's own library only, memberships included.
+async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Result<()> {
+    let lib = db
+        .library_of_asset(id)
+        .await
+        .ok_or_else(|| format!("Asset not found: {}", id))?;
+    let pool = &lib.pool;
+
+    if let Some(rating) = patch.rating {
+        let _ = sqlx::query("UPDATE assets SET rating = ? WHERE id = ?")
+            .bind(rating)
+            .bind(id)
+            .execute(pool)
+            .await;
+    }
+    if let Some(ref color_label) = patch.color_label {
+        let _ = sqlx::query("UPDATE assets SET color_label = ? WHERE id = ?")
+            .bind(color_label)
+            .bind(id)
+            .execute(pool)
+            .await;
+    }
+    if let Some(is_fav) = patch.is_favorite {
+        let fav_int: i64 = if is_fav { 1 } else { 0 };
+        let _ = sqlx::query("UPDATE assets SET is_favorite = ? WHERE id = ?")
+            .bind(fav_int)
+            .bind(id)
+            .execute(pool)
+            .await;
+    }
+    if let Some(ref description) = patch.description {
+        let _ = sqlx::query("UPDATE assets SET description = ? WHERE id = ?")
+            .bind(description)
+            .bind(id)
+            .execute(pool)
+            .await;
+    }
+    if let Some(ref thumbnail_path) = patch.thumbnail_path {
+        let rel_thumb = make_relative_path(&lib.root_path, Path::new(thumbnail_path));
+        let _ = sqlx::query("UPDATE assets SET thumbnail_path = ? WHERE id = ?")
+            .bind(rel_thumb)
+            .bind(id)
+            .execute(pool)
+            .await;
+    }
+    if let Some(ref preview_status) = patch.preview_status {
+        let _ = sqlx::query("UPDATE assets SET preview_status = ? WHERE id = ?")
+            .bind(preview_status)
+            .bind(id)
+            .execute(pool)
+            .await;
+    }
+    if let Some(ref tags) = patch.tags {
+        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM asset_tags WHERE asset_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        for tag_id in tags {
+            let _ =
+                sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
+                    .bind(id)
+                    .bind(tag_id)
+                    .execute(&mut *tx)
+                    .await;
+        }
+        tx.commit().await.map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -809,7 +736,6 @@ pub async fn delete_asset(
     }
 
     target_pools.push(state.db.master_pool.clone());
-    target_pools.push(state.db.get_active_pool().await);
 
     // If deleting from filesystem
     if should_delete_file {
@@ -948,11 +874,7 @@ pub async fn rename_asset(
     let now = chrono::Utc::now().timestamp_millis();
 
     // Update in all relevant databases
-    let pools_to_update = vec![
-        lib.pool.clone(),
-        state.db.master_pool.clone(),
-        state.db.get_active_pool().await,
-    ];
+    let pools_to_update = vec![lib.pool.clone(), state.db.master_pool.clone()];
     for pool in pools_to_update {
         let _ = sqlx::query(
             "UPDATE assets SET file_name = ?, file_path = ?, extension = ?, modified_at = ? WHERE id = ?"
@@ -973,7 +895,9 @@ pub async fn rename_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::memory_library_pool;
+    use crate::db::{
+        insert_asset, insert_tag, memory_database, memory_library, memory_library_pool,
+    };
 
     #[test]
     fn fts_match_expression_quotes_each_term_as_a_prefix_string() {
@@ -1048,5 +972,36 @@ mod tests {
         assert_eq!(search_names(&pool, "\"").await, all);
         assert_eq!(search_names(&pool, "(").await, all);
         assert_eq!(search_names(&pool, "( tree").await, ["tree.glb"]);
+    }
+
+    async fn tagged(pool: &sqlx::Pool<sqlx::Sqlite>) -> Vec<(String, String)> {
+        sqlx::query_as("SELECT asset_id, tag_id FROM asset_tags ORDER BY asset_id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tagging_assets_writes_each_membership_only_to_the_assets_own_library() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        insert_asset(&a, "in-a").await;
+        insert_asset(&b, "in-b").await;
+        let db = memory_database(vec![
+            memory_library("a", a.clone()),
+            memory_library("b", b.clone()),
+        ])
+        .await;
+        for pool in [&db.master_pool, &a, &b] {
+            insert_tag(pool, "t", "rock").await;
+        }
+        let patch: AssetPatch =
+            serde_json::from_value(serde_json::json!({ "tags": ["t"] })).unwrap();
+
+        apply_asset_patch(&db, "in-a", &patch).await.unwrap();
+        apply_asset_patch(&db, "in-b", &patch).await.unwrap();
+
+        assert_eq!(tagged(&a).await, [("in-a".to_string(), "t".to_string())]);
+        assert_eq!(tagged(&b).await, [("in-b".to_string(), "t".to_string())]);
     }
 }

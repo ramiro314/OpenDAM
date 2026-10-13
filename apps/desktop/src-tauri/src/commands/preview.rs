@@ -16,28 +16,17 @@ pub async fn request_preview(
     asset_ids: Vec<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
-    let libs = state.db.get_all_libraries().await;
     let now = Utc::now().timestamp_millis();
 
     for asset_id in &asset_ids {
-        let mut target_pool = None;
-        for lib in &libs {
-            let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM assets WHERE id = ?")
-                .bind(asset_id)
-                .fetch_optional(&lib.pool)
-                .await
-                .unwrap_or(None);
-
-            if exists.is_some() {
-                target_pool = Some(lib.pool.clone());
-                break;
-            }
-        }
-
-        let pool = match target_pool {
-            Some(p) => p,
-            None => state.db.get_active_pool().await,
+        let Some(lib) = state.db.library_of_asset(asset_id).await else {
+            tracing::warn!(
+                "Asset {} is in no open library, not queueing a preview",
+                asset_id
+            );
+            continue;
         };
+        let pool = lib.pool;
 
         // Delete any existing preview job so a new one is queued cleanly
         let _ = sqlx::query("DELETE FROM preview_jobs WHERE asset_id = ?")

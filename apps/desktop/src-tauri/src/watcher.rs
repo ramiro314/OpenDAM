@@ -145,7 +145,7 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
     // deleted-file pass below would then remove every asset row.
     let Some(LibraryHandle {
         pool, root_path, ..
-    }) = db.get_library_handle(Some(library_id)).await
+    }) = db.get_library_handle(library_id).await
     else {
         tracing::info!("Library {} is not open, skipping indexing", library_id);
         return Ok(());
@@ -438,10 +438,8 @@ async fn commit_asset_batch(pool: &sqlx::Pool<sqlx::Sqlite>, batch: &[PendingAss
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::memory_library_pool;
+    use crate::db::{memory_database, memory_library_pool};
     use sqlx::{Pool, Sqlite};
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
 
     async fn library_with_one_asset(id: &str, root_path: PathBuf) -> LibraryHandle {
         let pool = memory_library_pool().await;
@@ -457,17 +455,6 @@ mod tests {
             name: id.to_string(),
             root_path,
             pool,
-        }
-    }
-
-    async fn database_with(libraries: Vec<LibraryHandle>) -> Database {
-        let first_pool = libraries[0].pool.clone();
-        Database {
-            master_pool: memory_library_pool().await,
-            libraries: Arc::new(RwLock::new(
-                libraries.into_iter().map(|h| (h.id.clone(), h)).collect(),
-            )),
-            pool: first_pool,
         }
     }
 
@@ -489,7 +476,7 @@ mod tests {
         let online = library_with_one_asset("online", online_root.clone()).await;
         let online_pool = online.pool.clone();
         // The offline library's root is missing, so Database::new never opened it.
-        let db = database_with(vec![online]).await;
+        let db = memory_database(vec![online]).await;
 
         let offline_paths = [missing_root().to_string_lossy().to_string()];
         index_paths(&db, "offline", &offline_paths).await.unwrap();
@@ -504,7 +491,7 @@ mod tests {
         let root = missing_root();
         let unmounted = library_with_one_asset("unmounted", root.clone()).await;
         let pool = unmounted.pool.clone();
-        let db = database_with(vec![unmounted]).await;
+        let db = memory_database(vec![unmounted]).await;
 
         index_paths(&db, "unmounted", &[root.to_string_lossy().to_string()])
             .await
@@ -521,7 +508,7 @@ mod tests {
         // The seeded models/tree.glb row has no file on disk, so a re-index removes it.
         let mounted = library_with_one_asset("mounted", root.clone()).await;
         let pool = mounted.pool.clone();
-        let db = database_with(vec![mounted]).await;
+        let db = memory_database(vec![mounted]).await;
 
         let result = index_paths(&db, "mounted", &[root.to_string_lossy().to_string()]).await;
         let file_paths: Vec<String> = sqlx::query_scalar("SELECT file_path FROM assets")
