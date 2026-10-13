@@ -81,24 +81,32 @@ pub async fn delete_tag(id: String, state: State<'_, Arc<AppState>>) -> Result<(
 
 /// Deletes the definition from master and every open library, with its memberships.
 async fn delete_tag_in(db: &Database, id: &str) -> Result<()> {
+    // Mirrors first, each in one transaction, and master last: if a library can't take the
+    // delete, master keeps the tag, so the next open doesn't bring a "deleted" tag back.
+    for lib in db.get_all_libraries().await {
+        let delete = async {
+            let mut tx = lib.pool.begin().await?;
+            // Memberships are deleted explicitly: not every library connection enforces the cascade.
+            sqlx::query("DELETE FROM asset_tags WHERE tag_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM tags WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await
+        };
+        delete
+            .await
+            .map_err(|e| format!("Could not delete the tag from library {}: {}", lib.name, e))?;
+    }
+
     sqlx::query("DELETE FROM tags WHERE id = ?")
         .bind(id)
         .execute(&db.master_pool)
         .await
         .map_err(|e| e.to_string())?;
-
-    // Memberships are deleted explicitly: not every library connection enforces the cascade.
-    for lib in db.get_all_libraries().await {
-        let _ = sqlx::query("DELETE FROM asset_tags WHERE tag_id = ?")
-            .bind(id)
-            .execute(&lib.pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM tags WHERE id = ?")
-            .bind(id)
-            .execute(&lib.pool)
-            .await;
-    }
-
     Ok(())
 }
 
@@ -188,5 +196,25 @@ mod tests {
         }
         assert_eq!(membership_count(&a).await, 0);
         assert_eq!(membership_count(&b).await, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_tag_that_a_library_cannot_take_is_an_error_and_keeps_master() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        insert_tag(&a, "t", "rock").await;
+        insert_tag(&b, "t", "rock").await;
+        let db = memory_database(vec![
+            memory_library("a", a.clone()),
+            memory_library("b", b.clone()),
+        ])
+        .await;
+        insert_tag(&db.master_pool, "t", "rock").await;
+        b.close().await;
+
+        let result = delete_tag_in(&db, "t").await;
+
+        assert!(result.is_err());
+        assert_eq!(tag_names(&db.master_pool).await, ["rock"]);
     }
 }

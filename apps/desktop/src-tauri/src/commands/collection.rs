@@ -1,5 +1,5 @@
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tauri::State;
 use uuid::Uuid;
@@ -25,17 +25,17 @@ async fn list_collections_in(db: &Database) -> Result<Vec<Collection>> {
     .await
     .map_err(|e| e.to_string())?;
 
-    let mut members: HashMap<String, Vec<String>> = HashMap::new();
+    // A set per collection: an asset id held by two libraries is listed once.
+    let mut members: HashMap<String, BTreeSet<String>> = HashMap::new();
     for lib in db.get_all_libraries().await {
-        if let Ok(pairs) = sqlx::query_as::<_, (String, String)>(
+        let pairs = sqlx::query_as::<_, (String, String)>(
             "SELECT collection_id, asset_id FROM collection_assets",
         )
         .fetch_all(&lib.pool)
         .await
-        {
-            for (collection_id, asset_id) in pairs {
-                members.entry(collection_id).or_default().push(asset_id);
-            }
+        .map_err(|e| format!("Could not read collections in library {}: {}", lib.name, e))?;
+        for (collection_id, asset_id) in pairs {
+            members.entry(collection_id).or_default().insert(asset_id);
         }
     }
 
@@ -43,7 +43,11 @@ async fn list_collections_in(db: &Database) -> Result<Vec<Collection>> {
         .into_iter()
         .map(
             |(id, name, description, parent_id, is_smart, filter_spec, created_at)| Collection {
-                asset_ids: members.remove(&id).unwrap_or_default(),
+                asset_ids: members
+                    .remove(&id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
                 id,
                 name,
                 description,
@@ -215,24 +219,40 @@ async fn delete_collection_in(db: &Database, id: &str) -> Result<()> {
         idx += 1;
     }
 
-    let libs = db.get_all_libraries().await;
-    for cid in &to_delete {
-        let _ = sqlx::query("DELETE FROM collections WHERE id = ?")
-            .bind(cid)
-            .execute(&db.master_pool)
-            .await;
-        for lib in &libs {
-            let _ = sqlx::query("DELETE FROM collection_assets WHERE collection_id = ?")
-                .bind(cid)
-                .execute(&lib.pool)
-                .await;
-            let _ = sqlx::query("DELETE FROM collections WHERE id = ?")
-                .bind(cid)
-                .execute(&lib.pool)
-                .await;
-        }
+    // Mirrors first, each in one transaction, and master last: if a library can't take the
+    // delete, master keeps the collections, so the next open doesn't bring them back.
+    for lib in db.get_all_libraries().await {
+        let delete = async {
+            let mut tx = lib.pool.begin().await?;
+            for cid in &to_delete {
+                sqlx::query("DELETE FROM collection_assets WHERE collection_id = ?")
+                    .bind(cid)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM collections WHERE id = ?")
+                    .bind(cid)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await
+        };
+        delete.await.map_err(|e| {
+            format!(
+                "Could not delete the collection from library {}: {}",
+                lib.name, e
+            )
+        })?;
     }
-    Ok(())
+
+    let mut tx = db.master_pool.begin().await.map_err(|e| e.to_string())?;
+    for cid in &to_delete {
+        sqlx::query("DELETE FROM collections WHERE id = ?")
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -412,5 +432,52 @@ mod tests {
 
         assert!(result.is_err());
         assert!(collected(&b).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_collection_that_a_library_cannot_take_is_an_error_and_keeps_master() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        insert_collection(&a, "c", "props", None).await;
+        insert_collection(&b, "c", "props", None).await;
+        let db = memory_database(vec![
+            memory_library("a", a.clone()),
+            memory_library("b", b.clone()),
+        ])
+        .await;
+        insert_collection(&db.master_pool, "c", "props", None).await;
+        b.close().await;
+
+        let result = delete_collection_in(&db, "c").await;
+
+        assert!(result.is_err());
+        assert_eq!(collection_ids(&db.master_pool).await, ["c"]);
+    }
+
+    #[tokio::test]
+    async fn list_collections_reports_a_library_it_cannot_read() {
+        let a = memory_library_pool().await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_collection(&db.master_pool, "c", "props", None).await;
+        a.close().await;
+
+        assert!(list_collections_in(&db).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_collections_lists_an_asset_id_held_by_two_libraries_once() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        for pool in [&a, &b] {
+            insert_asset(pool, "same").await;
+            insert_collection(pool, "c", "props", None).await;
+            collect(pool, "c", "same").await;
+        }
+        let db = memory_database(vec![memory_library("a", a), memory_library("b", b)]).await;
+        insert_collection(&db.master_pool, "c", "props", None).await;
+
+        let collections = list_collections_in(&db).await.unwrap();
+
+        assert_eq!(collections[0].asset_ids, ["same"]);
     }
 }
