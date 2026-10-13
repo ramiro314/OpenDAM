@@ -25,21 +25,21 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": {
+        "default-src": "'self' ipc: http://ipc.localhost",
+        "script-src": "'self'",
+        "style-src": "'self'",
+        "img-src": "'self' asset: http://asset.localhost blob: data:",
+        "media-src": "'self' asset: http://asset.localhost",
+        "connect-src": "'self' ipc: http://ipc.localhost asset: http://asset.localhost blob: data:",
+        "object-src": "'none'",
+        "base-uri": "'none'"
+      },
       "assetProtocol": {
         "enable": true,
         "scope": {
           "requireLiteralLeadingDot": false,
-          "allow": [
-            "**",
-            "**/*",
-            "$APPDATA/**",
-            "$APPDATA/**/*",
-            "$HOME/**",
-            "$HOME/**/*",
-            "$DESKTOP/**",
-            "$DESKTOP/**/*"
-          ]
+          "allow": ["$APPDATA/**"]
         }
       }
     }

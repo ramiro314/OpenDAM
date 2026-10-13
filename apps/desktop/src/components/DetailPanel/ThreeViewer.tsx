@@ -1,6 +1,8 @@
-import { Canvas } from '@react-three/fiber';
-import { useGLTF, Stage, PresentationControls } from '@react-three/drei';
-import { Suspense, Component, type ReactNode } from 'react';
+import { Canvas, useThree } from '@react-three/fiber';
+import { useGLTF, Stage, PresentationControls, Environment } from '@react-three/drei';
+import { Suspense, Component, useEffect, useState, type ReactNode } from 'react';
+import { PMREMGenerator, type Texture } from 'three';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { convertFileSrc } from '@tauri-apps/api/core';
 
 interface ErrorBoundaryProps {
@@ -36,8 +38,30 @@ class ThreeErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryStat
 
 function Model({ url }: { url: string }) {
   const fileUrl = convertFileSrc(url);
-  const { scene } = useGLTF(fileUrl);
+  // No Draco or meshopt: their decoders come from a CDN or inline WASM, which the CSP blocks.
+  const { scene } = useGLTF(fileUrl, false, false);
   return <primitive object={scene} />;
+}
+
+/** Lights the scene with a generated room, as the thumbnailer does, instead of a downloaded HDR. */
+function RoomLighting() {
+  const gl = useThree((state) => state.gl);
+  const [map, setMap] = useState<Texture | null>(null);
+  // Created in the effect, not memoized, so each mount (StrictMode mounts twice) owns and frees
+  // its own render target.
+  useEffect(() => {
+    const pmrem = new PMREMGenerator(gl);
+    const room = new RoomEnvironment();
+    const target = pmrem.fromScene(room, 0.04);
+    room.dispose();
+    pmrem.dispose();
+    setMap(target.texture);
+    return () => {
+      setMap(null);
+      target.dispose();
+    };
+  }, [gl]);
+  return map ? <Environment map={map} /> : null;
 }
 
 export function ThreeViewer({ modelPath }: { modelPath: string }) {
@@ -59,9 +83,10 @@ export function ThreeViewer({ modelPath }: { modelPath: string }) {
       }
     >
       <Canvas shadows dpr={[1, 2]} camera={{ fov: 50 }}>
+        <RoomLighting />
         <Suspense fallback={null}>
           <PresentationControls speed={1.5} global zoom={0.5} polar={[-0.1, Math.PI / 4]}>
-            <Stage environment="city" intensity={0.5}>
+            <Stage environment={null} intensity={0.5}>
               <Model url={modelPath} />
             </Stage>
           </PresentationControls>

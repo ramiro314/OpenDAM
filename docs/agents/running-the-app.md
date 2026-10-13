@@ -26,6 +26,17 @@ make dev
 - Stop only the app you started. Other worktrees run their own `opendam-desktop`, so check a
   process's cwd (`readlink /proc/<pid>/cwd`) before killing it.
 
+## Checking the CSP
+
+`make dev` loads the page from Vite's `devUrl`, and Tauri only applies `app.security.csp` to the
+frontend it embeds, so dev mode runs with no CSP. To see the policy in force with devtools still
+available, build the embedded frontend in debug mode from `apps/desktop` and run the binary:
+
+```sh
+bun run tauri build --debug --no-bundle
+./src-tauri/target/debug/opendam-desktop
+```
+
 ## Where the data lives
 
 - **Master DB:** `~/.local/share/com.opendam.desktop/opendam.sqlite` (the Tauri app data dir,
