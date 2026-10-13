@@ -110,14 +110,17 @@ jobs:
           exit-code: ${{ steps.test.outputs.exit-code }}
           rerun-command: bun test {files} --reporter=junit --reporter-outfile={junit}
           report: ${{ runner.temp }}/flake/report.json
+      # The bun step always succeeds under set +e, so its success means setup
+      # did not fail: these two still run after a failed rerun, but not after
+      # a failed install.
       - name: Upload flake report
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.test.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: flake-report-bun
           path: ${{ runner.temp }}/flake/report.json
       - name: Test (Rust)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.test.outcome == 'success' }}
         working-directory: apps/desktop/src-tauri
         run: cargo nextest run --locked --profile ci
 
