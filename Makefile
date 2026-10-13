@@ -47,10 +47,12 @@ check: deps
 # Both runners write JUnit: bun to apps/desktop/test-results/junit.xml,
 # nextest's ci profile to apps/desktop/src-tauri/target/nextest/ci/junit.xml.
 # bun neither creates the report's directory nor fails when it can't write it.
+# Both runners always run, so a TypeScript failure still leaves Rust results.
 test: deps
 	mkdir -p $(DESKTOP)/test-results
-	cd $(DESKTOP) && bun test --reporter=junit --reporter-outfile=test-results/junit.xml
-	cd $(TAURI) && cargo nextest run --locked --profile ci
+	(cd $(DESKTOP) && bun test --reporter=junit --reporter-outfile=test-results/junit.xml); bun=$$?; \
+	(cd $(TAURI) && cargo nextest run --locked --profile ci); nextest=$$?; \
+	exit $$((bun || nextest))
 
 # tauri build runs the vite build first (beforeBuildCommand in tauri.conf.json).
 build: deps
