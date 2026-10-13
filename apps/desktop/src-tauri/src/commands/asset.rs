@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tauri::{Emitter, State};
 
-use crate::db::{make_relative_path, resolve_path};
+use crate::db::{make_relative_path, resolve_path, Database};
 use crate::models::{Asset, AssetPatch, SearchPayload, SearchResult};
 use crate::AppState;
 
@@ -765,14 +765,29 @@ pub async fn delete_asset(
     delete_file: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
-    let should_delete_file = delete_file.unwrap_or(true);
-    let libs = state.db.get_all_libraries().await;
+    delete_asset_with(&state.db, &id, delete_file.unwrap_or(true), |path| {
+        trash::delete(path)
+    })
+    .await?;
+    let _ = state.app_handle.emit("library:updated", ());
+    Ok(())
+}
+
+/// Deletes an asset's rows and, when `delete_file` is set, moves its file to the trash with
+/// `trash`. If the trash fails, it returns the error and leaves the file and the rows alone.
+async fn delete_asset_with<E: std::fmt::Display>(
+    db: &Database,
+    id: &str,
+    delete_file: bool,
+    trash: impl Fn(&Path) -> std::result::Result<(), E>,
+) -> Result<()> {
+    let libs = db.get_all_libraries().await;
     let mut target_pools = Vec::new();
     let mut file_to_delete: Option<std::path::PathBuf> = None;
 
     for lib in &libs {
         let row: Option<(String,)> = sqlx::query_as("SELECT file_path FROM assets WHERE id = ?")
-            .bind(&id)
+            .bind(id)
             .fetch_optional(&lib.pool)
             .await
             .unwrap_or(None);
@@ -788,22 +803,20 @@ pub async fn delete_asset(
         }
     }
 
-    target_pools.push(state.db.master_pool.clone());
-    target_pools.push(state.db.get_active_pool().await);
+    target_pools.push(db.master_pool.clone());
+    target_pools.push(db.get_active_pool().await);
 
-    // If deleting from filesystem
-    if should_delete_file {
+    // Move the file to the trash. Never fall back to a permanent delete.
+    if delete_file {
         if let Some(ref path) = file_to_delete {
             if path.exists() {
-                // Try moving to Recycle Bin first
-                if let Err(trash_err) = trash::delete(path) {
-                    tracing::warn!(
-                        "Failed to trash {:?}, falling back to remove_file: {}",
-                        path,
-                        trash_err
-                    );
-                    let _ = std::fs::remove_file(path);
-                }
+                trash(path).map_err(|e| {
+                    format!(
+                        "Could not move {} to the trash, so it was not deleted: {}",
+                        path.display(),
+                        e
+                    )
+                })?;
             }
         }
     }
@@ -811,19 +824,19 @@ pub async fn delete_asset(
     // Delete records from databases
     for pool in target_pools {
         let _ = sqlx::query("DELETE FROM asset_tags WHERE asset_id = ?")
-            .bind(&id)
+            .bind(id)
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM collection_assets WHERE asset_id = ?")
-            .bind(&id)
+            .bind(id)
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM preview_jobs WHERE asset_id = ?")
-            .bind(&id)
+            .bind(id)
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM assets WHERE id = ?")
-            .bind(&id)
+            .bind(id)
             .execute(&pool)
             .await;
         let _ = sqlx::query("UPDATE libraries SET asset_count = (SELECT COUNT(*) FROM assets)")
@@ -831,7 +844,6 @@ pub async fn delete_asset(
             .await;
     }
 
-    let _ = state.app_handle.emit("library:updated", ());
     Ok(())
 }
 
@@ -841,10 +853,17 @@ pub async fn delete_assets(
     delete_file: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
+    let mut errors = Vec::new();
     for id in ids {
-        let _ = delete_asset(id, delete_file, state.clone()).await;
+        if let Err(e) = delete_asset(id, delete_file, state.clone()).await {
+            errors.push(e);
+        }
     }
-    Ok(())
+    match errors.len() {
+        0 => Ok(()),
+        1 => Err(errors.remove(0)),
+        n => Err(format!("{} files were not deleted. {}", n, errors[0])),
+    }
 }
 
 #[tauri::command]
@@ -948,4 +967,51 @@ pub async fn rename_asset(
 
     let _ = state.app_handle.emit("library:updated", ());
     get_asset(id, state).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{memory_library_pool, LibraryHandle};
+    use std::collections::HashMap;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn a_failed_trash_keeps_the_file_and_the_asset_row() {
+        let root = std::env::temp_dir().join(format!("opendam-trash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("tree.glb");
+        std::fs::write(&file, "glTF").unwrap();
+        let pool = memory_library_pool().await;
+        sqlx::query(
+            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+             VALUES ('a1', 'tree.glb', 'tree.glb', 'glb', 'model', 4, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let library = LibraryHandle {
+            id: "lib".to_string(),
+            name: "lib".to_string(),
+            root_path: root.clone(),
+            pool: pool.clone(),
+        };
+        let db = Database {
+            master_pool: memory_library_pool().await,
+            libraries: Arc::new(RwLock::new(HashMap::from([("lib".to_string(), library)]))),
+            pool: pool.clone(),
+        };
+
+        let result = delete_asset_with(&db, "a1", true, |_| Err("trash unavailable")).await;
+
+        let file_exists = file.exists();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets WHERE id = 'a1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(result.is_err());
+        assert!(file_exists);
+        assert_eq!(rows, 1);
+    }
 }
