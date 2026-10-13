@@ -703,20 +703,10 @@ async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Resul
             // Copy master's definition, and its ancestors root first, into the mirror: a
             // mirror can lack them after a skipped name collision or a failed mirror write, and
             // a foreign-key-enforcing connection would then reject the membership or the tag.
-            let chain = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
-                "WITH RECURSIVE chain(id, name, color, parent_id, depth) AS (
-                     SELECT id, name, color, parent_id, 0 FROM tags WHERE id = ?
-                     UNION ALL
-                     SELECT t.id, t.name, t.color, t.parent_id, chain.depth + 1
-                     FROM tags t JOIN chain ON t.id = chain.parent_id
-                     WHERE chain.depth < 64
-                 )
-                 SELECT id, name, color, parent_id FROM chain ORDER BY depth DESC",
-            )
-            .bind(tag_id)
-            .fetch_all(&db.master_pool)
-            .await
-            .map_err(|e| e.to_string())?;
+            let chain = db
+                .tag_with_ancestors(tag_id)
+                .await
+                .map_err(|e| e.to_string())?;
             let Some(tag) = chain.last() else {
                 tracing::warn!(
                     "Tag {} is not in the catalog, not tagging {} with it",

@@ -137,12 +137,21 @@ pub async fn add_to_collection(
     add_assets_to_collection(&state.db, &collection_id, &asset_ids).await
 }
 
-/// Each membership row goes to the asset's own library only.
+/// Each membership row goes to the asset's own library only. The collection must be in the
+/// master catalog; it is copied, ancestors first, into that library's mirror before the
+/// membership, since a mirror can lack it after a failed mirror write.
 async fn add_assets_to_collection(
     db: &Database,
     collection_id: &str,
     asset_ids: &[String],
 ) -> Result<()> {
+    let chain = db
+        .collection_with_ancestors(collection_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if chain.is_empty() {
+        return Err(format!("Collection not found: {}", collection_id));
+    }
     for aid in asset_ids {
         let Some(lib) = db.library_of_asset(aid).await.map_err(|e| e.to_string())? else {
             tracing::warn!(
@@ -151,14 +160,21 @@ async fn add_assets_to_collection(
             );
             continue;
         };
-        sqlx::query(
-            "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
-        )
-        .bind(collection_id)
-        .bind(aid)
-        .execute(&lib.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+        let add = async {
+            let mut tx = lib.pool.begin().await?;
+            for definition in &chain {
+                upsert_collection(&mut *tx, definition).await?;
+            }
+            sqlx::query(
+                "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
+            )
+            .bind(collection_id)
+            .bind(aid)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await
+        };
+        add.await.map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -260,6 +276,7 @@ mod tests {
     use super::*;
     use crate::db::{
         insert_asset, insert_collection, memory_database, memory_library, memory_library_pool,
+        memory_library_pool_enforcing_foreign_keys,
     };
 
     async fn collected(pool: &sqlx::Pool<sqlx::Sqlite>) -> Vec<String> {
@@ -407,6 +424,7 @@ mod tests {
         let a = memory_library_pool().await;
         insert_collection(&a, "c", "props", None).await;
         let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_collection(&db.master_pool, "c", "props", None).await;
 
         add_assets_to_collection(&db, "c", &["nowhere".into()])
             .await
@@ -426,6 +444,7 @@ mod tests {
             memory_library("b", b.clone()),
         ])
         .await;
+        insert_collection(&db.master_pool, "c", "props", None).await;
         a.close().await;
 
         let result = add_assets_to_collection(&db, "c", &["in-b".into()]).await;
@@ -479,5 +498,33 @@ mod tests {
         let collections = list_collections_in(&db).await.unwrap();
 
         assert_eq!(collections[0].asset_ids, ["same"]);
+    }
+
+    #[tokio::test]
+    async fn collecting_into_a_collection_its_mirror_lacks_copies_it_and_its_ancestors() {
+        let a = memory_library_pool_enforcing_foreign_keys().await;
+        insert_asset(&a, "in-a").await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_collection(&db.master_pool, "parent", "props", None).await;
+        insert_collection(&db.master_pool, "child", "rocks", Some("parent")).await;
+
+        add_assets_to_collection(&db, "child", &["in-a".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(collected(&a).await, ["in-a"]);
+        assert_eq!(collection_ids(&a).await, ["child", "parent"]);
+    }
+
+    #[tokio::test]
+    async fn collecting_into_a_collection_master_lacks_is_an_error_and_writes_nothing() {
+        let a = memory_library_pool().await;
+        insert_asset(&a, "in-a").await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+
+        let result = add_assets_to_collection(&db, "gone", &["in-a".into()]).await;
+
+        assert!(result.is_err());
+        assert!(collected(&a).await.is_empty());
     }
 }

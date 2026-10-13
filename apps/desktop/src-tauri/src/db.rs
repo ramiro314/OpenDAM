@@ -33,7 +33,8 @@ pub type CollectionRow = (
     i64,
 );
 
-type TagRow = (String, String, Option<String>, Option<String>);
+/// A tag definition as stored: id, name, color, parent_id.
+pub type TagRow = (String, String, Option<String>, Option<String>);
 
 /// Writes a tag definition to a mirror, updating an existing row in place. Never `REPLACE`:
 /// it deletes the old row first, and `ON DELETE CASCADE` would take the library's memberships.
@@ -415,6 +416,45 @@ impl Database {
         let mut libs: Vec<LibraryHandle> = self.libraries.read().await.values().cloned().collect();
         libs.sort_by(|a, b| a.id.cmp(&b.id));
         libs
+    }
+
+    /// Tag `id` and its ancestors from the master catalog, root first and the tag itself last,
+    /// so writing them in order never trips `parent_id`. Empty when master lacks the tag.
+    pub async fn tag_with_ancestors(&self, id: &str) -> sqlx::Result<Vec<TagRow>> {
+        sqlx::query_as(
+            "WITH RECURSIVE chain(id, name, color, parent_id, depth) AS (
+                 SELECT id, name, color, parent_id, 0 FROM tags WHERE id = ?
+                 UNION ALL
+                 SELECT t.id, t.name, t.color, t.parent_id, chain.depth + 1
+                 FROM tags t JOIN chain ON t.id = chain.parent_id
+                 WHERE chain.depth < 64
+             )
+             SELECT id, name, color, parent_id FROM chain ORDER BY depth DESC",
+        )
+        .bind(id)
+        .fetch_all(&self.master_pool)
+        .await
+    }
+
+    /// Collection `id` and its ancestors from the master catalog, root first, like
+    /// `tag_with_ancestors`. Empty when master lacks the collection.
+    pub async fn collection_with_ancestors(&self, id: &str) -> sqlx::Result<Vec<CollectionRow>> {
+        sqlx::query_as(
+            "WITH RECURSIVE chain(id, name, description, parent_id, is_smart, filter_spec, created_at, depth) AS (
+                 SELECT id, name, description, parent_id, is_smart, filter_spec, created_at, 0
+                 FROM collections WHERE id = ?
+                 UNION ALL
+                 SELECT c.id, c.name, c.description, c.parent_id, c.is_smart, c.filter_spec,
+                        c.created_at, chain.depth + 1
+                 FROM collections c JOIN chain ON c.id = chain.parent_id
+                 WHERE chain.depth < 64
+             )
+             SELECT id, name, description, parent_id, is_smart, filter_spec, created_at
+             FROM chain ORDER BY depth DESC",
+        )
+        .bind(id)
+        .fetch_all(&self.master_pool)
+        .await
     }
 
     /// The open library that holds asset `asset_id`: the only library its tag and collection
