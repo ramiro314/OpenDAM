@@ -15,7 +15,7 @@ PY_STAMP := $(PREVIEW)/.venv/.deps-stamp
 # for make's own commands, and `make deps` persists the trust for the shell.
 export MISE_TRUSTED_CONFIG_PATHS := $(CURDIR)
 
-.PHONY: deps dev lint check test build install uninstall
+.PHONY: deps dev lint check test build install uninstall install-paths
 
 deps: $(JS_STAMP) $(PY_STAMP)
 	@if command -v mise >/dev/null; then env -u MISE_TRUSTED_CONFIG_PATHS mise trust --quiet; fi
@@ -80,7 +80,15 @@ StartupWMClass=opendam
 endef
 export DESKTOP_ENTRY
 
-install: build
+# make splits words on whitespace, so a path with a space would reach rm -rf
+# and install as several paths. Refuse it before any recipe runs.
+INSTALL_PATHS := $(INSTALL_BIN) $(INSTALL_DESKTOP) $(INSTALL_ICON) $(INSTALL_ENGINE)
+install-paths:
+ifneq ($(words $(INSTALL_PATHS)),4)
+	$(error HOME, XDG_DATA_HOME and the install paths must not contain whitespace)
+endif
+
+install: install-paths build
 	install -Dm755 $(TAURI)/target/release/opendam-desktop $(INSTALL_BIN)
 	install -Dm644 $(TAURI)/icons/128x128.png $(INSTALL_ICON)
 	install -d $(dir $(INSTALL_DESKTOP))
@@ -90,7 +98,7 @@ install: build
 
 # Leaves the master DB (~/.local/share/com.opendam.desktop) and every library's
 # .opendam/ folder alone.
-uninstall:
+uninstall: install-paths
 	rm -f $(INSTALL_BIN) $(INSTALL_DESKTOP) $(INSTALL_ICON)
 	rm -rf $(INSTALL_ENGINE)
 	rmdir --ignore-fail-on-non-empty $(dir $(INSTALL_ENGINE)) 2>/dev/null || true
