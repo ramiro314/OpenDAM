@@ -15,7 +15,7 @@ PY_STAMP := $(PREVIEW)/.venv/.deps-stamp
 # for make's own commands, and `make deps` persists the trust for the shell.
 export MISE_TRUSTED_CONFIG_PATHS := $(CURDIR)
 
-.PHONY: deps dev lint check test build
+.PHONY: deps dev lint check test build install uninstall
 
 deps: $(JS_STAMP) $(PY_STAMP)
 	@if command -v mise >/dev/null; then env -u MISE_TRUSTED_CONFIG_PATHS mise trust --quiet; fi
@@ -57,3 +57,40 @@ test: deps
 # tauri build runs the vite build first (beforeBuildCommand in tauri.conf.json).
 build: deps
 	cd $(DESKTOP) && bun run tauri build --no-bundle
+
+# make install puts the release build under ~/.local, and make uninstall removes
+# exactly these paths. The preview engine goes where preview.rs looks for it.
+DATA_HOME := $(or $(XDG_DATA_HOME),$(HOME)/.local/share)
+INSTALL_BIN := $(HOME)/.local/bin/opendam
+INSTALL_DESKTOP := $(DATA_HOME)/applications/opendam.desktop
+INSTALL_ICON := $(DATA_HOME)/icons/hicolor/128x128/apps/opendam.png
+INSTALL_ENGINE := $(DATA_HOME)/opendam/preview-engine
+
+define DESKTOP_ENTRY
+[Desktop Entry]
+Type=Application
+Name=OpenDAM
+GenericName=Asset Manager
+Comment=Browse and organize game-dev assets
+Exec=$(INSTALL_BIN)
+Icon=opendam
+Terminal=false
+Categories=Graphics;Viewer;
+StartupWMClass=opendam
+endef
+export DESKTOP_ENTRY
+
+install: build
+	install -Dm755 $(TAURI)/target/release/opendam-desktop $(INSTALL_BIN)
+	install -Dm644 $(TAURI)/icons/128x128.png $(INSTALL_ICON)
+	install -d $(dir $(INSTALL_DESKTOP))
+	printf '%s\n' "$$DESKTOP_ENTRY" > $(INSTALL_DESKTOP)
+	install -Dm644 -t $(INSTALL_ENGINE) $(addprefix $(PREVIEW)/,worker.py pyproject.toml uv.lock .python-version)
+	cd $(INSTALL_ENGINE) && uv sync --frozen --no-dev
+
+# Leaves the master DB (~/.local/share/com.opendam.desktop) and every library's
+# .opendam/ folder alone.
+uninstall:
+	rm -f $(INSTALL_BIN) $(INSTALL_DESKTOP) $(INSTALL_ICON)
+	rm -rf $(INSTALL_ENGINE)
+	rmdir --ignore-fail-on-non-empty $(dir $(INSTALL_ENGINE)) 2>/dev/null || true

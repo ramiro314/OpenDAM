@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use image::imageops::FilterType;
 use serde_json::json;
 use sqlx::{Pool, Sqlite};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::Emitter;
@@ -66,7 +67,7 @@ impl PythonWorker {
         cmd.arg(worker_py)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONIOENCODING", "utf-8");
 
@@ -80,6 +81,16 @@ impl PythonWorker {
             .take()
             .ok_or_else(|| anyhow!("Failed to take python stdout"))?;
         let reader = BufReader::new(stdout);
+
+        // Python tracebacks and library warnings land in the app log.
+        if let Some(stderr) = child.stderr.take() {
+            tauri::async_runtime::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::warn!(target: "preview_worker", "{}", line);
+                }
+            });
+        }
 
         Ok(Self {
             child,
@@ -117,79 +128,65 @@ impl PythonWorker {
     }
 }
 
+/// Picks the Python interpreter and `worker.py` for the preview worker.
+/// `OPENDAM_PYTHON`/`OPENDAM_WORKER` win. Otherwise the first preview engine
+/// with a `worker.py` is used: the one `make install` puts under
+/// `${XDG_DATA_HOME:-~/.local/share}/opendam/preview-engine`, then a dev
+/// checkout's `packages/preview-engine` under one of `search_roots`. Its
+/// `.venv` supplies Python; without one, `python3` on `PATH` does.
+fn find_preview_worker(
+    var: impl Fn(&str) -> Option<OsString>,
+    search_roots: &[PathBuf],
+) -> (PathBuf, PathBuf) {
+    let data_home = var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| var("HOME").map(|h| PathBuf::from(h).join(".local").join("share")));
+    let engine = data_home
+        .map(|d| d.join("opendam").join("preview-engine"))
+        .into_iter()
+        .chain(
+            search_roots
+                .iter()
+                .map(|r| r.join("packages").join("preview-engine")),
+        )
+        .find(|e| e.join("worker.py").is_file());
+
+    let python = var("OPENDAM_PYTHON").map(PathBuf::from).unwrap_or_else(|| {
+        engine
+            .as_ref()
+            .map(|e| e.join(".venv").join("bin").join("python"))
+            .filter(|p| p.is_file())
+            .or_else(|| {
+                std::env::split_paths(&var("PATH")?)
+                    .map(|dir| dir.join("python3"))
+                    .find(|p| p.is_file())
+            })
+            .unwrap_or_else(|| PathBuf::from("python3"))
+    });
+    let worker = var("OPENDAM_WORKER")
+        .map(PathBuf::from)
+        .or_else(|| engine.map(|e| e.join("worker.py")))
+        .unwrap_or_else(|| PathBuf::from("worker.py"));
+    (python, worker)
+}
+
 pub fn start_preview_worker(state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
-        // Dynamically resolve python worker and script paths
+        // The dev checkout is found from the cwd, the exe dir and their ancestors.
         let current_dir = std::env::current_dir().unwrap_or_default();
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| current_dir.clone());
+        let search_roots: Vec<PathBuf> = current_dir
+            .ancestors()
+            .take(5)
+            .chain(exe_dir.ancestors().take(5))
+            .map(Path::to_path_buf)
+            .collect();
 
-        let mut search_roots = vec![current_dir.clone(), exe_dir.clone()];
-        let mut curr = current_dir.clone();
-        for _ in 0..4 {
-            if let Some(parent) = curr.parent() {
-                search_roots.push(parent.to_path_buf());
-                curr = parent.to_path_buf();
-            } else {
-                break;
-            }
-        }
-        let mut curr_exe = exe_dir.clone();
-        for _ in 0..4 {
-            if let Some(parent) = curr_exe.parent() {
-                search_roots.push(parent.to_path_buf());
-                curr_exe = parent.to_path_buf();
-            } else {
-                break;
-            }
-        }
-
-        let py_exec = if let Ok(custom) = std::env::var("OPENDAM_PYTHON") {
-            PathBuf::from(custom)
-        } else {
-            let mut found_py = None;
-            for root in &search_roots {
-                let candidates = [
-                    root.join("packages")
-                        .join("preview-engine")
-                        .join(".venv")
-                        .join("bin")
-                        .join("python"),
-                    root.join("packages")
-                        .join("preview-engine")
-                        .join("venv")
-                        .join("bin")
-                        .join("python"),
-                    root.join("venv").join("bin").join("python"),
-                ];
-                if let Some(p) = candidates.into_iter().find(|p| p.exists()) {
-                    found_py = Some(p);
-                    break;
-                }
-            }
-            found_py.unwrap_or_else(|| PathBuf::from("python3"))
-        };
-
-        let worker_py = if let Ok(custom) = std::env::var("OPENDAM_WORKER") {
-            PathBuf::from(custom)
-        } else {
-            let mut found_worker = None;
-            for root in &search_roots {
-                let candidates = [
-                    root.join("packages")
-                        .join("preview-engine")
-                        .join("worker.py"),
-                    root.join("worker.py"),
-                ];
-                if let Some(p) = candidates.into_iter().find(|p| p.exists()) {
-                    found_worker = Some(p);
-                    break;
-                }
-            }
-            found_worker.unwrap_or_else(|| PathBuf::from("worker.py"))
-        };
+        let (py_exec, worker_py) = find_preview_worker(|k| std::env::var_os(k), &search_roots);
 
         tracing::info!(
             "Preview worker using Python: {:?}, Script: {:?}",
@@ -543,6 +540,88 @@ mod tests {
     fn decoder_panic_becomes_err() {
         let res = catch_decoder_panic(|| panic!("malformed image"));
         assert_eq!(res.unwrap_err().to_string(), "image decoder panicked");
+    }
+
+    /// A preview engine at `dir`: `worker.py`, plus `.venv/bin/python` when `venv`.
+    fn engine(dir: &Path, venv: bool) -> PathBuf {
+        std::fs::create_dir_all(dir.join(".venv").join("bin")).unwrap();
+        std::fs::write(dir.join("worker.py"), "").unwrap();
+        if venv {
+            std::fs::write(dir.join(".venv").join("bin").join("python"), "").unwrap();
+        }
+        dir.to_path_buf()
+    }
+
+    fn lookup(vars: &[(&str, &Path)], roots: &[PathBuf]) -> (PathBuf, PathBuf) {
+        let vars: std::collections::HashMap<String, OsString> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.as_os_str().to_owned()))
+            .collect();
+        find_preview_worker(|k| vars.get(k).cloned(), roots)
+    }
+
+    #[test]
+    fn preview_worker_lookup_order() {
+        let tmp = std::env::temp_dir().join(format!("opendam-lookup-{}", uuid::Uuid::new_v4()));
+        let data_home = tmp.join("data");
+        let repo = tmp.join("repo");
+        let installed = engine(&data_home.join("opendam").join("preview-engine"), true);
+        let dev = engine(&repo.join("packages").join("preview-engine"), true);
+        let venv_python = |e: &Path| e.join(".venv").join("bin").join("python");
+        let roots = [repo.join("apps"), repo.clone()];
+
+        // 1. The env overrides win over an installed engine.
+        let (py, worker) = lookup(
+            &[
+                ("OPENDAM_PYTHON", Path::new("/env/python")),
+                ("OPENDAM_WORKER", Path::new("/env/worker.py")),
+                ("XDG_DATA_HOME", &data_home),
+            ],
+            &roots,
+        );
+        assert_eq!(py, PathBuf::from("/env/python"));
+        assert_eq!(worker, PathBuf::from("/env/worker.py"));
+
+        // 2. The installed engine under XDG_DATA_HOME wins over the repo.
+        let (py, worker) = lookup(&[("XDG_DATA_HOME", &data_home)], &roots);
+        assert_eq!(py, venv_python(&installed));
+        assert_eq!(worker, installed.join("worker.py"));
+
+        // Without XDG_DATA_HOME, the installed engine is under ~/.local/share.
+        let home = tmp.join("home");
+        let home_engine = engine(
+            &home
+                .join(".local")
+                .join("share")
+                .join("opendam")
+                .join("preview-engine"),
+            true,
+        );
+        let (py, _) = lookup(&[("HOME", &home)], &roots);
+        assert_eq!(py, venv_python(&home_engine));
+
+        // 3. With nothing installed, the dev repo's engine.
+        let empty = tmp.join("empty");
+        let (py, worker) = lookup(&[("XDG_DATA_HOME", &empty)], &roots);
+        assert_eq!(py, venv_python(&dev));
+        assert_eq!(worker, dev.join("worker.py"));
+
+        // An engine without a .venv runs on python3 from PATH.
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("python3"), "").unwrap();
+        let bare = engine(
+            &tmp.join("bare").join("packages").join("preview-engine"),
+            false,
+        );
+        let (py, worker) = lookup(
+            &[("XDG_DATA_HOME", &empty), ("PATH", &bin)],
+            &[tmp.join("bare")],
+        );
+        assert_eq!(py, bin.join("python3"));
+        assert_eq!(worker, bare.join("worker.py"));
+
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
