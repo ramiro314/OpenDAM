@@ -1,0 +1,13 @@
+{
+  "tests": {
+    "patterns": ["apps/desktop/src/**/*.test.ts", "apps/desktop/src/**/*.test.tsx"],
+    "includeImporters": true,
+    "smokeSet": []
+  },
+  "flakes": {
+    "label": "flaky-test",
+    "actionableLabel": "flaky-test:actionable",
+    "actionableAfter": 3,
+    "windowDays": 30
+  }
+}

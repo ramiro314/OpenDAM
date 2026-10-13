@@ -36,6 +36,8 @@ packages/preview-engine/venv/
 # ── Agents ─────────────────────────────────────────────────────────────────
 .claude/settings.local.json
 .claude/worktrees/
+# Per-checkout Mission Control testing overrides
+.mission/testing.local.json
 # Screenshots and logs captured as workflow evidence (docs/agents/running-the-app.md)
 .evidence/
 

@@ -4,5 +4,5 @@
   "trailingComma": "es5",
   "printWidth": 100,
   "sortPackageJson": false,
-  "ignorePatterns": ["**/*.md", "docs/**"]
+  "ignorePatterns": ["**/*.md", "docs/**", ".github/actions/mission-flake-report/**"]
 }
