@@ -2,6 +2,8 @@
   "$schema": "./node_modules/oxlint/configuration_schema.json",
   "plugins": ["typescript", "react", "oxc", "unicorn"],
   // Correctness only: the formatter owns style, so a lint failure should mean a defect.
+  // Vendored from Mission Control, replaced whole on update: never edited here.
+  "ignorePatterns": [".github/actions/mission-flake-report/**"],
   "categories": {
     "correctness": "error"
   },

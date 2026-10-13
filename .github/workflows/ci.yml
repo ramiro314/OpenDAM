@@ -89,4 +89,62 @@ jobs:
         with:
           tool: cargo-nextest@0.9.148 # keep in step with mise.toml
       - run: make deps
-      - run: make test
+      # The same runs as `make test`, split so a failed TypeScript test file is
+      # rerun once. bun runs from the repo root so its JUnit names repo-relative
+      # files, which the rerun passes back to bun. nextest's JUnit names no file,
+      # so Rust failures are not rerun.
+      - name: Test (TypeScript)
+        id: test
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/flake"
+          set +e
+          bun test ./apps/desktop --reporter=junit --reporter-outfile="$RUNNER_TEMP/flake/junit.xml"
+          echo "exit-code=$?" >> "$GITHUB_OUTPUT"
+      - name: Rerun failed test files once
+        uses: ./.github/actions/mission-flake-report
+        with:
+          mode: rerun
+          job: test (bun)
+          junit: ${{ runner.temp }}/flake/junit.xml
+          exit-code: ${{ steps.test.outputs.exit-code }}
+          rerun-command: bun test {files} --reporter=junit --reporter-outfile={junit}
+          report: ${{ runner.temp }}/flake/report.json
+      # The bun step always succeeds under set +e, so its success means setup
+      # did not fail: these two still run after a failed rerun, but not after
+      # a failed install.
+      - name: Upload flake report
+        if: ${{ !cancelled() && steps.test.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flake-report-bun
+          path: ${{ runner.temp }}/flake/report.json
+      - name: Test (Rust)
+        if: ${{ !cancelled() && steps.test.outcome == 'success' }}
+        working-directory: apps/desktop/src-tauri
+        run: cargo nextest run --locked --profile ci
+
+  # Publishes the "Flaky tests" check and keeps one issue per flaky test.
+  flake-report:
+    name: Flake report
+    needs: [test]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download flake reports
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: flake-report-*
+          path: flake-reports
+      - name: Publish flake report
+        uses: ./.github/actions/mission-flake-report
+        with:
+          mode: publish
+          reports: flake-reports
+          report: flake-report.json

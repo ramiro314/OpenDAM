@@ -22,7 +22,7 @@ uv and cargo-nextest; uv pins Python from `packages/preview-engine/.python-versi
 | `make test` | `bun test` and `cargo nextest run`, both writing JUnit XML (see below) |
 | `make build` | Release build without bundling (`tauri build --no-bundle`) |
 
-CI runs `make deps check lint build` and, in a separate job, `make test` on ubuntu. Formatting is enforced: run `bun run format`,
+CI runs `make deps check lint build` and, in a separate job, the same bun test and nextest runs as `make test`, as separate steps so failed TypeScript test files are rerun once to tell flakes from failures (`.github/actions/mission-flake-report`, settings in `.mission/testing.json`). Formatting is enforced: run `bun run format`,
 `cargo fmt` (in `apps/desktop/src-tauri`) or `uv run ruff format` (in `packages/preview-engine`)
 before committing.
 
