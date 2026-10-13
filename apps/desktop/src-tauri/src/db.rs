@@ -312,14 +312,15 @@ impl Database {
         Ok(())
     }
 
+    /// `Some(id)` returns that library only if it is open, never another one: libraries whose
+    /// root is missing are not opened, and handing their callers another library's pool lets
+    /// a re-index delete that library's rows. `None` returns any open library.
     pub async fn get_library_handle(&self, id: Option<&str>) -> Option<LibraryHandle> {
         let libs = self.libraries.read().await;
-        if let Some(target_id) = id {
-            if let Some(h) = libs.get(target_id) {
-                return Some(h.clone());
-            }
+        match id {
+            Some(target_id) => libs.get(target_id).cloned(),
+            None => libs.values().next().cloned(),
         }
-        libs.values().next().cloned()
     }
 
     pub async fn get_library_root(&self, id: Option<&str>) -> Option<PathBuf> {
@@ -439,5 +440,28 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(ids, ["a1"]);
+    }
+
+    #[tokio::test]
+    async fn get_library_handle_does_not_fall_back_to_another_library() {
+        let pool = memory_library_pool().await;
+        let open = LibraryHandle {
+            id: "open".into(),
+            name: "open".into(),
+            root_path: PathBuf::from("/mnt/assets"),
+            pool: pool.clone(),
+        };
+        let db = Database {
+            master_pool: memory_library_pool().await,
+            libraries: Arc::new(RwLock::new(HashMap::from([("open".into(), open)]))),
+            pool,
+        };
+
+        assert!(db.get_library_handle(Some("offline")).await.is_none());
+        assert_eq!(
+            db.get_library_handle(Some("open")).await.unwrap().id,
+            "open"
+        );
+        assert_eq!(db.get_library_handle(None).await.unwrap().id, "open");
     }
 }

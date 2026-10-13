@@ -6,7 +6,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-use crate::db::{make_relative_path, Database};
+use crate::db::{make_relative_path, Database, LibraryHandle};
 use crate::models::AssetKind;
 
 // ── Advisory lock guard ─────────────────────────────────────────────────────
@@ -141,14 +141,23 @@ struct PendingAsset {
 /// 4. Groups writes into chunks of 200 inside single transactions (cutting NAS I/O by 99%).
 /// 5. Advisory index.lock prevents two machines from indexing the same library simultaneously.
 pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> Result<()> {
-    let handle_opt = db.get_library_handle(Some(library_id)).await;
-    let (pool, root_path) = match handle_opt {
-        Some(h) => (h.pool, h.root_path),
-        None => {
-            let p = PathBuf::from(paths.first().map(|s| s.as_str()).unwrap_or("."));
-            (db.pool.clone(), p)
-        }
+    // An offline library is skipped: walking a missing root finds nothing, and the
+    // deleted-file pass below would then remove every asset row.
+    let Some(LibraryHandle {
+        pool, root_path, ..
+    }) = db.get_library_handle(Some(library_id)).await
+    else {
+        tracing::info!("Library {} is not open, skipping indexing", library_id);
+        return Ok(());
     };
+    if !root_path.exists() {
+        tracing::info!(
+            "Library {} root {:?} is missing, skipping indexing",
+            library_id,
+            root_path
+        );
+        return Ok(());
+    }
 
     // ── Advisory lock: skip if another machine is already indexing ────────
     let opendam_dir = root_path.join(".opendam");
@@ -424,4 +433,83 @@ async fn commit_asset_batch(pool: &sqlx::Pool<sqlx::Sqlite>, batch: &[PendingAss
 
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::memory_library_pool;
+    use sqlx::{Pool, Sqlite};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    async fn library_with_one_asset(id: &str, root_path: PathBuf) -> LibraryHandle {
+        let pool = memory_library_pool().await;
+        sqlx::query(
+            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+             VALUES ('a1', 'models/tree.glb', 'tree.glb', 'glb', 'model', 1024, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        LibraryHandle {
+            id: id.to_string(),
+            name: id.to_string(),
+            root_path,
+            pool,
+        }
+    }
+
+    async fn database_with(libraries: Vec<LibraryHandle>) -> Database {
+        let first_pool = libraries[0].pool.clone();
+        Database {
+            master_pool: memory_library_pool().await,
+            libraries: Arc::new(RwLock::new(
+                libraries.into_iter().map(|h| (h.id.clone(), h)).collect(),
+            )),
+            pool: first_pool,
+        }
+    }
+
+    async fn asset_count(pool: &Pool<Sqlite>) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM assets")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn missing_root() -> PathBuf {
+        std::env::temp_dir().join(format!("opendam-missing-{}", Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn indexing_an_offline_library_leaves_other_libraries_intact() {
+        let online_root = std::env::temp_dir().join(format!("opendam-online-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(online_root.join(".opendam")).unwrap();
+        let online = library_with_one_asset("online", online_root.clone()).await;
+        let online_pool = online.pool.clone();
+        // The offline library's root is missing, so Database::new never opened it.
+        let db = database_with(vec![online]).await;
+
+        let offline_paths = [missing_root().to_string_lossy().to_string()];
+        index_paths(&db, "offline", &offline_paths).await.unwrap();
+
+        let remaining = asset_count(&online_pool).await;
+        std::fs::remove_dir_all(&online_root).unwrap();
+        assert_eq!(remaining, 1);
+    }
+
+    #[tokio::test]
+    async fn indexing_an_open_library_whose_root_went_missing_leaves_its_rows_intact() {
+        let root = missing_root();
+        let unmounted = library_with_one_asset("unmounted", root.clone()).await;
+        let pool = unmounted.pool.clone();
+        let db = database_with(vec![unmounted]).await;
+
+        index_paths(&db, "unmounted", &[root.to_string_lossy().to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(asset_count(&pool).await, 1);
+    }
 }
