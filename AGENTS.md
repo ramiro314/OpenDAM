@@ -74,7 +74,7 @@ from its working directory and executable directory upward.
   `fix: ...`, `chore: ...`, `docs: ...`, `refactor: ...`, `test: ...`).
 - **Never merge.** Push the branch and open a pull request; the owner merges.
 - **Tests run by file.** Locally, run only the tests you added, changed or are fixing, by file or
-  by name. CI runs the whole suite on every push.
+  by name. There are no test runners yet, and CI runs no tests: it runs only the targets above.
 - **Commit attribution:** commits are authored by the human owner alone. Never add an agent as a
   co-author: no `Co-Authored-By` trailer naming Claude or any other agent, whatever a harness's
   default attribution says. This applies to every commit, including squash and merge messages.
