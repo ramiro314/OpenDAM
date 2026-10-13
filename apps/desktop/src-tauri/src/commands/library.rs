@@ -2,7 +2,7 @@ use chrono::Utc;
 use serde_json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use uuid::Uuid;
 
 use crate::models::{AddLibraryPayload, Library};
@@ -13,12 +13,23 @@ type Result<T> = std::result::Result<T, String>;
 
 /// Lets the webview load files under a library's roots through the asset protocol, whose static
 /// scope in `tauri.conf.json` covers only app data.
-pub fn allow_library_roots(app: &AppHandle, root_paths: &[String]) {
+pub fn allow_library_roots<R: Runtime>(app: &AppHandle<R>, root_paths: &[String]) {
     let scope = app.asset_protocol_scope();
     for root in root_paths {
         if let Err(e) = scope.allow_directory(root, true) {
             tracing::error!("Failed to allow asset access to {}: {}", root, e);
         }
+    }
+}
+
+/// Refuses roots the user didn't pick. The native folder dialog adds the folder it returns to the
+/// asset protocol scope, so a root outside the scope came from a script, and allowing it would let
+/// that script widen the scope to any path, `/` included.
+fn check_roots_were_picked<R: Runtime>(app: &AppHandle<R>, root_paths: &[String]) -> Result<()> {
+    let scope = app.asset_protocol_scope();
+    match root_paths.iter().find(|root| !scope.is_allowed(root)) {
+        Some(root) => Err(format!("{root} was not chosen in the folder picker")),
+        None => Ok(()),
     }
 }
 
@@ -33,6 +44,7 @@ pub async fn add_library(
 
     let first_path = payload.root_paths.first().ok_or("No root path provided")?;
     let root_path = PathBuf::from(first_path);
+    check_roots_were_picked(&state.app_handle, &payload.root_paths)?;
 
     // Register library in memory & open its .opendam/library.sqlite with NAS pragmas
     let _handle = state
@@ -144,4 +156,29 @@ pub async fn refresh_all_libraries(state: State<'_, Arc<AppState>>) -> Result<()
 
     let _ = state.app_handle.emit("library:updated", ());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_roots_the_folder_dialog_allowed_can_become_libraries() {
+        let app = tauri::test::mock_app();
+        let picked = std::env::temp_dir().join(format!("opendam-picked-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&picked).unwrap();
+        // What the dialog plugin does with the folder it returns
+        app.asset_protocol_scope()
+            .allow_directory(&picked, true)
+            .unwrap();
+        let picked = picked.to_string_lossy().into_owned();
+        let home = std::env::var("HOME").unwrap();
+
+        assert!(check_roots_were_picked(app.handle(), std::slice::from_ref(&picked)).is_ok());
+        assert!(check_roots_were_picked(app.handle(), &[picked.clone(), "/".into()]).is_err());
+        assert!(check_roots_were_picked(app.handle(), &[home]).is_err());
+        assert!(check_roots_were_picked(app.handle(), &[format!("{picked}/../..")]).is_err());
+
+        std::fs::remove_dir_all(&picked).unwrap();
+    }
 }

@@ -38,4 +38,5 @@ opt-level = "s"
 strip = true
 
 [dev-dependencies]
+tauri = { version = "2", features = ["test"] }
 toml = "0.8"
