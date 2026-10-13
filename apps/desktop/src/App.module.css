@@ -49,7 +49,9 @@
   color: hsl(142 65% 55%);
 }
 
+/* Sits above the copy toast's spot so both stay readable while the error waits for Dismiss. */
 .errorToast {
+  bottom: 76px;
   max-width: 80vw;
   border-color: rgba(239, 68, 68, 0.6);
   color: #ef4444;
