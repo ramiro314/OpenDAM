@@ -354,11 +354,10 @@ pub fn resolve_path(root: &Path, rel_or_abs: &str) -> String {
     }
 }
 
-/// Helper to convert an absolute path to a portable relative path for storage
+/// Helper to convert an absolute path to a relative path for storage
 pub fn make_relative_path(root: &Path, p: &Path) -> String {
-    if let Ok(rel) = p.strip_prefix(root) {
-        rel.to_string_lossy().replace('\\', "/")
-    } else {
-        p.to_string_lossy().replace('\\', "/")
-    }
+    p.strip_prefix(root)
+        .unwrap_or(p)
+        .to_string_lossy()
+        .into_owned()
 }

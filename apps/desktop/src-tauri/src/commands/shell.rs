@@ -1,77 +1,30 @@
+use std::path::Path;
+
 type Result<T> = std::result::Result<T, String>;
 
+/// Shows the file selected in the file manager (FileManager1 over D-Bus, which
+/// Dolphin and Nautilus implement). If that fails, for example because the file
+/// is gone, opens its parent folder instead.
 #[tauri::command]
-pub async fn reveal_in_explorer(file_path: String) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        let norm_path = file_path.replace('/', "\\");
-        let path = std::path::Path::new(&norm_path);
-
-        if path.exists() {
-            std::process::Command::new("explorer")
-                .raw_arg(format!(r#"/select,"{}""#, norm_path))
-                .spawn()
-                .map_err(|e| format!("Failed to launch explorer: {}", e))?;
-        } else if let Some(parent) = path.parent() {
-            let parent_str = parent.to_string_lossy().replace('/', "\\");
-            std::process::Command::new("explorer")
-                .raw_arg(format!(r#""{}""#, parent_str))
-                .spawn()
-                .map_err(|e| format!("Failed to launch explorer: {}", e))?;
-        } else {
-            std::process::Command::new("explorer")
-                .raw_arg(format!(r#""{}""#, norm_path))
-                .spawn()
-                .map_err(|e| format!("Failed to launch explorer: {}", e))?;
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .args(["-R", &file_path])
-            .spawn()
-            .map_err(|e| e.to_string())?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let dir = std::path::Path::new(&file_path)
+pub async fn reveal_in_file_manager(file_path: String) -> Result<()> {
+    // The reveal is a blocking D-Bus call that can wait for the bus timeout, so
+    // keep it off the async runtime's workers. A sync command would block the
+    // main thread instead.
+    tauri::async_runtime::spawn_blocking(move || {
+        let Err(e) = tauri_plugin_opener::reveal_item_in_dir(&file_path) else {
+            return Ok(());
+        };
+        tracing::warn!("Reveal of {file_path} failed ({e}), opening its parent folder instead");
+        let parent = Path::new(&file_path)
             .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or(file_path);
-        std::process::Command::new("xdg-open")
-            .arg(&dir)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+            .ok_or("File has no parent folder")?;
+        tauri_plugin_opener::open_path(parent, None::<&str>).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn open_with_default(file_path: String) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        let norm_path = file_path.replace('/', "\\");
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &norm_path])
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .spawn()
-            .map_err(|e| format!("Failed to open file: {}", e))?;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(&file_path)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(&file_path)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    tauri_plugin_opener::open_path(&file_path, None::<&str>).map_err(|e| e.to_string())
 }

@@ -140,7 +140,7 @@ pub fn run() {
             commands::preview::list_pending_model_thumbnails,
             commands::preview::save_model_thumbnail,
             commands::preview::get_preview_progress,
-            commands::shell::reveal_in_explorer,
+            commands::shell::reveal_in_file_manager,
             commands::shell::open_with_default,
         ])
         .run(tauri::generate_context!())
