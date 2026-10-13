@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { api } from '../api';
 import { useAssetStore } from '.';
 import type { Asset, SearchResult } from '../types';
@@ -29,17 +29,19 @@ describe('useAssetStore search errors', () => {
     expect(s.loading).toBe(false);
   });
 
-  test('a failed refresh shows the error and clears stale results', async () => {
+  test('a failed refresh keeps the current results, which are for the same query', async () => {
     api.searchAssets = async () => found;
     await useAssetStore.getState().search();
 
     api.searchAssets = async () => {
       throw 'database is locked';
     };
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {});
     await useAssetStore.getState().refresh();
+    consoleError.mockRestore();
 
-    expect(useAssetStore.getState().searchError).toBe('database is locked');
-    expect(useAssetStore.getState().assets).toEqual([]);
+    expect(useAssetStore.getState().searchError).toBeNull();
+    expect(useAssetStore.getState().assets).toEqual([asset]);
   });
 
   test('the next successful search clears the error', async () => {

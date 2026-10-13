@@ -156,7 +156,7 @@ interface AssetStore {
   pageSize: number;
   loading: boolean;
   loadingMore: boolean;
-  /** Why the last search or refresh failed; the grid shows it instead of results */
+  /** Why the last search failed; the grid shows it instead of results */
   searchError: string | null;
   query: SearchQuery;
   assetMap: Map<string, Asset>;
@@ -297,7 +297,8 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       const assetMap = new Map(result.assets.map((a) => [a.id, a]));
       set({ assets: result.assets, total: result.total, assetMap, searchError: null });
     } catch (e) {
-      if (generation === queryGeneration) set(failedSearch(e));
+      // The loaded results belong to this same query, so keep them; the next event or search retries.
+      console.error('Failed to refresh assets:', e);
     }
   },
 
