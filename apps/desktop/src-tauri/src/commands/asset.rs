@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tauri::{Emitter, State};
 
-use crate::db::{make_relative_path, resolve_path, Database};
+use crate::db::{make_relative_path, resolve_path, upsert_tag, Database};
 use crate::models::{Asset, AssetPatch, SearchPayload, SearchResult};
 use crate::AppState;
 
@@ -693,12 +693,33 @@ async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Resul
             .await
             .map_err(|e| e.to_string())?;
         for tag_id in tags {
-            let _ =
-                sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
-                    .bind(id)
-                    .bind(tag_id)
-                    .execute(&mut *tx)
-                    .await;
+            // Copy master's definition into the mirror first: a mirror can lack it after a
+            // skipped name collision or a failed mirror write, and a foreign-key-enforcing
+            // connection would then reject the membership.
+            let Some(tag) = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
+                "SELECT id, name, color, parent_id FROM tags WHERE id = ?",
+            )
+            .bind(tag_id)
+            .fetch_optional(&db.master_pool)
+            .await
+            .map_err(|e| e.to_string())?
+            else {
+                tracing::warn!(
+                    "Tag {} is not in the catalog, not tagging {} with it",
+                    tag_id,
+                    id
+                );
+                continue;
+            };
+            upsert_tag(&mut *tx, &tag)
+                .await
+                .map_err(|e| format!("Could not tag the asset with '{}': {}", tag.1, e))?;
+            sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
+                .bind(id)
+                .bind(tag_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         tx.commit().await.map_err(|e| e.to_string())?;
     }
@@ -946,7 +967,7 @@ mod tests {
     use super::*;
     use crate::db::{
         insert_asset, insert_tag, memory_database, memory_library, memory_library_pool,
-        LibraryHandle,
+        memory_library_pool_enforcing_foreign_keys, LibraryHandle,
     };
     use sqlx::{Pool, Sqlite};
     use std::cell::RefCell;
@@ -1056,6 +1077,35 @@ mod tests {
 
         assert_eq!(tagged(&a).await, [("in-a".to_string(), "t".to_string())]);
         assert_eq!(tagged(&b).await, [("in-b".to_string(), "t".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn tagging_an_asset_with_a_tag_its_mirror_lacks_records_the_tag() {
+        let a = memory_library_pool_enforcing_foreign_keys().await;
+        insert_asset(&a, "in-a").await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_tag(&db.master_pool, "t", "rock").await;
+        let patch: AssetPatch =
+            serde_json::from_value(serde_json::json!({ "tags": ["t"] })).unwrap();
+
+        apply_asset_patch(&db, "in-a", &patch).await.unwrap();
+
+        assert_eq!(tagged(&a).await, [("in-a".to_string(), "t".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn tagging_with_a_tag_whose_name_collides_in_the_mirror_is_an_error() {
+        let a = memory_library_pool_enforcing_foreign_keys().await;
+        insert_asset(&a, "in-a").await;
+        insert_tag(&a, "other", "rock").await;
+        let db = memory_database(vec![memory_library("a", a.clone())]).await;
+        insert_tag(&db.master_pool, "t", "rock").await;
+        let patch: AssetPatch =
+            serde_json::from_value(serde_json::json!({ "tags": ["t"] })).unwrap();
+
+        let result = apply_asset_patch(&db, "in-a", &patch).await;
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]
