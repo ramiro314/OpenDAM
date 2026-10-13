@@ -853,9 +853,26 @@ pub async fn delete_assets(
     delete_file: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
+    let result = delete_assets_with(&state.db, &ids, delete_file.unwrap_or(true), |path| {
+        trash::delete(path)
+    })
+    .await;
+    // Emit even on failure: the assets that were trashed are gone.
+    let _ = state.app_handle.emit("library:updated", ());
+    result
+}
+
+/// Deletes each asset with `delete_asset_with`, carrying on past failures, and reports them:
+/// the error itself for one failure, a count and the first error for several.
+async fn delete_assets_with<E: std::fmt::Display>(
+    db: &Database,
+    ids: &[String],
+    delete_file: bool,
+    trash: impl Fn(&Path) -> std::result::Result<(), E>,
+) -> Result<()> {
     let mut errors = Vec::new();
     for id in ids {
-        if let Err(e) = delete_asset(id, delete_file, state.clone()).await {
+        if let Err(e) = delete_asset_with(db, id, delete_file, &trash).await {
             errors.push(e);
         }
     }
@@ -973,23 +990,31 @@ pub async fn rename_asset(
 mod tests {
     use super::*;
     use crate::db::{memory_library_pool, LibraryHandle};
+    use sqlx::{Pool, Sqlite};
+    use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use tokio::sync::RwLock;
 
-    #[tokio::test]
-    async fn a_failed_trash_keeps_the_file_and_the_asset_row() {
+    /// A library in a temporary root holding `<name>.glb` for each name, indexed as asset
+    /// `<name>`. Returns the root, the database and the library's pool.
+    async fn library_with(names: &[&str]) -> (PathBuf, Database, Pool<Sqlite>) {
         let root = std::env::temp_dir().join(format!("opendam-trash-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        let file = root.join("tree.glb");
-        std::fs::write(&file, "glTF").unwrap();
         let pool = memory_library_pool().await;
-        sqlx::query(
-            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
-             VALUES ('a1', 'tree.glb', 'tree.glb', 'glb', 'model', 4, 0, 0)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        for name in names {
+            std::fs::write(root.join(format!("{name}.glb")), "glTF").unwrap();
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+                 VALUES (?, ?, ?, 'glb', 'model', 4, 0, 0)",
+            )
+            .bind(name)
+            .bind(format!("{name}.glb"))
+            .bind(format!("{name}.glb"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
         let library = LibraryHandle {
             id: "lib".to_string(),
             name: "lib".to_string(),
@@ -1001,17 +1026,131 @@ mod tests {
             libraries: Arc::new(RwLock::new(HashMap::from([("lib".to_string(), library)]))),
             pool: pool.clone(),
         };
+        (root, db, pool)
+    }
 
-        let result = delete_asset_with(&db, "a1", true, |_| Err("trash unavailable")).await;
-
-        let file_exists = file.exists();
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets WHERE id = 'a1'")
-            .fetch_one(&pool)
+    async fn has_row(pool: &Pool<Sqlite>, id: &str) -> bool {
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
             .await
             .unwrap();
+        rows == 1
+    }
+
+    /// A trash function that fails for files named `<name>.glb` for any of `names`.
+    fn trash_failing_for(
+        names: &'static [&'static str],
+    ) -> impl Fn(&Path) -> std::result::Result<(), &'static str> {
+        move |path| {
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            if names.contains(&stem) {
+                Err("trash unavailable")
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn trash_error(root: &Path, name: &str) -> String {
+        format!(
+            "Could not move {} to the trash, so it was not deleted: trash unavailable",
+            root.join(format!("{name}.glb")).display()
+        )
+    }
+
+    #[tokio::test]
+    async fn a_failed_trash_keeps_the_file_and_the_asset_row() {
+        let (root, db, pool) = library_with(&["tree"]).await;
+
+        let result = delete_asset_with(&db, "tree", true, |_| Err("trash unavailable")).await;
+
+        let file_exists = root.join("tree.glb").exists();
+        let row_kept = has_row(&pool, "tree").await;
         std::fs::remove_dir_all(&root).unwrap();
-        assert!(result.is_err());
+        assert_eq!(result, Err(trash_error(&root, "tree")));
         assert!(file_exists);
-        assert_eq!(rows, 1);
+        assert!(row_kept);
+    }
+
+    #[tokio::test]
+    async fn a_successful_trash_trashes_the_file_and_deletes_the_asset_row() {
+        let (root, db, pool) = library_with(&["tree"]).await;
+        let trashed = RefCell::new(Vec::new());
+
+        let result = delete_asset_with(&db, "tree", true, |path| {
+            trashed.borrow_mut().push(path.to_path_buf());
+            Ok::<(), &str>(())
+        })
+        .await;
+
+        let row_kept = has_row(&pool, "tree").await;
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(trashed.into_inner(), vec![root.join("tree.glb")]);
+        assert!(!row_kept);
+    }
+
+    #[tokio::test]
+    async fn deleting_several_assets_succeeds_when_every_trash_does() {
+        let (root, db, pool) = library_with(&["tree", "rock"]).await;
+
+        let result =
+            delete_assets_with(&db, &ids(&["tree", "rock"]), true, trash_failing_for(&[])).await;
+
+        let rows_kept = [has_row(&pool, "tree").await, has_row(&pool, "rock").await];
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(rows_kept, [false, false]);
+    }
+
+    #[tokio::test]
+    async fn deleting_several_assets_returns_the_one_failed_trash() {
+        let (root, db, pool) = library_with(&["tree", "rock"]).await;
+
+        let result = delete_assets_with(
+            &db,
+            &ids(&["tree", "rock"]),
+            true,
+            trash_failing_for(&["rock"]),
+        )
+        .await;
+
+        let rows_kept = [has_row(&pool, "tree").await, has_row(&pool, "rock").await];
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Err(trash_error(&root, "rock")));
+        assert_eq!(rows_kept, [false, true]);
+    }
+
+    #[tokio::test]
+    async fn deleting_several_assets_counts_the_failed_trashes() {
+        let (root, db, pool) = library_with(&["tree", "rock", "bush"]).await;
+
+        let result = delete_assets_with(
+            &db,
+            &ids(&["tree", "rock", "bush"]),
+            true,
+            trash_failing_for(&["tree", "bush"]),
+        )
+        .await;
+
+        let rows_kept = [
+            has_row(&pool, "tree").await,
+            has_row(&pool, "rock").await,
+            has_row(&pool, "bush").await,
+        ];
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            result,
+            Err(format!(
+                "2 files were not deleted. {}",
+                trash_error(&root, "tree")
+            ))
+        );
+        assert_eq!(rows_kept, [true, false, true]);
     }
 }
