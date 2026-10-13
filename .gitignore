@@ -12,6 +12,7 @@ bundle/
 gen/
 .tauri/
 *.tsbuildinfo
+test-results/
 
 # ── Rust & Cargo ───────────────────────────────────────────────────────────
 *.rs.bk

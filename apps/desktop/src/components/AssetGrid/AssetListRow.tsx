@@ -4,19 +4,13 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import type { Asset } from '../../types';
 import { useAssetStore } from '../../store';
 import { IconImage, IconVideo, IconStar, IconHeart, IconHeartFilled } from '../Icons';
+import { formatSize } from '../../utils/format';
 import styles from './AssetListRow.module.css';
 
 interface AssetListRowProps {
   asset: Asset;
   selected: boolean;
   onClick: (asset: Asset, e: React.MouseEvent) => void;
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes}B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)}GB`;
 }
 
 function formatDate(ms: number): string {

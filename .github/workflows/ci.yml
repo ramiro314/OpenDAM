@@ -29,8 +29,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # One job: every make target spans TypeScript, Rust and Python, so
-  # splitting them would install the toolchains and compile Tauri repeatedly.
+  # Every make target spans TypeScript, Rust and Python, so splitting them
+  # would install the toolchains and compile Tauri repeatedly. Tests get their
+  # own job: they compile a separate (test) profile anyway, so it runs in parallel.
   checks:
     name: Lint, check and build
     runs-on: ubuntu-latest
@@ -62,3 +63,30 @@ jobs:
       - run: make check
       - run: make lint
       - run: make build
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: packages/preview-engine/uv.lock
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'apps/desktop/src-tauri -> target'
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.148 # keep in step with mise.toml
+      - run: make deps
+      - run: make test
