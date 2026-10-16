@@ -8,13 +8,11 @@ on:
       - 'docs/**'
       - '.gitignore'
       - 'LICENSE'
+  # No paths filter: "Lint, check and build" is a required check, and a
+  # workflow skipped by a filter leaves it pending, which blocks the merge.
+  # The changes job skips the work for docs-only pull requests instead.
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.gitignore'
-      - 'LICENSE'
 
 # Cancel superseded workflow runs when new commits are pushed
 concurrency:
@@ -29,11 +27,45 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A job skipped by its `if` passes a required check, so a pull request that
+  # changes only the files push's paths-ignore lists (keep the two in step)
+  # can merge without a build. The other jobs skip only on an explicit
+  # `false`: if this job fails, they still run.
+  changes:
+    name: Detect code changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # the pull request's merge commit and its parents
+      - name: Look for changes outside docs
+        id: filter
+        shell: bash
+        run: |
+          code=true
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # --no-renames lists both paths, so moving code into docs/ counts
+            git diff --name-only --no-renames HEAD^1 HEAD > "$RUNNER_TEMP/changed-files"
+            cat "$RUNNER_TEMP/changed-files"
+            code=false
+            while IFS= read -r file; do
+              case "$file" in
+                *.md | docs/* | .gitignore | LICENSE) ;;
+                *) code=true ;;
+              esac
+            done < "$RUNNER_TEMP/changed-files"
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
   # Every make target spans TypeScript, Rust and Python, so splitting them
   # would install the toolchains and compile Tauri repeatedly. Tests get their
   # own job: they compile a separate (test) profile anyway, so it runs in parallel.
   checks:
     name: Lint, check and build
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,6 +98,8 @@ jobs:
 
   test:
     name: Test
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -127,8 +161,8 @@ jobs:
   # Publishes the "Flaky tests" check and keeps one issue per flaky test.
   flake-report:
     name: Flake report
-    needs: [test]
-    if: ${{ !cancelled() }}
+    needs: [changes, test]
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
