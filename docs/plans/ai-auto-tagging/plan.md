@@ -4,6 +4,20 @@ Status: approved 2026-10-16. Shaped in a three-round interview (D1-D32) and appr
 where you kept the technical choices the plan made on its own (D33). Follow-up: once this plan
 merges, Mission Control slices it into dependency-linked tickets.
 
+Revised 2026-10-16 after Plan Validation repair round 1. These close validation gaps inside the
+approved decisions; no decision changed:
+- **Crash-safe, undoable writes.** Each item records an intent row in the master DB before it
+  touches the library, so a crash at any point leaves nothing the run can't undo. With a library
+  offline, undo leaves the run `undo_partial`, keeping the rows it couldn't remove, and finishes
+  once that library is back.
+- **External contracts verified.**
+  - The CLI is now probed with an image block and with an error result, and its documented
+    rate-limit and error types are cited.
+  - The `effort` and `fallbacks` request fields cite the API docs.
+  - Slices 3 and 4 open with a contract check, and the CLI pause and error paths get fixtures.
+- **UI verification.** The fake provider moves to slice 3. Every user-facing acceptance check
+  names its automated test and its screenshot, taken in a throwaway profile.
+
 ## Summary
 
 You can ask a model to tag one asset, a selection, or a whole library. The work runs in the
@@ -98,15 +112,43 @@ D33 at plan review.
   | Opus 5.5 | $4 | $20 |
   | Haiku 5.5 | $0.10 | $0.50 |
 
-- **The `claude` CLI** (v2.1.296 here, logged in with `authMethod: "claude.ai"`), probed with one tiny Haiku request:
+- **The `claude` CLI** (v2.1.296 here, logged in with `authMethod: "claude.ai"`), probed with three small Haiku requests:
   - **Flags:** `-p --input-format stream-json --output-format stream-json --verbose --json-schema <schema> --model <id or alias> --tools "" --safe-mode --no-session-persistence --system-prompt <text>`. Stream-json input **requires** stream-json output.
   - **Result:** the last stdout line is `{"type":"result","subtype":"success","is_error":false,"structured_output":{...},"usage":{...},"total_cost_usd":...}`.
   - **Rate limits:** a `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":<unix>,...}}` line reports plan limits.
   - **Speed:** one call took about 1.1s.
   - **Auth status:** `claude auth status --json` reports `loggedIn` and `authMethod`.
   - **Flags that don't fit:** `--bare` disables OAuth, so it can't be used with a plan.
+  - **Image input:** a stream-json user message whose content holds a base64 PNG `image` block
+    works. A red square with a white circle came back as `{"existing":["t1","t3"]}` (Color > Red,
+    Shape > Circle). The Agent SDK reference says images belong in `message.content`.
+  - **Error result:** an unknown model exits 1. The assistant line carries
+    `"error":"model_not_found"`. The `result` line reads `"subtype":"success","is_error":true,`
+    `"api_error_status":404,"terminal_reason":"api_error"`. So errors are detected from
+    `is_error`, the assistant `error` token and `api_error_status`, never from `subtype` alone.
+  - **Documented types** ([Agent SDK TypeScript reference](https://code.claude.com/docs/en/agent-sdk/typescript)):
+    - `rate_limit_info.status` is `allowed`, `allowed_warning` or `rejected`. Optional fields are
+      `resetsAt`, `utilization` and `errorCode: "credits_required"` (subscription usage exhausted).
+    - The assistant `error` is one of `authentication_failed`, `oauth_org_not_allowed`,
+      `account_on_hold`, `billing_error`, `rate_limit`, `overloaded`, `invalid_request`,
+      `model_not_found`, `server_error`, `max_output_tokens`, `cloud_credential_error` or `unknown`.
+    - Error results add the subtypes `error_max_turns`, `error_during_execution`,
+      `error_max_budget_usd` and `error_max_structured_output_retries`, each with
+      `errors: string[]`.
+- **Anthropic API request fields:**
+  - **Effort:** `output_config.effort` is GA with no beta header on Sonnet 5.5, Opus 5.5 and
+    Haiku 5.5. It accepts `low` through `max` and sits beside `format` in `output_config`
+    ([effort docs](https://platform.claude.com/docs/en/build-with-claude/effort)).
+  - **Fallbacks:** `fallbacks: "default"` needs the `anthropic-beta:
+    server-side-fallback-2026-07-01` header. It is a Claude API beta. Haiku 5.5 has no server-side
+    fallback, and on Sonnet 5.5 it retries only `cyber` and `frontier_llm` declines
+    ([refusals and fallback docs](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback)).
+  - **Refusals:** a decline is an HTTP 200 with `stop_reason: "refusal"`.
 - **Policy.** Anthropic's Agent SDK docs say third-party developers may not offer claude.ai login or rate limits in their products. This app is personal and never handles the login: it only runs the owner's own installed `claude`. The Claude-plan access mode is for personal use and must be removed or disabled if the app is ever distributed. A code comment and CLAUDE.md say so.
 - **Keyring.** This KDE session provides `org.freedesktop.secrets` (ksecretd).
+- **App data dir.** The master DB lives in `$XDG_DATA_HOME/com.opendam.desktop/`
+  (`docs/agents/running-the-app.md`), so a throwaway `XDG_DATA_HOME` gives a fresh master DB.
+  `Database::new` opens a library only when its root exists, so a library can be offline.
 - **Tauri version check.** `check-tauri-versions.mjs` pairs `@tauri-apps/*` npm packages with their crates. Adding the notification plugin as a Rust crate only, with no npm package, needs no pairing.
 
 ## Target state
@@ -146,15 +188,19 @@ stateDiagram-v2
   awaiting_review --> done: review applied
   running --> cancelled: cancel
   paused --> cancelled: cancel
-  done --> undone: undo
-  cancelled --> undone: undo
-  awaiting_review --> undone: undo
+  done --> undoing: undo
+  cancelled --> undoing: undo
+  awaiting_review --> undoing: undo
+  undoing --> undone: every recorded pair removed
+  undoing --> undo_partial: a library is offline, app restart
+  undo_partial --> undoing: finish undo
 ```
 
 Cancel stops the remaining items. Tags already applied stay. Proposals already collected still
 go to review (`awaiting_review`), where "Reject all" discards them. Undo is available once a run
 has stopped: `done`, `cancelled` or `awaiting_review` (which also rejects its pending
-proposals). A paused run is cancelled first.
+proposals). A paused run is cancelled first. Undo runs as `undoing` and ends `undone`, or
+`undo_partial` when a library is offline (see [Undo](#undo-d23-and-offline-libraries)).
 
 ### Data model
 
@@ -173,7 +219,7 @@ master-wins mirror rules.
 | `tag_run_items` | `run_id, asset_id, library_id, status` (queued/running/done/failed/skipped), `attempts, error, result` (JSON), primary key `(run_id, asset_id)` | Per-asset work and outcome |
 | `tag_run_proposals` | `id, run_id, name, normalized_name, parent_id, status` (pending/accepted/rejected/mapped), `final_tag_id, created_tag` (bool) | New tag names, merged per run by `normalized_name` (D26) |
 | `tag_run_proposal_assets` | `proposal_id, asset_id, included` | Which assets each proposal is for; `included` drives the review's checkboxes |
-| `tag_run_applied` | `run_id, asset_id, library_id, tag_id` | Only the `asset_tags` rows this run inserted, so undo removes exactly those (D23) |
+| `tag_run_applied` | `run_id, asset_id, library_id, tag_id, state` (pending/applied), primary key `(run_id, asset_id, tag_id)` | Every `asset_tags` row this run adds, recorded **before** the library write (see the write protocol), so undo removes exactly those (D23) |
 
 `normalized_name` is the name lowercased and trimmed, with inner whitespace collapsed.
 Create freely records its tags as proposals with `status = accepted, created_tag = 1`, so undo
@@ -185,9 +231,11 @@ comes from ("from ANTHROPIC_API_KEY", "saved in keyring", "not set"), never the 
 
 ### Run engine (`src-tauri/src/autotag/`)
 
-- **Start.** `lib.rs` starts the engine next to the preview worker. At startup, every `queued` or
-  `running` run becomes `paused` with the reason "app restarted", and every `running` item goes
-  back to `queued` (D25).
+- **Start.** `lib.rs` starts the engine next to the preview worker. At startup:
+  - every `queued` or `running` run becomes `paused` with the reason "app restarted" (D25);
+  - every `running` item goes back to `queued`;
+  - a run left `undoing` becomes `undo_partial`;
+  - `pending` `tag_run_applied` rows are replayed (see the write protocol).
 - **Scheduling (D12).** Each provider has one semaphore sized by its concurrency setting.
   - **Round-robin:** the scheduler hands permits out across that provider's running runs,
     taking one item from each in turn.
@@ -203,43 +251,94 @@ comes from ("from ANTHROPIC_API_KEY", "saved in keyring", "not set"), never the 
      - drop unknown tag ids;
      - drop proposals that match a catalog tag name, and count them as that tag;
      - apply the D21 caps.
-  5. Write it.
-- **Writing tags.**
-  - **Matches:** one small transaction per item in the asset's library DB:
-    `INSERT OR IGNORE INTO asset_tags`. A row is recorded in `tag_run_applied` only when the
-    insert actually added it.
-  - **Prefer existing:** upserts proposals by `normalized_name` and links the asset.
-  - **Create freely:** creates the tag through the same path as `create_tag` (master first, then
-    every open mirror), under the suggested parent if it still exists. An engine mutex
-    serializes creation, so parallel items can't create the same name twice. The tag is then
-    applied like a match.
-  - **Order:** these writes go to a single DB per item, ordered so that a crash leaves at worst
-    an item to redo, never a tag the run can't undo.
+  5. Write it with the write protocol below.
 - **Finishing.** Prefer existing with pending proposals goes to `awaiting_review`, and anything
   else goes to `done`. Multi-asset runs send a desktop notification (D15). Single-asset runs
   from "Suggest tags" (`inline = 1`) don't.
 - **Overlap (D13).** Creating a run leaves out assets that have a `queued` or `running` item in
   another run that is `queued`, `running` or `paused`. The response reports `queued` and
   `skipped` counts.
-- **Failures (D27).**
-  - **Retryable** (HTTP 429/529/5xx, timeouts, connection errors): backoff of 2s, 8s and 30s,
-    honouring `retry-after`. After the third try the item `failed`.
-  - **Fatal for the run** (401/403, no key, `claude` not found, `loggedIn: false`, unknown model):
-    the run `paused` with a readable `pause_reason`, and the item goes back to `queued`.
-  - **Claude plan limit:** a `rate_limit_event` whose status isn't `allowed` pauses the run with
-    "Claude plan limit reached, resets at HH:MM".
-  - **Item-specific** (refusal, unparseable output after one retry, asset gone): the item
-    `failed`, with the error stored.
-  - **Retry failed** re-queues `failed` items.
-- **Undo (D23)**, for a run that is `done`, `cancelled` or `awaiting_review`:
-  1. Delete each `tag_run_applied` row from its asset's library DB.
-  2. Delete every tag this run created (`created_tag = 1`) that no `asset_tags` row in any open
-     library still uses. This goes through the existing `delete_tag` path.
-  3. Mark the run `undone`.
-- **Clear (D28)** deletes the rows of a run that is not `running` or `paused`.
+- **Clear (D28)** deletes a run's rows when it is not `running`, `paused` or `undoing`. On an
+  `undo_partial` run it asks first, because the tags left in the offline library then stay.
 - **Events.** The engine emits `autotag:updated`, carrying the run summary and the asset ids
   whose tags changed, throttled to about 4 per second. The asset store re-fetches only the
   loaded assets that changed. The Runs panel and status bar subscribe instead of polling.
+
+### Write protocol: every tag a run adds stays undoable
+
+An item's writes span two databases. `asset_tags` lives only in the asset's library DB, while
+the run's records live in the master DB. SQLite can't commit both atomically through separate
+pools, so each item writes in this order:
+
+1. **Intent (one master transaction).**
+   - First, outside the transaction, read which of the item's pairs the asset's library already
+     has. A pair that already has a `tag_run_applied` row for this run counts as the run's own.
+   - Then, in one transaction:
+     - insert a `pending` `tag_run_applied` row for every pair the library lacks;
+     - upsert proposals (Prefer existing);
+     - for Create freely, insert each new tag into master `tags` **together with** its proposal row
+       (`accepted`, `created_tag = 1`, `final_tag_id`), through a transaction-taking variant of
+       `create_tag_in`;
+     - mark the item `done`.
+2. **Mirrors.** Upsert any tag created in step 1 into every open library with `db::upsert_tag`.
+   This is idempotent, and `sync_open_libraries` repairs it at the next open anyway.
+3. **Library (one transaction in the asset's library DB).** `INSERT OR IGNORE` the pending pairs
+   into `asset_tags`.
+4. **Confirm (one master transaction).** Mark those rows `applied`.
+
+**Replay.** At startup, and whenever a library opens, every `pending` row whose library is open
+is replayed: steps 3 and 4, both idempotent. Rows for an offline library wait for it. A step 3
+or 4 that fails during a run, such as a NAS lock timeout, also leaves its rows `pending` for
+replay. The item is never sent to the model again.
+
+**Why a crash can't escape undo.** Every pair the run might have written is recorded before the
+library sees it:
+- **After step 1:** replay inserts the pairs and confirms them. The item isn't sent to the model
+  again.
+- **After step 3:** replay's insert is a no-op, and the rows are confirmed.
+- **Create freely:** the tag and its `created_tag = 1` record commit in the same transaction, so
+  the tag can't exist without the run owning it.
+
+**Review apply** uses the same four steps. Its intent transaction creates the accepted tags,
+resolves the proposals, inserts `pending` rows for the ticked assets and marks the run `done`.
+
+**Batching.** Library writes stay batched at about 200 rows per transaction (the repository
+invariant). Review apply and undo split larger sets.
+
+### Undo (D23) and offline libraries
+
+Undo works on a run that is `done`, `cancelled` or `awaiting_review`. It moves the run to
+`undoing`, then:
+
+1. **Remove the run's pairs.** For each library that holds any of the run's `tag_run_applied`
+   rows (`pending` or `applied`):
+   - **Open library:** delete those pairs from its `asset_tags` in batched transactions, then
+     delete the matching master rows. Deleting an unapplied `pending` pair is a no-op.
+   - **Offline library** (its root is missing, so `Database::new` never opened it): leave its rows
+     untouched.
+2. **If every row is gone:** delete the tags this run created (`created_tag = 1`) that no
+   `asset_tags` row in any open library still uses, through the existing `delete_tag` path. The
+   run becomes `undone`.
+3. **If some rows remain:** the run becomes `undo_partial`, with the reason "Library <name>
+   offline: N tags not removed". Created tags are kept, because the offline library still uses
+   them. The Runs panel offers **Finish undo**, which runs the same steps again once the library
+   is back. A crash during undo leaves the run `undoing`, which startup turns into `undo_partial`.
+
+### Failures (D27)
+
+Each failure falls into one of four classes:
+- **API key path:** the HTTP status decides.
+- **Claude plan path:** the CLI's assistant `error` token, the `result` line (`is_error`,
+  `api_error_status`, error subtypes) and the process exit decide, never `subtype` alone.
+
+| Class | API key (HTTP) | Claude plan (CLI) | What happens |
+|---|---|---|---|
+| Retryable | 429, 529, 5xx, timeouts, connection errors | `rate_limit`, `overloaded`, `server_error`; `api_error_status` 429, 529 or 5xx; the process killed by the 120 s timeout | Backoff of 2s, 8s and 30s (honouring `retry-after` on HTTP); after the third try the item `failed` |
+| Fatal for the run | 401, 403, 404 (unknown model), no key | `authentication_failed`, `oauth_org_not_allowed`, `account_on_hold`, `billing_error`, `model_not_found`, `cloud_credential_error`; `claude` not on `PATH`; `claude auth status --json` reports `loggedIn: false` | The run `paused` with a readable `pause_reason`; the item goes back to `queued` |
+| Plan limit | - | `rate_limit_event` with `status: "rejected"` | The run `paused` with "Claude plan limit reached, resets at HH:MM" (from `resetsAt`), or "Claude plan usage exhausted" with `errorCode: "credits_required"`. `allowed_warning` never pauses: the Runs panel shows the utilization. |
+| Item-specific | 400, `stop_reason: "refusal"`, output that doesn't parse after one retry, asset gone | `invalid_request`, `max_output_tokens`, `unknown` or an unrecognized token, an error subtype such as `error_max_structured_output_retries`, an exit with no `result` line, no `structured_output` | The item `failed`, with the error stored |
+
+**Retry failed** re-queues `failed` items.
 
 ### Providers
 
@@ -249,8 +348,8 @@ with no `proposed` field.
 
 | Provider | Request | Notes |
 |---|---|---|
-| **Anthropic, API key** | `POST https://api.anthropic.com/v1/messages` with `x-api-key` and `anthropic-version: 2023-06-01` (`reqwest` + rustls). Body: model; small `max_tokens`; `output_config: { format: { type: "json_schema", schema }, effort: "low" }`; `system` = instructions + the catalog vocabulary, marked `cache_control: ephemeral`; user content = the image block + asset text + the run's pending proposals. | **Caching:** the volatile run vocabulary goes in the user message so the cached system prefix survives (D24). **Refusals:** on models that accept it (Sonnet 5.5, Opus 5.5), send `fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta header. A final `stop_reason: "refusal"` fails the item. **Cost:** usage tokens are added to the run's totals and cost. |
-| **Anthropic, Claude plan** | Spawn `claude -p --input-format stream-json --output-format stream-json --verbose --json-schema <schema> --model <model> --tools "" --safe-mode --no-session-persistence --system-prompt <instructions + vocabulary>`, with the app data dir as cwd. Write one user message (image block + text), close stdin, read lines until the `result` line, then take `structured_output`. | **Rate limits:** `rate_limit_event` lines feed the plan-limit pause. **Usage:** tokens are recorded; cost shows as "on your plan". **Settings:** shows the `claude` path, version and `claude auth status --json`. **Policy:** personal use only (see Facts). |
+| **Anthropic, API key** | `POST https://api.anthropic.com/v1/messages` with `x-api-key` and `anthropic-version: 2023-06-01` (`reqwest` + rustls). Body: model; small `max_tokens`; `output_config: { format: { type: "json_schema", schema }, effort: "low" }`; `system` = instructions + the catalog vocabulary, marked `cache_control: ephemeral`; user content = the image block + asset text + the run's pending proposals. | **Caching:** the volatile run vocabulary goes in the user message so the cached system prefix survives (D24). **Refusals:** on Sonnet 5.5 and Opus 5.5 only, send `fallbacks: "default"` with the `anthropic-beta: server-side-fallback-2026-07-01` header. Never send it on Haiku 5.5, which has no server-side fallback (see Facts). A final `stop_reason: "refusal"` fails the item. **Effort:** `low` is documented for all three models (see Facts). **Cost:** usage tokens are added to the run's totals and cost. |
+| **Anthropic, Claude plan** | Spawn `claude -p --input-format stream-json --output-format stream-json --verbose --json-schema <schema> --model <model> --tools "" --safe-mode --no-session-persistence --system-prompt <instructions + vocabulary>`, with the app data dir as cwd. Write one user message whose `message.content` holds the image block and the text (probed, see Facts), close stdin, read lines until the `result` line, then take `structured_output`. | **Rate limits and errors:** classified as in [Failures](#failures-d27). **Usage:** tokens are recorded; cost shows as "on your plan". **Settings:** shows the `claude` path, version and `claude auth status --json`. **Policy:** personal use only (see Facts). |
 | **Jev** | `POST https://api.typesafe.ai/v1/systemone`, `Authorization: Bearer`, `model: "jev-latest"`. `state` = the asset text. One `noul` question per catalog tag ("This asset should be tagged '<path>'. <hint>"), with ids `q0..qN` mapped back to tag ids. | **Selection:** keep tags with `noul >= threshold` (0.7), highest first, at most 8 (D21). **Chunking:** questions are sent in chunks of 50 per request until the real limit is known. **Cost:** usage tokens priced at $0.04/M. |
 
 A `pricing.rs` table gives per-model input and output prices for the run-dialog estimate and the
@@ -300,7 +399,7 @@ expected output. Update the table when prices change.
   - label, provider/model, mode and status (with the pause reason);
   - progress and failed count;
   - tokens and cost (or "on your plan");
-  - actions: Pause/Resume, Cancel, Retry failed, Review (N), Undo, Clear.
+  - actions: Pause/Resume, Cancel, Retry failed, Review (N), Undo or Finish undo, Clear.
 
   The panel header has Resume all and Clear finished.
 
@@ -334,9 +433,16 @@ expected output. Update the table when prices change.
 
 ### Dev affordance
 
-Debug builds only (`cfg(debug_assertions)`): `OPENDAM_AUTOTAG_FAKE=1` adds a "Fake" provider
-that tags from file-name words, after a short delay. Agents and you can then exercise and
-screenshot every flow without a key or any spend. Release builds never include it.
+In debug builds only (`cfg(debug_assertions)`), these variables let agents and you exercise and
+screenshot every flow without a key or any spend. Slice 3 lands them, so every UI slice can use
+them. Release builds never include them.
+- `OPENDAM_AUTOTAG_FAKE=1` adds two providers that tag from file-name words:
+  - **Fake** supports all three modes and proposes words that aren't in the catalog.
+  - **Fake text-only** supports Existing only, like Jev.
+- `OPENDAM_AUTOTAG_FAKE_DELAY_MS` (default 300) slows each call, so a run can be paused, quit or
+  photographed mid-way.
+- `OPENDAM_NO_KEYRING=1` ignores the OS keyring. With the two key env vars unset, the app then
+  shows the unconfigured state even on a machine with saved keys.
 
 ### Docs
 
@@ -347,7 +453,8 @@ screenshot every flow without a key or any spend. Release builds never include i
     you start, and nothing is sent until a provider is set up."
   - **Layout** gains `src/autotag/`.
   - A note that Claude-plan access is personal use only.
-- **`docs/agents/running-the-app.md`:** how to use `OPENDAM_AUTOTAG_FAKE=1`.
+- **`docs/agents/running-the-app.md`:** the throwaway profile and the debug variables above (see
+  [Verification of acceptance checks](#verification-of-acceptance-checks)).
 
 ## Work, in order
 
@@ -358,23 +465,54 @@ Suggested slices for the ticket follow-up. Each one leaves the app working.
 2. **Settings and credentials.** The `settings` table, keyring with env override, Settings
    dialog, provider status, "Test connection" for the Anthropic API key.
 3. **Run engine tracer bullet.**
-   - The run tables, engine, per-provider pool, the Anthropic API-key provider, and Existing only.
+   - **Resolve first:** the API contract check (see [Contract checks](#contract-checks-before-building)).
+   - The fake providers and debug variables, so this and every later UI slice is verified in the
+     throwaway profile.
+   - The run tables, engine, write protocol and replay, per-provider pool, the Anthropic API-key
+     provider, and Existing only.
    - The run dialog from the toolbar, `autotag:updated` events, the status bar entry and the Runs
      panel (pause, resume, cancel).
    - Paused-on-restart.
-4. **Claude plan access.** The CLI provider, plan-limit pause, and CLI status in Settings.
-5. **Jev provider.** Noul-per-tag, threshold, chunking, and Jev's "Test connection".
+4. **Claude plan access.** **Resolve first:** the CLI contract check and its fixtures. Then the CLI
+   provider, failure classification for CLI results, the plan-limit pause, and CLI status in
+   Settings.
+5. **Jev provider.** **Resolve first:** the questions-per-request limit. Then noul-per-tag,
+   threshold, chunking, and Jev's "Test connection".
 6. **Prefer existing.**
    - Proposals with the shared vocabulary, `awaiting_review`, and the review modal.
    - Desktop notifications.
    - "Suggest tags" with inline chips and last-used defaults.
 7. **Create freely.** Serialized tag creation with the suggested parent.
-8. **Run housekeeping.** Undo, Clear, Retry failed, the overlap skip, and failure classification
-   with backoff.
+8. **Run housekeeping.** Undo with `undo_partial` and Finish undo, Clear, Retry failed, the overlap
+   skip, and HTTP failure classification with backoff.
 9. **Entry points and estimates.** The grid right-click menu, the sidebar "Auto-tag library"
    (untagged by default), and the run-dialog estimate.
-10. **Docs and dev affordance.** The CLAUDE.md amendments, `OPENDAM_AUTOTAG_FAKE`, and
-    running-the-app notes.
+10. **Docs.** The CLAUDE.md amendments and the running-the-app notes for the throwaway profile.
+
+Each slice registers, as workflow evidence, the tests and screenshots its rows in
+[Verification of acceptance checks](#verification-of-acceptance-checks) name.
+
+### Contract checks before building
+
+Like Jev's question limit, these are confirmed before code depends on them:
+- **Slice 3, API key.**
+  - **First call:** the first "Test connection" call uses your key and sends the full production
+    request shape: an image block, `output_config.format` with `effort: "low"`, the cached system
+    block, and on Sonnet 5.5 `fallbacks: "default"` with its beta header.
+  - **Fixture:** its response, with no key in it, becomes the parser fixture.
+  - **If a field is rejected:** a 400 drops that field. The slice's PR records it before
+    anything builds on it.
+  - **Sources:** the field shapes come from the docs cited in Facts.
+- **Slice 4, Claude plan.**
+  - **Recorded fixtures:** rerun the three recorded probes (text, image, unknown model) with the
+    installed `claude` and commit their output lines as fixtures.
+  - **Synthesized fixtures,** from the documented types:
+    - `rate_limit_event` with `rejected`, with and without `credits_required`;
+    - `rate_limit_event` with `allowed_warning`;
+    - results carrying `authentication_failed`, `rate_limit`, `overloaded` and
+      `error_max_structured_output_retries`.
+  - **Replay:** a stub `claude` script on a test `PATH` replays each fixture.
+- **Slice 5, Jev.** Confirm the questions-per-request limit before relying on chunks of 50.
 
 ## Testing
 
@@ -390,18 +528,41 @@ No test calls a live service. CI never needs a key.
     - Under parallel items, Create freely creates a tag once and mirrors it to every open library.
     - Review accept, rename, map, untick and reject.
   - **Undo** removes exactly the run's rows, plus the created tags no asset uses any more.
+  - **Write protocol, crash points:**
+    - **Points tested:** after the intent commit, after the library commit, and after a Create
+      freely tag's master insert.
+    - **Mechanism:** a test-only fault hook stops the item at each point. The test then runs the
+      startup path and undoes the run.
+    - **Assertion:** every asset's `asset_tags` and the tag catalog match the pre-run snapshot.
+  - **Undo with an offline library:**
+    - **Setup:** a run spans libraries A and B, and B is unregistered before undo.
+    - **Result:** the run ends `undo_partial`, with A restored and B's rows kept.
+    - **Finish undo:** after B is reopened, Finish undo ends `undone`, and only then are the run's
+      created tags deleted.
   - **Restart and failures:**
     - Restart turns `running` into `paused`.
     - Retryable failures retry 3 times and then fail the item; fatal failures pause the run.
   - **Providers and tags:**
     - Jev threshold and cap selection, from a fixture response.
     - Anthropic response parsing, from fixtures: unknown ids dropped, caps applied, refusal.
-    - CLI `result` and `rate_limit_event` parsing, from the probe's recorded lines.
+    - The CLI provider against the stub `claude`, replaying each fixture:
+      - success with text and with an image;
+      - `model_not_found` and a logged-out CLI pause the run;
+      - `rejected` pauses with the reset time, and `allowed_warning` doesn't pause;
+      - `rate_limit` retries;
+      - `error_max_structured_output_retries` fails the item.
+    - Secrets: a sentinel key sits in the in-memory keyring and in the env. After a run, the master
+      DB file, the captured `tracing` output and every emitted event payload are free of it.
     - Request-body builders: image block, cache marker, schema by mode.
     - `update_tag` mirroring and its cycle guard.
     - Settings round-trip.
-- **TypeScript (bun):** pure helpers: the status-bar summary text, estimate formatting, and the
-  review-decision reducer.
+- **TypeScript (bun):** pure helpers:
+  - the status-bar summary text;
+  - estimate formatting;
+  - the review-decision reducer;
+  - `autotagAvailability(status)`: each entry point's enabled state and its reason;
+  - `modeOptions(capabilities)`: Jev and Fake text-only allow only Existing only, with the
+    reason.
 - **Manual smoke (you, once per provider):** run about 5 Kenney assets through each mode with the
   API key, the Claude plan and Jev. Screenshot the Runs panel and the review modal.
 
@@ -415,11 +576,34 @@ No test calls a live service. CI never needs a key.
 - Two runs progress together, and in-flight requests per provider never exceed the setting.
 - Quitting mid-run and relaunching shows the run paused. Resume finishes it, and pending
   proposals are still there.
-- Undo of a finished run restores every asset's tags to their pre-run state.
+- Undo of a finished run restores every asset's tags to their pre-run state, even after a crash
+  mid-item. With a library offline, the run stays `undo_partial` until that library is back.
 - Selecting Jev allows only Existing only, and Jev requests carry no image.
 - Claude-plan runs make no HTTPS call from the app itself. They go through `claude`, and a
   logged-out CLI pauses the run with a message.
 - No API key is stored in any DB, log or event payload.
+
+## Verification of acceptance checks
+
+**Throwaway profile.** UI checks never touch your real Kenney library, which
+`docs/agents/running-the-app.md` treats as read-only:
+- **Fresh data:** launch `make dev` with `XDG_DATA_HOME` set to a new temp dir, so the master DB,
+  settings and runs start empty.
+- **Scratch library:** copy about 60 assets from the Kenney library into a temp folder. Register it
+  by seeding the throwaway master DB's `libraries` row with `sqlite3` before launch, because
+  `add_library` accepts only folders picked in the dialog.
+- **Screenshots:** take them with `spectacle` into `.evidence/`, as that doc describes.
+
+| Acceptance check | Automated test | Screenshot (throwaway profile) | Slice |
+|---|---|---|---|
+| No provider configured: nothing is sent, and every entry point says why | Rust: `start_autotag_run` with nothing configured returns an error, and the provider stub records zero calls. bun: `autotagAvailability` | `OPENDAM_NO_KEYRING=1`, no key env vars, no fake: the toolbar button, grid menu item, "Suggest tags" and sidebar library item, each disabled with its reason | 3, 6, 9 |
+| A 50-asset Prefer-existing run applies matches as it runs, notifies once, then opens a review; applying creates the tags in master and every open library and tags the ticked assets | Rust: an engine test with the fake provider over 50 assets in two libraries. The notifier fake records one call, and review apply checks master, both mirrors and `asset_tags` | Fake: the Runs panel mid-run, the status bar "1 run needs review", the review modal, and the grid after Apply | 6 |
+| Two runs progress together, and in-flight requests never exceed the setting | Rust: two runs at concurrency 2; the fake records the maximum in flight | Fake with a delay: the Runs panel with two running runs | 3 |
+| Quit mid-run and relaunch: the run is paused, Resume finishes it, and pending proposals are still there | Rust: the restart test | Fake with a delay: the run paused with "app restarted" after a kill and relaunch, then finished after Resume | 3, 6 |
+| Undo restores the pre-run state, including after a crash, and stays `undo_partial` while a library is offline | Rust: the crash-point and offline-library tests above | The Runs panel after Undo, and `undo_partial` while the scratch library folder is moved away | 8 |
+| Jev allows only Existing only and sends no image | Rust: the Jev request builder has no image block. bun: `modeOptions` | Fake text-only selected in the run dialog, with two modes disabled and the reason shown | 5 |
+| Claude-plan runs make no HTTPS call from the app, and a logged-out CLI pauses the run | Rust: the CLI provider has no HTTP client. The stub `claude` fixtures cover logged out, `rejected` and errors | The Settings CLI status | 4 |
+| No API key in any DB, log or event | Rust: the sentinel-key test | - | 2, 3 |
 
 ## Manual steps for you
 
@@ -440,6 +624,8 @@ No test calls a live service. CI never needs a key.
   merged in review, with "Map to existing tag".
 - **Undo edge case.** Undo removes a pair the run inserted even if you later confirmed the same
   tag by hand.
+- **Offline libraries:** a `pending` row for an offline library is applied when that library
+  opens again. Until then, that asset lacks the tag.
 - **Jev's question limit per request is unverified.** Chunks of 50 are a guess, to confirm in
   slice 5.
 - **The pricing table is hardcoded** and goes stale when prices change.
