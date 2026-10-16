@@ -32,6 +32,14 @@ inside the approved decisions:
 - **AGENTS.md, not CLAUDE.md.** The invariants live in `AGENTS.md`; `CLAUDE.md` is only a
   symlink to it. D9's amendment now names the real file.
 
+Revised a third time 2026-10-16 after the second GitHub Inspector round on PR #43:
+- **Replay never undoes an undo.** It skips rows whose run is `undoing`, `undo_partial` or
+  `undone`.
+- **Review apply keeps a cancelled run `cancelled`.** It moves only an `awaiting_review` run to
+  `done`.
+- **Created tags can't come back from an offline mirror.** Undo deletes them only while every
+  registered library is open. Otherwise the run stays `undo_partial`.
+
 ## Summary
 
 You can ask a model to tag one asset, a selection, or a whole library. The work runs in the
@@ -261,7 +269,8 @@ comes from ("from ANTHROPIC_API_KEY", "saved in keyring", "not set"), never the 
   - every `queued` or `running` run becomes `paused` with the reason "app restarted" (D25);
   - every `running` item goes back to `queued`;
   - a run left `undoing` becomes `undo_partial`;
-  - `pending` `tag_run_applied` rows are replayed (see the write protocol).
+  - `pending` `tag_run_applied` rows are replayed, except rows of runs being undone (see the write
+    protocol).
 - **Scheduling (D12).** Each provider has one semaphore sized by its concurrency setting.
   - **Round-robin:** the scheduler hands permits out across that provider's running runs,
     taking one item from each in turn.
@@ -315,7 +324,8 @@ pools, so each item writes in this order:
 **Replay.** At startup, and whenever a library opens, every `pending` row whose library is open
 is replayed: steps 3 and 4, both idempotent. Rows for an offline library wait for it. A step 3
 or 4 that fails during a run, such as a NAS lock timeout, also leaves its rows `pending` for
-replay. The item is never sent to the model again.
+replay. The item is never sent to the model again. Replay skips every row whose run is
+`undoing`, `undo_partial` or `undone`, because those rows are waiting to be removed, not applied.
 
 **Why a crash can't escape undo.** Every pair the run might have written is recorded before the
 library sees it:
@@ -326,7 +336,8 @@ library sees it:
   the tag can't exist without the run owning it.
 
 **Review apply** uses the same four steps. Its intent transaction creates the accepted tags,
-resolves the proposals, inserts `pending` rows for the ticked assets and marks the run `done`.
+resolves the proposals and inserts `pending` rows for the ticked assets. It moves an
+`awaiting_review` run to `done`; a `cancelled` run keeps its status.
 
 **Batching.** Library writes stay batched at about 200 rows per transaction (the repository
 invariant). Review apply and undo split larger sets.
@@ -342,13 +353,19 @@ Undo works on a run that is `done`, `cancelled` or `awaiting_review`. It moves t
      delete the matching master rows. Deleting an unapplied `pending` pair is a no-op.
    - **Offline library** (its root is missing, so `Database::new` never opened it): leave its rows
      untouched.
-2. **If every row is gone:** delete the tags this run created (`created_tag = 1`) that no
-   `asset_tags` row in any open library still uses, through the existing `delete_tag` path. The
-   run becomes `undone`.
-3. **If some rows remain:** the run becomes `undo_partial`, with the reason "Library <name>
-   offline: N tags not removed". Created tags are kept, because the offline library still uses
-   them. The Runs panel offers **Finish undo**, which runs the same steps again once the library
-   is back. A crash during undo leaves the run `undoing`, which startup turns into `undo_partial`.
+2. **If every row is gone and every library registered in OpenDAM is open:** delete the tags this
+   run created (`created_tag = 1`) that no `asset_tags` row still uses, through the existing
+   `delete_tag` path. The run becomes `undone`.
+3. **Otherwise** the run becomes `undo_partial`. The reason is either "Library <name> offline: N
+   tags not removed" or, when only the created tags are left, "Created tags kept until <name> is
+   back".
+   - **Created tags are kept** while any registered library is offline. That library's mirror
+     still holds them, and opening it runs `add_definitions_master_lacks`, which would add them
+     straight back to master.
+   - **Finish undo** in the Runs panel runs the same steps again once the library is back.
+   - **Crash during undo:** a crash leaves the run `undoing`, which startup turns into
+     `undo_partial`. A crash between the library delete and the master delete leaves master rows
+     for pairs the library no longer has. Replay skips them, and Finish undo removes them.
 
 ### Failures (D27)
 
@@ -444,8 +461,9 @@ expected output. Update the table when prices change.
   - Accept and Reject.
 
   The modal also has Accept all, Reject all and Apply. Applying creates tags (master, then
-  mirrors), applies them to the ticked assets, records them for undo, and moves the run to
-  `done`. Command: `review_autotag_proposals(run_id, decisions)`.
+  mirrors), applies them to the ticked assets and records them for undo. It moves an
+  `awaiting_review` run to `done`; a cancelled run stays `cancelled`. Command:
+  `review_autotag_proposals(run_id, decisions)`.
 
 - **Edit tag dialog (D29).** Opened from a tag's right-click menu in the sidebar. It edits the
   name, color (existing swatches), parent (excluding the tag itself and its descendants) and
@@ -560,7 +578,8 @@ No test calls a live service. CI never needs a key.
   - **Create freely and review:**
     - Under parallel items, Create freely creates a tag once and mirrors it to every open library.
     - Review accept, rename, map, untick and reject.
-    - A cancelled run's pending proposals can be applied, and the run stays `cancelled`.
+    - A cancelled run's pending proposals can be applied, and the run stays `cancelled`. Applying
+      an `awaiting_review` run's review moves it to `done`.
     - Retry failed starts a new run over exactly the failed assets, and the original run's status
       doesn't change.
   - **Undo** removes exactly the run's rows, plus the created tags no asset uses any more.
@@ -575,6 +594,13 @@ No test calls a live service. CI never needs a key.
     - **Result:** the run ends `undo_partial`, with A restored and B's rows kept.
     - **Finish undo:** after B is reopened, Finish undo ends `undone`, and only then are the run's
       created tags deleted.
+    - **Replay during `undo_partial`:** B also holds a `pending` row. When B reopens before Finish
+      undo, replay leaves B's `asset_tags` unchanged.
+    - **Crash between the deletes:** stopping undo between the library delete and the master
+      delete, then restarting, leaves the library restored and the run `undo_partial`.
+    - **Offline mirror:** a third registered library C is offline and holds none of the run's
+      rows. The run stays `undo_partial` and keeps its created tags. Once C reopens, Finish undo
+      deletes them from master and every mirror, and reopening C again doesn't bring them back.
   - **Restart and failures:**
     - Restart turns `running` into `paused`.
     - Retryable failures retry 3 times and then fail the item; fatal failures pause the run.
@@ -667,6 +693,9 @@ No test calls a live service. CI never needs a key.
   tag by hand.
 - **Offline libraries:** a `pending` row for an offline library is applied when that library
   opens again. Until then, that asset lacks the tag.
+- **Removed libraries:** undo doesn't check a library that was removed from OpenDAM. If its
+  mirror held a tag the run created and it is added back later, the tag returns. That is the
+  existing no-tombstones gap for any deleted tag.
 - **Jev's question limit per request is unverified.** Chunks of 50 are a guess, to confirm in
   slice 5.
 - **The pricing table is hardcoded** and goes stale when prices change.
