@@ -18,6 +18,20 @@ approved decisions; no decision changed:
 - **UI verification.** The fake provider moves to slice 3. Every user-facing acceptance check
   names its automated test and its screenshot, taken in a throwaway profile.
 
+Revised again 2026-10-16 after the GitHub Inspector review of PR #43. These are corrections
+inside the approved decisions:
+- **Claude-plan runs can't bill an API key.**
+  - The `claude` child starts from a cleaned environment, so an `ANTHROPIC_API_KEY` set for the
+    app (D3) can't reach it. Probed: an inherited key makes the CLI use that key instead of your
+    login.
+  - Every run's `init` line must report `apiKeySource: "none"`.
+- **Cancel and Retry failed fit the lifecycle.**
+  - A cancelled run keeps its proposals reviewable and stays `cancelled`.
+  - "Retry failed" starts a new run over the failed assets.
+  - So no run leaves `done` or `cancelled` except through undo.
+- **AGENTS.md, not CLAUDE.md.** The invariants live in `AGENTS.md`; `CLAUDE.md` is only a
+  symlink to it. D9's amendment now names the real file.
+
 ## Summary
 
 You can ask a model to tag one asset, a selection, or a whole library. The work runs in the
@@ -52,7 +66,7 @@ Nothing leaves the machine until you configure a provider, and only for runs you
 - **No settings storage, no secrets, no context menus.** There is no settings UI, no stored
   credentials, and no right-click menu anywhere in the app.
 - **Network.** The webview CSP allows only `ipc:` and `asset:`, so every model call must happen
-  in the Rust backend. CLAUDE.md states a **zero-telemetry** invariant; this feature adds the
+  in the Rust backend. `AGENTS.md` (which `CLAUDE.md` links to) states a **zero-telemetry** invariant; this feature adds the
   app's first outbound calls to third-party services.
 
 ## Decisions
@@ -70,7 +84,7 @@ D33 at plan review.
 | D6 | Applying existing-tag matches | Automatic in every mode, additive only: a run never removes a tag. |
 | D7 | Quitting the app | Runs persist in the DB and resume on the next launch, including pending proposals |
 | D8 | Where a run starts | "Auto-tag..." for the selection (toolbar button and grid right-click menu), "Suggest tags" in the detail panel's Tags tab, "Auto-tag library" on a sidebar library. Not on indexing. |
-| D9 | Zero-telemetry rule | Off until a provider is configured. Calls are made only for runs you start. CLAUDE.md is amended to name AI tagging as the one allowed outbound call. |
+| D9 | Zero-telemetry rule | Off until a provider is configured. Calls are made only for runs you start. `AGENTS.md` (the file `CLAUDE.md` links to) is amended to name AI tagging as the one allowed outbound call. |
 | D10 | Using the Claude plan | Rust spawns the installed `claude` CLI headless: thumbnail in as stream-json, JSON-schema result out |
 | D11 | API key vs Claude plan | One "Anthropic" provider with an **Access** setting: API key or Claude plan. The model picker applies to both. |
 | D12 | Parallelism | A shared limit per provider (default 4 requests in flight), handed out round-robin across active runs, adjustable in Settings. One asset per request. |
@@ -126,6 +140,15 @@ D33 at plan review.
     `"error":"model_not_found"`. The `result` line reads `"subtype":"success","is_error":true,`
     `"api_error_status":404,"terminal_reason":"api_error"`. So errors are detected from
     `is_error`, the assistant `error` token and `api_error_status`, never from `subtype` alone.
+  - **Inherited API key:** with `ANTHROPIC_API_KEY` in its environment, the CLI uses that key
+    instead of the claude.ai login:
+    - `claude auth status --json` switches to `authMethod: "api_key"` and
+      `apiKeySource: "ANTHROPIC_API_KEY"`;
+    - a headless run's `init` line reports `apiKeySource: "ANTHROPIC_API_KEY"`, and an invalid key
+      failed with `authentication_failed` (401);
+    - with an environment of only `HOME`, `PATH`, `USER` and `LANG`, the status stays
+      `authMethod: "claude.ai"`, and without a key the probed runs' `init` lines report
+      `apiKeySource: "none"`.
   - **Documented types** ([Agent SDK TypeScript reference](https://code.claude.com/docs/en/agent-sdk/typescript)):
     - `rate_limit_info.status` is `allowed`, `allowed_warning` or `rejected`. Optional fields are
       `resetsAt`, `utilization` and `errorCode: "credits_required"` (subscription usage exhausted).
@@ -144,7 +167,7 @@ D33 at plan review.
     fallback, and on Sonnet 5.5 it retries only `cyber` and `frontier_llm` declines
     ([refusals and fallback docs](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback)).
   - **Refusals:** a decline is an HTTP 200 with `stop_reason: "refusal"`.
-- **Policy.** Anthropic's Agent SDK docs say third-party developers may not offer claude.ai login or rate limits in their products. This app is personal and never handles the login: it only runs the owner's own installed `claude`. The Claude-plan access mode is for personal use and must be removed or disabled if the app is ever distributed. A code comment and CLAUDE.md say so.
+- **Policy.** Anthropic's Agent SDK docs say third-party developers may not offer claude.ai login or rate limits in their products. This app is personal and never handles the login: it only runs the owner's own installed `claude`. The Claude-plan access mode is for personal use and must be removed or disabled if the app is ever distributed. A code comment and `AGENTS.md` say so.
 - **Keyring.** This KDE session provides `org.freedesktop.secrets` (ksecretd).
 - **App data dir.** The master DB lives in `$XDG_DATA_HOME/com.opendam.desktop/`
   (`docs/agents/running-the-app.md`), so a throwaway `XDG_DATA_HOME` gives a fresh master DB.
@@ -196,10 +219,13 @@ stateDiagram-v2
   undo_partial --> undoing: finish undo
 ```
 
-Cancel stops the remaining items. Tags already applied stay. Proposals already collected still
-go to review (`awaiting_review`), where "Reject all" discards them. Undo is available once a run
-has stopped: `done`, `cancelled` or `awaiting_review` (which also rejects its pending
-proposals). A paused run is cancelled first. Undo runs as `undoing` and ends `undone`, or
+**Cancel** stops the remaining items, which become `skipped`, and the run stays `cancelled`.
+- Tags already applied stay.
+- Proposals already collected stay reviewable. The Runs panel keeps "Review (N)" on the cancelled
+  run, and applying or rejecting them leaves it `cancelled`.
+
+**Undo** is available once a run has stopped: `done`, `cancelled` or `awaiting_review`. It
+rejects any pending proposals first. A paused run is cancelled first. Undo runs as `undoing` and ends `undone`, or
 `undo_partial` when a library is offline (see [Undo](#undo-d23-and-offline-libraries)).
 
 ### Data model
@@ -334,11 +360,16 @@ Each failure falls into one of four classes:
 | Class | API key (HTTP) | Claude plan (CLI) | What happens |
 |---|---|---|---|
 | Retryable | 429, 529, 5xx, timeouts, connection errors | `rate_limit`, `overloaded`, `server_error`; `api_error_status` 429, 529 or 5xx; the process killed by the 120 s timeout | Backoff of 2s, 8s and 30s (honouring `retry-after` on HTTP); after the third try the item `failed` |
-| Fatal for the run | 401, 403, 404 (unknown model), no key | `authentication_failed`, `oauth_org_not_allowed`, `account_on_hold`, `billing_error`, `model_not_found`, `cloud_credential_error`; `claude` not on `PATH`; `claude auth status --json` reports `loggedIn: false` | The run `paused` with a readable `pause_reason`; the item goes back to `queued` |
+| Fatal for the run | 401, 403, 404 (unknown model), no key | `authentication_failed`, `oauth_org_not_allowed`, `account_on_hold`, `billing_error`, `model_not_found`, `cloud_credential_error`; `claude` not on `PATH`; `claude auth status --json` reports `loggedIn: false` or an `authMethod` other than `claude.ai`; the `init` line reports an `apiKeySource` other than `none` | The run `paused` with a readable `pause_reason`; the item goes back to `queued` |
 | Plan limit | - | `rate_limit_event` with `status: "rejected"` | The run `paused` with "Claude plan limit reached, resets at HH:MM" (from `resetsAt`), or "Claude plan usage exhausted" with `errorCode: "credits_required"`. `allowed_warning` never pauses: the Runs panel shows the utilization. |
 | Item-specific | 400, `stop_reason: "refusal"`, output that doesn't parse after one retry, asset gone | `invalid_request`, `max_output_tokens`, `unknown` or an unrecognized token, an error subtype such as `error_max_structured_output_retries`, an exit with no `result` line, no `structured_output` | The item `failed`, with the error stored |
 
-**Retry failed** re-queues `failed` items.
+**Retry failed** starts a new run over the run's `failed` assets:
+- It keeps the same provider, mode and options and is labelled "Retry of <label>".
+- The original run keeps its status and history, so no run leaves `done` or `cancelled` except
+  through undo, and each run undoes only its own tags.
+- It is offered on any run with failed items, except one that is `undoing`, `undo_partial` or
+  `undone`.
 
 ### Providers
 
@@ -349,7 +380,7 @@ with no `proposed` field.
 | Provider | Request | Notes |
 |---|---|---|
 | **Anthropic, API key** | `POST https://api.anthropic.com/v1/messages` with `x-api-key` and `anthropic-version: 2023-06-01` (`reqwest` + rustls). Body: model; small `max_tokens`; `output_config: { format: { type: "json_schema", schema }, effort: "low" }`; `system` = instructions + the catalog vocabulary, marked `cache_control: ephemeral`; user content = the image block + asset text + the run's pending proposals. | **Caching:** the volatile run vocabulary goes in the user message so the cached system prefix survives (D24). **Refusals:** on Sonnet 5.5 and Opus 5.5 only, send `fallbacks: "default"` with the `anthropic-beta: server-side-fallback-2026-07-01` header. Never send it on Haiku 5.5, which has no server-side fallback (see Facts). A final `stop_reason: "refusal"` fails the item. **Effort:** `low` is documented for all three models (see Facts). **Cost:** usage tokens are added to the run's totals and cost. |
-| **Anthropic, Claude plan** | Spawn `claude -p --input-format stream-json --output-format stream-json --verbose --json-schema <schema> --model <model> --tools "" --safe-mode --no-session-persistence --system-prompt <instructions + vocabulary>`, with the app data dir as cwd. Write one user message whose `message.content` holds the image block and the text (probed, see Facts), close stdin, read lines until the `result` line, then take `structured_output`. | **Rate limits and errors:** classified as in [Failures](#failures-d27). **Usage:** tokens are recorded; cost shows as "on your plan". **Settings:** shows the `claude` path, version and `claude auth status --json`. **Policy:** personal use only (see Facts). |
+| **Anthropic, Claude plan** | Spawn `claude -p --input-format stream-json --output-format stream-json --verbose --json-schema <schema> --model <model> --tools "" --safe-mode --no-session-persistence --system-prompt <instructions + vocabulary>`, with the app data dir as cwd and a **cleaned environment**. The child starts empty and gets only `HOME`, `PATH`, `USER`, `LANG`, and `TMPDIR` and `CLAUDE_CONFIG_DIR` when set, so no auth override reaches it (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_PROFILE`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY` or any other). Write one user message whose `message.content` holds the image block and the text (probed, see Facts), close stdin, read lines until the `result` line, then take `structured_output`. | **Billing guard:** the `init` line must report `apiKeySource: "none"`. Any other value kills the child and pauses the run with "Claude plan run would bill an API key (<source>)". **Rate limits and errors:** classified as in [Failures](#failures-d27). **Usage:** tokens are recorded; cost shows as "on your plan". **Settings:** shows the `claude` path and version, and runs `claude auth status --json` with the same cleaned environment. Claude-plan access counts as configured only with `loggedIn: true` and `authMethod: "claude.ai"`. **Policy:** personal use only (see Facts). |
 | **Jev** | `POST https://api.typesafe.ai/v1/systemone`, `Authorization: Bearer`, `model: "jev-latest"`. `state` = the asset text. One `noul` question per catalog tag ("This asset should be tagged '<path>'. <hint>"), with ids `q0..qN` mapped back to tag ids. | **Selection:** keep tags with `noul >= threshold` (0.7), highest first, at most 8 (D21). **Chunking:** questions are sent in chunks of 50 per request until the real limit is known. **Cost:** usage tokens priced at $0.04/M. |
 
 A `pricing.rs` table gives per-model input and output prices for the run-dialog estimate and the
@@ -362,7 +393,8 @@ expected output. Update the table when prices change.
   - **Anthropic:**
     - Access (API key / Claude plan).
     - An API key field: write-only, with Save and Clear and the key's source shown.
-    - The Claude plan status: `claude` found, version, logged in.
+    - The Claude plan status: `claude` found, version, and logged in with the claude.ai login
+      (checked in the same cleaned environment the runs use).
     - The model: Sonnet 5.5 by default, Opus 5.5, Haiku 5.5, or a custom id.
     - Concurrency.
     - Max tags and max proposals per asset.
@@ -399,7 +431,8 @@ expected output. Update the table when prices change.
   - label, provider/model, mode and status (with the pause reason);
   - progress and failed count;
   - tokens and cost (or "on your plan");
-  - actions: Pause/Resume, Cancel, Retry failed, Review (N), Undo or Finish undo, Clear.
+  - actions: Pause/Resume, Cancel, Retry failed, Review (N) (on `awaiting_review` runs and on
+    cancelled runs with pending proposals), Undo or Finish undo, Clear.
 
   The panel header has Resume all and Clear finished.
 
@@ -422,7 +455,7 @@ expected output. Update the table when prices change.
 - **Run commands:** `estimate_autotag_run`, `start_autotag_run` (asset ids, or a library id with
   `all_assets`; provider; mode; `inline`), `list_autotag_runs`, `get_autotag_run`,
   `pause_autotag_run`, `resume_autotag_run`, `resume_all_autotag_runs`, `cancel_autotag_run`,
-  `retry_failed_autotag_items`, `undo_autotag_run`, `clear_autotag_runs`.
+  `retry_failed_autotag_run` (returns the new run), `undo_autotag_run`, `clear_autotag_runs`.
 
 ### New dependencies
 
@@ -446,7 +479,7 @@ them. Release builds never include them.
 
 ### Docs
 
-- **CLAUDE.md:**
+- **`AGENTS.md`.** Edit this file directly. `CLAUDE.md` is a symlink to it and must stay one.
   - **Zero telemetry** becomes: "The app makes no network calls to analytics or tracking
     services. The only outbound calls are AI tagging requests to the provider you configured
     (the Anthropic API, your local `claude` CLI, or TypeSafe's Jev). They are made only for runs
@@ -487,7 +520,7 @@ Suggested slices for the ticket follow-up. Each one leaves the app working.
    skip, and HTTP failure classification with backoff.
 9. **Entry points and estimates.** The grid right-click menu, the sidebar "Auto-tag library"
    (untagged by default), and the run-dialog estimate.
-10. **Docs.** The CLAUDE.md amendments and the running-the-app notes for the throwaway profile.
+10. **Docs.** The `AGENTS.md` amendments and the running-the-app notes for the throwaway profile.
 
 Each slice registers, as workflow evidence, the tests and screenshots its rows in
 [Verification of acceptance checks](#verification-of-acceptance-checks) name.
@@ -504,8 +537,8 @@ Like Jev's question limit, these are confirmed before code depends on them:
     anything builds on it.
   - **Sources:** the field shapes come from the docs cited in Facts.
 - **Slice 4, Claude plan.**
-  - **Recorded fixtures:** rerun the three recorded probes (text, image, unknown model) with the
-    installed `claude` and commit their output lines as fixtures.
+  - **Recorded fixtures:** rerun the four recorded probes (text, image, unknown model, inherited
+    invalid API key) with the installed `claude` and commit their output lines as fixtures.
   - **Synthesized fixtures,** from the documented types:
     - `rate_limit_event` with `rejected`, with and without `credits_required`;
     - `rate_limit_event` with `allowed_warning`;
@@ -527,6 +560,9 @@ No test calls a live service. CI never needs a key.
   - **Create freely and review:**
     - Under parallel items, Create freely creates a tag once and mirrors it to every open library.
     - Review accept, rename, map, untick and reject.
+    - A cancelled run's pending proposals can be applied, and the run stays `cancelled`.
+    - Retry failed starts a new run over exactly the failed assets, and the original run's status
+      doesn't change.
   - **Undo** removes exactly the run's rows, plus the created tags no asset uses any more.
   - **Write protocol, crash points:**
     - **Points tested:** after the intent commit, after the library commit, and after a Create
@@ -550,7 +586,11 @@ No test calls a live service. CI never needs a key.
       - `model_not_found` and a logged-out CLI pause the run;
       - `rejected` pauses with the reset time, and `allowed_warning` doesn't pause;
       - `rate_limit` retries;
-      - `error_max_structured_output_retries` fails the item.
+      - `error_max_structured_output_retries` fails the item;
+      - the stub records its environment. With `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+        `CLAUDE_CODE_USE_BEDROCK` set for the app, none reaches the child, for runs or for the
+        auth-status call;
+      - an `init` fixture with `apiKeySource: "ANTHROPIC_API_KEY"` pauses the run.
     - Secrets: a sentinel key sits in the in-memory keyring and in the env. After a run, the master
       DB file, the captured `tracing` output and every emitted event payload are free of it.
     - Request-body builders: image block, cache marker, schema by mode.
@@ -581,6 +621,7 @@ No test calls a live service. CI never needs a key.
 - Selecting Jev allows only Existing only, and Jev requests carry no image.
 - Claude-plan runs make no HTTPS call from the app itself. They go through `claude`, and a
   logged-out CLI pauses the run with a message.
+- A Claude-plan run never bills an API key, even when `ANTHROPIC_API_KEY` is set for the app.
 - No API key is stored in any DB, log or event payload.
 
 ## Verification of acceptance checks
@@ -602,7 +643,7 @@ No test calls a live service. CI never needs a key.
 | Quit mid-run and relaunch: the run is paused, Resume finishes it, and pending proposals are still there | Rust: the restart test | Fake with a delay: the run paused with "app restarted" after a kill and relaunch, then finished after Resume | 3, 6 |
 | Undo restores the pre-run state, including after a crash, and stays `undo_partial` while a library is offline | Rust: the crash-point and offline-library tests above | The Runs panel after Undo, and `undo_partial` while the scratch library folder is moved away | 8 |
 | Jev allows only Existing only and sends no image | Rust: the Jev request builder has no image block. bun: `modeOptions` | Fake text-only selected in the run dialog, with two modes disabled and the reason shown | 5 |
-| Claude-plan runs make no HTTPS call from the app, and a logged-out CLI pauses the run | Rust: the CLI provider has no HTTP client. The stub `claude` fixtures cover logged out, `rejected` and errors | The Settings CLI status | 4 |
+| Claude-plan runs make no HTTPS call from the app, a logged-out CLI pauses the run, and no run bills an API key | Rust: the CLI provider has no HTTP client. The stub `claude` fixtures cover logged out, `rejected` and errors. The stub's recorded environment holds no auth override, and an `init` line with an API-key source pauses the run | The Settings CLI status, taken with `ANTHROPIC_API_KEY` set for the app and still showing the claude.ai login | 4 |
 | No API key in any DB, log or event | Rust: the sentinel-key test | - | 2, 3 |
 
 ## Manual steps for you
