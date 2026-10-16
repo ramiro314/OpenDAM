@@ -40,6 +40,13 @@ Revised a third time 2026-10-16 after the second GitHub Inspector round on PR #4
 - **Created tags can't come back from an offline mirror.** Undo deletes them only while every
   registered library is open. Otherwise the run stays `undo_partial`.
 
+Revised a fourth time 2026-10-16 after the third GitHub Inspector round on PR #43:
+- **The vocabulary never goes through argv.** Claude-plan runs pass it with
+  `--system-prompt-file`. Probed: a 515 KB file works, while Linux rejects any single argument
+  over 128 KiB.
+- **Clear keeps writes still waiting for replay.** Pending rows outlive a cleared run until
+  replay applies them, except for an `undo_partial` run, whose rows are meant to be removed.
+
 ## Summary
 
 You can ask a model to tag one asset, a selection, or a whole library. The work runs in the
@@ -157,6 +164,12 @@ D33 at plan review.
     - with an environment of only `HOME`, `PATH`, `USER` and `LANG`, the status stays
       `authMethod: "claude.ai"`, and without a key the probed runs' `init` lines report
       `apiKeySource: "none"`.
+  - **System prompt from a file:** `--system-prompt-file <path>` works with `-p`. The help text
+    names it only under `--bare`.
+    - **Large file:** a 514,761-byte vocabulary file (4,002 tags with hints) returned the right
+      tags with `apiKeySource: "none"`. It cost about 213k input tokens.
+    - **Argument limit:** Linux rejects any single argument over 131,072 bytes
+      (`MAX_ARG_STRLEN`). A 140,000-byte argument failed with `E2BIG`.
   - **Documented types** ([Agent SDK TypeScript reference](https://code.claude.com/docs/en/agent-sdk/typescript)):
     - `rate_limit_info.status` is `allowed`, `allowed_warning` or `rejected`. Optional fields are
       `resetsAt`, `utilization` and `errorCode: "credits_required"` (subscription usage exhausted).
@@ -253,7 +266,7 @@ master-wins mirror rules.
 | `tag_run_items` | `run_id, asset_id, library_id, status` (queued/running/done/failed/skipped), `attempts, error, result` (JSON), primary key `(run_id, asset_id)` | Per-asset work and outcome |
 | `tag_run_proposals` | `id, run_id, name, normalized_name, parent_id, status` (pending/accepted/rejected/mapped), `final_tag_id, created_tag` (bool) | New tag names, merged per run by `normalized_name` (D26) |
 | `tag_run_proposal_assets` | `proposal_id, asset_id, included` | Which assets each proposal is for; `included` drives the review's checkboxes |
-| `tag_run_applied` | `run_id, asset_id, library_id, tag_id, state` (pending/applied), primary key `(run_id, asset_id, tag_id)` | Every `asset_tags` row this run adds, recorded **before** the library write (see the write protocol), so undo removes exactly those (D23) |
+| `tag_run_applied` | `run_id, asset_id, library_id, tag_id, state` (pending/applied), primary key `(run_id, asset_id, tag_id)` | Every `asset_tags` row this run adds, recorded **before** the library write (see the write protocol), so undo removes exactly those (D23). `pending` rows can outlive a cleared run until replay applies them |
 
 `normalized_name` is the name lowercased and trimmed, with inner whitespace collapsed.
 Create freely records its tags as proposals with `status = accepted, created_tag = 1`, so undo
@@ -293,8 +306,14 @@ comes from ("from ANTHROPIC_API_KEY", "saved in keyring", "not set"), never the 
 - **Overlap (D13).** Creating a run leaves out assets that have a `queued` or `running` item in
   another run that is `queued`, `running` or `paused`. The response reports `queued` and
   `skipped` counts.
-- **Clear (D28)** deletes a run's rows when it is not `running`, `paused` or `undoing`. On an
-  `undo_partial` run it asks first, because the tags left in the offline library then stay.
+- **Clear (D28)** removes a run from the Runs panel. It isn't offered while the run is `running`,
+  `paused` or `undoing`.
+  - **`undo_partial` run:** Clear asks first, then deletes every row of the run, `pending` ones
+    included. The tags left in the offline library stay there, and its unapplied pairs are never
+    applied.
+  - **Any other run:** Clear deletes the run's rows except its `pending` `tag_run_applied` rows.
+    Those stay, without their run, until replay applies them, and replay then deletes them. A
+    cleared run's waiting writes still land when their library comes back.
 - **Events.** The engine emits `autotag:updated`, carrying the run summary and the asset ids
   whose tags changed, throttled to about 4 per second. The asset store re-fetches only the
   loaded assets that changed. The Runs panel and status bar subscribe instead of polling.
@@ -326,6 +345,7 @@ is replayed: steps 3 and 4, both idempotent. Rows for an offline library wait fo
 or 4 that fails during a run, such as a NAS lock timeout, also leaves its rows `pending` for
 replay. The item is never sent to the model again. Replay skips every row whose run is
 `undoing`, `undo_partial` or `undone`, because those rows are waiting to be removed, not applied.
+Rows whose run was cleared are replayed like any other, then deleted.
 
 **Why a crash can't escape undo.** Every pair the run might have written is recorded before the
 library sees it:
@@ -377,7 +397,7 @@ Each failure falls into one of four classes:
 | Class | API key (HTTP) | Claude plan (CLI) | What happens |
 |---|---|---|---|
 | Retryable | 429, 529, 5xx, timeouts, connection errors | `rate_limit`, `overloaded`, `server_error`; `api_error_status` 429, 529 or 5xx; the process killed by the 120 s timeout | Backoff of 2s, 8s and 30s (honouring `retry-after` on HTTP); after the third try the item `failed` |
-| Fatal for the run | 401, 403, 404 (unknown model), no key | `authentication_failed`, `oauth_org_not_allowed`, `account_on_hold`, `billing_error`, `model_not_found`, `cloud_credential_error`; `claude` not on `PATH`; `claude auth status --json` reports `loggedIn: false` or an `authMethod` other than `claude.ai`; the `init` line reports an `apiKeySource` other than `none` | The run `paused` with a readable `pause_reason`; the item goes back to `queued` |
+| Fatal for the run | 401, 403, 404 (unknown model), no key | `authentication_failed`, `oauth_org_not_allowed`, `account_on_hold`, `billing_error`, `model_not_found`, `cloud_credential_error`; `claude` not on `PATH` or failing to spawn (for example `E2BIG`); `claude auth status --json` reports `loggedIn: false` or an `authMethod` other than `claude.ai`; the `init` line reports an `apiKeySource` other than `none` | The run `paused` with a readable `pause_reason`; the item goes back to `queued` |
 | Plan limit | - | `rate_limit_event` with `status: "rejected"` | The run `paused` with "Claude plan limit reached, resets at HH:MM" (from `resetsAt`), or "Claude plan usage exhausted" with `errorCode: "credits_required"`. `allowed_warning` never pauses: the Runs panel shows the utilization. |
 | Item-specific | 400, `stop_reason: "refusal"`, output that doesn't parse after one retry, asset gone | `invalid_request`, `max_output_tokens`, `unknown` or an unrecognized token, an error subtype such as `error_max_structured_output_retries`, an exit with no `result` line, no `structured_output` | The item `failed`, with the error stored |
 
@@ -397,7 +417,7 @@ with no `proposed` field.
 | Provider | Request | Notes |
 |---|---|---|
 | **Anthropic, API key** | `POST https://api.anthropic.com/v1/messages` with `x-api-key` and `anthropic-version: 2023-06-01` (`reqwest` + rustls). Body: model; small `max_tokens`; `output_config: { format: { type: "json_schema", schema }, effort: "low" }`; `system` = instructions + the catalog vocabulary, marked `cache_control: ephemeral`; user content = the image block + asset text + the run's pending proposals. | **Caching:** the volatile run vocabulary goes in the user message so the cached system prefix survives (D24). **Refusals:** on Sonnet 5.5 and Opus 5.5 only, send `fallbacks: "default"` with the `anthropic-beta: server-side-fallback-2026-07-01` header. Never send it on Haiku 5.5, which has no server-side fallback (see Facts). A final `stop_reason: "refusal"` fails the item. **Effort:** `low` is documented for all three models (see Facts). **Cost:** usage tokens are added to the run's totals and cost. |
-| **Anthropic, Claude plan** | Spawn `claude -p --input-format stream-json --output-format stream-json --verbose --json-schema <schema> --model <model> --tools "" --safe-mode --no-session-persistence --system-prompt <instructions + vocabulary>`, with the app data dir as cwd and a **cleaned environment**. The child starts empty and gets only `HOME`, `PATH`, `USER`, `LANG`, and `TMPDIR` and `CLAUDE_CONFIG_DIR` when set, so no auth override reaches it (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_PROFILE`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY` or any other). Write one user message whose `message.content` holds the image block and the text (probed, see Facts), close stdin, read lines until the `result` line, then take `structured_output`. | **Billing guard:** the `init` line must report `apiKeySource: "none"`. Any other value kills the child and pauses the run with "Claude plan run would bill an API key (<source>)". **Rate limits and errors:** classified as in [Failures](#failures-d27). **Usage:** tokens are recorded; cost shows as "on your plan". **Settings:** shows the `claude` path and version, and runs `claude auth status --json` with the same cleaned environment. Claude-plan access counts as configured only with `loggedIn: true` and `authMethod: "claude.ai"`. **Policy:** personal use only (see Facts). |
+| **Anthropic, Claude plan** | Spawn `claude -p --input-format stream-json --output-format stream-json --verbose --json-schema <schema> --model <model> --tools "" --safe-mode --no-session-persistence --system-prompt-file <path>`, with the app data dir as cwd and a **cleaned environment**. **No large argument:** the instructions and catalog vocabulary go in a per-run file, `autotag/<run id>/system.txt` under the app data dir. It is rewritten when the catalog changes and deleted with the run, and never passed in argv. `--json-schema` stays a few hundred bytes because the schema never lists tag ids. The child starts empty and gets only `HOME`, `PATH`, `USER`, `LANG`, and `TMPDIR` and `CLAUDE_CONFIG_DIR` when set, so no auth override reaches it (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_PROFILE`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY` or any other). Write one user message whose `message.content` holds the image block, the asset text and the run's pending proposals, as on the API-key path (probed, see Facts). Close stdin, read lines until the `result` line, then take `structured_output`. | **Billing guard:** the `init` line must report `apiKeySource: "none"`. Any other value kills the child and pauses the run with "Claude plan run would bill an API key (<source>)". **Rate limits and errors:** classified as in [Failures](#failures-d27). **Usage:** tokens are recorded; cost shows as "on your plan". **Settings:** shows the `claude` path and version, and runs `claude auth status --json` with the same cleaned environment. Claude-plan access counts as configured only with `loggedIn: true` and `authMethod: "claude.ai"`. **Policy:** personal use only (see Facts). |
 | **Jev** | `POST https://api.typesafe.ai/v1/systemone`, `Authorization: Bearer`, `model: "jev-latest"`. `state` = the asset text. One `noul` question per catalog tag ("This asset should be tagged '<path>'. <hint>"), with ids `q0..qN` mapped back to tag ids. | **Selection:** keep tags with `noul >= threshold` (0.7), highest first, at most 8 (D21). **Chunking:** questions are sent in chunks of 50 per request until the real limit is known. **Cost:** usage tokens priced at $0.04/M. |
 
 A `pricing.rs` table gives per-model input and output prices for the run-dialog estimate and the
@@ -563,6 +583,8 @@ Like Jev's question limit, these are confirmed before code depends on them:
     - results carrying `authentication_failed`, `rate_limit`, `overloaded` and
       `error_max_structured_output_retries`.
   - **Replay:** a stub `claude` script on a test `PATH` replays each fixture.
+  - **`--system-prompt-file`:** confirm it with the installed `claude`. If a later CLI drops it,
+    move the vocabulary into the user message, which arrives on stdin and has no size limit.
 - **Slice 5, Jev.** Confirm the questions-per-request limit before relying on chunks of 50.
 
 ## Testing
@@ -601,6 +623,11 @@ No test calls a live service. CI never needs a key.
     - **Offline mirror:** a third registered library C is offline and holds none of the run's
       rows. The run stays `undo_partial` and keeps its created tags. Once C reopens, Finish undo
       deletes them from master and every mirror, and reopening C again doesn't bring them back.
+  - **Clear:**
+    - Clearing a `done` run that has a `pending` row for an offline library keeps that row.
+      Reopening the library applies the tag and deletes the row.
+    - Clearing an `undo_partial` run drops its `pending` rows, so reopening the library applies
+      nothing.
   - **Restart and failures:**
     - Restart turns `running` into `paused`.
     - Retryable failures retry 3 times and then fail the item; fatal failures pause the run.
@@ -616,7 +643,9 @@ No test calls a live service. CI never needs a key.
       - the stub records its environment. With `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
         `CLAUDE_CODE_USE_BEDROCK` set for the app, none reaches the child, for runs or for the
         auth-status call;
-      - an `init` fixture with `apiKeySource: "ANTHROPIC_API_KEY"` pauses the run.
+      - an `init` fixture with `apiKeySource: "ANTHROPIC_API_KEY"` pauses the run;
+      - a catalog of 5,000 tags with hints, whose vocabulary is over 128 KiB, still runs. The stub
+        reads the whole vocabulary from the file, and no argv element is over 4 KiB.
     - Secrets: a sentinel key sits in the in-memory keyring and in the env. After a run, the master
       DB file, the captured `tracing` output and every emitted event payload are free of it.
     - Request-body builders: image block, cache marker, schema by mode.
@@ -699,6 +728,8 @@ No test calls a live service. CI never needs a key.
 - **Jev's question limit per request is unverified.** Chunks of 50 are a guess, to confirm in
   slice 5.
 - **The pricing table is hardcoded** and goes stale when prices change.
+- **Large catalogs make every request large.** Each request carries the whole vocabulary: 4,000
+  tags with hints measured about 213k input tokens. Prompt caching softens repeat requests.
 - **Assets with no thumbnail yet** (models not rendered) are tagged from text only. Re-run them
   after previews finish for better tags.
 - **Claude-plan access is personal use only.** It must be removed or disabled before any
