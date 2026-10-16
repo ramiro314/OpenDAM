@@ -24,7 +24,7 @@ uv and cargo-nextest; uv pins Python from `packages/preview-engine/.python-versi
 | `make install` | `make build`, then installs `~/.local/bin/opendam`, a desktop entry, an icon and the preview engine under `~/.local/share/opendam/preview-engine` |
 | `make uninstall` | Removes exactly what `make install` created, never the master DB or a library's `.opendam/` |
 
-CI runs `make deps check lint build` and, in a separate job, the same bun test and nextest runs as `make test`, as separate steps so failed TypeScript test files are rerun once to tell flakes from failures (`.github/actions/mission-flake-report`, settings in `.mission/testing.json`). Formatting is enforced: run `bun run format`,
+CI runs `make deps check lint build` and, in a separate job, the same bun test and nextest runs as `make test`, as separate steps so failed TypeScript test files are rerun once to tell flakes from failures (`.github/actions/mission-flake-report`, settings in `.mission/testing.json`). Pull requests that change only Markdown, `docs/`, `.gitignore` or `LICENSE` skip both jobs, which still passes the required check. Formatting is enforced: run `bun run format`,
 `cargo fmt` (in `apps/desktop/src-tauri`) or `uv run ruff format` (in `packages/preview-engine`)
 before committing.
 
