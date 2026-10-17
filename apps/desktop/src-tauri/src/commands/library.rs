@@ -54,7 +54,7 @@ pub async fn add_library(
         .map_err(|e| e.to_string())?;
     allow_library_roots(&state.app_handle, &payload.root_paths);
     // Tag writes a run left waiting for this library land now
-    state.autotag.library_opened().await;
+    state.autotag.library_opened(&id).await;
 
     // Record in master database
     sqlx::query(

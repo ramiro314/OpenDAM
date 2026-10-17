@@ -192,11 +192,27 @@ pub async fn create_run(
         }
         tx.commit().await?;
     }
+    finish_creating(master, run.id).await
+}
+
+/// Ends `create_run`: the run becomes `running`, unless it was paused or cancelled while its
+/// items went in. A cancel that landed between batches skipped only the items already in, so
+/// the later ones are skipped here rather than left queued in a run nobody schedules.
+async fn finish_creating(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<()> {
+    let mut tx = master.begin().await?;
     sqlx::query("UPDATE tag_runs SET status = 'running' WHERE id = ? AND status = 'queued'")
-        .bind(run.id)
-        .execute(master)
+        .bind(run_id)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    sqlx::query(
+        "UPDATE tag_run_items SET status = 'skipped'
+         WHERE run_id = ?1 AND status = 'queued'
+           AND (SELECT status FROM tag_runs WHERE id = ?1) = 'cancelled'",
+    )
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
 }
 
 /// A claimed item, now `running`.
@@ -578,17 +594,24 @@ pub async fn apply_pairs(
     Ok(changed)
 }
 
-/// Replays every `pending` row whose library is open (steps 3 and 4, both idempotent). Rows of
-/// runs being undone are skipped: they wait to be removed, not applied. Rows for an offline
-/// library wait for it. Returns the assets whose tags changed.
-pub async fn replay_pending(db: &Database) -> sqlx::Result<Vec<String>> {
+/// Replays every `pending` row whose library is open (steps 3 and 4, both idempotent), or only
+/// those of `library` when given. Rows of runs being undone are skipped: they wait to be
+/// removed, not applied. Rows for an offline library wait for it. Returns the assets whose tags
+/// changed.
+///
+/// Replaying every library is safe only before any item runs: an item between its step 1 and
+/// step 3 has `pending` rows too, and replay claiming them first makes the item's own step 3
+/// delete them as someone else's pairs, leaving tags undo can't find. Once runs are going,
+/// replay only a library that just opened, which no item can be writing to yet.
+pub async fn replay_pending(db: &Database, library: Option<&str>) -> sqlx::Result<Vec<String>> {
     let rows: Vec<PendingPair> = sqlx::query_as(
         "SELECT a.run_id, a.asset_id, a.library_id, a.tag_id, (r.id IS NULL) AS run_cleared
          FROM tag_run_applied a LEFT JOIN tag_runs r ON r.id = a.run_id
-         WHERE a.state = 'pending'
+         WHERE a.state = 'pending' AND (?1 IS NULL OR a.library_id = ?1)
            AND (r.status IS NULL OR r.status NOT IN ('undoing', 'undo_partial', 'undone'))
          ORDER BY a.library_id, a.asset_id, a.tag_id",
     )
+    .bind(library)
     .fetch_all(&db.master_pool)
     .await?;
     let mut by_library: BTreeMap<String, Vec<PendingPair>> = BTreeMap::new();
@@ -665,7 +688,7 @@ mod tests {
         insert_pending(&db, "cleared-run", "a1", "lib", "t2").await;
         insert_pending(&db, "done-run", "a9", "offline-lib", "t1").await;
 
-        let changed = replay_pending(&db).await.unwrap();
+        let changed = replay_pending(&db, None).await.unwrap();
 
         assert_eq!(changed, ["a1"]);
         assert_eq!(
@@ -756,7 +779,7 @@ mod tests {
         insert_pending(&db, "run", "a1", "lib", "t-tree").await;
 
         for _ in 0..2 {
-            assert!(replay_pending(&db).await.unwrap().len() <= 1);
+            assert!(replay_pending(&db, None).await.unwrap().len() <= 1);
             assert_eq!(
                 asset_tags(&lib_pool).await,
                 [("a1".into(), "t-tree".into())],
@@ -771,6 +794,114 @@ mod tests {
                 "the colliding pair waits, on every replay"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn replaying_one_library_leaves_another_librarys_in_flight_item_its_rows() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        insert_asset(&a, "a1").await;
+        insert_asset(&b, "b1").await;
+        let db = memory_database(vec![
+            memory_library("a-lib", a.clone()),
+            memory_library("b-lib", b.clone()),
+        ])
+        .await;
+        insert_tag(&db.master_pool, "t1", "Rock").await;
+        insert_run(&db, "run", "running").await;
+        // a1's item has recorded its intent (step 1) and is about to write library A.
+        insert_pending(&db, "run", "a1", "a-lib", "t1").await;
+        // b1's write waited for library B, which just opened.
+        insert_pending(&db, "run", "b1", "b-lib", "t1").await;
+
+        let replayed = replay_pending(&db, Some("b-lib")).await.unwrap();
+
+        assert_eq!(replayed, ["b1"]);
+        assert!(
+            asset_tags(&a).await.is_empty(),
+            "library A is left to its item"
+        );
+        let lib = db.get_library_handle("a-lib").await.unwrap();
+        let in_flight: Vec<PendingPair> = sqlx::query_as(
+            "SELECT run_id, asset_id, library_id, tag_id, 0 AS run_cleared FROM tag_run_applied
+             WHERE asset_id = 'a1'",
+        )
+        .fetch_all(&db.master_pool)
+        .await
+        .unwrap();
+        let written = apply_pairs(&db, &lib, &in_flight, Applier::Item)
+            .await
+            .unwrap();
+
+        assert_eq!(written, ["a1"]);
+        assert_eq!(
+            applied_rows(&db).await,
+            [
+                ("a1".into(), "t1".into(), "applied".into()),
+                ("b1".into(), "t1".into(), "applied".into()),
+            ],
+            "the item keeps its row, so undo can still remove the tag"
+        );
+    }
+
+    async fn insert_item(db: &Database, run: &str, asset: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO tag_run_items (run_id, asset_id, library_id, status)
+             VALUES (?, ?, 'lib', ?)",
+        )
+        .bind(run)
+        .bind(asset)
+        .bind(status)
+        .execute(&db.master_pool)
+        .await
+        .unwrap();
+    }
+
+    async fn items_of(db: &Database, run: &str) -> Vec<String> {
+        sqlx::query_scalar("SELECT status FROM tag_run_items WHERE run_id = ? ORDER BY asset_id")
+            .bind(run)
+            .fetch_all(&db.master_pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_creation_skips_the_items_inserted_after_it() {
+        let db = memory_database(Vec::new()).await;
+        // Cancelled after its first batch went in: that batch is skipped, later ones queued.
+        insert_run(&db, "cancelled", "cancelled").await;
+        insert_item(&db, "cancelled", "a1", "skipped").await;
+        insert_item(&db, "cancelled", "a2", "queued").await;
+        insert_item(&db, "cancelled", "a3", "queued").await;
+        insert_run(&db, "paused", "paused").await;
+        insert_item(&db, "paused", "a1", "queued").await;
+        insert_run(&db, "fresh", "queued").await;
+        insert_item(&db, "fresh", "a1", "queued").await;
+
+        for run in ["cancelled", "paused", "fresh"] {
+            finish_creating(&db.master_pool, run).await.unwrap();
+        }
+
+        assert_eq!(items_of(&db, "cancelled").await, ["skipped"; 3]);
+        assert_eq!(
+            items_of(&db, "paused").await,
+            ["queued"],
+            "resume hands them out"
+        );
+        assert_eq!(items_of(&db, "fresh").await, ["queued"]);
+        let statuses: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, status FROM tag_runs ORDER BY id")
+                .fetch_all(&db.master_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            statuses,
+            [
+                ("cancelled".into(), "cancelled".into()),
+                ("fresh".into(), "running".into()),
+                ("paused".into(), "paused".into()),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -789,7 +920,7 @@ mod tests {
         insert_pending(&db, "run", "b1", "b-lib", "t1").await;
         broken.close().await;
 
-        let changed = replay_pending(&db).await.unwrap();
+        let changed = replay_pending(&db, None).await.unwrap();
 
         assert_eq!(changed, ["b1"]);
         assert_eq!(

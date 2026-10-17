@@ -157,7 +157,7 @@ impl Engine {
         if let Err(e) = store::recover_after_restart(&self.db.master_pool).await {
             tracing::error!("Could not pause the auto-tag runs of the last session: {e}");
         }
-        self.replay().await;
+        self.replay(None).await;
         self.events_wake.notify_one();
         for index in 0..self.pools.len() {
             self.pools[index].wake.notify_one();
@@ -166,14 +166,15 @@ impl Engine {
         tokio::spawn(self.clone().emit_events());
     }
 
-    /// Replays the writes waiting for a library that just opened. Libraries open at startup,
-    /// which `start` covers, and when one is added.
-    pub async fn library_opened(&self) {
-        self.replay().await;
+    /// Replays the writes waiting for `library_id`, which just opened. Libraries open at
+    /// startup, which `start` covers, and when one is added. Other libraries' pending rows are
+    /// left alone: items in flight may be about to write them.
+    pub async fn library_opened(&self, library_id: &str) {
+        self.replay(Some(library_id)).await;
     }
 
-    async fn replay(&self) {
-        match store::replay_pending(&self.db).await {
+    async fn replay(&self, library: Option<&str>) {
+        match store::replay_pending(&self.db, library).await {
             Ok(changed) => self.assets_changed(changed),
             Err(e) => tracing::error!("Could not replay pending auto-tag writes: {e}"),
         }
@@ -1606,7 +1607,7 @@ mod tests {
         // A restart, then the library opening, replay it.
         s.engine.fail_library_writes.store(false, Ordering::SeqCst);
         store::recover_after_restart(master).await.unwrap();
-        s.engine.library_opened().await;
+        s.engine.library_opened("lib").await;
 
         let tags: Vec<(String, String)> = sqlx::query_as("SELECT asset_id, tag_id FROM asset_tags")
             .fetch_all(&s.lib_pool)
