@@ -297,7 +297,7 @@ function repin(pinned: Map<string, Asset>, assets: Iterable<Asset>): Map<string,
 // `refresh` reads it, so it stays out of the state that components subscribe to.
 let viewTop = 0;
 
-// Consecutive failed refreshes, for their retry backoff; reset when one lands.
+// Consecutive failed refreshes, for their retry backoff; reset by a search or a refresh that lands.
 let refreshFailures = 0;
 
 /** Masks deleted assets until the refresh that follows a delete replaces the cache (C4). */
@@ -361,6 +361,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
   search: async () => {
     const { query } = get();
     const generation = get().generation + 1;
+    refreshFailures = 0;
     // The old results stay on screen until page 0 replaces them
     set({ generation, loading: true, pending: new Set() });
     try {
@@ -484,6 +485,9 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       // so try again, waiting longer after each failure, unless a newer search or refresh ran.
       console.error('Failed to refresh assets:', e);
       get().ensurePages(get().wanted);
+      // A query whose search failed (an FTS syntax error) fails every refresh the same way and
+      // has nothing cached to keep in place: only a new search or the next event tries again
+      if (get().searchError) return;
       refreshFailures += 1;
       setTimeout(() => {
         if (get().generation === generation) void get().refresh();

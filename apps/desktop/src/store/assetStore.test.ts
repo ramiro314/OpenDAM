@@ -568,6 +568,50 @@ describe('useAssetStore deleteAssets', () => {
     expect(s.deleted.size).toBe(0);
   });
 
+  test('a refresh of a query whose search failed is not retried', async () => {
+    let calls = 0;
+    api.searchAssets = async () => {
+      calls += 1;
+      throw 'fts5: syntax error near "."';
+    };
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+    await useAssetStore.getState().search();
+    await useAssetStore.getState().refresh(); // library:updated still tries once
+    await sleep(RETRY_MS * 2);
+    consoleError.mockRestore();
+
+    expect(calls).toBe(2);
+    expect(useAssetStore.getState().searchError).toBe('fts5: syntax error near "."');
+  });
+
+  test('a search resets the refresh backoff', async () => {
+    const all = library(10);
+    serve(() => all);
+    await useAssetStore.getState().search();
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+    let refreshes = 0;
+    api.searchAssets = async () => {
+      refreshes += 1;
+      throw 'database is locked';
+    };
+    // Three failures in a row: the next retry would wait retryDelay(4)
+    void useAssetStore.getState().refresh();
+    await until(() => refreshes === 3, retryDelay(1) + retryDelay(2) + 2_000);
+    serve(() => all);
+    await useAssetStore.getState().search();
+    api.searchAssets = async () => {
+      refreshes += 1;
+      throw 'database is locked';
+    };
+    const before = refreshes;
+    await useAssetStore.getState().refresh();
+    // Retried from the first step of the backoff, well before retryDelay(4)
+    await until(() => refreshes === before + 2, retryDelay(4) - 500);
+    consoleError.mockRestore();
+
+    expect(refreshes).toBe(before + 2);
+  });
+
   test('a failed refresh is not retried once a newer search ran', async () => {
     const all = library(10);
     serve(() => all);
