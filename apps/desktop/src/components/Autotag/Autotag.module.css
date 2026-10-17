@@ -57,6 +57,12 @@
   color: var(--color-warning);
 }
 
+.estimate {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
 .runs {
   display: flex;
   flex-direction: column;

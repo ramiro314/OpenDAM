@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::pricing::Estimate;
 use super::settings::AiSettings;
 use super::vocabulary::Vocabulary;
 
@@ -169,6 +170,15 @@ pub trait TagProvider: Send + Sync {
     /// a subprocess: call it off async workers.
     fn unavailable_reason(&self, access: Option<&str>) -> Option<String>;
     fn tag<'a>(&'a self, request: &'a TagRequest) -> TagFuture<'a>;
+    /// What a run of `assets` assets would use, for the run dialog (D22). `sample` is a
+    /// typical asset's request with the run's settings and the current catalog. Free unless a
+    /// provider says otherwise.
+    fn estimate(&self, _sample: &TagRequest, _assets: usize) -> Estimate {
+        Estimate::Cost {
+            usd: Some(0.0),
+            model: None,
+        }
+    }
     /// Drops what the provider keeps per run for every run in `ended`, which can't send a
     /// request any more.
     fn forget_runs(&self, _ended: &HashSet<String>) {}

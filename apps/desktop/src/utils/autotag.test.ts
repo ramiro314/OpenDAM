@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import type { AutotagProviderOption, ReviewProposal, RunSummary } from '../types';
+import type { AutotagProviderOption, ReviewProposal, RunEstimate, RunSummary } from '../types';
 import {
   autotagAvailability,
+  estimateSkips,
+  estimateSummary,
   formatCost,
   modeOptions,
   runActions,
@@ -426,5 +428,52 @@ describe('suggestionChips', () => {
   test('no proposals, no chips', () => {
     expect(suggestionChips([])).toEqual([]);
     expect(suggestionChips([{ run: run('done', 1, 1), error: null, proposals: [] }])).toEqual([]);
+  });
+});
+
+describe('estimateSummary', () => {
+  const estimate = (e: RunEstimate['estimate'], assets = 120): RunEstimate => ({
+    assets,
+    skipped: 0,
+    missing: 0,
+    estimate: e,
+  });
+
+  test('shows the asset count and the cost with an API key', () => {
+    expect(
+      estimateSummary(estimate({ kind: 'cost', usd: 0.4216, model: 'claude-sonnet-5-5' }))
+    ).toBe('120 assets · about $0.42');
+    expect(estimateSummary(estimate({ kind: 'cost', usd: 0.0021, model: 'jev-latest' }, 1))).toBe(
+      '1 asset · about $0.0021'
+    );
+  });
+
+  test('shows a request count on the Claude plan', () => {
+    expect(estimateSummary(estimate({ kind: 'requests', count: 1200 }, 1200))).toBe(
+      `${(1200).toLocaleString()} assets · ${(1200).toLocaleString()} requests on your Claude plan`
+    );
+    expect(estimateSummary(estimate({ kind: 'requests', count: 1 }, 1))).toBe(
+      '1 asset · 1 request on your Claude plan'
+    );
+  });
+
+  test('says when the model has no price', () => {
+    expect(estimateSummary(estimate({ kind: 'cost', usd: null, model: 'my-model' }))).toBe(
+      '120 assets · cost unknown: no price for my-model'
+    );
+  });
+});
+
+describe('estimateSkips', () => {
+  const skips = (skipped: number, missing: number) =>
+    estimateSkips({ assets: 5, skipped, missing, estimate: { kind: 'requests', count: 5 } });
+
+  test('names each reason an asset is left out', () => {
+    expect(skips(0, 0)).toEqual([]);
+    expect(skips(1, 0)).toEqual(['Skips 1 asset already queued in another run']);
+    expect(skips(12, 3)).toEqual([
+      'Skips 12 assets already queued in another run',
+      'Skips 3 assets not in an open library',
+    ]);
   });
 });

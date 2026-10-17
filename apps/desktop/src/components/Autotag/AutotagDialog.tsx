@@ -2,8 +2,8 @@ import { useEffect, useState } from 'react';
 import clsx from 'clsx';
 import { api } from '../../api';
 import { useAutotagStore } from '../../store';
-import type { AutotagMode, AutotagTarget } from '../../types';
-import { modeOptions, scopeFor } from '../../utils/autotag';
+import type { AutotagMode, AutotagTarget, RunEstimate } from '../../types';
+import { estimateSkips, estimateSummary, modeOptions, scopeFor } from '../../utils/autotag';
 import { IconTag, IconX } from '../Icons';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './Autotag.module.css';
@@ -15,7 +15,8 @@ interface AutotagDialogProps {
 
 /**
  * Picks a provider and a mode, then starts a background run over the target's assets: chosen
- * assets, or a library's untagged assets unless "All assets" is ticked.
+ * assets, or a library's untagged assets unless "All assets" is ticked. Before Start it shows
+ * the run's asset count, its estimated cost or Claude-plan requests, and the assets it skips.
  */
 export function AutotagDialog({ target, onClose }: AutotagDialogProps) {
   const providers = useAutotagStore((s) => s.providers);
@@ -27,6 +28,8 @@ export function AutotagDialog({ target, onClose }: AutotagDialogProps) {
   const [allAssets, setAllAssets] = useState(false);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [estimate, setEstimate] = useState<RunEstimate | null>(null);
+  const [estimateError, setEstimateError] = useState<string | null>(null);
 
   useEffect(() => {
     fetchProviders().catch((e) => setError(String(e)));
@@ -50,6 +53,22 @@ export function AutotagDialog({ target, onClose }: AutotagDialogProps) {
   const provider = providers?.find((p) => p.id === providerId) ?? null;
   const modes = modeOptions(provider);
   const modeAllowed = modes.some((m) => m.mode === mode && m.enabled);
+
+  const scopeKey = JSON.stringify(scopeFor(target, allAssets));
+  const estimateFor = provider && modeAllowed ? provider.id : null;
+  useEffect(() => {
+    setEstimate(null);
+    setEstimateError(null);
+    if (estimateFor === null) return;
+    let current = true;
+    api
+      .estimateAutotagRun(JSON.parse(scopeKey), estimateFor, mode)
+      .then((e) => current && setEstimate(e))
+      .catch((e) => current && setEstimateError(String(e)));
+    return () => {
+      current = false;
+    };
+  }, [scopeKey, estimateFor, mode]);
 
   const handleStart = async () => {
     if (!provider || !modeAllowed) return;
@@ -182,6 +201,26 @@ export function AutotagDialog({ target, onClose }: AutotagDialogProps) {
               </label>
             ))}
           </fieldset>
+
+          <h4 className={dialog.sectionTitle}>Estimate</h4>
+          <div id="autotag-estimate" className={styles.estimate}>
+            {estimate && (
+              <>
+                <span className={styles.choiceLabel}>{estimateSummary(estimate)}</span>
+                {estimateSkips(estimate).map((line) => (
+                  <span key={line} className={styles.choiceNote}>
+                    {line}
+                  </span>
+                ))}
+              </>
+            )}
+            {estimateError && <span className={styles.choiceReason}>{estimateError}</span>}
+            {!estimate && !estimateError && (
+              <span className={styles.choiceNote}>
+                {estimateFor === null ? 'Pick a provider and a mode' : 'Estimating…'}
+              </span>
+            )}
+          </div>
 
           {error && <p className={dialog.error}>{error}</p>}
         </div>

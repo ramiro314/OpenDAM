@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use super::anthropic::ConnectionTest;
 use super::credentials::{self, Credentials};
 use super::http::{self, classify_status, retry_after};
-use super::pricing::{self, TokenUsage};
+use super::pricing::{self, tokens_by_length, Estimate, RequestTokens, TokenUsage};
 use super::provider::{
     AssetInfo, ErrorClass, Mode, ProviderError, TagFuture, TagProvider, TagRequest, TagResult,
     Usage,
@@ -45,12 +45,6 @@ const QUESTION_OVERHEAD_TOKENS: usize = 8;
 const MAX_ANSWERED_CHUNKS: usize = 2_000;
 /// Used when Settings has no threshold for a run, as for runs started before it was recorded.
 const DEFAULT_THRESHOLD: f64 = 0.7;
-
-/// Tokens in `text`, overestimated: about three bytes per token, which holds for English and
-/// for the three-byte UTF-8 characters that tokenize one per token.
-fn estimate_tokens(text: &str) -> usize {
-    text.len().div_ceil(3)
-}
 
 /// One Jev request: its body and which tag each of its question ids asks about.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,7 +83,7 @@ fn question(tag: &VocabularyTag) -> String {
 /// a request gets one to itself.
 fn build_requests_within(request: &TagRequest, budget: usize) -> Vec<JevRequest> {
     let state = state(&request.asset);
-    let state_tokens = estimate_tokens(&state.to_string());
+    let state_tokens = tokens_by_length(&state.to_string());
     let mut requests = Vec::new();
     let mut questions = serde_json::Map::new();
     let mut ids = Vec::new();
@@ -109,7 +103,7 @@ fn build_requests_within(request: &TagRequest, budget: usize) -> Vec<JevRequest>
     };
     for (index, tag) in request.vocabulary.tags.iter().enumerate() {
         let instructions = question(tag);
-        let cost = estimate_tokens(&instructions) + QUESTION_OVERHEAD_TOKENS;
+        let cost = tokens_by_length(&instructions) + QUESTION_OVERHEAD_TOKENS;
         if ids.len() == MAX_QUESTIONS_PER_REQUEST || (!ids.is_empty() && tokens + cost > budget) {
             flush(&mut questions, &mut ids);
             tokens = state_tokens;
@@ -536,6 +530,22 @@ impl TagProvider for JevProvider {
         None
     }
 
+    /// Every request one asset needs, by length, at Jev's input-only rate.
+    fn estimate(&self, sample: &TagRequest, assets: usize) -> Estimate {
+        let own: usize = build_requests_within(sample, REQUEST_TOKEN_BUDGET)
+            .iter()
+            .map(|r| tokens_by_length(&r.body.to_string()))
+            .sum();
+        let tokens = RequestTokens {
+            own: own as i64,
+            ..Default::default()
+        };
+        Estimate::Cost {
+            usd: pricing::estimate_usd(MODEL, tokens, assets),
+            model: Some(MODEL.to_string()),
+        }
+    }
+
     fn tag<'a>(&'a self, request: &'a TagRequest) -> TagFuture<'a> {
         Box::pin(async move {
             let scores = self.score(request).await?;
@@ -706,11 +716,11 @@ mod tests {
             let questions = chunk.body["questions"].as_object().unwrap();
             assert_eq!(questions.len(), chunk.questions.len());
             assert_eq!(questions.len(), MAX_QUESTIONS_PER_REQUEST);
-            let estimate = estimate_tokens(&chunk.body["state"].to_string())
+            let estimate = tokens_by_length(&chunk.body["state"].to_string())
                 + questions
                     .values()
                     .map(|q| {
-                        estimate_tokens(q["instructions"].as_str().unwrap())
+                        tokens_by_length(q["instructions"].as_str().unwrap())
                             + QUESTION_OVERHEAD_TOKENS
                     })
                     .sum::<usize>();
@@ -734,9 +744,9 @@ mod tests {
     #[test]
     fn chunks_fill_up_to_the_budget_and_no_further() {
         let request = request_with(big_catalog(10), false);
-        let state = estimate_tokens(&state(&request.asset).to_string());
+        let state = tokens_by_length(&state(&request.asset).to_string());
         let per_question =
-            estimate_tokens(&question(&request.vocabulary.tags[0])) + QUESTION_OVERHEAD_TOKENS;
+            tokens_by_length(&question(&request.vocabulary.tags[0])) + QUESTION_OVERHEAD_TOKENS;
 
         let sizes = |budget: usize| -> Vec<usize> {
             build_requests_within(&request, budget)
@@ -1202,5 +1212,41 @@ mod tests {
         );
         let body: Value = serde_json::from_str(&api.received()[0].body).unwrap();
         assert_eq!(body["questions"].as_object().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn an_estimate_prices_every_chunk_of_questions_for_every_asset_at_jevs_rate() {
+        let jev = provider("http://unused", None);
+        let sample = request_with(big_catalog(120), false);
+        let chunks = build_requests(&sample);
+        assert!(chunks.len() >= 3, "{}", chunks.len());
+        let per_asset: usize = chunks
+            .iter()
+            .map(|c| tokens_by_length(&c.body.to_string()))
+            .sum();
+
+        let Estimate::Cost { usd, model } = jev.estimate(&sample, 10) else {
+            panic!("Jev bills per token");
+        };
+
+        assert_eq!(model.as_deref(), Some(MODEL));
+        let expected = 10.0 * per_asset as f64 * 0.042 / 1e6;
+        assert!(
+            (usd.unwrap() - expected).abs() < 1e-12,
+            "{usd:?} != {expected}"
+        );
+    }
+
+    #[test]
+    fn an_empty_catalog_costs_nothing_to_estimate() {
+        let jev = provider("http://unused", None);
+
+        assert_eq!(
+            jev.estimate(&request_with(Vocabulary::default(), false), 10),
+            Estimate::Cost {
+                usd: Some(0.0),
+                model: Some(MODEL.into())
+            }
+        );
     }
 }

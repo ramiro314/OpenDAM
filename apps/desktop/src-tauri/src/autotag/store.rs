@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS tag_run_items (
     PRIMARY KEY (run_id, asset_id)
 );
 CREATE INDEX IF NOT EXISTS idx_tag_run_items_status ON tag_run_items(run_id, status);
+CREATE INDEX IF NOT EXISTS idx_tag_run_items_asset ON tag_run_items(asset_id);
 CREATE TABLE IF NOT EXISTS tag_run_proposals (
     id              TEXT PRIMARY KEY,
     run_id          TEXT NOT NULL REFERENCES tag_runs(id) ON DELETE CASCADE,
@@ -201,6 +202,33 @@ pub async fn library_assets(lib: &Pool<Sqlite>, all_assets: bool) -> sqlx::Resul
     sqlx::query_scalar(sql).fetch_all(lib).await
 }
 
+/// The overlap rule (D13), over an item `o` joined to its run `r`: an item that is `queued` or
+/// `running`, in a run that is `queued`, `running` or `paused`, holds its asset. The run dialog's
+/// skip count and the insert-time recheck both use it.
+const HOLDS_ASSET: &str = "o.status IN ('queued', 'running')
+    AND r.status IN ('queued', 'running', 'paused')";
+
+/// The assets of `items` that another active run already has queued or in flight.
+pub async fn taken_elsewhere(
+    master: &Pool<Sqlite>,
+    items: &[(String, String)],
+) -> sqlx::Result<HashSet<String>> {
+    let mut taken = HashSet::new();
+    for chunk in items.chunks(BATCH) {
+        let sql = format!(
+            "SELECT DISTINCT o.asset_id FROM tag_run_items o JOIN tag_runs r ON r.id = o.run_id
+             WHERE o.asset_id IN ({}) AND {HOLDS_ASSET}",
+            vec!["?"; chunk.len()].join(", ")
+        );
+        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        for (asset_id, _) in chunk {
+            query = query.bind(asset_id);
+        }
+        taken.extend(query.fetch_all(master).await?);
+    }
+    Ok(taken)
+}
+
 pub struct NewRun<'a> {
     pub id: &'a str,
     pub label: &'a str,
@@ -213,14 +241,15 @@ pub struct NewRun<'a> {
     pub inline: bool,
 }
 
-/// Inserts the run and its queued items. The run is `queued` while its items go in, in batches,
-/// and `running` once they all have, so the scheduler never sees half a run. A run paused or
-/// cancelled meanwhile stays so.
+/// Inserts the run and its queued items, leaving out assets another active run has taken
+/// meanwhile (D13), and returns how many went in. The run is `queued` while its items go in,
+/// in batches, and `running` once they all have, so the scheduler never sees half a run. A run
+/// paused or cancelled meanwhile stays so.
 pub async fn create_run(
     master: &Pool<Sqlite>,
     run: NewRun<'_>,
     items: &[(String, String)],
-) -> sqlx::Result<()> {
+) -> sqlx::Result<usize> {
     sqlx::query(
         "INSERT INTO tag_runs (id, label, provider, access, model, mode, status, options,
                                inline, created_at)
@@ -237,21 +266,38 @@ pub async fn create_run(
     .bind(now_ms())
     .execute(master)
     .await?;
+    let sql = format!(
+        "INSERT INTO tag_run_items (run_id, asset_id, library_id)
+         SELECT ?2, ?1, ?3 WHERE NOT EXISTS (
+             SELECT 1 FROM tag_run_items o JOIN tag_runs r ON r.id = o.run_id
+             WHERE o.asset_id = ?1 AND r.id != ?2 AND {HOLDS_ASSET})"
+    );
+    let mut inserted = 0;
     for chunk in items.chunks(BATCH) {
         let mut tx = master.begin().await?;
         for (asset_id, library_id) in chunk {
-            sqlx::query(
-                "INSERT INTO tag_run_items (run_id, asset_id, library_id) VALUES (?, ?, ?)",
-            )
-            .bind(run.id)
-            .bind(asset_id)
-            .bind(library_id)
-            .execute(&mut *tx)
-            .await?;
+            inserted += sqlx::query(&sql)
+                .bind(asset_id)
+                .bind(run.id)
+                .bind(library_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected() as usize;
         }
         tx.commit().await?;
     }
-    finish_creating(master, run.id).await
+    finish_creating(master, run.id).await?;
+    Ok(inserted)
+}
+
+/// Deletes a run that ended up with no items, as when other runs took all of its assets while
+/// it was being created.
+pub async fn discard_run(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM tag_runs WHERE id = ?")
+        .bind(run_id)
+        .execute(master)
+        .await?;
+    Ok(())
 }
 
 /// Ends `create_run`: the run becomes `running`, unless it was paused or cancelled while its

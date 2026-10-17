@@ -1,5 +1,7 @@
-//! Per-model prices, in US dollars per million tokens, for the running cost of a run. Update
-//! the table when prices change: it is hardcoded and goes stale.
+//! Per-model prices, in US dollars per million tokens, for the running cost of a run and the
+//! run dialog's estimate. Update the table when prices change: it is hardcoded and goes stale.
+
+use serde::Serialize;
 
 /// What one request used, as the Messages API reports it. `input` is the uncached remainder.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -25,6 +27,10 @@ struct Price {
     cache_write: f64,
     cache_read: f64,
 }
+
+/// The shortest prompt prefix the current Claude models cache. A shorter one is billed in full
+/// on every request.
+const MIN_CACHED_PREFIX: i64 = 512;
 
 /// Claude Haiku 5.5 bills prompts over this many tokens at its long-prompt rates.
 const HAIKU_LONG_PROMPT: i64 = 100_000;
@@ -63,6 +69,68 @@ pub fn cost_usd(model: &str, usage: &TokenUsage) -> Option<f64> {
             + per_token(usage.cache_read, p.cache_read)
             + per_token(usage.output, p.output),
     )
+}
+
+/// Tokens in `text`, overestimated: about three bytes per token, which holds for English and
+/// for the three-byte UTF-8 characters that tokenize one per token.
+pub fn tokens_by_length(text: &str) -> usize {
+    text.len().div_ceil(3)
+}
+
+/// What a run would use, shown before it starts (D22).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Estimate {
+    /// Billed per token: about `usd`, or None for a model the table doesn't list.
+    #[serde(rename_all = "camelCase")]
+    Cost {
+        usd: Option<f64>,
+        model: Option<String>,
+    },
+    /// On the Claude plan: one request per asset, counted against the plan's limits.
+    Requests { count: usize },
+}
+
+/// One asset's request, by length: the prefix every request of the run shares (the cached
+/// system block), the rest of the prompt, and the expected output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestTokens {
+    pub shared: i64,
+    pub own: i64,
+    pub output: i64,
+}
+
+/// The cost of `requests` requests like `tokens` on `model`. A shared prefix long enough to
+/// cache is written once and read by every later request; a shorter one is billed in full each
+/// time. None for a model the table doesn't list.
+pub fn estimate_usd(model: &str, tokens: RequestTokens, requests: usize) -> Option<f64> {
+    let uncached = TokenUsage {
+        input: tokens.shared + tokens.own,
+        output: tokens.output,
+        ..Default::default()
+    };
+    let (first, rest) = if tokens.shared >= MIN_CACHED_PREFIX {
+        let first = TokenUsage {
+            input: tokens.own,
+            cache_write: tokens.shared,
+            cache_read: 0,
+            output: tokens.output,
+        };
+        let rest = TokenUsage {
+            cache_write: 0,
+            cache_read: tokens.shared,
+            ..first
+        };
+        (first, rest)
+    } else {
+        (uncached, uncached)
+    };
+    let first_cost = cost_usd(model, &first)?;
+    let rest_cost = cost_usd(model, &rest)?;
+    Some(match requests {
+        0 => 0.0,
+        n => first_cost + (n - 1) as f64 * rest_cost,
+    })
 }
 
 #[cfg(test)]
@@ -139,5 +207,53 @@ mod tests {
     #[test]
     fn a_model_missing_from_the_table_has_no_price() {
         assert_eq!(cost_usd("my-custom-model", &TokenUsage::default()), None);
+    }
+
+    #[test]
+    fn a_long_shared_prefix_is_written_once_then_read_from_the_cache() {
+        let tokens = RequestTokens {
+            shared: 10_000,
+            own: 400,
+            output: 200,
+        };
+
+        // Sonnet 5.5: the first request writes 10k at $2.50/M, the other 9 read it at $0.20/M;
+        // each pays 400 in at $2/M and 200 out at $10/M
+        let per_request = 400.0 * 2.0 / 1e6 + 200.0 * 10.0 / 1e6;
+        let expected = 10.0 * per_request + 10_000.0 * 2.5 / 1e6 + 9.0 * 10_000.0 * 0.2 / 1e6;
+        let cost = estimate_usd("claude-sonnet-5-5", tokens, 10).unwrap();
+        assert!(close(cost, expected), "{cost} != {expected}");
+    }
+
+    #[test]
+    fn a_shared_prefix_too_short_to_cache_is_billed_in_full_every_time() {
+        let tokens = RequestTokens {
+            shared: 511,
+            own: 489,
+            output: 100,
+        };
+
+        // 1,000 in at $2/M and 100 out at $10/M, three times
+        let cost = estimate_usd("claude-sonnet-5-5", tokens, 3).unwrap();
+        assert!(close(cost, 3.0 * (0.002 + 0.001)), "{cost}");
+    }
+
+    #[test]
+    fn no_requests_cost_nothing_and_an_unlisted_model_has_no_estimate() {
+        let tokens = RequestTokens {
+            shared: 1_000,
+            own: 100,
+            output: 100,
+        };
+
+        assert_eq!(estimate_usd("claude-haiku-5-5", tokens, 0), Some(0.0));
+        assert_eq!(estimate_usd("my-custom-model", tokens, 10), None);
+    }
+
+    #[test]
+    fn tokens_by_length_counts_three_bytes_per_token_rounded_up() {
+        assert_eq!(tokens_by_length(""), 0);
+        assert_eq!(tokens_by_length("rock"), 2);
+        assert_eq!(tokens_by_length("Nature > Rock"), 5);
     }
 }
