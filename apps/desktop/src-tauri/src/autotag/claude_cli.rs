@@ -1105,6 +1105,57 @@ exit 1
         );
     }
 
+    #[test]
+    fn without_an_error_token_the_api_status_of_the_result_line_decides() {
+        for (status, class) in [
+            (401, ErrorClass::Fatal),
+            (403, ErrorClass::Fatal),
+            (429, ErrorClass::Retryable),
+            (529, ErrorClass::Retryable),
+            (503, ErrorClass::Retryable),
+            (400, ErrorClass::Item),
+        ] {
+            let mut stream = Stream::default();
+            let line = json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": true,
+                "api_error_status": status,
+                "result": "API Error",
+            });
+            assert!(stream.read(&line.to_string()).is_none());
+
+            let error = stream
+                .outcome(&request(false), "claude-haiku-5-5", Some(1), "")
+                .unwrap_err();
+
+            assert_eq!(error.class, class, "{status}: {}", error.message);
+            assert!(
+                error.message.contains(&format!("(API error {status})")),
+                "{status}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn an_init_line_without_an_api_key_source_stops_the_child() {
+        let mut stream = Stream::default();
+
+        let error = stream
+            .read(r#"{"type":"system","subtype":"init","model":"claude-haiku-5-5"}"#)
+            .unwrap();
+
+        assert_eq!(error.class, ErrorClass::Fatal);
+        assert_eq!(
+            error.message,
+            "Claude plan run would bill an API key (unknown)"
+        );
+        assert!(stream
+            .read(r#"{"type":"system","subtype":"init","apiKeySource":"none"}"#)
+            .is_none());
+    }
+
     #[tokio::test]
     async fn no_auth_override_reaches_the_child_for_runs_or_for_auth_status() {
         let stub = Stub::new("text.jsonl", "auth_logged_in.json", 0.0);
