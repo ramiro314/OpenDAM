@@ -36,6 +36,24 @@ pub type CollectionRow = (
 /// A tag definition as stored: id, name, color, parent_id, description (the hint).
 pub type TagRow = (String, String, Option<String>, Option<String>, String);
 
+/// Inserts a new tag definition into the master catalog, on the caller's connection or inside
+/// its transaction. Every way a tag is created goes through here: the create-tag command, a
+/// review's apply and a Create freely run. Callers check the name and the parent first.
+pub async fn create_master_tag(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    name: &str,
+    parent_id: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO tags (id, name, parent_id) VALUES (?, ?, ?)")
+        .bind(id)
+        .bind(name)
+        .bind(parent_id)
+        .execute(conn)
+        .await
+        .map(|_| ())
+}
+
 /// Writes a tag definition to a mirror, updating an existing row in place. Never `REPLACE`:
 /// it deletes the old row first, and `ON DELETE CASCADE` would take the library's memberships.
 pub async fn upsert_tag<'e, E: sqlx::Executor<'e, Database = Sqlite>>(

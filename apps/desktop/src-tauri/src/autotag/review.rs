@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::store::{self, Applier, PendingPair, BATCH};
 use super::vocabulary::{clean_name, normalize_name};
-use crate::db::{resolve_path, upsert_tag, Database, LibraryHandle};
+use crate::db::{create_master_tag, resolve_path, Database, LibraryHandle};
 
 /// An asset a proposal is for, as the review shows it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -351,18 +351,28 @@ pub async fn apply(
     pairs.retain(|p| !present.contains(&(p.asset_id.clone(), p.tag_id.clone())));
 
     // Step 1.
-    let status = record_review(master, run_id, &new_tags, &resolved, &pairs)
-        .await
-        .map_err(|e| match e {
-            ReviewError::AlreadyReviewed => {
-                "A proposal was already reviewed, or isn't part of this run".to_string()
-            }
-            ReviewError::Db(e) => e.to_string(),
-        })?;
+    let (status, created) = record_review(
+        master,
+        &present,
+        run_id,
+        &new_tags,
+        &mut resolved,
+        &mut pairs,
+    )
+    .await
+    .map_err(|e| match e {
+        ReviewError::AlreadyReviewed => {
+            "A proposal was already reviewed, or isn't part of this run".to_string()
+        }
+        ReviewError::Db(e) => e.to_string(),
+    })?;
+    // A name mapped onto a catalog tag can repeat a pair: write it once.
+    pairs.sort();
+    pairs.dedup();
 
     // Step 2.
-    for (tag_id, _, _) in new_tags.values() {
-        mirror_tag(db, &open, tag_id).await;
+    for tag_id in &created {
+        store::mirror_tag(db, open.values(), tag_id).await;
     }
 
     // Steps 3 and 4.
@@ -389,7 +399,8 @@ pub async fn apply(
     })
 }
 
-/// The `(asset, tag)` pairs among `pairs` that their open library already has.
+/// Every `(asset, tag)` pair the open libraries hold for the assets of `pairs`, whatever the tag,
+/// so it also answers for a tag a pair is later remapped to (`record_review`).
 async fn present_pairs(
     open: &BTreeMap<String, LibraryHandle>,
     pairs: &[PendingPair],
@@ -433,24 +444,59 @@ impl From<sqlx::Error> for ReviewError {
     }
 }
 
-/// Write protocol step 1 for a review, in one master transaction. Returns the run's status.
+/// Write protocol step 1 for a review, in one master transaction. Returns the run's status and
+/// the tags it created.
+///
+/// `new_tags` maps each normalized name to create to its planned id, name and parent. The
+/// transaction takes the write lock before it reads the catalog, so a name the catalog gained
+/// since the review read it (a Create freely run made it, say) maps onto that tag instead: its
+/// decisions in `resolved` become `mapped` and its `pairs` take the tag's id. A remapped pair in
+/// `present` (every tag the pairs' assets held when the caller read their libraries) is dropped,
+/// so undo never removes a tag the review didn't add, even when its write waits for replay. No
+/// library is read here: the write lock on master is never held across library I/O. A parent
+/// deleted meanwhile is dropped.
 async fn record_review(
     master: &Pool<Sqlite>,
+    present: &HashSet<(String, String)>,
     run_id: &str,
     new_tags: &BTreeMap<String, (String, String, Option<String>)>,
-    resolved: &[Resolved],
-    pairs: &[PendingPair],
-) -> Result<String, ReviewError> {
-    let mut tx = master.begin().await?;
-    for (tag_id, name, parent_id) in new_tags.values() {
-        sqlx::query("INSERT INTO tags (id, name, parent_id) VALUES (?, ?, ?)")
-            .bind(tag_id)
-            .bind(name)
-            .bind(parent_id)
-            .execute(&mut *tx)
-            .await?;
+    resolved: &mut [Resolved],
+    pairs: &mut Vec<PendingPair>,
+) -> Result<(String, Vec<String>), ReviewError> {
+    let mut tx = master.begin_with("BEGIN IMMEDIATE").await?;
+    let catalog: Vec<(String, String)> = sqlx::query_as("SELECT id, name FROM tags")
+        .fetch_all(&mut *tx)
+        .await?;
+    let ids: HashSet<&str> = catalog.iter().map(|(id, _)| id.as_str()).collect();
+    let by_name: HashMap<String, &str> = catalog
+        .iter()
+        .map(|(id, name)| (normalize_name(name), id.as_str()))
+        .collect();
+    let mut existing: HashMap<&str, String> = HashMap::new();
+    let mut created = Vec::new();
+    for (normalized, (tag_id, name, parent_id)) in new_tags {
+        if let Some(id) = by_name.get(normalized) {
+            existing.insert(tag_id.as_str(), id.to_string());
+            continue;
+        }
+        let parent_id = parent_id.as_deref().filter(|p| ids.contains(p));
+        create_master_tag(&mut tx, tag_id, name, parent_id).await?;
+        created.push(tag_id.clone());
     }
-    for r in resolved {
+    for r in resolved.iter_mut() {
+        if let Some(id) = r.tag_id.as_deref().and_then(|t| existing.get(t)) {
+            r.tag_id = Some(id.clone());
+            r.status = "mapped";
+            r.created_tag = false;
+        }
+    }
+    for pair in pairs.iter_mut() {
+        if let Some(id) = existing.get(pair.tag_id.as_str()) {
+            pair.tag_id = id.clone();
+        }
+    }
+    pairs.retain(|p| !present.contains(&(p.asset_id.clone(), p.tag_id.clone())));
+    for r in resolved.iter() {
         // Only a pending proposal: a review applied meanwhile rolls this one back.
         let updated = sqlx::query(
             "UPDATE tag_run_proposals SET status = ?, final_tag_id = ?, created_tag = ?
@@ -499,31 +545,7 @@ async fn record_review(
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(status)
-}
-
-/// Write protocol step 2: a created tag, with its ancestors, into every open library's mirror.
-/// Idempotent, and `sync_open_libraries` repairs a mirror that misses it at the next open.
-async fn mirror_tag(db: &Database, open: &BTreeMap<String, LibraryHandle>, tag_id: &str) {
-    let chain = match db.tag_with_ancestors(tag_id).await {
-        Ok(chain) => chain,
-        Err(e) => {
-            tracing::warn!("Could not read created tag {tag_id} to mirror it: {e}");
-            return;
-        }
-    };
-    for lib in open.values() {
-        let mirror = async {
-            let mut tx = lib.pool.begin().await?;
-            for definition in &chain {
-                upsert_tag(&mut *tx, definition).await?;
-            }
-            tx.commit().await
-        };
-        if let Err(e) = mirror.await {
-            tracing::warn!("Failed to mirror tag {tag_id} to library {}: {e}", lib.id);
-        }
-    }
+    Ok((status, created))
 }
 
 #[cfg(test)]
@@ -1026,5 +1048,140 @@ mod tests {
         assert_eq!(lichens, [("Lichen".into(), None)]);
         assert_eq!(asset_tag_names(&s.a).await, [pair("a1", "Lichen")]);
         assert_eq!(asset_tag_names(&s.b).await, [pair("b1", "Lichen")]);
+    }
+
+    #[tokio::test]
+    async fn a_name_the_catalog_gains_before_the_review_writes_maps_onto_that_tag() {
+        let s = run_with_proposals("awaiting_review").await;
+        let master = &s.db.master_pool;
+        // Rock was planned as a new tag, then a Create freely run made "ROCK" before step 1.
+        let new_tags = BTreeMap::from([(
+            "rock".to_string(),
+            (
+                "t-planned".to_string(),
+                "Rock".to_string(),
+                Some("t-nature".to_string()),
+            ),
+        )]);
+        let mut resolved = [Resolved {
+            proposal_id: "p-rock".into(),
+            status: "accepted",
+            tag_id: Some("t-planned".into()),
+            created_tag: true,
+            ticked: vec!["a1".into()],
+        }];
+        let mut pairs = vec![PendingPair {
+            run_id: "run".into(),
+            asset_id: "a1".into(),
+            library_id: "a-lib".into(),
+            tag_id: "t-planned".into(),
+            run_cleared: false,
+        }];
+        insert_tag(master, "t-made", "ROCK").await;
+
+        let (_, created) = record_review(
+            master,
+            &present_pairs(&open_libraries(&s.db).await, &pairs)
+                .await
+                .unwrap(),
+            "run",
+            &new_tags,
+            &mut resolved,
+            &mut pairs,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the review failed"));
+
+        assert!(created.is_empty(), "nothing created: {created:?}");
+        let rocks: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM tags WHERE lower(name) = 'rock'")
+                .fetch_all(master)
+                .await
+                .unwrap();
+        assert_eq!(rocks, ["t-made"], "one tag for the name");
+        let proposal: (String, String, bool) = sqlx::query_as(
+            "SELECT status, final_tag_id, created_tag FROM tag_run_proposals WHERE id = 'p-rock'",
+        )
+        .fetch_one(master)
+        .await
+        .unwrap();
+        assert_eq!(proposal, ("mapped".into(), "t-made".into(), false));
+        let recorded: Vec<(String, String)> =
+            sqlx::query_as("SELECT asset_id, tag_id FROM tag_run_applied")
+                .fetch_all(master)
+                .await
+                .unwrap();
+        assert_eq!(recorded, [("a1".into(), "t-made".into())]);
+        assert_eq!(
+            pairs[0].tag_id, "t-made",
+            "steps 3 and 4 write the catalog tag"
+        );
+    }
+
+    async fn open_libraries(db: &Database) -> BTreeMap<String, LibraryHandle> {
+        db.get_all_libraries()
+            .await
+            .into_iter()
+            .map(|lib| (lib.id.clone(), lib))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_remapped_pair_the_library_already_has_is_not_recorded_as_the_reviews() {
+        let s = run_with_proposals("awaiting_review").await;
+        let master = &s.db.master_pool;
+        // A Create freely run made "ROCK" and applied it to a1 before the review read the
+        // libraries, then the review planned "Rock" as new from an older catalog read.
+        insert_tag(master, "t-made", "ROCK").await;
+        insert_tag(&s.a, "t-made", "ROCK").await;
+        sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES ('a1', 't-made')")
+            .execute(&s.a)
+            .await
+            .unwrap();
+        let new_tags = BTreeMap::from([(
+            "rock".to_string(),
+            ("t-planned".to_string(), "Rock".to_string(), None),
+        )]);
+        let mut resolved = [Resolved {
+            proposal_id: "p-rock".into(),
+            status: "accepted",
+            tag_id: Some("t-planned".into()),
+            created_tag: true,
+            ticked: vec!["a1".into(), "a2".into()],
+        }];
+        let pair = |asset: &str| PendingPair {
+            run_id: "run".into(),
+            asset_id: asset.into(),
+            library_id: "a-lib".into(),
+            tag_id: "t-planned".into(),
+            run_cleared: false,
+        };
+        let mut pairs = vec![pair("a1"), pair("a2")];
+
+        record_review(
+            master,
+            &present_pairs(&open_libraries(&s.db).await, &pairs)
+                .await
+                .unwrap(),
+            "run",
+            &new_tags,
+            &mut resolved,
+            &mut pairs,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the review failed"));
+
+        let recorded: Vec<(String, String)> =
+            sqlx::query_as("SELECT asset_id, tag_id FROM tag_run_applied")
+                .fetch_all(master)
+                .await
+                .unwrap();
+        assert_eq!(
+            recorded,
+            [("a2".into(), "t-made".into())],
+            "a1 already had the tag, so the review never owns that pair"
+        );
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].asset_id, "a2");
     }
 }

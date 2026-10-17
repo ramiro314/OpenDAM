@@ -143,11 +143,14 @@ describe('modeOptions', () => {
     expect(options[1].reason).toBe('Jev can only match existing tags, not propose new ones');
   });
 
-  test('a provider that can propose offers Prefer existing; Create freely is not built yet', () => {
+  test('a provider that can propose offers every mode, Create freely included', () => {
     const options = modeOptions(provider('fake', null));
 
-    expect(options.map((o) => o.enabled)).toEqual([true, true, false]);
-    expect(options[2].reason).toBe('Coming in a later update');
+    expect(options.map((o) => [o.mode, o.enabled, o.reason])).toEqual([
+      ['existing_only', true, null],
+      ['prefer_existing', true, null],
+      ['create_freely', true, null],
+    ]);
   });
 
   test('with no provider every mode is disabled', () => {
