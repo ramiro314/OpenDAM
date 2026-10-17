@@ -14,7 +14,6 @@ import {
   IconTag,
 } from '../Icons';
 import { SettingsDialog } from '../Settings/SettingsDialog';
-import { AutotagDialog } from '../Autotag/AutotagDialog';
 import { autotagAvailability } from '../../utils/autotag';
 import styles from './Toolbar.module.css';
 import clsx from 'clsx';
@@ -37,14 +36,14 @@ export function Toolbar() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const providers = useAutotagStore((s) => s.providers);
   const fetchProviders = useAutotagStore((s) => s.fetchProviders);
-  const [autotagAssetIds, setAutotagAssetIds] = useState<string[] | null>(null);
+  const openAutotagDialog = useAutotagStore((s) => s.openAutotagDialog);
   const [autotagReasonShown, setAutotagReasonShown] = useState(false);
   const autotag = autotagAvailability(providers, selectedAssetIds.size);
 
   // A disabled button shows no tooltip in every webview, so a click shows the reason instead.
   const handleAutotag = () => {
     if (autotag.enabled) {
-      setAutotagAssetIds(Array.from(selectedAssetIds));
+      openAutotagDialog({ kind: 'assets', assetIds: Array.from(selectedAssetIds) });
     } else {
       setAutotagReasonShown((shown) => !shown);
     }
@@ -281,9 +280,6 @@ export function Toolbar() {
             fetchProviders().catch(console.error);
           }}
         />
-      )}
-      {autotagAssetIds && (
-        <AutotagDialog assetIds={autotagAssetIds} onClose={() => setAutotagAssetIds(null)} />
       )}
     </header>
   );

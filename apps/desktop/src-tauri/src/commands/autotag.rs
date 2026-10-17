@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tauri::State;
 
-use crate::autotag::engine::{ProviderOption, StartedRun};
+use crate::autotag::engine::{ProviderOption, RunScope, StartedRun};
 use crate::autotag::provider::Mode;
 use crate::autotag::store::RunSummary;
 use crate::AppState;
@@ -20,15 +20,16 @@ pub async fn list_autotag_providers(
         .map_err(|e| e.to_string())
 }
 
-/// Starts a background run over `asset_ids`. Progress arrives as `autotag:updated` events.
+/// Starts a background run over chosen assets, or over a library's untagged assets (every
+/// asset with `allAssets`). Progress arrives as `autotag:updated` events.
 #[tauri::command]
 pub async fn start_autotag_run(
-    asset_ids: Vec<String>,
+    scope: RunScope,
     provider: String,
     mode: Mode,
     state: State<'_, Arc<AppState>>,
 ) -> Result<StartedRun> {
-    state.autotag.start_run(asset_ids, &provider, mode).await
+    state.autotag.start_run(scope, &provider, mode).await
 }
 
 /// Every run, newest first.

@@ -267,6 +267,16 @@ export interface RunSummary {
   finishedAt: number | null;
 }
 
+/** What a run covers: chosen assets, or a library's untagged assets (every asset with `allAssets`) */
+export type AutotagScope =
+  | { kind: 'assets'; assetIds: string[] }
+  | { kind: 'library'; libraryId: string; allAssets: boolean };
+
+/** What the run dialog was opened for: chosen assets, or a sidebar library */
+export type AutotagTarget =
+  | { kind: 'assets'; assetIds: string[] }
+  | { kind: 'library'; libraryId: string; libraryName: string };
+
 export interface StartedRun {
   run: RunSummary;
   queued: number;

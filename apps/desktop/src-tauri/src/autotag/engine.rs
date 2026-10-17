@@ -3,7 +3,7 @@
 //! to the UI as throttled `autotag:updated` events. Runs can be paused, resumed and cancelled,
 //! and provider failures are retried, pause the run or fail the item by their class.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -51,6 +51,24 @@ pub struct ProviderOption {
     pub modes: Vec<Mode>,
     /// Why no run can start with it, when none can.
     pub unavailable_reason: Option<String>,
+}
+
+/// What a run covers: chosen assets, or a library's untagged assets (every asset with
+/// `all_assets`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum RunScope {
+    Assets {
+        asset_ids: Vec<String>,
+    },
+    Library {
+        library_id: String,
+        all_assets: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -303,11 +321,11 @@ impl Engine {
         Ok(runs)
     }
 
-    /// Queues a run over `asset_ids`. Nothing is created, and nothing is sent, unless the
-    /// provider is set up and can do `mode`.
+    /// Queues a run over `scope`. Nothing is created, and nothing is sent, unless the provider
+    /// is set up and can do `mode`.
     pub async fn start_run(
         &self,
-        asset_ids: Vec<String>,
+        scope: RunScope,
         provider_id: &str,
         mode: Mode,
     ) -> Result<StartedRun, String> {
@@ -326,24 +344,60 @@ impl Engine {
         if mode != Mode::ExistingOnly {
             return Err("Only Existing only runs are available so far".into());
         }
-        if asset_ids.is_empty() {
-            return Err("No assets to tag".into());
-        }
 
-        let items = store::locate_assets(&self.db, &asset_ids)
-            .await
-            .map_err(|e| e.to_string())?;
-        if items.is_empty() {
-            return Err("None of these assets is in an open library".into());
-        }
+        let (items, requested, run_label) = match scope {
+            RunScope::Assets { asset_ids } => {
+                if asset_ids.is_empty() {
+                    return Err("No assets to tag".into());
+                }
+                let items = store::locate_assets(&self.db, &asset_ids)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if items.is_empty() {
+                    return Err("None of these assets is in an open library".into());
+                }
+                let run_label = match items.len() {
+                    1 => "1 asset".to_string(),
+                    n => format!("{n} assets"),
+                };
+                (items, asset_ids.len(), run_label)
+            }
+            RunScope::Library {
+                library_id,
+                all_assets,
+            } => {
+                let lib = self
+                    .db
+                    .get_library_handle(&library_id)
+                    .await
+                    .ok_or("This library is offline")?;
+                let asset_ids = store::library_assets(&lib.pool, all_assets)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if asset_ids.is_empty() {
+                    return Err(if all_assets {
+                        format!("{} has no assets", lib.name)
+                    } else {
+                        format!("Every asset in {} already has a tag", lib.name)
+                    });
+                }
+                let run_label = if all_assets {
+                    format!("{}: all assets", lib.name)
+                } else {
+                    format!("{}: untagged assets", lib.name)
+                };
+                let n = asset_ids.len();
+                let items = asset_ids
+                    .into_iter()
+                    .map(|id| (id, lib.id.clone()))
+                    .collect();
+                (items, n, run_label)
+            }
+        };
         let settings = settings::load(&self.db.master_pool)
             .await
             .map_err(|e| e.to_string())?;
         let id = uuid::Uuid::new_v4().to_string();
-        let run_label = match items.len() {
-            1 => "1 asset".to_string(),
-            n => format!("{n} assets"),
-        };
         store::create_run(
             &self.db.master_pool,
             NewRun {
@@ -372,7 +426,7 @@ impl Engine {
         Ok(StartedRun {
             run,
             queued: items.len(),
-            skipped: asset_ids.len() - items.len(),
+            skipped: requested - items.len(),
         })
     }
 
@@ -782,6 +836,12 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    fn scope(names: &[&str]) -> RunScope {
+        RunScope::Assets {
+            asset_ids: ids(names),
+        }
+    }
+
     fn failures(errors: Vec<ProviderError>) -> Mutex<VecDeque<ProviderError>> {
         Mutex::new(errors.into())
     }
@@ -839,7 +899,7 @@ mod tests {
 
         s.engine.start().await;
         s.engine
-            .start_run(ids(&["a1"]), "recording", Mode::ExistingOnly)
+            .start_run(scope(&["a1"]), "recording", Mode::ExistingOnly)
             .await
             .unwrap();
         let runs = wait_until_done(&s.engine).await;
@@ -884,12 +944,12 @@ mod tests {
         .unwrap();
         let first = s
             .engine
-            .start_run(ids(&assets[..4]), "recording", Mode::ExistingOnly)
+            .start_run(scope(&assets[..4]), "recording", Mode::ExistingOnly)
             .await
             .unwrap();
         let second = s
             .engine
-            .start_run(ids(&assets[4..]), "recording", Mode::ExistingOnly)
+            .start_run(scope(&assets[4..]), "recording", Mode::ExistingOnly)
             .await
             .unwrap();
 
@@ -925,7 +985,7 @@ mod tests {
 
         let error = s
             .engine
-            .start_run(ids(&["a1"]), "recording", Mode::ExistingOnly)
+            .start_run(scope(&["a1"]), "recording", Mode::ExistingOnly)
             .await
             .unwrap_err();
 
@@ -941,11 +1001,123 @@ mod tests {
 
         let error = s
             .engine
-            .start_run(ids(&["a1"]), "recording", Mode::PreferExisting)
+            .start_run(scope(&["a1"]), "recording", Mode::PreferExisting)
             .await
             .unwrap_err();
 
         assert!(error.contains("Existing only"), "{error}");
+        assert!(s.engine.list_runs().await.unwrap().is_empty());
+    }
+
+    async fn items_of(engine: &Engine, run_id: &str) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT asset_id, library_id FROM tag_run_items WHERE run_id = ? ORDER BY asset_id",
+        )
+        .bind(run_id)
+        .fetch_all(&engine.db.master_pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_library_run_covers_its_untagged_assets_or_every_asset_with_all_assets() {
+        let lib_pool = memory_library_pool().await;
+        for id in ["a3", "a1", "a2"] {
+            insert_asset(&lib_pool, id).await;
+        }
+        insert_tag(&lib_pool, "t-rock", "Rock").await;
+        sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES ('a2', 't-rock')")
+            .execute(&lib_pool)
+            .await
+            .unwrap();
+        let other = memory_library_pool().await;
+        insert_asset(&other, "b1").await;
+        let db = memory_database(vec![
+            memory_library("lib", lib_pool),
+            memory_library("other", other),
+        ])
+        .await;
+        let engine = Engine::new(
+            Arc::new(db),
+            vec![Arc::new(Recording::default())],
+            Arc::new(|_| {}),
+        );
+        let library = |all_assets| RunScope::Library {
+            library_id: "lib".into(),
+            all_assets,
+        };
+
+        let untagged = engine
+            .start_run(library(false), "recording", Mode::ExistingOnly)
+            .await
+            .unwrap();
+        let all = engine
+            .start_run(library(true), "recording", Mode::ExistingOnly)
+            .await
+            .unwrap();
+
+        let pair = |id: &str| (id.to_string(), "lib".to_string());
+        assert_eq!(
+            items_of(&engine, &untagged.run.id).await,
+            [pair("a1"), pair("a3")]
+        );
+        assert_eq!((untagged.queued, untagged.skipped), (2, 0));
+        assert_eq!(untagged.run.label, "lib: untagged assets");
+        assert_eq!(
+            items_of(&engine, &all.run.id).await,
+            [pair("a1"), pair("a2"), pair("a3")]
+        );
+        assert_eq!(all.run.label, "lib: all assets");
+    }
+
+    #[tokio::test]
+    async fn a_library_run_with_nothing_to_tag_is_refused() {
+        let s = setup(Recording::default(), &["a1"]).await;
+        insert_tag(&s.lib_pool, "t-rock", "Rock").await;
+        sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES ('a1', 't-rock')")
+            .execute(&s.lib_pool)
+            .await
+            .unwrap();
+        let start = |library_id: &str| {
+            s.engine.start_run(
+                RunScope::Library {
+                    library_id: library_id.into(),
+                    all_assets: false,
+                },
+                "recording",
+                Mode::ExistingOnly,
+            )
+        };
+
+        assert_eq!(
+            start("lib").await.unwrap_err(),
+            "Every asset in lib already has a tag"
+        );
+        assert_eq!(
+            start("offline").await.unwrap_err(),
+            "This library is offline"
+        );
+        assert!(s.engine.list_runs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_all_assets_run_on_an_empty_library_is_refused() {
+        let s = setup(Recording::default(), &[]).await;
+
+        let error = s
+            .engine
+            .start_run(
+                RunScope::Library {
+                    library_id: "lib".into(),
+                    all_assets: true,
+                },
+                "recording",
+                Mode::ExistingOnly,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "lib has no assets");
         assert!(s.engine.list_runs().await.unwrap().is_empty());
     }
 
@@ -955,7 +1127,7 @@ mod tests {
         let started = s
             .engine
             .start_run(
-                ids(&["a1", "a2", "nowhere"]),
+                scope(&["a1", "a2", "nowhere"]),
                 "recording",
                 Mode::ExistingOnly,
             )
@@ -999,7 +1171,7 @@ mod tests {
         s.engine.start().await;
 
         s.engine
-            .start_run(ids(&["a1"]), "recording", Mode::ExistingOnly)
+            .start_run(scope(&["a1"]), "recording", Mode::ExistingOnly)
             .await
             .unwrap();
         let runs = wait_until_done(&s.engine).await;
@@ -1048,7 +1220,7 @@ mod tests {
         s.engine.start().await;
 
         s.engine
-            .start_run(ids(&["a1"]), "recording", Mode::ExistingOnly)
+            .start_run(scope(&["a1"]), "recording", Mode::ExistingOnly)
             .await
             .unwrap();
         let runs = wait_until_done(&s.engine).await;
@@ -1104,7 +1276,7 @@ mod tests {
 
         let started = s
             .engine
-            .start_run(ids(&["a1", "a2"]), "recording", Mode::ExistingOnly)
+            .start_run(scope(&["a1", "a2"]), "recording", Mode::ExistingOnly)
             .await
             .unwrap();
         let runs = wait_for(&s.engine, |runs| {
@@ -1150,7 +1322,7 @@ mod tests {
         s.engine.start().await;
 
         s.engine
-            .start_run(ids(&["a1", "a2"]), "recording", Mode::ExistingOnly)
+            .start_run(scope(&["a1", "a2"]), "recording", Mode::ExistingOnly)
             .await
             .unwrap();
         let runs = wait_until_done(&s.engine).await;
@@ -1184,7 +1356,11 @@ mod tests {
         s.engine.start().await;
         let started = s
             .engine
-            .start_run(assets, "recording", Mode::ExistingOnly)
+            .start_run(
+                RunScope::Assets { asset_ids: assets },
+                "recording",
+                Mode::ExistingOnly,
+            )
             .await
             .unwrap();
         wait_for(&s.engine, |runs| runs[0].done >= 1).await;
@@ -1292,7 +1468,7 @@ mod tests {
         s.engine.start().await;
         let started = s
             .engine
-            .start_run(ids(&["a1"]), "recording", Mode::ExistingOnly)
+            .start_run(scope(&["a1"]), "recording", Mode::ExistingOnly)
             .await
             .unwrap();
         for _ in 0..100 {
@@ -1513,7 +1689,7 @@ mod tests {
         );
         first.start().await;
         let started = first
-            .start_run(ids(&assets), "recording", Mode::ExistingOnly)
+            .start_run(scope(&assets), "recording", Mode::ExistingOnly)
             .await
             .unwrap();
         wait_for(&first, |runs| runs[0].running == 2).await;
@@ -1594,7 +1770,7 @@ mod tests {
         s.engine.start().await;
 
         s.engine
-            .start_run(ids(&["a1"]), "recording", Mode::ExistingOnly)
+            .start_run(scope(&["a1"]), "recording", Mode::ExistingOnly)
             .await
             .unwrap();
         let runs = wait_until_done(&s.engine).await;
@@ -1658,7 +1834,13 @@ mod tests {
 
         let started = std::time::Instant::now();
         s.engine
-            .start_run(assets.clone(), "recording", Mode::ExistingOnly)
+            .start_run(
+                RunScope::Assets {
+                    asset_ids: assets.clone(),
+                },
+                "recording",
+                Mode::ExistingOnly,
+            )
             .await
             .unwrap();
         wait_until_done(&s.engine).await;
@@ -1671,6 +1853,21 @@ mod tests {
         assert!(sent >= 1 && sent <= allowed, "{sent} events in {elapsed:?}");
         assert!(sent < 40, "{sent} events for 40 items");
         assert_eq!(s.updates.lock().unwrap().last().unwrap().runs[0].done, 40);
+    }
+
+    #[test]
+    fn the_run_scope_reads_the_shape_the_frontend_sends() {
+        let assets: RunScope =
+            serde_json::from_str(r#"{"kind":"assets","assetIds":["a1"]}"#).unwrap();
+        let library: RunScope =
+            serde_json::from_str(r#"{"kind":"library","libraryId":"lib","allAssets":true}"#)
+                .unwrap();
+
+        assert!(matches!(assets, RunScope::Assets { asset_ids } if asset_ids == ["a1"]));
+        assert!(matches!(
+            library,
+            RunScope::Library { library_id, all_assets: true } if library_id == "lib"
+        ));
     }
 
     #[test]
