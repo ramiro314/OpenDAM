@@ -1538,9 +1538,18 @@ mod tests {
 
         for run in &runs {
             assert_eq!(run.status, "paused", "{run:?}");
-            assert_eq!(run.pause_reason.as_deref(), Some(store::APP_RESTARTED));
         }
         let run = runs.iter().find(|r| r.id == started.run.id).unwrap();
+        assert_eq!(run.pause_reason.as_deref(), Some(store::APP_RESTARTED));
+        let half_made = runs.iter().find(|r| r.id == "half-made").unwrap();
+        assert_eq!(
+            half_made.pause_reason.as_deref(),
+            Some(
+                "app restarted while the run was starting: it holds only 0 assets, \
+                 and any others were never added"
+            ),
+            "a run cut off while its items went in says it may be incomplete"
+        );
         assert_eq!((run.running, run.queued), (0, 4));
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(provider.calls.lock().unwrap().is_empty());

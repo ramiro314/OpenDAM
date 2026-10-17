@@ -296,19 +296,35 @@ pub async fn finish_run_if_complete(master: &Pool<Sqlite>, run_id: &str) -> sqlx
 
 /// The `pause_reason` of every run a previous session left unfinished.
 pub const APP_RESTARTED: &str = "app restarted";
+/// How the `pause_reason` of a run a previous session left half-created begins.
+pub const APP_RESTARTED_WHILE_STARTING: &str = "app restarted while the run was starting";
 
 /// At startup, in one transaction: every `queued` or `running` run becomes `paused` with "app
 /// restarted", and every item left `running` goes back to the queue, or is `skipped` when its
 /// run was cancelled while the item was in flight.
+///
+/// A run still `queued` was being created, its items going in by batches, so it may hold only
+/// some of the assets asked for. Its reason says so and how many it holds, so Resume finishing
+/// it never passes for the whole run.
 pub async fn recover_after_restart(master: &Pool<Sqlite>) -> sqlx::Result<()> {
     let mut tx = master.begin().await?;
     sqlx::query(
-        "UPDATE tag_runs SET status = 'paused', pause_reason = ?
-         WHERE status IN ('queued', 'running')",
+        "UPDATE tag_runs
+         SET status = 'paused',
+             pause_reason = ?1 || ': it holds only ' || n || CASE n WHEN 1 THEN ' asset' ELSE ' assets' END
+                            || ', and any others were never added'
+         FROM (SELECT r.id AS run_id, COUNT(i.asset_id) AS n
+               FROM tag_runs r LEFT JOIN tag_run_items i ON i.run_id = r.id
+               WHERE r.status = 'queued' GROUP BY r.id) AS counts
+         WHERE tag_runs.id = counts.run_id",
     )
-    .bind(APP_RESTARTED)
+    .bind(APP_RESTARTED_WHILE_STARTING)
     .execute(&mut *tx)
     .await?;
+    sqlx::query("UPDATE tag_runs SET status = 'paused', pause_reason = ? WHERE status = 'running'")
+        .bind(APP_RESTARTED)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "UPDATE tag_run_items
          SET status = CASE WHEN (SELECT status FROM tag_runs WHERE id = run_id) = 'cancelled'
@@ -713,12 +729,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_skips_the_in_flight_items_of_a_cancelled_run() {
+    async fn restart_skips_a_cancelled_runs_in_flight_items_and_flags_half_made_runs() {
         let db = memory_database(Vec::new()).await;
         let master = &db.master_pool;
         insert_run(&db, "cancelled-run", "cancelled").await;
         insert_run(&db, "running-run", "running").await;
-        for run in ["cancelled-run", "running-run"] {
+        insert_run(&db, "half-made-run", "queued").await;
+        for run in ["cancelled-run", "half-made-run", "running-run"] {
             sqlx::query(
                 "INSERT INTO tag_run_items (run_id, asset_id, library_id, status)
                  VALUES (?, 'a1', 'lib', 'running')",
@@ -746,6 +763,16 @@ mod tests {
                     "cancelled".into(),
                     None,
                     "skipped".into()
+                ),
+                (
+                    "half-made-run".into(),
+                    "paused".into(),
+                    Some(
+                        "app restarted while the run was starting: it holds only 1 asset, \
+                         and any others were never added"
+                            .into()
+                    ),
+                    "queued".into()
                 ),
                 (
                     "running-run".into(),
