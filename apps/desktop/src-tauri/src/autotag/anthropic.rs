@@ -10,13 +10,14 @@
 //!   5.5 has none. A refusal that still comes back fails the item.
 
 use base64::Engine as _;
-use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::credentials::{self, Credentials};
+use super::http::{self, classify_status, retry_after};
 use super::pricing::{self, TokenUsage};
 use super::provider::{
     AssetInfo, ErrorClass, Mode, ProposedTag, ProviderError, TagFuture, TagProvider, TagRequest,
@@ -31,8 +32,6 @@ const API_VERSION: &str = "2023-06-01";
 pub const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 /// Room for low-effort thinking plus the answer, which is about 100 tokens.
 const MAX_TOKENS: u32 = 2048;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Models with a server-side refusal fallback. Haiku 5.5 has none, and a custom id may not.
 fn supports_fallback(model: &str) -> bool {
@@ -354,28 +353,6 @@ pub fn parse_response(
     })
 }
 
-/// The plan's failure class for an HTTP error status.
-pub fn classify_status(status: u16) -> ErrorClass {
-    match status {
-        408 | 429 | 500..=599 => ErrorClass::Retryable,
-        401..=404 => ErrorClass::Fatal,
-        _ => ErrorClass::Item,
-    }
-}
-
-/// `retry-after` in seconds, as the Anthropic API sends it.
-fn retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let seconds: f64 = headers
-        .get(RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    // Negative, NaN, infinite or too long for a Duration: ignored like any other garbage
-    Duration::try_from_secs_f64(seconds).ok()
-}
-
 #[derive(Debug, Deserialize)]
 struct ErrorBody {
     error: ErrorDetail,
@@ -483,6 +460,7 @@ pub fn test_request(model: &str) -> TagRequest {
         model: Some(model.to_string()),
         max_tags: 8,
         max_proposals: 0,
+        threshold: None,
         asset: AssetInfo {
             file_name: "test-image.png".into(),
             relative_path: "connection-test/test-image.png".into(),
@@ -515,17 +493,10 @@ impl AnthropicProvider {
     }
 
     pub fn with_base_url(credentials: Arc<Credentials>, base_url: String) -> Self {
-        // reqwest's rustls needs a process-wide provider; installing it twice is harmless
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(|e| format!("Could not set up HTTPS: {e}"));
         Self {
             credentials,
             base_url: base_url.trim_end_matches('/').to_string(),
-            http,
+            http: http::client(),
         }
     }
 
@@ -756,26 +727,47 @@ pub(crate) mod mock {
 
     /// Answers every request with `status`, the extra `headers` and `body`.
     pub async fn serve(status: u16, headers: &[(&str, &str)], body: &str) -> MockApi {
+        serve_sequence(&[(status, headers, body)]).await
+    }
+
+    /// A status, extra headers and a body.
+    pub type Reply<'a> = (u16, &'a [(&'a str, &'a str)], &'a str);
+
+    /// Answers the requests in the order they arrive with `replies`, one each, then repeats the
+    /// last one.
+    pub async fn serve_sequence(replies: &[Reply<'_>]) -> MockApi {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let received = Arc::new(Mutex::new(Vec::new()));
-        let mut reply = format!(
-            "HTTP/1.1 {status} Mock\r\ncontent-type: application/json\r\n\
-             content-length: {}\r\nconnection: close\r\n",
-            body.len()
+        let replies: Arc<Vec<String>> = Arc::new(
+            replies
+                .iter()
+                .map(|(status, headers, body)| {
+                    let mut reply = format!(
+                        "HTTP/1.1 {status} Mock\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n",
+                        body.len()
+                    );
+                    for (name, value) in *headers {
+                        reply.push_str(&format!("{name}: {value}\r\n"));
+                    }
+                    reply.push_str("\r\n");
+                    reply.push_str(body);
+                    reply
+                })
+                .collect(),
         );
-        for (name, value) in headers {
-            reply.push_str(&format!("{name}: {value}\r\n"));
-        }
-        reply.push_str("\r\n");
-        reply.push_str(body);
         let recorded = received.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let (recorded, reply) = (recorded.clone(), reply.clone());
+                let (recorded, replies) = (recorded.clone(), replies.clone());
                 tokio::spawn(async move {
                     if let Some(request) = read_request(&mut socket).await {
-                        recorded.lock().unwrap().push(request);
+                        let reply = {
+                            let mut recorded = recorded.lock().unwrap();
+                            recorded.push(request);
+                            replies[(recorded.len() - 1).min(replies.len() - 1)].clone()
+                        };
                         let _ = socket.write_all(reply.as_bytes()).await;
                         let _ = socket.shutdown().await;
                     }
@@ -824,6 +816,7 @@ mod tests {
             model: Some("claude-sonnet-5-5".into()),
             max_tags: 8,
             max_proposals: 3,
+            threshold: None,
             asset: AssetInfo {
                 file_name: "rock_large.glb".into(),
                 relative_path: "models/rock_large.glb".into(),
@@ -1077,43 +1070,6 @@ mod tests {
             let error = parse_response(body, Mode::ExistingOnly, 0, "m").unwrap_err();
             assert_eq!(error.class, ErrorClass::Item, "{body}");
         }
-    }
-
-    #[test]
-    fn http_statuses_map_to_the_plan_failure_classes() {
-        for status in [408, 429, 500, 502, 503, 529] {
-            assert_eq!(classify_status(status), ErrorClass::Retryable, "{status}");
-        }
-        for status in [401, 402, 403, 404] {
-            assert_eq!(classify_status(status), ErrorClass::Fatal, "{status}");
-        }
-        for status in [400, 413, 422] {
-            assert_eq!(classify_status(status), ErrorClass::Item, "{status}");
-        }
-    }
-
-    #[test]
-    fn retry_after_is_read_in_seconds() {
-        let headers = |value: &str| {
-            let mut map = HeaderMap::new();
-            map.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
-            map
-        };
-
-        assert_eq!(retry_after(&headers("30")), Some(Duration::from_secs(30)));
-        assert_eq!(
-            retry_after(&headers("1.5")),
-            Some(Duration::from_millis(1500))
-        );
-        assert_eq!(retry_after(&headers("soon")), None);
-        assert_eq!(retry_after(&headers("-1")), None);
-        assert_eq!(
-            retry_after(&headers("1e20")),
-            None,
-            "too long for a Duration"
-        );
-        assert_eq!(retry_after(&headers("NaN")), None);
-        assert_eq!(retry_after(&HeaderMap::new()), None);
     }
 
     fn provider(url: &str, key: Option<&'static str>) -> AnthropicProvider {

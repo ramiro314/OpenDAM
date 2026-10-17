@@ -6,7 +6,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::credentials::{self, Credentials};
 use super::settings::AiSettings;
 use super::vocabulary::Vocabulary;
 
@@ -58,6 +57,8 @@ pub struct TagRequest {
     pub max_tags: u32,
     /// The most new tag names to propose, outside Existing only.
     pub max_proposals: u32,
+    /// For providers that score each catalog tag: the lowest score a tag is kept at.
+    pub threshold: Option<f64>,
     pub asset: AssetInfo,
     /// None when the asset has no thumbnail yet: the request is text only.
     pub image: Option<Thumbnail>,
@@ -145,75 +146,15 @@ pub trait TagProvider: Send + Sync {
     fn model(&self, _settings: &AiSettings) -> Option<String> {
         None
     }
+    /// The lowest score a tag is kept at, for providers that score each catalog tag.
+    fn threshold(&self, _settings: &AiSettings) -> Option<f64> {
+        None
+    }
+    /// Whether the provider looks at thumbnails. Text-only providers are never sent one.
+    fn sees_images(&self) -> bool {
+        true
+    }
     /// Why no run can start, when none can. May block on the keyring: call it off async workers.
     fn unavailable_reason(&self) -> Option<String>;
     fn tag<'a>(&'a self, request: &'a TagRequest) -> TagFuture<'a>;
-}
-
-/// A provider whose requests come in a later ticket. It shows in the run dialog, with why it
-/// can't be picked yet.
-pub struct NotYetBuilt {
-    pub provider: credentials::Provider,
-    pub credentials: Arc<Credentials>,
-}
-
-impl TagProvider for NotYetBuilt {
-    fn id(&self) -> &'static str {
-        match self.provider {
-            credentials::Provider::Anthropic => "anthropic",
-            credentials::Provider::Jev => "jev",
-        }
-    }
-
-    fn label(&self) -> &'static str {
-        match self.provider {
-            credentials::Provider::Anthropic => "Anthropic",
-            credentials::Provider::Jev => "Jev",
-        }
-    }
-
-    fn modes(&self) -> &'static [Mode] {
-        match self.provider {
-            credentials::Provider::Anthropic => &Mode::ALL,
-            credentials::Provider::Jev => &[Mode::ExistingOnly],
-        }
-    }
-
-    fn concurrency(&self, settings: &AiSettings) -> u32 {
-        match self.provider {
-            credentials::Provider::Anthropic => settings.anthropic.concurrency,
-            credentials::Provider::Jev => settings.jev.concurrency,
-        }
-    }
-
-    fn max_tags(&self, settings: &AiSettings) -> u32 {
-        match self.provider {
-            credentials::Provider::Anthropic => settings.anthropic.max_tags,
-            credentials::Provider::Jev => settings.jev.max_tags,
-        }
-    }
-
-    fn max_proposals(&self, settings: &AiSettings) -> u32 {
-        match self.provider {
-            credentials::Provider::Anthropic => settings.anthropic.max_proposals,
-            credentials::Provider::Jev => 0,
-        }
-    }
-
-    fn unavailable_reason(&self) -> Option<String> {
-        if !self.credentials.status(self.provider).configured {
-            return Some(format!("Set up {} in Settings", self.label()));
-        }
-        Some(format!("{} tagging isn't built yet", self.label()))
-    }
-
-    fn tag<'a>(&'a self, _request: &'a TagRequest) -> TagFuture<'a> {
-        let label = self.label();
-        Box::pin(async move {
-            Err(ProviderError::new(
-                ErrorClass::Fatal,
-                format!("{label} tagging isn't built yet"),
-            ))
-        })
-    }
 }

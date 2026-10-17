@@ -537,6 +537,7 @@ impl Engine {
                 options: serde_json::json!({
                     "maxTags": pool.provider.max_tags(&settings),
                     "maxProposals": pool.provider.max_proposals(&settings),
+                    "threshold": pool.provider.threshold(&settings),
                 }),
                 inline,
             },
@@ -722,7 +723,7 @@ impl Engine {
         let (file_name, relative_path, kind, extension, metadata, thumbnail) =
             row.ok_or("The asset is gone")?;
 
-        let image = match thumbnail {
+        let image = match thumbnail.filter(|_| provider.sees_images()) {
             Some(thumb) => {
                 let path = resolve_path(&lib.root_path, &thumb);
                 tokio::task::spawn_blocking(move || load_thumbnail(Path::new(&path)))
@@ -752,6 +753,7 @@ impl Engine {
             model: item.model.clone(),
             max_tags: max_tags as u32,
             max_proposals: item.options["maxProposals"].as_u64().unwrap_or(0) as u32,
+            threshold: item.options["threshold"].as_f64(),
             asset: AssetInfo {
                 file_name,
                 relative_path,
