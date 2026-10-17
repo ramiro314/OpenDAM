@@ -21,6 +21,7 @@ export function AutotagDialog({ target, onClose }: AutotagDialogProps) {
   const providers = useAutotagStore((s) => s.providers);
   const fetchProviders = useAutotagStore((s) => s.fetchProviders);
   const setRunsPanelOpen = useAutotagStore((s) => s.setRunsPanelOpen);
+  const fetchLastUsed = useAutotagStore((s) => s.fetchLastUsed);
   const [providerId, setProviderId] = useState<string | null>(null);
   const [mode, setMode] = useState<AutotagMode>('existing_only');
   const [allAssets, setAllAssets] = useState(false);
@@ -58,6 +59,8 @@ export function AutotagDialog({ target, onClose }: AutotagDialogProps) {
       await api.startAutotagRun(scopeFor(target, allAssets), provider.id, mode);
       onClose();
       setRunsPanelOpen(true);
+      // The start saved them for "Suggest tags"
+      fetchLastUsed().catch(console.error);
     } catch (e) {
       setError(String(e));
     } finally {

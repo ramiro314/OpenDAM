@@ -82,6 +82,7 @@ export default function App() {
     // Auto-tagging runs: the first list, then the engine pushes every change
     useAutotagStore.getState().fetchRuns().catch(console.error);
     useAutotagStore.getState().fetchProviders().catch(console.error);
+    useAutotagStore.getState().fetchLastUsed().catch(console.error);
     const unlistenAutotag = listen<AutotagUpdate>('autotag:updated', (event) => {
       useAutotagStore.getState().applyUpdate(event.payload);
     });

@@ -1,7 +1,9 @@
 import type {
+  AutotagLastUsed,
   AutotagMode,
   AutotagProviderOption,
   AutotagScope,
+  AutotagSuggestion,
   AutotagTarget,
   RunSummary,
 } from '../types';
@@ -53,6 +55,72 @@ export function autotagAvailability(
   }
   if (assetCount === 0) return { enabled: false, reason: emptyReason };
   return { enabled: true, reason: null };
+}
+
+export interface SuggestTagsAvailability extends Availability {
+  /** The button's tooltip: the provider and mode it uses, or why it is disabled */
+  tooltip: string;
+}
+
+/**
+ * Whether "Suggest tags" can tag the asset with the last-used provider and mode (D32), and the
+ * tooltip naming them, or saying why it can't.
+ */
+export function suggestTagsAvailability(
+  providers: AutotagProviderOption[] | null,
+  lastUsed: AutotagLastUsed | null
+): SuggestTagsAvailability {
+  const disabled = (reason: string) => ({ enabled: false, reason, tooltip: reason });
+  const base = autotagAvailability(providers, 1);
+  if (!base.enabled) return disabled(base.reason!);
+  if (lastUsed === null) return disabled('Checking tagging providers…');
+  const provider = providers!.find((p) => p.id === lastUsed.provider);
+  if (!provider) {
+    return disabled(
+      `Suggest tags uses the provider of your last run, ${lastUsed.provider}, which isn't available. Start a run from Auto-tag… with another provider to switch.`
+    );
+  }
+  if (provider.unavailableReason !== null) {
+    return disabled(
+      `Suggest tags uses the provider of your last run, ${provider.label}: ${provider.unavailableReason}. Start a run from Auto-tag… with another provider to switch.`
+    );
+  }
+  const mode = modeOptions(provider).find((m) => m.mode === lastUsed.mode);
+  if (!mode?.enabled) {
+    return disabled(
+      `Suggest tags uses the mode of your last run, ${modeLabel(lastUsed.mode)}: ${mode?.reason ?? 'unknown mode'}.`
+    );
+  }
+  return {
+    enabled: true,
+    reason: null,
+    tooltip: `Suggest tags with ${provider.label}, ${mode.label}`,
+  };
+}
+
+/** A suggested new tag name in the Tags tab, standing for every pending proposal of that name */
+export interface SuggestionChip {
+  name: string;
+  parentId: string | null;
+  /** Each run's proposal of this name; a decision on the chip applies to all of them */
+  proposals: { runId: string; proposalId: string }[];
+}
+
+/**
+ * The chips for an asset's "Suggest tags" runs, newest run first. Two runs proposing the same
+ * name (case and spacing aside) give one chip, named and placed as the newest proposed it.
+ */
+export function suggestionChips(suggestions: AutotagSuggestion[]): SuggestionChip[] {
+  const chips = new Map<string, SuggestionChip>();
+  for (const { run, proposals } of suggestions) {
+    for (const p of proposals) {
+      const key = p.name.trim().replace(/\s+/g, ' ').toLowerCase();
+      const chip = chips.get(key) ?? { name: p.name, parentId: p.parentId, proposals: [] };
+      chip.proposals.push({ runId: run.id, proposalId: p.id });
+      chips.set(key, chip);
+    }
+  }
+  return [...chips.values()];
 }
 
 /** What the run dialog asks the backend to tag: the chosen assets, or the library with its "All assets" choice. */
