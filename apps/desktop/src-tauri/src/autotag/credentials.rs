@@ -284,6 +284,50 @@ mod tests {
         }
     }
 
+    /// A keyring that can't be read, like a locked or missing Secret Service.
+    struct BrokenKeyring;
+
+    impl SecretStore for BrokenKeyring {
+        fn get(&self, _entry: &str) -> Result<Option<String>, String> {
+            Err("boom".into())
+        }
+        fn set(&self, _entry: &str, _secret: &str) -> Result<(), String> {
+            Err("boom".into())
+        }
+        fn delete(&self, _entry: &str) -> Result<(), String> {
+            Err("boom".into())
+        }
+    }
+
+    #[test]
+    fn an_unreadable_keyring_is_reported_and_not_counted_as_a_key() {
+        let creds = Credentials::new(BrokenKeyring, env_with(&[]));
+
+        let status = creds.status(Provider::Anthropic);
+        assert!(!status.configured);
+        assert_eq!(status.key_source, KeySource::None);
+        assert!(!status.saved_in_keyring);
+        assert!(status.keyring_problem.unwrap().contains("boom"));
+        assert!(creds.api_key(Provider::Anthropic).is_err());
+    }
+
+    #[test]
+    fn an_unreadable_keyring_does_not_hide_the_env_key() {
+        let creds = Credentials::new(
+            BrokenKeyring,
+            env_with(&[("ANTHROPIC_API_KEY", "from-env")]),
+        );
+
+        let status = creds.status(Provider::Anthropic);
+        assert!(status.configured);
+        assert_eq!(status.key_source, KeySource::Env);
+        assert!(status.keyring_problem.unwrap().contains("boom"));
+        assert_eq!(
+            creds.api_key(Provider::Anthropic).unwrap().as_deref(),
+            Some("from-env")
+        );
+    }
+
     #[test]
     fn the_env_var_overrides_a_saved_key() {
         let creds = Credentials::new(

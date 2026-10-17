@@ -254,6 +254,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_range_includes_its_bounds_and_nothing_past_them() {
+        let db = memory_database(vec![]).await;
+
+        for patch in [
+            json!({"anthropic": {"concurrency": 17}}),
+            json!({"anthropic": {"maxTags": 51}}),
+            json!({"anthropic": {"maxProposals": 21}}),
+            json!({"anthropic": {"maxTags": 0}}),
+            json!({"jev": {"concurrency": 17}}),
+            json!({"jev": {"maxTags": 51}}),
+            json!({"jev": {"threshold": -0.01}}),
+            json!({"jev": {"threshold": 1.01}}),
+        ] {
+            assert!(
+                update(&db.master_pool, patch.clone()).await.is_err(),
+                "{patch}"
+            );
+        }
+        assert!(saved_rows(&db.master_pool).await.is_empty());
+
+        let at_max = update(
+            &db.master_pool,
+            json!({
+                "anthropic": {"concurrency": 16, "maxTags": 50, "maxProposals": 20},
+                "jev": {"concurrency": 16, "threshold": 1.0, "maxTags": 50},
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(at_max.anthropic.concurrency, 16);
+        assert_eq!(at_max.anthropic.max_tags, 50);
+        assert_eq!(at_max.anthropic.max_proposals, 20);
+        assert_eq!(at_max.jev.concurrency, 16);
+        assert_eq!(at_max.jev.threshold, 1.0);
+        assert_eq!(at_max.jev.max_tags, 50);
+
+        let at_min = update(
+            &db.master_pool,
+            json!({
+                "anthropic": {"concurrency": 1, "maxTags": 1, "maxProposals": 0},
+                "jev": {"concurrency": 1, "threshold": 0.0, "maxTags": 1},
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(load(&db.master_pool).await.unwrap(), at_min);
+        assert_eq!(at_min.jev.threshold, 0.0);
+        assert_eq!(at_min.anthropic.max_proposals, 0);
+    }
+
+    #[tokio::test]
     async fn a_saved_value_that_is_no_longer_valid_falls_back_to_its_default() {
         let db = memory_database(vec![]).await;
         for (key, value) in [
