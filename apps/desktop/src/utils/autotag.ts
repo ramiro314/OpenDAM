@@ -128,10 +128,10 @@ export interface RunActions {
 
 /** The Runs panel buttons a run in `status` offers. */
 export function runActions(status: RunSummary['status']): RunActions {
-  const active = status === 'running' || status === 'queued';
   return {
-    pause: active,
+    // A queued run is still being created: it can be cancelled, not paused
+    pause: status === 'running',
     resume: status === 'paused',
-    cancel: active || status === 'paused',
+    cancel: status === 'running' || status === 'queued' || status === 'paused',
   };
 }

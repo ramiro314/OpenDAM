@@ -355,8 +355,13 @@ pub async fn run_status(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<Opt
         .await
 }
 
-/// Pauses a `queued` or `running` run. `reason` is shown in the Runs panel; a pause you asked
-/// for has none. Returns whether the run was paused.
+/// Pauses a `running` run. `reason` is shown in the Runs panel; a pause you asked for has none.
+/// Returns whether the run was paused.
+///
+/// A `queued` run is still being created and can't be paused: resumed before `create_run`
+/// finished, it could end `done` with later batches still to come, which would then sit
+/// `queued` in a run nobody schedules. It can be cancelled (`finish_creating` skips what comes
+/// after), and restart recovery pauses one a crash cut off.
 pub async fn pause_run(
     master: &Pool<Sqlite>,
     run_id: &str,
@@ -364,7 +369,7 @@ pub async fn pause_run(
 ) -> sqlx::Result<bool> {
     let paused = sqlx::query(
         "UPDATE tag_runs SET status = 'paused', pause_reason = ?
-         WHERE id = ? AND status IN ('queued', 'running')",
+         WHERE id = ? AND status = 'running'",
     )
     .bind(reason)
     .bind(run_id)

@@ -185,9 +185,12 @@ describe('runProgress', () => {
 });
 
 describe('runActions', () => {
-  test('an active run can be paused or cancelled', () => {
+  test('a running run can be paused or cancelled', () => {
     expect(runActions('running')).toEqual({ pause: true, resume: false, cancel: true });
-    expect(runActions('queued')).toEqual({ pause: true, resume: false, cancel: true });
+  });
+
+  test('a run still being created can be cancelled but not paused', () => {
+    expect(runActions('queued')).toEqual({ pause: false, resume: false, cancel: true });
   });
 
   test('a paused run can be resumed or cancelled', () => {

@@ -1618,6 +1618,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_run_still_being_created_can_be_cancelled_but_not_paused() {
+        let s = setup(Recording::default(), &["a1"]).await;
+        let master = &s.engine.db.master_pool;
+        s.engine.start().await;
+        // create_run has committed one batch and is inserting the next.
+        sqlx::query(
+            "INSERT INTO tag_runs (id, label, provider, mode, status, created_at)
+             VALUES ('creating', 'run', 'recording', 'existing_only', 'queued', 0)",
+        )
+        .execute(master)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tag_run_items (run_id, asset_id, library_id) VALUES ('creating', 'a1', 'lib')",
+        )
+        .execute(master)
+        .await
+        .unwrap();
+
+        assert!(s.engine.pause_run("creating").await.is_err());
+        assert_eq!(status_of(master, "creating").await, ("queued".into(), None));
+
+        s.engine.cancel_run("creating").await.unwrap();
+        assert_eq!(status_of(master, "creating").await.0, "cancelled");
+        assert!(s.provider.calls.lock().unwrap().is_empty());
+    }
+
     async fn insert_paused_run(master: &Pool<Sqlite>, id: &str, provider: &str, asset: &str) {
         sqlx::query(
             "INSERT INTO tag_runs (id, label, provider, mode, status, pause_reason, created_at)
