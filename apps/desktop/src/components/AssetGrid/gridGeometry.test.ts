@@ -5,6 +5,7 @@ import {
   LIST_ROW_HEIGHT,
   TILE_MIN,
   anchorRow,
+  anchoredScrollTop,
   gridLayout,
   listLayout,
   pagesForIndexRange,
@@ -110,6 +111,26 @@ describe('anchorRow', () => {
     }
     expect(anchorRow(6_000, 6)).toBe(1_000);
     expect(anchorRow(6_000, 4)).toBe(1_500);
+  });
+});
+
+describe('anchoredScrollTop', () => {
+  test('shifts the view by as many rows as the top asset moved, keeping its offset in the row', () => {
+    // 5 columns of 300 px rows; asset 450 was 40 px into row 90's view, two rows were added above
+    expect(anchoredScrollTop(rowTop(90, 300) + 40, 450, 460, 5, 300)).toBe(rowTop(92, 300) + 40);
+    expect(anchoredScrollTop(rowTop(90, 300) + 40, 450, 452, 5, 300)).toBe(rowTop(90, 300) + 40);
+  });
+
+  test('a shrinking result set near the bottom shifts once, from the scrollTop before the refresh', () => {
+    // The view was at 30,000 with asset 990 on top; 100 assets went, so 990 clamps to 899, 19 rows
+    // up. The browser has already pulled the live scrollTop up to the shorter end; the result
+    // depends only on where the view was.
+    expect(anchoredScrollTop(30_000, 990, 899, 5, 300)).toBe(30_000 - 19 * 300);
+  });
+
+  test('rounds up, as the browser rounds scrollTop down, and never goes above the top', () => {
+    expect(anchoredScrollTop(100, 10, 15, 5, 300.4)).toBe(401);
+    expect(anchoredScrollTop(100, 500, 0, 5, 300)).toBe(0);
   });
 });
 

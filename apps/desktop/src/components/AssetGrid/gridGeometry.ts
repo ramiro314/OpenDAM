@@ -108,6 +108,23 @@ export function anchorRow(firstIndex: number, columns: number): number {
 }
 
 /**
+ * The `scrollTop` after a refresh moved the asset at the top from index `from` to `to` (C5): the
+ * `scrollTop` the view had before the refresh, shifted by as many rows. It starts from the old
+ * value, because a shorter result set has already pulled the live `scrollTop` up to its new end,
+ * and shifting that would move the view twice. Rounded up, as the browser rounds down.
+ */
+export function anchoredScrollTop(
+  before: number,
+  from: number,
+  to: number,
+  columns: number,
+  rowPitch: number
+): number {
+  const rows = rowOfIndex(to, columns) - rowOfIndex(from, columns);
+  return Math.max(0, Math.ceil(before + rows * rowPitch));
+}
+
+/**
  * The page to prefetch (C3): the next page in the scroll direction, once the viewport, showing
  * indices `first` to `last`, is within two screens (`screenAssets` assets each) of it. Null when
  * that page is out of range or still far away.

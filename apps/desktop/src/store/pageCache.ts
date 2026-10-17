@@ -12,6 +12,14 @@ export const MAX_PAGES = 25;
 export const SETTLE_MS = 80;
 /** How far around its old index a refresh looks for the asset that was at the top (C5). */
 export const ANCHOR_REACH = 200;
+/** The first wait before a failed page is asked for again, doubled per failure up to the max. */
+export const RETRY_MS = 250;
+export const RETRY_MAX_MS = 5_000;
+
+/** How long to wait before asking again for a page that has failed `failures` times in a row. */
+export function retryDelay(failures: number): number {
+  return Math.min(RETRY_MS * 2 ** Math.max(0, failures - 1), RETRY_MAX_MS);
+}
 
 export interface PageCache {
   /** Page index to its assets, up to `PAGE_SIZE` each */

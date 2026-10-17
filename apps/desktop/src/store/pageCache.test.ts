@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   MAX_PAGES,
   PAGE_SIZE,
+  RETRY_MAX_MS,
+  RETRY_MS,
   SETTLE_MS,
   assetAt,
   createSettler,
@@ -10,6 +12,7 @@ import {
   insertPage,
   patchAssets,
   refreshPages,
+  retryDelay,
   touch,
   type PageCache,
   type Schedule,
@@ -111,6 +114,19 @@ describe('refresh anchor', () => {
     expect(findAnchor(cache.pages, 'deleted', 250, 1000)).toBe(250);
     expect(findAnchor(cache.pages, 'deleted', 250, 100)).toBe(99);
     expect(findAnchor(cache.pages, undefined, 0, 0)).toBe(0);
+  });
+});
+
+describe('retryDelay', () => {
+  test('doubles after each failure, up to the max', () => {
+    expect([1, 2, 3, 4, 5].map(retryDelay)).toEqual([
+      RETRY_MS,
+      RETRY_MS * 2,
+      RETRY_MS * 4,
+      RETRY_MS * 8,
+      RETRY_MS * 16,
+    ]);
+    expect(retryDelay(50)).toBe(RETRY_MAX_MS);
   });
 });
 

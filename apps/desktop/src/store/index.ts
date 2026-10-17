@@ -27,6 +27,7 @@ import {
   pageOf,
   patchAssets,
   refreshPages,
+  retryDelay,
   touch,
   type PageCache,
 } from './pageCache';
@@ -290,6 +291,14 @@ function repin(pinned: Map<string, Asset>, assets: Iterable<Asset>): Map<string,
 // `refresh` reads it, so it stays out of the state that components subscribe to.
 let viewTop = 0;
 
+// Consecutive failures per page, for the retry backoff; reset by every search and refresh.
+let pageFailures = { generation: -1, counts: new Map<number, number>() };
+
+function failuresOf(generation: number) {
+  if (pageFailures.generation !== generation) pageFailures = { generation, counts: new Map() };
+  return pageFailures.counts;
+}
+
 export const useAssetStore = create<AssetStore>()((set, get) => ({
   ...emptyCache(),
   total: 0,
@@ -381,12 +390,27 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
         .searchAssets({ query, page, pageSize: PAGE_SIZE, includeTotal: false })
         .then((result) => {
           if (generation !== get().generation) return;
+          failuresOf(generation).delete(page);
           set((cur) => ({
             ...insertPage(cur, page, result.assets, cur.wanted),
             pinned: repin(cur.pinned, result.assets),
           }));
         })
-        .catch((e) => console.error(`Failed to load page ${page}:`, e))
+        .catch((e) => {
+          console.error(`Failed to load page ${page}:`, e);
+          if (generation !== get().generation) return;
+          // The grid asks again only when its wanted pages change, so a failed page it still
+          // shows would stay placeholders: ask again, waiting longer after each failure
+          const counts = failuresOf(generation);
+          const failures = (counts.get(page) ?? 0) + 1;
+          counts.set(page, failures);
+          setTimeout(() => {
+            const cur = get();
+            if (cur.generation === generation && cur.wanted.includes(page)) {
+              cur.ensurePages(cur.wanted);
+            }
+          }, retryDelay(failures));
+        })
         .finally(() => {
           if (generation !== get().generation) return;
           set((cur) => {

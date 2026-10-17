@@ -19,10 +19,10 @@ import {
   SCROLL_PADDING,
   TILE_MIN,
   anchorRow,
+  anchoredScrollTop,
   gridLayout,
   listLayout,
   rowCount,
-  rowOfIndex,
   rowTop,
   rowsToIndexRange,
   visibleRows,
@@ -223,8 +223,14 @@ function WindowedResults({
     if (!el || appliedEpoch.current === epoch) return;
     if (!anchor) el.scrollTop = 0;
     else {
-      const rows = rowOfIndex(anchor.to, columns) - rowOfIndex(anchor.from, columns);
-      el.scrollTop = Math.ceil(el.scrollTop + rows * rowPitch);
+      // From the scrollTop before this render: a shorter result set has already clamped it
+      el.scrollTop = anchoredScrollTop(
+        lastScrollTop.current,
+        anchor.from,
+        anchor.to,
+        columns,
+        rowPitch
+      );
     }
   }, [epoch, anchor, columns, rowPitch]);
 

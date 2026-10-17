@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { api } from '../api';
 import { useAssetStore, useAutotagStore, useCollectionStore, useTagStore, useUIStore } from '.';
-import { MAX_PAGES, PAGE_SIZE, emptyCache } from './pageCache';
+import { MAX_PAGES, PAGE_SIZE, RETRY_MS, emptyCache, retryDelay } from './pageCache';
 import type { Asset, DeleteAssetsError, SearchPayload, SearchResult, Tag } from '../types';
 
 const realSearch = api.searchAssets;
@@ -15,6 +15,15 @@ const realDeleteAsset = api.deleteAsset;
 const named = (id: string) => ({ id, fileName: `${id}.png`, collections: [] }) as unknown as Asset;
 const library = (n: number) => Array.from({ length: n }, (_, i) => named(`a${i}`));
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function until(predicate: () => boolean, timeoutMs: number) {
+  const deadline = performance.now() + timeoutMs;
+  while (!predicate()) {
+    if (performance.now() > deadline) throw new Error(`Timed out after ${timeoutMs} ms`);
+    await sleep(10);
+  }
+}
 
 /** A `search_assets` that never answers until `release`, recording each request. */
 function hold() {
@@ -303,6 +312,67 @@ describe('useAssetStore page cache guards and failures', () => {
     await flush();
     expect(calls.map((c) => c.page)).toEqual([2]);
     expect(useAssetStore.getState().assetAt(400)?.id).toBe('a400');
+  });
+
+  test('a failed page still wanted is asked for again on its own, waiting longer each time', async () => {
+    const all = library(1000);
+    serve(() => all);
+    await useAssetStore.getState().search();
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+    // The first two requests for page 2 fail, the third succeeds
+    const at: number[] = [];
+    const answer = pagesOf(() => all);
+    api.searchAssets = async (payload) => {
+      at.push(performance.now());
+      if (at.length <= 2) throw 'database is locked';
+      return answer(payload);
+    };
+    useAssetStore.getState().ensurePages([2]);
+    await until(() => useAssetStore.getState().pages.has(2), 5_000);
+    consoleError.mockRestore();
+
+    expect(at.length).toBe(3);
+    // Timers never fire early; allow 1 ms for their rounding
+    expect(at[1] - at[0]).toBeGreaterThanOrEqual(retryDelay(1) - 1);
+    expect(at[2] - at[1]).toBeGreaterThanOrEqual(retryDelay(2) - 1);
+    expect(useAssetStore.getState().assetAt(400)?.id).toBe('a400');
+  });
+
+  test('a failed page is not asked for again once the grid no longer wants it', async () => {
+    const all = library(1000);
+    serve(() => all);
+    await useAssetStore.getState().search();
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+    const calls: number[] = [];
+    api.searchAssets = async (payload) => {
+      calls.push(payload.page);
+      throw 'database is locked';
+    };
+    useAssetStore.getState().ensurePages([2]);
+    await flush();
+    useAssetStore.getState().ensurePages([0]); // scrolled back to the top, which is cached
+    await sleep(RETRY_MS * 2);
+    consoleError.mockRestore();
+
+    expect(calls).toEqual([2]);
+  });
+
+  test('a failed page is not asked for again after a new search', async () => {
+    const all = library(1000);
+    serve(() => all);
+    await useAssetStore.getState().search();
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+    api.searchAssets = async () => {
+      throw 'database is locked';
+    };
+    useAssetStore.getState().ensurePages([2]);
+    await flush();
+    const calls = serve(() => all);
+    await useAssetStore.getState().search();
+    await sleep(RETRY_MS * 2);
+    consoleError.mockRestore();
+
+    expect(calls.map((c) => c.page)).toEqual([0]);
   });
 
   test('a failed refresh keeps the stale pages and total, then asks for the wanted pages again', async () => {
