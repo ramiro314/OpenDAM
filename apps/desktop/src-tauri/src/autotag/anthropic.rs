@@ -372,7 +372,8 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
         .trim()
         .parse()
         .ok()?;
-    (seconds.is_finite() && seconds >= 0.0).then(|| Duration::from_secs_f64(seconds))
+    // Negative, NaN, infinite or too long for a Duration: ignored like any other garbage
+    Duration::try_from_secs_f64(seconds).ok()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1106,6 +1107,12 @@ mod tests {
         );
         assert_eq!(retry_after(&headers("soon")), None);
         assert_eq!(retry_after(&headers("-1")), None);
+        assert_eq!(
+            retry_after(&headers("1e20")),
+            None,
+            "too long for a Duration"
+        );
+        assert_eq!(retry_after(&headers("NaN")), None);
         assert_eq!(retry_after(&HeaderMap::new()), None);
     }
 
