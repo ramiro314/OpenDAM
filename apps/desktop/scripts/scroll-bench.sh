@@ -87,6 +87,8 @@ for only in ${scenarios[*]}; do
   exec 3<&-
   wait \$app 2>/dev/null
   cat "\$log" >>"$run/app.log"
+  # A cap kill is a finding: report it rather than start the next scenario's app
+  grep -q '^memory-cap: .* killed at the' "\$log" && break
 done
 EOF
 chmod +x "$run/session.sh"

@@ -44,6 +44,15 @@ while kill -0 "$child" 2>/dev/null; do
   status=$?
 done
 
+# The command can exit while the kernel is still killing the rest of the scope and before systemd
+# has recorded the oom-kill, so wait for the scope to stop before reading its result. A scope the
+# command left processes running in stays active, so give up after 5 s.
+for _ in {1..50}; do
+  case $(systemctl --user show "$unit" -p ActiveState --value 2>/dev/null) in
+    active | activating | deactivating) sleep 0.1 ;;
+    *) break ;;
+  esac
+done
 if [[ $(systemctl --user show "$unit" -p Result --value 2>/dev/null) == oom-kill ]]; then
   echo "memory-cap: $1 was killed at the $max memory cap (oom-kill in $unit)" >&2
 fi
