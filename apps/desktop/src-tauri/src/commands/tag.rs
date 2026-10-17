@@ -473,4 +473,94 @@ mod tests {
             .unwrap();
         assert_eq!(tag_row(&db.master_pool, "t").await.unwrap().1, "Rock");
     }
+
+    #[tokio::test]
+    async fn update_tag_still_saves_to_master_and_healthy_mirrors_when_one_mirror_refuses() {
+        let a = memory_library_pool_enforcing_foreign_keys().await;
+        let b = memory_library_pool_enforcing_foreign_keys().await;
+        for pool in [&a, &b] {
+            insert_tag(pool, "t", "rock").await;
+        }
+        // b holds another tag with the new name, so it can't take the rename.
+        insert_tag(&b, "u", "stone").await;
+        let db = memory_database(vec![
+            memory_library("a", a.clone()),
+            memory_library("b", b.clone()),
+        ])
+        .await;
+        insert_tag(&db.master_pool, "t", "rock").await;
+        insert_tag(&db.master_pool, "p", "nature").await;
+
+        let result = update_tag_in(
+            &db,
+            "t",
+            patch(serde_json::json!({ "name": "stone", "parentId": "p", "description": "hint" })),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let edited: TagRow = (
+            "t".into(),
+            "stone".into(),
+            None,
+            Some("p".into()),
+            "hint".into(),
+        );
+        assert_eq!(tag_row(&db.master_pool, "t").await, Some(edited.clone()));
+        assert_eq!(tag_row(&a, "t").await, Some(edited));
+        assert!(tag_row(&a, "p").await.is_some());
+        // b's transaction rolled back: its row is as it was, and it didn't gain the parent.
+        assert_eq!(
+            tag_row(&b, "t").await,
+            Some(("t".into(), "rock".into(), None, None, String::new()))
+        );
+        assert_eq!(tag_row(&b, "p").await, None);
+    }
+
+    #[tokio::test]
+    async fn update_tag_refuses_a_missing_parent_an_empty_name_and_an_unknown_tag() {
+        let db = memory_database(vec![]).await;
+        insert_tag(&db.master_pool, "t", "rock").await;
+        let before = tag_row(&db.master_pool, "t").await;
+
+        for (id, json, error) in [
+            (
+                "t",
+                serde_json::json!({ "parentId": "gone" }),
+                "The parent tag no longer exists",
+            ),
+            (
+                "t",
+                serde_json::json!({ "name": "   " }),
+                "A tag needs a name",
+            ),
+            (
+                "gone",
+                serde_json::json!({ "name": "stone" }),
+                "The tag no longer exists",
+            ),
+        ] {
+            assert_eq!(
+                update_tag_in(&db, id, patch(json)).await.unwrap_err(),
+                error
+            );
+            assert_eq!(tag_row(&db.master_pool, "t").await, before);
+        }
+    }
+
+    #[tokio::test]
+    async fn update_tag_stores_a_none_or_empty_color_as_no_color() {
+        let db = memory_database(vec![]).await;
+        insert_tag(&db.master_pool, "t", "rock").await;
+
+        for color in ["none", ""] {
+            update_tag_in(&db, "t", patch(serde_json::json!({ "color": "red" })))
+                .await
+                .unwrap();
+            update_tag_in(&db, "t", patch(serde_json::json!({ "color": color })))
+                .await
+                .unwrap();
+            assert_eq!(tag_row(&db.master_pool, "t").await.unwrap().2, None);
+        }
+    }
 }
