@@ -140,21 +140,19 @@ async fn search_libraries(
     let filter = search_filter(&payload.query);
     let sort_field = payload.query.sort.field.as_str();
     let is_asc = payload.query.sort.order == "asc";
-    let sort_col = match sort_field {
-        "name" => "a.file_name",
-        "size" => "a.size_bytes",
-        "rating" => "a.rating",
-        "kind" => "a.kind",
-        "favorite" => "a.is_favorite",
-        _ => "a.modified_at",
-    };
-    let order_by = format!("{} {}", sort_col, if is_asc { "ASC" } else { "DESC" });
+    let order_by = order_by(sort_field, is_asc);
 
     if target_libs.len() == 1 {
         let (pool, root_opt) = &target_libs[0];
-        let total = count_assets(pool, &filter)
-            .await
-            .map_err(|e| e.to_string())?;
+        let total = if payload.include_total {
+            Some(
+                count_assets(pool, &filter)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
         let assets = fetch_assets(pool, root_opt, &filter, &order_by, limit, Some(offset))
             .await
             .map_err(|e| e.to_string())?;
@@ -170,8 +168,10 @@ async fn search_libraries(
     let mut total: i64 = 0;
     let mut all_assets: Vec<Asset> = Vec::new();
     for (pool, root_opt) in target_libs {
-        if let Ok(c) = count_assets(pool, &filter).await {
-            total += c;
+        if payload.include_total {
+            if let Ok(c) = count_assets(pool, &filter).await {
+                total += c;
+            }
         }
         if let Ok(assets) =
             fetch_assets(pool, root_opt, &filter, &order_by, offset + limit, None).await
@@ -204,10 +204,25 @@ async fn search_libraries(
 
     Ok(SearchResult {
         assets: paged_assets,
-        total,
+        total: payload.include_total.then_some(total),
         page: payload.page,
         page_size: payload.page_size,
     })
+}
+
+/// The `ORDER BY` terms of a search over `assets a` sorted by `field`. The `rowid` tie-break makes
+/// the order total, so offset pages never overlap or skip.
+fn order_by(field: &str, is_asc: bool) -> String {
+    let sort_col = match field {
+        "name" => "a.file_name COLLATE NOCASE",
+        "size" => "a.size_bytes",
+        "rating" => "a.rating",
+        "kind" => "a.kind",
+        "favorite" => "a.is_favorite",
+        _ => "a.modified_at",
+    };
+    let dir = if is_asc { "ASC" } else { "DESC" };
+    format!("{sort_col} {dir}, a.rowid {dir}")
 }
 
 /// The `WHERE` conditions of a search over `assets a`, and the values bound to their `?`
@@ -836,7 +851,7 @@ mod tests {
         insert_asset, insert_collection, insert_tag, memory_database, memory_library,
         memory_library_pool, memory_library_pool_enforcing_foreign_keys, LibraryHandle,
     };
-    use sqlx::{Pool, Sqlite};
+    use sqlx::{Pool, Row, Sqlite};
     use std::cell::RefCell;
     use std::path::PathBuf;
 
@@ -994,7 +1009,9 @@ mod tests {
             .unwrap_or_else(|e| panic!("search for {query} failed: {e}"));
         (
             result.assets.into_iter().map(|a| a.id).collect(),
-            result.total,
+            result
+                .total
+                .expect("a search counts its matches by default"),
         )
     }
 
@@ -1475,6 +1492,174 @@ mod tests {
             (ids(&["m2", "m3", "m3"]), 10)
         );
         assert_eq!(search_page(&both, all, 3, 3).await, (ids(&["p2"]), 10));
+    }
+
+    /// A library of `count` assets whose sort keys all tie, except that names repeat in threes
+    /// and differ only in case within a pair (`Rock.png`, `rock.png`, `tree.png`).
+    async fn tied_library(count: usize) -> Pool<Sqlite> {
+        let pool = memory_library_pool().await;
+        for i in 0..count {
+            let name = ["Rock.png", "rock.png", "tree.png"][i % 3];
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+                 VALUES (?, ?, ?, 'png', 'texture', 0, 0, 0)",
+            )
+            .bind(format!("a{i:04}"))
+            .bind(format!("{i}/{name}"))
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool
+    }
+
+    async fn search_sorted(
+        pool: &Pool<Sqlite>,
+        field: &str,
+        order: &str,
+        page: i64,
+        page_size: i64,
+    ) -> SearchResult {
+        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+            "query": { "text": "", "filter": {}, "sort": { "field": field, "order": order } },
+            "page": page,
+            "pageSize": page_size,
+        }))
+        .unwrap();
+        search_libraries(&payload, &[(pool.clone(), None)])
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn consecutive_pages_of_tied_assets_neither_overlap_nor_skip() {
+        let count = 600;
+        let pool = tied_library(count).await;
+        for field in ["date", "name", "size", "rating", "kind", "favorite"] {
+            for order in ["asc", "desc"] {
+                // Ties come in insertion (rowid) order, in the sort direction.
+                let mut expected: Vec<usize> = (0..count).collect();
+                if field == "name" {
+                    expected.sort_by_key(|i| (*i % 3 == 2, *i));
+                }
+                if order == "desc" {
+                    expected.reverse();
+                }
+                let expected: Vec<String> = expected.iter().map(|i| format!("a{i:04}")).collect();
+
+                let mut pages = Vec::new();
+                for page in 0..(count as i64 / 50) {
+                    let result = search_sorted(&pool, field, order, page, 50).await;
+                    pages.extend(result.assets.into_iter().map(|a| a.id));
+                }
+                assert!(
+                    pages == expected,
+                    "pages sorted by {field} {order} are out of order, overlap or skip"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn name_order_ignores_case() {
+        let pool = tied_library(6).await;
+        let names = |result: SearchResult| -> Vec<(String, String)> {
+            result
+                .assets
+                .into_iter()
+                .map(|a| (a.file_name, a.id))
+                .collect()
+        };
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(n, i)| (n.to_string(), i.to_string()))
+                .collect()
+        };
+
+        assert_eq!(
+            names(search_sorted(&pool, "name", "asc", 0, 100).await),
+            pairs(&[
+                ("Rock.png", "a0000"),
+                ("rock.png", "a0001"),
+                ("Rock.png", "a0003"),
+                ("rock.png", "a0004"),
+                ("tree.png", "a0002"),
+                ("tree.png", "a0005"),
+            ])
+        );
+        assert_eq!(
+            names(search_sorted(&pool, "name", "desc", 0, 100).await),
+            pairs(&[
+                ("tree.png", "a0005"),
+                ("tree.png", "a0002"),
+                ("rock.png", "a0004"),
+                ("Rock.png", "a0003"),
+                ("rock.png", "a0001"),
+                ("Rock.png", "a0000"),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn sorting_by_name_or_size_reads_an_index_like_sorting_by_date() {
+        let pool = memory_library_pool().await;
+        for (field, index) in [
+            ("date", "idx_assets_modified_at"),
+            ("name", "idx_assets_file_name_nocase"),
+            ("size", "idx_assets_size_bytes"),
+        ] {
+            for is_asc in [true, false] {
+                let sql = format!(
+                    "EXPLAIN QUERY PLAN SELECT a.id FROM assets a ORDER BY {} LIMIT 200 OFFSET 400",
+                    order_by(field, is_asc)
+                );
+                let plan: Vec<String> = sqlx::query(&sql)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.get::<String, _>("detail"))
+                    .collect();
+                assert_eq!(
+                    plan,
+                    [format!("SCAN a USING INDEX {index}")],
+                    "sorting by {field}, ascending {is_asc}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_search_without_the_total_skips_the_count() {
+        let pool = attribute_library().await;
+        let payload = |include_total: Option<bool>| {
+            let mut payload = serde_json::json!({
+                "query": { "text": "", "filter": {}, "sort": { "field": "name", "order": "asc" } },
+                "page": 0,
+                "pageSize": 2,
+            });
+            if let Some(include) = include_total {
+                payload["includeTotal"] = include.into();
+            }
+            serde_json::from_value::<SearchPayload>(payload).unwrap()
+        };
+        let libs = [(pool.clone(), None)];
+
+        let without = search_libraries(&payload(Some(false)), &libs)
+            .await
+            .unwrap();
+        assert_eq!(without.total, None);
+        assert_eq!(without.assets.len(), 2);
+        assert!(serde_json::to_value(&without)
+            .unwrap()
+            .get("total")
+            .is_none());
+
+        let with = search_libraries(&payload(Some(true)), &libs).await.unwrap();
+        assert_eq!(with.total, Some(5));
+        let by_default = search_libraries(&payload(None), &libs).await.unwrap();
+        assert_eq!(by_default.total, Some(5));
     }
 
     async fn tagged(pool: &sqlx::Pool<sqlx::Sqlite>) -> Vec<(String, String)> {

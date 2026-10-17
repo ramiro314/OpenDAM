@@ -168,6 +168,13 @@ pub struct SearchPayload {
     pub page: i64,
     #[serde(rename = "pageSize")]
     pub page_size: i64,
+    /// Whether to count every match into `SearchResult::total`. Later pages of a query skip it.
+    #[serde(rename = "includeTotal", default = "default_true")]
+    pub include_total: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,7 +253,9 @@ pub struct SortSpec {
 #[derive(Debug, Serialize)]
 pub struct SearchResult {
     pub assets: Vec<Asset>,
-    pub total: i64,
+    /// Every match, not only this page's; absent when the payload set `includeTotal` to false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<i64>,
     pub page: i64,
     #[serde(rename = "pageSize")]
     pub page_size: i64,
