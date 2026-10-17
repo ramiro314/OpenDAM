@@ -50,7 +50,8 @@ real data:
 3. **Auto-tagging without a key:** debug builds read these variables. Release builds ignore them.
    - `OPENDAM_AUTOTAG_FAKE=1` adds two tagging providers that tag from file-name words: **Fake**
      (all three modes) and **Fake text-only** (Existing only, like Jev). A file named
-     `rock_large.png` gets a catalog tag named "Rock".
+     `rock_large.png` gets a catalog tag named "Rock", and in Prefer existing it proposes
+     "Large" for review.
    - `OPENDAM_AUTOTAG_FAKE_DELAY_MS` (default 300) slows each fake call, so a run can be watched,
      paused or photographed mid-way.
    - `OPENDAM_NO_KEYRING=1` ignores the OS keyring. With `ANTHROPIC_API_KEY` and
@@ -63,7 +64,9 @@ XDG_DATA_HOME=$XDG_DATA_HOME OPENDAM_AUTOTAG_FAKE=1 OPENDAM_AUTOTAG_FAKE_DELAY_M
 ```
 
 Runs live in the master DB's `tag_runs` and `tag_run_items` tables, and every tag a run adds is
-recorded in `tag_run_applied` before the library sees it.
+recorded in `tag_run_applied` before the library sees it. A Prefer existing run's new tag names
+wait for review in `tag_run_proposals` and `tag_run_proposal_assets`. The desktop notification a
+run sends needs a notification server, which the nested headless KWin used for screenshots lacks.
 
 ## Checking the CSP
 

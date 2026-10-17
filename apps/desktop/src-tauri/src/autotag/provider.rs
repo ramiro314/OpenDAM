@@ -56,6 +56,9 @@ pub struct TagRequest {
     /// None when the asset has no thumbnail yet: the request is text only.
     pub image: Option<Thumbnail>,
     pub vocabulary: Arc<Vocabulary>,
+    /// The new tag names this run has collected so far, so later assets reuse them rather than
+    /// coin near-duplicates. Empty outside Prefer existing.
+    pub run_proposals: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +132,10 @@ pub trait TagProvider: Send + Sync {
     fn concurrency(&self, settings: &AiSettings) -> u32;
     /// The most catalog tags kept per asset.
     fn max_tags(&self, settings: &AiSettings) -> u32;
+    /// The most new tag names kept per asset. Zero for a provider that can't propose any.
+    fn max_proposals(&self, _settings: &AiSettings) -> u32 {
+        0
+    }
     fn model(&self, _settings: &AiSettings) -> Option<String> {
         None
     }
@@ -177,6 +184,13 @@ impl TagProvider for NotYetBuilt {
         match self.provider {
             credentials::Provider::Anthropic => settings.anthropic.max_tags,
             credentials::Provider::Jev => settings.jev.max_tags,
+        }
+    }
+
+    fn max_proposals(&self, settings: &AiSettings) -> u32 {
+        match self.provider {
+            credentials::Provider::Anthropic => settings.anthropic.max_proposals,
+            credentials::Provider::Jev => 0,
         }
     }
 

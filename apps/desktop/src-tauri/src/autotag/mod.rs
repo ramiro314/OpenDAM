@@ -6,6 +6,7 @@ pub mod engine;
 #[cfg(debug_assertions)]
 pub mod fake;
 pub mod provider;
+pub mod review;
 pub mod settings;
 pub mod store;
 pub mod vocabulary;

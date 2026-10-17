@@ -20,6 +20,8 @@ import type {
   AutotagScope,
   RunSummary,
   StartedRun,
+  ReviewProposal,
+  ProposalDecision,
 } from '../types';
 
 /** Thin wrapper around Tauri IPC commands */
@@ -102,4 +104,9 @@ export const api = {
   /** Resumes every paused run whose provider is ready; returns how many */
   resumeAllAutotagRuns: () => invoke<number>('resume_all_autotag_runs'),
   cancelAutotagRun: (runId: string) => invoke<void>('cancel_autotag_run', { runId }),
+  getAutotagProposals: (runId: string) =>
+    invoke<ReviewProposal[]>('get_autotag_proposals', { runId }),
+  /** Applies the review; returns the run's status afterwards */
+  reviewAutotagProposals: (runId: string, decisions: ProposalDecision[]) =>
+    invoke<string>('review_autotag_proposals', { runId, decisions }),
 };

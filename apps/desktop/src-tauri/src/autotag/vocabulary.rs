@@ -3,7 +3,7 @@
 use sqlx::{Pool, Sqlite};
 use std::collections::{HashMap, HashSet};
 
-use super::provider::TagResult;
+use super::provider::{ProposedTag, TagResult};
 use crate::db::TagRow;
 
 /// A catalog tag as a provider sees it.
@@ -24,10 +24,12 @@ pub struct Vocabulary {
 
 /// Lowercased and trimmed, with inner whitespace collapsed.
 pub fn normalize_name(name: &str) -> String {
-    name.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+    clean_name(name).to_lowercase()
+}
+
+/// Trimmed, with inner whitespace collapsed: how a proposed name is shown.
+pub fn clean_name(name: &str) -> String {
+    name.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 impl Vocabulary {
@@ -68,18 +70,48 @@ impl Vocabulary {
         Self { tags }
     }
 
-    /// The catalog tag ids to apply from a provider's result: unknown ids dropped, proposals
-    /// that name a catalog tag counted as that tag, no repeats, at most `max_tags`.
-    pub fn accepted_tags(&self, result: &TagResult, max_tags: usize) -> Vec<String> {
-        let ids: HashSet<&str> = self.tags.iter().map(|t| t.id.as_str()).collect();
-        let by_name: HashMap<String, &str> = self
-            .tags
+    /// The catalog tag a name stands for: the tag whose own name (the last part of its path)
+    /// matches it by normalized name.
+    fn by_name(&self) -> HashMap<String, &str> {
+        self.tags
             .iter()
             .map(|t| {
                 let leaf = t.path.rsplit(" > ").next().unwrap_or(&t.path);
                 (normalize_name(leaf), t.id.as_str())
             })
-            .collect();
+            .collect()
+    }
+
+    /// The new tag names in a provider's result: names of catalog tags left out (they count
+    /// as that tag), blank names and repeats dropped, a parent that isn't a catalog tag
+    /// cleared, at most `max_proposals`.
+    pub fn new_proposals(&self, result: &TagResult, max_proposals: usize) -> Vec<ProposedTag> {
+        let ids: HashSet<&str> = self.tags.iter().map(|t| t.id.as_str()).collect();
+        let by_name = self.by_name();
+        let mut seen = HashSet::new();
+        result
+            .proposed
+            .iter()
+            .filter_map(|p| {
+                let name = clean_name(&p.name);
+                let normalized = name.to_lowercase();
+                let new = !name.is_empty()
+                    && !by_name.contains_key(&normalized)
+                    && seen.insert(normalized);
+                new.then(|| ProposedTag {
+                    name,
+                    parent_id: p.parent_id.clone().filter(|id| ids.contains(id.as_str())),
+                })
+            })
+            .take(max_proposals)
+            .collect()
+    }
+
+    /// The catalog tag ids to apply from a provider's result: unknown ids dropped, proposals
+    /// that name a catalog tag counted as that tag, no repeats, at most `max_tags`.
+    pub fn accepted_tags(&self, result: &TagResult, max_tags: usize) -> Vec<String> {
+        let ids: HashSet<&str> = self.tags.iter().map(|t| t.id.as_str()).collect();
+        let by_name = self.by_name();
 
         let named = result
             .proposed
@@ -193,6 +225,39 @@ mod tests {
         };
 
         assert_eq!(vocabulary().accepted_tags(&result, 8), ["rock", "tree"]);
+    }
+
+    fn proposed(name: &str, parent: Option<&str>) -> ProposedTag {
+        ProposedTag {
+            name: name.into(),
+            parent_id: parent.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn new_proposals_leave_out_catalog_names_blanks_and_repeats_and_respect_the_cap() {
+        let result = TagResult {
+            proposed: vec![
+                proposed("ROCK", None),
+                proposed("  Mossy   stone ", Some("rock")),
+                proposed("   ", None),
+                proposed("mossy stone", None),
+                proposed("Lichen", Some("ghost")),
+                proposed("Fern", None),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            vocabulary().new_proposals(&result, 2),
+            [
+                proposed("Mossy stone", Some("rock")),
+                proposed("Lichen", None)
+            ],
+            "a parent that isn't a catalog tag is cleared"
+        );
+        assert_eq!(vocabulary().new_proposals(&result, 8).len(), 3);
+        assert!(vocabulary().new_proposals(&result, 0).is_empty());
     }
 
     #[test]
