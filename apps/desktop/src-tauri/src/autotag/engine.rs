@@ -48,6 +48,8 @@ pub type EventSink = Arc<dyn Fn(AutotagUpdate) + Send + Sync>;
 pub struct ProviderOption {
     pub id: &'static str,
     pub label: &'static str,
+    /// How a run started now reaches it, for providers with more than one way.
+    pub access: Option<&'static str>,
     pub modes: Vec<Mode>,
     /// Why no run can start with it, when none can.
     pub unavailable_reason: Option<String>,
@@ -148,7 +150,7 @@ impl Engine {
         Self::with_retry_delays(db, providers, sink, RETRY_DELAYS.to_vec())
     }
 
-    fn with_retry_delays(
+    pub(crate) fn with_retry_delays(
         db: Arc<Database>,
         providers: Vec<Arc<dyn TagProvider>>,
         sink: EventSink,
@@ -184,6 +186,7 @@ impl Engine {
         if let Err(e) = store::recover_after_restart(&self.db.master_pool).await {
             tracing::error!("Could not pause the auto-tag runs of the last session: {e}");
         }
+        self.retain_active_runs().await;
         self.replay(None).await;
         self.events_wake.notify_one();
         for index in 0..self.pools.len() {
@@ -235,11 +238,14 @@ impl Engine {
         let paused = store::paused_runs(&self.db.master_pool)
             .await
             .map_err(|e| e.to_string())?;
-        let (_, provider) = paused
+        let run = paused
             .into_iter()
-            .find(|(id, _)| id == run_id)
+            .find(|run| run.id == run_id)
             .ok_or("Only a paused run can be resumed")?;
-        if let Some(reason) = self.unavailable_reason(&provider).await? {
+        if let Some(reason) = self
+            .unavailable_reason(&run.provider, run.access.clone())
+            .await?
+        {
             return Err(reason);
         }
         self.resume(&[run_id.to_string()]).await?;
@@ -254,13 +260,14 @@ impl Engine {
             .map_err(|e| e.to_string())?;
         let mut ready = std::collections::HashMap::new();
         let mut run_ids = Vec::new();
-        for (id, provider) in paused {
-            if !ready.contains_key(&provider) {
-                let reason = self.unavailable_reason(&provider).await?;
-                ready.insert(provider.clone(), reason.is_none());
+        for run in paused {
+            let key = (run.provider.clone(), run.access.clone());
+            if !ready.contains_key(&key) {
+                let reason = self.unavailable_reason(&run.provider, run.access).await?;
+                ready.insert(key.clone(), reason.is_none());
             }
-            if ready[&provider] {
-                run_ids.push(id);
+            if ready[&key] {
+                run_ids.push(run.id);
             }
         }
         self.resume(&run_ids).await
@@ -301,19 +308,37 @@ impl Engine {
         }
         self.run_stopped.notify_waiters();
         self.events_wake.notify_one();
+        self.retain_active_runs().await;
         Ok(())
     }
 
-    /// Why a run of `provider_id` can't go on, when it can't. Reads the keyring off the async
-    /// workers.
-    async fn unavailable_reason(&self, provider_id: &str) -> Result<Option<String>, String> {
+    /// Lets every provider drop what it keeps for runs that can't send a request any more,
+    /// such as a Claude-plan run's vocabulary file.
+    async fn retain_active_runs(&self) {
+        match store::active_run_ids(&self.db.master_pool).await {
+            Ok(active) => {
+                for pool in &self.pools {
+                    pool.provider.retain_runs(&active);
+                }
+            }
+            Err(e) => tracing::error!("Could not list the active auto-tag runs: {e}"),
+        }
+    }
+
+    /// Why a run of `provider_id` with `access` can't go on, when it can't. Reads the keyring,
+    /// or asks `claude` for its login, off the async workers.
+    async fn unavailable_reason(
+        &self,
+        provider_id: &str,
+        access: Option<String>,
+    ) -> Result<Option<String>, String> {
         let Ok(pool) = self.pool(provider_id) else {
             return Ok(Some(format!(
                 "The {provider_id} provider isn't available in this session"
             )));
         };
         let provider = pool.provider.clone();
-        tokio::task::spawn_blocking(move || provider.unavailable_reason())
+        tokio::task::spawn_blocking(move || provider.unavailable_reason(access.as_deref()))
             .await
             .map_err(|e| e.to_string())
     }
@@ -325,18 +350,31 @@ impl Engine {
             .ok_or_else(|| format!("Unknown tagging provider {provider_id}"))
     }
 
-    /// Every provider, with why it can't be picked. Blocks on the keyring: call it off async
-    /// workers.
-    pub fn provider_options(&self) -> Vec<ProviderOption> {
-        self.pools
-            .iter()
-            .map(|p| ProviderOption {
-                id: p.provider.id(),
-                label: p.provider.label(),
-                modes: p.provider.modes().to_vec(),
-                unavailable_reason: p.provider.unavailable_reason(),
-            })
-            .collect()
+    /// Every provider, with the access a run would use now and why it can't be picked.
+    pub async fn provider_options(&self) -> Result<Vec<ProviderOption>, String> {
+        let settings = settings::load(&self.db.master_pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        let providers: Vec<Arc<dyn TagProvider>> =
+            self.pools.iter().map(|p| p.provider.clone()).collect();
+        // The keyring and `claude auth status` block
+        tokio::task::spawn_blocking(move || {
+            providers
+                .iter()
+                .map(|provider| {
+                    let access = provider.access(&settings);
+                    ProviderOption {
+                        id: provider.id(),
+                        label: provider.label(),
+                        access,
+                        modes: provider.modes().to_vec(),
+                        unavailable_reason: provider.unavailable_reason(access),
+                    }
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| e.to_string())
     }
 
     pub async fn list_runs(&self) -> sqlx::Result<Vec<RunSummary>> {
@@ -358,11 +396,14 @@ impl Engine {
         mode: Mode,
     ) -> Result<StartedRun, String> {
         let pool = self.pool(provider_id)?;
-        let provider = pool.provider.clone();
-        let label = provider.label();
-        let unavailable = tokio::task::spawn_blocking(move || provider.unavailable_reason())
+        let label = pool.provider.label();
+        let settings = settings::load(&self.db.master_pool)
             .await
             .map_err(|e| e.to_string())?;
+        let access = pool.provider.access(&settings);
+        let unavailable = self
+            .unavailable_reason(provider_id, access.map(str::to_string))
+            .await?;
         if let Some(reason) = unavailable {
             return Err(reason);
         }
@@ -422,9 +463,6 @@ impl Engine {
                 (items, n, run_label)
             }
         };
-        let settings = settings::load(&self.db.master_pool)
-            .await
-            .map_err(|e| e.to_string())?;
         let id = uuid::Uuid::new_v4().to_string();
         store::create_run(
             &self.db.master_pool,
@@ -432,6 +470,7 @@ impl Engine {
                 id: &id,
                 label: &run_label,
                 provider: provider_id,
+                access,
                 model: pool.provider.model(&settings).as_deref(),
                 mode: mode.as_str(),
                 options: serde_json::json!({
@@ -543,8 +582,19 @@ impl Engine {
         if let Err(e) = recorded {
             tracing::error!("Could not record auto-tag item {}: {e}", item.asset_id);
         }
-        if let Err(e) = store::finish_run_if_complete(&self.db.master_pool, &item.run_id).await {
-            tracing::error!("Could not finish auto-tag run {}: {e}", item.run_id);
+        let finished = match store::finish_run_if_complete(master, &item.run_id).await {
+            Ok(finished) => finished,
+            Err(e) => {
+                tracing::error!("Could not finish auto-tag run {}: {e}", item.run_id);
+                false
+            }
+        };
+        let cancelled = matches!(
+            store::run_status(master, &item.run_id).await,
+            Ok(Some(status)) if status == "cancelled"
+        );
+        if finished || cancelled {
+            self.retain_active_runs().await;
         }
         self.events_wake.notify_one();
     }
@@ -588,6 +638,7 @@ impl Engine {
         let request = TagRequest {
             run_id: item.run_id.clone(),
             mode,
+            access: item.access.clone(),
             model: item.model.clone(),
             max_tags: max_tags as u32,
             max_proposals: item.options["maxProposals"].as_u64().unwrap_or(0) as u32,
@@ -628,6 +679,7 @@ impl Engine {
             &new_tags,
             &summary,
             &result.usage,
+            result.notice.as_deref(),
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -814,7 +866,7 @@ mod tests {
         fn max_tags(&self, settings: &AiSettings) -> u32 {
             settings.anthropic.max_tags
         }
-        fn unavailable_reason(&self) -> Option<String> {
+        fn unavailable_reason(&self, _access: Option<&str>) -> Option<String> {
             self.unavailable.clone()
         }
         fn tag<'a>(&'a self, request: &'a TagRequest) -> TagFuture<'a> {

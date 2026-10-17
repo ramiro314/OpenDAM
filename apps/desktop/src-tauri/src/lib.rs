@@ -10,6 +10,7 @@ use tauri::{Emitter, Manager};
 use tracing_subscriber::EnvFilter;
 
 use autotag::anthropic::AnthropicProvider;
+use autotag::claude_cli::ClaudeCli;
 use autotag::credentials::{self, Credentials};
 use autotag::engine::Engine;
 use autotag::provider::{NotYetBuilt, TagProvider};
@@ -19,6 +20,8 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub credentials: Arc<Credentials>,
     pub anthropic: Arc<AnthropicProvider>,
+    /// Claude-plan access, which `anthropic` also runs through. Personal use only.
+    pub claude: Arc<ClaudeCli>,
     pub autotag: Arc<Engine>,
     pub app_handle: tauri::AppHandle,
 }
@@ -102,7 +105,8 @@ pub fn run() {
 
             let db = Arc::new(db);
             let credentials = Arc::new(Credentials::from_process_env());
-            let anthropic = Arc::new(AnthropicProvider::new(credentials.clone()));
+            let claude = Arc::new(ClaudeCli::from_process_env(app_data_dir.clone()));
+            let anthropic = Arc::new(AnthropicProvider::new(credentials.clone(), claude.clone()));
             let events = app.handle().clone();
             let autotag = Engine::new(
                 db.clone(),
@@ -115,6 +119,7 @@ pub fn run() {
                 db,
                 credentials,
                 anthropic,
+                claude,
                 autotag: autotag.clone(),
                 app_handle: app.handle().clone(),
             });
@@ -212,6 +217,7 @@ pub fn run() {
             commands::settings::set_api_key,
             commands::settings::get_provider_status,
             commands::settings::test_provider,
+            commands::settings::get_claude_plan_status,
             commands::autotag::list_autotag_providers,
             commands::autotag::start_autotag_run,
             commands::autotag::list_autotag_runs,

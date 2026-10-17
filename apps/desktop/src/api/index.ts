@@ -13,6 +13,8 @@ import type {
   PreviewProgress,
   AiProvider,
   AiSettings,
+  AnthropicAccess,
+  ClaudePlanStatus,
   AiSettingsPatch,
   ProviderStatus,
   AutotagMode,
@@ -91,9 +93,15 @@ export const api = {
   setApiKey: (provider: AiProvider, key: string | null) =>
     invoke<ProviderStatus>('set_api_key', { provider, key }),
   getProviderStatus: () => invoke<ProviderStatus[]>('get_provider_status'),
-  /** One small request with the configured key, to `model` or the saved model */
-  testProvider: (provider: AiProvider, model?: string) =>
-    invoke<ConnectionTest>('test_provider', { provider, model: model ?? null }),
+  /** `claude`'s path, version and login, read from the cleaned environment runs use */
+  getClaudePlanStatus: () => invoke<ClaudePlanStatus>('get_claude_plan_status'),
+  /** One small request to `model` or the saved model, with the API key or on your Claude plan */
+  testProvider: (provider: AiProvider, model?: string, access?: AnthropicAccess) =>
+    invoke<ConnectionTest>('test_provider', {
+      provider,
+      model: model ?? null,
+      access: access ?? null,
+    }),
 
   // Auto-tagging runs. Progress arrives as `autotag:updated` events.
   listAutotagProviders: () => invoke<AutotagProviderOption[]>('list_autotag_providers'),

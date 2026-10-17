@@ -16,13 +16,14 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::claude_cli::ClaudeCli;
 use super::credentials::{self, Credentials};
 use super::pricing::{self, TokenUsage};
 use super::provider::{
     AssetInfo, ErrorClass, Mode, ProposedTag, ProviderError, TagFuture, TagProvider, TagRequest,
     TagResult, Thumbnail, Usage,
 };
-use super::settings::{AiSettings, DEFAULT_ANTHROPIC_MODEL};
+use super::settings::{AiSettings, AnthropicAccess, DEFAULT_ANTHROPIC_MODEL};
 use super::vocabulary::Vocabulary;
 
 pub const API_URL: &str = "https://api.anthropic.com";
@@ -49,7 +50,7 @@ pub struct MessagesRequest {
 /// The JSON schema of the answer. Existing only has no `proposed` field. Array lengths can't
 /// be constrained in the schema, so the caps are stated in the instructions and enforced when
 /// the answer is read.
-fn answer_schema(mode: Mode) -> Value {
+pub(crate) fn answer_schema(mode: Mode) -> Value {
     let existing = json!({ "type": "array", "items": { "type": "string" } });
     if mode == Mode::ExistingOnly {
         return json!({
@@ -173,8 +174,9 @@ fn image_block(image: &Thumbnail) -> Value {
     })
 }
 
-/// The production request for one asset.
-pub fn build_request(model: &str, request: &TagRequest) -> MessagesRequest {
+/// The user message's content: the image block when there is a thumbnail, then the asset text
+/// and the run's own vocabulary. Claude-plan runs send the same content through `claude`.
+pub(crate) fn user_content(request: &TagRequest) -> Vec<Value> {
     let mut content = Vec::new();
     if let Some(image) = &request.image {
         content.push(image_block(image));
@@ -183,20 +185,36 @@ pub fn build_request(model: &str, request: &TagRequest) -> MessagesRequest {
         "type": "text",
         "text": asset_text(&request.asset, &request.run_proposals, &request.vocabulary),
     }));
+    content
+}
+
+/// The instructions and the catalog vocabulary: the API's cached system block, and the
+/// Claude-plan run's `system.txt`.
+pub(crate) fn system_text(request: &TagRequest) -> String {
     let max_proposals = if request.mode == Mode::ExistingOnly {
         0
     } else {
         request.max_proposals
     };
+    system_prompt(
+        request.mode,
+        request.max_tags,
+        max_proposals,
+        &request.vocabulary,
+    )
+}
+
+/// The production request for one asset.
+pub fn build_request(model: &str, request: &TagRequest) -> MessagesRequest {
     let mut body = json!({
         "model": model,
         "max_tokens": MAX_TOKENS,
         "system": [{
             "type": "text",
-            "text": system_prompt(request.mode, request.max_tags, max_proposals, &request.vocabulary),
+            "text": system_text(request),
             "cache_control": { "type": "ephemeral" },
         }],
-        "messages": [{ "role": "user", "content": content }],
+        "messages": [{ "role": "user", "content": user_content(request) }],
         "output_config": {
             "format": { "type": "json_schema", "schema": answer_schema(request.mode) },
             "effort": "low",
@@ -327,7 +345,20 @@ pub fn parse_response(
         .filter(|block| block.kind == "text")
         .filter_map(|block| block.text.as_deref())
         .collect();
-    let answer: Answer = serde_json::from_str(&text).map_err(|e| {
+    Ok(TagResult {
+        usage: usage_of(&response, requested_model),
+        ..read_answer(&text, mode, max_proposals)?
+    })
+}
+
+/// Reads Claude's JSON answer, from either access. Proposals are dropped in Existing only and
+/// capped at `max_proposals` otherwise. The result has no usage yet.
+pub(crate) fn read_answer(
+    text: &str,
+    mode: Mode,
+    max_proposals: u32,
+) -> Result<TagResult, ProviderError> {
+    let answer: Answer = serde_json::from_str(text).map_err(|e| {
         ProviderError::new(
             ErrorClass::Item,
             format!("Claude's answer isn't the expected JSON: {e}"),
@@ -350,7 +381,7 @@ pub fn parse_response(
     Ok(TagResult {
         existing: answer.existing,
         proposed,
-        usage: usage_of(&response, requested_model),
+        ..Default::default()
     })
 }
 
@@ -427,6 +458,60 @@ pub struct ConnectionTest {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cost_usd: f64,
+    /// The request went through `claude` on your Claude plan, so it has no cost of its own.
+    pub on_plan: bool,
+}
+
+impl ConnectionTest {
+    /// How a test request over `request` went. `via` says how it reached `model`: "Connected to"
+    /// for the API, or the Claude plan's wording.
+    pub(crate) fn of(
+        model: &str,
+        request: &TagRequest,
+        outcome: Result<TagResult, ProviderError>,
+        on_plan: bool,
+    ) -> Self {
+        let via = if on_plan {
+            format!("Your Claude plan answered through claude with {model}")
+        } else {
+            format!("Connected to {model}")
+        };
+        match outcome {
+            Ok(result) => {
+                let accepted = request.vocabulary.accepted_tags(&result, 8);
+                let tags: Vec<String> = accepted
+                    .iter()
+                    .filter_map(|id| request.vocabulary.tags.iter().find(|t| &t.id == id))
+                    .map(|t| t.path.clone())
+                    .collect();
+                let message = if tags.is_empty() {
+                    format!("{via}, but it found no tags on the test image")
+                } else {
+                    format!("{via}. It tagged the test image {}", tags.join(", "))
+                };
+                ConnectionTest {
+                    ok: true,
+                    model: model.to_string(),
+                    message,
+                    tags,
+                    input_tokens: result.usage.input_tokens,
+                    output_tokens: result.usage.output_tokens,
+                    cost_usd: result.usage.cost_usd,
+                    on_plan,
+                }
+            }
+            Err(error) => ConnectionTest {
+                ok: false,
+                model: model.to_string(),
+                message: error.message,
+                tags: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+                on_plan,
+            },
+        }
+    }
 }
 
 /// A tiny catalog for "Test connection": the test image is a red square with a white circle.
@@ -480,6 +565,7 @@ pub fn test_request(model: &str) -> TagRequest {
     TagRequest {
         run_id: "connection-test".into(),
         mode: Mode::ExistingOnly,
+        access: None,
         model: Some(model.to_string()),
         max_tags: 8,
         max_proposals: 0,
@@ -496,8 +582,11 @@ pub fn test_request(model: &str) -> TagRequest {
     }
 }
 
+/// The one Anthropic provider (D11). Each run keeps the access it started with: API-key runs
+/// call the Messages API from here, Claude-plan runs go through `cli` and never reach `http`.
 pub struct AnthropicProvider {
     credentials: Arc<Credentials>,
+    cli: Arc<ClaudeCli>,
     base_url: String,
     http: Result<reqwest::Client, String>,
 }
@@ -505,16 +594,20 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     /// Talks to the Anthropic API, or in a debug build to `OPENDAM_ANTHROPIC_BASE_URL` when it
     /// is set, so a local stand-in can serve screenshots without a key.
-    pub fn new(credentials: Arc<Credentials>) -> Self {
+    pub fn new(credentials: Arc<Credentials>, cli: Arc<ClaudeCli>) -> Self {
         #[cfg(debug_assertions)]
         if let Ok(url) = std::env::var("OPENDAM_ANTHROPIC_BASE_URL") {
             tracing::info!("OPENDAM_ANTHROPIC_BASE_URL: Anthropic requests go to {url}");
-            return Self::with_base_url(credentials, url);
+            return Self::with_base_url(credentials, cli, url);
         }
-        Self::with_base_url(credentials, API_URL.to_string())
+        Self::with_base_url(credentials, cli, API_URL.to_string())
     }
 
-    pub fn with_base_url(credentials: Arc<Credentials>, base_url: String) -> Self {
+    pub fn with_base_url(
+        credentials: Arc<Credentials>,
+        cli: Arc<ClaudeCli>,
+        base_url: String,
+    ) -> Self {
         // reqwest's rustls needs a process-wide provider; installing it twice is harmless
         let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::builder()
@@ -524,6 +617,7 @@ impl AnthropicProvider {
             .map_err(|e| format!("Could not set up HTTPS: {e}"));
         Self {
             credentials,
+            cli,
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
         }
@@ -583,42 +677,7 @@ impl AnthropicProvider {
             parse_response(&body, request.mode, 0, model)
         }
         .await;
-        match outcome {
-            Ok(result) => {
-                let accepted = request.vocabulary.accepted_tags(&result, 8);
-                let tags: Vec<String> = accepted
-                    .iter()
-                    .filter_map(|id| request.vocabulary.tags.iter().find(|t| &t.id == id))
-                    .map(|t| t.path.clone())
-                    .collect();
-                let message = if tags.is_empty() {
-                    format!("Connected to {model}, but it found no tags on the test image")
-                } else {
-                    format!(
-                        "Connected to {model}. It tagged the test image {}",
-                        tags.join(", ")
-                    )
-                };
-                ConnectionTest {
-                    ok: true,
-                    model: model.to_string(),
-                    message,
-                    tags,
-                    input_tokens: result.usage.input_tokens,
-                    output_tokens: result.usage.output_tokens,
-                    cost_usd: result.usage.cost_usd,
-                }
-            }
-            Err(error) => ConnectionTest {
-                ok: false,
-                model: model.to_string(),
-                message: error.message,
-                tags: Vec::new(),
-                input_tokens: 0,
-                output_tokens: 0,
-                cost_usd: 0.0,
-            },
-        }
+        ConnectionTest::of(model, &request, outcome, false)
     }
 
     #[cfg(debug_assertions)]
@@ -672,7 +731,14 @@ impl TagProvider for AnthropicProvider {
         Some(settings.anthropic.model.clone())
     }
 
-    fn unavailable_reason(&self) -> Option<String> {
+    fn access(&self, settings: &AiSettings) -> Option<&'static str> {
+        Some(settings.anthropic.access.as_str())
+    }
+
+    fn unavailable_reason(&self, access: Option<&str>) -> Option<String> {
+        if access == Some(AnthropicAccess::ClaudePlan.as_str()) {
+            return self.cli.status().problem;
+        }
         if let Err(e) = &self.http {
             return Some(e.clone());
         }
@@ -689,9 +755,17 @@ impl TagProvider for AnthropicProvider {
     fn tag<'a>(&'a self, request: &'a TagRequest) -> TagFuture<'a> {
         Box::pin(async move {
             let model = request.model.as_deref().unwrap_or(DEFAULT_ANTHROPIC_MODEL);
+            // A run with no access recorded predates Claude-plan access: it used the API key
+            if request.access.as_deref() == Some(AnthropicAccess::ClaudePlan.as_str()) {
+                return self.cli.tag(request, model).await;
+            }
             let body = self.send(&build_request(model, request)).await?;
             parse_response(&body, request.mode, request.max_proposals, model)
         })
+    }
+
+    fn retain_runs(&self, active: &std::collections::HashSet<String>) {
+        self.cli.retain_runs(active);
     }
 }
 
@@ -821,6 +895,7 @@ mod tests {
         TagRequest {
             run_id: "run".into(),
             mode,
+            access: None,
             model: Some("claude-sonnet-5-5".into()),
             max_tags: 8,
             max_proposals: 3,
@@ -1122,7 +1197,11 @@ mod tests {
                 .then(|| key.map(str::to_string))
                 .flatten()
         });
-        AnthropicProvider::with_base_url(Arc::new(credentials), url.to_string())
+        AnthropicProvider::with_base_url(
+            Arc::new(credentials),
+            Arc::new(ClaudeCli::unused()),
+            url.to_string(),
+        )
     }
 
     #[tokio::test]
@@ -1218,7 +1297,7 @@ mod tests {
         let anthropic = provider(&api.url, None);
 
         assert_eq!(
-            anthropic.unavailable_reason().as_deref(),
+            anthropic.unavailable_reason(Some("api_key")).as_deref(),
             Some("Set up Anthropic in Settings")
         );
         let error = anthropic

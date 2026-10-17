@@ -2,8 +2,9 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::autotag::anthropic::ConnectionTest;
+use crate::autotag::claude_cli::ClaudePlanStatus;
 use crate::autotag::credentials::{Provider, ProviderStatus};
-use crate::autotag::settings::{self, AiSettings};
+use crate::autotag::settings::{self, AiSettings, AnthropicAccess};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -47,27 +48,41 @@ pub async fn get_provider_status(state: State<'_, Arc<AppState>>) -> Result<Vec<
         .map_err(|e| e.to_string())
 }
 
-/// Sends one small request in the production shape with the configured key, to `model` or the
-/// saved model. Errors come back in the result, for Settings to show.
+/// Claude-plan access as Settings shows it: `claude`'s path, version and login, read from the
+/// cleaned environment runs use.
+#[tauri::command]
+pub async fn get_claude_plan_status(state: State<'_, Arc<AppState>>) -> Result<ClaudePlanStatus> {
+    let claude = state.claude.clone();
+    // Two short `claude` subprocesses
+    tauri::async_runtime::spawn_blocking(move || claude.status())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Sends one small request in the production shape to `model` or the saved model, through
+/// `access` or the saved access: with the configured key, or through `claude` on your Claude
+/// plan. Errors come back in the result, for Settings to show.
 #[tauri::command]
 pub async fn test_provider(
     provider: Provider,
     model: Option<String>,
+    access: Option<AnthropicAccess>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<ConnectionTest> {
     match provider {
         Provider::Anthropic => {
+            let saved = settings::load(&state.db.master_pool)
+                .await
+                .map_err(|e| e.to_string())?
+                .anthropic;
             let model = match model.map(|m| m.trim().to_string()) {
                 Some(model) if !model.is_empty() => model,
-                _ => {
-                    settings::load(&state.db.master_pool)
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .anthropic
-                        .model
-                }
+                _ => saved.model,
             };
-            Ok(state.anthropic.test_connection(&model).await)
+            Ok(match access.unwrap_or(saved.access) {
+                AnthropicAccess::ApiKey => state.anthropic.test_connection(&model).await,
+                AnthropicAccess::ClaudePlan => state.claude.test_connection(&model).await,
+            })
         }
         Provider::Jev => Err("Jev's connection test isn't built yet".into()),
     }
@@ -76,6 +91,7 @@ pub async fn test_provider(
 #[cfg(test)]
 mod tests {
     use crate::autotag::anthropic::{mock, AnthropicProvider};
+    use crate::autotag::claude_cli::ClaudeCli;
     use crate::autotag::credentials::{Credentials, MemoryKeyring, Provider};
     use crate::autotag::engine::{Engine, RunScope};
     use crate::autotag::provider::Mode;
@@ -168,6 +184,7 @@ mod tests {
         .await;
         let anthropic = Arc::new(AnthropicProvider::with_base_url(
             creds.clone(),
+            Arc::new(ClaudeCli::unused()),
             api.url.clone(),
         ));
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -200,7 +217,7 @@ mod tests {
         assert_eq!((runs[0].status.as_str(), runs[0].done), ("done", 1));
         assert!(runs[0].cost_usd > 0.0, "the run's running cost");
         payloads.push(json!(runs));
-        payloads.push(json!(engine.provider_options()));
+        payloads.push(json!(engine.provider_options().await.unwrap()));
         payloads.push(json!(anthropic.test_connection("claude-sonnet-5-5").await));
         let received = api.received();
         assert_eq!(received.len(), 2, "the run's item and the connection test");

@@ -179,8 +179,12 @@ export interface SearchResult {
 // ── AI tagging settings ──────────────────────────────────────────────────
 export type AiProvider = 'anthropic' | 'jev';
 
+/** How Anthropic requests reach Claude: an API key, or your Claude plan through `claude` */
+export type AnthropicAccess = 'api_key' | 'claude_plan';
+
 export interface AnthropicSettings {
-  /** A Claude model id, one of ANTHROPIC_MODELS or a custom id */
+  access: AnthropicAccess;
+  /** A Claude model id, one of ANTHROPIC_MODELS or a custom id. It applies to both accesses */
   model: string;
   /** Requests in flight at once, shared by every run */
   concurrency: number;
@@ -218,6 +222,23 @@ export interface ProviderStatus {
   keyringProblem: string | null;
 }
 
+/** Claude-plan access: `claude`'s path, version and login, read as runs see them */
+export interface ClaudePlanStatus {
+  path: string | null;
+  /** "2.1.296 (Claude Code)" */
+  version: string | null;
+  loggedIn: boolean;
+  /** "claude.ai" when runs use your Claude plan */
+  authMethod: string | null;
+  /** "max", "pro", ... */
+  subscriptionType: string | null;
+  configured: boolean;
+  /** Why Claude-plan runs can't start, when they can't */
+  problem: string | null;
+  /** Auth overrides set for the app that `claude` never gets, such as ANTHROPIC_API_KEY */
+  ignoredOverrides: string[];
+}
+
 /** The result of "Test connection". It never carries the key. */
 export interface ConnectionTest {
   ok: boolean;
@@ -228,6 +249,8 @@ export interface ConnectionTest {
   inputTokens: number;
   outputTokens: number;
   costUsd: number;
+  /** Sent through `claude` on your Claude plan, so it has no cost of its own */
+  onPlan: boolean;
 }
 
 // ── Auto-tagging runs ────────────────────────────────────────────────────
@@ -238,6 +261,8 @@ export interface AutotagProviderOption {
   /** "anthropic", "jev", or in debug builds "fake" and "fake-text" */
   id: string;
   label: string;
+  /** How a run started now reaches it, for providers with more than one way */
+  access: AnthropicAccess | null;
   /** The modes the provider can do */
   modes: AutotagMode[];
   /** Why no run can start with it, when none can */
@@ -260,10 +285,14 @@ export interface RunSummary {
   label: string;
   provider: string;
   providerLabel: string;
+  /** "api_key" or "claude_plan" for Anthropic runs */
+  access: AnthropicAccess | null;
   model: string | null;
   mode: AutotagMode;
   status: RunStatus;
   pauseReason: string | null;
+  /** What the provider last reported without pausing, such as Claude plan usage */
+  notice: string | null;
   total: number;
   done: number;
   failed: number;

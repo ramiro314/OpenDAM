@@ -1,6 +1,7 @@
 //! The `TagProvider` trait every tagging provider implements, and its request and result types.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -52,6 +53,8 @@ pub struct Thumbnail {
 pub struct TagRequest {
     pub run_id: String,
     pub mode: Mode,
+    /// The run's access, for providers that have more than one (`TagProvider::access`).
+    pub access: Option<String>,
     /// The run's model, for providers that have one.
     pub model: Option<String>,
     /// The most catalog tags to pick; the engine also enforces it.
@@ -87,6 +90,9 @@ pub struct TagResult {
     pub existing: Vec<String>,
     pub proposed: Vec<ProposedTag>,
     pub usage: Usage,
+    /// Something the Runs panel shows on the run without pausing it, such as how much of a
+    /// Claude plan limit is used. Each result replaces the last one's.
+    pub notice: Option<String>,
 }
 
 /// How a failed call is handled (the plan's Failures).
@@ -145,9 +151,18 @@ pub trait TagProvider: Send + Sync {
     fn model(&self, _settings: &AiSettings) -> Option<String> {
         None
     }
-    /// Why no run can start, when none can. May block on the keyring: call it off async workers.
-    fn unavailable_reason(&self) -> Option<String>;
+    /// How new runs reach the provider, for providers with more than one way (Anthropic's API
+    /// key or Claude plan). Stored in `tag_runs.access` and handed back in `TagRequest::access`.
+    fn access(&self, _settings: &AiSettings) -> Option<&'static str> {
+        None
+    }
+    /// Why no run with `access` can start or resume, when none can. May block on the keyring or
+    /// a subprocess: call it off async workers.
+    fn unavailable_reason(&self, access: Option<&str>) -> Option<String>;
     fn tag<'a>(&'a self, request: &'a TagRequest) -> TagFuture<'a>;
+    /// Drops what the provider keeps per run for every run not in `active`, which holds each
+    /// run that can still send a request.
+    fn retain_runs(&self, _active: &HashSet<String>) {}
 }
 
 /// A provider whose requests come in a later ticket. It shows in the run dialog, with why it
@@ -193,7 +208,7 @@ impl TagProvider for NotYetBuilt {
         }
     }
 
-    fn unavailable_reason(&self) -> Option<String> {
+    fn unavailable_reason(&self, _access: Option<&str>) -> Option<String> {
         if !self.credentials.status(self.provider).configured {
             return Some(format!("Set up {} in Settings", self.label()));
         }

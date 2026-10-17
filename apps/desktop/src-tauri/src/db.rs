@@ -220,6 +220,9 @@ async fn create_master_tables(master_pool: &Pool<Sqlite>) -> sqlx::Result<()> {
     sqlx::query(crate::autotag::store::SCHEMA)
         .execute(master_pool)
         .await?;
+    for column in crate::autotag::store::ADDED_COLUMNS {
+        let _ = sqlx::query(column).execute(master_pool).await;
+    }
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS libraries (
@@ -955,6 +958,33 @@ mod tests {
                 Some("hint only a had")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_master_db_made_before_run_notices_gains_the_column_and_keeps_its_runs() {
+        let pool = memory_library_pool().await;
+        sqlx::query(
+            "CREATE TABLE tag_runs (id TEXT PRIMARY KEY, label TEXT NOT NULL,
+                 provider TEXT NOT NULL, access TEXT, model TEXT, mode TEXT NOT NULL,
+                 status TEXT NOT NULL, pause_reason TEXT, inline INTEGER NOT NULL DEFAULT 0,
+                 options TEXT NOT NULL DEFAULT '{}', input_tokens INTEGER NOT NULL DEFAULT 0,
+                 output_tokens INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL, finished_at INTEGER);
+             INSERT INTO tag_runs (id, label, provider, mode, status, created_at)
+             VALUES ('r', 'old run', 'anthropic', 'existing_only', 'done', 0);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        create_master_tables(&pool).await.unwrap();
+        create_master_tables(&pool).await.unwrap();
+
+        let run: (String, Option<String>) = sqlx::query_as("SELECT label, notice FROM tag_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(run, ("old run".to_string(), None));
     }
 
     #[tokio::test]
