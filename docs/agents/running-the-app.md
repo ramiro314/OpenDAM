@@ -60,6 +60,10 @@ real data:
      stand-in instead of `https://api.anthropic.com`, so the real provider can be exercised and
      photographed with a dummy key and no spend. It must answer `POST /v1/messages` like the API,
      for example with a file from `src-tauri/src/autotag/fixtures/anthropic/`.
+   - `OPENDAM_JEV_BASE_URL=http://127.0.0.1:<port>` does the same for Jev instead of
+     `https://api.typesafe.ai`. The stand-in answers `POST /v1/systemone`, for example with
+     `src-tauri/src/autotag/fixtures/jev/scores.json`, and `TYPESAFE_API_KEY` can be any dummy
+     value.
    - `OPENDAM_ANTHROPIC_FIXTURE=<path>` saves the response of a successful Settings "Test
      connection" there, after checking it holds no key. That is how the parser fixture is
      captured with a real key (see that folder's `README.md`).
