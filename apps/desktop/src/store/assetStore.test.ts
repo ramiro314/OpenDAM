@@ -9,16 +9,27 @@ const realDeleteAssets = api.deleteAssets;
 const realGetAsset = api.getAsset;
 const realListTags = api.listTags;
 const realAddToCollection = api.addToCollection;
+const realRemoveFromCollection = api.removeFromCollection;
+const realDeleteAsset = api.deleteAsset;
 
 const named = (id: string) => ({ id, fileName: `${id}.png`, collections: [] }) as unknown as Asset;
 const library = (n: number) => Array.from({ length: n }, (_, i) => named(`a${i}`));
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-/** Serves `search_assets` pages from `assets` (read on every call), recording each request. */
-function serve(assets: () => Asset[]) {
+/** A `search_assets` that never answers until `release`, recording each request. */
+function hold() {
   const calls: SearchPayload[] = [];
-  api.searchAssets = async (payload) => {
+  const waiting: (() => void)[] = [];
+  api.searchAssets = (payload) => {
     calls.push(payload);
+    return new Promise((_, reject) => waiting.push(() => reject('released')));
+  };
+  return { calls, release: () => waiting.forEach((w) => w()) };
+}
+
+/** A `search_assets` answering pages from `assets` (read on every call). */
+function pagesOf(assets: () => Asset[]): typeof api.searchAssets {
+  return async (payload) => {
     const all = assets();
     const start = payload.page * payload.pageSize;
     const result: SearchResult = {
@@ -28,6 +39,16 @@ function serve(assets: () => Asset[]) {
     };
     if (payload.includeTotal !== false) result.total = all.length;
     return result;
+  };
+}
+
+/** Serves `search_assets` pages from `assets`, recording each request. */
+function serve(assets: () => Asset[]) {
+  const calls: SearchPayload[] = [];
+  const answer = pagesOf(assets);
+  api.searchAssets = (payload) => {
+    calls.push(payload);
+    return answer(payload);
   };
   return calls;
 }
@@ -53,6 +74,8 @@ afterEach(() => {
   api.getAsset = realGetAsset;
   api.listTags = realListTags;
   api.addToCollection = realAddToCollection;
+  api.removeFromCollection = realRemoveFromCollection;
+  api.deleteAsset = realDeleteAsset;
 });
 
 describe('useAssetStore search errors', () => {
@@ -259,6 +282,111 @@ describe('useAssetStore page cache', () => {
   });
 });
 
+describe('useAssetStore page cache guards and failures', () => {
+  test('a page that fails to load stays uncached, leaves pending, and is asked for again', async () => {
+    const all = library(1000);
+    serve(() => all);
+    await useAssetStore.getState().search();
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+    api.searchAssets = async () => {
+      throw 'database is locked';
+    };
+    useAssetStore.getState().ensurePages([2]);
+    await flush();
+    consoleError.mockRestore();
+
+    expect(useAssetStore.getState().pages.has(2)).toBe(false);
+    expect(useAssetStore.getState().pending.size).toBe(0);
+
+    const calls = serve(() => all);
+    useAssetStore.getState().ensurePages([2]);
+    await flush();
+    expect(calls.map((c) => c.page)).toEqual([2]);
+    expect(useAssetStore.getState().assetAt(400)?.id).toBe('a400');
+  });
+
+  test('a failed refresh keeps the stale pages and total, then asks for the wanted pages again', async () => {
+    const all = library(1000);
+    serve(() => all);
+    await useAssetStore.getState().search();
+    // Page 2 is in flight when the refresh starts, which drops its answer
+    hold();
+    useAssetStore.getState().ensurePages([2]);
+    useAssetStore.getState().setViewTop(400);
+    // The refresh's first request, which counts the total, fails; page requests succeed
+    const calls: SearchPayload[] = [];
+    const answer = pagesOf(() => all);
+    api.searchAssets = async (payload) => {
+      calls.push(payload);
+      if (payload.includeTotal !== false) throw 'database is locked';
+      return answer(payload);
+    };
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+    await useAssetStore.getState().refresh();
+    await flush();
+    consoleError.mockRestore();
+
+    const s = useAssetStore.getState();
+    expect(s.total).toBe(1000);
+    expect(s.anchor).toBeNull();
+    expect(s.assetAt(0)?.id).toBe('a0');
+    expect(calls.at(-1)).toMatchObject({ page: 2, includeTotal: false });
+    expect(s.assetAt(400)?.id).toBe('a400');
+    expect(s.pending.size).toBe(0);
+  });
+
+  test('a refresh during a search runs the search again instead', async () => {
+    const first = hold();
+    const searching = useAssetStore.getState().search();
+    const all = library(1000);
+    const calls = serve(() => all);
+    useAssetStore.getState().setViewTop(400);
+    await useAssetStore.getState().refresh();
+    first.release();
+    await searching;
+
+    expect(calls.map((c) => [c.page, c.includeTotal])).toEqual([[0, true]]);
+    const s = useAssetStore.getState();
+    expect(s.total).toBe(1000);
+    expect(s.anchor).toBeNull();
+    expect(s.searchError).toBeNull();
+    expect(s.loading).toBe(false);
+  });
+
+  test('ensurePages asks for nothing before the first page or past the last one', async () => {
+    const all = library(1000);
+    const calls = serve(() => all);
+    await useAssetStore.getState().search();
+    calls.length = 0;
+
+    useAssetStore.getState().ensurePages([-1, 5, 9]);
+    await flush();
+
+    expect(calls).toEqual([]);
+    expect(useAssetStore.getState().wanted).toEqual([]);
+  });
+
+  test('ensurePages asks for nothing while a search is loading or with no results', async () => {
+    const all = library(1000);
+    serve(() => all);
+    await useAssetStore.getState().search();
+    const pending = hold();
+    void useAssetStore.getState().search();
+    useAssetStore.getState().ensurePages([1, 2]);
+    expect(pending.calls.map((c) => c.page)).toEqual([0]);
+    expect(useAssetStore.getState().wanted).toEqual([1, 2]);
+    pending.release();
+    await flush();
+
+    // The failed search left no results
+    const calls = serve(() => all);
+    useAssetStore.getState().ensurePages([0]);
+    await flush();
+    expect(useAssetStore.getState().total).toBe(0);
+    expect(calls).toEqual([]);
+  });
+});
+
 describe('useAssetStore deleteAssets', () => {
   test('after a partial failure, rethrows, deselects only the deleted assets and refreshes', async () => {
     let all = ['a', 'b', 'c', 'd'].map(named);
@@ -286,6 +414,45 @@ describe('useAssetStore deleteAssets', () => {
         ?.map((a) => a.id)
     ).toEqual(['b', 'd']);
     expect(useAssetStore.getState().total).toBe(2);
+  });
+
+  test('a successful delete deselects the assets and refetches the page without them', async () => {
+    let all = ['a', 'b', 'c', 'd'].map(named);
+    const calls = serve(() => all);
+    await useAssetStore.getState().search();
+    useUIStore.getState().selectAll(['a', 'c']);
+    api.deleteAssets = async (ids) => {
+      all = all.filter((a) => !ids.includes(a.id));
+    };
+    calls.length = 0;
+
+    await useAssetStore.getState().deleteAssets(['a', 'c']);
+
+    expect(calls.map((c) => [c.page, c.includeTotal])).toEqual([[0, true]]);
+    expect(useUIStore.getState().selectedAssetIds.size).toBe(0);
+    expect(
+      useAssetStore
+        .getState()
+        .pages.get(0)
+        ?.map((a) => a.id)
+    ).toEqual(['b', 'd']);
+    expect(useAssetStore.getState().total).toBe(2);
+  });
+
+  test('deleting one asset unfocuses it and refetches the page without it', async () => {
+    let all = ['a', 'b'].map(named);
+    serve(() => all);
+    await useAssetStore.getState().search();
+    useUIStore.getState().selectAsset('b');
+    api.deleteAsset = async (id) => {
+      all = all.filter((a) => a.id !== id);
+    };
+
+    await useAssetStore.getState().deleteAsset('b');
+
+    expect(useUIStore.getState().focusedAssetId).toBeNull();
+    expect(useAssetStore.getState().getById('b')).toBeUndefined();
+    expect(useAssetStore.getState().total).toBe(1);
   });
 
   test('a rejection without failed ids keeps every asset', async () => {
@@ -379,7 +546,7 @@ describe('useAutotagStore applyUpdate', () => {
   });
 });
 
-describe('useCollectionStore addToCollection', () => {
+describe('useCollectionStore membership', () => {
   test('adds the collection to the cached and pinned assets', async () => {
     const all = library(500);
     serve(() => all);
@@ -394,5 +561,21 @@ describe('useCollectionStore addToCollection', () => {
     expect(s.assetAt(4)?.collections).toEqual(['c-rocks']);
     expect(s.pinned.get('a3')?.collections).toEqual(['c-rocks']);
     expect(s.assetAt(5)?.collections).toEqual([]);
+  });
+
+  test('removes the collection from the cached and pinned assets', async () => {
+    const all = library(500).map((a) => ({ ...a, collections: ['c-rocks'] }));
+    serve(() => all);
+    await useAssetStore.getState().search();
+    useUIStore.getState().selectAsset('a3');
+    api.removeFromCollection = async () => {};
+
+    await useCollectionStore.getState().removeFromCollection('c-rocks', ['a3', 'a4', 'a450']);
+
+    const s = useAssetStore.getState();
+    expect(s.assetAt(3)?.collections).toEqual([]);
+    expect(s.assetAt(4)?.collections).toEqual([]);
+    expect(s.pinned.get('a3')?.collections).toEqual([]);
+    expect(s.assetAt(5)?.collections).toEqual(['c-rocks']);
   });
 });
