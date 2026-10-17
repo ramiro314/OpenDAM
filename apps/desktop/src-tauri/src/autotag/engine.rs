@@ -128,6 +128,9 @@ pub struct Engine {
     events_wake: Notify,
     sink: EventSink,
     retry_delays: Vec<Duration>,
+    /// Woken when a run is paused or cancelled, so items waiting to retry let go of their
+    /// provider permit at once instead of at the end of the wait.
+    run_stopped: Notify,
     /// Test-only fault: the library write of every item fails, as a NAS lock timeout would.
     #[cfg(test)]
     fail_library_writes: std::sync::atomic::AtomicBool,
@@ -163,6 +166,7 @@ impl Engine {
             events_wake: Notify::new(),
             sink,
             retry_delays,
+            run_stopped: Notify::new(),
             #[cfg(test)]
             fail_library_writes: Default::default(),
         })
@@ -206,6 +210,7 @@ impl Engine {
         if !paused {
             return Err("Only a running run can be paused".into());
         }
+        self.run_stopped.notify_waiters();
         self.events_wake.notify_one();
         Ok(())
     }
@@ -272,6 +277,7 @@ impl Engine {
         if !cancelled {
             return Err("Only a running or paused run can be cancelled".into());
         }
+        self.run_stopped.notify_waiters();
         self.events_wake.notify_one();
         Ok(())
     }
@@ -500,7 +506,10 @@ impl Engine {
             Err(Stop::Pause(reason)) => {
                 tracing::warn!("Auto-tag run {} paused: {reason}", item.run_id);
                 match store::pause_run(master, &item.run_id, Some(&reason)).await {
-                    Ok(_) => store::release_item(master, &item).await,
+                    Ok(_) => {
+                        self.run_stopped.notify_waiters();
+                        store::release_item(master, &item).await
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -654,17 +663,39 @@ impl Engine {
                 item.asset_id,
                 error.message
             );
-            tokio::time::sleep(delay).await;
-            let status = store::run_status(master, &item.run_id)
+            let still_running = self
+                .wait_to_retry(item, delay)
                 .await
                 .map_err(|e| e.to_string())?;
-            if status.as_deref() != Some("running") {
+            if !still_running {
                 return Err(Stop::Release);
             }
             store::count_attempt(master, item)
                 .await
                 .map_err(|e| e.to_string())?;
         }
+    }
+
+    /// Waits `delay` before a retry, ending early when the item's run is paused or cancelled.
+    /// Returns whether the run is still running.
+    async fn wait_to_retry(&self, item: &Item, delay: Duration) -> sqlx::Result<bool> {
+        let master = &self.db.master_pool;
+        let deadline = tokio::time::Instant::now() + delay;
+        loop {
+            // Listen before reading the status, so a stop landing between the two still wakes
+            // the wait. Another run stopping wakes it too: it reads the status and waits on.
+            let stopped = self.run_stopped.notified();
+            tokio::pin!(stopped);
+            stopped.as_mut().enable();
+            if store::run_status(master, &item.run_id).await?.as_deref() != Some("running") {
+                return Ok(false);
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = &mut stopped => {}
+            }
+        }
+        Ok(store::run_status(master, &item.run_id).await?.as_deref() == Some("running"))
     }
 
     fn assets_changed(&self, assets: Vec<String>) {
@@ -1448,7 +1479,7 @@ mod tests {
         assert_eq!(runs[0].done + runs[0].skipped, 4);
     }
 
-    /// A one-asset run whose first call fails with a retryable error, then waits 300 ms
+    /// A one-asset run whose first call fails with a retryable error, then waits a minute
     /// before its retry. Returns once that wait has begun.
     async fn run_waiting_to_retry() -> (Setup, String) {
         let s = setup_with_delays(
@@ -1461,7 +1492,7 @@ mod tests {
                 ..Default::default()
             },
             &["a1"],
-            vec![Duration::from_millis(300); 3],
+            vec![Duration::from_secs(60); 3],
         )
         .await;
         insert_tag(&s.engine.db.master_pool, "t-rock", "Rock").await;
@@ -1486,9 +1517,14 @@ mod tests {
         let (s, run_id) = run_waiting_to_retry().await;
         let master = &s.engine.db.master_pool;
 
+        let paused_at = std::time::Instant::now();
         s.engine.pause_run(&run_id).await.unwrap();
         let runs = wait_for(&s.engine, |runs| runs[0].running == 0).await;
 
+        assert!(
+            paused_at.elapsed() < Duration::from_secs(2),
+            "the item lets go of its permit at once, not after the minute's wait"
+        );
         assert_eq!(runs[0].status, "paused");
         assert_eq!(item(master, "a1").await, ("queued".into(), None, 1));
         assert_eq!(
@@ -1513,9 +1549,14 @@ mod tests {
         let (s, run_id) = run_waiting_to_retry().await;
         let master = &s.engine.db.master_pool;
 
+        let cancelled_at = std::time::Instant::now();
         s.engine.cancel_run(&run_id).await.unwrap();
         let runs = wait_for(&s.engine, |runs| runs[0].running == 0).await;
 
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(2),
+            "the item lets go of its permit at once, not after the minute's wait"
+        );
         assert_eq!(runs[0].status, "cancelled");
         assert_eq!((runs[0].skipped, runs[0].queued, runs[0].failed), (1, 0, 0));
         assert_eq!(item(master, "a1").await.0, "skipped");
@@ -1528,6 +1569,52 @@ mod tests {
         assert_eq!(
             count(&s.lib_pool, "SELECT COUNT(*) FROM asset_tags").await,
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fatal_error_ends_another_items_retry_wait_in_the_same_run() {
+        // Two items in flight: the first call fails retryably and waits a minute to retry, the
+        // second fails fatally and pauses the run.
+        let s = setup_with_delays(
+            Recording {
+                failures: failures(vec![
+                    ProviderError::new(ErrorClass::Retryable, "Overloaded"),
+                    ProviderError::new(ErrorClass::Fatal, "Anthropic rejected the API key"),
+                ]),
+                delay: Duration::from_millis(20),
+                ..Default::default()
+            },
+            &["a1", "a2"],
+            vec![Duration::from_secs(60); 3],
+        )
+        .await;
+        let master = &s.engine.db.master_pool;
+        settings::update(master, serde_json::json!({"anthropic": {"concurrency": 2}}))
+            .await
+            .unwrap();
+        s.engine.start().await;
+
+        let started_at = std::time::Instant::now();
+        s.engine
+            .start_run(scope(&["a1", "a2"]), "recording", Mode::ExistingOnly)
+            .await
+            .unwrap();
+        let runs = wait_for(&s.engine, |runs| {
+            runs[0].status == "paused" && runs[0].running == 0
+        })
+        .await;
+
+        assert!(started_at.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            runs[0].pause_reason.as_deref(),
+            Some("Anthropic rejected the API key")
+        );
+        assert_eq!((runs[0].queued, runs[0].done, runs[0].failed), (2, 0, 0));
+        assert_eq!(
+            s.provider.calls.lock().unwrap().len(),
+            2,
+            "no retry once paused"
         );
     }
 
