@@ -150,7 +150,10 @@ export function ReviewModal({ runId }: { runId: string }) {
   const [loaded, setLoaded] = useState(false);
   const [applying, setApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const onClose = () => openReview(null);
+  // While Apply runs the modal stays, so its outcome is never lost
+  const onClose = () => {
+    if (!applying) openReview(null);
+  };
 
   useEffect(() => {
     api
@@ -164,11 +167,11 @@ export function ReviewModal({ runId }: { runId: string }) {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') openReview(null);
+      if (e.key === 'Escape' && !applying) openReview(null);
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [openReview]);
+  }, [openReview, applying]);
 
   const tagOptions = useMemo(
     () =>
@@ -186,13 +189,14 @@ export function ReviewModal({ runId }: { runId: string }) {
     setError(null);
     try {
       await api.reviewAutotagProposals(runId, toDecisions(state));
-      await fetchTags();
-      onClose();
     } catch (e) {
       setError(String(e));
-    } finally {
       setApplying(false);
+      return;
     }
+    // Applied: a failed tag refresh must not invite a second Apply of the same review
+    openReview(null);
+    fetchTags().catch(console.error);
   };
 
   return (
@@ -228,7 +232,7 @@ export function ReviewModal({ runId }: { runId: string }) {
             >
               Reject all
             </button>
-            <button className={dialog.closeBtn} onClick={onClose} title="Close">
+            <button className={dialog.closeBtn} onClick={onClose} disabled={applying} title="Close">
               <IconX size={14} />
             </button>
           </div>
@@ -258,7 +262,11 @@ export function ReviewModal({ runId }: { runId: string }) {
                 ? `${undecided} undecided stay${undecided === 1 ? 's' : ''} for later`
                 : ''}
           </span>
-          <button className={clsx(dialog.btn, dialog.secondaryBtn)} onClick={onClose}>
+          <button
+            className={clsx(dialog.btn, dialog.secondaryBtn)}
+            onClick={onClose}
+            disabled={applying}
+          >
             Cancel
           </button>
           <button
