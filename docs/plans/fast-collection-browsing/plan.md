@@ -12,6 +12,27 @@ decision changed:
 - The windowed grid and list keep #62's right-click menu.
 - The merge-conflict risk with ticket #50 is gone, because it landed as #62.
 
+Revised again 2026-10-16 after Plan Validation repair round 1. These close validation gaps inside
+the approved decisions; no decision changed:
+
+- **No reader left behind between steps.** Step 3 removes `assets`, so it also moves the list view
+  and the footer onto the page cache. Step 4 adds only keyboard paging and the scrub label.
+- **Render mode from step 1.** `bench_render_mode` reports the effective mode read from the
+  environment (`describe_render_env`). So it works before step 7, and step 7 doesn't change it.
+- **Benchmarks and checks never touch your live library.** Agents run them on a fresh copy of a
+  golden snapshot of the Kenney library, in a throwaway profile, so the step-1 baseline can be
+  rerun on identical data at any later step.
+- **UI checks.** Each user-facing behavior gets a scripted check (U1-U8) in the dev harness, with
+  screenshots.
+- **WebKitGTK capabilities.**
+  - A probe confirmed that `image-rendering: pixelated` works in WebKitGTK 2.54.1.
+  - The scrub label no longer depends on `pointerdown` events from the native scrollbar, which
+    are unverified. It keys off scroll speed, which any thumb drag on a big collection exceeds.
+- **Interrupt-safe cleanup pass.** It deletes a batch's files before committing the batch.
+  - An interrupted pass redoes that batch on the next open and never orphans files.
+  - A card whose thumbnail fails to load falls back to the original.
+  - A test covers the interruption.
+
 ## Problem
 
 In your words: scanning big collections with the infinite scroll gets slow. The scrollbar doesn't
@@ -146,7 +167,7 @@ kept them at review (D20).
 | C6 | `SearchPayload` gains `includeTotal` (default `true`). `SearchResult.total` becomes optional. | This is how D14's "count once per query" reaches the backend. Only the first page of a query and refreshes ask for the total. |
 | C7 | The multi-library merge compares exactly as SQLite does. | Each library's list arrives sorted by SQLite, so the merge must use the same comparator or the global top N can miss rows. Names compare with NOCASE semantics (ASCII-only folding, then bytewise), `kind` bytewise, and numbers numerically. Ties break by library position, then `rowid`. Today's Rust comparator uses Unicode `to_lowercase` and has no tie-break. |
 | C8 | Cards stop building per-card maps. | One shared memoized collection-name map replaces the map each `AssetCard` builds on every render. |
-| C9 | Without a thumbnail, the grid and list choose the original by file extension, not by asset kind. | The rule is: show the original if it is webview-displayable (png, jpg, jpeg, webp, bmp, gif, svg). `DetailPanel` already uses this list. Today a small PNG of kind `material` would show a placeholder once its thumbnail is gone. |
+| C9 | Without a thumbnail, the grid and list choose the original by file extension, not by asset kind. | The rule is: show the original if it is webview-displayable (png, jpg, jpeg, webp, bmp, gif, svg). `DetailPanel` already uses this list. Today a small PNG of kind `material` would show a placeholder once its thumbnail is gone. A thumbnail that fails to load falls back to the original the same way, before the placeholder. |
 | C10 | The cleanup pass is recorded in a new per-library `library_meta (key, value)` table, under key `thumbs_no_upscale`. | Once recorded, it never re-reads 57k image headers on later opens, which matters on network shares. It is resumable, because cleared rows no longer match. |
 | C11 | The cleanup pass only touches assets whose own extension is a raster image. | 3D-model thumbnails are also named `<id>_thumb.png`, so matching on the file name would delete them. |
 | C12 | The footer shows the visible range, `41,201-41,236 of 83,095 assets`. | "Loaded of total" means nothing once pages are evicted. |
@@ -227,8 +248,10 @@ Actions:
 | `patchCached(id, fn)` | Replaces one asset in its page, so only that page's rows re-render. It also updates the pinned copy. `patchAsset`, `updateAssetPreview`, `setPreviewStatus`, `refreshAssets` and the collection store's add/remove loops all use it. |
 | `refresh()` | Invalidates the cache but keeps stale pages on screen until they are replaced, refetches the total and the wanted pages, then applies the anchor (C5). |
 
-These callers move off `assets`:
+These callers move off `assets`, all in the same build step (step 3):
 
+- `AssetGrid.tsx`: the grid, the list view (`assets.map` into `AssetListRow`) and the footer
+  (`assets.length`).
 - `App.tsx` and `DetailPanel.tsx`: focused-asset lookups use `getById`.
 - `CollectionsSection.tsx`: `resolveDroppedAssetId` gets the cached assets.
 - `refreshAssets(ids)`: `useAutotagStore.applyUpdate` calls it for assets an auto-tag run changed.
@@ -277,8 +300,11 @@ These callers move off `assets`:
     height.
   - Text: `41,200 of 83,095 - M`, where the position is the first visible index plus 1. The key
     shows once that asset's page is cached.
-  - When it shows: while the pointer is down on the scrollbar (`offsetX >= clientWidth` at
-    pointerdown), or when scroll speed exceeds 2 viewport heights per second.
+  - When it shows: while scroll speed exceeds 2 viewport heights per second.
+    - That covers flings, and it covers every thumb drag on a big collection: there, one pixel of
+      thumb travel moves the content thousands of pixels, several viewport heights.
+    - It doesn't rely on `pointerdown` from the native scrollbar. Whether WebKitGTK dispatches that
+      event is unverified, so the plan doesn't use it.
   - It hides 600 ms after the last scroll event, and is `aria-hidden`.
   - Keys come from the pure function `scrubKey(asset, sortField)`:
 
@@ -321,8 +347,12 @@ These callers move off `assets`:
      (png, jpg, jpeg, webp, bmp, gif, tga, tif, tiff).
   2. It reads each source's header. Sources that are missing or unreadable are skipped.
   3. Where the max side is 512 px or smaller:
-     - **Webview-displayable sources:** it sets `thumbnail_path = NULL` in transactions of 200
-       rows, then deletes the thumbnail file after each commit (ignoring NotFound).
+     - **Webview-displayable sources:** it works in batches of 200. It deletes the batch's
+       thumbnail files first (ignoring NotFound), then sets `thumbnail_path = NULL` for the batch
+       in one transaction.
+       - If the pass is interrupted between the two, those rows still point at deleted files, so
+         the next open redoes the batch. No file is orphaned and no row is lost.
+       - Until then, a card whose thumbnail fails to load shows the original (C9).
      - **TGA and TIFF:** it re-queues a preview job, so the image queue rewrites the thumbnail at
        native size.
   4. It sets the meta key to `done` and emits `library:updated` once.
@@ -340,6 +370,10 @@ These callers move off `assets`:
   the preference is pixelated and the image is enlarged in device pixels (D19, C14). A hook,
   `useImageScaling`, applies `image-rendering: pixelated` to the grid card, the list thumbnail,
   the detail panel preview and the QuickLook image (D15). It re-checks on load and on resize.
+- **Verified in WebKitGTK.** A probe ran MiniBrowser in a nested headless KWin on this machine
+  (WebKitGTK 2.54.1). A 4x4 checkerboard scaled to 256 px rendered with hard pixel edges under
+  `image-rendering: pixelated`, also with `object-fit: cover`. That held in both CPU mode and
+  `WEBKIT_DMABUF_RENDERER_FORCE_SHM=1`. Without the property, the same image rendered blurred.
 
 ### GPU rendering (D8, D19)
 
@@ -365,8 +399,19 @@ flowchart LR
   - Otherwise, if `/proc/driver/nvidia/version` exists, it sets
     `WEBKIT_DMABUF_RENDERER_FORCE_SHM=1`. The mode is `gpu-shm`.
   - Otherwise it sets nothing. The mode is `webkit-default`.
+- **Reporting the mode.** `describe_render_env(lookup_env)` is a pure function added in step 1. It
+  names the effective mode from the variables that are set once `main.rs` has applied its defaults:
+  - `cpu`: `WEBKIT_DISABLE_DMABUF_RENDERER` or `WEBKIT_SKIA_ENABLE_CPU_RENDERING` is set.
+  - `gpu-shm`: otherwise, if `WEBKIT_DMABUF_RENDERER_FORCE_SHM` is set.
+  - `explicit-sync`: otherwise, if `__NV_DISABLE_EXPLICIT_SYNC` is set.
+  - `webkit-default`: none of them is set.
+
+  Until step 7, `main.rs` always sets `WEBKIT_DISABLE_DMABUF_RENDERER=1`, so it reports `cpu`. The
+  startup log and `bench_render_mode` both use it. Step 7 therefore changes what gets set, not how
+  it is reported.
 - **Applying it.** `main.rs` applies the choice before Tauri starts any threads and passes it to
-  `opendam_desktop_lib::run`, which logs it under the `render` target once tracing is up.
+  `opendam_desktop_lib::run`. Once tracing is up, `run` logs the choice's reason and the
+  `describe_render_env` mode under the `render` target.
 - **Effect.** On NVIDIA, GPU painting, compositing layers and threaded scrolling come back. Machines
   without NVIDIA move from today's CPU mode (the variable is set unconditionally now) to WebKit's
   default DMA-BUF path. Setting `WEBKIT_DISABLE_DMABUF_RENDERER=1` yourself restores the old
@@ -384,13 +429,14 @@ flowchart LR
 
 ### Scroll benchmark (D7, D13, D19, C13)
 
-- **Entry point.** `apps/desktop/src/dev/scrollBench.ts` is loaded from `main.tsx` only when
-  `import.meta.env.DEV && import.meta.env.VITE_SCROLL_BENCH === '1'`. Vite drops the branch from
-  release builds.
+- **Entry point.** `main.tsx` loads `apps/desktop/src/dev/scrollBench.ts` only when
+  `import.meta.env.DEV` is true and `VITE_SCROLL_BENCH` is set: `1` runs the timing scenarios and
+  `checks` runs the UI checks. Vite drops the branch from release builds.
 - **Debug-only Tauri commands (C13).**
   - `bench_rss` sums `VmRSS` of descendant processes whose `comm` starts with `WebKitWebProces`
     (`comm` is truncated to 15 characters).
-  - `bench_render_mode` returns the startup mode.
+  - `bench_render_mode` returns `describe_render_env` for the environment the app started
+    with. It works from step 1 on and needs no change in step 7.
   - `bench_report(json)` prints the report and writes
     `apps/desktop/src-tauri/target/scroll-bench/<mode>-<unix-ts>.json`, which is gitignored.
 - **DOM markers.**
@@ -417,15 +463,42 @@ flowchart LR
   - Scenario 2 becomes "jump to the bottom repeatedly until 20,000 assets have loaded or 120 s
     pass".
   - Scenario 3 is reported as unsupported.
-- **Where it runs.** Agents run it on the Kenney library in a nested headless KWin with a virtual
-  1400x900 output, its own D-Bus session and `OPENDAM_NO_KEYRING=1`, never on your desktop
-  session. You can rerun it on the real session.
+- **UI checks.** `VITE_SCROLL_BENCH=checks` runs the checks U1-U8 (see
+  [Acceptance targets](#acceptance-targets)) instead of the timing scenarios.
+  - It writes PASS or FAIL for each check into the same report.
+  - It logs a named pause wherever the nested-KWin script should take a screenshot, which goes
+    into `.evidence/` for the PR.
+  - Key presses are dispatched to the scroll container. That exercises the plan's own key handler,
+    since it doesn't rely on native scrolling.
+- **Bench data, never the live library.** Agent builds from this plan's branches never open
+  `~/Documents/Kenney/Assets` or the real master DB, because they write to any library they open
+  (indexes, `library_meta`, the cleanup pass).
+  1. **Golden snapshot, once, in step 1.**
+     - `rsync -a` the live library root to `~/.cache/opendam-bench/kenney-golden/`, excluding
+       `.opendam/library.sqlite*`, `.opendam/index.lock` and `.opendam/backup-*`.
+     - Copy the DB with `sqlite3 -readonly <live>/.opendam/library.sqlite ".backup <golden>/.opendam/library.sqlite"`,
+       which stays consistent even while your app holds the DB.
+     - The snapshot is about 5.5 GB. The disk is ext4, which has no reflinks, and has 666 GB free.
+     - A `golden.json` records the source, the time, the asset count and the commit.
+  2. **Each run.**
+     - `cp -a` the golden snapshot into a fresh run directory and start from a fresh
+       `XDG_DATA_HOME`.
+     - Register the run copy as the only library by seeding the throwaway master DB, as in
+       "A throwaway profile".
+     - Delete the run directory afterwards.
+  3. **Comparisons.** Every comparison (baseline, after, GPU modes) uses the same golden snapshot,
+     so the step-1 baseline can be rerun on identical data at any later step. The cleanup pass and
+     the new indexes only ever run on run copies. Your live library gets them when you run a build
+     that has them.
+- **Where it runs.** Agents run it in a nested headless KWin with a virtual 1400x900 output, its own
+  D-Bus session and `OPENDAM_NO_KEYRING=1`, never on your desktop session. You can rerun it on the
+  real session.
 
 ## Acceptance targets
 
-These are D18's targets. They are measured by the benchmark on the Kenney library at md grid size
-with the new GPU default, in the nested headless KWin. The report also records the CPU-mode
-numbers and the pre-change baseline for comparison.
+These are D18's targets. The benchmark measures them at md grid size with the new GPU default, in
+the nested headless KWin, on a run copy of the golden Kenney snapshot. The report also records the
+CPU-mode numbers and the pre-change baseline for comparison.
 
 | # | Target | Scenario |
 |---|---|---|
@@ -433,6 +506,20 @@ numbers and the pre-change baseline for comparison.
 | T2 | A jump to any offset fills the visible tiles within 300 ms at p95. | Random jumps |
 | T3 | Continuous-scroll p95 frame interval is 20 ms or less, with no frame over 100 ms. | Continuous scroll |
 | T4 | Web-process RSS grows by less than 150 MB after scrolling end to end. | End to end |
+
+The UI checks run in the harness's `checks` mode on a run copy. Each must pass in the step that
+delivers its behavior and again in the final run (step 8).
+
+| # | Check | Behavior | Step |
+|---|---|---|---|
+| U1 | With only page 0 cached, `scrollHeight` matches `ceil(total / columns) x rowPitch` within one row. | Full-size scrollbar (D2) | 3 |
+| U2 | After a jump to 75%, placeholders show, then every visible tile is ready within 300 ms. Screenshot after the fill. | Jumping and placeholders (D2, T2) | 3 |
+| U3 | In list view, rendered rows stay under 60 from top to bottom, and the footer reads `first-last of total assets`. | Windowed list and footer (D6, C12) | 3 |
+| U4 | Changing the grid size keeps the first visible asset in the first visible row. | Anchoring (D14) | 3 |
+| U5 | Right-clicking a card at offset 60,000 opens the menu with `grid-menu-autotag`, and Escape closes it. | #62's context menu kept | 3 |
+| U6 | During a scripted scroll faster than 2 viewport heights per second, under name and date sort, the label shows `<n> of <total> - <key>`. It hides 0.6 s after the scroll stops. Screenshot while visible. | Scrub label (D5, D19) | 4 |
+| U7 | With the container focused, End shows the last row, Home the first, and Page Down advances by one viewport minus one row. | Keyboard (D17) | 4 |
+| U8 | `#image-scaling-toggle` flips an enlarged small image's computed `image-rendering` between `pixelated` and `auto`. A shrunk image stays `auto`, and the setting survives a reload. Screenshots of both states. | Scaling toggle (D11, D15, D16) | 6 |
 
 Two checks need a human:
 
@@ -469,28 +556,45 @@ Tests run by file, as `AGENTS.md` says. Each regression test must fail on `main`
     - It keeps large rasters and leaves model thumbnails alone.
     - It re-queues small TGAs.
     - It records `library_meta`, and a second run does nothing.
+    - It is safe to interrupt. A test hook stops the pass after it deletes a batch's files but
+      before it commits the batch. A rerun redoes that batch and finishes the rest. It sets
+      `library_meta` only at the end, and leaves the same rows and files as an uninterrupted run.
   - `choose_render_env`: user-set variables win, NVIDIA gets FORCE_SHM, and other GPUs keep the
     default.
+  - `describe_render_env`: each variable maps to its mode, `WEBKIT_DISABLE_DMABUF_RENDERER` wins
+    over the others, and no variable gives `webkit-default`.
+- **UI checks U1-U8:** these run in the nested KWin through the harness's `checks` mode (see
+  [Acceptance targets](#acceptance-targets)), not in `bun test`.
 
 ## Suggested build order
 
 The follow-up ticket slicing decides the final cut. This is the dependency order the design
 implies:
 
-1. **Benchmark harness and baseline.** Commit the harness, the DOM markers on today's grid and the
-   debug-only commands. Record the baseline report in CPU mode.
+1. **Benchmark harness, snapshot and baseline.**
+   - Commit the harness with its `checks` mode, the DOM markers on today's grid, and the
+     debug-only commands with `describe_render_env`.
+   - Take the golden snapshot.
+   - Record the baseline report in CPU mode on a run copy.
 2. **Search backend.** The `rowid` tie-break, NOCASE and size indexes, `includeTotal`, and the
    key-only multi-library merge.
-3. **Page cache and windowed grid.** Fixed card height, placeholders, no fade-in, anchoring, and the
-   shared collection map. Depends on step 2.
-4. **Navigation.** The windowed list view, keyboard paging, scrub label and footer range. Depends on
-   step 3.
+3. **Page cache, windowed grid and windowed list.** Depends on step 2.
+   - Every reader of `assets` moves in this step, so nothing reads it once it's gone:
+     - the grid, the list view and the footer range (C12);
+     - `App.tsx`, `DetailPanel.tsx` and `CollectionsSection.tsx`;
+     - `refreshAssets` and the collection store's loops.
+   - Fixed card height, placeholders, no fade-in, anchoring and the shared collection map also
+     land here.
+   - Checks U1-U5.
+4. **Navigation.** Keyboard paging and the scrub label. Checks U6-U7. Depends on step 3.
 5. **Thumbnails.** The no-upscale rule, the extension-based fallback and the cleanup pass.
-   Independent of step 3, apart from a small overlap in `AssetCard`'s image branch.
-6. **Image scaling toggle.** After steps 3 and 5.
-7. **GPU default and mode comparison.** Independent; the comparison needs step 1 and means most
-   after step 3.
-8. **Final benchmark.** Check T1-T4 after all of the above, then the human checks.
+   Independent of step 3, apart from a small overlap in `AssetCard`'s image branch. Its tests
+   include the interrupted pass.
+6. **Image scaling toggle.** Check U8. After steps 3 and 5.
+7. **GPU default and mode comparison.** Independent. The comparison uses step 1's harness and
+   `bench_render_mode` unchanged, and means most after step 3.
+8. **Final run.** T1-T4 and U1-U8 on a fresh run copy after all of the above, then the human
+   checks.
 
 ## Docs and invariants
 
@@ -503,7 +607,10 @@ implies:
     Nothing maps over all results.
 - **`docs/agents/running-the-app.md`.** Replace the note that `main.rs` sets
   `WEBKIT_DISABLE_DMABUF_RENDERER=1` with the mode selection and how to override it. Document the
-  benchmark: how to run it, the nested-KWin recipe, and where reports land.
+  benchmark and its `checks` mode:
+  - how to run it, the nested-KWin recipe, and where reports land;
+  - the bench data recipe: the golden snapshot, run copies, and the rule that builds from these
+    branches never open the live library.
 
 ## Risks and known gaps
 
@@ -515,6 +622,10 @@ implies:
   are judged there because agents can't use your desktop.
 - **Concurrent work.** Open tickets from the AI auto-tagging plan may still touch `AssetGrid.tsx`
   or the asset store. Whichever lands second rebases.
+- **Snapshot drift.** The golden snapshot is frozen at step 1, so later changes to your live
+  library aren't in it. That's intended: comparisons need identical data.
+- **Disk use.** The golden snapshot takes about 5.5 GB under `~/.cache/opendam-bench`, and each
+  run copy takes as much again until it is deleted.
 - **The cleanup pass on network shares.** It reads about 57k image headers once per library. It is
   background work and resumable, but it can take minutes over SMB.
 
