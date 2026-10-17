@@ -1027,6 +1027,33 @@ mod tests {
     }
 
     #[test]
+    fn the_model_that_answered_sets_the_rates() {
+        let body = |model: &str| {
+            format!(
+                r#"{{{model}"stop_reason":"end_turn",
+                     "content":[{{"type":"text","text":"{{\"existing\":[]}}"}}],
+                     "usage":{{"input_tokens":1000000,"output_tokens":0}}}}"#
+            )
+        };
+        let cost = |body: &str, requested: &str| {
+            parse_response(body, Mode::ExistingOnly, 0, requested)
+                .unwrap()
+                .usage
+                .cost_usd
+        };
+
+        // A fallback to Opus 5.5 is priced at Opus rates ($4/M in), not Sonnet's ($2/M)
+        let fallback = body(r#""model":"claude-opus-5-5","#);
+        assert!((cost(&fallback, "claude-sonnet-5-5") - 4.0).abs() < 1e-9);
+        // No model, or one the table lacks, falls back to the requested model's rates
+        assert!((cost(&body(""), "claude-sonnet-5-5") - 2.0).abs() < 1e-9);
+        let unknown = body(r#""model":"claude-future-9","#);
+        assert!((cost(&unknown, "claude-sonnet-5-5") - 2.0).abs() < 1e-9);
+        // Neither priced: the cost counts as 0
+        assert_eq!(cost(&unknown, "my-custom-model"), 0.0);
+    }
+
+    #[test]
     fn a_final_refusal_fails_the_item() {
         let error =
             parse_response(REFUSAL, Mode::ExistingOnly, 0, "claude-sonnet-5-5").unwrap_err();
@@ -1221,6 +1248,62 @@ mod tests {
         assert_eq!(body["output_config"]["effort"], "low");
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");
         assert_eq!(body["fallbacks"], "default");
+    }
+
+    /// The model saved in Settings when a run starts is the one its requests name, through the
+    /// run row, `claim_item` and the engine.
+    #[tokio::test]
+    async fn a_run_sends_the_model_it_was_started_with() {
+        use crate::autotag::engine::Engine;
+        use crate::autotag::settings;
+        use crate::db::{insert_asset, memory_database, memory_library, memory_library_pool};
+
+        let lib_pool = memory_library_pool().await;
+        insert_asset(&lib_pool, "a1").await;
+        let db = Arc::new(memory_database(vec![memory_library("lib", lib_pool)]).await);
+        settings::update(
+            &db.master_pool,
+            json!({"anthropic": {"model": "claude-haiku-5-5"}}),
+        )
+        .await
+        .unwrap();
+        let api = mock::serve(200, &[], UNKNOWN_IDS).await;
+        let engine = Engine::new(
+            db.clone(),
+            vec![Arc::new(provider(&api.url, Some("key")))],
+            Arc::new(|_| {}),
+        );
+        engine.start().await;
+
+        let started = engine
+            .start_run(vec!["a1".into()], "anthropic", Mode::ExistingOnly)
+            .await
+            .unwrap();
+        // A later change to the setting doesn't touch a run already started
+        settings::update(
+            &db.master_pool,
+            json!({"anthropic": {"model": "claude-opus-5-5"}}),
+        )
+        .await
+        .unwrap();
+        for _ in 0..500 {
+            if !api.received().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(started.run.model.as_deref(), Some("claude-haiku-5-5"));
+        let received = api.received();
+        assert_eq!(received.len(), 1);
+        let body: Value = serde_json::from_str(&received[0].body).unwrap();
+        assert_eq!(body["model"], "claude-haiku-5-5");
+        assert!(body.get("fallbacks").is_none());
+        assert!(
+            !received[0].head.contains("anthropic-beta"),
+            "{}",
+            received[0].head
+        );
     }
 
     #[test]
