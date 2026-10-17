@@ -134,6 +134,9 @@ pub struct Engine {
     /// Test-only fault: the library write of every item fails, as a NAS lock timeout would.
     #[cfg(test)]
     fail_library_writes: std::sync::atomic::AtomicBool,
+    /// Test-only fault: `resume` can't run its finish check, as with a locked master DB.
+    #[cfg(test)]
+    fail_finishing: std::sync::atomic::AtomicBool,
 }
 
 impl Engine {
@@ -169,6 +172,8 @@ impl Engine {
             run_stopped: Notify::new(),
             #[cfg(test)]
             fail_library_writes: Default::default(),
+            #[cfg(test)]
+            fail_finishing: Default::default(),
         })
     }
 
@@ -257,11 +262,18 @@ impl Engine {
         let resumed = store::resume_runs(master, run_ids)
             .await
             .map_err(|e| e.to_string())?;
-        // A run paused after its last item was claimed has nothing left to hand out.
+        // A run paused after its last item was claimed has nothing left to hand out. The runs
+        // are `running` already, so a failure here is logged, never returned: the schedulers
+        // and the UI must still hear about them.
         for run_id in &resumed {
-            store::finish_run_if_complete(master, run_id)
-                .await
-                .map_err(|e| e.to_string())?;
+            #[cfg(test)]
+            if self.fail_finishing.load(Ordering::SeqCst) {
+                tracing::warn!("Test fault: not finishing resumed run {run_id}");
+                continue;
+            }
+            if let Err(e) = store::finish_run_if_complete(master, run_id).await {
+                tracing::error!("Could not finish resumed auto-tag run {run_id}: {e}");
+            }
         }
         for pool in &self.pools {
             pool.wake.notify_one();
@@ -1777,6 +1789,27 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(s.provider.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_finish_check_on_resume_still_wakes_the_scheduler() {
+        let s = setup(Recording::default(), &["a1", "a2"]).await;
+        let master = &s.engine.db.master_pool;
+        insert_paused_run(master, "run", "recording", "a1").await;
+        sqlx::query(
+            "INSERT INTO tag_run_items (run_id, asset_id, library_id) VALUES ('run', 'a2', 'lib')",
+        )
+        .execute(master)
+        .await
+        .unwrap();
+        s.engine.start().await;
+        s.engine.fail_finishing.store(true, Ordering::SeqCst);
+
+        s.engine.resume_run("run").await.unwrap();
+        let runs = wait_until_done(&s.engine).await;
+
+        assert_eq!((runs[0].done, runs[0].failed), (2, 0));
+        assert_eq!(s.provider.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
