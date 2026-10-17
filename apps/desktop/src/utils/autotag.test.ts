@@ -31,12 +31,14 @@ function run(status: RunSummary['status'], done: number, total: number, failed =
     mode: 'existing_only',
     status,
     pauseReason: null,
+    inline: false,
     total,
     done,
     failed,
     skipped: 0,
     running: 0,
     queued: total - done - failed,
+    pendingProposals: status === 'awaiting_review' ? 2 : 0,
     inputTokens: 0,
     outputTokens: 0,
     costUsd: 0,
@@ -137,10 +139,10 @@ describe('modeOptions', () => {
     expect(options[1].reason).toBe('Jev can only match existing tags, not propose new ones');
   });
 
-  test('modes the engine cannot run yet are disabled for every provider', () => {
+  test('a provider that can propose offers Prefer existing; Create freely is not built yet', () => {
     const options = modeOptions(provider('fake', null));
 
-    expect(options.map((o) => o.enabled)).toEqual([true, false, false]);
+    expect(options.map((o) => o.enabled)).toEqual([true, true, false]);
     expect(options[2].reason).toBe('Coming in a later update');
   });
 
@@ -163,6 +165,13 @@ describe('taggingSummary', () => {
 
   test('names runs that need review or are paused', () => {
     expect(taggingSummary([run('awaiting_review', 5, 5)])).toBe('1 run needs review');
+    expect(
+      taggingSummary([
+        run('awaiting_review', 5, 5),
+        { ...run('cancelled', 2, 5), pendingProposals: 1 },
+        run('cancelled', 1, 5),
+      ])
+    ).toBe('2 runs need review');
     expect(taggingSummary([run('paused', 1, 5), run('paused', 2, 5), run('running', 0, 2)])).toBe(
       'Tagging 1 run - 0/2 · 2 runs paused'
     );
@@ -187,22 +196,33 @@ describe('runProgress', () => {
 });
 
 describe('runActions', () => {
+  const none = { pause: false, resume: false, cancel: false, review: false };
+
   test('a running run can be paused or cancelled', () => {
-    expect(runActions('running')).toEqual({ pause: true, resume: false, cancel: true });
+    expect(runActions(run('running', 1, 4))).toEqual({ ...none, pause: true, cancel: true });
   });
 
   test('a run still being created can be cancelled but not paused', () => {
-    expect(runActions('queued')).toEqual({ pause: false, resume: false, cancel: true });
+    expect(runActions(run('queued', 0, 4))).toEqual({ ...none, cancel: true });
   });
 
   test('a paused run can be resumed or cancelled', () => {
-    expect(runActions('paused')).toEqual({ pause: false, resume: true, cancel: true });
+    expect(runActions(run('paused', 1, 4))).toEqual({ ...none, resume: true, cancel: true });
   });
 
   test('a stopped run offers none of them', () => {
-    for (const status of ['done', 'cancelled', 'awaiting_review', 'undone'] as const) {
-      expect(runActions(status)).toEqual({ pause: false, resume: false, cancel: false });
+    for (const status of ['done', 'cancelled', 'undone'] as const) {
+      expect(runActions(run(status, 4, 4))).toEqual(none);
     }
+  });
+
+  test('a run waiting for review, or cancelled with proposals left, offers Review', () => {
+    expect(runActions(run('awaiting_review', 4, 4))).toEqual({ ...none, review: true });
+    expect(runActions({ ...run('cancelled', 2, 4), pendingProposals: 3 })).toEqual({
+      ...none,
+      review: true,
+    });
+    expect(runActions({ ...run('paused', 2, 4), pendingProposals: 3 }).review).toBe(false);
   });
 });
 

@@ -193,6 +193,13 @@ impl TagProvider for NotYetBuilt {
         }
     }
 
+    fn max_proposals(&self, settings: &AiSettings) -> u32 {
+        match self.provider {
+            credentials::Provider::Anthropic => settings.anthropic.max_proposals,
+            credentials::Provider::Jev => 0,
+        }
+    }
+
     fn unavailable_reason(&self) -> Option<String> {
         if !self.credentials.status(self.provider).configured {
             return Some(format!("Set up {} in Settings", self.label()));

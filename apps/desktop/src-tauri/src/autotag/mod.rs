@@ -8,6 +8,7 @@ pub mod engine;
 pub mod fake;
 pub mod pricing;
 pub mod provider;
+pub mod review;
 pub mod settings;
 pub mod store;
 pub mod vocabulary;

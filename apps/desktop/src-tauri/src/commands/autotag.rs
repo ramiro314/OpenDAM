@@ -3,6 +3,7 @@ use tauri::State;
 
 use crate::autotag::engine::{ProviderOption, RunScope, StartedRun};
 use crate::autotag::provider::Mode;
+use crate::autotag::review::{ProposalDecision, ReviewProposal};
 use crate::autotag::store::RunSummary;
 use crate::AppState;
 
@@ -60,4 +61,25 @@ pub async fn resume_all_autotag_runs(state: State<'_, Arc<AppState>>) -> Result<
 #[tauri::command]
 pub async fn cancel_autotag_run(run_id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
     state.autotag.cancel_run(&run_id).await
+}
+
+/// The run's new tag names waiting for review, each with its assets.
+#[tauri::command]
+pub async fn get_autotag_proposals(
+    run_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<ReviewProposal>> {
+    state.autotag.proposals(&run_id).await
+}
+
+/// Applies the review: accepted tags are created (master, then every open library), the
+/// ticked assets tagged, and both recorded for undo. Returns the run's status: `done` once
+/// nothing is left to review, or `cancelled` for a cancelled run.
+#[tauri::command]
+pub async fn review_autotag_proposals(
+    run_id: String,
+    decisions: Vec<ProposalDecision>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String> {
+    state.autotag.review_proposals(&run_id, decisions).await
 }

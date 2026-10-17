@@ -5,10 +5,12 @@ use serde::Serialize;
 use sqlx::{Pool, Sqlite};
 use std::collections::{BTreeMap, HashSet};
 
+use super::provider::ProposedTag;
+use super::vocabulary::normalize_name;
 use crate::db::{upsert_tag, Database, LibraryHandle};
 
 /// Rows per transaction, the repository's batch size.
-const BATCH: usize = 200;
+pub const BATCH: usize = 200;
 
 /// The run tables. `tag_run_applied` has no foreign key on its run: its `pending` rows outlive
 /// a cleared run until replay applies them.
@@ -82,12 +84,16 @@ pub struct RunSummary {
     pub mode: String,
     pub status: String,
     pub pause_reason: Option<String>,
+    /// Started by "Suggest tags" on one asset.
+    pub inline: bool,
     pub total: i64,
     pub done: i64,
     pub failed: i64,
     pub skipped: i64,
     pub running: i64,
     pub queued: i64,
+    /// New tag names waiting for review.
+    pub pending_proposals: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cost_usd: f64,
@@ -99,23 +105,33 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+const RUN_SUMMARY: &str =
+    "SELECT r.id, r.label, r.provider, r.model, r.mode, r.status, r.pause_reason, r.inline,
+            COUNT(i.asset_id) AS total,
+            COALESCE(SUM(i.status = 'done'), 0) AS done,
+            COALESCE(SUM(i.status = 'failed'), 0) AS failed,
+            COALESCE(SUM(i.status = 'skipped'), 0) AS skipped,
+            COALESCE(SUM(i.status = 'running'), 0) AS running,
+            COALESCE(SUM(i.status = 'queued'), 0) AS queued,
+            (SELECT COUNT(*) FROM tag_run_proposals p
+             WHERE p.run_id = r.id AND p.status = 'pending') AS pending_proposals,
+            r.input_tokens, r.output_tokens, r.cost_usd, r.created_at, r.finished_at
+     FROM tag_runs r LEFT JOIN tag_run_items i ON i.run_id = r.id";
+
 /// Every run, newest first.
 pub async fn list_runs(master: &Pool<Sqlite>) -> sqlx::Result<Vec<RunSummary>> {
-    sqlx::query_as(
-        "SELECT r.id, r.label, r.provider, r.model, r.mode, r.status, r.pause_reason,
-                COUNT(i.asset_id) AS total,
-                COALESCE(SUM(i.status = 'done'), 0) AS done,
-                COALESCE(SUM(i.status = 'failed'), 0) AS failed,
-                COALESCE(SUM(i.status = 'skipped'), 0) AS skipped,
-                COALESCE(SUM(i.status = 'running'), 0) AS running,
-                COALESCE(SUM(i.status = 'queued'), 0) AS queued,
-                r.input_tokens, r.output_tokens, r.cost_usd, r.created_at, r.finished_at
-         FROM tag_runs r LEFT JOIN tag_run_items i ON i.run_id = r.id
-         GROUP BY r.id
-         ORDER BY r.created_at DESC, r.id",
-    )
+    sqlx::query_as(&format!(
+        "{RUN_SUMMARY} GROUP BY r.id ORDER BY r.created_at DESC, r.id"
+    ))
     .fetch_all(master)
     .await
+}
+
+pub async fn run_summary(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<Option<RunSummary>> {
+    sqlx::query_as(&format!("{RUN_SUMMARY} WHERE r.id = ? GROUP BY r.id"))
+        .bind(run_id)
+        .fetch_optional(master)
+        .await
 }
 
 /// Which open library holds each asset, in the order given. Assets no open library holds are
@@ -292,20 +308,27 @@ pub async fn fail_item(master: &Pool<Sqlite>, item: &Item, error: &str) -> sqlx:
     .map(|_| ())
 }
 
-/// Ends a running run once none of its items is queued or running. Returns whether it ended.
-pub async fn finish_run_if_complete(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<bool> {
-    let ended = sqlx::query(
-        "UPDATE tag_runs SET status = 'done', finished_at = ?
-         WHERE id = ? AND status = 'running'
+/// Ends a running run once none of its items is queued or running: `awaiting_review` when it
+/// has new tag names to review, else `done`. Returns the status it ended with, if it ended.
+pub async fn finish_run_if_complete(
+    master: &Pool<Sqlite>,
+    run_id: &str,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "UPDATE tag_runs
+         SET status = CASE WHEN EXISTS (SELECT 1 FROM tag_run_proposals
+                                        WHERE run_id = ?1 AND status = 'pending')
+                           THEN 'awaiting_review' ELSE 'done' END,
+             finished_at = ?2
+         WHERE id = ?1 AND status = 'running'
            AND NOT EXISTS (SELECT 1 FROM tag_run_items
-                           WHERE run_id = ? AND status IN ('queued', 'running'))",
+                           WHERE run_id = ?1 AND status IN ('queued', 'running'))
+         RETURNING status",
     )
+    .bind(run_id)
     .bind(now_ms())
-    .bind(run_id)
-    .bind(run_id)
-    .execute(master)
-    .await?;
-    Ok(ended.rows_affected() > 0)
+    .fetch_optional(master)
+    .await
 }
 
 /// The `pause_reason` of every run a previous session left unfinished.
@@ -462,28 +485,71 @@ pub async fn count_attempt(master: &Pool<Sqlite>, item: &Item) -> sqlx::Result<(
     .map(|_| ())
 }
 
+/// The run's new tag names still waiting for review, with their suggested parents, oldest first.
+pub async fn pending_proposals(
+    master: &Pool<Sqlite>,
+    run_id: &str,
+) -> sqlx::Result<Vec<ProposedTag>> {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT name, parent_id FROM tag_run_proposals
+         WHERE run_id = ? AND status = 'pending' ORDER BY rowid",
+    )
+    .bind(run_id)
+    .fetch_all(master)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(name, parent_id)| ProposedTag { name, parent_id })
+        .collect())
+}
+
 /// Write protocol step 1, in one master transaction: a `pending` row for every pair the
-/// library lacks, then the item `done` with its result, and the run's usage.
+/// library lacks, the item's new tag names merged into the run's proposals by normalized name,
+/// then the item `done` with its result, and the run's usage.
 pub async fn record_intent(
     master: &Pool<Sqlite>,
     item: &Item,
     new_tag_ids: &[String],
+    proposals: &[ProposedTag],
     result: &serde_json::Value,
     usage: &super::provider::Usage,
 ) -> sqlx::Result<()> {
     let mut tx = master.begin().await?;
-    for tag_id in new_tag_ids {
-        sqlx::query(
-            "INSERT OR IGNORE INTO tag_run_applied (run_id, asset_id, library_id, tag_id, state)
-             VALUES (?, ?, ?, ?, 'pending')",
+    for proposal in proposals {
+        // The first spelling stays, and the first parent suggested.
+        let proposal_id: String = sqlx::query_scalar(
+            "INSERT INTO tag_run_proposals (id, run_id, name, normalized_name, parent_id)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (run_id, normalized_name)
+             DO UPDATE SET parent_id = COALESCE(tag_run_proposals.parent_id, excluded.parent_id)
+             RETURNING id",
         )
+        .bind(uuid::Uuid::new_v4().to_string())
         .bind(&item.run_id)
+        .bind(&proposal.name)
+        .bind(normalize_name(&proposal.name))
+        .bind(&proposal.parent_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO tag_run_proposal_assets (proposal_id, asset_id) VALUES (?, ?)",
+        )
+        .bind(&proposal_id)
         .bind(&item.asset_id)
-        .bind(&item.library_id)
-        .bind(tag_id)
         .execute(&mut *tx)
         .await?;
     }
+    let pairs: Vec<PendingPair> = new_tag_ids
+        .iter()
+        .map(|tag_id| PendingPair {
+            run_id: item.run_id.clone(),
+            asset_id: item.asset_id.clone(),
+            library_id: item.library_id.clone(),
+            tag_id: tag_id.clone(),
+            run_cleared: false,
+        })
+        .collect();
+    insert_pending(&mut tx, &pairs).await?;
     sqlx::query(
         "UPDATE tag_run_items SET status = 'done', error = NULL, result = ?
          WHERE run_id = ? AND asset_id = ?",
@@ -505,6 +571,28 @@ pub async fn record_intent(
     .execute(&mut *tx)
     .await?;
     tx.commit().await
+}
+
+/// Write protocol step 1's record of the pairs about to be written, inside the caller's master
+/// transaction: a `pending` row for each, which replay applies and undo removes. A pair the run
+/// already recorded keeps its row.
+pub async fn insert_pending(
+    tx: &mut sqlx::SqliteConnection,
+    pairs: &[PendingPair],
+) -> sqlx::Result<()> {
+    for pair in pairs {
+        sqlx::query(
+            "INSERT OR IGNORE INTO tag_run_applied (run_id, asset_id, library_id, tag_id, state)
+             VALUES (?, ?, ?, ?, 'pending')",
+        )
+        .bind(&pair.run_id)
+        .bind(&pair.asset_id)
+        .bind(&pair.library_id)
+        .bind(&pair.tag_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
 }
 
 /// A `tag_run_applied` row still waiting for its library write.
