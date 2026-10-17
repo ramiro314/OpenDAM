@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, type ReactNode } from 'react';
 import clsx from 'clsx';
 import { fitInViewport } from '../../utils/contextMenu';
 import styles from './ContextMenu.module.css';
@@ -35,6 +35,15 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
     el.style.top = `${top}px`;
   }, [x, y]);
 
+  // On the window, not the menu: with every item disabled nothing in the menu can take focus.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
   const firstEnabled = items.findIndex((item) => !item.disabledReason);
 
   return (
@@ -52,7 +61,6 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
         style={{ left: x, top: y }}
         role="menu"
         onClick={(e) => e.stopPropagation()}
-        onKeyDown={(e) => e.key === 'Escape' && onClose()}
       >
         {items.map((item, i) => (
           <button
