@@ -2,8 +2,8 @@ import { useEffect, useState } from 'react';
 import clsx from 'clsx';
 import { api } from '../../api';
 import { useAutotagStore } from '../../store';
-import type { AutotagMode, AutotagScope, AutotagTarget } from '../../types';
-import { modeOptions } from '../../utils/autotag';
+import type { AutotagMode, AutotagTarget } from '../../types';
+import { modeOptions, scopeFor } from '../../utils/autotag';
 import { IconTag, IconX } from '../Icons';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './Autotag.module.css';
@@ -55,11 +55,7 @@ export function AutotagDialog({ target, onClose }: AutotagDialogProps) {
     setStarting(true);
     setError(null);
     try {
-      const scope: AutotagScope =
-        target.kind === 'assets'
-          ? { kind: 'assets', assetIds: target.assetIds }
-          : { kind: 'library', libraryId: target.libraryId, allAssets };
-      await api.startAutotagRun(scope, provider.id, mode);
+      await api.startAutotagRun(scopeFor(target, allAssets), provider.id, mode);
       onClose();
       setRunsPanelOpen(true);
     } catch (e) {

@@ -1,4 +1,10 @@
-import type { AutotagMode, AutotagProviderOption, RunSummary } from '../types';
+import type {
+  AutotagMode,
+  AutotagProviderOption,
+  AutotagScope,
+  AutotagTarget,
+  RunSummary,
+} from '../types';
 
 export const MODES: { mode: AutotagMode; label: string; description: string }[] = [
   {
@@ -47,6 +53,13 @@ export function autotagAvailability(
   }
   if (assetCount === 0) return { enabled: false, reason: emptyReason };
   return { enabled: true, reason: null };
+}
+
+/** What the run dialog asks the backend to tag: the chosen assets, or the library with its "All assets" choice. */
+export function scopeFor(target: AutotagTarget, allAssets: boolean): AutotagScope {
+  return target.kind === 'assets'
+    ? { kind: 'assets', assetIds: target.assetIds }
+    : { kind: 'library', libraryId: target.libraryId, allAssets };
 }
 
 export interface ModeOption {

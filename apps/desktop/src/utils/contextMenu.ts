@@ -17,6 +17,14 @@ export function fitInViewport(
   };
 }
 
+/** The most assets Open or Reveal acts on at once, so a misclick can't launch hundreds of apps */
+export const MAX_OPEN = 10;
+
+/** Why Open and Reveal are disabled for `count` assets, or null when they can run. */
+export function openLimitReason(count: number): string | null {
+  return count > MAX_OPEN ? `Works on up to ${MAX_OPEN} assets at once` : null;
+}
+
 /** The assets a grid right-click acts on: the selection, or the clicked asset if it isn't in it. */
 export function menuTargets(selected: ReadonlySet<string>, clickedId: string): string[] {
   return selected.has(clickedId) ? Array.from(selected) : [clickedId];

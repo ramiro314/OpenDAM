@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { AutotagProviderOption, RunSummary } from '../types';
-import { autotagAvailability, modeOptions, runProgress, taggingSummary } from './autotag';
+import { autotagAvailability, modeOptions, runProgress, scopeFor, taggingSummary } from './autotag';
 
 const ALL_MODES = ['existing_only', 'prefer_existing', 'create_freely'] as const;
 
@@ -88,6 +88,30 @@ describe('autotagAvailability', () => {
 
   test('is disabled while providers load', () => {
     expect(autotagAvailability(null, 2).enabled).toBe(false);
+  });
+});
+
+describe('scopeFor', () => {
+  test('an assets target sends its asset ids, whatever the checkbox says', () => {
+    expect(scopeFor({ kind: 'assets', assetIds: ['a1', 'a2'] }, true)).toEqual({
+      kind: 'assets',
+      assetIds: ['a1', 'a2'],
+    });
+  });
+
+  test('a library target sends its id and the All assets choice', () => {
+    const library = { kind: 'library', libraryId: 'lib-1', libraryName: 'Kenney' } as const;
+
+    expect(scopeFor(library, false)).toEqual({
+      kind: 'library',
+      libraryId: 'lib-1',
+      allAssets: false,
+    });
+    expect(scopeFor(library, true)).toEqual({
+      kind: 'library',
+      libraryId: 'lib-1',
+      allAssets: true,
+    });
   });
 });
 

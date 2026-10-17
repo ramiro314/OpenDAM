@@ -822,6 +822,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_all_assets_run_on_an_empty_library_is_refused() {
+        let s = setup(Recording::default(), &[]).await;
+
+        let error = s
+            .engine
+            .start_run(
+                RunScope::Library {
+                    library_id: "lib".into(),
+                    all_assets: true,
+                },
+                "recording",
+                Mode::ExistingOnly,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "lib has no assets");
+        assert!(s.engine.list_runs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_missing_asset_fails_its_item_and_the_run_still_finishes() {
         let s = setup(Recording::default(), &["a1", "a2"]).await;
         let started = s

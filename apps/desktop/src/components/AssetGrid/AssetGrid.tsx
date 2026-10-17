@@ -4,7 +4,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { api } from '../../api';
 import { useUIStore, useAssetStore, useLibraryStore, useAutotagStore } from '../../store';
 import { autotagAvailability } from '../../utils/autotag';
-import { menuTargets } from '../../utils/contextMenu';
+import { menuTargets, openLimitReason } from '../../utils/contextMenu';
 import { ContextMenu } from '../ContextMenu/ContextMenu';
 import { IconEye, IconExternal, IconTag, IconTrash } from '../Icons';
 import { AssetCard } from './AssetCard';
@@ -12,9 +12,6 @@ import { AssetListRow } from './AssetListRow';
 import { FilterBar } from './FilterBar';
 import type { Asset } from '../../types';
 import styles from './AssetGrid.module.css';
-
-/** The most assets Open or Reveal acts on at once, so a misclick can't launch hundreds of apps */
-const MAX_OPEN = 10;
 
 const GRID_COLS: Record<'sm' | 'md' | 'lg', number> = {
   sm: 180,
@@ -184,7 +181,7 @@ function AssetContextMenu({
   onDelete,
   onClose,
 }: AssetContextMenuProps) {
-  const tooMany = assetIds.length > MAX_OPEN ? `Works on up to ${MAX_OPEN} assets at once` : null;
+  const tooMany = openLimitReason(assetIds.length);
   const forEachPath = (action: (path: string) => Promise<void>, what: string) => {
     const getById = useAssetStore.getState().getById;
     for (const id of assetIds) {

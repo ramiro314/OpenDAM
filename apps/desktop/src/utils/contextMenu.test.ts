@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { fitInViewport, menuTargets } from './contextMenu';
+import { fitInViewport, menuTargets, openLimitReason } from './contextMenu';
 
 describe('fitInViewport', () => {
   test('keeps a menu that fits at the cursor', () => {
@@ -25,5 +25,16 @@ describe('menuTargets', () => {
   test('an asset outside the selection acts on itself alone', () => {
     expect(menuTargets(selected, 'c')).toEqual(['c']);
     expect(menuTargets(new Set(), 'c')).toEqual(['c']);
+  });
+});
+
+describe('openLimitReason', () => {
+  test('Open and Reveal work on up to 10 assets', () => {
+    expect(openLimitReason(1)).toBeNull();
+    expect(openLimitReason(10)).toBeNull();
+  });
+
+  test('past 10 assets they are disabled with the reason', () => {
+    expect(openLimitReason(11)).toBe('Works on up to 10 assets at once');
   });
 });
