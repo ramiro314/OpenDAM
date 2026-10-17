@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import clsx from 'clsx';
 import { useTagStore, useUIStore, useAssetStore } from '../../store';
 import { IconEdit, IconTag, IconTrash } from '../Icons';
@@ -6,7 +6,7 @@ import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { SidebarSection } from './SidebarSection';
 import { InlineCreateForm } from './InlineCreateForm';
 import { EditTagDialog } from './EditTagDialog';
-import { isNameTaken } from './sidebarHelpers';
+import { fitInViewport, isNameTaken } from './sidebarHelpers';
 import type { Tag } from '../../types';
 import styles from './Sidebar.module.css';
 
@@ -33,6 +33,24 @@ export function TagsSection({ clearSmartFilter }: TagsSectionProps) {
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; tag: Tag } | null>(null);
   const [editTarget, setEditTarget] = useState<Tag | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // Opened at the cursor, then moved back inside the window once its size is known.
+  useLayoutEffect(() => {
+    const el = menuRef.current;
+    if (!menu || !el) return;
+    const { width, height } = el.getBoundingClientRect();
+    const { left, top } = fitInViewport(
+      menu.x,
+      menu.y,
+      width,
+      height,
+      window.innerWidth,
+      window.innerHeight
+    );
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+  }, [menu]);
 
   const cancelCreate = () => {
     setIsCreating(false);
@@ -170,6 +188,7 @@ export function TagsSection({ clearSmartFilter }: TagsSectionProps) {
           }}
         >
           <div
+            ref={menuRef}
             className={styles.contextMenu}
             style={{ left: menu.x, top: menu.y }}
             role="menu"
