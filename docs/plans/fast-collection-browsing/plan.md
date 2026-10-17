@@ -33,6 +33,16 @@ the approved decisions; no decision changed:
   - A card whose thumbnail fails to load falls back to the original.
   - A test covers the interruption.
 
+Revised a third time 2026-10-16 after the GitHub Inspector review of PR #66. These are
+corrections inside the approved decisions; no decision changed:
+
+- **No double scrolling from real key presses.** The container's key handler calls
+  `preventDefault()` for Home, End, Page Up, Page Down and Space, so WebKit's built-in scrolling
+  never runs on top of the plan's own. U7 checks `defaultPrevented`, because scripted key events
+  never trigger built-in scrolling.
+- **User-set compositing gets its own mode name.** `WEBKIT_DISABLE_COMPOSITING_MODE` on its own now
+  reports `no-compositing` instead of `webkit-default`, and the tests cover it.
+
 ## Problem
 
 In your words: scanning big collections with the infinite scroll gets slow. The scrollbar doesn't
@@ -322,8 +332,12 @@ These callers move off `assets`, all in the same build step (step 3):
   unless the target is itself focusable.
   - Home and End scroll to the top and bottom.
   - Page Down and Page Up scroll by one viewport height minus one row.
-  - The keys are ignored while a text field has focus (`isEditingText`), and Space keeps opening
-    QuickLook.
+  - The handler calls `preventDefault()` for Home, End, Page Up, Page Down and Space. Otherwise
+    WebKit's built-in scrolling of the focused container would also run, and one real Page Down
+    would scroll twice.
+  - Space still opens QuickLook: `App.tsx`'s window handler sees the event as it bubbles up.
+  - The keys are ignored while a text field has focus (`isEditingText`). Arrow keys keep their
+    native small-step scrolling, since arrow-key tile navigation is out of scope.
 
 ### Thumbnails (D6, D10, D19, C9-C11)
 
@@ -404,6 +418,7 @@ flowchart LR
   - `cpu`: `WEBKIT_DISABLE_DMABUF_RENDERER` or `WEBKIT_SKIA_ENABLE_CPU_RENDERING` is set.
   - `gpu-shm`: otherwise, if `WEBKIT_DMABUF_RENDERER_FORCE_SHM` is set.
   - `explicit-sync`: otherwise, if `__NV_DISABLE_EXPLICIT_SYNC` is set.
+  - `no-compositing`: otherwise, if `WEBKIT_DISABLE_COMPOSITING_MODE` is set.
   - `webkit-default`: none of them is set.
 
   Until step 7, `main.rs` always sets `WEBKIT_DISABLE_DMABUF_RENDERER=1`, so it reports `cpu`. The
@@ -468,8 +483,12 @@ flowchart LR
   - It writes PASS or FAIL for each check into the same report.
   - It logs a named pause wherever the nested-KWin script should take a screenshot, which goes
     into `.evidence/` for the PR.
-  - Key presses are dispatched to the scroll container. That exercises the plan's own key handler,
-    since it doesn't rely on native scrolling.
+  - Key presses are dispatched to the scroll container as cancelable `keydown` events, which
+    exercises the plan's own key handler.
+  - Scripted events never trigger WebKit's built-in scrolling, so the check also asserts
+    `defaultPrevented`. That is what keeps a real press from scrolling twice.
+  - No tool for injecting real key presses (`wtype`, `ydotool`, `xdotool`) is installed here, so
+    your feel check covers real presses.
 - **Bench data, never the live library.** Agent builds from this plan's branches never open
   `~/Documents/Kenney/Assets` or the real master DB, because they write to any library they open
   (indexes, `library_meta`, the cleanup pass).
@@ -518,12 +537,13 @@ delivers its behavior and again in the final run (step 8).
 | U4 | Changing the grid size keeps the first visible asset in the first visible row. | Anchoring (D14) | 3 |
 | U5 | Right-clicking a card at offset 60,000 opens the menu with `grid-menu-autotag`, and Escape closes it. | #62's context menu kept | 3 |
 | U6 | During a scripted scroll faster than 2 viewport heights per second, under name and date sort, the label shows `<n> of <total> - <key>`. It hides 0.6 s after the scroll stops. Screenshot while visible. | Scrub label (D5, D19) | 4 |
-| U7 | With the container focused, End shows the last row, Home the first, and Page Down advances by one viewport minus one row. | Keyboard (D17) | 4 |
+| U7 | With the container focused, End shows the last row, Home the first, and Page Down advances by one viewport minus one row. Each of Home, End, Page Up, Page Down and Space comes back with `defaultPrevented` true. | Keyboard (D17) | 4 |
 | U8 | `#image-scaling-toggle` flips an enlarged small image's computed `image-rendering` between `pixelated` and `auto`. A shrunk image stays `auto`, and the setting survives a reload. Screenshots of both states. | Scaling toggle (D11, D15, D16) | 6 |
 
 Two checks need a human:
 
-- your feel check after the windowed grid lands;
+- your feel check after the windowed grid lands, and after step 4, that one real Page Down moves
+  exactly one screen;
 - the 10-minute flicker check that gates the D8 explicit-sync switch.
 
 ## Tests
@@ -562,7 +582,8 @@ Tests run by file, as `AGENTS.md` says. Each regression test must fail on `main`
   - `choose_render_env`: user-set variables win, NVIDIA gets FORCE_SHM, and other GPUs keep the
     default.
   - `describe_render_env`: each variable maps to its mode, `WEBKIT_DISABLE_DMABUF_RENDERER` wins
-    over the others, and no variable gives `webkit-default`.
+    over the others, `WEBKIT_DISABLE_COMPOSITING_MODE` alone gives `no-compositing`, and no
+    variable gives `webkit-default`.
 - **UI checks U1-U8:** these run in the nested KWin through the harness's `checks` mode (see
   [Acceptance targets](#acceptance-targets)), not in `bun test`.
 
