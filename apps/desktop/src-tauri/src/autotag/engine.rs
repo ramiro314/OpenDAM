@@ -138,6 +138,9 @@ pub struct Engine {
     db: Arc<Database>,
     pools: Vec<ProviderPool>,
     changed_assets: Mutex<HashSet<String>>,
+    /// Each run's items claimed and not yet through `process`. An item is `done` from its
+    /// intent commit, before its library write, so a run with any here isn't finished yet.
+    items_in_flight: Mutex<std::collections::HashMap<String, usize>>,
     events_wake: Notify,
     sink: EventSink,
     notifier: Notifier,
@@ -182,6 +185,7 @@ impl Engine {
             db,
             pools,
             changed_assets: Mutex::new(HashSet::new()),
+            items_in_flight: Mutex::default(),
             events_wake: Notify::new(),
             sink,
             notifier,
@@ -532,6 +536,12 @@ impl Engine {
             match self.next_item(pool.provider.id(), &mut last_run).await {
                 Ok(Some(item)) => {
                     pool.in_flight.fetch_add(1, Ordering::SeqCst);
+                    *self
+                        .items_in_flight
+                        .lock()
+                        .unwrap()
+                        .entry(item.run_id.clone())
+                        .or_default() += 1;
                     let engine = self.clone();
                     tokio::spawn(async move {
                         let pool = &engine.pools[index];
@@ -596,6 +606,15 @@ impl Engine {
         if let Err(e) = recorded {
             tracing::error!("Could not record auto-tag item {}: {e}", item.asset_id);
         }
+        {
+            let mut in_flight = self.items_in_flight.lock().unwrap();
+            if let Some(count) = in_flight.get_mut(&item.run_id) {
+                *count -= 1;
+                if *count == 0 {
+                    in_flight.remove(&item.run_id);
+                }
+            }
+        }
         self.finish_if_complete(&item.run_id).await;
         // Done, awaiting review or cancelled: the run sends no more requests
         let still_active = matches!(
@@ -611,7 +630,13 @@ impl Engine {
     /// Ends the run once nothing is left to hand out, and tells you about a run of several
     /// assets: it needs review, or it finished. Only the call that ends the run notifies, so
     /// each run notifies once.
+    ///
+    /// A run with an item still in `process` is left alone: that item may be `done` with its
+    /// library write still going, and its own `process` finishes the run when it ends.
     async fn finish_if_complete(&self, run_id: &str) {
+        if self.items_in_flight.lock().unwrap().contains_key(run_id) {
+            return;
+        }
         let master = &self.db.master_pool;
         let status = match store::finish_run_if_complete(master, run_id).await {
             Ok(Some(status)) => status,
@@ -1098,6 +1123,16 @@ mod tests {
         wait_for(engine, |runs| runs.iter().all(|r| r.status == "done")).await
     }
 
+    /// Waits for `count` notices: a notice follows the status change that ends its run.
+    async fn wait_for_notices(notices: &Mutex<Vec<Notice>>, count: usize) {
+        for _ in 0..500 {
+            if notices.lock().unwrap().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     async fn item(master: &Pool<Sqlite>, asset: &str) -> (String, Option<String>, i64) {
         sqlx::query_as("SELECT status, error, attempts FROM tag_run_items WHERE asset_id = ?")
             .bind(asset)
@@ -1338,6 +1373,7 @@ mod tests {
             Some("t-nature"),
             "the review preselects the suggested parent"
         );
+        wait_for_notices(&s.notices, 1).await;
         assert_eq!(
             *s.notices.lock().unwrap(),
             [Notice {
@@ -1452,6 +1488,7 @@ mod tests {
             50,
             "matches are applied while the run goes"
         );
+        wait_for_notices(&notices, 1).await;
         assert_eq!(notices.lock().unwrap().len(), 1);
 
         // Accept both, unticking x01 (library A) and x31 (library B) for Rock.
