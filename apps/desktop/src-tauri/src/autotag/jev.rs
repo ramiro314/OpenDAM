@@ -16,7 +16,8 @@ use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 use super::anthropic::ConnectionTest;
 use super::credentials::{self, Credentials};
@@ -39,6 +40,9 @@ const REQUEST_TOKEN_BUDGET: usize = 40_000;
 const MAX_QUESTIONS_PER_REQUEST: usize = 50;
 /// What a question costs beyond its instructions: its type and the JSON around it.
 const QUESTION_OVERHEAD_TOKENS: usize = 8;
+/// The most answered chunks kept for retries before the store is emptied. Each entry is a
+/// chunk's scores, a few kilobytes at most.
+const MAX_ANSWERED_CHUNKS: usize = 2_000;
 /// Used when Settings has no threshold for a run, as for runs started before it was recorded.
 const DEFAULT_THRESHOLD: f64 = 0.7;
 
@@ -316,6 +320,19 @@ pub struct JevProvider {
     http: Result<reqwest::Client, String>,
     /// Estimated tokens per request; tests lower it to split a small catalog.
     budget: usize,
+    /// Chunks already answered for an asset whose later chunk failed, by `chunk_key`. A retry
+    /// of the asset sends only the chunks still unanswered, and the stored chunks' usage counts
+    /// once, when the asset completes.
+    answered: Mutex<HashMap<u64, Scores>>,
+}
+
+/// One chunk of one run: its run id and its exact body, so a retry after the catalog or the
+/// asset changed asks again.
+fn chunk_key(run_id: &str, chunk: &JevRequest) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    run_id.hash(&mut hasher);
+    chunk.body.to_string().hash(&mut hasher);
+    hasher.finish()
 }
 
 impl JevProvider {
@@ -336,6 +353,7 @@ impl JevProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             http: http::client(),
             budget: REQUEST_TOKEN_BUDGET,
+            answered: Mutex::new(HashMap::new()),
         }
     }
 
@@ -373,7 +391,9 @@ impl JevProvider {
     }
 
     /// Every tag's score for one asset, one request per chunk of questions, sent one after
-    /// another so a run stays within its requests-in-flight setting. Usage is summed.
+    /// another so a run stays within its requests-in-flight setting. Usage is summed. When a
+    /// chunk fails, the chunks before it are kept, so the engine's retry of the asset doesn't
+    /// send them again while the API is asking for less traffic.
     async fn score(&self, request: &TagRequest) -> Result<Scores, ProviderError> {
         let requests = build_requests_within(request, self.budget);
         let mut total = Scores {
@@ -392,13 +412,33 @@ impl JevProvider {
                 )
             })?;
         key.set_sensitive(true);
-        for chunk in &requests {
-            let scores = self.send(&key, chunk).await?;
+        let keys: Vec<u64> = requests
+            .iter()
+            .map(|chunk| chunk_key(&request.run_id, chunk))
+            .collect();
+        for (chunk, chunk_key) in requests.iter().zip(&keys) {
+            let stored = self.answered.lock().unwrap().get(chunk_key).cloned();
+            let scores = match stored {
+                Some(scores) => scores,
+                None => {
+                    let scores = self.send(&key, chunk).await?;
+                    let mut answered = self.answered.lock().unwrap();
+                    if answered.len() >= MAX_ANSWERED_CHUNKS {
+                        answered.clear();
+                    }
+                    answered.insert(*chunk_key, scores.clone());
+                    scores
+                }
+            };
             total.scores.extend(scores.scores);
             total.model = scores.model;
             total.usage.input_tokens += scores.usage.input_tokens;
             total.usage.output_tokens += scores.usage.output_tokens;
             total.usage.cost_usd += scores.usage.cost_usd;
+        }
+        let mut answered = self.answered.lock().unwrap();
+        for chunk_key in &keys {
+            answered.remove(chunk_key);
         }
         Ok(total)
     }
@@ -916,6 +956,87 @@ mod tests {
         assert_eq!(result.usage.input_tokens, input);
         assert_eq!(result.usage.output_tokens, 6 * 20);
         assert!((result.usage.cost_usd - input as f64 * 0.042 / 1e6).abs() < 1e-15);
+    }
+
+    #[tokio::test]
+    async fn a_retry_sends_only_the_chunks_still_unanswered_and_counts_usage_once() {
+        let nouls = [0.66, 0.03, 0.93, 0.70, 0.97, 0.08];
+        let bodies: Vec<String> = nouls
+            .iter()
+            .enumerate()
+            .map(|(q, noul)| one_answer(q, *noul))
+            .collect();
+        let rate_limited: &[(&str, &str)] = &[("retry-after", "1")];
+        let mut replies: Vec<mock::Reply> = vec![
+            (200, &[], bodies[0].as_str()),
+            (200, &[], bodies[1].as_str()),
+            (429, rate_limited, r#"{"detail":"slow down"}"#),
+        ];
+        replies.extend(bodies[2..].iter().map(|b| (200, &[][..], b.as_str())));
+        let api = mock::serve_sequence(&replies).await;
+        let mut jev = provider(&api.url, Some("key"));
+        jev.budget = 0;
+        let request = test_request(0.7, 8);
+
+        let error = jev.tag(&request).await.unwrap_err();
+        let retried = jev.tag(&request).await.unwrap();
+
+        assert_eq!(error.class, ErrorClass::Retryable);
+        let sent: Vec<String> = api
+            .received()
+            .iter()
+            .map(|r| {
+                let body: Value = serde_json::from_str(&r.body).unwrap();
+                body["questions"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .next()
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            ["q0", "q1", "q2", "q2", "q3", "q4", "q5"],
+            "the retry starts at the chunk that failed"
+        );
+        assert_eq!(
+            retried.existing,
+            ["test-material-brick", "test-color-red", "test-material"]
+        );
+        let input: i64 = (100..106).sum();
+        assert_eq!(
+            retried.usage.input_tokens, input,
+            "every chunk counted once"
+        );
+        assert!((retried.usage.cost_usd - input as f64 * 0.042 / 1e6).abs() < 1e-15);
+        assert!(
+            jev.answered.lock().unwrap().is_empty(),
+            "a finished asset keeps nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn another_run_or_a_changed_request_asks_again() {
+        let api = mock::serve(200, &[], SCORES).await;
+        let jev = provider(&api.url, Some("key"));
+        let request = test_request(0.7, 8);
+        let chunk = build_requests(&request).remove(0);
+        jev.answered.lock().unwrap().insert(
+            chunk_key("an-earlier-run", &chunk),
+            parse_response(SCORES, &chunk).unwrap(),
+        );
+
+        jev.tag(&request).await.unwrap();
+
+        assert_eq!(api.received().len(), 1, "stored for another run, so sent");
+        let mut changed = test_request(0.7, 8);
+        changed.asset.file_name = "blue_planks.png".into();
+        assert_ne!(
+            chunk_key("run", &build_requests(&changed)[0]),
+            chunk_key("run", &build_requests(&request)[0])
+        );
     }
 
     #[tokio::test]
