@@ -169,7 +169,7 @@ pub trait TagProvider: Send + Sync {
     /// a subprocess: call it off async workers.
     fn unavailable_reason(&self, access: Option<&str>) -> Option<String>;
     fn tag<'a>(&'a self, request: &'a TagRequest) -> TagFuture<'a>;
-    /// Drops what the provider keeps per run for every run not in `active`, which holds each
-    /// run that can still send a request.
-    fn retain_runs(&self, _active: &HashSet<String>) {}
+    /// Drops what the provider keeps per run for every run in `ended`, which can't send a
+    /// request any more.
+    fn forget_runs(&self, _ended: &HashSet<String>) {}
 }

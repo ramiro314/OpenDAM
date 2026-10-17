@@ -227,7 +227,7 @@ impl Engine {
         if let Err(e) = store::recover_after_restart(&self.db.master_pool).await {
             tracing::error!("Could not pause the auto-tag runs of the last session: {e}");
         }
-        self.retain_active_runs().await;
+        self.forget_ended_runs().await;
         self.replay(None).await;
         self.events_wake.notify_one();
         for index in 0..self.pools.len() {
@@ -347,20 +347,20 @@ impl Engine {
         }
         self.run_stopped.notify_waiters();
         self.events_wake.notify_one();
-        self.retain_active_runs().await;
+        self.forget_ended_runs().await;
         Ok(())
     }
 
     /// Lets every provider drop what it keeps for runs that can't send a request any more,
     /// such as a Claude-plan run's vocabulary file.
-    async fn retain_active_runs(&self) {
-        match store::active_run_ids(&self.db.master_pool).await {
-            Ok(active) => {
+    async fn forget_ended_runs(&self) {
+        match store::ended_run_ids(&self.db.master_pool).await {
+            Ok(ended) => {
                 for pool in &self.pools {
-                    pool.provider.retain_runs(&active);
+                    pool.provider.forget_runs(&ended);
                 }
             }
-            Err(e) => tracing::error!("Could not list the active auto-tag runs: {e}"),
+            Err(e) => tracing::error!("Could not list the ended auto-tag runs: {e}"),
         }
     }
 
@@ -725,7 +725,7 @@ impl Engine {
             Ok(Some(status)) if matches!(status.as_str(), "queued" | "running" | "paused")
         );
         if !still_active {
-            self.retain_active_runs().await;
+            self.forget_ended_runs().await;
         }
         self.events_wake.notify_one();
     }

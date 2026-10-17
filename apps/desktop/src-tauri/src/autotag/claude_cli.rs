@@ -63,6 +63,9 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a child may take to exit once its output has ended.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long stderr may stay open once the child is gone: a descendant of `claude` that inherited
+/// it would otherwise hold the item, and its run, forever.
+const STDERR_TIMEOUT: Duration = Duration::from_secs(2);
 /// The run id, and run directory, of "Test connection".
 const TEST_RUN: &str = "connection-test";
 /// The CLI's own login, the only one a Claude-plan run may use.
@@ -325,16 +328,19 @@ impl ClaudeCli {
         Ok(path)
     }
 
-    /// Deletes the vocabulary file of every run not in `active`.
-    pub fn retain_runs(&self, active: &HashSet<String>) {
-        let keep = |id: &str| active.contains(id) || id == TEST_RUN;
-        self.runs.lock().unwrap().retain(|id, _| keep(id));
+    /// Deletes the vocabulary file of every run in `ended`. Only those: a run missing from it
+    /// may have been created since it was read, and be writing its first file.
+    pub fn forget_runs(&self, ended: &HashSet<String>) {
+        self.runs
+            .lock()
+            .unwrap()
+            .retain(|id, _| !ended.contains(id));
         let Ok(entries) = std::fs::read_dir(self.data_dir.join("autotag")) else {
             return;
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if keep(&name) || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if !ended.contains(&name) || !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             if let Err(e) = std::fs::remove_dir_all(entry.path()) {
@@ -392,7 +398,7 @@ impl ClaudeCli {
         // Written alongside the reads below; dropping stdin closes it, which ends the input
         let feed = tokio::spawn(async move { stdin.write_all(message.as_bytes()).await });
         let mut stderr = child.stderr.take().expect("stderr is piped");
-        let errors = tokio::spawn(async move {
+        let mut errors = tokio::spawn(async move {
             let mut head = Vec::new();
             let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut head).await;
             let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
@@ -432,7 +438,13 @@ impl ClaudeCli {
             }
         };
         feed.abort();
-        let stderr = errors.await.unwrap_or_default();
+        let stderr = match tokio::time::timeout(STDERR_TIMEOUT, &mut errors).await {
+            Ok(Ok(text)) => text,
+            _ => {
+                errors.abort();
+                String::new()
+            }
+        };
         if !stderr.trim().is_empty() {
             tracing::debug!("claude stderr: {}", stderr.trim());
         }
@@ -1246,6 +1258,35 @@ exit 1
     }
 
     #[tokio::test]
+    async fn a_descendant_holding_stderr_open_never_holds_the_item() {
+        let stub = Stub::new("", "auth_logged_in.json", 0.0);
+        // claude prints an API-key init, which stops the run, and leaves a helper behind that
+        // inherited its stderr
+        std::fs::write(
+            stub.bin().join("claude"),
+            format!(
+                "#!/bin/sh\ncat > /dev/null\nsleep 30 &\ncat '{}'\nsleep 30\n",
+                fixture("inherited_api_key.jsonl").display()
+            ),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let error = stub
+            .cli(&[])
+            .tag(&request(false), "claude-haiku-5-5")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.class, ErrorClass::Fatal, "{}", error.message);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
     async fn a_vocabulary_over_128_kib_goes_through_the_file_and_no_argument_is_large() {
         let stub = Stub::new("text.jsonl", "auth_logged_in.json", 0.0);
         let mut request = request(false);
@@ -1337,15 +1378,18 @@ exit 1
     }
 
     #[tokio::test]
-    async fn run_files_are_deleted_once_their_run_is_no_longer_active() {
+    async fn only_the_files_of_ended_runs_are_deleted() {
         let stub = Stub::new("text.jsonl", "auth_logged_in.json", 0.0);
         let cli = stub.cli(&[]);
         let mut other = request(false);
         other.run_id = "99999999-0000-0000-0000-000000000000".into();
         cli.tag(&request(false), "claude-haiku-5-5").await.unwrap();
+        // `other` stands for a run created after the ended runs were listed
         cli.tag(&other, "claude-haiku-5-5").await.unwrap();
 
-        cli.retain_runs(&HashSet::from([other.run_id.clone()]));
+        cli.forget_runs(&HashSet::from([
+            "11111111-2222-3333-4444-555555555555".to_string()
+        ]));
 
         let autotag = stub.data_dir().join("autotag");
         assert!(!autotag
@@ -1446,6 +1490,9 @@ exit 1
     #[tokio::test]
     async fn a_plan_run_tags_records_tokens_and_shows_the_warning_without_pausing() {
         let p = plan_engine("text.jsonl", "auth_logged_in.json").await;
+        // As if a run were created, and wrote its first file, after the ended runs were listed
+        const NEWER_RUN: &str = "22222222-0000-0000-0000-000000000000";
+        std::fs::create_dir_all(p.stub.data_dir().join("autotag").join(NEWER_RUN)).unwrap();
 
         let (run, item) = p.run().await;
 
@@ -1464,6 +1511,10 @@ exit 1
         assert!(
             !p.stub.data_dir().join("autotag").join(&run.id).exists(),
             "the vocabulary file is deleted with the finished run"
+        );
+        assert!(
+            p.stub.data_dir().join("autotag").join(NEWER_RUN).is_dir(),
+            "a run the database doesn't list as ended keeps its file"
         );
     }
 

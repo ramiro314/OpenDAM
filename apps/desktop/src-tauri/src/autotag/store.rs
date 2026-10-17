@@ -72,9 +72,9 @@ CREATE TABLE IF NOT EXISTS tag_run_applied (
 CREATE INDEX IF NOT EXISTS idx_tag_run_applied_state ON tag_run_applied(state, library_id);
 "#;
 
-/// Columns added to the run tables after they first shipped, for master DBs made before.
-/// Each fails harmlessly once its column exists.
-pub const ADDED_COLUMNS: [&str; 1] = ["ALTER TABLE tag_runs ADD COLUMN notice TEXT"];
+/// Columns added to the run tables after they first shipped, for master DBs made before: table,
+/// column and definition (`db::add_run_columns`).
+pub const ADDED_COLUMNS: [(&str, &str, &str); 1] = [("tag_runs", "notice", "TEXT")];
 
 /// A run as the status bar and the Runs panel show it.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -472,12 +472,13 @@ pub async fn paused_runs(master: &Pool<Sqlite>) -> sqlx::Result<Vec<PausedRun>> 
     .await
 }
 
-/// Every run that can still send a request: `queued`, `running` or `paused`, or with an item
-/// still in flight, as a cancelled run can have.
-pub async fn active_run_ids(master: &Pool<Sqlite>) -> sqlx::Result<HashSet<String>> {
+/// Every run that can't send a request any more: not `queued`, `running` or `paused`, and with
+/// no item in flight, as a cancelled run can have. A run never leaves that state: Retry failed
+/// starts a new run.
+pub async fn ended_run_ids(master: &Pool<Sqlite>) -> sqlx::Result<HashSet<String>> {
     let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM tag_runs WHERE status IN ('queued', 'running', 'paused')
-         UNION SELECT run_id FROM tag_run_items WHERE status = 'running'",
+        "SELECT id FROM tag_runs WHERE status NOT IN ('queued', 'running', 'paused')
+         EXCEPT SELECT run_id FROM tag_run_items WHERE status = 'running'",
     )
     .fetch_all(master)
     .await?;

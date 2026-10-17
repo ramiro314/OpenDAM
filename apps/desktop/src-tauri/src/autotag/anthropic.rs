@@ -735,8 +735,8 @@ impl TagProvider for AnthropicProvider {
         })
     }
 
-    fn retain_runs(&self, active: &std::collections::HashSet<String>) {
-        self.cli.retain_runs(active);
+    fn forget_runs(&self, ended: &std::collections::HashSet<String>) {
+        self.cli.forget_runs(ended);
     }
 }
 
