@@ -202,13 +202,11 @@ pub async fn library_assets(lib: &Pool<Sqlite>, all_assets: bool) -> sqlx::Resul
     sqlx::query_scalar(sql).fetch_all(lib).await
 }
 
-/// Where an asset counts as taken by another run (D13): its item is `queued` or `running` in a
-/// run that is `queued`, `running` or `paused`.
-const TAKEN_ELSEWHERE: &str = "EXISTS (
-    SELECT 1 FROM tag_run_items o JOIN tag_runs r ON r.id = o.run_id
-    WHERE o.asset_id = ?1 AND r.id != ?2
-      AND o.status IN ('queued', 'running')
-      AND r.status IN ('queued', 'running', 'paused'))";
+/// The overlap rule (D13), over an item `o` joined to its run `r`: an item that is `queued` or
+/// `running`, in a run that is `queued`, `running` or `paused`, holds its asset. The run dialog's
+/// skip count and the insert-time recheck both use it.
+const HOLDS_ASSET: &str = "o.status IN ('queued', 'running')
+    AND r.status IN ('queued', 'running', 'paused')";
 
 /// The assets of `items` that another active run already has queued or in flight.
 pub async fn taken_elsewhere(
@@ -219,9 +217,7 @@ pub async fn taken_elsewhere(
     for chunk in items.chunks(BATCH) {
         let sql = format!(
             "SELECT DISTINCT o.asset_id FROM tag_run_items o JOIN tag_runs r ON r.id = o.run_id
-             WHERE o.asset_id IN ({})
-               AND o.status IN ('queued', 'running')
-               AND r.status IN ('queued', 'running', 'paused')",
+             WHERE o.asset_id IN ({}) AND {HOLDS_ASSET}",
             vec!["?"; chunk.len()].join(", ")
         );
         let mut query = sqlx::query_scalar::<_, String>(&sql);
@@ -272,7 +268,9 @@ pub async fn create_run(
     .await?;
     let sql = format!(
         "INSERT INTO tag_run_items (run_id, asset_id, library_id)
-         SELECT ?2, ?1, ?3 WHERE NOT {TAKEN_ELSEWHERE}"
+         SELECT ?2, ?1, ?3 WHERE NOT EXISTS (
+             SELECT 1 FROM tag_run_items o JOIN tag_runs r ON r.id = o.run_id
+             WHERE o.asset_id = ?1 AND r.id != ?2 AND {HOLDS_ASSET})"
     );
     let mut inserted = 0;
     for chunk in items.chunks(BATCH) {
