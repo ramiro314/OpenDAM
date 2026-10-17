@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 
 use super::provider::{AssetInfo, ErrorClass, Mode, TagProvider, TagRequest, TagResult, Thumbnail};
 use super::settings::{self, AiSettings};
-use super::store::{self, Item, NewRun, RunSummary};
+use super::store::{self, Item, NewRun, PendingPair, RunSummary};
 use super::vocabulary::Vocabulary;
 use crate::db::{resolve_path, Database};
 
@@ -193,12 +193,21 @@ impl Engine {
         tokio::spawn(self.clone().emit_events());
     }
 
-    /// Replays the writes waiting for `library_id`, which just opened. Libraries open at
+    /// The writes waiting for `library_id`, read while it is still offline. Libraries open at
     /// startup, which `start` covers, and when adding a folder reopens the offline library it
-    /// already is (`commands::library::open_library`). Other libraries' pending rows are left
-    /// alone: items in flight may be about to write them.
-    pub async fn library_opened(&self, library_id: &str) {
-        self.replay(Some(library_id)).await;
+    /// already is (`commands::library::open_library`), which reads these first, then opens the
+    /// library, then hands them to `library_opened`.
+    pub async fn waiting_writes(&self, library_id: &str) -> Result<Vec<PendingPair>, String> {
+        store::pending_rows(&self.db, Some(library_id))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Replays `waiting`, read by `waiting_writes` before the library opened. Only those rows:
+    /// once the library is open a scheduler can claim one of its items, whose own `pending`
+    /// rows replay must leave to it, and other libraries' rows may belong to items in flight.
+    pub async fn library_opened(&self, waiting: Vec<PendingPair>) {
+        self.assets_changed(store::replay_rows(&self.db, waiting).await);
     }
 
     async fn replay(&self, library: Option<&str>) {
@@ -1941,7 +1950,8 @@ mod tests {
         // A restart, then the library opening, replay it.
         s.engine.fail_library_writes.store(false, Ordering::SeqCst);
         store::recover_after_restart(master).await.unwrap();
-        s.engine.library_opened("lib").await;
+        let waiting = s.engine.waiting_writes("lib").await.unwrap();
+        s.engine.library_opened(waiting).await;
 
         let tags: Vec<(String, String)> = sqlx::query_as("SELECT asset_id, tag_id FROM asset_tags")
             .fetch_all(&s.lib_pool)

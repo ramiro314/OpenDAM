@@ -628,16 +628,22 @@ pub async fn apply_pairs(
 }
 
 /// Replays every `pending` row whose library is open (steps 3 and 4, both idempotent), or only
-/// those of `library` when given. Rows of runs being undone are skipped: they wait to be
-/// removed, not applied. Rows for an offline library wait for it. Returns the assets whose tags
-/// changed.
+/// those of `library` when given. Returns the assets whose tags changed.
 ///
-/// Replaying every library is safe only before any item runs: an item between its step 1 and
-/// step 3 has `pending` rows too, and replay claiming them first makes the item's own step 3
-/// delete them as someone else's pairs, leaving tags undo can't find. Once runs are going,
-/// replay only a library that just opened, which no item can be writing to yet.
+/// Replaying a library is safe only while no item can be writing to it: an item between its
+/// step 1 and step 3 has `pending` rows too, and replay claiming them first makes the item's own
+/// step 3 delete them as someone else's pairs, leaving tags undo can't find. So this runs at
+/// startup, before any scheduler; a library opening while runs are going instead takes its
+/// rows with `pending_rows` before it opens and replays only those with `replay_rows`.
 pub async fn replay_pending(db: &Database, library: Option<&str>) -> sqlx::Result<Vec<String>> {
-    let rows: Vec<PendingPair> = sqlx::query_as(
+    let rows = pending_rows(db, library).await?;
+    Ok(replay_rows(db, rows).await)
+}
+
+/// Every `pending` row, or those of `library` when given, except rows of runs being undone:
+/// they wait to be removed, not applied.
+pub async fn pending_rows(db: &Database, library: Option<&str>) -> sqlx::Result<Vec<PendingPair>> {
+    sqlx::query_as(
         "SELECT a.run_id, a.asset_id, a.library_id, a.tag_id, (r.id IS NULL) AS run_cleared
          FROM tag_run_applied a LEFT JOIN tag_runs r ON r.id = a.run_id
          WHERE a.state = 'pending' AND (?1 IS NULL OR a.library_id = ?1)
@@ -646,7 +652,13 @@ pub async fn replay_pending(db: &Database, library: Option<&str>) -> sqlx::Resul
     )
     .bind(library)
     .fetch_all(&db.master_pool)
-    .await?;
+    .await
+}
+
+/// Write protocol steps 3 and 4 for `rows`, as replay. Rows for an offline library wait for
+/// it, and one library's failure (a NAS lock timeout) leaves its rows for the next replay.
+/// Returns the assets whose tags changed.
+pub async fn replay_rows(db: &Database, rows: Vec<PendingPair>) -> Vec<String> {
     let mut by_library: BTreeMap<String, Vec<PendingPair>> = BTreeMap::new();
     for row in rows {
         by_library
@@ -659,13 +671,12 @@ pub async fn replay_pending(db: &Database, library: Option<&str>) -> sqlx::Resul
         let Some(lib) = db.get_library_handle(&library_id).await else {
             continue;
         };
-        // One library's failure (a NAS lock timeout) leaves its rows for the next replay.
         match apply_pairs(db, &lib, &pairs, Applier::Replay).await {
             Ok(assets) => changed.extend(assets),
             Err(e) => tracing::warn!("Pending tags for library {library_id} wait: {e}"),
         }
     }
-    Ok(changed)
+    changed
 }
 
 #[cfg(test)]
@@ -945,6 +956,35 @@ mod tests {
                 ("fresh".into(), "running".into()),
                 ("paused".into(), "paused".into()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn replaying_the_rows_read_before_a_library_opened_leaves_a_new_items_rows() {
+        let lib_pool = memory_library_pool().await;
+        insert_asset(&lib_pool, "a1").await;
+        insert_asset(&lib_pool, "a2").await;
+        let db = memory_database(vec![memory_library("lib", lib_pool.clone())]).await;
+        insert_tag(&db.master_pool, "t1", "Rock").await;
+        insert_run(&db, "old-run", "done").await;
+        insert_run(&db, "running-run", "running").await;
+        // Stranded while the library was offline.
+        insert_pending(&db, "old-run", "a1", "lib", "t1").await;
+        let waiting = pending_rows(&db, Some("lib")).await.unwrap();
+        // The library opens, and an item claims a2 and records its intent before replay runs.
+        insert_pending(&db, "running-run", "a2", "lib", "t1").await;
+
+        let replayed = replay_rows(&db, waiting).await;
+
+        assert_eq!(replayed, ["a1"]);
+        assert_eq!(asset_tags(&lib_pool).await, [("a1".into(), "t1".into())]);
+        assert_eq!(
+            applied_rows(&db).await,
+            [
+                ("a1".into(), "t1".into(), "applied".into()),
+                ("a2".into(), "t1".into(), "pending".into()),
+            ],
+            "the item's row is left to its own step 3"
         );
     }
 

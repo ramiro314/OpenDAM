@@ -79,11 +79,14 @@ pub(crate) async fn open_library(
     let root_path = PathBuf::from(first_path);
 
     if let Some(library) = offline_library_at(db, &root_path).await? {
+        // Read before the library opens: once it is open, an item can claim one of its assets
+        // and record its own pending rows, which replay must leave to it.
+        let waiting = autotag.waiting_writes(&library.id).await?;
         // Register library in memory & open its .opendam/library.sqlite with NAS pragmas
         db.register_library(&library.id, &library.name, &root_path)
             .await
             .map_err(|e| e.to_string())?;
-        autotag.library_opened(&library.id).await;
+        autotag.library_opened(waiting).await;
         tracing::info!("Reopened offline library {} at {first_path}", library.id);
         return Ok(library);
     }
