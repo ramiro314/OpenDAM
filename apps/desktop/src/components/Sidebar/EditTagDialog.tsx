@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import clsx from 'clsx';
 import type { ColorLabel, Tag } from '../../types';
 import { useTagStore } from '../../store';
@@ -33,6 +33,9 @@ export function EditTagDialog({ tag, onClose }: EditTagDialogProps) {
   const [description, setDescription] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // A press that starts in the form and ends on the overlay (selecting text) still fires a click
+  // on the overlay, so it closes only for a press that started there too.
+  const pressedOnOverlay = useRef(false);
 
   useEffect(() => {
     if (!tag) return;
@@ -67,12 +70,17 @@ export function EditTagDialog({ tag, onClose }: EditTagDialogProps) {
   return (
     <div
       className={dialogStyles.overlay}
-      onClick={onClose}
+      onMouseDown={(e) => {
+        pressedOnOverlay.current = e.target === e.currentTarget;
+      }}
+      onClick={(e) => {
+        if (pressedOnOverlay.current && e.target === e.currentTarget) onClose();
+        pressedOnOverlay.current = false;
+      }}
       onKeyDown={(e) => e.key === 'Escape' && onClose()}
     >
       <div
         className={clsx(dialogStyles.dialog, styles.dialog)}
-        onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
         aria-labelledby="edit-tag-title"
