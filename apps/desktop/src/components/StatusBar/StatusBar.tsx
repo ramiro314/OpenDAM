@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
-import { useAssetStore } from '../../store';
+import { useAssetStore, useAutotagStore } from '../../store';
+import { taggingSummary } from '../../utils/autotag';
+import autotagStyles from '../Autotag/Autotag.module.css';
 import { api } from '../../api';
 import type { PreviewProgress } from '../../types';
 import styles from './StatusBar.module.css';
@@ -35,6 +37,8 @@ function usePreviewProgress(): PreviewProgress | null {
 export function StatusBar() {
   const { total, loading, query } = useAssetStore();
   const previewProgress = usePreviewProgress();
+  const tagging = taggingSummary(useAutotagStore((s) => s.runs));
+  const setRunsPanelOpen = useAutotagStore((s) => s.setRunsPanelOpen);
 
   return (
     <footer className={styles.statusBar} id="status-bar">
@@ -63,6 +67,16 @@ export function StatusBar() {
             {previewProgress.modelsAwaitingRender > 0 &&
               `${previewProgress.modelsAwaitingRender.toLocaleString()} model${previewProgress.modelsAwaitingRender !== 1 ? 's' : ''} to render`}
           </span>
+        )}
+        {tagging && (
+          <button
+            id="status-tagging"
+            className={autotagStyles.summaryBtn}
+            onClick={() => setRunsPanelOpen(true)}
+            title="Show tagging runs"
+          >
+            {tagging}
+          </button>
         )}
         <span className={styles.item}>OpenDAM v0.1.0</span>
       </div>

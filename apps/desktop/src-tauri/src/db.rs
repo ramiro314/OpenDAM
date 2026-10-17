@@ -214,9 +214,12 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     Ok(pool)
 }
 
-/// Tables only the master DB has: the registered libraries, and non-secret settings as
-/// key/JSON-value rows (API keys live in the OS keyring, never here).
+/// Tables only the master DB has: the registered libraries, non-secret settings as
+/// key/JSON-value rows (API keys live in the OS keyring, never here), and auto-tagging runs.
 async fn create_master_tables(master_pool: &Pool<Sqlite>) -> sqlx::Result<()> {
+    sqlx::query(crate::autotag::store::SCHEMA)
+        .execute(master_pool)
+        .await?;
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS libraries (

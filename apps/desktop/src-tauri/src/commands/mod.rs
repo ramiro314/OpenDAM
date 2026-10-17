@@ -1,4 +1,5 @@
 pub mod asset;
+pub mod autotag;
 pub mod collection;
 pub mod library;
 pub mod preview;

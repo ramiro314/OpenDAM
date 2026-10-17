@@ -26,6 +26,45 @@ make dev
 - Stop only the app you started. Other worktrees run their own `opendam-desktop`, so check a
   process's cwd (`readlink /proc/<pid>/cwd`) before killing it.
 
+## A throwaway profile
+
+To test anything that writes (auto-tagging runs, tag edits), use a throwaway profile, never the
+real data:
+
+1. **Fresh data:** point `XDG_DATA_HOME` at a new temp dir, so the master DB, settings and runs
+   start empty.
+2. **Scratch library:** copy some assets into a temp folder, then register it by seeding the
+   throwaway master DB before launch (`add_library` only takes folders picked in the dialog). Run
+   `make dev` once with that `XDG_DATA_HOME` so the app creates the master DB, quit it, then:
+
+   ```sh
+   export XDG_DATA_HOME=$(mktemp -d)
+   SCRATCH=$(mktemp -d)
+   cp ~/Documents/Kenney/Assets/<some pack>/*.png "$SCRATCH"/
+   # ...run make dev once with this XDG_DATA_HOME, quit, then:
+   sqlite3 "$XDG_DATA_HOME/com.opendam.desktop/opendam.sqlite" \
+     "INSERT INTO libraries (id, name, root_paths, created_at) VALUES ('scratch', 'Scratch', '[\"$SCRATCH\"]', 0);"
+   ```
+
+   The next launch opens and indexes it.
+3. **Auto-tagging without a key:** debug builds read these variables. Release builds ignore them.
+   - `OPENDAM_AUTOTAG_FAKE=1` adds two tagging providers that tag from file-name words: **Fake**
+     (all three modes) and **Fake text-only** (Existing only, like Jev). A file named
+     `rock_large.png` gets a catalog tag named "Rock".
+   - `OPENDAM_AUTOTAG_FAKE_DELAY_MS` (default 300) slows each fake call, so a run can be watched,
+     paused or photographed mid-way.
+   - `OPENDAM_NO_KEYRING=1` ignores the OS keyring. With `ANTHROPIC_API_KEY` and
+     `TYPESAFE_API_KEY` unset too, the app shows the unconfigured state even on a machine with
+     saved keys.
+
+```sh
+XDG_DATA_HOME=$XDG_DATA_HOME OPENDAM_AUTOTAG_FAKE=1 OPENDAM_AUTOTAG_FAKE_DELAY_MS=1500 \
+  OPENDAM_NO_KEYRING=1 make dev
+```
+
+Runs live in the master DB's `tag_runs` and `tag_run_items` tables, and every tag a run adds is
+recorded in `tag_run_applied` before the library sees it.
+
 ## Checking the CSP
 
 `make dev` loads the page from Vite's `devUrl`, and Tauri only applies `app.security.csp` to the

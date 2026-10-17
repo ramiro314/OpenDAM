@@ -1,0 +1,146 @@
+/* The modal chrome comes from SettingsDialog.module.css; these are the auto-tag specifics. */
+
+.fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+
+.choice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-base);
+  cursor: pointer;
+}
+
+.choice input {
+  margin-top: 2px;
+  accent-color: var(--color-brand-500);
+}
+
+.choiceSelected {
+  border-color: var(--color-brand-500);
+}
+
+.choiceDisabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.choiceText {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.choiceLabel {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-primary);
+}
+
+.choiceNote {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.choiceReason {
+  font-size: 12px;
+  color: var(--color-warning);
+}
+
+.runs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.empty {
+  font-size: 13px;
+  color: var(--color-text-muted);
+}
+
+.run {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-base);
+}
+
+.runHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.runLabel {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.runMeta,
+.runProgressText {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.status {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.statusRunning {
+  color: var(--color-brand-300);
+}
+
+.statusDone {
+  color: var(--color-success);
+}
+
+.statusPaused {
+  color: var(--color-warning);
+}
+
+.bar {
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: var(--color-bg-elevated);
+  overflow: hidden;
+}
+
+.barFill {
+  height: 100%;
+  background: var(--color-brand-500);
+  transition: width 200ms ease;
+}
+
+.summaryBtn {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  color: var(--color-brand-300);
+  cursor: pointer;
+}
+
+.summaryBtn:hover {
+  text-decoration: underline;
+}

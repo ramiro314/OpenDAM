@@ -217,3 +217,64 @@ export interface ProviderStatus {
   savedInKeyring: boolean;
   keyringProblem: string | null;
 }
+
+// ── Auto-tagging runs ────────────────────────────────────────────────────
+export type AutotagMode = 'existing_only' | 'prefer_existing' | 'create_freely';
+
+/** A tagging provider as the run dialog shows it */
+export interface AutotagProviderOption {
+  /** "anthropic", "jev", or in debug builds "fake" and "fake-text" */
+  id: string;
+  label: string;
+  /** The modes the provider can do */
+  modes: AutotagMode[];
+  /** Why no run can start with it, when none can */
+  unavailableReason: string | null;
+}
+
+export type RunStatus =
+  | 'queued'
+  | 'running'
+  | 'paused'
+  | 'awaiting_review'
+  | 'done'
+  | 'cancelled'
+  | 'undoing'
+  | 'undo_partial'
+  | 'undone';
+
+export interface RunSummary {
+  id: string;
+  label: string;
+  provider: string;
+  providerLabel: string;
+  model: string | null;
+  mode: AutotagMode;
+  status: RunStatus;
+  pauseReason: string | null;
+  total: number;
+  done: number;
+  failed: number;
+  running: number;
+  queued: number;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  /** Unix milliseconds */
+  createdAt: number;
+  finishedAt: number | null;
+}
+
+export interface StartedRun {
+  run: RunSummary;
+  queued: number;
+  /** Assets left out because no open library holds them */
+  skipped: number;
+}
+
+/** The payload of the `autotag:updated` event */
+export interface AutotagUpdate {
+  runs: RunSummary[];
+  /** Assets whose tags changed since the last event */
+  changedAssetIds: string[];
+}

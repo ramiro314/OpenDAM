@@ -1,16 +1,18 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { api } from '../api';
-import { useAssetStore, useUIStore } from '.';
+import { useAssetStore, useAutotagStore, useUIStore } from '.';
 import type { Asset, DeleteAssetsError, SearchResult } from '../types';
 
 const realSearch = api.searchAssets;
 const realDeleteAssets = api.deleteAssets;
+const realGetAsset = api.getAsset;
 const asset = { id: 'a1', fileName: 'tree.glb' } as Asset;
 const found: SearchResult = { assets: [asset], total: 1, page: 0, pageSize: 100 };
 
 afterEach(() => {
   api.searchAssets = realSearch;
   api.deleteAssets = realDeleteAssets;
+  api.getAsset = realGetAsset;
 });
 
 describe('useAssetStore search errors', () => {
@@ -103,5 +105,27 @@ describe('useAssetStore deleteAssets', () => {
 
     expect(Array.from(useUIStore.getState().selectedAssetIds)).toEqual(['a', 'b']);
     expect(useAssetStore.getState().assets).toEqual(before);
+  });
+});
+
+describe('useAutotagStore applyUpdate', () => {
+  test('re-fetches only the changed assets that are loaded', async () => {
+    const loaded = ['a', 'b'].map(
+      (id) => ({ id, fileName: `${id}.png`, tags: [] }) as unknown as Asset
+    );
+    useAssetStore.setState({ assets: loaded, assetMap: new Map(loaded.map((a) => [a.id, a])) });
+    const fetched: string[] = [];
+    api.getAsset = async (id) => {
+      fetched.push(id);
+      return { id, fileName: `${id}.png`, tags: ['t-rock'] } as unknown as Asset;
+    };
+
+    useAutotagStore.getState().applyUpdate({ runs: [], changedAssetIds: ['b', 'not-loaded'] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(fetched).toEqual(['b']);
+    const s = useAssetStore.getState();
+    expect(s.assets.map((a) => a.tags)).toEqual([[], ['t-rock']]);
+    expect(s.assetMap.get('b')?.tags).toEqual(['t-rock']);
   });
 });

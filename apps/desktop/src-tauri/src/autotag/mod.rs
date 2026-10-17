@@ -1,4 +1,11 @@
-//! AI auto-tagging (docs/plans/ai-auto-tagging/plan.md). So far: its settings and credentials.
+//! AI auto-tagging (docs/plans/ai-auto-tagging/plan.md): settings and credentials, and runs
+//! that tag assets in the background through a `TagProvider`.
 
 pub mod credentials;
+pub mod engine;
+#[cfg(debug_assertions)]
+pub mod fake;
+pub mod provider;
 pub mod settings;
+pub mod store;
+pub mod vocabulary;
