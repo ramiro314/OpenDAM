@@ -154,6 +154,10 @@ pub struct Engine {
     /// Test-only fault: the library write of every item fails, as a NAS lock timeout would.
     #[cfg(test)]
     fail_library_writes: AtomicBool,
+    /// Test-only fault: step 2 never mirrors a created tag, as when the creating item's mirror
+    /// to a slow share hasn't reached a library yet.
+    #[cfg(test)]
+    skip_mirroring: AtomicBool,
     /// Test-only fault: `resume` can't run its finish check, as with a locked master DB.
     #[cfg(test)]
     fail_finishing: AtomicBool,
@@ -197,6 +201,8 @@ impl Engine {
             tag_creation: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             fail_library_writes: Default::default(),
+            #[cfg(test)]
+            skip_mirroring: Default::default(),
             #[cfg(test)]
             fail_finishing: Default::default(),
         })
@@ -734,9 +740,17 @@ impl Engine {
         .map_err(|e| e.to_string())?;
         drop(creating);
 
-        // Step 2.
+        // Step 2, outside the lock: a slow share mustn't hold up other items. An item that
+        // resolves a name to this tag before the mirror reaches its library is fine, as step 3
+        // writes the tag's definition into that library with the pair.
         if !created.is_empty() {
             let open = self.db.get_all_libraries().await;
+            #[cfg(test)]
+            let open = if self.skip_mirroring.load(Ordering::SeqCst) {
+                Vec::new()
+            } else {
+                open
+            };
             for tag_id in &created {
                 store::mirror_tag(&self.db, &open, tag_id).await;
             }
@@ -919,6 +933,7 @@ mod tests {
     use crate::autotag::vocabulary::normalize_name;
     use crate::db::{
         insert_asset, insert_tag, memory_database, memory_library, memory_library_pool,
+        memory_library_pool_enforcing_foreign_keys,
     };
     use sqlx::{Pool, Sqlite};
     use std::collections::VecDeque;
@@ -1501,23 +1516,33 @@ mod tests {
         assert_eq!(notices.lock().unwrap().len(), 1, "still one notification");
     }
 
-    #[tokio::test]
-    async fn create_freely_under_parallel_items_creates_a_tag_once_and_mirrors_it_everywhere() {
-        // A file master with several connections, as in the app, so items really write at once.
+    struct MossRun {
+        db: Arc<Database>,
+        _dir: tempfile::TempDir,
+        provider: Arc<Recording>,
+        updates: Arc<Mutex<Vec<AutotagUpdate>>>,
+        runs: Vec<RunSummary>,
+    }
+
+    /// A Create freely run at concurrency 4 over eight assets, four in library `a` and four in
+    /// `b`, each proposing Moss under Nature, spelled four ways. Library `c` holds none of them.
+    /// The master is a file with several connections, as in the app, so items really write at
+    /// once. With `skip_mirroring`, step 2 never runs.
+    async fn moss_run(
+        a: &Pool<Sqlite>,
+        b: &Pool<Sqlite>,
+        c: &Pool<Sqlite>,
+        skip_mirroring: bool,
+    ) -> MossRun {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::new(dir.path().join("master.sqlite").to_str().unwrap())
             .await
             .unwrap();
-        let (a, b, c) = (
-            memory_library_pool().await,
-            memory_library_pool().await,
-            memory_library_pool().await,
-        );
         let assets: Vec<String> = (0..8).map(|i| format!("m{i}")).collect();
         for (i, id) in assets.iter().enumerate() {
-            insert_asset(if i % 2 == 0 { &a } else { &b }, id).await;
+            insert_asset(if i % 2 == 0 { a } else { b }, id).await;
         }
-        for (id, pool) in [("a-lib", &a), ("b-lib", &b), ("c-lib", &c)] {
+        for (id, pool) in [("a-lib", a), ("b-lib", b), ("c-lib", c)] {
             let lib = memory_library(id, pool.clone());
             db.libraries.write().await.insert(lib.id.clone(), lib);
         }
@@ -1544,19 +1569,48 @@ mod tests {
                 ..Default::default()
             },
         );
+        engine
+            .skip_mirroring
+            .store(skip_mirroring, Ordering::SeqCst);
         engine.start().await;
 
         engine
             .start_run(
-                RunScope::Assets {
-                    asset_ids: assets.clone(),
-                },
+                RunScope::Assets { asset_ids: assets },
                 "recording",
                 Mode::CreateFreely,
             )
             .await
             .unwrap();
         let runs = wait_until_done(&engine).await;
+        // An item is done at step 1, so the run can be done while one is still writing.
+        while engine.pools[0].in_flight.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        MossRun {
+            db,
+            _dir: dir,
+            provider,
+            updates,
+            runs,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_freely_under_parallel_items_creates_a_tag_once_and_mirrors_it_everywhere() {
+        let (a, b, c) = (
+            memory_library_pool().await,
+            memory_library_pool().await,
+            memory_library_pool().await,
+        );
+        let MossRun {
+            db,
+            _dir,
+            provider,
+            updates,
+            runs,
+        } = moss_run(&a, &b, &c, false).await;
+        let master = &db.master_pool;
 
         assert_eq!(
             (runs[0].done, runs[0].failed, runs[0].pending_proposals),
@@ -1619,6 +1673,38 @@ mod tests {
         assert!(
             updates.lock().unwrap().iter().any(|u| u.tags_changed),
             "the UI hears the catalog changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_item_applies_a_tag_another_item_created_before_its_mirror_reaches_the_library() {
+        let (a, b, c) = (
+            memory_library_pool_enforcing_foreign_keys().await,
+            memory_library_pool_enforcing_foreign_keys().await,
+            memory_library_pool_enforcing_foreign_keys().await,
+        );
+        let run = moss_run(&a, &b, &c, true).await;
+        let master = &run.db.master_pool;
+
+        assert_eq!((run.runs[0].done, run.runs[0].failed), (8, 0));
+        assert_eq!(
+            count(
+                master,
+                "SELECT COUNT(*) FROM tag_run_applied WHERE state = 'pending'"
+            )
+            .await,
+            0,
+            "no pair waits for replay"
+        );
+        let tagged = "SELECT COUNT(*) FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+                      WHERE lower(t.name) = 'moss'";
+        assert_eq!(count(&a, tagged).await, 4);
+        assert_eq!(count(&b, tagged).await, 4);
+        let moss = "SELECT COUNT(*) FROM tags WHERE lower(name) = 'moss'";
+        assert_eq!(
+            count(&c, moss).await,
+            0,
+            "step 2 never ran: only the pairs' own writes carried the tag"
         );
     }
 
