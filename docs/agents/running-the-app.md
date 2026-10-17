@@ -68,6 +68,11 @@ real data:
    - `OPENDAM_ANTHROPIC_FIXTURE=<path>` saves the response of a successful Settings "Test
      connection" there, after checking it holds no key. That is how the parser fixture is
      captured with a real key (see that folder's `README.md`).
+4. **Claude plan:** set Settings > Anthropic > Access to "Claude plan". Runs then go through the
+   `claude` on the app's `PATH`, logged in with your claude.ai account, and count against your
+   plan's limits. Each run's vocabulary sits in `$XDG_DATA_HOME/com.opendam.desktop/autotag/<run
+   id>/system.txt` while the run can still send requests. A throwaway `XDG_DATA_HOME` doesn't
+   change which login `claude` uses: that lives in `~/.claude`.
 
 ```sh
 XDG_DATA_HOME=$XDG_DATA_HOME OPENDAM_AUTOTAG_FAKE=1 OPENDAM_AUTOTAG_FAKE_DELAY_MS=1500 \

@@ -63,6 +63,8 @@ pub type Notifier = Arc<dyn Fn(Notice) + Send + Sync>;
 pub struct ProviderOption {
     pub id: &'static str,
     pub label: &'static str,
+    /// How a run started now reaches it, for providers with more than one way.
+    pub access: Option<&'static str>,
     pub modes: Vec<Mode>,
     /// Why no run can start with it, when none can.
     pub unavailable_reason: Option<String>,
@@ -151,6 +153,9 @@ pub struct Engine {
     db: Arc<Database>,
     pools: Vec<ProviderPool>,
     changed_assets: Mutex<HashSet<String>>,
+    /// Each run's items claimed and not yet through `process`. An item is `done` from its
+    /// intent commit, before its library write, so a run with any here isn't finished yet.
+    items_in_flight: Mutex<std::collections::HashMap<String, usize>>,
     tags_changed: AtomicBool,
     events_wake: Notify,
     sink: EventSink,
@@ -185,7 +190,7 @@ impl Engine {
         Self::with_retry_delays(db, providers, sink, notifier, RETRY_DELAYS.to_vec())
     }
 
-    fn with_retry_delays(
+    pub(crate) fn with_retry_delays(
         db: Arc<Database>,
         providers: Vec<Arc<dyn TagProvider>>,
         sink: EventSink,
@@ -204,6 +209,7 @@ impl Engine {
             db,
             pools,
             changed_assets: Mutex::new(HashSet::new()),
+            items_in_flight: Mutex::default(),
             tags_changed: AtomicBool::new(false),
             events_wake: Notify::new(),
             sink,
@@ -233,6 +239,7 @@ impl Engine {
         if let Err(e) = store::recover_after_restart(&self.db.master_pool).await {
             tracing::error!("Could not pause the auto-tag runs of the last session: {e}");
         }
+        self.forget_ended_runs().await;
         self.replay(None).await;
         self.events_wake.notify_one();
         for index in 0..self.pools.len() {
@@ -289,11 +296,14 @@ impl Engine {
         let paused = store::paused_runs(&self.db.master_pool)
             .await
             .map_err(|e| e.to_string())?;
-        let (_, provider) = paused
+        let run = paused
             .into_iter()
-            .find(|(id, _)| id == run_id)
+            .find(|run| run.id == run_id)
             .ok_or("Only a paused run can be resumed")?;
-        if let Some(reason) = self.unavailable_reason(&provider).await? {
+        if let Some(reason) = self
+            .unavailable_reason(&run.provider, run.access.clone())
+            .await?
+        {
             return Err(reason);
         }
         self.resume(&[run_id.to_string()]).await?;
@@ -308,13 +318,14 @@ impl Engine {
             .map_err(|e| e.to_string())?;
         let mut ready = std::collections::HashMap::new();
         let mut run_ids = Vec::new();
-        for (id, provider) in paused {
-            if !ready.contains_key(&provider) {
-                let reason = self.unavailable_reason(&provider).await?;
-                ready.insert(provider.clone(), reason.is_none());
+        for run in paused {
+            let key = (run.provider.clone(), run.access.clone());
+            if !ready.contains_key(&key) {
+                let reason = self.unavailable_reason(&run.provider, run.access).await?;
+                ready.insert(key.clone(), reason.is_none());
             }
-            if ready[&provider] {
-                run_ids.push(id);
+            if ready[&key] {
+                run_ids.push(run.id);
             }
         }
         self.resume(&run_ids).await
@@ -353,19 +364,37 @@ impl Engine {
         }
         self.run_stopped.notify_waiters();
         self.events_wake.notify_one();
+        self.forget_ended_runs().await;
         Ok(())
     }
 
-    /// Why a run of `provider_id` can't go on, when it can't. Reads the keyring off the async
-    /// workers.
-    async fn unavailable_reason(&self, provider_id: &str) -> Result<Option<String>, String> {
+    /// Lets every provider drop what it keeps for runs that can't send a request any more,
+    /// such as a Claude-plan run's vocabulary file.
+    async fn forget_ended_runs(&self) {
+        match store::ended_run_ids(&self.db.master_pool).await {
+            Ok(ended) => {
+                for pool in &self.pools {
+                    pool.provider.forget_runs(&ended);
+                }
+            }
+            Err(e) => tracing::error!("Could not list the ended auto-tag runs: {e}"),
+        }
+    }
+
+    /// Why a run of `provider_id` with `access` can't go on, when it can't. Reads the keyring,
+    /// or asks `claude` for its login, off the async workers.
+    async fn unavailable_reason(
+        &self,
+        provider_id: &str,
+        access: Option<String>,
+    ) -> Result<Option<String>, String> {
         let Ok(pool) = self.pool(provider_id) else {
             return Ok(Some(format!(
                 "The {provider_id} provider isn't available in this session"
             )));
         };
         let provider = pool.provider.clone();
-        tokio::task::spawn_blocking(move || provider.unavailable_reason())
+        tokio::task::spawn_blocking(move || provider.unavailable_reason(access.as_deref()))
             .await
             .map_err(|e| e.to_string())
     }
@@ -377,18 +406,31 @@ impl Engine {
             .ok_or_else(|| format!("Unknown tagging provider {provider_id}"))
     }
 
-    /// Every provider, with why it can't be picked. Blocks on the keyring: call it off async
-    /// workers.
-    pub fn provider_options(&self) -> Vec<ProviderOption> {
-        self.pools
-            .iter()
-            .map(|p| ProviderOption {
-                id: p.provider.id(),
-                label: p.provider.label(),
-                modes: p.provider.modes().to_vec(),
-                unavailable_reason: p.provider.unavailable_reason(),
-            })
-            .collect()
+    /// Every provider, with the access a run would use now and why it can't be picked.
+    pub async fn provider_options(&self) -> Result<Vec<ProviderOption>, String> {
+        let settings = settings::load(&self.db.master_pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        let providers: Vec<Arc<dyn TagProvider>> =
+            self.pools.iter().map(|p| p.provider.clone()).collect();
+        // The keyring and `claude auth status` block
+        tokio::task::spawn_blocking(move || {
+            providers
+                .iter()
+                .map(|provider| {
+                    let access = provider.access(&settings);
+                    ProviderOption {
+                        id: provider.id(),
+                        label: provider.label(),
+                        access,
+                        modes: provider.modes().to_vec(),
+                        unavailable_reason: provider.unavailable_reason(access),
+                    }
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| e.to_string())
     }
 
     pub async fn list_runs(&self) -> sqlx::Result<Vec<RunSummary>> {
@@ -482,11 +524,14 @@ impl Engine {
             return Err("Suggest tags works on one asset".into());
         }
         let pool = self.pool(provider_id)?;
-        let provider = pool.provider.clone();
-        let label = provider.label();
-        let unavailable = tokio::task::spawn_blocking(move || provider.unavailable_reason())
+        let label = pool.provider.label();
+        let settings = settings::load(&self.db.master_pool)
             .await
             .map_err(|e| e.to_string())?;
+        let access = pool.provider.access(&settings);
+        let unavailable = self
+            .unavailable_reason(provider_id, access.map(str::to_string))
+            .await?;
         if let Some(reason) = unavailable {
             return Err(reason);
         }
@@ -547,9 +592,6 @@ impl Engine {
                 (items, n, run_label)
             }
         };
-        let settings = settings::load(&self.db.master_pool)
-            .await
-            .map_err(|e| e.to_string())?;
         let id = uuid::Uuid::new_v4().to_string();
         store::create_run(
             &self.db.master_pool,
@@ -557,6 +599,7 @@ impl Engine {
                 id: &id,
                 label: &run_label,
                 provider: provider_id,
+                access,
                 model: pool.provider.model(&settings).as_deref(),
                 mode: mode.as_str(),
                 options: serde_json::json!({
@@ -613,6 +656,12 @@ impl Engine {
             match self.next_item(pool.provider.id(), &mut last_run).await {
                 Ok(Some(item)) => {
                     pool.in_flight.fetch_add(1, Ordering::SeqCst);
+                    *self
+                        .items_in_flight
+                        .lock()
+                        .unwrap()
+                        .entry(item.run_id.clone())
+                        .or_default() += 1;
                     let engine = self.clone();
                     tokio::spawn(async move {
                         let pool = &engine.pools[index];
@@ -677,14 +726,37 @@ impl Engine {
         if let Err(e) = recorded {
             tracing::error!("Could not record auto-tag item {}: {e}", item.asset_id);
         }
+        {
+            let mut in_flight = self.items_in_flight.lock().unwrap();
+            if let Some(count) = in_flight.get_mut(&item.run_id) {
+                *count -= 1;
+                if *count == 0 {
+                    in_flight.remove(&item.run_id);
+                }
+            }
+        }
         self.finish_if_complete(&item.run_id).await;
+        // Done, awaiting review or cancelled: the run sends no more requests
+        let still_active = matches!(
+            store::run_status(master, &item.run_id).await,
+            Ok(Some(status)) if matches!(status.as_str(), "queued" | "running" | "paused")
+        );
+        if !still_active {
+            self.forget_ended_runs().await;
+        }
         self.events_wake.notify_one();
     }
 
     /// Ends the run once nothing is left to hand out, and tells you about a run of several
     /// assets: it needs review, or it finished. Only the call that ends the run notifies, so
     /// each run notifies once.
+    ///
+    /// A run with an item still in `process` is left alone: that item may be `done` with its
+    /// library write still going, and its own `process` finishes the run when it ends.
     async fn finish_if_complete(&self, run_id: &str) {
+        if self.items_in_flight.lock().unwrap().contains_key(run_id) {
+            return;
+        }
         let master = &self.db.master_pool;
         let status = match store::finish_run_if_complete(master, run_id).await {
             Ok(Some(status)) => status,
@@ -817,6 +889,7 @@ impl Engine {
         let request = TagRequest {
             run_id: item.run_id.clone(),
             mode,
+            access: item.access.clone(),
             model: item.model.clone(),
             max_tags: max_tags as u32,
             max_proposals: item.options["maxProposals"].as_u64().unwrap_or(0) as u32,
@@ -862,16 +935,9 @@ impl Engine {
         };
         let intent = async {
             let mut tx = store::begin_intent(&self.db.master_pool).await?;
-            let created = store::record_intent(
-                &mut tx,
-                item,
-                &accepted,
-                &present,
-                names,
-                &summary,
-                &result.usage,
-            )
-            .await?;
+            let created =
+                store::record_intent(&mut tx, item, &accepted, &present, names, &summary, &result)
+                    .await?;
             if !created.is_empty() && self.crashes.at(CrashPoint::AfterTagInsert) {
                 drop(tx);
                 match self.crashes.stop().await {}
@@ -1127,7 +1193,7 @@ mod tests {
         fn max_proposals(&self, settings: &AiSettings) -> u32 {
             settings.anthropic.max_proposals
         }
-        fn unavailable_reason(&self) -> Option<String> {
+        fn unavailable_reason(&self, _access: Option<&str>) -> Option<String> {
             self.unavailable.clone()
         }
         fn tag<'a>(&'a self, request: &'a TagRequest) -> TagFuture<'a> {
@@ -1262,6 +1328,16 @@ mod tests {
 
     async fn wait_until_done(engine: &Engine) -> Vec<RunSummary> {
         wait_for(engine, |runs| runs.iter().all(|r| r.status == "done")).await
+    }
+
+    /// Waits for `count` notices: a notice follows the status change that ends its run.
+    async fn wait_for_notices(notices: &Mutex<Vec<Notice>>, count: usize) {
+        for _ in 0..500 {
+            if notices.lock().unwrap().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     async fn item(master: &Pool<Sqlite>, asset: &str) -> (String, Option<String>, i64) {
@@ -1490,6 +1566,7 @@ mod tests {
             Some("t-nature"),
             "the review preselects the suggested parent"
         );
+        wait_for_notices(&s.notices, 1).await;
         assert_eq!(
             *s.notices.lock().unwrap(),
             [Notice {
@@ -1604,6 +1681,7 @@ mod tests {
             50,
             "matches are applied while the run goes"
         );
+        wait_for_notices(&notices, 1).await;
         assert_eq!(notices.lock().unwrap().len(), 1);
 
         // Accept both, unticking x01 (library A) and x31 (library B) for Rock.

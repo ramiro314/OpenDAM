@@ -20,7 +20,7 @@ function provider(
   unavailableReason: string | null,
   modes: AutotagProviderOption['modes'] = [...ALL_MODES]
 ): AutotagProviderOption {
-  return { id, label: id[0].toUpperCase() + id.slice(1), modes, unavailableReason };
+  return { id, label: id[0].toUpperCase() + id.slice(1), access: null, modes, unavailableReason };
 }
 
 function run(status: RunSummary['status'], done: number, total: number, failed = 0): RunSummary {
@@ -29,10 +29,12 @@ function run(status: RunSummary['status'], done: number, total: number, failed =
     label: `${total} assets`,
     provider: 'fake',
     providerLabel: 'Fake',
+    access: null,
     model: 'fake',
     mode: 'existing_only',
     status,
     pauseReason: null,
+    notice: null,
     inline: false,
     total,
     done,
@@ -276,6 +278,16 @@ describe('runUsage', () => {
     expect(runUsage(run('running', 0, 10))).toBeNull();
     const used = { ...run('running', 2, 10), inputTokens: 3500, outputTokens: 80, costUsd: 0.0043 };
     expect(runUsage(used)).toBe(`${(3580).toLocaleString()} tokens · $0.0043`);
+  });
+
+  test('a Claude-plan run shows its tokens on your plan, with no cost', () => {
+    const plan = {
+      ...run('running', 2, 10),
+      access: 'claude_plan' as const,
+      inputTokens: 1452,
+      outputTokens: 242,
+    };
+    expect(runUsage(plan)).toBe(`${(1694).toLocaleString()} tokens · on your plan`);
   });
 });
 

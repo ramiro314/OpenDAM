@@ -15,11 +15,7 @@ type Result<T> = std::result::Result<T, String>;
 pub async fn list_autotag_providers(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<ProviderOption>> {
-    let engine = state.autotag.clone();
-    // Provider status reads the keyring, which blocks on D-Bus
-    tauri::async_runtime::spawn_blocking(move || engine.provider_options())
-        .await
-        .map_err(|e| e.to_string())
+    state.autotag.provider_options().await
 }
 
 /// Starts a background run over chosen assets, or over a library's untagged assets (every

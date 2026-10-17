@@ -1,9 +1,21 @@
 import { describe, expect, test } from 'bun:test';
-import { isKnownModel, parseNumberInput, settingsPatch } from './settingsHelpers';
-import type { AiSettings } from '../../types';
+import {
+  claudePlanLines,
+  ignoredOverridesNote,
+  isKnownModel,
+  parseNumberInput,
+  settingsPatch,
+} from './settingsHelpers';
+import type { AiSettings, ClaudePlanStatus } from '../../types';
 
 const saved: AiSettings = {
-  anthropic: { model: 'claude-sonnet-5-5', concurrency: 4, maxTags: 8, maxProposals: 3 },
+  anthropic: {
+    access: 'api_key',
+    model: 'claude-sonnet-5-5',
+    concurrency: 4,
+    maxTags: 8,
+    maxProposals: 3,
+  },
   jev: { concurrency: 4, threshold: 0.7, maxTags: 8 },
 };
 
@@ -45,5 +57,49 @@ describe('parseNumberInput', () => {
   test('fractional fields take decimals, and nothing that is not a number', () => {
     expect(parseNumberInput('0.85', false)).toBe(0.85);
     expect(parseNumberInput('-', false)).toBeNull();
+  });
+});
+
+const loggedIn: ClaudePlanStatus = {
+  path: '/usr/bin/claude',
+  version: '2.1.296 (Claude Code)',
+  loggedIn: true,
+  authMethod: 'claude.ai',
+  subscriptionType: 'max',
+  configured: true,
+  problem: null,
+  ignoredOverrides: ['ANTHROPIC_API_KEY'],
+};
+
+describe('claudePlanLines', () => {
+  test('names the path, the version and the claude.ai login', () => {
+    expect(claudePlanLines(loggedIn)).toEqual({
+      found: 'claude 2.1.296 (Claude Code) at /usr/bin/claude',
+      login: 'Logged in with your Claude account (claude.ai, max plan)',
+    });
+  });
+
+  test('says when the login is not your Claude plan, or there is none', () => {
+    const apiKey = { ...loggedIn, authMethod: 'api_key', configured: false };
+    expect(claudePlanLines(apiKey).login).toBe('Logged in with api_key, not your Claude plan');
+    const out = { ...loggedIn, loggedIn: false, authMethod: 'none', configured: false };
+    expect(claudePlanLines(out).login).toBe('Logged out');
+    const missing = { ...out, path: null, version: null };
+    expect(claudePlanLines(missing)).toEqual({
+      found: 'claude not found on PATH',
+      login: 'Not checked',
+    });
+  });
+});
+
+describe('ignoredOverridesNote', () => {
+  test('names the overrides claude never gets', () => {
+    expect(ignoredOverridesNote([])).toBeNull();
+    expect(ignoredOverridesNote(['ANTHROPIC_API_KEY'])).toBe(
+      'ANTHROPIC_API_KEY is set for the app, but claude never gets it'
+    );
+    expect(ignoredOverridesNote(['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'])).toBe(
+      'ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL are set for the app, but claude never gets them'
+    );
   });
 });

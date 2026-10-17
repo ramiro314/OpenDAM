@@ -159,7 +159,7 @@ impl TagProvider for FakeProvider {
         !self.text_only
     }
 
-    fn unavailable_reason(&self) -> Option<String> {
+    fn unavailable_reason(&self, _access: Option<&str>) -> Option<String> {
         None
     }
 
@@ -186,6 +186,7 @@ mod tests {
         TagRequest {
             run_id: "run".into(),
             mode,
+            access: None,
             model: None,
             max_tags: 8,
             max_proposals: 3,

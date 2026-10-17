@@ -61,6 +61,7 @@ function RunRow({ run, act }: { run: RunSummary; act: Act }) {
         {provider} · {modeLabel(run.mode)}
       </span>
       {run.pauseReason && <span className={styles.choiceReason}>{run.pauseReason}</span>}
+      {run.notice && <span className={styles.choiceReason}>{run.notice}</span>}
       <div className={styles.bar}>
         <div className={styles.barFill} style={{ width: `${percent}%` }} />
       </div>

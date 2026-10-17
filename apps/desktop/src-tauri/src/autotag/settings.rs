@@ -20,10 +20,32 @@ pub struct AiSettings {
     pub jev: JevSettings,
 }
 
+/// How Anthropic requests reach Claude (D11).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicAccess {
+    /// The Messages API over HTTPS, with the key from the keyring or `ANTHROPIC_API_KEY`.
+    #[default]
+    ApiKey,
+    /// Your Claude plan, through the installed `claude` CLI (`claude_cli`). Personal use only.
+    ClaudePlan,
+}
+
+impl AnthropicAccess {
+    /// Stored in `tag_runs.access`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnthropicAccess::ApiKey => "api_key",
+            AnthropicAccess::ClaudePlan => "claude_plan",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnthropicSettings {
-    /// A model id: one of the Claude 5.5 models or any custom id.
+    pub access: AnthropicAccess,
+    /// A model id: one of the Claude 5.5 models or any custom id. It applies to both accesses.
     pub model: String,
     /// Requests in flight at once, shared by every run.
     pub concurrency: u32,
@@ -44,6 +66,7 @@ impl Default for AiSettings {
     fn default() -> Self {
         Self {
             anthropic: AnthropicSettings {
+                access: AnthropicAccess::ApiKey,
                 model: DEFAULT_ANTHROPIC_MODEL.to_string(),
                 concurrency: 4,
                 max_tags: 8,
@@ -232,6 +255,7 @@ mod tests {
 
         let settings = load(&db.master_pool).await.unwrap();
 
+        assert_eq!(settings.anthropic.access, AnthropicAccess::ApiKey);
         assert_eq!(settings.anthropic.model, "claude-sonnet-5-5");
         assert_eq!(settings.anthropic.concurrency, 4);
         assert_eq!(settings.anthropic.max_tags, 8);
@@ -248,7 +272,7 @@ mod tests {
         let saved = update(
             &db.master_pool,
             json!({
-                "anthropic": {"model": "my-custom-model", "concurrency": 2, "maxTags": 5, "maxProposals": 0},
+                "anthropic": {"access": "claude_plan", "model": "my-custom-model", "concurrency": 2, "maxTags": 5, "maxProposals": 0},
                 "jev": {"concurrency": 8, "threshold": 0.85, "maxTags": 3},
             }),
         )
@@ -257,6 +281,7 @@ mod tests {
 
         let loaded = load(&db.master_pool).await.unwrap();
         assert_eq!(loaded, saved);
+        assert_eq!(loaded.anthropic.access, AnthropicAccess::ClaudePlan);
         assert_eq!(loaded.anthropic.model, "my-custom-model");
         assert_eq!(loaded.anthropic.max_proposals, 0);
         assert_eq!(loaded.jev.threshold, 0.85);
@@ -288,6 +313,7 @@ mod tests {
             json!({"jev": {"threshold": 1.5}}),
             json!({"jev": {"maxTags": "eight"}}),
             json!({"anthropic": {"model": "has spaces"}}),
+            json!({"anthropic": {"access": "oauth"}}),
             json!({"openai": {"model": "x"}}),
             json!(["not", "an", "object"]),
         ] {
