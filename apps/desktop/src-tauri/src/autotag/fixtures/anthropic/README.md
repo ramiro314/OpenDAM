@@ -7,6 +7,14 @@ Every file here is synthesized from the documented Messages API shapes (response
 meant to be replaced by a real response: the plan's contract check makes the first "Test
 connection" call with the owner's key and keeps its response as the fixture.
 
+**Status (2026-10-16): not captured yet.** No key was available when the provider was built,
+and the owner chose to ship without the live check. Until it runs, nothing confirms that the API
+accepts these request fields as sent: `output_config.format` (`json_schema`),
+`output_config.effort: "low"`, `fallbacks: "default"` with the
+`anthropic-beta: server-side-fallback-2026-07-01` header, and `cache_control` on the system
+block. They follow the docs cited in the plan's Facts. One live call with an invalid dummy key
+reached the API over HTTPS and came back 401, which only shows the key check runs first.
+
 To capture it, run a debug build with the key set and a fixture path:
 
 ```sh
