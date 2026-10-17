@@ -1436,6 +1436,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resuming_a_run_with_nothing_left_to_hand_out_finishes_it() {
+        let s = setup(Recording::default(), &["a1", "a2", "a3", "a4"]).await;
+        let master = &s.engine.db.master_pool;
+        // Paused while its last items were in flight, which then finished.
+        insert_paused_run(master, "one", "recording", "a1").await;
+        insert_paused_run(master, "two", "recording", "a2").await;
+        sqlx::query("UPDATE tag_run_items SET status = 'done'")
+            .execute(master)
+            .await
+            .unwrap();
+        insert_paused_run(master, "all", "recording", "a3").await;
+        sqlx::query(
+            "INSERT INTO tag_run_items (run_id, asset_id, library_id) VALUES ('all', 'a4', 'lib')",
+        )
+        .execute(master)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE tag_run_items SET status = 'failed' WHERE run_id = 'all' AND asset_id = 'a3'",
+        )
+        .execute(master)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE tag_run_items SET status = 'done' WHERE run_id = 'all' AND asset_id = 'a4'",
+        )
+        .execute(master)
+        .await
+        .unwrap();
+        s.engine.start().await;
+
+        s.engine.resume_run("one").await.unwrap();
+        assert_eq!(s.engine.resume_all().await.unwrap(), 2);
+
+        for run in ["one", "two", "all"] {
+            let (status, reason, finished_at): (String, Option<String>, Option<i64>) =
+                sqlx::query_as(
+                    "SELECT status, pause_reason, finished_at FROM tag_runs WHERE id = ?",
+                )
+                .bind(run)
+                .fetch_one(master)
+                .await
+                .unwrap();
+            assert_eq!((status.as_str(), reason), ("done", None), "{run}");
+            assert!(finished_at.is_some(), "{run}");
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(s.provider.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_restart_pauses_unfinished_runs_and_resume_finishes_them() {
         let assets = ["a1", "a2", "a3", "a4"];
         let lib_pool = memory_library_pool().await;
