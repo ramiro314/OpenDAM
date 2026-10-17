@@ -189,8 +189,9 @@ impl Engine {
     }
 
     /// Replays the writes waiting for `library_id`, which just opened. Libraries open at
-    /// startup, which `start` covers, and when one is added. Other libraries' pending rows are
-    /// left alone: items in flight may be about to write them.
+    /// startup, which `start` covers, and when adding a folder reopens the offline library it
+    /// already is (`commands::library::open_library`). Other libraries' pending rows are left
+    /// alone: items in flight may be about to write them.
     pub async fn library_opened(&self, library_id: &str) {
         self.replay(Some(library_id)).await;
     }

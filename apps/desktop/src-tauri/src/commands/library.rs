@@ -1,10 +1,12 @@
 use chrono::Utc;
 use serde_json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use uuid::Uuid;
 
+use crate::autotag::engine::Engine;
+use crate::db::Database;
 use crate::models::{AddLibraryPayload, Library};
 use crate::watcher;
 use crate::AppState;
@@ -38,40 +40,20 @@ pub async fn add_library(
     payload: AddLibraryPayload,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Library> {
-    let id = Uuid::new_v4().to_string();
-    let now = Utc::now().timestamp_millis();
-    let root_paths_json = serde_json::to_string(&payload.root_paths).map_err(|e| e.to_string())?;
-
-    let first_path = payload.root_paths.first().ok_or("No root path provided")?;
-    let root_path = PathBuf::from(first_path);
     check_roots_were_picked(&state.app_handle, &payload.root_paths)?;
-
-    // Register library in memory & open its .opendam/library.sqlite with NAS pragmas
-    let _handle = state
-        .db
-        .register_library(&id, &payload.name, &root_path)
-        .await
-        .map_err(|e| e.to_string())?;
-    allow_library_roots(&state.app_handle, &payload.root_paths);
-    // Tag writes a run left waiting for this library land now
-    state.autotag.library_opened(&id).await;
-
-    // Record in master database
-    sqlx::query(
-        "INSERT INTO libraries (id, name, root_paths, created_at, asset_count) VALUES (?, ?, ?, ?, 0)"
+    let library = open_library(
+        &state.db,
+        &state.autotag,
+        &payload.name,
+        &payload.root_paths,
     )
-    .bind(&id)
-    .bind(&payload.name)
-    .bind(&root_paths_json)
-    .bind(now)
-    .execute(&state.db.master_pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
+    allow_library_roots(&state.app_handle, &library.root_paths);
 
     // Kick off background NAS-efficient indexing
     let state_clone = Arc::clone(&state);
-    let paths = payload.root_paths.clone();
-    let lib_id = id.clone();
+    let paths = library.root_paths.clone();
+    let lib_id = library.id.clone();
     tokio::spawn(async move {
         if let Err(e) = watcher::index_paths(&state_clone.db, &lib_id, &paths).await {
             tracing::error!("Failed to index library {}: {}", lib_id, e);
@@ -80,13 +62,84 @@ pub async fn add_library(
         }
     });
 
+    Ok(library)
+}
+
+/// Opens the folder at `root_paths` as a library: the registered library it already is when
+/// that one is offline (its folder was missing when the app started, a NAS not mounted yet),
+/// else a new library. A library reopened this way keeps its id, name and roots, and the tag
+/// writes auto-tag runs left waiting for it are replayed. A new library has nothing waiting.
+pub(crate) async fn open_library(
+    db: &Database,
+    autotag: &Engine,
+    name: &str,
+    root_paths: &[String],
+) -> Result<Library> {
+    let first_path = root_paths.first().ok_or("No root path provided")?;
+    let root_path = PathBuf::from(first_path);
+
+    if let Some(library) = offline_library_at(db, &root_path).await? {
+        // Register library in memory & open its .opendam/library.sqlite with NAS pragmas
+        db.register_library(&library.id, &library.name, &root_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        autotag.library_opened(&library.id).await;
+        tracing::info!("Reopened offline library {} at {first_path}", library.id);
+        return Ok(library);
+    }
+
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().timestamp_millis();
+    let root_paths_json = serde_json::to_string(root_paths).map_err(|e| e.to_string())?;
+    db.register_library(&id, name, &root_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Record in master database
+    sqlx::query(
+        "INSERT INTO libraries (id, name, root_paths, created_at, asset_count) VALUES (?, ?, ?, ?, 0)"
+    )
+    .bind(&id)
+    .bind(name)
+    .bind(&root_paths_json)
+    .bind(now)
+    .execute(&db.master_pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
     Ok(Library {
         id,
-        name: payload.name,
-        root_paths: payload.root_paths,
+        name: name.to_string(),
+        root_paths: root_paths.to_vec(),
         created_at: now,
         asset_count: 0,
     })
+}
+
+/// The registered library whose first root is `root_path`, if it isn't open.
+async fn offline_library_at(db: &Database, root_path: &Path) -> Result<Option<Library>> {
+    let rows = sqlx::query_as::<_, (String, String, String, i64, i64)>(
+        "SELECT id, name, root_paths, created_at, asset_count FROM libraries ORDER BY created_at, id",
+    )
+    .fetch_all(&db.master_pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (id, name, root_paths_json, created_at, asset_count) in rows {
+        let root_paths: Vec<String> = serde_json::from_str(&root_paths_json).unwrap_or_default();
+        let same_folder = root_paths
+            .first()
+            .is_some_and(|first| Path::new(first) == root_path);
+        if same_folder && db.get_library_handle(&id).await.is_none() {
+            return Ok(Some(Library {
+                id,
+                name,
+                root_paths,
+                created_at,
+                asset_count,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 #[tauri::command]
@@ -163,6 +216,149 @@ pub async fn refresh_all_libraries(state: State<'_, Arc<AppState>>) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{connect_library_sqlite, insert_asset, insert_tag, memory_database};
+
+    fn engine_over(db: &Arc<Database>) -> Arc<Engine> {
+        Engine::new(db.clone(), Vec::new(), Arc::new(|_| {}))
+    }
+
+    async fn library_rows(db: &Database) -> Vec<(String, String)> {
+        sqlx::query_as("SELECT id, name FROM libraries ORDER BY id")
+            .fetch_all(&db.master_pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn adding_an_offline_librarys_folder_reopens_it_and_replays_its_waiting_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("nas-library");
+        std::fs::create_dir_all(root.join(".opendam")).unwrap();
+        let lib = connect_library_sqlite(&root.join(".opendam/library.sqlite"))
+            .await
+            .unwrap();
+        insert_asset(&lib, "a1").await;
+        lib.close().await;
+        let root = root.to_string_lossy().into_owned();
+        // Registered, but its folder was missing when the app started, so it isn't open.
+        let db = Arc::new(memory_database(Vec::new()).await);
+        let master = &db.master_pool;
+        sqlx::query(
+            "INSERT INTO libraries (id, name, root_paths, created_at, asset_count)
+             VALUES ('nas', 'NAS', ?, 7, 1)",
+        )
+        .bind(serde_json::to_string(&[&root]).unwrap())
+        .execute(master)
+        .await
+        .unwrap();
+        insert_tag(master, "t1", "Rock").await;
+        sqlx::query(
+            "INSERT INTO tag_runs (id, label, provider, mode, status, created_at)
+             VALUES ('run', 'run', 'fake', 'existing_only', 'done', 0);
+             INSERT INTO tag_run_applied (run_id, asset_id, library_id, tag_id)
+             VALUES ('run', 'a1', 'nas', 't1');",
+        )
+        .execute(master)
+        .await
+        .unwrap();
+
+        let library = open_library(&db, &engine_over(&db), "Picked again", &[root.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                library.id.as_str(),
+                library.name.as_str(),
+                library.created_at
+            ),
+            ("nas", "NAS", 7),
+            "the registered library, not a new one"
+        );
+        assert_eq!(library_rows(&db).await, [("nas".into(), "NAS".into())]);
+        let lib = db.get_library_handle("nas").await.unwrap().pool;
+        let tags: Vec<(String, String)> = sqlx::query_as("SELECT asset_id, tag_id FROM asset_tags")
+            .fetch_all(&lib)
+            .await
+            .unwrap();
+        assert_eq!(
+            tags,
+            [("a1".into(), "t1".into())],
+            "the waiting write landed"
+        );
+        let state: String = sqlx::query_scalar("SELECT state FROM tag_run_applied")
+            .fetch_one(master)
+            .await
+            .unwrap();
+        assert_eq!(state, "applied");
+    }
+
+    #[tokio::test]
+    async fn adding_a_new_folder_registers_a_new_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let db = Arc::new(memory_database(Vec::new()).await);
+
+        let library = open_library(&db, &engine_over(&db), "Sprites", &[root.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(library.name, "Sprites");
+        assert_eq!(library.root_paths, [root]);
+        assert_eq!(
+            library_rows(&db).await,
+            [(library.id.clone(), "Sprites".into())]
+        );
+        assert!(db.get_library_handle(&library.id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn adding_an_open_librarys_folder_again_never_replays_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let db = Arc::new(memory_database(Vec::new()).await);
+        let engine = engine_over(&db);
+        let open = open_library(&db, &engine, "Sprites", &[root.clone()])
+            .await
+            .unwrap();
+        let lib = db.get_library_handle(&open.id).await.unwrap().pool;
+        insert_asset(&lib, "a1").await;
+        insert_tag(&db.master_pool, "t1", "Rock").await;
+        // An item of a running run has recorded its intent and is about to write the library.
+        sqlx::query(
+            "INSERT INTO tag_runs (id, label, provider, mode, status, created_at)
+             VALUES ('run', 'run', 'fake', 'existing_only', 'running', 0)",
+        )
+        .execute(&db.master_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tag_run_applied (run_id, asset_id, library_id, tag_id)
+             VALUES ('run', 'a1', ?, 't1')",
+        )
+        .bind(&open.id)
+        .execute(&db.master_pool)
+        .await
+        .unwrap();
+
+        open_library(&db, &engine, "Sprites", &[root])
+            .await
+            .unwrap();
+
+        let tagged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM asset_tags")
+            .fetch_one(&lib)
+            .await
+            .unwrap();
+        let state: String = sqlx::query_scalar("SELECT state FROM tag_run_applied")
+            .fetch_one(&db.master_pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            (tagged, state.as_str()),
+            (0, "pending"),
+            "the in-flight item's row is left to the item"
+        );
+    }
 
     #[test]
     fn only_roots_the_folder_dialog_allowed_can_become_libraries() {
