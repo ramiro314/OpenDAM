@@ -539,9 +539,9 @@ mod tests {
         assert_eq!(file_paths, ["notes.txt"]);
     }
 
-    /// Writes a `size` x `size` PNG to `path`.
-    fn write_png(path: &Path, size: u32) {
-        image::RgbImage::new(size, size).save(path).unwrap();
+    /// Writes a `width` x `height` PNG to `path`. Large ones are short, so the decode stays cheap.
+    fn write_png(path: &Path, width: u32, height: u32) {
+        image::RgbImage::new(width, height).save(path).unwrap();
     }
 
     /// A library rooted at a fresh temp dir, open in a fresh database.
@@ -588,12 +588,12 @@ mod tests {
     async fn small_png_that_grows_past_512_gets_a_thumbnail() {
         let (dir, db, lib) = temp_library().await;
         let source = dir.path().join("sprite.png");
-        write_png(&source, 64);
+        write_png(&source, 64, 64);
         reindex(&db, &lib).await;
         crate::preview::process_image_jobs(&lib, 2).await;
         assert_eq!(preview_state(&lib.pool).await, (None, "done".into(), 0));
 
-        write_png(&source, 1024);
+        write_png(&source, 1024, 32);
         reindex(&db, &lib).await;
         assert_eq!(preview_state(&lib.pool).await, (None, "pending".into(), 1));
 
@@ -603,7 +603,7 @@ mod tests {
         assert_eq!((status.as_str(), active), ("done", 0));
         assert_eq!(
             image::image_dimensions(dir.path().join(&thumb)).unwrap(),
-            (512, 512)
+            (512, 16)
         );
     }
 
@@ -611,11 +611,11 @@ mod tests {
     async fn changed_raster_with_an_active_job_gets_no_second_one() {
         let (dir, db, lib) = temp_library().await;
         let source = dir.path().join("sprite.png");
-        write_png(&source, 64);
+        write_png(&source, 64, 64);
         reindex(&db, &lib).await;
         assert_eq!(preview_state(&lib.pool).await.2, 1);
 
-        write_png(&source, 1024);
+        write_png(&source, 1024, 32);
         reindex(&db, &lib).await;
 
         assert_eq!(preview_state(&lib.pool).await, (None, "pending".into(), 1));

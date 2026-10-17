@@ -778,7 +778,7 @@ mod tests {
     fn large_png_is_downscaled_to_512() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("rock.png");
-        write_image(&source, 1024, 600);
+        write_image(&source, 1024, 40);
         let thumbs = dir.path().join("thumbs");
 
         let name = generate_image_thumb(&source, &thumbs, "a1").unwrap();
@@ -786,7 +786,7 @@ mod tests {
         assert_eq!(name.as_deref(), Some("a1_thumb.png"));
         assert_eq!(
             image::image_dimensions(thumbs.join("a1_thumb.png")).unwrap(),
-            (512, 300)
+            (512, 20)
         );
     }
 
@@ -795,7 +795,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let png = dir.path().join("edge.png");
         let tif = dir.path().join("edge.tif");
-        write_image(&png, 512, 512);
+        write_image(&png, 512, 8);
         write_image(&tif, 512, 100);
         let thumbs = dir.path().join("thumbs");
 
@@ -864,7 +864,7 @@ mod tests {
         let root = dir.path();
         // The old thumbnail, from when the source was larger.
         let old_thumb = root.join(".opendam/thumbs/a1_thumb.png");
-        write_image(&old_thumb, 512, 512);
+        write_image(&old_thumb, 16, 16);
         write_image(&root.join("textures/rock.png"), 256, 256);
         let lib =
             library_with_pending_job(root, "textures/rock.png", ".opendam/thumbs/a1_thumb.png")
@@ -889,8 +889,8 @@ mod tests {
         let root = dir.path();
         // The old thumbnail has the name the new one is written under.
         let thumb = root.join(".opendam/thumbs/a1_thumb.png");
-        write_image(&thumb, 300, 300);
-        write_image(&root.join("textures/rock.png"), 1024, 1024);
+        write_image(&thumb, 30, 30);
+        write_image(&root.join("textures/rock.png"), 1024, 32);
         let lib =
             library_with_pending_job(root, "textures/rock.png", ".opendam/thumbs/a1_thumb.png")
                 .await;
@@ -901,7 +901,7 @@ mod tests {
             done[0].thumb_path.as_deref(),
             Some(thumb.to_string_lossy().as_ref())
         );
-        assert_eq!(image::image_dimensions(&thumb).unwrap(), (512, 512));
+        assert_eq!(image::image_dimensions(&thumb).unwrap(), (512, 16));
         assert_eq!(
             job_outcome(&lib.pool).await,
             (
@@ -918,7 +918,7 @@ mod tests {
         let root = dir.path();
         // An upscaled JPEG from before the rule; a small TGA now gets a native-size PNG.
         let old_thumb = root.join(".opendam/thumbs/a1_thumb.jpg");
-        write_image(&old_thumb, 512, 512);
+        write_image(&old_thumb, 16, 16);
         write_image(&root.join("textures/rock.tga"), 64, 64);
         let lib =
             library_with_pending_job(root, "textures/rock.tga", ".opendam/thumbs/a1_thumb.jpg")
