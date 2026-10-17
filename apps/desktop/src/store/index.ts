@@ -11,6 +11,7 @@ import type {
   FilterSpec,
   SortField,
   SortOrder,
+  AutotagLastUsed,
   AutotagProviderOption,
   AutotagTarget,
   AutotagUpdate,
@@ -448,6 +449,8 @@ interface AutotagStore {
   runs: RunSummary[];
   /** null until loaded */
   providers: AutotagProviderOption[] | null;
+  /** What "Suggest tags" uses; null until loaded */
+  lastUsed: AutotagLastUsed | null;
   runsPanelOpen: boolean;
   /** What the open run dialog would tag, or null when it is closed */
   dialogTarget: AutotagTarget | null;
@@ -455,6 +458,8 @@ interface AutotagStore {
   reviewRunId: string | null;
   fetchRuns: () => Promise<void>;
   fetchProviders: () => Promise<void>;
+  /** Reads the last-used provider and mode, which every run start saves */
+  fetchLastUsed: () => Promise<void>;
   /** Takes an `autotag:updated` event: the runs, and re-fetches the loaded assets that changed */
   applyUpdate: (update: AutotagUpdate) => void;
   setRunsPanelOpen: (open: boolean) => void;
@@ -466,6 +471,7 @@ interface AutotagStore {
 export const useAutotagStore = create<AutotagStore>()((set) => ({
   runs: [],
   providers: null,
+  lastUsed: null,
   runsPanelOpen: false,
   dialogTarget: null,
   reviewRunId: null,
@@ -476,6 +482,10 @@ export const useAutotagStore = create<AutotagStore>()((set) => ({
 
   fetchProviders: async () => {
     set({ providers: await api.listAutotagProviders() });
+  },
+
+  fetchLastUsed: async () => {
+    set({ lastUsed: await api.getAutotagLastUsed() });
   },
 
   applyUpdate: ({ runs, changedAssetIds }) => {

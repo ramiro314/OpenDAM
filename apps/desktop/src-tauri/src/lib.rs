@@ -226,6 +226,8 @@ pub fn run() {
             commands::settings::test_provider,
             commands::autotag::list_autotag_providers,
             commands::autotag::start_autotag_run,
+            commands::autotag::get_autotag_last_used,
+            commands::autotag::get_autotag_suggestions,
             commands::autotag::list_autotag_runs,
             commands::autotag::pause_autotag_run,
             commands::autotag::resume_autotag_run,
