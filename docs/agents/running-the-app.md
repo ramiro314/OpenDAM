@@ -198,7 +198,10 @@ them. This was seen in the nested KWin; `make dev` on your own session is unveri
 The app picks its usual rendering mode (`gpu-shm` on this machine). To bench another, export its
 variable for the script, for example `WEBKIT_DISABLE_DMABUF_RENDERER=1` for `cpu`; the app
 inherits it and `bench_render_mode` reports it.
-`BENCH_TIMEOUT` (seconds, default 1800) stops a stuck app launch.
+`BENCH_TIMEOUT` (seconds, default 1800) stops a stuck app launch. On a fresh run copy, the one-time
+thumbnail cleanup pass holds the library's connections for about 14 minutes on Kenney: the grid
+stays empty until the pass ends with `library:updated`, so the harness waits up to 20 minutes for
+the first page.
 
 **Reports** land in `apps/desktop/src-tauri/target/scroll-bench/` (gitignored), as
 `<render mode>-<unix ts>.json` for timing runs and `<render mode>-checks-<unix ts>.json` for
@@ -212,7 +215,10 @@ The CPU-mode baseline of the grid before windowing is
 
 **DOM markers** the harness reads: the grid's scroll container is `#asset-scroll`, and every
 tile carries `data-tile`, with `data-tile-state="ready"` once its asset is loaded and its image
-has loaded or failed, `"placeholder"` before that.
+has loaded or failed, `"placeholder"` before that. The windowed grid also gives every tile
+`data-index` (its position in the results) and a tile whose page isn't cached yet
+`data-placeholder`; `#asset-scroll` carries the layout as `data-columns` and `data-row-pitch`,
+and the footer's visible range is `#asset-range`.
 
 ### Bench data
 

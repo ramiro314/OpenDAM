@@ -26,6 +26,11 @@ const JUMP_TIMEOUT_MS = 5_000;
 const PAUSE_MS = 3_000;
 /** Startup indexing ends with `library:updated`; a big library on a cold cache takes a while. */
 const INDEXING_TIMEOUT_MS = 180_000;
+/**
+ * On a fresh run copy the one-time thumbnail cleanup pass holds the library's connections for
+ * about 14 minutes on Kenney, and the first page arrives with the `library:updated` it ends with.
+ */
+const FIRST_PAGE_TIMEOUT_MS = 1_200_000;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const nextFrame = () => new Promise<number>((resolve) => requestAnimationFrame(resolve));
@@ -322,9 +327,19 @@ export async function startScrollBench(mode: string): Promise<void> {
         const s = useAssetStore.getState();
         return !s.loading && s.total > 0 && document.getElementById('asset-scroll') !== null;
       },
-      60_000,
+      FIRST_PAGE_TIMEOUT_MS,
       'the first page of results'
-    );
+    ).catch((e) => {
+      const s = useAssetStore.getState();
+      const state = {
+        loading: s.loading,
+        total: s.total,
+        searchError: s.searchError,
+        cachedPages: s.pages.size,
+        assetScroll: document.getElementById('asset-scroll') !== null,
+      };
+      throw new Error(`${String(e)}; asset store ${JSON.stringify(state)}`);
+    });
     report.context = {
       renderMode,
       startedAt,

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import clsx from 'clsx';
-import { useCollectionStore, useUIStore, useAssetStore } from '../../store';
+import { useCollectionStore, useUIStore, useAssetStore, cachedAssets } from '../../store';
 import { IconCollection, IconChevronDown, IconChevronRight, IconPlus, IconTrash } from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { SidebarSection } from './SidebarSection';
@@ -124,12 +124,12 @@ export function CollectionsSection({ clearSmartFilter }: CollectionsSectionProps
       e.dataTransfer.getData('text/plain');
     if (!rawData) return;
 
-    const assetId = resolveDroppedAssetId(rawData, useAssetStore.getState().assets);
+    const assetId = resolveDroppedAssetId(rawData, cachedAssets(useAssetStore.getState()));
 
     try {
       await addToCollection(colId, [assetId]);
       await useCollectionStore.getState().fetchCollections();
-      const curAsset = useAssetStore.getState().assetMap.get(assetId);
+      const curAsset = useAssetStore.getState().getById(assetId);
       if (curAsset) {
         const updatedCols = Array.from(new Set([...(curAsset.collections || []), colId]));
         useAssetStore.getState().patchAsset(assetId, { collections: updatedCols });

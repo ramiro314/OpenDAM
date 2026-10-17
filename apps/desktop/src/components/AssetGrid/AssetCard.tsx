@@ -18,6 +18,8 @@ import styles from './AssetCard.module.css';
 
 export interface AssetCardProps {
   asset: Asset;
+  /** Position in the results, as `data-index` for the UI checks */
+  index: number;
   selected: boolean;
   onClick: (asset: Asset, e: React.MouseEvent) => void;
   onContextMenu: (asset: Asset, e: React.MouseEvent) => void;
@@ -49,6 +51,7 @@ const KIND_COLOR: Record<AssetKind, string> = {
 
 export const AssetCard = memo(function AssetCard({
   asset,
+  index,
   selected,
   onClick,
   onContextMenu,
@@ -141,6 +144,7 @@ export const AssetCard = memo(function AssetCard({
       role="button"
       tabIndex={0}
       data-tile
+      data-index={index}
       data-tile-state={tileState(media, mediaLoaded)}
       onKeyDown={(e) => e.key === 'Enter' && handleClick(e as unknown as React.MouseEvent)}
     >
@@ -151,7 +155,7 @@ export const AssetCard = memo(function AssetCard({
             src={convertFileSrc(asset.thumbnailPath)}
             alt={asset.fileName}
             className={styles.thumbImg}
-            loading="lazy"
+            decoding="async"
             onLoad={() => setMediaLoaded(true)}
             onError={() => setFailed(media)}
           />
@@ -160,7 +164,7 @@ export const AssetCard = memo(function AssetCard({
             src={convertFileSrc(asset.filePath)}
             alt={asset.fileName}
             className={styles.thumbImg}
-            loading="lazy"
+            decoding="async"
             onLoad={() => setMediaLoaded(true)}
             onError={() => setFailed(media)}
           />

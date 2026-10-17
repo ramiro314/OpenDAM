@@ -1,6 +1,12 @@
 import { useCallback, useState, useMemo, useEffect } from 'react';
 import clsx from 'clsx';
-import { useUIStore, useAssetStore, useTagStore, useCollectionStore } from '../../store';
+import {
+  useUIStore,
+  useAssetStore,
+  useTagStore,
+  useCollectionStore,
+  lookupAsset,
+} from '../../store';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import type { Asset, ColorLabel, Collection } from '../../types';
 import {
@@ -38,9 +44,7 @@ const COLOR_LABELS: ColorLabel[] = [
 export function DetailPanel() {
   const focusedAssetId = useUIStore((s) => s.focusedAssetId);
   const asset = useAssetStore((s) =>
-    focusedAssetId
-      ? (s.assets.find((a) => a.id === focusedAssetId) ?? s.assetMap.get(focusedAssetId) ?? null)
-      : null
+    focusedAssetId ? (lookupAsset(s, focusedAssetId) ?? null) : null
   );
   const patchAsset = useAssetStore((s) => s.patchAsset);
   const deleteAsset = useAssetStore((s) => s.deleteAsset);
