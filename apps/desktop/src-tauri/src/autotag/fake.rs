@@ -126,6 +126,14 @@ impl TagProvider for FakeProvider {
         }
     }
 
+    fn max_proposals(&self, settings: &AiSettings) -> u32 {
+        if self.text_only {
+            0
+        } else {
+            settings.anthropic.max_proposals
+        }
+    }
+
     fn unavailable_reason(&self) -> Option<String> {
         None
     }
@@ -149,6 +157,9 @@ mod tests {
         TagRequest {
             run_id: "run".into(),
             mode,
+            model: None,
+            max_tags: 8,
+            max_proposals: 3,
             asset: AssetInfo {
                 file_name: file_name.into(),
                 relative_path: file_name.into(),
@@ -161,6 +172,7 @@ mod tests {
                 ("t-rock".into(), "Rock".into(), None, None, String::new()),
                 ("t-tree".into(), "Tree".into(), None, None, String::new()),
             ])),
+            run_proposals: Vec::new(),
         }
     }
 

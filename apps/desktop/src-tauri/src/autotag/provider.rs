@@ -52,10 +52,19 @@ pub struct Thumbnail {
 pub struct TagRequest {
     pub run_id: String,
     pub mode: Mode,
+    /// The run's model, for providers that have one.
+    pub model: Option<String>,
+    /// The most catalog tags to pick; the engine also enforces it.
+    pub max_tags: u32,
+    /// The most new tag names to propose, outside Existing only.
+    pub max_proposals: u32,
     pub asset: AssetInfo,
     /// None when the asset has no thumbnail yet: the request is text only.
     pub image: Option<Thumbnail>,
     pub vocabulary: Arc<Vocabulary>,
+    /// This run's own vocabulary (D26): names it already proposed or created, which later
+    /// assets should reuse rather than near-duplicate.
+    pub run_proposals: Vec<ProposedTag>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +138,10 @@ pub trait TagProvider: Send + Sync {
     fn concurrency(&self, settings: &AiSettings) -> u32;
     /// The most catalog tags kept per asset.
     fn max_tags(&self, settings: &AiSettings) -> u32;
+    /// The most new tag names proposed per asset, for providers that propose any.
+    fn max_proposals(&self, _settings: &AiSettings) -> u32 {
+        0
+    }
     fn model(&self, _settings: &AiSettings) -> Option<String> {
         None
     }
