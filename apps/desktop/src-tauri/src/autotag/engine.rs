@@ -3365,7 +3365,8 @@ mod tests {
     }
 
     /// a1 is queued in a paused run and a2 in flight in a running one, so a new run skips
-    /// both. a3 is only in an ended run, and a4's item is done, so both are free again.
+    /// both. a3 is queued and in flight only in ended runs, and a4's item in a running run is
+    /// done, so both are free again.
     async fn overlapping_runs() -> Setup {
         let s = setup(Recording::default(), &["a1", "a2", "a3", "a4"]).await;
         let master = &s.engine.db.master_pool;
@@ -3377,8 +3378,8 @@ mod tests {
             &[("a2", "running"), ("a4", "done")],
         )
         .await;
-        insert_run(master, "cancelled", "cancelled", &[("a3", "skipped")]).await;
-        insert_run(master, "done", "done", &[("a4", "done")]).await;
+        insert_run(master, "cancelled", "cancelled", &[("a3", "queued")]).await;
+        insert_run(master, "done", "done", &[("a3", "running"), ("a4", "done")]).await;
         s
     }
 
@@ -3515,27 +3516,15 @@ mod tests {
         let master = &s.engine.db.master_pool;
         // Taken after the new run checked, before its items went in
         insert_run(master, "other", "queued", &[("a1", "queued")]).await;
+        // Still queued, but in ended runs, which hold nothing
+        insert_run(master, "cancelled", "cancelled", &[("a2", "queued")]).await;
+        insert_run(master, "done", "done", &[("a2", "running")]).await;
         let items = vec![
             ("a1".to_string(), "lib".to_string()),
             ("a2".into(), "lib".into()),
         ];
 
-        let queued = store::create_run(
-            master,
-            NewRun {
-                id: "new",
-                label: "2 assets",
-                provider: "recording",
-                access: None,
-                model: None,
-                mode: "existing_only",
-                options: serde_json::json!({}),
-                inline: false,
-            },
-            &items,
-        )
-        .await
-        .unwrap();
+        let queued = create_new_run(master, &items).await;
 
         assert_eq!(queued, 1);
         let assets: Vec<String> =
@@ -3544,5 +3533,48 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(assets, ["a2"]);
+    }
+
+    /// `store::create_run` of a run "new" over `items`, returning how many went in.
+    async fn create_new_run(master: &Pool<Sqlite>, items: &[(String, String)]) -> usize {
+        store::create_run(
+            master,
+            NewRun {
+                id: "new",
+                label: "assets",
+                provider: "recording",
+                access: None,
+                model: None,
+                mode: "existing_only",
+                options: serde_json::json!({}),
+                inline: false,
+            },
+            items,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_every_asset_was_taken_meanwhile_inserts_nothing_and_is_discarded() {
+        let s = setup(Recording::default(), &["a1", "a2"]).await;
+        let master = &s.engine.db.master_pool;
+        insert_run(master, "paused", "paused", &[("a1", "queued")]).await;
+        insert_run(master, "running", "running", &[("a2", "running")]).await;
+        let items = vec![
+            ("a1".to_string(), "lib".to_string()),
+            ("a2".into(), "lib".into()),
+        ];
+
+        let queued = create_new_run(master, &items).await;
+        assert_eq!(queued, 0);
+        store::discard_run(master, "new").await.unwrap();
+
+        let runs = "SELECT COUNT(*) FROM tag_runs WHERE id = 'new'";
+        assert_eq!(count(master, runs).await, 0);
+        let items = "SELECT COUNT(*) FROM tag_run_items WHERE run_id = 'new'";
+        assert_eq!(count(master, items).await, 0);
+        // The runs holding the assets keep their items
+        assert_eq!(count(master, "SELECT COUNT(*) FROM tag_run_items").await, 2);
     }
 }
