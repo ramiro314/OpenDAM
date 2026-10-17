@@ -163,8 +163,9 @@ apps/desktop/scripts/scroll-bench.sh checks   # UI checks
 The script:
 
 1. copies the golden snapshot (below) to a fresh `~/.cache/opendam-bench/run-*` directory and
-   registers the copy as the only library in a fresh `XDG_DATA_HOME`, seeded as in "A throwaway
-   profile";
+   starts the app with a fresh `XDG_DATA_HOME` and `OPENDAM_BENCH_LIBRARY` set to the copy. Debug
+   builds read that variable at startup, register the copy as library `bench` in the master DB
+   they just created, so the app's own schema is used, and open it;
 2. builds a debug binary with the frontend embedded and built in Vite's development mode
    (`NODE_ENV=development vite build --mode development`), with `VITE_SCROLL_BENCH` set;
 3. runs the app in a nested headless KWin with a virtual 1400x900 output, its own D-Bus session

@@ -80,6 +80,12 @@ pub fn run() {
                 let db = Database::new(db_path.to_str().unwrap())
                     .await
                     .expect("Failed to initialize database");
+                #[cfg(debug_assertions)]
+                commands::bench::register_bench_library(
+                    &db,
+                    std::env::var("OPENDAM_BENCH_LIBRARY").ok(),
+                )
+                .await;
                 let libraries =
                     sqlx::query_as::<_, (String, String)>("SELECT id, root_paths FROM libraries")
                         .fetch_all(&db.master_pool)

@@ -30,14 +30,9 @@ trap 'rm -rf "$run"' EXIT
 
 echo "Copying the golden snapshot to $run/library"
 cp -a "$golden" "$run/library"
-# Register the run copy as the only library. The app creates the master DB's other tables.
-mkdir -p "$run/xdg/com.opendam.desktop"
-sqlite3 "$run/xdg/com.opendam.desktop/opendam.sqlite" "
-  CREATE TABLE IF NOT EXISTS libraries (
-    id TEXT PRIMARY KEY, name TEXT NOT NULL, root_paths TEXT NOT NULL,
-    created_at INTEGER NOT NULL, asset_count INTEGER NOT NULL DEFAULT 0);
-  INSERT INTO libraries (id, name, root_paths, created_at)
-    VALUES ('bench', 'Bench', '[\"$run/library\"]', 0);"
+# The app registers the run copy as its only library from OPENDAM_BENCH_LIBRARY (debug builds),
+# once it has created the master DB in the fresh XDG_DATA_HOME with its own schema.
+mkdir -p "$run/xdg"
 
 # A debug binary with the frontend embedded and built in Vite's development mode, so the bench
 # module is in it. Not the Vite dev server: under its http://localhost origin, WebKitGTK fails
@@ -67,10 +62,14 @@ cd "$desktop/src-tauri"
 for only in ${scenarios[*]}; do
   log="$run/app-\${only//\//-}.log"
   [[ \$only == all ]] && only=
-  XDG_DATA_HOME="$run/xdg" OPENDAM_NO_KEYRING=1 OPENDAM_SCROLL_BENCH_ONLY=\$only \\
-    ./target/debug/opendam-desktop >"\$log" 2>&1 &
+  XDG_DATA_HOME="$run/xdg" OPENDAM_NO_KEYRING=1 OPENDAM_BENCH_LIBRARY="$run/library" \\
+    OPENDAM_SCROLL_BENCH_ONLY=\$only ./target/debug/opendam-desktop >"\$log" 2>&1 &
   app=\$!
-  timeout $timeout tail -n +1 -F "\$log" 2>/dev/null | while IFS= read -r line; do
+  # tail runs beside the loop, not in a pipeline, so it can be stopped as soon as the report
+  # line arrives; a pipeline would wait for tail, which waits for the app's next log line.
+  exec 3< <(timeout $timeout tail -n +1 -F "\$log" 2>/dev/null)
+  feeder=\$!
+  while IFS= read -r line <&3; do
     case "\$line" in
       *"[scroll-bench] pause "*)
         name=\${line##*pause }
@@ -80,7 +79,8 @@ for only in ${scenarios[*]}; do
         break ;;
     esac
   done
-  kill \$app 2>/dev/null
+  kill \$feeder \$app 2>/dev/null
+  exec 3<&-
   wait \$app 2>/dev/null
   cat "\$log" >>"$run/app.log"
 done

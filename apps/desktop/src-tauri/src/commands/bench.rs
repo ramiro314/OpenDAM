@@ -6,14 +6,53 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::db::Database;
+
 type Result<T> = std::result::Result<T, String>;
 
 /// `comm` is truncated to 15 characters, so `WebKitWebProcess` reads `WebKitWebProces`.
 const WEB_PROCESS_COMM: &str = "WebKitWebProces";
 
-/// Resident memory, in bytes, of the WebKit web processes this app started.
+/// Registers `root` (from `OPENDAM_BENCH_LIBRARY`) as library `bench` in the master DB once the
+/// app has created its schema, so the run script doesn't copy that schema, and opens it.
+/// `Database::new` has already opened the libraries registered before it ran, so on a fresh
+/// profile this opens it the way `Database::new` would have. Leaves a registered `bench` row alone.
+pub async fn register_bench_library(db: &Database, root: Option<String>) {
+    let Some(root) = root.filter(|r| !r.is_empty()) else {
+        return;
+    };
+    let root_paths = serde_json::json!([root]).to_string();
+    let result = sqlx::query(
+        "INSERT OR IGNORE INTO libraries (id, name, root_paths, created_at)
+         VALUES ('bench', 'Bench', ?, 0)",
+    )
+    .bind(root_paths)
+    .execute(&db.master_pool)
+    .await;
+    if let Err(e) = result {
+        tracing::error!("Could not register the bench library {root}: {e}");
+        return;
+    }
+    if db.get_library_handle("bench").await.is_none() {
+        if let Err(e) = db
+            .register_library("bench", "Bench", Path::new(&root))
+            .await
+        {
+            tracing::error!("Could not open the bench library {root}: {e}");
+        }
+    }
+}
+
+/// Resident memory, in bytes, of the WebKit web processes this app started. Async, so the
+/// `/proc` scan runs off the main thread while the harness times frames.
 #[tauri::command]
-pub fn bench_rss() -> Result<u64> {
+pub async fn bench_rss() -> Result<u64> {
+    tauri::async_runtime::spawn_blocking(web_process_rss)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn web_process_rss() -> Result<u64> {
     let mut parent_of = HashMap::new();
     let mut comm_of = HashMap::new();
     for entry in std::fs::read_dir("/proc").map_err(|e| e.to_string())? {
@@ -94,7 +133,13 @@ pub fn bench_log(line: String) {
 /// Adds the git commit to the report's `context`, prints the report and writes it to
 /// `src-tauri/target/scroll-bench/<name>-<unix-ts>.json`. Returns the file's path.
 #[tauri::command]
-pub fn bench_report(name: String, json: String) -> Result<String> {
+pub async fn bench_report(name: String, json: String) -> Result<String> {
+    tauri::async_runtime::spawn_blocking(move || write_report(name, json))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn write_report(name: String, json: String) -> Result<String> {
     let mut report: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     if let Some(context) = report.get_mut("context").and_then(|c| c.as_object_mut()) {
@@ -134,4 +179,41 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn registers_and_opens_the_bench_library_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(dir.path().join("opendam.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+
+        let library = tempfile::tempdir().unwrap();
+        let root = library.path().to_str().unwrap().to_string();
+        register_bench_library(&db, Some(root.clone())).await;
+        register_bench_library(&db, Some("/elsewhere".into())).await;
+        register_bench_library(&db, None).await;
+
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, name, root_paths FROM libraries")
+                .fetch_all(&db.master_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "bench".to_string(),
+                "Bench".to_string(),
+                serde_json::json!([root]).to_string()
+            )]
+        );
+        // Open in this process too, not only from the next launch
+        let handle = db.get_library_handle("bench").await.expect("bench is open");
+        assert_eq!(handle.root_path, library.path());
+        assert!(library.path().join(".opendam/library.sqlite").exists());
+    }
 }
