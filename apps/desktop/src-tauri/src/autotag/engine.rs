@@ -693,35 +693,28 @@ impl Engine {
         let missing = requested - items.len();
         let mut skipped = self.drop_taken(&mut items).await?;
         let id = uuid::Uuid::new_v4().to_string();
-        let queued = store::create_run(
-            &self.db.master_pool,
-            NewRun {
-                id: &id,
-                label: &run_label,
-                provider: provider_id,
-                access,
-                model: pool.provider.model(&settings).as_deref(),
-                mode: mode.as_str(),
-                options: serde_json::json!({
-                    "maxTags": pool.provider.max_tags(&settings),
-                    "maxProposals": pool.provider.max_proposals(&settings),
-                    "threshold": pool.provider.threshold(&settings),
-                }),
-                inline,
-            },
-            &items,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let (run, queued) = self
+            .create_run(
+                pool,
+                NewRun {
+                    id: &id,
+                    label: &run_label,
+                    provider: provider_id,
+                    access,
+                    model: pool.provider.model(&settings).as_deref(),
+                    mode: mode.as_str(),
+                    options: serde_json::json!({
+                        "maxTags": pool.provider.max_tags(&settings),
+                        "maxProposals": pool.provider.max_proposals(&settings),
+                        "threshold": pool.provider.threshold(&settings),
+                    }),
+                    inline,
+                },
+                &items,
+            )
+            .await?;
         // Another run took some of the assets while this one was being created
         skipped += items.len() - queued;
-        if queued == 0 {
-            if let Err(e) = store::discard_run(&self.db.master_pool, &id).await {
-                tracing::warn!("Could not delete the empty auto-tag run {id}: {e}");
-            }
-            return Err("Every one of these assets is already queued in another run".into());
-        }
-        tracing::info!("Started auto-tag run {id}: {} with {label}", run_label);
         let last = settings::LastUsed {
             provider: provider_id.to_string(),
             mode,
@@ -729,22 +722,122 @@ impl Engine {
         if let Err(e) = settings::save_last_used(&self.db.master_pool, &last).await {
             tracing::warn!("Could not save the last-used tagging provider and mode: {e}");
         }
-
-        pool.wake.notify_one();
-        self.events_wake.notify_one();
-        let run = self
-            .list_runs()
-            .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|r| r.id == id)
-            .ok_or("The new run is missing")?;
         Ok(StartedRun {
             run,
             queued,
             skipped,
             missing,
         })
+    }
+
+    /// Starts "Retry of <label>" over exactly the run's failed assets, with its provider,
+    /// access, model, mode and options. The run itself keeps its status and history, so it
+    /// still undoes only its own tags. Refused on a run being or already undone.
+    pub async fn retry_failed(&self, run_id: &str) -> Result<StartedRun, String> {
+        let master = &self.db.master_pool;
+        let run = store::run_settings(master, run_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("The run no longer exists")?;
+        if ["undoing", "undo_partial", "undone"].contains(&run.status.as_str()) {
+            return Err("An undone run can't retry its failed assets".into());
+        }
+        let mut items = store::failed_items(master, run_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if items.is_empty() {
+            return Err("This run has no failed assets".into());
+        }
+        if let Some(reason) = self
+            .unavailable_reason(&run.provider, run.access.clone())
+            .await?
+        {
+            return Err(reason);
+        }
+        let pool = self.pool(&run.provider)?;
+        let mut skipped = self.drop_taken(&mut items).await?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let (summary, queued) = self
+            .create_run(
+                pool,
+                NewRun {
+                    id: &id,
+                    label: &format!("Retry of {}", run.label),
+                    provider: &run.provider,
+                    access: run.access.as_deref(),
+                    model: run.model.as_deref(),
+                    mode: &run.mode,
+                    options: serde_json::from_str(&run.options).unwrap_or_default(),
+                    inline: run.inline,
+                },
+                &items,
+            )
+            .await?;
+        skipped += items.len() - queued;
+        Ok(StartedRun {
+            run: summary,
+            queued,
+            skipped,
+            missing: 0,
+        })
+    }
+
+    /// Creates the run with its items, leaving out assets another run took meanwhile, wakes its
+    /// provider's scheduler, and returns the run with how many items went in. A run left with
+    /// none is deleted, and refused.
+    async fn create_run(
+        &self,
+        pool: &ProviderPool,
+        run: NewRun<'_>,
+        items: &[(String, String)],
+    ) -> Result<(RunSummary, usize), String> {
+        let id = run.id.to_string();
+        let label = run.label.to_string();
+        let queued = store::create_run(&self.db.master_pool, run, items)
+            .await
+            .map_err(|e| e.to_string())?;
+        if queued == 0 {
+            if let Err(e) = store::discard_run(&self.db.master_pool, &id).await {
+                tracing::warn!("Could not delete the empty auto-tag run {id}: {e}");
+            }
+            return Err("Every one of these assets is already queued in another run".into());
+        }
+        tracing::info!(
+            "Started auto-tag run {id}: {label} with {}",
+            pool.provider.label()
+        );
+        pool.wake.notify_one();
+        self.events_wake.notify_one();
+        let mut summary = store::run_summary(&self.db.master_pool, &id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("The new run is missing")?;
+        self.label_provider(&mut summary);
+        Ok((summary, queued))
+    }
+
+    /// Clears `run_id` from the Runs panel, or with none every finished run (`store::clear_runs`
+    /// says which, and what each keeps). Returns how many it cleared.
+    pub async fn clear_runs(&self, run_id: Option<&str>) -> Result<usize, String> {
+        // No item's, review's or replay's write is half done while the rows go
+        let _writes = self.writes.write().await;
+        let busy: HashSet<String> = self
+            .items_in_flight
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let cleared = store::clear_runs(&self.db.master_pool, run_id, &busy).await?;
+        if !cleared.is_empty() {
+            tracing::info!("Cleared {} auto-tag runs", cleared.len());
+            let cleared: HashSet<String> = cleared.iter().cloned().collect();
+            for pool in &self.pools {
+                pool.provider.forget_runs(&cleared);
+            }
+            self.events_wake.notify_one();
+        }
+        Ok(cleared.len())
     }
 
     /// Hands out permits for one provider: while a request slot is free, it claims the next
@@ -2396,6 +2489,110 @@ mod tests {
         assert_eq!(
             item(master, "a1").await,
             ("failed".into(), Some("Refused".into()), 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_failed_starts_a_new_run_over_exactly_the_failed_assets_and_leaves_the_run_alone()
+    {
+        let s = setup(
+            Recording {
+                existing: ids(&["t-rock"]),
+                failures: failures(vec![
+                    ProviderError::new(ErrorClass::Item, "Refused"),
+                    ProviderError::new(ErrorClass::Item, "Refused"),
+                ]),
+                ..Default::default()
+            },
+            &["a1", "a2", "a3", "a4"],
+        )
+        .await;
+        let master = &s.engine.db.master_pool;
+        insert_tag(master, "t-rock", "Rock").await;
+        settings::update(
+            master,
+            serde_json::json!({"anthropic": {"concurrency": 1, "maxTags": 5}}),
+        )
+        .await
+        .unwrap();
+        s.engine.start().await;
+        let original = s
+            .engine
+            .start_run(
+                scope(&["a1", "a2", "a3", "a4"]),
+                "recording",
+                Mode::PreferExisting,
+            )
+            .await
+            .unwrap()
+            .run;
+        let before = wait_until_done(&s.engine).await[0].clone();
+        assert_eq!((before.done, before.failed), (2, 2));
+        let settings_of = |run_id: String| async move {
+            sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String)>(
+                "SELECT provider, access, model, mode, options FROM tag_runs WHERE id = ?",
+            )
+            .bind(run_id)
+            .fetch_one(master)
+            .await
+            .unwrap()
+        };
+        // Settings changed since don't reach the retry: it copies the run's options
+        settings::update(master, serde_json::json!({"anthropic": {"maxTags": 3}}))
+            .await
+            .unwrap();
+
+        let retry = s.engine.retry_failed(&original.id).await.unwrap();
+
+        assert_eq!(retry.run.label, "Retry of 4 assets");
+        assert_eq!((retry.queued, retry.skipped), (2, 0));
+        assert_eq!(
+            items_of(&s.engine, &retry.run.id).await,
+            [("a1".into(), "lib".into()), ("a2".into(), "lib".into())]
+        );
+        assert_eq!(
+            settings_of(retry.run.id.clone()).await,
+            settings_of(original.id.clone()).await
+        );
+        let runs = wait_until_done(&s.engine).await;
+        let retried = runs.iter().find(|r| r.id == retry.run.id).unwrap();
+        assert_eq!((retried.done, retried.failed), (2, 0));
+        let after = runs.iter().find(|r| r.id == original.id).unwrap();
+        assert_eq!(
+            (&after.status, after.done, after.failed, after.finished_at),
+            (
+                &before.status,
+                before.done,
+                before.failed,
+                before.finished_at
+            ),
+            "the run keeps its status and history"
+        );
+        let owners: Vec<(String, bool)> =
+            sqlx::query_as("SELECT asset_id, run_id = ? FROM tag_run_applied ORDER BY asset_id")
+                .bind(&retry.run.id)
+                .fetch_all(master)
+                .await
+                .unwrap();
+        assert_eq!(
+            owners,
+            [
+                ("a1".into(), true),
+                ("a2".into(), true),
+                ("a3".into(), false),
+                ("a4".into(), false),
+            ],
+            "each run owns only its own tags"
+        );
+
+        assert_eq!(
+            s.engine.retry_failed(&retry.run.id).await.unwrap_err(),
+            "This run has no failed assets"
+        );
+        assert_eq!(s.engine.undo_run(&original.id).await.unwrap(), "undone");
+        assert_eq!(
+            s.engine.retry_failed(&original.id).await.unwrap_err(),
+            "An undone run can't retry its failed assets"
         );
     }
 

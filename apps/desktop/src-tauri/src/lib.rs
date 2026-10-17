@@ -243,6 +243,8 @@ pub fn run() {
             commands::autotag::get_autotag_proposals,
             commands::autotag::review_autotag_proposals,
             commands::autotag::undo_autotag_run,
+            commands::autotag::retry_failed_autotag_run,
+            commands::autotag::clear_autotag_runs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

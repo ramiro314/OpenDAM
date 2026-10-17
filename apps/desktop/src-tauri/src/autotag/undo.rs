@@ -1127,4 +1127,88 @@ mod tests {
         assert_eq!(engine.undo_run(&y).await.unwrap(), "undone");
         assert!(asset_tags(a).await.is_empty(), "undoing Y removes it");
     }
+
+    /// A `done` run over A's rock-a1, plus a write of Rock to B's rock-b1 still waiting for
+    /// replay, with B offline.
+    async fn run_with_a_write_waiting_for_b(
+    ) -> (Arc<Database>, Vec<Pool<Sqlite>>, Arc<Engine>, String) {
+        let (db, pools) = libraries(&["A", "B"], &[&["rock-a1"], &["rock-b1"]]).await;
+        let engine = started_engine(&db).await;
+        let run_id = run(&engine, &db, &["rock-a1"], Mode::ExistingOnly, "done").await;
+        db.unregister_library("B").await.unwrap();
+        sqlx::query(
+            "INSERT INTO tag_run_applied (run_id, asset_id, library_id, tag_id)
+             VALUES (?, 'rock-b1', 'B', 't-rock')",
+        )
+        .bind(&run_id)
+        .execute(&db.master_pool)
+        .await
+        .unwrap();
+        (db, pools, engine, run_id)
+    }
+
+    #[tokio::test]
+    async fn clearing_a_done_run_keeps_its_write_for_an_offline_library_until_replay_applies_it() {
+        let (db, pools, engine, run_id) = run_with_a_write_waiting_for_b().await;
+        let (a, b) = (&pools[0], &pools[1]);
+
+        assert_eq!(engine.clear_runs(Some(&run_id)).await.unwrap(), 1);
+
+        assert_eq!(
+            count(&db.master_pool, "SELECT COUNT(*) FROM tag_runs").await,
+            0
+        );
+        assert_eq!(
+            count(&db.master_pool, "SELECT COUNT(*) FROM tag_run_items").await,
+            0
+        );
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT library_id, state FROM tag_run_applied")
+                .fetch_all(&db.master_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            [("B".into(), "pending".into())],
+            "only the write still waiting stays"
+        );
+        assert_eq!(
+            asset_tags(a).await,
+            [("rock-a1".into(), "t-rock".into())],
+            "the run's tags stay"
+        );
+
+        reopen(&engine, &db, "B", b).await;
+
+        assert_eq!(asset_tags(b).await, [("rock-b1".into(), "t-rock".into())]);
+        assert_eq!(
+            count(&db.master_pool, "SELECT COUNT(*) FROM tag_run_applied").await,
+            0,
+            "replay deletes the row once applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_partly_undone_run_drops_its_pending_rows_so_reopening_applies_nothing() {
+        let (db, pools, engine, run_id) = run_with_a_write_waiting_for_b().await;
+        let (a, b) = (&pools[0], &pools[1]);
+        assert_eq!(engine.undo_run(&run_id).await.unwrap(), "undo_partial");
+        assert!(asset_tags(a).await.is_empty());
+
+        assert_eq!(engine.clear_runs(Some(&run_id)).await.unwrap(), 1);
+
+        assert_eq!(
+            count(&db.master_pool, "SELECT COUNT(*) FROM tag_runs").await,
+            0
+        );
+        assert_eq!(
+            count(&db.master_pool, "SELECT COUNT(*) FROM tag_run_applied").await,
+            0
+        );
+        reopen(&engine, &db, "B", b).await;
+        assert!(
+            asset_tags(b).await.is_empty(),
+            "the unapplied pair never lands"
+        );
+    }
 }

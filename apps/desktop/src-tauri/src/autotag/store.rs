@@ -566,6 +566,136 @@ pub async fn cancel_run(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<boo
     Ok(true)
 }
 
+/// Clears runs from the Runs panel (D28), in one master transaction: `run_id`, or with none
+/// every finished run (`done`, `cancelled` or `undone`, with no proposals waiting for review).
+/// A run is never cleared while it is `queued`, `running`, `paused` or `undoing`, or while an
+/// item of it is in flight (`busy` holds the runs with one still in the engine). Returns the
+/// runs cleared.
+///
+/// - An `undo_partial` run loses every row, `pending` ones included: the tags left in its
+///   offline library stay there, and its unapplied pairs are never applied.
+/// - Any other run keeps its `pending` `tag_run_applied` rows, without their run: replay
+///   applies them when their library is back, then deletes them.
+/// - An `applied` row of a cleared run stays while another run records the same pair, so
+///   undoing that run leaves the tag both added.
+pub async fn clear_runs(
+    master: &Pool<Sqlite>,
+    run_id: Option<&str>,
+    busy: &HashSet<String>,
+) -> Result<Vec<String>, String> {
+    let db = |e: sqlx::Error| e.to_string();
+    let mut tx = master.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;
+    let candidates: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT id, status, (SELECT COUNT(*) FROM tag_run_items
+                             WHERE run_id = tag_runs.id AND status = 'running')
+         FROM tag_runs
+         WHERE CASE WHEN ?1 IS NULL
+                    THEN status IN ('done', 'cancelled', 'undone')
+                         AND NOT EXISTS (SELECT 1 FROM tag_run_proposals p
+                                         WHERE p.run_id = tag_runs.id AND p.status = 'pending')
+                    ELSE id = ?1 END",
+    )
+    .bind(run_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db)?;
+    if run_id.is_some() {
+        let (id, status, in_flight) = candidates.first().ok_or("The run no longer exists")?;
+        if ["queued", "running", "paused", "undoing"].contains(&status.as_str()) {
+            return Err("Only a stopped run can be cleared".into());
+        }
+        if *in_flight > 0 || busy.contains(id) {
+            return Err("Wait for the requests still in flight to finish".into());
+        }
+    }
+    let mut cleared = Vec::new();
+    for (id, status, in_flight) in candidates {
+        if in_flight == 0 && !busy.contains(&id) {
+            delete_run(&mut tx, &id, status == "undo_partial")
+                .await
+                .map_err(db)?;
+            cleared.push(id);
+        }
+    }
+    sqlx::query(
+        "DELETE FROM tag_run_applied
+         WHERE state = 'applied' AND run_id NOT IN (SELECT id FROM tag_runs)
+           AND NOT EXISTS (SELECT 1 FROM tag_run_applied o JOIN tag_runs r ON r.id = o.run_id
+                           WHERE o.asset_id = tag_run_applied.asset_id
+                             AND o.tag_id = tag_run_applied.tag_id)",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?;
+    tx.commit().await.map_err(db)?;
+    Ok(cleared)
+}
+
+/// Deletes the run and its items and proposals, and every one of its `tag_run_applied` rows
+/// with `all_rows`, else none: `clear_runs` drops the `applied` ones no other run shares.
+async fn delete_run(
+    tx: &mut sqlx::SqliteConnection,
+    run_id: &str,
+    all_rows: bool,
+) -> sqlx::Result<()> {
+    if all_rows {
+        sqlx::query("DELETE FROM tag_run_applied WHERE run_id = ?")
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for sql in [
+        "DELETE FROM tag_run_proposal_assets
+         WHERE proposal_id IN (SELECT id FROM tag_run_proposals WHERE run_id = ?)",
+        "DELETE FROM tag_run_proposals WHERE run_id = ?",
+        "DELETE FROM tag_run_items WHERE run_id = ?",
+        "DELETE FROM tag_runs WHERE id = ?",
+    ] {
+        sqlx::query(sql).bind(run_id).execute(&mut *tx).await?;
+    }
+    Ok(())
+}
+
+/// A run as Retry failed copies it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RunSettings {
+    pub label: String,
+    pub provider: String,
+    pub access: Option<String>,
+    pub model: Option<String>,
+    pub mode: String,
+    pub status: String,
+    pub options: String,
+    pub inline: bool,
+}
+
+pub async fn run_settings(
+    master: &Pool<Sqlite>,
+    run_id: &str,
+) -> sqlx::Result<Option<RunSettings>> {
+    sqlx::query_as(
+        "SELECT label, provider, access, model, mode, status, options, inline
+         FROM tag_runs WHERE id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(master)
+    .await
+}
+
+/// The run's `failed` assets with their libraries, in the order the run had them.
+pub async fn failed_items(
+    master: &Pool<Sqlite>,
+    run_id: &str,
+) -> sqlx::Result<Vec<(String, String)>> {
+    sqlx::query_as(
+        "SELECT asset_id, library_id FROM tag_run_items
+         WHERE run_id = ? AND status = 'failed' ORDER BY rowid",
+    )
+    .bind(run_id)
+    .fetch_all(master)
+    .await
+}
+
 /// Gives back an item that stopped before its result was written: it goes back to the queue,
 /// or is `skipped` when its run was cancelled meanwhile.
 pub async fn release_item(master: &Pool<Sqlite>, item: &Item) -> sqlx::Result<()> {
@@ -1667,5 +1797,131 @@ mod tests {
             serde_json::json!(["t-rock"]),
             "the result agrees"
         );
+    }
+
+    #[tokio::test]
+    async fn clear_takes_only_stopped_runs_and_clear_finished_leaves_those_needing_you() {
+        let db = memory_database(Vec::new()).await;
+        let master = &db.master_pool;
+        for status in [
+            "queued",
+            "running",
+            "paused",
+            "undoing",
+            "awaiting_review",
+            "undo_partial",
+            "done",
+            "cancelled",
+            "undone",
+        ] {
+            insert_run(&db, status, status).await;
+        }
+        insert_run(&db, "cancelled-in-flight", "cancelled").await;
+        insert_item(&db, "cancelled-in-flight", "a1", "running").await;
+        insert_run(&db, "done-in-engine", "done").await;
+        insert_run(&db, "cancelled-with-proposals", "cancelled").await;
+        for run in ["awaiting_review", "cancelled-with-proposals"] {
+            sqlx::query(
+                "INSERT INTO tag_run_proposals (id, run_id, name, normalized_name)
+                 VALUES (?, ?, 'Moss', 'moss')",
+            )
+            .bind(format!("p-{run}"))
+            .bind(run)
+            .execute(master)
+            .await
+            .unwrap();
+        }
+        let busy = HashSet::from(["done-in-engine".to_string()]);
+
+        for run in ["queued", "running", "paused", "undoing"] {
+            assert_eq!(
+                clear_runs(master, Some(run), &busy).await,
+                Err("Only a stopped run can be cleared".into()),
+                "{run}"
+            );
+        }
+        for run in ["cancelled-in-flight", "done-in-engine"] {
+            assert_eq!(
+                clear_runs(master, Some(run), &busy).await,
+                Err("Wait for the requests still in flight to finish".into()),
+                "{run}"
+            );
+        }
+        assert_eq!(
+            clear_runs(master, Some("missing"), &busy).await,
+            Err("The run no longer exists".into())
+        );
+
+        let mut cleared = clear_runs(master, None, &busy).await.unwrap();
+        cleared.sort();
+        assert_eq!(cleared, ["cancelled", "done", "undone"]);
+        assert_eq!(
+            clear_runs(master, Some("awaiting_review"), &busy).await,
+            Ok(vec!["awaiting_review".to_string()]),
+            "one at a time, a run waiting for review can go"
+        );
+        let left: Vec<String> = sqlx::query_scalar("SELECT id FROM tag_runs ORDER BY id")
+            .fetch_all(master)
+            .await
+            .unwrap();
+        assert_eq!(
+            left,
+            [
+                "cancelled-in-flight",
+                "cancelled-with-proposals",
+                "done-in-engine",
+                "paused",
+                "queued",
+                "running",
+                "undo_partial",
+                "undoing",
+            ]
+        );
+        assert_eq!(
+            count_rows(master, "tag_run_proposals").await,
+            1,
+            "the cleared run's proposals go with it"
+        );
+    }
+
+    async fn count_rows(master: &Pool<Sqlite>, table: &str) -> i64 {
+        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(master)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cleared_runs_applied_pair_stays_recorded_while_another_run_records_it_too() {
+        let db = memory_database(Vec::new()).await;
+        let master = &db.master_pool;
+        insert_run(&db, "x", "done").await;
+        insert_run(&db, "y", "done").await;
+        for (run, tag) in [("x", "t-rock"), ("x", "t-tree"), ("y", "t-rock")] {
+            insert_pending(&db, run, "a1", "lib", tag).await;
+        }
+        sqlx::query("UPDATE tag_run_applied SET state = 'applied'")
+            .execute(master)
+            .await
+            .unwrap();
+
+        clear_runs(master, Some("x"), &HashSet::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            applied_rows(&db).await,
+            [
+                ("a1".into(), "t-rock".into(), "applied".into()),
+                ("a1".into(), "t-rock".into(), "applied".into()),
+            ],
+            "x's Rock row stays, so undoing y leaves the tag x added too"
+        );
+
+        clear_runs(master, Some("y"), &HashSet::new())
+            .await
+            .unwrap();
+
+        assert_eq!(count_rows(master, "tag_run_applied").await, 0);
     }
 }

@@ -3,7 +3,13 @@ import clsx from 'clsx';
 import { api } from '../../api';
 import { useAutotagStore } from '../../store';
 import type { RunSummary } from '../../types';
-import { modeLabel, runActions, runProgress, runUsage } from '../../utils/autotag';
+import {
+  clearedWithFinished,
+  modeLabel,
+  runActions,
+  runProgress,
+  runUsage,
+} from '../../utils/autotag';
 import { IconTag, IconX } from '../Icons';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './Autotag.module.css';
@@ -39,11 +45,21 @@ function undoTitle(run: RunSummary): string {
   return parts.join(' ');
 }
 
+function clearTitle(run: RunSummary): string {
+  if (run.status === 'undo_partial')
+    return 'Remove this run from the list. The tags left in the offline library stay there, and Finish undo is no longer possible.';
+  const parts = ['Remove this run from the list. Its tags stay, and it can no longer be undone.'];
+  if (run.pendingProposals > 0) parts.push('Its proposals waiting for review are dropped.');
+  return parts.join(' ');
+}
+
 function RunRow({ run, act }: { run: RunSummary; act: Act }) {
   const actions = runActions(run);
   const openReview = useAutotagStore((s) => s.openReview);
   // Undo can't be taken back, so it asks for a second click
   const [confirmingUndo, setConfirmingUndo] = useState(false);
+  // Clearing a partly undone run gives up its Finish undo, so it asks first too
+  const [confirmingClear, setConfirmingClear] = useState(false);
   const button = clsx(dialog.btn, dialog.secondaryBtn, styles.runBtn);
   const processed = run.done + run.failed;
   const percent = run.total > 0 ? (processed / run.total) * 100 : 0;
@@ -74,7 +90,9 @@ function RunRow({ run, act }: { run: RunSummary; act: Act }) {
         actions.cancel ||
         actions.review ||
         actions.undo ||
-        actions.finishUndo) && (
+        actions.finishUndo ||
+        actions.retryFailed ||
+        actions.clear) && (
         <div className={styles.runActions}>
           {actions.review && (
             <button
@@ -127,6 +145,30 @@ function RunRow({ run, act }: { run: RunSummary; act: Act }) {
               Finish undo
             </button>
           )}
+          {actions.retryFailed && (
+            <button
+              className={button}
+              onClick={() => act(() => api.retryFailedAutotagRun(run.id))}
+              title="Start a new run over the assets that failed, with the same provider, mode and options"
+            >
+              Retry failed
+            </button>
+          )}
+          {actions.clear && (
+            <button
+              className={button}
+              onClick={() => {
+                if (run.status === 'undo_partial' && !confirmingClear)
+                  return setConfirmingClear(true);
+                setConfirmingClear(false);
+                act(() => api.clearAutotagRuns(run.id));
+              }}
+              onBlur={() => setConfirmingClear(false)}
+              title={clearTitle(run)}
+            >
+              {confirmingClear ? 'Confirm clear' : 'Clear'}
+            </button>
+          )}
         </div>
       )}
     </li>
@@ -140,6 +182,7 @@ export function RunsPanel() {
   const [error, setError] = useState<string | null>(null);
   const onClose = () => setRunsPanelOpen(false);
   const paused = runs.filter((r) => r.status === 'paused').length;
+  const finished = runs.filter(clearedWithFinished).length;
 
   const act: Act = (action) => {
     setError(null);
@@ -187,6 +230,16 @@ export function RunsPanel() {
                 onClick={resumeAll}
               >
                 Resume all
+              </button>
+            )}
+            {finished > 0 && (
+              <button
+                id="runs-clear-finished"
+                className={clsx(dialog.btn, dialog.secondaryBtn, styles.runBtn)}
+                onClick={() => act(() => api.clearAutotagRuns())}
+                title="Remove the done, cancelled and undone runs from the list. Their tags stay, and they can no longer be undone."
+              >
+                Clear finished
               </button>
             )}
             <button className={dialog.closeBtn} onClick={onClose} title="Close">
