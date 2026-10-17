@@ -258,6 +258,7 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
                     onChange={(maxTags) => setJev({ maxTags })}
                   />
                 </div>
+                <TestConnection provider="jev" configured={statusOf('jev')?.configured ?? false} />
               </section>
             </>
           )}
@@ -476,8 +477,9 @@ function ClaudePlanField({ status, error, onCheckAgain }: ClaudePlanFieldProps) 
 
 interface TestConnectionProps {
   provider: AiProvider;
-  /** The model in the form, which may not be saved yet */
-  model: string;
+  /** The model in the form, which may not be saved yet. Jev has none and tests with the saved
+   * threshold and cap. */
+  model?: string;
   /** The access in the form, for Anthropic */
   access?: AnthropicAccess;
   configured: boolean;

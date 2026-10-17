@@ -42,6 +42,13 @@ fn price(model: &str, prompt_tokens: i64) -> Option<Price> {
         "claude-opus-5" | "claude-opus-4-8" => price(5.0, 25.0, 0.50),
         "claude-haiku-5-5" if prompt_tokens > HAIKU_LONG_PROMPT => price(0.50, 2.50, 0.05),
         "claude-haiku-5-5" => price(0.10, 0.50, 0.01),
+        // Jev bills input tokens only, every version at the same rate
+        m if m.starts_with("jev-") => Price {
+            input: 0.042,
+            output: 0.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
         _ => return None,
     })
 }
@@ -115,6 +122,18 @@ mod tests {
             cost_usd("claude-haiku-5-5", &long).unwrap(),
             100_001.0 * 0.5 / 1e6 + 0.0025
         ));
+    }
+
+    #[test]
+    fn jev_bills_input_tokens_alone() {
+        let usage = TokenUsage {
+            input: 1_000_000,
+            output: 1_000_000,
+            ..Default::default()
+        };
+
+        assert!(close(cost_usd("jev-1.14.0", &usage).unwrap(), 0.042));
+        assert!(close(cost_usd("jev-latest", &usage).unwrap(), 0.042));
     }
 
     #[test]

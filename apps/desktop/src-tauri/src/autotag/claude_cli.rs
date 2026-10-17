@@ -914,6 +914,7 @@ exit 1
             model: Some("claude-haiku-5-5".into()),
             max_tags: 8,
             max_proposals: 0,
+            threshold: None,
             asset: AssetInfo {
                 file_name: "red_circle_icon.png".into(),
                 relative_path: "ui/red_circle_icon.png".into(),

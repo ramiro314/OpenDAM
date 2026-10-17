@@ -150,6 +150,10 @@ impl TagProvider for FakeProvider {
         }
     }
 
+    fn sees_images(&self) -> bool {
+        !self.text_only
+    }
+
     fn unavailable_reason(&self, _access: Option<&str>) -> Option<String> {
         None
     }
@@ -181,6 +185,7 @@ mod tests {
             model: None,
             max_tags: 8,
             max_proposals: 3,
+            threshold: None,
             asset: AssetInfo {
                 file_name: file_name.into(),
                 relative_path: file_name.into(),

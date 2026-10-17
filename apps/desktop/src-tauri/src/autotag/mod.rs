@@ -7,6 +7,8 @@ pub mod credentials;
 pub mod engine;
 #[cfg(debug_assertions)]
 pub mod fake;
+pub mod http;
+pub mod jev;
 pub mod pricing;
 pub mod provider;
 pub mod review;
