@@ -8,6 +8,7 @@ import { menuTargets, openLimitReason } from '../../utils/contextMenu';
 import { ContextMenu } from '../ContextMenu/ContextMenu';
 import { IconEye, IconExternal, IconTag, IconTrash } from '../Icons';
 import { AssetCard } from './AssetCard';
+import { CARD_BODY_HEIGHT } from './cardMetrics';
 import { AssetListRow } from './AssetListRow';
 import { FilterBar } from './FilterBar';
 import type { Asset } from '../../types';
@@ -126,7 +127,12 @@ export function AssetGrid() {
         {viewMode === 'grid' ? (
           <div
             className={styles.grid}
-            style={{ '--tile-size': `${tileSize}px` } as React.CSSProperties}
+            style={
+              {
+                '--tile-size': `${tileSize}px`,
+                '--card-body-height': `${CARD_BODY_HEIGHT}px`,
+              } as React.CSSProperties
+            }
           >
             {assets.map((asset) => (
               <AssetCard
