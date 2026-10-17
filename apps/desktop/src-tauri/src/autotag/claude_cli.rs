@@ -1508,7 +1508,7 @@ exit 1
                 .await
                 .unwrap();
         assert_eq!(tags, ["t3", "t5"]);
-        // The engine marks the run done, then deletes the ended runs' files: wait for that
+        // The engine deletes the file just after it records the run as done, so wait for it
         let run_dir = p.stub.data_dir().join("autotag").join(&run.id);
         for _ in 0..500 {
             if !run_dir.exists() {

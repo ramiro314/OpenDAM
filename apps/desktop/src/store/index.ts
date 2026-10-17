@@ -564,6 +564,21 @@ interface CollectionStore {
   deleteCollection: (id: string) => Promise<void>;
 }
 
+let namedCollections: Collection[] | undefined;
+let collectionNames = new Map<string, string>();
+
+/**
+ * Collection id to name, for `useCollectionStore`. It rebuilds the map only when the collection
+ * list changes, so every grid card shares one map instead of building its own.
+ */
+export function selectCollectionNames(s: { collections: Collection[] }): Map<string, string> {
+  if (s.collections !== namedCollections) {
+    namedCollections = s.collections;
+    collectionNames = new Map(s.collections.map((c) => [c.id, c.name]));
+  }
+  return collectionNames;
+}
+
 export const useCollectionStore = create<CollectionStore>()((set) => ({
   collections: [],
 
