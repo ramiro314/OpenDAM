@@ -4,8 +4,29 @@ import {
   isFilterEmpty,
   isNameTaken,
   libraryNameFromPath,
+  parentCandidates,
   resolveDroppedAssetId,
 } from './sidebarHelpers';
+
+describe('parentCandidates', () => {
+  const tags = [
+    { id: 'nature' },
+    { id: 'rock', parentId: 'nature' },
+    { id: 'granite', parentId: 'rock' },
+    { id: 'basalt', parentId: 'rock' },
+    { id: 'props' },
+  ];
+  const ids = (id: string) => parentCandidates(tags, id).map((t) => t.id);
+
+  test('leaves out the tag itself and every tag nested in it', () => {
+    expect(ids('nature')).toEqual(['props']);
+    expect(ids('rock')).toEqual(['nature', 'props']);
+  });
+
+  test('keeps every other tag for a leaf', () => {
+    expect(ids('granite')).toEqual(['nature', 'rock', 'basalt', 'props']);
+  });
+});
 
 describe('libraryNameFromPath', () => {
   test('uses the last path segment', () => {

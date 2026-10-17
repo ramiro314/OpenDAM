@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS tags (
     id         TEXT PRIMARY KEY,
     name       TEXT NOT NULL UNIQUE,
     color      TEXT,            -- color label enum string
-    parent_id  TEXT REFERENCES tags(id) ON DELETE SET NULL
+    parent_id  TEXT REFERENCES tags(id) ON DELETE SET NULL,
+    description TEXT NOT NULL DEFAULT '' -- hint sent to the tagging providers
 );
 
 -- ── Assets ─────────────────────────────────────────────────────────────────

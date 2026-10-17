@@ -12,6 +12,25 @@ export function isNameTaken(existing: { name: string }[], name: string): boolean
   return existing.some((item) => item.name.trim().toLowerCase() === name.toLowerCase());
 }
 
+/** Tags `id` may be nested under: every tag but itself and the tags nested in it. */
+export function parentCandidates<T extends { id: string; parentId?: string | null }>(
+  tags: T[],
+  id: string
+): T[] {
+  const excluded = new Set([id]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const tag of tags) {
+      if (tag.parentId && excluded.has(tag.parentId) && !excluded.has(tag.id)) {
+        excluded.add(tag.id);
+        grew = true;
+      }
+    }
+  }
+  return tags.filter((tag) => !excluded.has(tag.id));
+}
+
 /**
  * Asset id carried by a drop. A drag from outside the grid may carry a file path instead of an
  * id; it resolves to the loaded asset with that path, or stays as given if none matches.

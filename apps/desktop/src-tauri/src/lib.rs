@@ -145,6 +145,7 @@ pub fn run() {
             commands::asset::rename_asset,
             commands::tag::list_tags,
             commands::tag::create_tag,
+            commands::tag::update_tag,
             commands::tag::delete_tag,
             commands::collection::list_collections,
             commands::collection::create_collection,

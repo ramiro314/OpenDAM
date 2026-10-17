@@ -120,6 +120,8 @@ pub struct Tag {
     pub color: Option<String>,
     #[serde(rename = "parentId")]
     pub parent_id: Option<String>,
+    /// The hint the tagging providers get with the tag.
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,4 +265,26 @@ pub struct AssetPatch {
     pub thumbnail_path: Option<String>,
     #[serde(rename = "previewStatus")]
     pub preview_status: Option<String>,
+}
+
+/// Changes to a tag definition. A field left out stays as it is; `color` and `parentId` sent as
+/// `null` clear it.
+#[derive(Debug, Default, Deserialize)]
+pub struct TagPatch {
+    pub name: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    pub color: Option<Option<String>>,
+    #[serde(rename = "parentId", default, deserialize_with = "present")]
+    pub parent_id: Option<Option<String>>,
+    pub description: Option<String>,
+}
+
+/// Wraps a field that was sent, `null` included, in `Some`, so a patch tells "clear it" from
+/// "leave it".
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }

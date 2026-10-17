@@ -6,6 +6,7 @@ import type {
   Library,
   Collection,
   Tag,
+  TagPatch,
   SearchQuery,
   FilterSpec,
   SortField,
@@ -412,6 +413,7 @@ interface TagStore {
   tagMap: Map<string, Tag>;
   fetchTags: () => Promise<void>;
   createTag: (name: string, parentId?: string) => Promise<void>;
+  updateTag: (id: string, patch: TagPatch) => Promise<void>;
   deleteTag: (id: string) => Promise<void>;
 }
 
@@ -429,6 +431,14 @@ export const useTagStore = create<TagStore>()((set) => ({
     set((s) => ({
       tags: [...s.tags, tag],
       tagMap: new Map(s.tagMap).set(tag.id, tag),
+    }));
+  },
+
+  updateTag: async (id, patch) => {
+    const tag = await api.updateTag(id, patch);
+    set((s) => ({
+      tags: s.tags.map((t) => (t.id === id ? tag : t)),
+      tagMap: new Map(s.tagMap).set(id, tag),
     }));
   },
 

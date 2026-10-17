@@ -26,6 +26,16 @@ export interface Tag {
   name: string;
   color?: ColorLabel;
   parentId?: string;
+  /** Hint sent to the tagging providers with the tag. */
+  description: string;
+}
+
+/** Changes to a tag. A field left out stays as it is; `null` clears `color` or `parentId`. */
+export interface TagPatch {
+  name?: string;
+  color?: ColorLabel | null;
+  parentId?: string | null;
+  description?: string;
 }
 
 export interface AssetMeta {
