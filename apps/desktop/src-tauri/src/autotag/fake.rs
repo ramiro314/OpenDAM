@@ -1,7 +1,7 @@
 //! Debug builds only: providers that tag from file-name words, so every flow can be run and
 //! screenshotted with no key and no spend (`OPENDAM_AUTOTAG_FAKE=1`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use super::provider::{Mode, ProposedTag, TagFuture, TagProvider, TagRequest, TagResult};
@@ -51,6 +51,14 @@ fn file_name_words(file_name: &str) -> Vec<String> {
         .collect()
 }
 
+/// "mossy" gives "Mossy".
+fn capitalize(word: &str) -> String {
+    let mut chars = word.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
 impl FakeProvider {
     fn result(&self, request: &TagRequest) -> TagResult {
         let words = file_name_words(&request.asset.file_name);
@@ -63,6 +71,12 @@ impl FakeProvider {
                 existing.push(tag.id.clone());
             }
         }
+        // A word this run already proposed comes back spelled as it was first proposed.
+        let earlier: HashMap<String, &String> = request
+            .run_proposals
+            .iter()
+            .map(|p| (normalize_name(&p.name), &p.name))
+            .collect();
         let proposed = if request.mode == Mode::ExistingOnly {
             Vec::new()
         } else {
@@ -71,7 +85,9 @@ impl FakeProvider {
                 .filter(|w| w.len() >= 3 && w.chars().all(char::is_alphabetic))
                 .filter(|w| !known.contains(*w))
                 .map(|w| ProposedTag {
-                    name: w.clone(),
+                    name: earlier
+                        .get(w)
+                        .map_or_else(|| capitalize(w), |n| n.to_string()),
                     parent_id: None,
                 })
                 .collect()
@@ -158,6 +174,10 @@ mod tests {
     use std::sync::Arc;
 
     fn request(file_name: &str, mode: Mode) -> TagRequest {
+        request_in_run(file_name, mode, &[])
+    }
+
+    fn request_in_run(file_name: &str, mode: Mode, run_proposals: &[&str]) -> TagRequest {
         TagRequest {
             run_id: "run".into(),
             mode,
@@ -177,7 +197,13 @@ mod tests {
                 ("t-rock".into(), "Rock".into(), None, None, String::new()),
                 ("t-tree".into(), "Tree".into(), None, None, String::new()),
             ])),
-            run_proposals: Vec::new(),
+            run_proposals: run_proposals
+                .iter()
+                .map(|name| ProposedTag {
+                    name: name.to_string(),
+                    parent_id: None,
+                })
+                .collect(),
         }
     }
 
@@ -207,7 +233,22 @@ mod tests {
             .unwrap();
 
         let names: Vec<&str> = result.proposed.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["mossy"]);
+        assert_eq!(names, ["Mossy"]);
+    }
+
+    #[tokio::test]
+    async fn a_word_the_run_already_proposed_keeps_its_first_spelling() {
+        let result = fake(false)
+            .tag(&request_in_run(
+                "mossy_fern.glb",
+                Mode::PreferExisting,
+                &["MOSSY"],
+            ))
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = result.proposed.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["MOSSY", "Fern"]);
     }
 
     #[test]

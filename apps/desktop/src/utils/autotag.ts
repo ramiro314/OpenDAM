@@ -25,7 +25,7 @@ export const MODES: { mode: AutotagMode; label: string; description: string }[] 
 ];
 
 /** The modes the run engine can do so far. */
-const BUILT_MODES: readonly AutotagMode[] = ['existing_only'];
+const BUILT_MODES: readonly AutotagMode[] = ['existing_only', 'prefer_existing'];
 
 export interface Availability {
   enabled: boolean;
@@ -94,7 +94,7 @@ function plural(n: number, word: string): string {
 export function taggingSummary(runs: RunSummary[]): string | null {
   if (runs.length === 0) return null;
   const active = runs.filter((r) => r.status === 'running' || r.status === 'queued');
-  const review = runs.filter((r) => r.status === 'awaiting_review').length;
+  const review = runs.filter(needsReview).length;
   const paused = runs.filter((r) => r.status === 'paused').length;
 
   const parts: string[] = [];
@@ -120,19 +120,30 @@ export function runProgress(run: RunSummary): string {
   return parts.join(' · ');
 }
 
+/** A run whose new tag names wait for review: one that finished with some, or was cancelled with some. */
+export function needsReview(run: Pick<RunSummary, 'status' | 'pendingProposals'>): boolean {
+  return (
+    run.pendingProposals > 0 && (run.status === 'awaiting_review' || run.status === 'cancelled')
+  );
+}
+
 export interface RunActions {
   pause: boolean;
   resume: boolean;
   cancel: boolean;
+  /** "Review (N)" */
+  review: boolean;
 }
 
-/** The Runs panel buttons a run in `status` offers. */
-export function runActions(status: RunSummary['status']): RunActions {
+/** The Runs panel buttons a run offers. */
+export function runActions(run: Pick<RunSummary, 'status' | 'pendingProposals'>): RunActions {
+  const { status } = run;
   return {
     // A queued run is still being created: it can be cancelled, not paused
     pause: status === 'running',
     resume: status === 'paused',
     cancel: status === 'running' || status === 'queued' || status === 'paused',
+    review: needsReview(run),
   };
 }
 

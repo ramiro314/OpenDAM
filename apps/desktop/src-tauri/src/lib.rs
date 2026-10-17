@@ -7,6 +7,7 @@ pub mod watcher;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
+use tauri_plugin_notification::NotificationExt;
 use tracing_subscriber::EnvFilter;
 
 use autotag::anthropic::AnthropicProvider;
@@ -54,6 +55,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let app_data_dir = app
                 .path()
@@ -101,11 +103,23 @@ pub fn run() {
             let anthropic = Arc::new(AnthropicProvider::new(credentials.clone()));
             let jev = Arc::new(JevProvider::new(credentials.clone()));
             let events = app.handle().clone();
+            let notifications = app.handle().clone();
             let autotag = Engine::new(
                 db.clone(),
                 tag_providers(&anthropic, &jev),
                 Arc::new(move |update| {
                     let _ = events.emit("autotag:updated", update);
+                }),
+                Arc::new(move |notice| {
+                    let shown = notifications
+                        .notification()
+                        .builder()
+                        .title(notice.title)
+                        .body(notice.body)
+                        .show();
+                    if let Err(e) = shown {
+                        tracing::warn!("Could not show a desktop notification: {e}");
+                    }
                 }),
             );
             let state = Arc::new(AppState {
@@ -217,6 +231,8 @@ pub fn run() {
             commands::autotag::resume_autotag_run,
             commands::autotag::resume_all_autotag_runs,
             commands::autotag::cancel_autotag_run,
+            commands::autotag::get_autotag_proposals,
+            commands::autotag::review_autotag_proposals,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

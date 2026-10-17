@@ -10,6 +10,7 @@ pub mod http;
 pub mod jev;
 pub mod pricing;
 pub mod provider;
+pub mod review;
 pub mod settings;
 pub mod store;
 pub mod vocabulary;

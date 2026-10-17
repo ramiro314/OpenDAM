@@ -160,3 +160,113 @@
 .summaryBtn:hover {
   text-decoration: underline;
 }
+
+.reviewDialog {
+  max-width: 780px;
+}
+
+.proposal {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-base);
+}
+
+.proposalAccepted {
+  border-color: var(--color-brand-500);
+}
+
+.proposalRejected {
+  opacity: 0.55;
+}
+
+.proposalHeader,
+.proposalFields {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.proposalField {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.toggleOn {
+  border-color: var(--color-brand-500);
+  color: var(--color-brand-300);
+}
+
+.toggleOff {
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+}
+
+.thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  max-height: 196px;
+  overflow-y: auto;
+}
+
+.thumb {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 76px;
+  cursor: pointer;
+}
+
+.thumb input {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  accent-color: var(--color-brand-500);
+}
+
+.thumb img,
+.thumbPlaceholder {
+  width: 76px;
+  height: 76px;
+  object-fit: contain;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-elevated);
+}
+
+.thumbPlaceholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+.thumbName {
+  width: 100%;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thumbOff img,
+.thumbOff .thumbPlaceholder {
+  opacity: 0.35;
+}
+
+.actionsNote {
+  flex: 1;
+  align-self: center;
+}

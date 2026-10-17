@@ -1235,6 +1235,7 @@ mod tests {
             db.clone(),
             vec![Arc::new(provider(&api.url, Some("key")))],
             Arc::new(|_| {}),
+            Arc::new(|_| {}),
         );
         engine.start().await;
 

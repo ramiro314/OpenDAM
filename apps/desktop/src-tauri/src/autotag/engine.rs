@@ -1,7 +1,8 @@
 //! The run engine: one permit pool per provider hands queued items out round-robin across that
 //! provider's running runs, each item is written through the write protocol, and progress goes
 //! to the UI as throttled `autotag:updated` events. Runs can be paused, resumed and cancelled,
-//! and provider failures are retried, pause the run or fail the item by their class.
+//! and provider failures are retried, pause the run or fail the item by their class. A Prefer
+//! existing run collects new tag names and ends waiting for one review.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -12,6 +13,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use super::provider::{AssetInfo, ErrorClass, Mode, TagProvider, TagRequest, TagResult, Thumbnail};
+use super::review::{self, ProposalDecision, ReviewProposal};
 use super::settings::{self, AiSettings};
 use super::store::{self, Item, NewRun, PendingPair, RunSummary};
 use super::vocabulary::Vocabulary;
@@ -41,6 +43,15 @@ pub struct AutotagUpdate {
 }
 
 pub type EventSink = Arc<dyn Fn(AutotagUpdate) + Send + Sync>;
+
+/// A desktop notification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Notice {
+    pub title: String,
+    pub body: String,
+}
+
+pub type Notifier = Arc<dyn Fn(Notice) + Send + Sync>;
 
 /// A provider as the run dialog shows it.
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +138,7 @@ pub struct Engine {
     changed_assets: Mutex<HashSet<String>>,
     events_wake: Notify,
     sink: EventSink,
+    notifier: Notifier,
     retry_delays: Vec<Duration>,
     /// Woken when a run is paused or cancelled, so items waiting to retry let go of their
     /// provider permit at once instead of at the end of the wait.
@@ -144,14 +156,16 @@ impl Engine {
         db: Arc<Database>,
         providers: Vec<Arc<dyn TagProvider>>,
         sink: EventSink,
+        notifier: Notifier,
     ) -> Arc<Self> {
-        Self::with_retry_delays(db, providers, sink, RETRY_DELAYS.to_vec())
+        Self::with_retry_delays(db, providers, sink, notifier, RETRY_DELAYS.to_vec())
     }
 
     fn with_retry_delays(
         db: Arc<Database>,
         providers: Vec<Arc<dyn TagProvider>>,
         sink: EventSink,
+        notifier: Notifier,
         retry_delays: Vec<Duration>,
     ) -> Arc<Self> {
         let pools = providers
@@ -168,6 +182,7 @@ impl Engine {
             changed_assets: Mutex::new(HashSet::new()),
             events_wake: Notify::new(),
             sink,
+            notifier,
             retry_delays,
             run_stopped: Notify::new(),
             #[cfg(test)]
@@ -280,9 +295,7 @@ impl Engine {
                 tracing::warn!("Test fault: not finishing resumed run {run_id}");
                 continue;
             }
-            if let Err(e) = store::finish_run_if_complete(master, run_id).await {
-                tracing::error!("Could not finish resumed auto-tag run {run_id}: {e}");
-            }
+            self.finish_if_complete(run_id).await;
         }
         for pool in &self.pools {
             pool.wake.notify_one();
@@ -369,8 +382,8 @@ impl Engine {
         if !pool.provider.modes().contains(&mode) {
             return Err(format!("{label} can't do {}", mode.as_str()));
         }
-        if mode != Mode::ExistingOnly {
-            return Err("Only Existing only runs are available so far".into());
+        if mode == Mode::CreateFreely {
+            return Err("Create freely runs aren't available yet".into());
         }
 
         let (items, requested, run_label) = match scope {
@@ -544,10 +557,56 @@ impl Engine {
         if let Err(e) = recorded {
             tracing::error!("Could not record auto-tag item {}: {e}", item.asset_id);
         }
-        if let Err(e) = store::finish_run_if_complete(&self.db.master_pool, &item.run_id).await {
-            tracing::error!("Could not finish auto-tag run {}: {e}", item.run_id);
-        }
+        self.finish_if_complete(&item.run_id).await;
         self.events_wake.notify_one();
+    }
+
+    /// Ends the run once nothing is left to hand out, and tells you about a run of several
+    /// assets: it needs review, or it finished. Only the call that ends the run notifies, so
+    /// each run notifies once.
+    async fn finish_if_complete(&self, run_id: &str) {
+        let master = &self.db.master_pool;
+        let status = match store::finish_run_if_complete(master, run_id).await {
+            Ok(Some(status)) => status,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!("Could not finish auto-tag run {run_id}: {e}");
+                return;
+            }
+        };
+        let run = match store::run_summary(master, run_id).await {
+            Ok(Some(run)) => run,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!("Could not read finished auto-tag run {run_id}: {e}");
+                return;
+            }
+        };
+        if run.inline || run.total < 2 {
+            return;
+        }
+        (self.notifier)(finish_notice(&run, &status));
+    }
+
+    /// The run's new tag names waiting for review, each with its assets.
+    pub async fn proposals(&self, run_id: &str) -> Result<Vec<ReviewProposal>, String> {
+        review::load(&self.db, run_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Applies the review of a run's new tag names. A run waiting for review becomes `done`
+    /// once none is left; a cancelled run stays `cancelled`.
+    pub async fn review_proposals(
+        &self,
+        run_id: &str,
+        decisions: Vec<ProposalDecision>,
+    ) -> Result<String, String> {
+        let applied = review::apply(&self.db, run_id, decisions).await?;
+        tracing::info!("Applied the review of auto-tag run {run_id}");
+        self.assets_changed(applied.changed_assets);
+        self.events_wake.notify_one();
+        Ok(applied.status)
     }
 
     /// Asks the provider about one asset and writes the result through the write protocol.
@@ -586,6 +645,13 @@ impl Engine {
         let max_tags = item.options["maxTags"].as_u64().unwrap_or(8) as usize;
         let mode: Mode = serde_json::from_value(serde_json::Value::String(item.mode.clone()))
             .map_err(|_| format!("Unknown mode {}", item.mode))?;
+        let run_proposals = if mode == Mode::PreferExisting {
+            store::pending_proposals(&self.db.master_pool, &item.run_id)
+                .await
+                .map_err(|e| e.to_string())?
+        } else {
+            Vec::new()
+        };
         let request = TagRequest {
             run_id: item.run_id.clone(),
             mode,
@@ -602,12 +668,16 @@ impl Engine {
             },
             image,
             vocabulary: vocabulary.clone(),
-            // Proposals arrive with Prefer existing and Create freely
-            run_proposals: Vec::new(),
+            run_proposals,
         };
 
         let result = self.call_provider(provider, &request, item).await?;
         let accepted = vocabulary.accepted_tags(&result, max_tags);
+        let proposals = if mode == Mode::PreferExisting {
+            vocabulary.new_proposals(&result, request.max_proposals as usize)
+        } else {
+            Vec::new()
+        };
 
         // Step 1: record every pair the library lacks before the library sees it.
         let present: HashSet<String> =
@@ -623,11 +693,12 @@ impl Engine {
             .filter(|id| !present.contains(*id))
             .cloned()
             .collect();
-        let summary = serde_json::json!({ "tags": accepted, "proposed": result.proposed });
+        let summary = serde_json::json!({ "tags": accepted, "proposed": proposals });
         store::record_intent(
             &self.db.master_pool,
             item,
             &new_tags,
+            &proposals,
             &summary,
             &result.usage,
         )
@@ -755,6 +826,32 @@ impl Engine {
     }
 }
 
+fn plural(n: i64, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+
+/// What the notification says when a run ends `status`.
+fn finish_notice(run: &RunSummary, status: &str) -> Notice {
+    if status == "awaiting_review" {
+        return Notice {
+            title: "Tagging run needs review".into(),
+            body: format!(
+                "{}: {} to review",
+                run.label,
+                plural(run.pending_proposals, "new tag")
+            ),
+        };
+    }
+    let mut body = format!("{}: {} tagged", run.label, plural(run.done, "asset"));
+    if run.failed > 0 {
+        body.push_str(&format!(", {} failed", run.failed));
+    }
+    Notice {
+        title: "Tagging run finished".into(),
+        body,
+    }
+}
+
 /// The thumbnail as a PNG at most `THUMBNAIL_EDGE` px on its long edge, or None when it can't
 /// be read: the request is then text only.
 fn load_thumbnail(path: &Path) -> Option<Thumbnail> {
@@ -777,7 +874,7 @@ fn load_thumbnail(path: &Path) -> Option<Thumbnail> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::autotag::provider::{ProviderError, TagFuture};
+    use crate::autotag::provider::{ProposedTag, ProviderError, TagFuture};
     use crate::db::{
         insert_asset, insert_tag, memory_database, memory_library, memory_library_pool,
     };
@@ -785,12 +882,16 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
 
-    /// Counts calls and requests in flight, and answers every asset with `existing`. Each call
-    /// first takes the next of `failures` and returns it, while there is one. With `hang`, no
-    /// call ever returns, like a request in flight when the app is killed.
+    /// Counts calls and requests in flight, and answers every asset with `existing`, plus the
+    /// new names `proposed` holds for its file name. Each call first takes the next of
+    /// `failures` and returns it, while there is one. With `hang`, no call ever returns, like a
+    /// request in flight when the app is killed.
     #[derive(Default)]
     struct Recording {
         existing: Vec<String>,
+        proposed: std::collections::HashMap<String, Vec<ProposedTag>>,
+        /// The run's earlier proposals each call was given, in call order.
+        run_proposals_seen: Mutex<Vec<Vec<String>>>,
         failures: Mutex<VecDeque<ProviderError>>,
         hang: bool,
         delay: Duration,
@@ -816,12 +917,22 @@ mod tests {
         fn max_tags(&self, settings: &AiSettings) -> u32 {
             settings.anthropic.max_tags
         }
+        fn max_proposals(&self, settings: &AiSettings) -> u32 {
+            settings.anthropic.max_proposals
+        }
         fn unavailable_reason(&self) -> Option<String> {
             self.unavailable.clone()
         }
         fn tag<'a>(&'a self, request: &'a TagRequest) -> TagFuture<'a> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(request.run_id.clone());
+                self.run_proposals_seen.lock().unwrap().push(
+                    request
+                        .run_proposals
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect(),
+                );
                 let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_in_flight.fetch_max(now, Ordering::SeqCst);
                 if self.hang {
@@ -834,6 +945,11 @@ mod tests {
                 }
                 Ok(TagResult {
                     existing: self.existing.clone(),
+                    proposed: self
+                        .proposed
+                        .get(&request.asset.file_name)
+                        .cloned()
+                        .unwrap_or_default(),
                     ..Default::default()
                 })
             })
@@ -845,7 +961,15 @@ mod tests {
         provider: Arc<Recording>,
         lib_pool: Pool<Sqlite>,
         updates: Arc<Mutex<Vec<AutotagUpdate>>>,
+        notices: Arc<Mutex<Vec<Notice>>>,
     }
+
+    type Recorded = (
+        Arc<Engine>,
+        Arc<Recording>,
+        Arc<Mutex<Vec<AutotagUpdate>>>,
+        Arc<Mutex<Vec<Notice>>>,
+    );
 
     async fn setup(provider: Recording, assets: &[&str]) -> Setup {
         setup_with_delays(provider, assets, vec![Duration::from_millis(1); 3]).await
@@ -861,20 +985,18 @@ mod tests {
             insert_asset(&lib_pool, id).await;
         }
         let db = Arc::new(memory_database(vec![memory_library("lib", lib_pool.clone())]).await);
-        let (engine, provider, updates) = engine_with_delays(db, provider, retry_delays);
+        let (engine, provider, updates, notices) = engine_with_delays(db, provider, retry_delays);
         Setup {
             engine,
             provider,
             lib_pool,
             updates,
+            notices,
         }
     }
 
     /// An engine over `db` whose retries wait a millisecond.
-    fn engine_on(
-        db: Arc<Database>,
-        provider: Recording,
-    ) -> (Arc<Engine>, Arc<Recording>, Arc<Mutex<Vec<AutotagUpdate>>>) {
+    fn engine_on(db: Arc<Database>, provider: Recording) -> Recorded {
         engine_with_delays(db, provider, vec![Duration::from_millis(1); 3])
     }
 
@@ -882,17 +1004,20 @@ mod tests {
         db: Arc<Database>,
         provider: Recording,
         retry_delays: Vec<Duration>,
-    ) -> (Arc<Engine>, Arc<Recording>, Arc<Mutex<Vec<AutotagUpdate>>>) {
+    ) -> Recorded {
         let provider = Arc::new(provider);
         let updates = Arc::new(Mutex::new(Vec::new()));
         let recorded = updates.clone();
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let noticed = notices.clone();
         let engine = Engine::with_retry_delays(
             db,
             vec![provider.clone()],
             Arc::new(move |update| recorded.lock().unwrap().push(update)),
+            Arc::new(move |notice| noticed.lock().unwrap().push(notice)),
             retry_delays,
         );
-        (engine, provider, updates)
+        (engine, provider, updates, notices)
     }
 
     fn ids(names: &[&str]) -> Vec<String> {
@@ -1064,12 +1189,278 @@ mod tests {
 
         let error = s
             .engine
-            .start_run(scope(&["a1"]), "recording", Mode::PreferExisting)
+            .start_run(scope(&["a1"]), "recording", Mode::CreateFreely)
             .await
             .unwrap_err();
 
-        assert!(error.contains("Existing only"), "{error}");
+        assert!(error.contains("Create freely"), "{error}");
         assert!(s.engine.list_runs().await.unwrap().is_empty());
+    }
+
+    fn proposal(name: &str, parent: Option<&str>) -> ProposedTag {
+        ProposedTag {
+            name: name.into(),
+            parent_id: parent.map(Into::into),
+        }
+    }
+
+    async fn proposals_of(master: &Pool<Sqlite>) -> Vec<(String, Option<String>, String)> {
+        sqlx::query_as(
+            "SELECT p.name, p.parent_id, group_concat(pa.asset_id, ',')
+             FROM tag_run_proposals p JOIN tag_run_proposal_assets pa ON pa.proposal_id = p.id
+             WHERE p.status = 'pending' GROUP BY p.id ORDER BY p.rowid",
+        )
+        .fetch_all(master)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn prefer_existing_merges_rock_and_rock_into_one_proposal_and_ends_awaiting_review() {
+        let s = setup(
+            Recording {
+                proposed: [
+                    ("a1.glb", vec![proposal("Rock", Some("t-nature"))]),
+                    (
+                        "a2.glb",
+                        vec![
+                            proposal(" rock", None),
+                            proposal("Moss", Some("t-ghost")),
+                            proposal("Fern", None),
+                        ],
+                    ),
+                    // A proposal naming a catalog tag counts as that tag.
+                    ("a3.glb", vec![proposal("TREE", None)]),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+                ..Default::default()
+            },
+            &["a1", "a2", "a3"],
+        )
+        .await;
+        let master = &s.engine.db.master_pool;
+        insert_tag(master, "t-nature", "Nature").await;
+        insert_tag(master, "t-tree", "Tree").await;
+        settings::update(
+            master,
+            serde_json::json!({"anthropic": {"concurrency": 1, "maxProposals": 2}}),
+        )
+        .await
+        .unwrap();
+
+        s.engine.start().await;
+        let started = s
+            .engine
+            .start_run(
+                scope(&["a1", "a2", "a3"]),
+                "recording",
+                Mode::PreferExisting,
+            )
+            .await
+            .unwrap();
+        let runs = wait_for(&s.engine, |runs| runs[0].status == "awaiting_review").await;
+
+        assert_eq!((runs[0].done, runs[0].pending_proposals), (3, 2));
+        assert!(runs[0].finished_at.is_some());
+        assert_eq!(
+            proposals_of(master).await,
+            [
+                ("Rock".into(), Some("t-nature".into()), "a1,a2".into()),
+                ("Moss".into(), None, "a2".into()),
+            ],
+            "merged by normalized name, the per-asset cap of 2 drops Fern, an unknown parent \
+             is cleared, and Tree is no proposal"
+        );
+        let seen = s.provider.run_proposals_seen.lock().unwrap().clone();
+        assert_eq!(seen[0], Vec::<String>::new());
+        assert_eq!(seen[1], ["Rock"], "later assets share the run's proposals");
+        assert_eq!(seen[2], ["Rock", "Moss"]);
+        let tags: Vec<(String, String)> =
+            sqlx::query_as("SELECT asset_id, tag_id FROM asset_tags ORDER BY asset_id")
+                .fetch_all(&s.lib_pool)
+                .await
+                .unwrap();
+        assert_eq!(tags, [("a3".into(), "t-tree".into())]);
+        let review = s.engine.proposals(&started.run.id).await.unwrap();
+        assert_eq!(
+            review[0].parent_id.as_deref(),
+            Some("t-nature"),
+            "the review preselects the suggested parent"
+        );
+        assert_eq!(
+            *s.notices.lock().unwrap(),
+            [Notice {
+                title: "Tagging run needs review".into(),
+                body: "3 assets: 2 new tags to review".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_with_nothing_to_review_ends_done_and_notifies_once_unless_it_is_one_asset() {
+        let s = setup(
+            Recording {
+                existing: ids(&["t-rock"]),
+                ..Default::default()
+            },
+            &["a1", "a2", "a3"],
+        )
+        .await;
+        insert_tag(&s.engine.db.master_pool, "t-rock", "Rock").await;
+        s.engine.start().await;
+
+        s.engine
+            .start_run(scope(&["a1", "a2"]), "recording", Mode::PreferExisting)
+            .await
+            .unwrap();
+        wait_until_done(&s.engine).await;
+        s.engine
+            .start_run(scope(&["a3"]), "recording", Mode::ExistingOnly)
+            .await
+            .unwrap();
+        wait_for(&s.engine, |runs| {
+            runs.len() == 2 && runs.iter().all(|r| r.status == "done")
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        assert_eq!(
+            *s.notices.lock().unwrap(),
+            [Notice {
+                title: "Tagging run finished".into(),
+                body: "2 assets: 2 assets tagged".into(),
+            }],
+            "the one-asset run sends none"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fifty_asset_run_over_two_libraries_notifies_once_and_its_review_applies_everywhere()
+    {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        let assets: Vec<String> = (0..50).map(|i| format!("x{i:02}")).collect();
+        for (i, id) in assets.iter().enumerate() {
+            insert_asset(if i < 30 { &a } else { &b }, id).await;
+        }
+        let db = Arc::new(
+            memory_database(vec![
+                memory_library("a-lib", a.clone()),
+                memory_library("b-lib", b.clone()),
+            ])
+            .await,
+        );
+        insert_tag(&db.master_pool, "t-tree", "Tree").await;
+        let proposed = assets
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let rock = if i % 2 == 0 { "Rock" } else { "rock" };
+                let mut names = vec![proposal(rock, None)];
+                if i % 10 == 0 {
+                    names.push(proposal("Moss", None));
+                }
+                (format!("{id}.glb"), names)
+            })
+            .collect();
+        let (engine, provider, _, notices) = engine_on(
+            db.clone(),
+            Recording {
+                existing: ids(&["t-tree"]),
+                proposed,
+                ..Default::default()
+            },
+        );
+        engine.start().await;
+
+        let started = engine
+            .start_run(
+                RunScope::Assets {
+                    asset_ids: assets.clone(),
+                },
+                "recording",
+                Mode::PreferExisting,
+            )
+            .await
+            .unwrap();
+        let runs = wait_for(&engine, |runs| runs[0].status == "awaiting_review").await;
+
+        assert_eq!((runs[0].done, runs[0].pending_proposals), (50, 2));
+        assert_eq!(provider.calls.lock().unwrap().len(), 50);
+        assert_eq!(
+            count(
+                &a,
+                "SELECT COUNT(*) FROM asset_tags WHERE tag_id = 't-tree'"
+            )
+            .await
+                + count(
+                    &b,
+                    "SELECT COUNT(*) FROM asset_tags WHERE tag_id = 't-tree'"
+                )
+                .await,
+            50,
+            "matches are applied while the run goes"
+        );
+        assert_eq!(notices.lock().unwrap().len(), 1);
+
+        // Accept both, unticking x01 (library A) and x31 (library B) for Rock.
+        let review = engine.proposals(&started.run.id).await.unwrap();
+        let decisions = review
+            .iter()
+            .map(|p| ProposalDecision::Accept {
+                proposal_id: p.id.clone(),
+                name: p.name.clone(),
+                parent_id: p.parent_id.clone(),
+                asset_ids: p
+                    .assets
+                    .iter()
+                    .map(|a| a.asset_id.clone())
+                    .filter(|a| a != "x01" && a != "x31")
+                    .collect(),
+            })
+            .collect();
+        let status = engine
+            .review_proposals(&started.run.id, decisions)
+            .await
+            .unwrap();
+
+        assert_eq!(status, "done");
+        let rock_and_moss = "SELECT COUNT(*) FROM tags WHERE name IN ('Rock', 'Moss')";
+        for pool in [&db.master_pool, &a, &b] {
+            assert_eq!(
+                count(pool, rock_and_moss).await,
+                2,
+                "master and both mirrors"
+            );
+        }
+        let tagged = |pool, tag| async move {
+            let sql = format!(
+                "SELECT COUNT(*) FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+                 WHERE t.name = '{tag}'"
+            );
+            count(pool, &sql).await
+        };
+        assert_eq!(tagged(&a, "Rock").await, 29);
+        assert_eq!(tagged(&b, "Rock").await, 19);
+        assert_eq!(tagged(&a, "Moss").await, 3);
+        assert_eq!(tagged(&b, "Moss").await, 2);
+        assert_eq!(
+            count(
+                &db.master_pool,
+                "SELECT COUNT(*) FROM tag_run_applied WHERE state = 'applied'"
+            )
+            .await,
+            50 + 48 + 5,
+            "every pair the run added is recorded for undo"
+        );
+        let runs = engine.list_runs().await.unwrap();
+        assert_eq!(
+            (runs[0].status.as_str(), runs[0].pending_proposals),
+            ("done", 0)
+        );
+        assert_eq!(notices.lock().unwrap().len(), 1, "still one notification");
     }
 
     async fn items_of(engine: &Engine, run_id: &str) -> Vec<(String, String)> {
@@ -1103,6 +1494,7 @@ mod tests {
         let engine = Engine::new(
             Arc::new(db),
             vec![Arc::new(Recording::default())],
+            Arc::new(|_| {}),
             Arc::new(|_| {}),
         );
         let library = |all_assets| RunScope::Library {
@@ -1848,7 +2240,7 @@ mod tests {
         .unwrap();
 
         // The first session gets two requests in flight, then is killed: they never return.
-        let (first, _, _) = engine_on(
+        let (first, _, _, _) = engine_on(
             db.clone(),
             Recording {
                 hang: true,
@@ -1870,7 +2262,7 @@ mod tests {
         .unwrap();
 
         // The next session.
-        let (engine, provider, updates) = engine_on(
+        let (engine, provider, updates, _) = engine_on(
             db.clone(),
             Recording {
                 existing: ids(&["t-rock"]),
