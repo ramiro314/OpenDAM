@@ -250,6 +250,7 @@ pub struct Item {
     pub asset_id: String,
     pub library_id: String,
     pub mode: String,
+    pub model: Option<String>,
     pub options: serde_json::Value,
 }
 
@@ -280,8 +281,8 @@ pub async fn claim_item(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<Opt
     let Some((asset_id, library_id)) = claimed else {
         return Ok(None);
     };
-    let (mode, options): (String, String) =
-        sqlx::query_as("SELECT mode, options FROM tag_runs WHERE id = ?")
+    let (mode, model, options): (String, Option<String>, String) =
+        sqlx::query_as("SELECT mode, model, options FROM tag_runs WHERE id = ?")
             .bind(run_id)
             .fetch_one(master)
             .await?;
@@ -290,6 +291,7 @@ pub async fn claim_item(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<Opt
         asset_id,
         library_id,
         mode,
+        model,
         options: serde_json::from_str(&options).unwrap_or_default(),
     }))
 }
@@ -483,17 +485,22 @@ pub async fn count_attempt(master: &Pool<Sqlite>, item: &Item) -> sqlx::Result<(
     .map(|_| ())
 }
 
-/// The run's new tag names still waiting for review, oldest first.
-pub async fn pending_proposal_names(
+/// The run's new tag names still waiting for review, with their suggested parents, oldest first.
+pub async fn pending_proposals(
     master: &Pool<Sqlite>,
     run_id: &str,
-) -> sqlx::Result<Vec<String>> {
-    sqlx::query_scalar(
-        "SELECT name FROM tag_run_proposals WHERE run_id = ? AND status = 'pending' ORDER BY rowid",
+) -> sqlx::Result<Vec<ProposedTag>> {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT name, parent_id FROM tag_run_proposals
+         WHERE run_id = ? AND status = 'pending' ORDER BY rowid",
     )
     .bind(run_id)
     .fetch_all(master)
-    .await
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(name, parent_id)| ProposedTag { name, parent_id })
+        .collect())
 }
 
 /// Write protocol step 1, in one master transaction: a `pending` row for every pair the

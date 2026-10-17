@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tauri::State;
 
+use crate::autotag::anthropic::ConnectionTest;
 use crate::autotag::credentials::{Provider, ProviderStatus};
 use crate::autotag::settings::{self, AiSettings};
 use crate::AppState;
@@ -46,14 +47,44 @@ pub async fn get_provider_status(state: State<'_, Arc<AppState>>) -> Result<Vec<
         .map_err(|e| e.to_string())
 }
 
+/// Sends one small request in the production shape with the configured key, to `model` or the
+/// saved model. Errors come back in the result, for Settings to show.
+#[tauri::command]
+pub async fn test_provider(
+    provider: Provider,
+    model: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ConnectionTest> {
+    match provider {
+        Provider::Anthropic => {
+            let model = match model.map(|m| m.trim().to_string()) {
+                Some(model) if !model.is_empty() => model,
+                _ => {
+                    settings::load(&state.db.master_pool)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .anthropic
+                        .model
+                }
+            };
+            Ok(state.anthropic.test_connection(&model).await)
+        }
+        Provider::Jev => Err("Jev's connection test isn't built yet".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::autotag::anthropic::{mock, AnthropicProvider};
     use crate::autotag::credentials::{Credentials, MemoryKeyring, Provider};
+    use crate::autotag::engine::{Engine, RunScope};
+    use crate::autotag::provider::Mode;
     use crate::autotag::settings;
-    use crate::db::Database;
+    use crate::db::{insert_asset, insert_tag, memory_library, memory_library_pool, Database};
     use serde_json::json;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     const SAVED_SENTINEL: &str = "sk-ant-SENTINEL-saved-7d1f0c";
     const ENV_SENTINEL: &str = "sk-ant-SENTINEL-env-93be4a";
@@ -72,9 +103,10 @@ mod tests {
         }
     }
 
-    /// Saves, reads, overrides and clears sentinel keys, and saves settings, with every
-    /// `tracing` event captured. No sentinel may reach the master DB file, the log or any
-    /// returned payload.
+    /// Saves, reads, overrides and clears sentinel keys, saves settings, and runs an Anthropic
+    /// tagging run and "Test connection" against a local stand-in for the API, with every
+    /// `tracing` event captured. No sentinel may reach the master DB file, the log, any returned
+    /// payload or any `autotag:updated` event.
     #[tokio::test]
     async fn api_keys_never_reach_the_master_db_the_log_or_a_payload() {
         let log = Captured::default();
@@ -90,9 +122,9 @@ mod tests {
         let db = Database::new(dir.path().join("opendam.sqlite").to_str().unwrap())
             .await
             .unwrap();
-        let creds = Credentials::new(MemoryKeyring::default(), |name| {
+        let creds = Arc::new(Credentials::new(MemoryKeyring::default(), |name| {
             (name == "ANTHROPIC_API_KEY").then(|| ENV_SENTINEL.to_string())
-        });
+        }));
 
         let mut payloads = Vec::new();
         payloads.push(json!(creds
@@ -117,6 +149,74 @@ mod tests {
             creds.api_key(Provider::Jev).unwrap().as_deref(),
             Some(JEV_SENTINEL)
         );
+
+        // A run and a connection test through the Anthropic provider
+        let lib_pool = memory_library_pool().await;
+        insert_asset(&lib_pool, "a1").await;
+        db.libraries
+            .write()
+            .await
+            .insert("lib".into(), memory_library("lib", lib_pool));
+        for id in ["nature", "rock", "tree"] {
+            insert_tag(&db.master_pool, id, id).await;
+        }
+        let api = mock::serve(
+            200,
+            &[],
+            include_str!("../autotag/fixtures/anthropic/unknown_ids.json"),
+        )
+        .await;
+        let anthropic = Arc::new(AnthropicProvider::with_base_url(
+            creds.clone(),
+            api.url.clone(),
+        ));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let db = Arc::new(db);
+        let engine = Engine::new(
+            db.clone(),
+            vec![anthropic.clone()],
+            Arc::new(move |update| recorded.lock().unwrap().push(json!(update))),
+            Arc::new(|_| {}),
+        );
+        engine.start().await;
+        payloads.push(json!(engine
+            .start_run(
+                RunScope::Assets {
+                    asset_ids: vec!["a1".into()],
+                },
+                "anthropic",
+                Mode::ExistingOnly,
+            )
+            .await
+            .unwrap()));
+        for _ in 0..500 {
+            if engine.list_runs().await.unwrap()[0].status == "done" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let runs = engine.list_runs().await.unwrap();
+        assert_eq!((runs[0].status.as_str(), runs[0].done), ("done", 1));
+        assert!(runs[0].cost_usd > 0.0, "the run's running cost");
+        payloads.push(json!(runs));
+        payloads.push(json!(engine.provider_options()));
+        payloads.push(json!(anthropic.test_connection("claude-sonnet-5-5").await));
+        let received = api.received();
+        assert_eq!(received.len(), 2, "the run's item and the connection test");
+        for request in &received {
+            assert!(
+                request
+                    .head
+                    .contains(&format!("x-api-key: {}", ENV_SENTINEL.to_lowercase())),
+                "the key goes to the API, and only in its header"
+            );
+            assert!(!request.body.contains(ENV_SENTINEL));
+        }
+        let events = events.lock().unwrap().clone();
+        assert!(!events.is_empty(), "the run emitted events");
+
         payloads.push(json!(creds.set_key(Provider::Anthropic, None).unwrap()));
         db.master_pool.close().await;
 
@@ -134,11 +234,14 @@ mod tests {
         assert!(log_text.contains("Saved the Anthropic API key in the keyring"));
         let payload_text = serde_json::to_string(&payloads).unwrap();
         assert!(payload_text.contains("from ANTHROPIC_API_KEY"));
+        let event_text = serde_json::to_string(&events).unwrap();
+        assert!(event_text.contains("changedAssetIds"));
 
         for sentinel in sentinels {
             assert!(!db_text.contains(sentinel), "{sentinel} in the master DB");
             assert!(!log_text.contains(sentinel), "{sentinel} in the log");
             assert!(!payload_text.contains(sentinel), "{sentinel} in a payload");
+            assert!(!event_text.contains(sentinel), "{sentinel} in an event");
         }
     }
 }

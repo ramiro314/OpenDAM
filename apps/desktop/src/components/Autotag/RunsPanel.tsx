@@ -3,7 +3,7 @@ import clsx from 'clsx';
 import { api } from '../../api';
 import { useAutotagStore } from '../../store';
 import type { RunSummary } from '../../types';
-import { modeLabel, runActions, runProgress } from '../../utils/autotag';
+import { modeLabel, runActions, runProgress, runUsage } from '../../utils/autotag';
 import { IconTag, IconX } from '../Icons';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './Autotag.module.css';
@@ -37,6 +37,7 @@ function RunRow({ run, act }: { run: RunSummary; act: Act }) {
   const processed = run.done + run.failed;
   const percent = run.total > 0 ? (processed / run.total) * 100 : 0;
   const provider = run.model ? `${run.providerLabel} · ${run.model}` : run.providerLabel;
+  const usage = runUsage(run);
   return (
     <li className={styles.run} data-run-id={run.id}>
       <div className={styles.runHeader}>
@@ -54,8 +55,7 @@ function RunRow({ run, act }: { run: RunSummary; act: Act }) {
       </div>
       <span className={styles.runProgressText}>
         {runProgress(run)}
-        {run.inputTokens + run.outputTokens > 0 &&
-          ` · ${(run.inputTokens + run.outputTokens).toLocaleString()} tokens · $${run.costUsd.toFixed(2)}`}
+        {usage && ` · ${usage}`}
       </span>
       {(actions.pause || actions.resume || actions.cancel || actions.review) && (
         <div className={styles.runActions}>

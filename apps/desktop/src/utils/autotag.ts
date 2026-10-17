@@ -146,3 +146,16 @@ export function runActions(run: Pick<RunSummary, 'status' | 'pendingProposals'>)
     review: needsReview(run),
   };
 }
+
+/** Dollars, with enough decimals that a fraction of a cent doesn't read as $0.00. */
+export function formatCost(usd: number): string {
+  if (usd > 0 && usd < 0.01) return `$${usd.toPrecision(2)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
+/** "4,000 tokens · $0.0021", or null before the run has used any tokens. */
+export function runUsage(run: RunSummary): string | null {
+  const tokens = run.inputTokens + run.outputTokens;
+  if (tokens === 0) return null;
+  return `${tokens.toLocaleString()} tokens · ${formatCost(run.costUsd)}`;
+}

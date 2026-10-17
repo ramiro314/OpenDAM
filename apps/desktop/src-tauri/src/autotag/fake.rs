@@ -75,7 +75,7 @@ impl FakeProvider {
         let earlier: HashMap<String, &String> = request
             .run_proposals
             .iter()
-            .map(|name| (normalize_name(name), name))
+            .map(|p| (normalize_name(&p.name), &p.name))
             .collect();
         let proposed = if request.mode == Mode::ExistingOnly {
             Vec::new()
@@ -177,6 +177,9 @@ mod tests {
         TagRequest {
             run_id: "run".into(),
             mode,
+            model: None,
+            max_tags: 8,
+            max_proposals: 3,
             asset: AssetInfo {
                 file_name: file_name.into(),
                 relative_path: file_name.into(),
@@ -189,7 +192,13 @@ mod tests {
                 ("t-rock".into(), "Rock".into(), None, None, String::new()),
                 ("t-tree".into(), "Tree".into(), None, None, String::new()),
             ])),
-            run_proposals: run_proposals.iter().map(|n| n.to_string()).collect(),
+            run_proposals: run_proposals
+                .iter()
+                .map(|name| ProposedTag {
+                    name: name.to_string(),
+                    parent_id: None,
+                })
+                .collect(),
         }
     }
 

@@ -2,9 +2,11 @@ import { describe, expect, test } from 'bun:test';
 import type { AutotagProviderOption, RunSummary } from '../types';
 import {
   autotagAvailability,
+  formatCost,
   modeOptions,
   runActions,
   runProgress,
+  runUsage,
   scopeFor,
   taggingSummary,
 } from './autotag';
@@ -221,5 +223,23 @@ describe('runActions', () => {
       review: true,
     });
     expect(runActions({ ...run('paused', 2, 4), pendingProposals: 3 }).review).toBe(false);
+  });
+});
+
+describe('formatCost', () => {
+  test('keeps a fraction of a cent visible', () => {
+    expect(formatCost(0)).toBe('$0.00');
+    expect(formatCost(0.0021)).toBe('$0.0021');
+    expect(formatCost(0.000184)).toBe('$0.00018');
+    expect(formatCost(0.01)).toBe('$0.01');
+    expect(formatCost(12.345)).toBe('$12.35');
+  });
+});
+
+describe('runUsage', () => {
+  test('shows tokens and the running cost once the run has used any', () => {
+    expect(runUsage(run('running', 0, 10))).toBeNull();
+    const used = { ...run('running', 2, 10), inputTokens: 3500, outputTokens: 80, costUsd: 0.0043 };
+    expect(runUsage(used)).toBe(`${(3580).toLocaleString()} tokens · $0.0043`);
   });
 });

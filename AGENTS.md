@@ -60,7 +60,10 @@ docs/plans                    Plans for this fork
   Rust with the `image` crate. Only formats Rust can't decode go to Python.
 - **One persistent Python worker.** The worker is a long-lived JSON-over-stdio daemon. Send it
   requests over the existing stream; one process serves every file.
-- **Zero telemetry.** The app makes no network calls to analytics or tracking services.
+- **Zero telemetry.** The app makes no network calls to analytics or tracking services. The only
+  outbound calls are AI tagging requests to the provider you configured (the Anthropic API, your
+  local `claude` CLI, or TypeSafe's Jev). They are made only for runs you start, and nothing is
+  sent until a provider is set up.
 - **Master DB is the tag and collection catalog.** Tag and collection lists are read from master.
   Definition create, update and delete write to master, then mirror to every open library DB.
   `asset_tags` and `collection_assets` rows go only to the asset's own library
