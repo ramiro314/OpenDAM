@@ -806,19 +806,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn job_for_a_source_that_shrank_deletes_its_old_thumbnail_and_clears_the_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        // The old thumbnail, from when the source was larger.
-        let old_thumb = root.join(".opendam/thumbs/a1_thumb.png");
-        write_image(&old_thumb, 512, 512);
-        write_image(&root.join("textures/rock.png"), 256, 256);
+    /// A library at `root` holding asset `a1` (the source `file_path`) with `old_thumb` as its
+    /// thumbnail and a pending preview job `j1`.
+    async fn library_with_pending_job(
+        root: &Path,
+        file_path: &str,
+        old_thumb: &str,
+    ) -> LibraryHandle {
         let pool = crate::db::memory_library_pool().await;
+        let ext = file_path.rsplit('.').next().unwrap();
         sqlx::query(
             "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, thumbnail_path, preview_status)
-             VALUES ('a1', 'textures/rock.png', 'rock.png', 'png', 'texture', 0, 0, 0, '.opendam/thumbs/a1_thumb.png', 'pending')",
+             VALUES ('a1', ?, ?, ?, 'texture', 0, 0, 0, ?, 'pending')",
         )
+        .bind(file_path)
+        .bind(file_path.rsplit('/').next().unwrap())
+        .bind(ext)
+        .bind(old_thumb)
         .execute(&pool)
         .await
         .unwrap();
@@ -828,12 +832,39 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let lib = LibraryHandle {
+        LibraryHandle {
             id: "lib".into(),
             name: "lib".into(),
             root_path: root.to_path_buf(),
-            pool: pool.clone(),
-        };
+            pool,
+        }
+    }
+
+    /// Asset `a1`'s (thumbnail_path, preview_status) and job `j1`'s status.
+    async fn job_outcome(pool: &Pool<Sqlite>) -> (Option<String>, String, String) {
+        let (thumb, status): (Option<String>, String) =
+            sqlx::query_as("SELECT thumbnail_path, preview_status FROM assets WHERE id = 'a1'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let job: String = sqlx::query_scalar("SELECT status FROM preview_jobs WHERE id = 'j1'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        (thumb, status, job)
+    }
+
+    #[tokio::test]
+    async fn job_for_a_source_that_shrank_deletes_its_old_thumbnail_and_clears_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The old thumbnail, from when the source was larger.
+        let old_thumb = root.join(".opendam/thumbs/a1_thumb.png");
+        write_image(&old_thumb, 512, 512);
+        write_image(&root.join("textures/rock.png"), 256, 256);
+        let lib =
+            library_with_pending_job(root, "textures/rock.png", ".opendam/thumbs/a1_thumb.png")
+                .await;
 
         let (claimed, done) = process_image_jobs(&lib, 2).await;
 
@@ -842,18 +873,66 @@ mod tests {
         assert_eq!(done[0].asset_id, "a1");
         assert_eq!(done[0].thumb_path, None);
         assert!(!old_thumb.exists());
-        let (thumb, status): (Option<String>, String) =
-            sqlx::query_as("SELECT thumbnail_path, preview_status FROM assets WHERE id = 'a1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(thumb, None);
-        assert_eq!(status, "done");
-        let job: String = sqlx::query_scalar("SELECT status FROM preview_jobs WHERE id = 'j1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(job, "done");
+        assert_eq!(
+            job_outcome(&lib.pool).await,
+            (None, "done".into(), "done".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn job_for_a_large_source_keeps_its_rewritten_same_named_thumbnail() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The old thumbnail has the name the new one is written under.
+        let thumb = root.join(".opendam/thumbs/a1_thumb.png");
+        write_image(&thumb, 300, 300);
+        write_image(&root.join("textures/rock.png"), 1024, 1024);
+        let lib =
+            library_with_pending_job(root, "textures/rock.png", ".opendam/thumbs/a1_thumb.png")
+                .await;
+
+        let (_, done) = process_image_jobs(&lib, 2).await;
+
+        assert_eq!(
+            done[0].thumb_path.as_deref(),
+            Some(thumb.to_string_lossy().as_ref())
+        );
+        assert_eq!(image::image_dimensions(&thumb).unwrap(), (512, 512));
+        assert_eq!(
+            job_outcome(&lib.pool).await,
+            (
+                Some(".opendam/thumbs/a1_thumb.png".into()),
+                "done".into(),
+                "done".into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn job_that_renames_a_thumbnail_deletes_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // An upscaled JPEG from before the rule; a small TGA now gets a native-size PNG.
+        let old_thumb = root.join(".opendam/thumbs/a1_thumb.jpg");
+        write_image(&old_thumb, 512, 512);
+        write_image(&root.join("textures/rock.tga"), 64, 64);
+        let lib =
+            library_with_pending_job(root, "textures/rock.tga", ".opendam/thumbs/a1_thumb.jpg")
+                .await;
+
+        process_image_jobs(&lib, 2).await;
+
+        assert!(!old_thumb.exists());
+        let new_thumb = root.join(".opendam/thumbs/a1_thumb.png");
+        assert_eq!(image::image_dimensions(&new_thumb).unwrap(), (64, 64));
+        assert_eq!(
+            job_outcome(&lib.pool).await,
+            (
+                Some(".opendam/thumbs/a1_thumb.png".into()),
+                "done".into(),
+                "done".into()
+            )
+        );
     }
 
     #[test]
