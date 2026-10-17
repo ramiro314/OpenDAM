@@ -1,4 +1,4 @@
-import { memo, useCallback } from 'react';
+import { memo, useCallback, useEffect, useState } from 'react';
 import clsx from 'clsx';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import type { Asset } from '../../types';
@@ -26,6 +26,20 @@ export const AssetListRow = memo(function AssetListRow({
   onContextMenu,
 }: AssetListRowProps) {
   const patchAsset = useAssetStore((s) => s.patchAsset);
+  // The thumbnail has loaded or failed; `data-tile-state` reads "ready" once it has
+  const [mediaSettled, setMediaSettled] = useState(false);
+
+  useEffect(() => {
+    setMediaSettled(false);
+  }, [asset.thumbnailPath, asset.filePath]);
+
+  const media =
+    asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb')
+      ? 'thumbnail'
+      : ['image', 'texture'].includes(asset.kind) && asset.filePath
+        ? 'original'
+        : 'none';
+  const settle = () => setMediaSettled(true);
 
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
@@ -70,6 +84,8 @@ export const AssetListRow = memo(function AssetListRow({
       onDragStart={handleDragStart}
       role="button"
       tabIndex={0}
+      data-tile
+      data-tile-state={media === 'none' || mediaSettled ? 'ready' : 'placeholder'}
     >
       {/* Favorite Button */}
       <button
@@ -89,19 +105,23 @@ export const AssetListRow = memo(function AssetListRow({
 
       {/* Thumbnail */}
       <div className={styles.thumb}>
-        {asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb') ? (
+        {media === 'thumbnail' && asset.thumbnailPath ? (
           <img
             src={convertFileSrc(asset.thumbnailPath)}
             alt={asset.fileName}
             className={styles.thumbImg}
             loading="lazy"
+            onLoad={settle}
+            onError={settle}
           />
-        ) : ['image', 'texture'].includes(asset.kind) && asset.filePath ? (
+        ) : media === 'original' ? (
           <img
             src={convertFileSrc(asset.filePath)}
             alt={asset.fileName}
             className={styles.thumbImg}
             loading="lazy"
+            onLoad={settle}
+            onError={settle}
           />
         ) : (
           <div className={styles.thumbPlaceholder}>

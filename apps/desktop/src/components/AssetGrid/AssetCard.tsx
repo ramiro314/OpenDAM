@@ -53,11 +53,25 @@ export const AssetCard = memo(function AssetCard({
   onContextMenu,
 }: AssetCardProps) {
   const [imgError, setImgError] = useState(false);
+  // `data-tile-state` reads "ready" once the image or video has loaded, or failed (`imgError`)
+  const [mediaLoaded, setMediaLoaded] = useState(false);
   const patchAsset = useAssetStore((s) => s.patchAsset);
 
   useEffect(() => {
     setImgError(false);
+    setMediaLoaded(false);
   }, [asset.thumbnailPath, asset.filePath]);
+
+  const media = imgError
+    ? 'none'
+    : asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb')
+      ? 'thumbnail'
+      : ['image', 'texture'].includes(asset.kind) && asset.filePath
+        ? 'original'
+        : asset.kind === 'video' && asset.filePath
+          ? 'video'
+          : 'none';
+  const tileState = media === 'none' || mediaLoaded ? 'ready' : 'placeholder';
 
   const KindIcon = KIND_ICON[asset.kind] ?? IconImage;
   const kindColor = KIND_COLOR[asset.kind];
@@ -141,27 +155,31 @@ export const AssetCard = memo(function AssetCard({
       title={asset.fileName}
       role="button"
       tabIndex={0}
+      data-tile
+      data-tile-state={tileState}
       onKeyDown={(e) => e.key === 'Enter' && handleClick(e as unknown as React.MouseEvent)}
     >
       {/* Thumbnail / preview area */}
       <div className={styles.thumb}>
-        {asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb') && !imgError ? (
+        {media === 'thumbnail' && asset.thumbnailPath ? (
           <img
             src={convertFileSrc(asset.thumbnailPath)}
             alt={asset.fileName}
             className={styles.thumbImg}
             loading="lazy"
+            onLoad={() => setMediaLoaded(true)}
             onError={() => setImgError(true)}
           />
-        ) : ['image', 'texture'].includes(asset.kind) && asset.filePath && !imgError ? (
+        ) : media === 'original' ? (
           <img
             src={convertFileSrc(asset.filePath)}
             alt={asset.fileName}
             className={styles.thumbImg}
             loading="lazy"
+            onLoad={() => setMediaLoaded(true)}
             onError={() => setImgError(true)}
           />
-        ) : asset.kind === 'video' && asset.filePath && !imgError ? (
+        ) : media === 'video' ? (
           <div className={styles.videoThumbWrapper}>
             <video
               src={convertFileSrc(asset.filePath)}
@@ -170,6 +188,7 @@ export const AssetCard = memo(function AssetCard({
               playsInline
               className={styles.thumbVideo}
               onLoadedMetadata={(e) => {
+                setMediaLoaded(true);
                 try {
                   e.currentTarget.currentTime = 0.1;
                 } catch {}

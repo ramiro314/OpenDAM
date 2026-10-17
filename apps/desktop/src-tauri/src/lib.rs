@@ -3,6 +3,7 @@ pub mod commands;
 pub mod db;
 pub mod models;
 pub mod preview;
+pub mod render;
 pub mod watcher;
 
 use std::sync::Arc;
@@ -55,6 +56,11 @@ pub fn run() {
                 .unwrap_or_else(|_| "opendam=debug,info".parse().unwrap()),
         )
         .init();
+    tracing::info!(
+        target: "render",
+        mode = render::current_render_mode(),
+        "WebKitGTK rendering mode"
+    );
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -245,6 +251,14 @@ pub fn run() {
             commands::autotag::undo_autotag_run,
             commands::autotag::retry_failed_autotag_run,
             commands::autotag::clear_autotag_runs,
+            #[cfg(debug_assertions)]
+            commands::bench::bench_rss,
+            #[cfg(debug_assertions)]
+            commands::bench::bench_render_mode,
+            #[cfg(debug_assertions)]
+            commands::bench::bench_log,
+            #[cfg(debug_assertions)]
+            commands::bench::bench_report,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
