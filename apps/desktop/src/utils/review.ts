@@ -1,7 +1,10 @@
 import type { ProposalDecision, ReviewProposal, Tag } from '../types';
 
-/** What the review will do with a proposal; `undecided` ones stay for a later review. */
-export type ReviewChoice = 'undecided' | 'accept' | 'map' | 'reject';
+/**
+ * What the review will do with a proposal; `undecided` ones stay for a later review. An accepted
+ * proposal with `mapTo` set applies that existing tag instead of creating one.
+ */
+export type ReviewChoice = 'undecided' | 'accept' | 'reject';
 
 export interface ProposalReview {
   proposal: ReviewProposal;
@@ -9,7 +12,7 @@ export interface ProposalReview {
   /** The name the new tag gets */
   name: string;
   parentId: string | null;
-  /** The existing tag to apply instead, when mapped */
+  /** The existing tag to apply instead of creating one, or null to create one */
   mapTo: string | null;
   /** The ticked assets */
   ticked: string[];
@@ -43,23 +46,22 @@ export function reviewReducer(state: ProposalReview[], action: ReviewAction): Pr
   if (action.type === 'load') return initialReview(action.proposals);
   if (action.type === 'acceptAll' || action.type === 'rejectAll') {
     const choice = action.type === 'acceptAll' ? 'accept' : 'reject';
-    // Accept all keeps a mapping you chose: it is a way of accepting.
-    return state.map((r) => ({ ...r, choice: choice === 'accept' && r.mapTo ? 'map' : choice }));
+    return state.map((r) => ({ ...r, choice }));
   }
   return state.map((r) => {
     if (r.proposal.id !== action.id) return r;
     switch (action.type) {
       case 'accept':
-        return { ...r, choice: r.mapTo ? 'map' : 'accept' };
+        return { ...r, choice: 'accept' };
       case 'reject':
         return { ...r, choice: 'reject' };
       // Editing a proposal means you want it
       case 'rename':
-        return { ...r, name: action.name, choice: r.mapTo ? 'map' : 'accept' };
+        return { ...r, name: action.name, choice: 'accept' };
       case 'setParent':
-        return { ...r, parentId: action.parentId, choice: r.mapTo ? 'map' : 'accept' };
+        return { ...r, parentId: action.parentId, choice: 'accept' };
       case 'map':
-        return { ...r, mapTo: action.tagId, choice: action.tagId ? 'map' : 'accept' };
+        return { ...r, mapTo: action.tagId, choice: 'accept' };
       case 'toggleAsset': {
         const ticked = r.ticked.includes(action.assetId)
           ? r.ticked.filter((a) => a !== action.assetId)
@@ -81,12 +83,10 @@ export function toDecisions(state: ProposalReview[]): ProposalDecision[] {
         return [];
       case 'reject':
         return [{ action: 'reject', proposalId }];
-      case 'map':
-        return [{ action: 'map', proposalId, tagId: r.mapTo!, assetIds }];
       case 'accept':
-        return [
-          { action: 'accept', proposalId, name: r.name.trim(), parentId: r.parentId, assetIds },
-        ];
+        return r.mapTo !== null
+          ? [{ action: 'map', proposalId, tagId: r.mapTo, assetIds }]
+          : [{ action: 'accept', proposalId, name: r.name.trim(), parentId: r.parentId, assetIds }];
     }
   });
 }
@@ -95,18 +95,23 @@ export function toDecisions(state: ProposalReview[]): ProposalDecision[] {
 export function applyProblem(state: ProposalReview[]): string | null {
   if (state.every((r) => r.choice === 'undecided')) return 'Accept or reject a proposal first';
   for (const r of state) {
-    if (r.choice === 'accept' && !r.name.trim())
+    if (r.choice === 'accept' && r.mapTo === null && !r.name.trim())
       return `Name the tag proposed as "${r.proposal.name}"`;
-    if ((r.choice === 'accept' || r.choice === 'map') && r.ticked.length === 0)
+    if (r.choice === 'accept' && r.ticked.length === 0)
       return `Tick an asset for "${r.name.trim() || r.proposal.name}", or reject it`;
   }
   return null;
 }
 
-/** The catalog tag a new name would duplicate (names are unique, ignoring case), so Apply maps onto it. */
+/** Lowercased and trimmed, with inner whitespace collapsed, like the backend's `normalize_name`. */
+function normalizeName(name: string): string {
+  return name.trim().split(/\s+/).join(' ').toLowerCase();
+}
+
+/** The catalog tag a new name would duplicate (by normalized name), so Apply maps onto it. */
 export function existingTagNamed(name: string, tags: Tag[]): Tag | null {
-  const folded = name.trim().toLowerCase();
-  return tags.find((t) => t.name.toLowerCase() === folded) ?? null;
+  const normalized = normalizeName(name);
+  return tags.find((t) => normalizeName(t.name) === normalized) ?? null;
 }
 
 /** "Nature > Rock": the tag's name after its ancestors'. */

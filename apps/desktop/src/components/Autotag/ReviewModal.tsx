@@ -43,7 +43,7 @@ function ProposalRow({
     <li
       className={clsx(
         styles.proposal,
-        (choice === 'accept' || choice === 'map') && styles.proposalAccepted,
+        choice === 'accept' && styles.proposalAccepted,
         choice === 'reject' && styles.proposalRejected
       )}
       data-proposal-id={id}
@@ -57,8 +57,8 @@ function ProposalRow({
           aria-label={`Name for "${proposal.name}"`}
         />
         <button
-          className={clsx(toggle, (choice === 'accept' || choice === 'map') && styles.toggleOn)}
-          aria-pressed={choice === 'accept' || choice === 'map'}
+          className={clsx(toggle, choice === 'accept' && styles.toggleOn)}
+          aria-pressed={choice === 'accept'}
           onClick={() => dispatch({ type: 'accept', id })}
         >
           Accept

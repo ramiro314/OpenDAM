@@ -484,18 +484,7 @@ async fn record_review(
             .await?;
         }
     }
-    for pair in pairs {
-        sqlx::query(
-            "INSERT OR IGNORE INTO tag_run_applied (run_id, asset_id, library_id, tag_id, state)
-             VALUES (?, ?, ?, ?, 'pending')",
-        )
-        .bind(&pair.run_id)
-        .bind(&pair.asset_id)
-        .bind(&pair.library_id)
-        .bind(&pair.tag_id)
-        .execute(&mut *tx)
-        .await?;
-    }
+    store::insert_pending(&mut tx, pairs).await?;
     sqlx::query(
         "UPDATE tag_runs SET status = 'done'
          WHERE id = ?1 AND status = 'awaiting_review'

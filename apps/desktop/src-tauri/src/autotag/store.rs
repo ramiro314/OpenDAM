@@ -532,18 +532,17 @@ pub async fn record_intent(
         .execute(&mut *tx)
         .await?;
     }
-    for tag_id in new_tag_ids {
-        sqlx::query(
-            "INSERT OR IGNORE INTO tag_run_applied (run_id, asset_id, library_id, tag_id, state)
-             VALUES (?, ?, ?, ?, 'pending')",
-        )
-        .bind(&item.run_id)
-        .bind(&item.asset_id)
-        .bind(&item.library_id)
-        .bind(tag_id)
-        .execute(&mut *tx)
-        .await?;
-    }
+    let pairs: Vec<PendingPair> = new_tag_ids
+        .iter()
+        .map(|tag_id| PendingPair {
+            run_id: item.run_id.clone(),
+            asset_id: item.asset_id.clone(),
+            library_id: item.library_id.clone(),
+            tag_id: tag_id.clone(),
+            run_cleared: false,
+        })
+        .collect();
+    insert_pending(&mut tx, &pairs).await?;
     sqlx::query(
         "UPDATE tag_run_items SET status = 'done', error = NULL, result = ?
          WHERE run_id = ? AND asset_id = ?",
@@ -565,6 +564,28 @@ pub async fn record_intent(
     .execute(&mut *tx)
     .await?;
     tx.commit().await
+}
+
+/// Write protocol step 1's record of the pairs about to be written, inside the caller's master
+/// transaction: a `pending` row for each, which replay applies and undo removes. A pair the run
+/// already recorded keeps its row.
+pub async fn insert_pending(
+    tx: &mut sqlx::SqliteConnection,
+    pairs: &[PendingPair],
+) -> sqlx::Result<()> {
+    for pair in pairs {
+        sqlx::query(
+            "INSERT OR IGNORE INTO tag_run_applied (run_id, asset_id, library_id, tag_id, state)
+             VALUES (?, ?, ?, ?, 'pending')",
+        )
+        .bind(&pair.run_id)
+        .bind(&pair.asset_id)
+        .bind(&pair.library_id)
+        .bind(&pair.tag_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
 }
 
 /// A `tag_run_applied` row still waiting for its library write.

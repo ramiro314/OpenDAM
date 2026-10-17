@@ -99,6 +99,24 @@ describe('the review-decision reducer', () => {
       mapped
     );
     expect(unmapped[1]).toMatchObject({ choice: 'accept', mapTo: null });
+    expect(toDecisions(unmapped)[0]).toMatchObject({ action: 'accept', name: 'Stones' });
+  });
+
+  test('a mapped proposal stays mapped through rename, re-parent, accept and reject', () => {
+    const state = run(
+      { type: 'map', id: 'p-stones', tagId: 't-stone' },
+      { type: 'rename', id: 'p-stones', name: '' },
+      { type: 'setParent', id: 'p-stones', parentId: 't-nature' },
+      { type: 'reject', id: 'p-stones' },
+      { type: 'accept', id: 'p-stones' }
+    );
+
+    expect(toDecisions(state)).toEqual([
+      { action: 'map', proposalId: 'p-stones', tagId: 't-stone', assetIds: ['a2'] },
+    ]);
+    expect(applyProblem(state)).toBeNull();
+    const rejected = [{ type: 'reject', id: 'p-stones' } as const].reduce(reviewReducer, state);
+    expect(toDecisions(rejected)).toEqual([{ action: 'reject', proposalId: 'p-stones' }]);
   });
 
   test('accept all keeps mappings, reject all rejects everything', () => {
@@ -108,7 +126,8 @@ describe('the review-decision reducer', () => {
       { type: 'acceptAll' }
     );
 
-    expect(accepted.map((r) => r.choice)).toEqual(['accept', 'map', 'accept']);
+    expect(accepted.map((r) => r.choice)).toEqual(['accept', 'accept', 'accept']);
+    expect(toDecisions(accepted).map((d) => d.action)).toEqual(['accept', 'map', 'accept']);
     const rejected = [{ type: 'rejectAll' } as const].reduce(reviewReducer, accepted);
     expect(toDecisions(rejected).every((d) => d.action === 'reject')).toBe(true);
   });
@@ -140,8 +159,10 @@ const TAGS: Tag[] = [
 ];
 
 describe('tag helpers', () => {
-  test('existingTagNamed ignores case and spacing at the ends', () => {
+  test('existingTagNamed matches by normalized name, like Apply', () => {
     expect(existingTagNamed(' rock ', TAGS)?.id).toBe('t-rock');
+    const bigRock = { id: 't-big', name: 'Big Rock', description: '' };
+    expect(existingTagNamed('  big   ROCK', [bigRock])?.id).toBe('t-big');
     expect(existingTagNamed('Moss', TAGS)).toBeNull();
   });
 
