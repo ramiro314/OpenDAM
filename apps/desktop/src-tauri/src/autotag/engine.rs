@@ -94,6 +94,17 @@ pub struct StartedRun {
     pub skipped: usize,
 }
 
+/// A "Suggest tags" run as the asset's Tags tab shows it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Suggestion {
+    pub run: RunSummary,
+    /// Why the asset's item failed, when it did.
+    pub error: Option<String>,
+    /// The new tag names waiting for review, shown as chips.
+    pub proposals: Vec<ReviewProposal>,
+}
+
 /// One provider's share of the engine: its requests in flight never exceed its concurrency
 /// setting, whatever the number of runs.
 struct ProviderPool {
@@ -366,21 +377,93 @@ impl Engine {
     pub async fn list_runs(&self) -> sqlx::Result<Vec<RunSummary>> {
         let mut runs = store::list_runs(&self.db.master_pool).await?;
         for run in &mut runs {
-            run.provider_label = self
-                .pool(&run.provider)
-                .map_or(run.provider.clone(), |p| p.provider.label().to_string());
+            self.label_provider(run);
         }
         Ok(runs)
     }
 
-    /// Queues a run over `scope`. Nothing is created, and nothing is sent, unless the provider
-    /// is set up and can do `mode`.
+    fn label_provider(&self, run: &mut RunSummary) {
+        run.provider_label = self
+            .pool(&run.provider)
+            .map_or(run.provider.clone(), |p| p.provider.label().to_string());
+    }
+
+    /// The provider and mode "Suggest tags" uses: those of the last run started.
+    pub async fn last_used(&self) -> Result<settings::LastUsed, String> {
+        settings::last_used(&self.db.master_pool)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The asset's "Suggest tags" runs for its Tags tab, newest first: the newest one, and
+    /// any older one whose new tag names still wait for review.
+    pub async fn suggestions(&self, asset_id: &str) -> Result<Vec<Suggestion>, String> {
+        let master = &self.db.master_pool;
+        let runs = store::inline_runs_of(master, asset_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut suggestions = Vec::new();
+        for (index, (run_id, error)) in runs.into_iter().enumerate() {
+            let Some(mut run) = store::run_summary(master, &run_id)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                continue;
+            };
+            let reviewable = run.pending_proposals > 0
+                && (run.status == "awaiting_review" || run.status == "cancelled");
+            if index > 0 && !reviewable {
+                continue;
+            }
+            let proposals = if reviewable {
+                self.proposals(&run_id).await?
+            } else {
+                Vec::new()
+            };
+            self.label_provider(&mut run);
+            suggestions.push(Suggestion {
+                run,
+                error,
+                proposals,
+            });
+        }
+        Ok(suggestions)
+    }
+
+    /// The file name of an item's asset, if its library is open and holds it.
+    async fn file_name(&self, (asset_id, library_id): &(String, String)) -> Option<String> {
+        let lib = self.db.get_library_handle(library_id).await?;
+        sqlx::query_scalar("SELECT file_name FROM assets WHERE id = ?")
+            .bind(asset_id)
+            .fetch_optional(&lib.pool)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Queues a run over `scope`, as the run dialog does.
     pub async fn start_run(
         &self,
         scope: RunScope,
         provider_id: &str,
         mode: Mode,
     ) -> Result<StartedRun, String> {
+        self.queue_run(scope, provider_id, mode, false).await
+    }
+
+    /// Queues a run over `scope`. Nothing is created, and nothing is sent, unless the provider
+    /// is set up and can do `mode`. An `inline` run is "Suggest tags" on one asset: it sends no
+    /// desktop notification. Every run started saves its provider and mode as last used.
+    pub async fn queue_run(
+        &self,
+        scope: RunScope,
+        provider_id: &str,
+        mode: Mode,
+        inline: bool,
+    ) -> Result<StartedRun, String> {
+        if inline && !matches!(&scope, RunScope::Assets { asset_ids } if asset_ids.len() == 1) {
+            return Err("Suggest tags works on one asset".into());
+        }
         let pool = self.pool(provider_id)?;
         let provider = pool.provider.clone();
         let label = provider.label();
@@ -406,6 +489,10 @@ impl Engine {
                     return Err("None of these assets is in an open library".into());
                 }
                 let run_label = match items.len() {
+                    _ if inline => format!(
+                        "Suggest tags: {}",
+                        self.file_name(&items[0]).await.unwrap_or_default()
+                    ),
                     1 => "1 asset".to_string(),
                     n => format!("{n} assets"),
                 };
@@ -458,13 +545,22 @@ impl Engine {
                 options: serde_json::json!({
                     "maxTags": pool.provider.max_tags(&settings),
                     "maxProposals": pool.provider.max_proposals(&settings),
+                    "threshold": pool.provider.threshold(&settings),
                 }),
+                inline,
             },
             &items,
         )
         .await
         .map_err(|e| e.to_string())?;
         tracing::info!("Started auto-tag run {id}: {} with {label}", run_label);
+        let last = settings::LastUsed {
+            provider: provider_id.to_string(),
+            mode,
+        };
+        if let Err(e) = settings::save_last_used(&self.db.master_pool, &last).await {
+            tracing::warn!("Could not save the last-used tagging provider and mode: {e}");
+        }
 
         pool.wake.notify_one();
         self.events_wake.notify_one();
@@ -635,7 +731,7 @@ impl Engine {
         let (file_name, relative_path, kind, extension, metadata, thumbnail) =
             row.ok_or("The asset is gone")?;
 
-        let image = match thumbnail {
+        let image = match thumbnail.filter(|_| provider.sees_images()) {
             Some(thumb) => {
                 let path = resolve_path(&lib.root_path, &thumb);
                 tokio::task::spawn_blocking(move || load_thumbnail(Path::new(&path)))
@@ -679,6 +775,7 @@ impl Engine {
             model: item.model.clone(),
             max_tags: max_tags as u32,
             max_proposals: item.options["maxProposals"].as_u64().unwrap_or(0) as u32,
+            threshold: item.options["threshold"].as_f64(),
             asset: AssetInfo {
                 file_name,
                 relative_path,
@@ -2675,5 +2772,347 @@ mod tests {
         assert_eq!((decoded.width(), decoded.height()), (512, 128));
         assert_eq!(thumbnail.media_type, "image/png");
         assert!(load_thumbnail(&dir.path().join("missing.png")).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_inline_run_applies_matches_shows_its_proposals_as_chips_and_never_notifies() {
+        let s = setup(
+            Recording {
+                existing: ids(&["t-rock"]),
+                proposed: [(
+                    "a1.glb".to_string(),
+                    vec![proposal("Moss", None), proposal("Lichen", None)],
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            &["a1", "a2"],
+        )
+        .await;
+        let master = &s.engine.db.master_pool;
+        insert_tag(master, "t-rock", "Rock").await;
+        s.engine.start().await;
+
+        let started = s
+            .engine
+            .queue_run(scope(&["a1"]), "recording", Mode::PreferExisting, true)
+            .await
+            .unwrap();
+        assert!(started.run.inline);
+        assert_eq!(started.run.label, "Suggest tags: a1.glb");
+        wait_for(&s.engine, |runs| runs[0].status == "awaiting_review").await;
+
+        let tags: Vec<String> =
+            sqlx::query_scalar("SELECT tag_id FROM asset_tags WHERE asset_id = 'a1'")
+                .fetch_all(&s.lib_pool)
+                .await
+                .unwrap();
+        assert_eq!(tags, ["t-rock"], "the existing match is applied at once");
+        let suggestions = s.engine.suggestions("a1").await.unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].run.provider_label, "Recording");
+        let chips: Vec<&str> = suggestions[0]
+            .proposals
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(chips, ["Moss", "Lichen"]);
+        assert!(s.engine.suggestions("a2").await.unwrap().is_empty());
+
+        // Accepting one chip creates and applies its tag; the other stays for later.
+        let moss = &suggestions[0].proposals[0];
+        let status = s
+            .engine
+            .review_proposals(
+                &started.run.id,
+                vec![ProposalDecision::Accept {
+                    proposal_id: moss.id.clone(),
+                    name: moss.name.clone(),
+                    parent_id: None,
+                    asset_ids: ids(&["a1"]),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, "awaiting_review");
+        let moss_id: String = sqlx::query_scalar("SELECT id FROM tags WHERE name = 'Moss'")
+            .fetch_one(master)
+            .await
+            .unwrap();
+        assert_eq!(
+            count(
+                &s.lib_pool,
+                &format!(
+                    "SELECT COUNT(*) FROM asset_tags WHERE asset_id = 'a1' AND tag_id = '{moss_id}'"
+                )
+            )
+            .await,
+            1
+        );
+        let left = s.engine.suggestions("a1").await.unwrap();
+        assert_eq!(left[0].proposals.len(), 1);
+        assert_eq!(left[0].proposals[0].name, "Lichen");
+
+        let lichen = left[0].proposals[0].id.clone();
+        let status = s
+            .engine
+            .review_proposals(
+                &started.run.id,
+                vec![ProposalDecision::Reject {
+                    proposal_id: lichen,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, "done");
+        let done = s.engine.suggestions("a1").await.unwrap();
+        assert_eq!(done.len(), 1, "the newest run stays, for its status");
+        assert!(done[0].proposals.is_empty());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            s.notices.lock().unwrap().is_empty(),
+            "no desktop notification"
+        );
+    }
+
+    /// Starts a run and waits until it ends `status`. Returns its id.
+    async fn run_until(
+        engine: &Engine,
+        assets: &[&str],
+        mode: Mode,
+        inline: bool,
+        status: &str,
+    ) -> String {
+        let id = engine
+            .queue_run(scope(assets), "recording", mode, inline)
+            .await
+            .unwrap()
+            .run
+            .id;
+        wait_for(engine, |runs| {
+            runs.iter().any(|r| r.id == id && r.status == status)
+        })
+        .await;
+        id
+    }
+
+    #[tokio::test]
+    async fn suggestions_list_the_newest_inline_run_then_older_ones_still_under_review() {
+        let s = setup(
+            Recording {
+                proposed: [("a1.glb".to_string(), vec![proposal("Moss", None)])]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            &["a1", "a2"],
+        )
+        .await;
+        let master = &s.engine.db.master_pool;
+        s.engine.start().await;
+        let e = &s.engine;
+
+        let done = run_until(e, &["a1"], Mode::ExistingOnly, true, "done").await;
+        let review = run_until(e, &["a1"], Mode::PreferExisting, true, "awaiting_review").await;
+        let cancelled = run_until(e, &["a1"], Mode::PreferExisting, true, "awaiting_review").await;
+        sqlx::query("UPDATE tag_runs SET status = 'cancelled' WHERE id = ?")
+            .bind(&cancelled)
+            .execute(master)
+            .await
+            .unwrap();
+        let reviewed = run_until(e, &["a1"], Mode::PreferExisting, true, "awaiting_review").await;
+        let moss = e.proposals(&reviewed).await.unwrap()[0].id.clone();
+        e.review_proposals(
+            &reviewed,
+            vec![ProposalDecision::Reject { proposal_id: moss }],
+        )
+        .await
+        .unwrap();
+        let batch = run_until(
+            e,
+            &["a1", "a2"],
+            Mode::PreferExisting,
+            false,
+            "awaiting_review",
+        )
+        .await;
+        let newest = run_until(e, &["a1"], Mode::ExistingOnly, true, "done").await;
+
+        let suggestions = e.suggestions("a1").await.unwrap();
+
+        let listed: Vec<(&str, usize)> = suggestions
+            .iter()
+            .map(|s| (s.run.id.as_str(), s.proposals.len()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (newest.as_str(), 0),
+                (cancelled.as_str(), 1),
+                (review.as_str(), 1),
+            ],
+            "newest first; older inline runs only with proposals waiting; never the \
+             non-inline run {batch}, the done run {done} or the fully reviewed run {reviewed}"
+        );
+        assert_eq!(suggestions[1].proposals[0].name, "Moss");
+        assert!(suggestions.iter().all(|s| s.error.is_none()));
+    }
+
+    #[tokio::test]
+    async fn accepting_a_name_two_inline_runs_proposed_creates_one_tag_and_ends_both_reviews() {
+        let s = setup(
+            Recording {
+                proposed: [("a1.glb".to_string(), vec![proposal("Moss", None)])]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            &["a1"],
+        )
+        .await;
+        let master = &s.engine.db.master_pool;
+        s.engine.start().await;
+        let e = &s.engine;
+        let first = run_until(e, &["a1"], Mode::PreferExisting, true, "awaiting_review").await;
+        let second = run_until(e, &["a1"], Mode::PreferExisting, true, "awaiting_review").await;
+
+        // What the Tags tab's merged "Moss" chip sends: one Accept per run holding the name.
+        for suggestion in e.suggestions("a1").await.unwrap() {
+            let moss = &suggestion.proposals[0];
+            let status = e
+                .review_proposals(
+                    &suggestion.run.id,
+                    vec![ProposalDecision::Accept {
+                        proposal_id: moss.id.clone(),
+                        name: moss.name.clone(),
+                        parent_id: None,
+                        asset_ids: ids(&["a1"]),
+                    }],
+                )
+                .await
+                .unwrap();
+            assert_eq!(status, "done");
+        }
+
+        assert_eq!(
+            count(master, "SELECT COUNT(*) FROM tags WHERE name = 'Moss'").await,
+            1
+        );
+        let moss_id: String = sqlx::query_scalar("SELECT id FROM tags WHERE name = 'Moss'")
+            .fetch_one(master)
+            .await
+            .unwrap();
+        let applied: Vec<String> =
+            sqlx::query_scalar("SELECT tag_id FROM asset_tags WHERE asset_id = 'a1'")
+                .fetch_all(&s.lib_pool)
+                .await
+                .unwrap();
+        assert_eq!(applied, std::slice::from_ref(&moss_id), "applied once");
+        let resolved: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
+            "SELECT run_id, status, final_tag_id, created_tag FROM tag_run_proposals
+             ORDER BY run_id = ?",
+        )
+        .bind(&second)
+        .fetch_all(master)
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved,
+            [
+                (first.clone(), "mapped".into(), Some(moss_id.clone()), false),
+                (second.clone(), "accepted".into(), Some(moss_id), true),
+            ],
+            "the newest run, decided first, creates the tag, and the older run maps onto it"
+        );
+        assert!(e.suggestions("a1").await.unwrap()[0].proposals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn suggestions_carry_the_error_of_a_failed_inline_item() {
+        let s = setup(
+            Recording {
+                failures: failures(vec![ProviderError::new(ErrorClass::Item, "Refused")]),
+                ..Default::default()
+            },
+            &["a1"],
+        )
+        .await;
+        s.engine.start().await;
+
+        run_until(&s.engine, &["a1"], Mode::PreferExisting, true, "done").await;
+        let suggestions = s.engine.suggestions("a1").await.unwrap();
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].run.failed, 1);
+        assert_eq!(suggestions[0].error.as_deref(), Some("Refused"));
+        assert!(suggestions[0].proposals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_inline_run_covers_exactly_one_asset() {
+        let s = setup(Recording::default(), &["a1", "a2"]).await;
+        s.engine.start().await;
+
+        for asset_ids in [vec![], ids(&["a1", "a2"])] {
+            let err = s
+                .engine
+                .queue_run(
+                    RunScope::Assets { asset_ids },
+                    "recording",
+                    Mode::ExistingOnly,
+                    true,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err, "Suggest tags works on one asset");
+        }
+        let library = RunScope::Library {
+            library_id: "lib".into(),
+            all_assets: true,
+        };
+        assert!(s
+            .engine
+            .queue_run(library, "recording", Mode::ExistingOnly, true)
+            .await
+            .is_err());
+        assert!(s.engine.list_runs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn starting_a_run_saves_its_provider_and_mode_as_last_used() {
+        let s = setup(Recording::default(), &["a1", "a2"]).await;
+        s.engine.start().await;
+
+        assert_eq!(
+            s.engine.last_used().await.unwrap(),
+            settings::LastUsed {
+                provider: "anthropic".into(),
+                mode: Mode::PreferExisting,
+            },
+            "the default before any run"
+        );
+        let refused = s
+            .engine
+            .start_run(scope(&["ghost"]), "recording", Mode::CreateFreely)
+            .await;
+        assert!(refused.is_err());
+        assert_eq!(
+            s.engine.last_used().await.unwrap(),
+            settings::LastUsed::default(),
+            "a refused start saves nothing"
+        );
+
+        s.engine
+            .start_run(scope(&["a1", "a2"]), "recording", Mode::ExistingOnly)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.engine.last_used().await.unwrap(),
+            settings::LastUsed {
+                provider: "recording".into(),
+                mode: Mode::ExistingOnly,
+            }
+        );
     }
 }

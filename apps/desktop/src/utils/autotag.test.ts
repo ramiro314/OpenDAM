@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import type { AutotagProviderOption, RunSummary } from '../types';
+import type { AutotagProviderOption, ReviewProposal, RunSummary } from '../types';
 import {
   autotagAvailability,
   formatCost,
@@ -8,6 +8,8 @@ import {
   runProgress,
   runUsage,
   scopeFor,
+  suggestionChips,
+  suggestTagsAvailability,
   taggingSummary,
 } from './autotag';
 
@@ -244,5 +246,143 @@ describe('runUsage', () => {
     expect(runUsage(run('running', 0, 10))).toBeNull();
     const used = { ...run('running', 2, 10), inputTokens: 3500, outputTokens: 80, costUsd: 0.0043 };
     expect(runUsage(used)).toBe(`${(3580).toLocaleString()} tokens · $0.0043`);
+  });
+});
+
+describe('suggestTagsAvailability', () => {
+  const anthropicPrefer = { provider: 'anthropic', mode: 'prefer_existing' } as const;
+
+  test('with no provider configured the button is disabled and says why', () => {
+    const providers = [
+      provider('anthropic', 'Set up Anthropic in Settings'),
+      provider('jev', 'Set up Jev in Settings', ['existing_only']),
+    ];
+    const reason =
+      'No tagging provider is ready. Set up Anthropic in Settings. Set up Jev in Settings.';
+
+    expect(suggestTagsAvailability(providers, anthropicPrefer)).toEqual({
+      enabled: false,
+      reason,
+      tooltip: reason,
+    });
+    expect(suggestTagsAvailability(null, anthropicPrefer).enabled).toBe(false);
+  });
+
+  test('the tooltip names the last-used provider and mode', () => {
+    const providers = [provider('anthropic', null), provider('jev', null, ['existing_only'])];
+
+    expect(suggestTagsAvailability(providers, anthropicPrefer)).toEqual({
+      enabled: true,
+      reason: null,
+      tooltip: 'Suggest tags with Anthropic, Prefer existing',
+    });
+    expect(
+      suggestTagsAvailability(providers, { provider: 'jev', mode: 'existing_only' }).tooltip
+    ).toBe('Suggest tags with Jev, Existing only');
+  });
+
+  test('it waits for the last-used provider and mode to load', () => {
+    expect(suggestTagsAvailability([provider('anthropic', null)], null)).toEqual({
+      enabled: false,
+      reason: 'Checking tagging providers…',
+      tooltip: 'Checking tagging providers…',
+    });
+  });
+
+  test('a last-used provider that is not ready disables it, even with another ready', () => {
+    const providers = [
+      provider('anthropic', 'Set up Anthropic in Settings'),
+      provider('jev', null, ['existing_only']),
+    ];
+
+    const availability = suggestTagsAvailability(providers, anthropicPrefer);
+
+    expect(availability.enabled).toBe(false);
+    expect(availability.reason).toBe(
+      'Suggest tags uses the provider of your last run, Anthropic: Set up Anthropic in Settings. Start a run from Auto-tag… with another provider to switch.'
+    );
+  });
+
+  test('a last-used provider missing from this session disables it', () => {
+    const availability = suggestTagsAvailability([provider('anthropic', null)], {
+      provider: 'fake',
+      mode: 'prefer_existing',
+    });
+
+    expect(availability.enabled).toBe(false);
+    expect(availability.reason).toContain("fake, which isn't available");
+  });
+
+  test('a mode the provider cannot do disables it with the reason', () => {
+    const availability = suggestTagsAvailability([provider('jev', null, ['existing_only'])], {
+      provider: 'jev',
+      mode: 'prefer_existing',
+    });
+
+    expect(availability).toEqual({
+      enabled: false,
+      reason:
+        'Suggest tags uses the mode of your last run, Prefer existing: Jev can only match existing tags, not propose new ones.',
+      tooltip:
+        'Suggest tags uses the mode of your last run, Prefer existing: Jev can only match existing tags, not propose new ones.',
+    });
+  });
+});
+
+describe('suggestionChips', () => {
+  const proposal = (id: string, name: string, parentId: string | null = null): ReviewProposal => ({
+    id,
+    name,
+    parentId,
+    assets: [{ assetId: 'a1', fileName: 'a1.png', thumbnailPath: null, included: true }],
+  });
+
+  test('one chip per name across runs, as the newest run proposed it', () => {
+    const newer = { run: { ...run('awaiting_review', 1, 1), id: 'r2' }, error: null };
+    const older = { run: { ...run('awaiting_review', 1, 1), id: 'r1' }, error: null };
+
+    const chips = suggestionChips([
+      { ...newer, proposals: [proposal('p3', 'Moss', 't-nature'), proposal('p4', 'Large')] },
+      { ...older, proposals: [proposal('p1', ' moss '), proposal('p2', 'Lichen')] },
+    ]);
+
+    expect(chips).toEqual([
+      {
+        name: 'Moss',
+        parentId: 't-nature',
+        proposals: [
+          { runId: 'r2', proposalId: 'p3', assetIds: ['a1'] },
+          { runId: 'r1', proposalId: 'p1', assetIds: ['a1'] },
+        ],
+      },
+      {
+        name: 'Large',
+        parentId: null,
+        proposals: [{ runId: 'r2', proposalId: 'p4', assetIds: ['a1'] }],
+      },
+      {
+        name: 'Lichen',
+        parentId: null,
+        proposals: [{ runId: 'r1', proposalId: 'p2', assetIds: ['a1'] }],
+      },
+    ]);
+  });
+
+  test("a chip's assets are its proposals' own, whatever asset is shown", () => {
+    const other = {
+      ...proposal('p9', 'Sand'),
+      assets: [{ ...proposal('x', 'x').assets[0], assetId: 'a9' }],
+    };
+
+    const [chip] = suggestionChips([
+      { run: { ...run('awaiting_review', 1, 1), id: 'r9' }, error: null, proposals: [other] },
+    ]);
+
+    expect(chip.proposals).toEqual([{ runId: 'r9', proposalId: 'p9', assetIds: ['a9'] }]);
+  });
+
+  test('no proposals, no chips', () => {
+    expect(suggestionChips([])).toEqual([]);
+    expect(suggestionChips([{ run: run('done', 1, 1), error: null, proposals: [] }])).toEqual([]);
   });
 });

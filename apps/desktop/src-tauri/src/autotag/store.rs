@@ -164,6 +164,21 @@ pub async fn locate_assets(
         .collect())
 }
 
+/// The "Suggest tags" runs of one asset, newest first, each with its item's error if it failed.
+pub async fn inline_runs_of(
+    master: &Pool<Sqlite>,
+    asset_id: &str,
+) -> sqlx::Result<Vec<(String, Option<String>)>> {
+    sqlx::query_as(
+        "SELECT r.id, i.error FROM tag_runs r JOIN tag_run_items i ON i.run_id = r.id
+         WHERE r.inline = 1 AND i.asset_id = ?
+         ORDER BY r.created_at DESC, r.rowid DESC",
+    )
+    .bind(asset_id)
+    .fetch_all(master)
+    .await
+}
+
 /// A library's assets with no tag, or all of them with `all_assets`, in file path order.
 pub async fn library_assets(lib: &Pool<Sqlite>, all_assets: bool) -> sqlx::Result<Vec<String>> {
     let sql = if all_assets {
@@ -183,6 +198,8 @@ pub struct NewRun<'a> {
     pub model: Option<&'a str>,
     pub mode: &'a str,
     pub options: serde_json::Value,
+    /// Started by "Suggest tags" on one asset.
+    pub inline: bool,
 }
 
 /// Inserts the run and its queued items. The run is `queued` while its items go in, in batches,
@@ -194,8 +211,9 @@ pub async fn create_run(
     items: &[(String, String)],
 ) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO tag_runs (id, label, provider, model, mode, status, options, created_at)
-         VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)",
+        "INSERT INTO tag_runs (id, label, provider, model, mode, status, options, inline,
+                               created_at)
+         VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
     )
     .bind(run.id)
     .bind(run.label)
@@ -203,6 +221,7 @@ pub async fn create_run(
     .bind(run.model)
     .bind(run.mode)
     .bind(run.options.to_string())
+    .bind(run.inline)
     .bind(now_ms())
     .execute(master)
     .await?;

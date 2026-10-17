@@ -20,6 +20,7 @@ import {
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { api } from '../../api';
 import { ThreeViewer } from './ThreeViewer';
+import { SuggestTags } from './SuggestTags';
 import styles from './DetailPanel.module.css';
 
 const COLOR_LABELS: ColorLabel[] = [
@@ -562,6 +563,9 @@ function TagsTab({
 
   return (
     <div className={styles.tagsSection}>
+      {/* Keyed so another asset gets a fresh instance: a late reply for the last one is dropped */}
+      <SuggestTags key={asset.id} assetId={asset.id} />
+
       {tags.length === 0 && (
         <p className={styles.noTags}>No tags yet. Create tags in the sidebar.</p>
       )}

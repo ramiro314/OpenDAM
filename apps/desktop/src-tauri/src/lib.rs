@@ -11,15 +11,17 @@ use tauri_plugin_notification::NotificationExt;
 use tracing_subscriber::EnvFilter;
 
 use autotag::anthropic::AnthropicProvider;
-use autotag::credentials::{self, Credentials};
+use autotag::credentials::Credentials;
 use autotag::engine::Engine;
-use autotag::provider::{NotYetBuilt, TagProvider};
+use autotag::jev::JevProvider;
+use autotag::provider::TagProvider;
 use db::Database;
 
 pub struct AppState {
     pub db: Arc<Database>,
     pub credentials: Arc<Credentials>,
     pub anthropic: Arc<AnthropicProvider>,
+    pub jev: Arc<JevProvider>,
     pub autotag: Arc<Engine>,
     pub app_handle: tauri::AppHandle,
 }
@@ -27,17 +29,11 @@ pub struct AppState {
 /// The tagging providers runs can use, plus the fake ones in a debug build run with
 /// `OPENDAM_AUTOTAG_FAKE=1`.
 fn tag_providers(
-    credentials: &Arc<Credentials>,
     anthropic: &Arc<AnthropicProvider>,
+    jev: &Arc<JevProvider>,
 ) -> Vec<Arc<dyn TagProvider>> {
     #[allow(unused_mut)]
-    let mut providers: Vec<Arc<dyn TagProvider>> = vec![
-        anthropic.clone(),
-        Arc::new(NotYetBuilt {
-            provider: credentials::Provider::Jev,
-            credentials: credentials.clone(),
-        }),
-    ];
+    let mut providers: Vec<Arc<dyn TagProvider>> = vec![anthropic.clone(), jev.clone()];
     #[cfg(debug_assertions)]
     providers.extend(
         autotag::fake::from_env()
@@ -105,11 +101,12 @@ pub fn run() {
             let db = Arc::new(db);
             let credentials = Arc::new(Credentials::from_process_env());
             let anthropic = Arc::new(AnthropicProvider::new(credentials.clone()));
+            let jev = Arc::new(JevProvider::new(credentials.clone()));
             let events = app.handle().clone();
             let notifications = app.handle().clone();
             let autotag = Engine::new(
                 db.clone(),
-                tag_providers(&credentials, &anthropic),
+                tag_providers(&anthropic, &jev),
                 Arc::new(move |update| {
                     let _ = events.emit("autotag:updated", update);
                 }),
@@ -129,6 +126,7 @@ pub fn run() {
                 db,
                 credentials,
                 anthropic,
+                jev,
                 autotag: autotag.clone(),
                 app_handle: app.handle().clone(),
             });
@@ -228,6 +226,8 @@ pub fn run() {
             commands::settings::test_provider,
             commands::autotag::list_autotag_providers,
             commands::autotag::start_autotag_run,
+            commands::autotag::get_autotag_last_used,
+            commands::autotag::get_autotag_suggestions,
             commands::autotag::list_autotag_runs,
             commands::autotag::pause_autotag_run,
             commands::autotag::resume_autotag_run,

@@ -474,6 +474,13 @@ expected output. Update the table when prices change.
   - Applied tags appear in the existing list.
   - Proposals show as chips with accept and reject.
   - The button is disabled, with a tooltip, when no provider is configured.
+  - **Last used (built):** every run start saves `autotag.lastUsed` in `settings`
+    (`get_autotag_last_used`). If that provider isn't ready, the button stays disabled and says
+    so, even when another provider is ready: D32 picks the provider, and a run from Auto-tag...
+    switches it.
+  - **Chips (built):** `get_autotag_suggestions(asset_id)` returns the asset's newest inline run
+    and older ones still holding proposals. Two runs proposing the same name show one chip, and
+    accepting or rejecting it sends one `review_autotag_proposals` decision to each run.
 
 - **Status bar:** the tagging summary sits next to the preview progress, for example
   "Tagging 2 runs - 120/400", "1 run needs review" or "2 runs paused". Clicking it opens the
