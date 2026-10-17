@@ -55,8 +55,10 @@ test: deps
 	exit $$((bun || nextest))
 
 # tauri build runs the vite build first (beforeBuildCommand in tauri.conf.json).
+# `bun run dev` and `bun run build` run tauri under scripts/memory-cap.sh (AGENTS.md,
+# "Memory-heavy tools").
 build: deps
-	cd $(DESKTOP) && bun run tauri build --no-bundle
+	cd $(DESKTOP) && bun run build --no-bundle
 
 # make install puts the release build under ~/.local, and make uninstall removes
 # exactly these paths. The preview engine goes where preview.rs looks for it.
