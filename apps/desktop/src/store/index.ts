@@ -11,6 +11,9 @@ import type {
   FilterSpec,
   SortField,
   SortOrder,
+  AutotagProviderOption,
+  AutotagUpdate,
+  RunSummary,
 } from '../types';
 import { api } from '../api';
 
@@ -182,6 +185,8 @@ interface AssetStore {
   updateAssetPreview: (id: string, thumbnailPath?: string, previewModel?: string) => void;
   setPreviewStatus: (id: string, status: Asset['previewStatus']) => void;
   getById: (id: string) => Asset | undefined;
+  /** Re-fetches the given assets that are loaded; ids not loaded are ignored */
+  refreshAssets: (ids: string[]) => Promise<void>;
 }
 
 /** Drops deleted assets from the selection and the focus. */
@@ -405,6 +410,59 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
   },
 
   getById: (id) => get().assetMap.get(id),
+
+  refreshAssets: async (ids) => {
+    const loaded = ids.filter((id) => get().assetMap.has(id));
+    const fetched = await Promise.all(
+      loaded.map((id) =>
+        api.getAsset(id).catch((e) => {
+          console.error(`Failed to refresh asset ${id}:`, e);
+          return null;
+        })
+      )
+    );
+    const updated = new Map(fetched.filter((a): a is Asset => a !== null).map((a) => [a.id, a]));
+    if (updated.size === 0) return;
+    set((s) => {
+      const assetMap = new Map(s.assetMap);
+      for (const [id, asset] of updated) if (assetMap.has(id)) assetMap.set(id, asset);
+      return { assets: s.assets.map((a) => updated.get(a.id) ?? a), assetMap };
+    });
+  },
+}));
+
+// ── Auto-tagging Store ────────────────────────────────────────────────────
+interface AutotagStore {
+  runs: RunSummary[];
+  /** null until loaded */
+  providers: AutotagProviderOption[] | null;
+  runsPanelOpen: boolean;
+  fetchRuns: () => Promise<void>;
+  fetchProviders: () => Promise<void>;
+  /** Takes an `autotag:updated` event: the runs, and re-fetches the loaded assets that changed */
+  applyUpdate: (update: AutotagUpdate) => void;
+  setRunsPanelOpen: (open: boolean) => void;
+}
+
+export const useAutotagStore = create<AutotagStore>()((set) => ({
+  runs: [],
+  providers: null,
+  runsPanelOpen: false,
+
+  fetchRuns: async () => {
+    set({ runs: await api.listAutotagRuns() });
+  },
+
+  fetchProviders: async () => {
+    set({ providers: await api.listAutotagProviders() });
+  },
+
+  applyUpdate: ({ runs, changedAssetIds }) => {
+    set({ runs });
+    if (changedAssetIds.length > 0) useAssetStore.getState().refreshAssets(changedAssetIds);
+  },
+
+  setRunsPanelOpen: (runsPanelOpen) => set({ runsPanelOpen }),
 }));
 
 // ── Tag Store ─────────────────────────────────────────────────────────────

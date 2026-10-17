@@ -7,9 +7,17 @@ import { DetailPanel } from './components/DetailPanel/DetailPanel';
 import { StatusBar } from './components/StatusBar/StatusBar';
 import { QuickLookModal } from './components/QuickLook/QuickLookModal';
 import { ConfirmDeleteDialog } from './components/ConfirmDeleteDialog';
+import { RunsPanel } from './components/Autotag/RunsPanel';
 import { IconCheck } from './components/Icons';
 import { useUIStore } from './store';
-import { useLibraryStore, useTagStore, useCollectionStore, useAssetStore } from './store';
+import {
+  useLibraryStore,
+  useTagStore,
+  useCollectionStore,
+  useAssetStore,
+  useAutotagStore,
+} from './store';
+import type { AutotagUpdate } from './types';
 import { api } from './api';
 import { startModelThumbnailer } from './preview/modelThumbnailer';
 import styles from './App.module.css';
@@ -32,6 +40,7 @@ export default function App() {
   const fetchTags = useTagStore((s) => s.fetchTags);
   const fetchCollections = useCollectionStore((s) => s.fetchCollections);
   const search = useAssetStore((s) => s.search);
+  const runsPanelOpen = useAutotagStore((s) => s.runsPanelOpen);
 
   const [quickLookOpen, setQuickLookOpen] = useState(false);
   const [copyToast, setCopyToast] = useState<string | null>(null);
@@ -64,6 +73,13 @@ export default function App() {
 
     // Render grid thumbnails for 3D models the preview engine converted to .glb
     const stopModelThumbnailer = startModelThumbnailer();
+
+    // Auto-tagging runs: the first list, then the engine pushes every change
+    useAutotagStore.getState().fetchRuns().catch(console.error);
+    useAutotagStore.getState().fetchProviders().catch(console.error);
+    const unlistenAutotag = listen<AutotagUpdate>('autotag:updated', (event) => {
+      useAutotagStore.getState().applyUpdate(event.payload);
+    });
 
     const unlistenLib = listen('library:updated', () => {
       useAssetStore.getState().refresh();
@@ -200,6 +216,7 @@ export default function App() {
       unlistenDone.then((fn) => fn());
       unlistenError.then((fn) => fn());
       unlistenLib.then((fn) => fn());
+      unlistenAutotag.then((fn) => fn());
       stopModelThumbnailer();
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
@@ -241,6 +258,7 @@ export default function App() {
 
       {/* Spacebar Quick Look Modal */}
       <QuickLookModal asset={focusedAsset} isOpen={quickLookOpen} />
+      {runsPanelOpen && <RunsPanel />}
 
       {/* Delete Confirmation Dialog */}
       <ConfirmDeleteDialog

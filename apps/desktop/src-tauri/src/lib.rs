@@ -9,13 +9,38 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use tracing_subscriber::EnvFilter;
 
-use autotag::credentials::Credentials;
+use autotag::credentials::{self, Credentials};
+use autotag::engine::Engine;
+use autotag::provider::{NotYetBuilt, TagProvider};
 use db::Database;
 
 pub struct AppState {
-    pub db: Database,
+    pub db: Arc<Database>,
     pub credentials: Arc<Credentials>,
+    pub autotag: Arc<Engine>,
     pub app_handle: tauri::AppHandle,
+}
+
+/// The tagging providers runs can use, plus the fake ones in a debug build run with
+/// `OPENDAM_AUTOTAG_FAKE=1`.
+fn tag_providers(credentials: &Arc<Credentials>) -> Vec<Arc<dyn TagProvider>> {
+    #[allow(unused_mut)]
+    let mut providers: Vec<Arc<dyn TagProvider>> = credentials::Provider::ALL
+        .into_iter()
+        .map(|provider| {
+            Arc::new(NotYetBuilt {
+                provider,
+                credentials: credentials.clone(),
+            }) as Arc<dyn TagProvider>
+        })
+        .collect();
+    #[cfg(debug_assertions)]
+    providers.extend(
+        autotag::fake::from_env()
+            .into_iter()
+            .map(|p| Arc::new(p) as Arc<dyn TagProvider>),
+    );
+    providers
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -72,9 +97,20 @@ pub fn run() {
                 commands::library::allow_library_roots(app.handle(), paths);
             }
 
+            let db = Arc::new(db);
+            let credentials = Arc::new(Credentials::from_process_env());
+            let events = app.handle().clone();
+            let autotag = Engine::new(
+                db.clone(),
+                tag_providers(&credentials),
+                Arc::new(move |update| {
+                    let _ = events.emit("autotag:updated", update);
+                }),
+            );
             let state = Arc::new(AppState {
                 db,
-                credentials: Arc::new(Credentials::from_process_env()),
+                credentials,
+                autotag: autotag.clone(),
                 app_handle: app.handle().clone(),
             });
 
@@ -82,6 +118,9 @@ pub fn run() {
 
             // Start the background preview worker queue
             crate::preview::start_preview_worker(state.clone());
+
+            // Auto-tagging runs: replays writes left pending, then serves queued items
+            tauri::async_runtime::spawn(async move { autotag.start().await });
 
             // Re-index all existing libraries on startup in background
             let startup_state = state.clone();
@@ -167,6 +206,9 @@ pub fn run() {
             commands::settings::set_ai_settings,
             commands::settings::set_api_key,
             commands::settings::get_provider_status,
+            commands::autotag::list_autotag_providers,
+            commands::autotag::start_autotag_run,
+            commands::autotag::list_autotag_runs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

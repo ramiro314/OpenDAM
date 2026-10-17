@@ -1,5 +1,5 @@
 import { useCallback, useState } from 'react';
-import { useUIStore, useAssetStore, useLibraryStore } from '../../store';
+import { useUIStore, useAssetStore, useLibraryStore, useAutotagStore } from '../../store';
 import { api } from '../../api';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
@@ -11,8 +11,11 @@ import {
   IconRefresh,
   IconPlus,
   IconSettings,
+  IconTag,
 } from '../Icons';
 import { SettingsDialog } from '../Settings/SettingsDialog';
+import { AutotagDialog } from '../Autotag/AutotagDialog';
+import { autotagAvailability } from '../../utils/autotag';
 import styles from './Toolbar.module.css';
 import clsx from 'clsx';
 
@@ -26,11 +29,26 @@ export function Toolbar() {
     setGridSize,
     toggleSidebar,
     toggleDetailPanel,
+    selectedAssetIds,
   } = useUIStore();
   const { query, setQuery, search, loading } = useAssetStore();
   const { addLibrary } = useLibraryStore();
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const providers = useAutotagStore((s) => s.providers);
+  const fetchProviders = useAutotagStore((s) => s.fetchProviders);
+  const [autotagAssetIds, setAutotagAssetIds] = useState<string[] | null>(null);
+  const [autotagReasonShown, setAutotagReasonShown] = useState(false);
+  const autotag = autotagAvailability(providers, selectedAssetIds.size);
+
+  // A disabled button shows no tooltip in every webview, so a click shows the reason instead.
+  const handleAutotag = () => {
+    if (autotag.enabled) {
+      setAutotagAssetIds(Array.from(selectedAssetIds));
+    } else {
+      setAutotagReasonShown((shown) => !shown);
+    }
+  };
 
   const handleRefresh = async () => {
     setIsRefreshing(true);
@@ -216,6 +234,25 @@ export function Toolbar() {
           <IconRefresh className={loading || isRefreshing ? 'animate-spin' : undefined} />
         </button>
 
+        <div className={styles.autotagWrap}>
+          <button
+            id="autotag-selection"
+            className={clsx(styles.textBtn, !autotag.enabled && styles.textBtnDisabled)}
+            onClick={handleAutotag}
+            onBlur={() => setAutotagReasonShown(false)}
+            aria-disabled={!autotag.enabled}
+            title={autotag.reason ?? `Auto-tag ${selectedAssetIds.size} selected assets`}
+          >
+            <IconTag />
+            <span>Auto-tag</span>
+          </button>
+          {autotagReasonShown && autotag.reason && (
+            <div className={styles.autotagReason} role="status">
+              {autotag.reason}
+            </div>
+          )}
+        </div>
+
         <button
           id="open-settings"
           className={styles.iconBtn}
@@ -236,7 +273,18 @@ export function Toolbar() {
         </button>
       </div>
 
-      {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <SettingsDialog
+          onClose={() => {
+            setSettingsOpen(false);
+            // A saved or cleared key changes which providers can run
+            fetchProviders().catch(console.error);
+          }}
+        />
+      )}
+      {autotagAssetIds && (
+        <AutotagDialog assetIds={autotagAssetIds} onClose={() => setAutotagAssetIds(null)} />
+      )}
     </header>
   );
 }

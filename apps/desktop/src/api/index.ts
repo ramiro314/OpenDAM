@@ -15,6 +15,10 @@ import type {
   AiSettings,
   AiSettingsPatch,
   ProviderStatus,
+  AutotagMode,
+  AutotagProviderOption,
+  RunSummary,
+  StartedRun,
 } from '../types';
 
 /** Thin wrapper around Tauri IPC commands */
@@ -85,4 +89,10 @@ export const api = {
   setApiKey: (provider: AiProvider, key: string | null) =>
     invoke<ProviderStatus>('set_api_key', { provider, key }),
   getProviderStatus: () => invoke<ProviderStatus[]>('get_provider_status'),
+
+  // Auto-tagging runs. Progress arrives as `autotag:updated` events.
+  listAutotagProviders: () => invoke<AutotagProviderOption[]>('list_autotag_providers'),
+  startAutotagRun: (assetIds: string[], provider: string, mode: AutotagMode) =>
+    invoke<StartedRun>('start_autotag_run', { assetIds, provider, mode }),
+  listAutotagRuns: () => invoke<RunSummary[]>('list_autotag_runs'),
 };
