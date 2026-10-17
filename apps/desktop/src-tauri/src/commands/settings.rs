@@ -47,8 +47,9 @@ pub async fn get_provider_status(state: State<'_, Arc<AppState>>) -> Result<Vec<
         .map_err(|e| e.to_string())
 }
 
-/// Sends one small request in the production shape with the configured key, to `model` or the
-/// saved model. Errors come back in the result, for Settings to show.
+/// Sends one small request in the production shape with the configured key: for Anthropic to
+/// `model` or the saved model, for Jev with the saved threshold and cap. Errors come back in the
+/// result, for Settings to show.
 #[tauri::command]
 pub async fn test_provider(
     provider: Provider,
@@ -69,7 +70,13 @@ pub async fn test_provider(
             };
             Ok(state.anthropic.test_connection(&model).await)
         }
-        Provider::Jev => Err("Jev's connection test isn't built yet".into()),
+        Provider::Jev => {
+            let jev = settings::load(&state.db.master_pool)
+                .await
+                .map_err(|e| e.to_string())?
+                .jev;
+            Ok(state.jev.test_connection(jev.threshold, jev.max_tags).await)
+        }
     }
 }
 
@@ -78,6 +85,7 @@ mod tests {
     use crate::autotag::anthropic::{mock, AnthropicProvider};
     use crate::autotag::credentials::{Credentials, MemoryKeyring, Provider};
     use crate::autotag::engine::{Engine, RunScope};
+    use crate::autotag::jev::JevProvider;
     use crate::autotag::provider::Mode;
     use crate::autotag::settings;
     use crate::db::{insert_asset, insert_tag, memory_library, memory_library_pool, Database};
@@ -104,7 +112,7 @@ mod tests {
     }
 
     /// Saves, reads, overrides and clears sentinel keys, saves settings, and runs an Anthropic
-    /// tagging run and "Test connection" against a local stand-in for the API, with every
+    /// tagging run and "Test connection" for both providers against local stand-ins, with every
     /// `tracing` event captured. No sentinel may reach the master DB file, the log, any returned
     /// payload or any `autotag:updated` event.
     #[tokio::test]
@@ -216,6 +224,25 @@ mod tests {
         }
         let events = events.lock().unwrap().clone();
         assert!(!events.is_empty(), "the run emitted events");
+
+        // Jev's connection test, with the saved key
+        let typesafe = mock::serve(
+            200,
+            &[],
+            include_str!("../autotag/fixtures/jev/scores.json"),
+        )
+        .await;
+        let jev = JevProvider::with_base_url(creds.clone(), typesafe.url.clone());
+        let jev_test = jev.test_connection(0.7, 8).await;
+        assert!(jev_test.ok, "{jev_test:?}");
+        payloads.push(json!(jev_test));
+        let received = typesafe.received();
+        assert_eq!(received.len(), 1);
+        assert!(received[0].head.contains(&format!(
+            "authorization: bearer {}",
+            JEV_SENTINEL.to_lowercase()
+        )));
+        assert!(!received[0].body.contains(JEV_SENTINEL));
 
         payloads.push(json!(creds.set_key(Provider::Anthropic, None).unwrap()));
         db.master_pool.close().await;

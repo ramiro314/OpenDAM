@@ -206,6 +206,7 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
                     onChange={(maxTags) => setJev({ maxTags })}
                   />
                 </div>
+                <TestConnection provider="jev" configured={statusOf('jev')?.configured ?? false} />
               </section>
             </>
           )}
@@ -365,8 +366,9 @@ function ApiKeyField({ provider, status, onStatus }: ApiKeyFieldProps) {
 
 interface TestConnectionProps {
   provider: AiProvider;
-  /** The model in the form, which may not be saved yet */
-  model: string;
+  /** The model in the form, which may not be saved yet. Jev has none and tests with the saved
+   * threshold and cap. */
+  model?: string;
   configured: boolean;
 }
 
