@@ -435,17 +435,19 @@ fn load_thumbnail(path: &Path) -> Option<Thumbnail> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::autotag::provider::{TagFuture, TagResult};
+    use crate::autotag::provider::{ErrorClass, ProviderError, TagFuture, TagResult};
     use crate::db::{
         insert_asset, insert_tag, memory_database, memory_library, memory_library_pool,
     };
     use sqlx::{Pool, Sqlite};
     use std::sync::atomic::AtomicUsize;
 
-    /// Counts calls and requests in flight, and answers every asset with `existing`.
+    /// Counts calls and requests in flight, and answers every asset with `existing`, or with
+    /// `error` when it is set.
     #[derive(Default)]
     struct Recording {
         existing: Vec<String>,
+        error: Option<ProviderError>,
         delay: Duration,
         unavailable: Option<String>,
         in_flight: AtomicUsize,
@@ -479,6 +481,9 @@ mod tests {
                 self.max_in_flight.fetch_max(now, Ordering::SeqCst);
                 tokio::time::sleep(self.delay).await;
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                if let Some(error) = &self.error {
+                    return Err(error.clone());
+                }
                 Ok(TagResult {
                     existing: self.existing.clone(),
                     ..Default::default()
@@ -693,6 +698,83 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(error, "The asset is gone");
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_of_every_class_fails_the_item() {
+        for class in [ErrorClass::Retryable, ErrorClass::Fatal, ErrorClass::Item] {
+            let message = format!("{class:?} trouble");
+            let s = setup(
+                Recording {
+                    existing: ids(&["t-rock"]),
+                    error: Some(ProviderError::new(class, &message)),
+                    ..Default::default()
+                },
+                &["a1"],
+            )
+            .await;
+            let master = &s.engine.db.master_pool;
+            insert_tag(master, "t-rock", "Rock").await;
+
+            s.engine.start().await;
+            s.engine
+                .start_run(ids(&["a1"]), "recording", Mode::ExistingOnly)
+                .await
+                .unwrap();
+            let runs = wait_until_done(&s.engine).await;
+
+            assert_eq!((runs[0].done, runs[0].failed), (0, 1), "{class:?}");
+            assert_eq!(
+                s.provider.calls.lock().unwrap().len(),
+                1,
+                "{class:?}: no retry"
+            );
+            let (status, error): (String, String) =
+                sqlx::query_as("SELECT status, error FROM tag_run_items WHERE asset_id = 'a1'")
+                    .fetch_one(master)
+                    .await
+                    .unwrap();
+            assert_eq!((status.as_str(), error), ("failed", message), "{class:?}");
+            let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tag_run_applied")
+                .fetch_one(master)
+                .await
+                .unwrap();
+            let tagged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM asset_tags")
+                .fetch_one(&s.lib_pool)
+                .await
+                .unwrap();
+            assert_eq!((applied, tagged), (0, 0), "{class:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn updates_are_throttled_to_one_per_event_interval() {
+        let assets: Vec<String> = (0..40).map(|i| format!("a{i}")).collect();
+        let names: Vec<&str> = assets.iter().map(String::as_str).collect();
+        let s = setup(Recording::default(), &names).await;
+        settings::update(
+            &s.engine.db.master_pool,
+            serde_json::json!({"anthropic": {"concurrency": 16}}),
+        )
+        .await
+        .unwrap();
+        s.engine.start().await;
+
+        let started = std::time::Instant::now();
+        s.engine
+            .start_run(assets.clone(), "recording", Mode::ExistingOnly)
+            .await
+            .unwrap();
+        wait_until_done(&s.engine).await;
+        tokio::time::sleep(EVENT_INTERVAL * 2).await;
+        let elapsed = started.elapsed();
+
+        // 40 items finish, each waking the event loop, but sends are spaced EVENT_INTERVAL apart.
+        let sent = s.updates.lock().unwrap().len() as u128;
+        let allowed = elapsed.as_millis() / EVENT_INTERVAL.as_millis() + 1;
+        assert!(sent >= 1 && sent <= allowed, "{sent} events in {elapsed:?}");
+        assert!(sent < 40, "{sent} events for 40 items");
+        assert_eq!(s.updates.lock().unwrap().last().unwrap().runs[0].done, 40);
     }
 
     #[test]
