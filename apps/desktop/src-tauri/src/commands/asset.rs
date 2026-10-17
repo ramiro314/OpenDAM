@@ -1,4 +1,6 @@
 use serde_json;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tauri::{Emitter, State};
@@ -164,65 +166,111 @@ async fn search_libraries(
         });
     }
 
-    // Multiple libraries: query each, combine counts, and merge-sort
+    // Multiple libraries: each returns only the rowid and sort key of its first `offset + limit`
+    // matches, and only the merged page's rows are fetched in full.
     let mut total: i64 = 0;
-    let mut all_assets: Vec<Asset> = Vec::new();
-    for (pool, root_opt) in target_libs {
+    let mut keys: Vec<(usize, i64, SortKey)> = Vec::new();
+    for (lib, (pool, _)) in target_libs.iter().enumerate() {
         if payload.include_total {
             if let Ok(c) = count_assets(pool, &filter).await {
                 total += c;
             }
         }
-        if let Ok(assets) =
-            fetch_assets(pool, root_opt, &filter, &order_by, offset + limit, None).await
-        {
-            all_assets.extend(assets);
+        match fetch_sort_keys(pool, &filter, sort_field, &order_by, offset + limit).await {
+            Ok(lib_keys) => keys.extend(lib_keys.into_iter().map(|(rowid, key)| (lib, rowid, key))),
+            Err(e) => tracing::warn!("Left library {lib} out of a search: {e}"),
         }
     }
 
-    all_assets.sort_by(|a, b| {
-        let cmp = match sort_field {
-            "name" => a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()),
-            "size" => a.size_bytes.cmp(&b.size_bytes),
-            "rating" => a.rating.cmp(&b.rating),
-            "kind" => a.kind.cmp(&b.kind),
-            "favorite" => a.is_favorite.cmp(&b.is_favorite),
-            _ => a.modified_at.cmp(&b.modified_at),
-        };
-        if is_asc {
-            cmp
+    // Each library's keys are already in its order, so the stable sort merges sorted runs.
+    keys.sort_by(|(lib_a, rowid_a, key_a), (lib_b, rowid_b, key_b)| {
+        let by_key = key_a.cmp_like_sqlite(key_b);
+        let by_key = if is_asc { by_key } else { by_key.reverse() };
+        let by_rowid = if is_asc {
+            rowid_a.cmp(rowid_b)
         } else {
-            cmp.reverse()
-        }
+            rowid_b.cmp(rowid_a)
+        };
+        by_key.then(lib_a.cmp(lib_b)).then(by_rowid)
     });
-
-    let paged_assets: Vec<Asset> = all_assets
+    let page: Vec<(usize, i64)> = keys
         .into_iter()
         .skip(offset as usize)
         .take(limit as usize)
+        .map(|(lib, rowid, _)| (lib, rowid))
         .collect();
 
+    let mut fetched: HashMap<(usize, i64), Asset> = HashMap::new();
+    for (lib, (pool, root_opt)) in target_libs.iter().enumerate() {
+        let rowids: Vec<i64> = page
+            .iter()
+            .filter(|(l, _)| *l == lib)
+            .map(|(_, rowid)| *rowid)
+            .collect();
+        if rowids.is_empty() {
+            continue;
+        }
+        match fetch_assets_by_rowid(pool, root_opt, &rowids).await {
+            Ok(assets) => fetched.extend(
+                assets
+                    .into_iter()
+                    .map(|(rowid, asset)| ((lib, rowid), asset)),
+            ),
+            Err(e) => tracing::warn!("Left library {lib} out of a search page: {e}"),
+        }
+    }
+    let assets = page.iter().filter_map(|key| fetched.remove(key)).collect();
+
     Ok(SearchResult {
-        assets: paged_assets,
+        assets,
         total: payload.include_total.then_some(total),
         page: payload.page,
         page_size: payload.page_size,
     })
 }
 
+/// The value an asset is sorted by, compared as SQLite compares it in `order_by`.
+#[derive(Debug)]
+enum SortKey {
+    /// `COLLATE NOCASE` text.
+    NoCase(String),
+    /// `BINARY` text.
+    Binary(String),
+    Integer(i64),
+}
+
+impl SortKey {
+    fn cmp_like_sqlite(&self, other: &SortKey) -> Ordering {
+        match (self, other) {
+            // NOCASE folds only ASCII letters, then compares bytes, a prefix first.
+            (SortKey::NoCase(a), SortKey::NoCase(b)) => a
+                .bytes()
+                .map(|c| c.to_ascii_lowercase())
+                .cmp(b.bytes().map(|c| c.to_ascii_lowercase())),
+            (SortKey::Binary(a), SortKey::Binary(b)) => a.as_bytes().cmp(b.as_bytes()),
+            (SortKey::Integer(a), SortKey::Integer(b)) => a.cmp(b),
+            _ => Ordering::Equal,
+        }
+    }
+}
+
 /// The `ORDER BY` terms of a search over `assets a` sorted by `field`. The `rowid` tie-break makes
 /// the order total, so offset pages never overlap or skip.
 fn order_by(field: &str, is_asc: bool) -> String {
-    let sort_col = match field {
+    let dir = if is_asc { "ASC" } else { "DESC" };
+    format!("{} {dir}, a.rowid {dir}", sort_column(field))
+}
+
+/// The column of `assets a` a search sorted by `field` orders on, with its collation.
+fn sort_column(field: &str) -> &'static str {
+    match field {
         "name" => "a.file_name COLLATE NOCASE",
         "size" => "a.size_bytes",
         "rating" => "a.rating",
         "kind" => "a.kind",
         "favorite" => "a.is_favorite",
         _ => "a.modified_at",
-    };
-    let dir = if is_asc { "ASC" } else { "DESC" };
-    format!("{sort_col} {dir}, a.rowid {dir}")
+    }
 }
 
 /// The `WHERE` conditions of a search over `assets a`, and the values bound to their `?`
@@ -441,6 +489,85 @@ async fn count_assets(pool: &sqlx::Pool<sqlx::Sqlite>, filter: &SqlFilter) -> sq
     query.fetch_one(pool).await
 }
 
+/// The columns of a `RawAssetRow` selected from `assets a`.
+const ASSET_COLUMNS: &str = r#"
+    a.id, a.file_path, a.file_name, a.extension, a.kind,
+    a.size_bytes, a.modified_at, a.indexed_at, a.rating,
+    a.color_label, a.is_favorite, a.description, a.thumbnail_path,
+    a.preview_status, a.metadata,
+    (SELECT json_group_array(tag_id) FROM asset_tags WHERE asset_id = a.id) AS tags,
+    (SELECT json_group_array(collection_id) FROM collection_assets WHERE asset_id = a.id) AS collections"#;
+
+/// The rowid and sort key of the first `limit` assets matching `filter` in `order_by` order, the
+/// order of a search sorted by `field`.
+async fn fetch_sort_keys(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    filter: &SqlFilter,
+    field: &str,
+    order_by: &str,
+    limit: i64,
+) -> sqlx::Result<Vec<(i64, SortKey)>> {
+    let sql = format!(
+        "SELECT a.rowid, {} FROM assets a {} ORDER BY {order_by} LIMIT ?",
+        sort_column(field),
+        filter.where_clause(),
+    );
+    match field {
+        "name" | "kind" => {
+            let mut query = sqlx::query_as::<_, (i64, String)>(&sql);
+            for b in &filter.binds {
+                query = query.bind(b.clone());
+            }
+            let rows = query.bind(limit).fetch_all(pool).await?;
+            let key = if field == "name" {
+                SortKey::NoCase
+            } else {
+                SortKey::Binary
+            };
+            Ok(rows.into_iter().map(|(rowid, k)| (rowid, key(k))).collect())
+        }
+        _ => {
+            let mut query = sqlx::query_as::<_, (i64, i64)>(&sql);
+            for b in &filter.binds {
+                query = query.bind(b.clone());
+            }
+            let rows = query.bind(limit).fetch_all(pool).await?;
+            Ok(rows
+                .into_iter()
+                .map(|(rowid, k)| (rowid, SortKey::Integer(k)))
+                .collect())
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct RowidAssetRow {
+    rowid: i64,
+    #[sqlx(flatten)]
+    row: RawAssetRow,
+}
+
+/// The assets with `rowids`, each with its rowid, in no particular order.
+async fn fetch_assets_by_rowid(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    root: &Option<std::path::PathBuf>,
+    rowids: &[i64],
+) -> sqlx::Result<Vec<(i64, Asset)>> {
+    let sql = format!(
+        "SELECT a.rowid AS rowid, {ASSET_COLUMNS} FROM assets a WHERE a.rowid IN ({})",
+        placeholders(rowids.len())
+    );
+    let mut query = sqlx::query_as::<_, RowidAssetRow>(&sql);
+    for rowid in rowids {
+        query = query.bind(rowid);
+    }
+    let rows = query.fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.rowid, row_to_asset(root.as_deref(), r.row)))
+        .collect())
+}
+
 /// The first `limit` assets matching `filter` in `order_by` order, after skipping `offset`.
 async fn fetch_assets(
     pool: &sqlx::Pool<sqlx::Sqlite>,
@@ -451,13 +578,7 @@ async fn fetch_assets(
     offset: Option<i64>,
 ) -> sqlx::Result<Vec<Asset>> {
     let sql = format!(
-        r#"SELECT
-            a.id, a.file_path, a.file_name, a.extension, a.kind,
-            a.size_bytes, a.modified_at, a.indexed_at, a.rating,
-            a.color_label, a.is_favorite, a.description, a.thumbnail_path,
-            a.preview_status, a.metadata,
-            (SELECT json_group_array(tag_id) FROM asset_tags WHERE asset_id = a.id) AS tags,
-            (SELECT json_group_array(collection_id) FROM collection_assets WHERE asset_id = a.id) AS collections
+        r#"SELECT {ASSET_COLUMNS}
            FROM assets a
            {}
            ORDER BY {}
@@ -1635,6 +1756,137 @@ mod tests {
                     [format!("SCAN a USING INDEX {index}")],
                     "sorting by {field}, ascending {is_asc}"
                 );
+            }
+        }
+    }
+
+    /// A library holding `names`, in that order, whose other sort keys repeat so that many tie.
+    async fn mixed_library(prefix: &str, names: &[&str]) -> Pool<Sqlite> {
+        let pool = memory_library_pool().await;
+        for (i, name) in names.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at,
+                    indexed_at, rating, is_favorite)
+                 VALUES (?, ?, ?, 'png', ?, ?, ?, 0, ?, ?)",
+            )
+            .bind(format!("{prefix}{i:02}"))
+            .bind(format!("{i}/{name}"))
+            .bind(name)
+            .bind(["model", "texture", "Model", "sprite"][i % 4])
+            .bind((i % 3) as i64 * 1024)
+            .bind((i % 5) as i64)
+            .bind((i % 2) as i64)
+            .bind((i % 3 == 0) as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool
+    }
+
+    /// The ids of every asset in `libs` sorted by `field` in `order`, as one SQLite query over all
+    /// of them sorts them, ties broken by library position and then rowid.
+    async fn sorted_by_sqlite(libs: &[Pool<Sqlite>], field: &str, order: &str) -> Vec<String> {
+        let merged = memory_library_pool().await;
+        sqlx::query(
+            "CREATE TABLE merged (lib INTEGER, rid INTEGER, id TEXT, file_name TEXT, kind TEXT,
+                size_bytes INTEGER, modified_at INTEGER, rating INTEGER, is_favorite INTEGER)",
+        )
+        .execute(&merged)
+        .await
+        .unwrap();
+        for (lib, pool) in libs.iter().enumerate() {
+            let rows = sqlx::query(
+                "SELECT rowid, id, file_name, kind, size_bytes, modified_at, rating, is_favorite
+                 FROM assets",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            for row in rows {
+                sqlx::query("INSERT INTO merged VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                    .bind(lib as i64)
+                    .bind(row.get::<i64, _>(0))
+                    .bind(row.get::<String, _>(1))
+                    .bind(row.get::<String, _>(2))
+                    .bind(row.get::<String, _>(3))
+                    .bind(row.get::<i64, _>(4))
+                    .bind(row.get::<i64, _>(5))
+                    .bind(row.get::<i64, _>(6))
+                    .bind(row.get::<i64, _>(7))
+                    .execute(&merged)
+                    .await
+                    .unwrap();
+            }
+        }
+        let dir = if order == "asc" { "ASC" } else { "DESC" };
+        sqlx::query_scalar(&format!(
+            "SELECT id FROM merged a ORDER BY {} {dir}, a.lib ASC, a.rid {dir}",
+            sort_column(field)
+        ))
+        .fetch_all(&merged)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pages_over_several_libraries_match_one_full_sort() {
+        // Case variants, non-ASCII letters that only Unicode folds (`Ä`/`ä`, `É`/`é`) and
+        // punctuation between the ASCII cases, with names repeated within and across libraries.
+        let names = [
+            "Ä_b.png",
+            "ä_a.png",
+            "rock.png",
+            "Rock.png",
+            "ROCK.png",
+            "zebra.png",
+            "Éclair.png",
+            "éclair.png",
+            "_under.png",
+            "[bracket].png",
+            "Straße.png",
+            "STRASSE.png",
+            "rock.png",
+            "Zebra.png",
+            "a.png",
+        ];
+        let reversed: Vec<&str> = names.iter().rev().copied().collect();
+        let libs = [
+            mixed_library("a", &names).await,
+            mixed_library("b", &reversed[..10]).await,
+        ];
+        let targets: Vec<_> = libs.iter().map(|pool| (pool.clone(), None)).collect();
+        let count = names.len() + 10;
+
+        for field in ["name", "kind", "size", "modified", "rating", "favorite"] {
+            for order in ["asc", "desc"] {
+                let expected = sorted_by_sqlite(&libs, field, order).await;
+                for page_size in [1, 4, 7, count as i64] {
+                    let mut found = Vec::new();
+                    // One page past the end, which is empty.
+                    for page in 0..=(count as i64 / page_size) {
+                        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+                            "query": {
+                                "text": "", "filter": {}, "sort": { "field": field, "order": order }
+                            },
+                            "page": page,
+                            "pageSize": page_size,
+                            "includeTotal": false,
+                        }))
+                        .unwrap();
+                        let result = search_libraries(&payload, &targets).await.unwrap();
+                        let start = (page * page_size) as usize;
+                        let end = (start + page_size as usize).min(count);
+                        let ids: Vec<String> = result.assets.into_iter().map(|a| a.id).collect();
+                        assert_eq!(
+                            ids,
+                            expected[start..end],
+                            "{field} {order}, page {page} of {page_size}"
+                        );
+                        found.extend(ids);
+                    }
+                    assert_eq!(found, expected, "{field} {order}, pages of {page_size}");
+                }
             }
         }
     }
