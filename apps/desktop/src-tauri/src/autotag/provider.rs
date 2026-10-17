@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::credentials::{self, Credentials};
 use super::settings::AiSettings;
@@ -79,15 +80,16 @@ pub struct TagResult {
     pub usage: Usage,
 }
 
-/// How a failed call is handled (the plan's Failures). For now every class fails the item.
+/// How a failed call is handled (the plan's Failures).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorClass {
-    /// Worth another try later: rate limits, overload, server errors, timeouts.
+    /// Worth another try later: rate limits, overload, server errors, timeouts. Retried after
+    /// a backoff, then the item fails.
     Retryable,
-    /// Every item of the run would fail the same way: bad key, unknown model.
+    /// Every item of the run would fail the same way: bad key, unknown model. Pauses the run.
     Fatal,
-    /// Only this asset: a refusal, output that doesn't parse, the asset gone.
+    /// Only this asset: a refusal, output that doesn't parse, the asset gone. Fails the item.
     Item,
 }
 
@@ -95,6 +97,8 @@ pub enum ErrorClass {
 pub struct ProviderError {
     pub class: ErrorClass,
     pub message: String,
+    /// How long the provider asked us to wait before trying again (HTTP `retry-after`).
+    pub retry_after: Option<Duration>,
 }
 
 impl ProviderError {
@@ -102,7 +106,13 @@ impl ProviderError {
         Self {
             class,
             message: message.into(),
+            retry_after: None,
         }
+    }
+
+    pub fn with_retry_after(mut self, wait: Duration) -> Self {
+        self.retry_after = Some(wait);
+        self
     }
 }
 

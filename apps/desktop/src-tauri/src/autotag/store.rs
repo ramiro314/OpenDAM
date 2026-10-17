@@ -85,6 +85,7 @@ pub struct RunSummary {
     pub total: i64,
     pub done: i64,
     pub failed: i64,
+    pub skipped: i64,
     pub running: i64,
     pub queued: i64,
     pub input_tokens: i64,
@@ -105,6 +106,7 @@ pub async fn list_runs(master: &Pool<Sqlite>) -> sqlx::Result<Vec<RunSummary>> {
                 COUNT(i.asset_id) AS total,
                 COALESCE(SUM(i.status = 'done'), 0) AS done,
                 COALESCE(SUM(i.status = 'failed'), 0) AS failed,
+                COALESCE(SUM(i.status = 'skipped'), 0) AS skipped,
                 COALESCE(SUM(i.status = 'running'), 0) AS running,
                 COALESCE(SUM(i.status = 'queued'), 0) AS queued,
                 r.input_tokens, r.output_tokens, r.cost_usd, r.created_at, r.finished_at
@@ -156,7 +158,8 @@ pub struct NewRun<'a> {
 }
 
 /// Inserts the run and its queued items. The run is `queued` while its items go in, in batches,
-/// and `running` once they all have, so the scheduler never sees half a run.
+/// and `running` once they all have, so the scheduler never sees half a run. A run paused or
+/// cancelled meanwhile stays so.
 pub async fn create_run(
     master: &Pool<Sqlite>,
     run: NewRun<'_>,
@@ -189,7 +192,7 @@ pub async fn create_run(
         }
         tx.commit().await?;
     }
-    sqlx::query("UPDATE tag_runs SET status = 'running' WHERE id = ?")
+    sqlx::query("UPDATE tag_runs SET status = 'running' WHERE id = ? AND status = 'queued'")
         .bind(run.id)
         .execute(master)
         .await?;
@@ -275,12 +278,137 @@ pub async fn finish_run_if_complete(master: &Pool<Sqlite>, run_id: &str) -> sqlx
     Ok(ended.rows_affected() > 0)
 }
 
-/// Items left `running` by a previous session go back to the queue.
-pub async fn requeue_running_items(master: &Pool<Sqlite>) -> sqlx::Result<()> {
-    sqlx::query("UPDATE tag_run_items SET status = 'queued' WHERE status = 'running'")
-        .execute(master)
+/// The `pause_reason` of every run a previous session left unfinished.
+pub const APP_RESTARTED: &str = "app restarted";
+
+/// At startup, in one transaction: every `queued` or `running` run becomes `paused` with "app
+/// restarted", and every item left `running` goes back to the queue, or is `skipped` when its
+/// run was cancelled while the item was in flight.
+pub async fn recover_after_restart(master: &Pool<Sqlite>) -> sqlx::Result<()> {
+    let mut tx = master.begin().await?;
+    sqlx::query(
+        "UPDATE tag_runs SET status = 'paused', pause_reason = ?
+         WHERE status IN ('queued', 'running')",
+    )
+    .bind(APP_RESTARTED)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE tag_run_items
+         SET status = CASE WHEN (SELECT status FROM tag_runs WHERE id = run_id) = 'cancelled'
+                           THEN 'skipped' ELSE 'queued' END
+         WHERE status = 'running'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+pub async fn run_status(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar("SELECT status FROM tag_runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(master)
         .await
-        .map(|_| ())
+}
+
+/// Pauses a `queued` or `running` run. `reason` is shown in the Runs panel; a pause you asked
+/// for has none. Returns whether the run was paused.
+pub async fn pause_run(
+    master: &Pool<Sqlite>,
+    run_id: &str,
+    reason: Option<&str>,
+) -> sqlx::Result<bool> {
+    let paused = sqlx::query(
+        "UPDATE tag_runs SET status = 'paused', pause_reason = ?
+         WHERE id = ? AND status IN ('queued', 'running')",
+    )
+    .bind(reason)
+    .bind(run_id)
+    .execute(master)
+    .await?;
+    Ok(paused.rows_affected() > 0)
+}
+
+/// Sets the `paused` runs among `run_ids` running again. Returns the ones it resumed.
+pub async fn resume_runs(master: &Pool<Sqlite>, run_ids: &[String]) -> sqlx::Result<Vec<String>> {
+    let mut resumed = Vec::new();
+    for chunk in run_ids.chunks(BATCH) {
+        let sql = format!(
+            "UPDATE tag_runs SET status = 'running', pause_reason = NULL
+             WHERE status = 'paused' AND id IN ({}) RETURNING id",
+            vec!["?"; chunk.len()].join(", ")
+        );
+        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        resumed.extend(query.fetch_all(master).await?);
+    }
+    Ok(resumed)
+}
+
+/// Every paused run, oldest first, with its provider.
+pub async fn paused_runs(master: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, String)>> {
+    sqlx::query_as(
+        "SELECT id, provider FROM tag_runs WHERE status = 'paused' ORDER BY created_at, id",
+    )
+    .fetch_all(master)
+    .await
+}
+
+/// Cancels a `queued`, `running` or `paused` run, in one transaction: its queued items become
+/// `skipped`. Items in flight finish, and every tag already applied stays. Returns whether the
+/// run was cancelled.
+pub async fn cancel_run(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<bool> {
+    let mut tx = master.begin().await?;
+    let cancelled = sqlx::query(
+        "UPDATE tag_runs SET status = 'cancelled', pause_reason = NULL, finished_at = ?
+         WHERE id = ? AND status IN ('queued', 'running', 'paused')",
+    )
+    .bind(now_ms())
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?;
+    if cancelled.rows_affected() == 0 {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE tag_run_items SET status = 'skipped' WHERE run_id = ? AND status = 'queued'",
+    )
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Gives back an item that stopped before its result was written: it goes back to the queue,
+/// or is `skipped` when its run was cancelled meanwhile.
+pub async fn release_item(master: &Pool<Sqlite>, item: &Item) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE tag_run_items
+         SET status = CASE WHEN (SELECT status FROM tag_runs WHERE id = ?) = 'cancelled'
+                           THEN 'skipped' ELSE 'queued' END
+         WHERE run_id = ? AND asset_id = ? AND status = 'running'",
+    )
+    .bind(&item.run_id)
+    .bind(&item.run_id)
+    .bind(&item.asset_id)
+    .execute(master)
+    .await
+    .map(|_| ())
+}
+
+/// Counts one more call for the item, before a retry.
+pub async fn count_attempt(master: &Pool<Sqlite>, item: &Item) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE tag_run_items SET attempts = attempts + 1 WHERE run_id = ? AND asset_id = ?",
+    )
+    .bind(&item.run_id)
+    .bind(&item.asset_id)
+    .execute(master)
+    .await
+    .map(|_| ())
 }
 
 /// Write protocol step 1, in one master transaction: a `pending` row for every pair the

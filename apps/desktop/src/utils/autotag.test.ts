@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import type { AutotagProviderOption, RunSummary } from '../types';
-import { autotagAvailability, modeOptions, runProgress, taggingSummary } from './autotag';
+import {
+  autotagAvailability,
+  modeOptions,
+  runActions,
+  runProgress,
+  taggingSummary,
+} from './autotag';
 
 const ALL_MODES = ['existing_only', 'prefer_existing', 'create_freely'] as const;
 
@@ -25,6 +31,7 @@ function run(status: RunSummary['status'], done: number, total: number, failed =
     total,
     done,
     failed,
+    skipped: 0,
     running: 0,
     queued: total - done - failed,
     inputTokens: 0,
@@ -118,5 +125,28 @@ describe('runProgress', () => {
   test('shows processed over total, and failures', () => {
     expect(runProgress(run('running', 3, 10))).toBe('3 / 10');
     expect(runProgress(run('done', 8, 10, 2))).toBe('10 / 10 · 2 failed');
+  });
+
+  test('shows what a cancel skipped', () => {
+    expect(runProgress({ ...run('cancelled', 3, 10, 1), skipped: 6 })).toBe(
+      '4 / 10 · 1 failed · 6 skipped'
+    );
+  });
+});
+
+describe('runActions', () => {
+  test('an active run can be paused or cancelled', () => {
+    expect(runActions('running')).toEqual({ pause: true, resume: false, cancel: true });
+    expect(runActions('queued')).toEqual({ pause: true, resume: false, cancel: true });
+  });
+
+  test('a paused run can be resumed or cancelled', () => {
+    expect(runActions('paused')).toEqual({ pause: false, resume: true, cancel: true });
+  });
+
+  test('a stopped run offers none of them', () => {
+    for (const status of ['done', 'cancelled', 'awaiting_review', 'undone'] as const) {
+      expect(runActions(status)).toEqual({ pause: false, resume: false, cancel: false });
+    }
   });
 });

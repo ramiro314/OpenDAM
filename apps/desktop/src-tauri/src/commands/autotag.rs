@@ -36,3 +36,27 @@ pub async fn start_autotag_run(
 pub async fn list_autotag_runs(state: State<'_, Arc<AppState>>) -> Result<Vec<RunSummary>> {
     state.autotag.list_runs().await.map_err(|e| e.to_string())
 }
+
+/// Stops handing out the run's items; requests in flight finish.
+#[tauri::command]
+pub async fn pause_autotag_run(run_id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
+    state.autotag.pause_run(&run_id).await
+}
+
+/// Resumes a paused run. Fails, leaving it paused, when its provider isn't ready.
+#[tauri::command]
+pub async fn resume_autotag_run(run_id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
+    state.autotag.resume_run(&run_id).await
+}
+
+/// Resumes every paused run whose provider is ready, and returns how many.
+#[tauri::command]
+pub async fn resume_all_autotag_runs(state: State<'_, Arc<AppState>>) -> Result<usize> {
+    state.autotag.resume_all().await
+}
+
+/// Cancels a run: its remaining items are skipped, and the tags it applied stay.
+#[tauri::command]
+pub async fn cancel_autotag_run(run_id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
+    state.autotag.cancel_run(&run_id).await
+}

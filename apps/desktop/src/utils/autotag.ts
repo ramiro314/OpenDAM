@@ -93,9 +93,27 @@ export function taggingSummary(runs: RunSummary[]): string | null {
   return parts.join(' · ');
 }
 
-/** "120 / 400", plus the failed count when there is one. */
+/** "120 / 400", plus the failed and skipped counts when there are some. */
 export function runProgress(run: RunSummary): string {
   const processed = run.done + run.failed;
-  const text = `${processed.toLocaleString()} / ${run.total.toLocaleString()}`;
-  return run.failed > 0 ? `${text} · ${run.failed.toLocaleString()} failed` : text;
+  const parts = [`${processed.toLocaleString()} / ${run.total.toLocaleString()}`];
+  if (run.failed > 0) parts.push(`${run.failed.toLocaleString()} failed`);
+  if (run.skipped > 0) parts.push(`${run.skipped.toLocaleString()} skipped`);
+  return parts.join(' · ');
+}
+
+export interface RunActions {
+  pause: boolean;
+  resume: boolean;
+  cancel: boolean;
+}
+
+/** The Runs panel buttons a run in `status` offers. */
+export function runActions(status: RunSummary['status']): RunActions {
+  const active = status === 'running' || status === 'queued';
+  return {
+    pause: active,
+    resume: status === 'paused',
+    cancel: active || status === 'paused',
+  };
 }
