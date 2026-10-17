@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::provider::ProposedTag;
 use super::vocabulary::normalize_name;
-use crate::db::{upsert_tag, Database, LibraryHandle};
+use crate::db::{create_master_tag, upsert_tag, Database, LibraryHandle};
 
 /// Rows per transaction, the repository's batch size.
 pub const BATCH: usize = 200;
@@ -538,9 +538,9 @@ pub enum NewNames<'a> {
 /// tags), then the item `done` with its result, and the run's usage. Returns the tags it
 /// created.
 ///
-/// The transaction takes the write lock before it reads the catalog, so items proposing the same
-/// name at once create it once. Callers creating tags also hold the engine's tag-creation lock,
-/// which keeps a review from creating the name meanwhile.
+/// The transaction takes the write lock before it reads the catalog, so no other creator (an
+/// item, a review, you) can add the same name between the read and the insert, and items
+/// proposing a name at once create it once.
 pub async fn record_intent(
     master: &Pool<Sqlite>,
     item: &Item,
@@ -687,12 +687,7 @@ async fn create(
             None => {
                 let tag_id = uuid::Uuid::new_v4().to_string();
                 let parent_id = proposal.parent_id.clone().filter(|p| ids.contains(p));
-                sqlx::query("INSERT INTO tags (id, name, parent_id) VALUES (?, ?, ?)")
-                    .bind(&tag_id)
-                    .bind(&proposal.name)
-                    .bind(&parent_id)
-                    .execute(&mut *tx)
-                    .await?;
+                create_master_tag(tx, &tag_id, &proposal.name, parent_id.as_deref()).await?;
                 // A row left from a tag of the run that was deleted since now owns this one.
                 proposal_id = Some(
                     sqlx::query_scalar(

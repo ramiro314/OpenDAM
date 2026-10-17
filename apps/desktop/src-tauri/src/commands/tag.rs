@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tauri::State;
 use uuid::Uuid;
 
-use crate::db::{upsert_tag, Database, TagRow};
+use crate::db::{create_master_tag, upsert_tag, Database, TagRow};
 use crate::models::{Tag, TagPatch};
 use crate::AppState;
 
@@ -47,13 +47,11 @@ pub async fn create_tag(
 /// Writes the definition to master, then mirrors it to every open library.
 async fn create_tag_in(db: &Database, name: String, parent_id: Option<String>) -> Result<Tag> {
     let id = Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO tags (id, name, parent_id) VALUES (?, ?, ?)")
-        .bind(&id)
-        .bind(&name)
-        .bind(&parent_id)
-        .execute(&db.master_pool)
+    let mut conn = db.master_pool.acquire().await.map_err(|e| e.to_string())?;
+    create_master_tag(&mut conn, &id, &name, parent_id.as_deref())
         .await
         .map_err(|e| e.to_string())?;
+    drop(conn);
 
     let row = (id, name, None, parent_id, String::new());
     for lib in db.get_all_libraries().await {

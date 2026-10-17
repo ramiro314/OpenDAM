@@ -147,10 +147,6 @@ pub struct Engine {
     /// Woken when a run is paused or cancelled, so items waiting to retry let go of their
     /// provider permit at once instead of at the end of the wait.
     run_stopped: Notify,
-    /// Held while tags are created (a Create freely item's intent, a review's apply), so two
-    /// creators can't both find a name missing and create it twice. Items alone are already
-    /// serialized by their immediate transaction, but a review reads the catalog before its own.
-    tag_creation: tokio::sync::Mutex<()>,
     /// Test-only fault: the library write of every item fails, as a NAS lock timeout would.
     #[cfg(test)]
     fail_library_writes: AtomicBool,
@@ -198,7 +194,6 @@ impl Engine {
             notifier,
             retry_delays,
             run_stopped: Notify::new(),
-            tag_creation: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             fail_library_writes: Default::default(),
             #[cfg(test)]
@@ -614,10 +609,7 @@ impl Engine {
         run_id: &str,
         decisions: Vec<ProposalDecision>,
     ) -> Result<String, String> {
-        let applied = {
-            let _creating = self.tag_creation.lock().await;
-            review::apply(&self.db, run_id, decisions).await?
-        };
+        let applied = review::apply(&self.db, run_id, decisions).await?;
         tracing::info!("Applied the review of auto-tag run {run_id}");
         self.assets_changed(applied.changed_assets);
         self.events_wake.notify_one();
@@ -719,13 +711,10 @@ impl Engine {
                 .into_iter()
                 .collect();
         let summary = serde_json::json!({ "tags": accepted, "proposed": proposals });
-        let (names, creating) = if mode == Mode::CreateFreely {
-            (
-                NewNames::Create(&proposals),
-                Some(self.tag_creation.lock().await),
-            )
+        let names = if mode == Mode::CreateFreely {
+            NewNames::Create(&proposals)
         } else {
-            (NewNames::Propose(&proposals), None)
+            NewNames::Propose(&proposals)
         };
         let created = store::record_intent(
             &self.db.master_pool,
@@ -738,11 +727,9 @@ impl Engine {
         )
         .await
         .map_err(|e| e.to_string())?;
-        drop(creating);
 
-        // Step 2, outside the lock: a slow share mustn't hold up other items. An item that
-        // resolves a name to this tag before the mirror reaches its library is fine, as step 3
-        // writes the tag's definition into that library with the pair.
+        // Step 2. An item that resolves a name to this tag before the mirror reaches its library
+        // is fine: step 3 writes the tag's definition into that library with the pair.
         if !created.is_empty() {
             let open = self.db.get_all_libraries().await;
             #[cfg(test)]
