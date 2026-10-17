@@ -90,19 +90,36 @@ const scrubLabel = () => document.getElementById('scrub-label');
 
 /**
  * Scrolls `el` down at `viewportsPerSecond` viewport heights a second, a step every frame, until
- * `during` settles. Resolves with the time of the last step.
+ * `during` settles. Reports how many frames there were, on how many the scrub label showed, the
+ * longest frame and the time of the last scroll event.
  */
 async function scrollAt(el: HTMLElement, viewportsPerSecond: number, during: Promise<unknown>) {
   let done = false;
   void during.finally(() => (done = true));
+  let lastScroll = 0;
+  const onScroll = () => (lastScroll = performance.now());
+  el.addEventListener('scroll', onScroll, { passive: true });
   const from = el.scrollTop;
   const start = performance.now();
-  let last = start;
+  let [frameCount, labelled, longest, prev] = [0, 0, 0, start];
   while (!done) {
-    last = await nextFrame();
-    el.scrollTop = from + (viewportsPerSecond * el.clientHeight * (last - start)) / 1000;
+    const t = await nextFrame();
+    frameCount++;
+    if (scrubLabel()) labelled++;
+    longest = Math.max(longest, t - prev);
+    prev = t;
+    el.scrollTop = from + (viewportsPerSecond * el.clientHeight * (t - start)) / 1000;
   }
-  return performance.now();
+  // The last step's scroll event
+  await frames(2);
+  el.removeEventListener('scroll', onScroll);
+  return {
+    frames: frameCount,
+    labelled,
+    longestFrameMs: Math.round(longest),
+    lastScroll,
+    summary: `${labelled} of ${frameCount} frames labelled, longest frame ${Math.round(longest)} ms`,
+  };
 }
 
 /** A cancelable `keydown` on `el`, as a real press reaches the grid; returns the event. */
@@ -312,16 +329,26 @@ export const UI_CHECKS: UiCheck[] = [
           const el = scroll();
           el.scrollTop = 0.3 * (el.scrollHeight - el.clientHeight);
           await frames(3);
-          // Slower than the threshold: no label
-          await scrollAt(el, 1, sleep(700));
-          assert(!scrubLabel(), `${sort}: the label showed at 1 viewport a second`);
-          // Faster: the label, and for name sort the screenshot while it shows
-          const stoppedAt = await scrollAt(
+          // The jump is a fast scroll too: start once its label has gone
+          await untilFrame(() => !scrubLabel(), 30_000, `${sort}: the label from the jump hides`);
+          // Slower than the threshold: no label on any frame
+          const slow = await scrollAt(el, 1, sleep(700));
+          assert(
+            slow.labelled === 0 && !scrubLabel(),
+            `${sort}: the label showed at 1 viewport a second (${slow.summary})`
+          );
+          // Faster: the label on nearly every frame, and for name sort the screenshot while it
+          // shows. A frame over 600 ms hides it until the next scroll event, as it should.
+          const fast = await scrollAt(
             el,
             4,
             sort === 'name' ? pause('U6-scrub-label') : sleep(1_000)
           );
-          assert(scrubLabel(), `${sort}: no label at 4 viewports a second`);
+          assert(
+            fast.labelled >= 0.8 * fast.frames,
+            `${sort}: at 4 viewports a second ${fast.summary}`
+          );
+          assert(scrubLabel(), `${sort}: no label after the last scroll event (${fast.summary})`);
           assert(scrubLabel()!.getAttribute('aria-hidden') === 'true', `${sort}: not aria-hidden`);
           // The key arrives with the page under the viewport, while the label still shows
           await untilFrame(
@@ -353,10 +380,10 @@ export const UI_CHECKS: UiCheck[] = [
             `${sort}: the key is "${key}", asset ${index} has "${expected}"`
           );
           await untilFrame(() => !scrubLabel(), 1_500, `${sort}: the label hides`);
-          const hidAfter = Math.round(performance.now() - stoppedAt);
+          const hidAfter = Math.round(performance.now() - fast.lastScroll);
           assert(
             hidAfter >= 550 && hidAfter <= 900,
-            `${sort}: the label hid ${hidAfter} ms after the scroll stopped`
+            `${sort}: the label hid ${hidAfter} ms after the last scroll event (${fast.summary})`
           );
         }
       } finally {
