@@ -305,6 +305,8 @@ export interface AutotagUpdate {
   runs: RunSummary[];
   /** Assets whose tags changed since the last event */
   changedAssetIds: string[];
+  /** A run created tags since the last event, so the tag catalog changed */
+  tagsChanged: boolean;
 }
 
 /** An asset a proposed tag is for, as the review shows it */

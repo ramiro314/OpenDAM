@@ -24,9 +24,6 @@ export const MODES: { mode: AutotagMode; label: string; description: string }[] 
   },
 ];
 
-/** The modes the run engine can do so far. */
-const BUILT_MODES: readonly AutotagMode[] = ['existing_only', 'prefer_existing'];
-
 export interface Availability {
   enabled: boolean;
   /** Why the entry point is disabled, when it is */
@@ -70,14 +67,13 @@ export interface ModeOption {
   reason: string | null;
 }
 
-/** Every mode, enabled only when the provider supports it and the engine can run it. */
+/** Every mode, enabled only when the provider supports it. */
 export function modeOptions(provider: AutotagProviderOption | null): ModeOption[] {
   return MODES.map(({ mode, label, description }) => {
     let reason: string | null = null;
     if (!provider) reason = 'Pick a provider first';
     else if (!provider.modes.includes(mode))
       reason = `${provider.label} can only match existing tags, not propose new ones`;
-    else if (!BUILT_MODES.includes(mode)) reason = 'Coming in a later update';
     return { mode, label, description, enabled: reason === null, reason };
   });
 }

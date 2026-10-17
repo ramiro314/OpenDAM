@@ -455,7 +455,10 @@ interface AutotagStore {
   reviewRunId: string | null;
   fetchRuns: () => Promise<void>;
   fetchProviders: () => Promise<void>;
-  /** Takes an `autotag:updated` event: the runs, and re-fetches the loaded assets that changed */
+  /**
+   * Takes an `autotag:updated` event: the runs, and re-fetches the loaded assets that changed,
+   * and the tags when a run created some
+   */
   applyUpdate: (update: AutotagUpdate) => void;
   setRunsPanelOpen: (open: boolean) => void;
   openAutotagDialog: (target: AutotagTarget | null) => void;
@@ -478,8 +481,9 @@ export const useAutotagStore = create<AutotagStore>()((set) => ({
     set({ providers: await api.listAutotagProviders() });
   },
 
-  applyUpdate: ({ runs, changedAssetIds }) => {
+  applyUpdate: ({ runs, changedAssetIds, tagsChanged }) => {
     set({ runs });
+    if (tagsChanged) useTagStore.getState().fetchTags().catch(console.error);
     if (changedAssetIds.length > 0) useAssetStore.getState().refreshAssets(changedAssetIds);
   },
 

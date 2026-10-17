@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::store::{self, Applier, PendingPair, BATCH};
 use super::vocabulary::{clean_name, normalize_name};
-use crate::db::{resolve_path, upsert_tag, Database, LibraryHandle};
+use crate::db::{resolve_path, Database, LibraryHandle};
 
 /// An asset a proposal is for, as the review shows it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -362,7 +362,7 @@ pub async fn apply(
 
     // Step 2.
     for (tag_id, _, _) in new_tags.values() {
-        mirror_tag(db, &open, tag_id).await;
+        store::mirror_tag(db, open.values(), tag_id).await;
     }
 
     // Steps 3 and 4.
@@ -500,30 +500,6 @@ async fn record_review(
         .await?;
     tx.commit().await?;
     Ok(status)
-}
-
-/// Write protocol step 2: a created tag, with its ancestors, into every open library's mirror.
-/// Idempotent, and `sync_open_libraries` repairs a mirror that misses it at the next open.
-async fn mirror_tag(db: &Database, open: &BTreeMap<String, LibraryHandle>, tag_id: &str) {
-    let chain = match db.tag_with_ancestors(tag_id).await {
-        Ok(chain) => chain,
-        Err(e) => {
-            tracing::warn!("Could not read created tag {tag_id} to mirror it: {e}");
-            return;
-        }
-    };
-    for lib in open.values() {
-        let mirror = async {
-            let mut tx = lib.pool.begin().await?;
-            for definition in &chain {
-                upsert_tag(&mut *tx, definition).await?;
-            }
-            tx.commit().await
-        };
-        if let Err(e) = mirror.await {
-            tracing::warn!("Failed to mirror tag {tag_id} to library {}: {e}", lib.id);
-        }
-    }
 }
 
 #[cfg(test)]

@@ -51,7 +51,7 @@ real data:
    - `OPENDAM_AUTOTAG_FAKE=1` adds two tagging providers that tag from file-name words: **Fake**
      (all three modes) and **Fake text-only** (Existing only, like Jev). A file named
      `rock_large.png` gets a catalog tag named "Rock", and in Prefer existing it proposes
-     "Large" for review.
+     "Large" for review. In Create freely it creates "Large" and applies it.
    - `OPENDAM_AUTOTAG_FAKE_DELAY_MS` (default 300) slows each fake call, so a run can be watched,
      paused or photographed mid-way.
    - `OPENDAM_NO_KEYRING=1` ignores the OS keyring. With `ANTHROPIC_API_KEY` and
@@ -72,7 +72,8 @@ XDG_DATA_HOME=$XDG_DATA_HOME OPENDAM_AUTOTAG_FAKE=1 OPENDAM_AUTOTAG_FAKE_DELAY_M
 
 Runs live in the master DB's `tag_runs` and `tag_run_items` tables, and every tag a run adds is
 recorded in `tag_run_applied` before the library sees it. A Prefer existing run's new tag names
-wait for review in `tag_run_proposals` and `tag_run_proposal_assets`. The desktop notification a
+wait for review in `tag_run_proposals` and `tag_run_proposal_assets`. A Create freely run records
+each tag it created there too, as an `accepted` proposal with `created_tag = 1`. The desktop notification a
 run sends needs a notification server, which the nested headless KWin used for screenshots lacks.
 
 ## Checking the CSP

@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { api } from '../api';
-import { useAssetStore, useAutotagStore, useUIStore } from '.';
-import type { Asset, DeleteAssetsError, SearchResult } from '../types';
+import { useAssetStore, useAutotagStore, useTagStore, useUIStore } from '.';
+import type { Asset, DeleteAssetsError, SearchResult, Tag } from '../types';
 
 const realSearch = api.searchAssets;
 const realDeleteAssets = api.deleteAssets;
 const realGetAsset = api.getAsset;
+const realListTags = api.listTags;
 const asset = { id: 'a1', fileName: 'tree.glb' } as Asset;
 const found: SearchResult = { assets: [asset], total: 1, page: 0, pageSize: 100 };
 
@@ -13,6 +14,7 @@ afterEach(() => {
   api.searchAssets = realSearch;
   api.deleteAssets = realDeleteAssets;
   api.getAsset = realGetAsset;
+  api.listTags = realListTags;
 });
 
 describe('useAssetStore search errors', () => {
@@ -120,12 +122,36 @@ describe('useAutotagStore applyUpdate', () => {
       return { id, fileName: `${id}.png`, tags: ['t-rock'] } as unknown as Asset;
     };
 
-    useAutotagStore.getState().applyUpdate({ runs: [], changedAssetIds: ['b', 'not-loaded'] });
+    useAutotagStore.getState().applyUpdate({
+      runs: [],
+      changedAssetIds: ['b', 'not-loaded'],
+      tagsChanged: false,
+    });
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(fetched).toEqual(['b']);
     const s = useAssetStore.getState();
     expect(s.assets.map((a) => a.tags)).toEqual([[], ['t-rock']]);
     expect(s.assetMap.get('b')?.tags).toEqual(['t-rock']);
+  });
+
+  test('re-fetches the tags only when a run created some', async () => {
+    let listed = 0;
+    const moss = { id: 't-moss', name: 'Moss' } as Tag;
+    api.listTags = async () => {
+      listed += 1;
+      return [moss];
+    };
+    const update = (tagsChanged: boolean) =>
+      useAutotagStore.getState().applyUpdate({ runs: [], changedAssetIds: [], tagsChanged });
+
+    update(false);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(listed).toBe(0);
+
+    update(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(listed).toBe(1);
+    expect(useTagStore.getState().tagMap.get('t-moss')).toEqual(moss);
   });
 });
