@@ -15,7 +15,9 @@ make dev
   app is up when the log prints ``Running `target/debug/opendam-desktop` `` and then
   `NAS-efficient indexing complete`.
 - Export nothing. `main.rs` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` when it is unset; without it
-  the window crashes with `Error 71 (Protocol error) dispatching to Wayland display`.
+  the window crashes with `Error 71 (Protocol error) dispatching to Wayland display`. At startup
+  the app logs the rendering mode this gives under the `render` target (`mode="cpu"` today);
+  `render::describe_render_env` names it from the variables that are set.
 - Vite listens on port 1420, which every worktree's `make dev` shares. If another worktree holds
   it, run on 1430 from `apps/desktop`:
 
@@ -131,3 +133,90 @@ spectacle -b -n -a -o .evidence/app-window.png
 something else took focus since, raise the app first: KDE doesn't raise a window on request, so
 bring it forward by hand or with a KWin script (`qdbus6 org.kde.KWin /Scripting loadScript ...`
 setting `workspace.activeWindow`). Look at the PNG before submitting it as evidence.
+
+## Scroll benchmark
+
+A dev-only harness, `apps/desktop/src/dev/scrollBench.ts`, measures how the asset grid scrolls on
+the Kenney bench data, so every change to the grid is judged on the same numbers
+([plan](../plans/fast-collection-browsing/plan.md), "Scroll benchmark"). `main.tsx` loads it only
+when `import.meta.env.DEV` is true and `VITE_SCROLL_BENCH` is set, so release builds don't contain
+it. Its Tauri commands (`bench_rss`, `bench_render_mode`, `bench_log`, `bench_only`,
+`bench_report`) exist only under `debug_assertions`.
+
+- `VITE_SCROLL_BENCH=1` runs the timing scenarios at sm, md and lg: continuous scroll (60 s at
+  3,000 px/s), end to end, and 20 seeded random jumps. On the grid that appends pages,
+  end to end jumps to the bottom until 20,000 tiles have loaded or 120 s pass, and random jumps
+  are reported as unsupported. Started by hand (`VITE_SCROLL_BENCH=1 make dev`), it runs all of
+  them in one process, so its RSS figures carry over between scenarios; use the script for
+  numbers to compare.
+- `VITE_SCROLL_BENCH=checks` runs the UI checks registered in `src/dev/uiChecks.ts` and writes
+  PASS or FAIL for each. A check calls `pause(name)` where a screenshot should be taken; the
+  harness always pauses once at the start, as `checks-start`.
+
+Run it with the script, from the repo root:
+
+```sh
+apps/desktop/scripts/scroll-bench.sh          # timing scenarios, about 10 minutes plus the copy
+apps/desktop/scripts/scroll-bench.sh checks   # UI checks
+```
+
+The script:
+
+1. copies the golden snapshot (below) to a fresh `~/.cache/opendam-bench/run-*` directory and
+   starts the app with a fresh `XDG_DATA_HOME` and `OPENDAM_BENCH_LIBRARY` set to the copy. Debug
+   builds read that variable at startup, register the copy as library `bench` in the master DB
+   they just created, so the app's own schema is used, and open it;
+2. builds a debug binary with the frontend embedded and built in Vite's development mode
+   (`NODE_ENV=development vite build --mode development`), with `VITE_SCROLL_BENCH` set;
+3. runs the app in a nested headless KWin with a virtual 1400x900 output, its own D-Bus session
+   and `OPENDAM_NO_KEYRING=1`, never on your desktop session. A timing run starts a fresh app
+   process for each size and scenario, naming it in `OPENDAM_SCROLL_BENCH_ONLY` (for example
+   `md/endToEnd`), because memory one scenario takes stays with the web process and would count
+   toward the next one's RSS. It then merges the nine reports into one. Checks run in one process;
+4. screenshots each `[scroll-bench] pause <name>` line the app prints, with `spectacle`, into
+   `.evidence/scroll-bench/<name>.png`, and stops the app at `[scroll-bench] done`;
+5. deletes the run directory.
+
+It doesn't use the Vite dev server: under its `http://localhost` origin, every `<img>` loaded
+from the asset protocol fails in WebKitGTK 2.54 (libpng logs `Read Error`, while `fetch` of the
+same URL returns the whole file), so the grid would show no images. The embedded frontend loads
+them. This was seen in the nested KWin; `make dev` on your own session is unverified.
+
+To bench another rendering mode, export its variable for the script, for example
+`WEBKIT_DMABUF_RENDERER_FORCE_SHM=1`; the app inherits it and `bench_render_mode` reports it.
+`BENCH_TIMEOUT` (seconds, default 1800) stops a stuck app launch.
+
+**Reports** land in `apps/desktop/src-tauri/target/scroll-bench/` (gitignored), as
+`<render mode>-<unix ts>.json` for timing runs and `<render mode>-checks-<unix ts>.json` for
+checks. The app also prints each report after `[scroll-bench] report <path>`, and the script
+copies the last run's app log to `last-run.log` there. A report holds, per grid size and scenario,
+frame intervals (p50, p95, max, counts over 50 and 100 ms), DOM node min and max, web-process RSS
+(start, end, max), jump time-to-ready, and the run context: render mode, window size,
+`devicePixelRatio`, total assets, whether the grid is windowed, and the git commit.
+The CPU-mode baseline of the grid before windowing is
+[`docs/plans/fast-collection-browsing/baseline-cpu.json`](../plans/fast-collection-browsing/baseline-cpu.json).
+
+**DOM markers** the harness reads: the grid's scroll container is `#asset-scroll`, and every
+tile carries `data-tile`, with `data-tile-state="ready"` once its asset is loaded and its image
+has loaded or failed, `"placeholder"` before that.
+
+### Bench data
+
+Builds from the fast-collection-browsing branches never open `~/Documents/Kenney/Assets` or the
+real master DB, because they write to any library they open. They run on copies of a golden
+snapshot, made once:
+
+```sh
+G=~/.cache/opendam-bench/kenney-golden L=~/Documents/Kenney/Assets
+rsync -a --exclude='/.opendam/library.sqlite*' --exclude='/.opendam/index.lock' \
+  --exclude='/.opendam/backup-*' "$L/" "$G/"
+sqlite3 -readonly "$L/.opendam/library.sqlite" ".backup '$G/.opendam/library.sqlite'"
+```
+
+`.backup` stays consistent even while your app holds the DB. `~/.cache/opendam-bench/golden.json`
+records the source, the time, the asset count (83,095), the size (about 5.3 GB) and the commit.
+Every comparison uses this same snapshot, so a baseline can be rerun on identical data at any
+later step; your live library only gets new indexes or cleanup passes when you run a build that
+has them. Each run copy takes as much disk again until the script deletes it. Don't refresh the
+snapshot without rerunning the baseline: comparisons need identical data.
+

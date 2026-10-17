@@ -93,7 +93,12 @@ export function AssetGrid() {
           style={{ '--tile-size': `${tileSize}px` } as React.CSSProperties}
         >
           {Array.from({ length: 24 }).map((_, i) => (
-            <div key={i} className={clsx(styles.skeletonCard, 'skeleton')} />
+            <div
+              key={i}
+              className={clsx(styles.skeletonCard, 'skeleton')}
+              data-tile
+              data-tile-state="placeholder"
+            />
           ))}
         </div>
       </div>
@@ -112,7 +117,12 @@ export function AssetGrid() {
   return (
     <div className={styles.container}>
       <FilterBar />
-      <div className={styles.scrollArea} onClick={handleBackdropClick} ref={scrollRef}>
+      <div
+        id="asset-scroll"
+        className={styles.scrollArea}
+        onClick={handleBackdropClick}
+        ref={scrollRef}
+      >
         {viewMode === 'grid' ? (
           <div
             className={styles.grid}

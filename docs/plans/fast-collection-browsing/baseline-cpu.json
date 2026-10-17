@@ -1,0 +1,187 @@
+{
+  "kind": "timing",
+  "context": {
+    "devicePixelRatio": 1,
+    "gitCommit": "bcb88c4e9bada125c07e61fbe53a9fba07dfba8b",
+    "gitDirty": false,
+    "gridWindowed": false,
+    "indexingSettled": true,
+    "renderMode": "cpu",
+    "startedAt": "2026-10-17T07:11:23.147Z",
+    "totalAssets": 83095,
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15",
+    "waitedForStartupMs": 105,
+    "window": {
+      "height": 900,
+      "width": 1400
+    },
+    "isolation": "each scenario in a fresh app process"
+  },
+  "scenarios": {
+    "sm": {
+      "continuousScroll": {
+        "clampedFrames": 0,
+        "domNodes": {
+          "max": 40998,
+          "min": 1790
+        },
+        "durationMs": 60298,
+        "frames": {
+          "frames": 3176,
+          "maxMs": 353,
+          "over100Ms": 33,
+          "over50Ms": 46,
+          "p50Ms": 16,
+          "p95Ms": 18
+        },
+        "reachedPx": 180597,
+        "rss": {
+          "endMB": 864,
+          "maxMB": 864,
+          "startMB": 362.9
+        },
+        "targetPx": 180000,
+        "tiles": 2900
+      },
+      "endToEnd": {
+        "domNodes": {
+          "max": 133490,
+          "min": 1790
+        },
+        "durationMs": 120145,
+        "frames": {
+          "frames": 295,
+          "maxMs": 1396,
+          "over100Ms": 173,
+          "over50Ms": 218,
+          "p50Ms": 248,
+          "p95Ms": 1207
+        },
+        "rss": {
+          "endMB": 2232.2,
+          "maxMB": 2232.2,
+          "startMB": 367.5
+        },
+        "scrollHeightPx": 615850,
+        "steps": 94,
+        "stopReason": "timeout",
+        "tiles": 9500,
+        "variant": "baseline: jump to the bottom until 20000 tiles or 120 s"
+      },
+      "randomJumps": {
+        "reason": "today's grid can only reach loaded pages, so a jump to any offset is not possible",
+        "supported": false
+      }
+    },
+    "md": {
+      "continuousScroll": {
+        "clampedFrames": 0,
+        "domNodes": {
+          "max": 24198,
+          "min": 1790
+        },
+        "durationMs": 60021,
+        "frames": {
+          "frames": 3510,
+          "maxMs": 197,
+          "over100Ms": 14,
+          "over50Ms": 18,
+          "p50Ms": 17,
+          "p95Ms": 18
+        },
+        "reachedPx": 180042,
+        "rss": {
+          "endMB": 694.5,
+          "maxMB": 694.5,
+          "startMB": 372.4
+        },
+        "targetPx": 180000,
+        "tiles": 1700
+      },
+      "endToEnd": {
+        "domNodes": {
+          "max": 132090,
+          "min": 1790
+        },
+        "durationMs": 121624,
+        "frames": {
+          "frames": 291,
+          "maxMs": 1372,
+          "over100Ms": 182,
+          "over50Ms": 243,
+          "p50Ms": 248,
+          "p95Ms": 1219
+        },
+        "rss": {
+          "endMB": 2203.2,
+          "maxMB": 2203.2,
+          "startMB": 363.4
+        },
+        "scrollHeightPx": 1025230,
+        "steps": 93,
+        "stopReason": "timeout",
+        "tiles": 9400,
+        "variant": "baseline: jump to the bottom until 20000 tiles or 120 s"
+      },
+      "randomJumps": {
+        "reason": "today's grid can only reach loaded pages, so a jump to any offset is not possible",
+        "supported": false
+      }
+    },
+    "lg": {
+      "continuousScroll": {
+        "clampedFrames": 0,
+        "domNodes": {
+          "max": 11596,
+          "min": 1790
+        },
+        "durationMs": 60020,
+        "frames": {
+          "frames": 3590,
+          "maxMs": 113,
+          "over100Ms": 3,
+          "over50Ms": 7,
+          "p50Ms": 17,
+          "p95Ms": 18
+        },
+        "reachedPx": 180042,
+        "rss": {
+          "endMB": 562.7,
+          "maxMB": 584.8,
+          "startMB": 375.6
+        },
+        "targetPx": 180000,
+        "tiles": 800
+      },
+      "endToEnd": {
+        "domNodes": {
+          "max": 134890,
+          "min": 1790
+        },
+        "durationMs": 122097,
+        "frames": {
+          "frames": 303,
+          "maxMs": 1359,
+          "over100Ms": 175,
+          "over50Ms": 216,
+          "p50Ms": 233,
+          "p95Ms": 1217
+        },
+        "rss": {
+          "endMB": 2245.1,
+          "maxMB": 2245.1,
+          "startMB": 362.2
+        },
+        "scrollHeightPx": 2221445,
+        "steps": 95,
+        "stopReason": "timeout",
+        "tiles": 9600,
+        "variant": "baseline: jump to the bottom until 20000 tiles or 120 s"
+      },
+      "randomJumps": {
+        "reason": "today's grid can only reach loaded pages, so a jump to any offset is not possible",
+        "supported": false
+      }
+    }
+  }
+}

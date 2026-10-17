@@ -1,10 +1,11 @@
-import { memo, useCallback } from 'react';
+import { memo, useCallback, useEffect, useState } from 'react';
 import clsx from 'clsx';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import type { Asset } from '../../types';
 import { useAssetStore } from '../../store';
 import { IconImage, IconVideo, IconStar, IconHeart, IconHeartFilled } from '../Icons';
 import { formatSize } from '../../utils/format';
+import { tileMedia, tileState } from './tileState';
 import styles from './AssetListRow.module.css';
 
 interface AssetListRowProps {
@@ -26,6 +27,15 @@ export const AssetListRow = memo(function AssetListRow({
   onContextMenu,
 }: AssetListRowProps) {
   const patchAsset = useAssetStore((s) => s.patchAsset);
+  // The thumbnail has loaded or failed; `data-tile-state` reads "ready" once it has
+  const [mediaSettled, setMediaSettled] = useState(false);
+
+  useEffect(() => {
+    setMediaSettled(false);
+  }, [asset.thumbnailPath, asset.filePath]);
+
+  const media = tileMedia(asset);
+  const settle = () => setMediaSettled(true);
 
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
@@ -70,6 +80,8 @@ export const AssetListRow = memo(function AssetListRow({
       onDragStart={handleDragStart}
       role="button"
       tabIndex={0}
+      data-tile
+      data-tile-state={tileState(media, mediaSettled)}
     >
       {/* Favorite Button */}
       <button
@@ -89,19 +101,23 @@ export const AssetListRow = memo(function AssetListRow({
 
       {/* Thumbnail */}
       <div className={styles.thumb}>
-        {asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb') ? (
+        {media === 'thumbnail' && asset.thumbnailPath ? (
           <img
             src={convertFileSrc(asset.thumbnailPath)}
             alt={asset.fileName}
             className={styles.thumbImg}
             loading="lazy"
+            onLoad={settle}
+            onError={settle}
           />
-        ) : ['image', 'texture'].includes(asset.kind) && asset.filePath ? (
+        ) : media === 'original' ? (
           <img
             src={convertFileSrc(asset.filePath)}
             alt={asset.fileName}
             className={styles.thumbImg}
             loading="lazy"
+            onLoad={settle}
+            onError={settle}
           />
         ) : (
           <div className={styles.thumbPlaceholder}>
