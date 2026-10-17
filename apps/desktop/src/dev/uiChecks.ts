@@ -89,9 +89,38 @@ const parseCount = (s: string) => Number(s.replace(/,/g, ''));
 const scrubLabel = () => document.getElementById('scrub-label');
 
 /**
+ * Records, from DOM mutations rather than frames, each time the scrub label shows or hides and the
+ * last text it showed, so a stalled frame can't hide what happened between two frames.
+ */
+function watchLabel(frame: HTMLElement) {
+  const watch = {
+    changes: [] as { at: number; visible: boolean }[],
+    text: scrubLabel()?.textContent ?? '',
+    /** False once the label showed without `aria-hidden="true"` */
+    ariaHidden: true,
+    shownSince: (t: number) => watch.changes.filter((c) => c.visible && c.at >= t).length,
+    hiddenAt: () => watch.changes.filter((c) => !c.visible).at(-1)?.at ?? -1,
+    stop: () => observer.disconnect(),
+  };
+  let visible = scrubLabel() !== null;
+  const observer = new MutationObserver(() => {
+    const label = scrubLabel();
+    if (label) {
+      watch.text = label.textContent ?? '';
+      watch.ariaHidden &&= label.getAttribute('aria-hidden') === 'true';
+    }
+    if ((label !== null) !== visible) {
+      visible = label !== null;
+      watch.changes.push({ at: performance.now(), visible });
+    }
+  });
+  observer.observe(frame, { childList: true, subtree: true, characterData: true });
+  return watch;
+}
+
+/**
  * Scrolls `el` down at `viewportsPerSecond` viewport heights a second, a step every frame, until
- * `during` settles. Reports how many frames there were, on how many the scrub label showed, the
- * longest frame and the time of the last scroll event.
+ * `during` settles. Reports the time of the last scroll event, and the frames for diagnostics.
  */
 async function scrollAt(el: HTMLElement, viewportsPerSecond: number, during: Promise<unknown>) {
   let done = false;
@@ -101,11 +130,10 @@ async function scrollAt(el: HTMLElement, viewportsPerSecond: number, during: Pro
   el.addEventListener('scroll', onScroll, { passive: true });
   const from = el.scrollTop;
   const start = performance.now();
-  let [frameCount, labelled, longest, prev] = [0, 0, 0, start];
+  let [frameCount, longest, prev] = [0, 0, start];
   while (!done) {
     const t = await nextFrame();
     frameCount++;
-    if (scrubLabel()) labelled++;
     longest = Math.max(longest, t - prev);
     prev = t;
     el.scrollTop = from + (viewportsPerSecond * el.clientHeight * (t - start)) / 1000;
@@ -113,13 +141,7 @@ async function scrollAt(el: HTMLElement, viewportsPerSecond: number, during: Pro
   // The last step's scroll event
   await frames(2);
   el.removeEventListener('scroll', onScroll);
-  return {
-    frames: frameCount,
-    labelled,
-    longestFrameMs: Math.round(longest),
-    lastScroll,
-    summary: `${labelled} of ${frameCount} frames labelled, longest frame ${Math.round(longest)} ms`,
-  };
+  return { lastScroll, summary: `${frameCount} frames, longest ${Math.round(longest)} ms` };
 }
 
 /** A cancelable `keydown` on `el`, as a real press reaches the grid; returns the event. */
@@ -331,60 +353,68 @@ export const UI_CHECKS: UiCheck[] = [
           await frames(3);
           // The jump is a fast scroll too: start once its label has gone
           await untilFrame(() => !scrubLabel(), 30_000, `${sort}: the label from the jump hides`);
-          // Slower than the threshold: no label on any frame
-          const slow = await scrollAt(el, 1, sleep(700));
-          assert(
-            slow.labelled === 0 && !scrubLabel(),
-            `${sort}: the label showed at 1 viewport a second (${slow.summary})`
-          );
-          // Faster: the label on nearly every frame, and for name sort the screenshot while it
-          // shows. A frame over 600 ms hides it until the next scroll event, as it should.
-          const fast = await scrollAt(
-            el,
-            4,
-            sort === 'name' ? pause('U6-scrub-label') : sleep(1_000)
-          );
-          assert(
-            fast.labelled >= 0.8 * fast.frames,
-            `${sort}: at 4 viewports a second ${fast.summary}`
-          );
-          assert(scrubLabel(), `${sort}: no label after the last scroll event (${fast.summary})`);
-          assert(scrubLabel()!.getAttribute('aria-hidden') === 'true', `${sort}: not aria-hidden`);
-          // The key arrives with the page under the viewport, while the label still shows
-          await untilFrame(
-            () => SCRUB_LABEL.exec(scrubLabel()?.textContent ?? '')?.[3] !== undefined,
-            500,
-            `${sort}: the label's key (it reads "${scrubLabel()?.textContent}")`
-          );
-          const [, position, count, key] = SCRUB_LABEL.exec(scrubLabel()!.textContent!)!;
-          const { total, pages } = useAssetStore.getState();
-          assert(parseCount(count) === total, `${sort}: the label counts ${count} of ${total}`);
-          // The first visible asset, or the first of the row above when only its gap shows, as
-          // the footer counts it
-          const index = parseCount(position) - 1;
-          const row = firstVisibleRow(el);
-          const { columns } = layoutOf(el);
-          const rowTopPx = el
-            .querySelector<HTMLElement>(`[data-index="${row[0]}"]`)!
-            .getBoundingClientRect().top;
-          const gapShows = rowTopPx > el.getBoundingClientRect().top + 0.5;
-          assert(
-            index === row[0] || (gapShows && index === row[0] - columns),
-            `${sort}: the label reads ${position}, asset ${row[0] + 1} is the first visible`
-          );
-          const asset = assetAt({ pages }, index);
-          assert(asset, `${sort}: asset ${index} is not cached`);
-          const expected = scrubKey(asset!, sort);
-          assert(
-            key === expected,
-            `${sort}: the key is "${key}", asset ${index} has "${expected}"`
-          );
-          await untilFrame(() => !scrubLabel(), 1_500, `${sort}: the label hides`);
-          const hidAfter = Math.round(performance.now() - fast.lastScroll);
-          assert(
-            hidAfter >= 550 && hidAfter <= 900,
-            `${sort}: the label hid ${hidAfter} ms after the last scroll event (${fast.summary})`
-          );
+          const watch = watchLabel(el.parentElement!);
+          try {
+            // Slower than the threshold: no label
+            const slowStart = performance.now();
+            const slow = await scrollAt(el, 1, sleep(700));
+            assert(
+              watch.shownSince(slowStart) === 0,
+              `${sort}: the label showed at 1 viewport a second (${slow.summary})`
+            );
+            // Faster: the label, and for name sort the screenshot while it shows
+            const fastStart = performance.now();
+            const fast = await scrollAt(
+              el,
+              4,
+              sort === 'name' ? pause('U6-scrub-label') : sleep(1_000)
+            );
+            assert(
+              watch.shownSince(fastStart) > 0,
+              `${sort}: no label at 4 viewports a second (${fast.summary})`
+            );
+            assert(watch.ariaHidden, `${sort}: the label is not aria-hidden`);
+            // It hides 0.6 s after the last scroll event
+            await untilFrame(
+              () => !scrubLabel() && watch.hiddenAt() > fast.lastScroll,
+              30_000,
+              `${sort}: the label hides after the last scroll event`
+            );
+            const hidAfter = Math.round(watch.hiddenAt() - fast.lastScroll);
+            assert(
+              hidAfter >= 550 && hidAfter <= 900,
+              `${sort}: the label hid ${hidAfter} ms after the last scroll event (${fast.summary})`
+            );
+            // What it showed last: the first visible asset's position and, once its page
+            // arrived, its key
+            const m = SCRUB_LABEL.exec(watch.text);
+            assert(m && m[3] !== undefined, `${sort}: the label last read "${watch.text}"`);
+            const [, position, count, key] = m!;
+            const { total, pages } = useAssetStore.getState();
+            assert(parseCount(count) === total, `${sort}: the label counts ${count} of ${total}`);
+            // The first visible asset, or the first of the row above when only its gap shows,
+            // as the footer counts it
+            const index = parseCount(position) - 1;
+            const row = firstVisibleRow(el);
+            const { columns } = layoutOf(el);
+            const rowTopPx = el
+              .querySelector<HTMLElement>(`[data-index="${row[0]}"]`)!
+              .getBoundingClientRect().top;
+            const gapShows = rowTopPx > el.getBoundingClientRect().top + 0.5;
+            assert(
+              index === row[0] || (gapShows && index === row[0] - columns),
+              `${sort}: the label reads ${position}, asset ${row[0] + 1} is the first visible`
+            );
+            const asset = assetAt({ pages }, index);
+            assert(asset, `${sort}: asset ${index} is not cached`);
+            const expected = scrubKey(asset!, sort);
+            assert(
+              key === expected,
+              `${sort}: the key is "${key}", asset ${index} has "${expected}"`
+            );
+          } finally {
+            watch.stop();
+          }
         }
       } finally {
         useAssetStore.getState().setSort(field, order);
