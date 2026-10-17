@@ -7,8 +7,10 @@ Every file here is synthesized from the documented Messages API shapes (response
 meant to be replaced by a real response: the plan's contract check makes the first "Test
 connection" call with the owner's key and keeps its response as the fixture.
 
-**Status (2026-10-16): not captured yet.** No key was available when the provider was built,
-and the owner chose to ship without the live check. Until it runs, nothing confirms that the API
+**Status (2026-10-16): not captured, contract check waived.** No key was available when the
+provider was built. Asked through Mission Control to run the one-request check or waive it, the
+owner answered "I waive the contract-check criterion for #49", so issue #49 is delivered with
+this gap open. Until it runs, nothing confirms that the API
 accepts these request fields as sent: `output_config.format` (`json_schema`),
 `output_config.effort: "low"`, `fallbacks: "default"` with the
 `anthropic-beta: server-side-fallback-2026-07-01` header, and `cache_control` on the system
