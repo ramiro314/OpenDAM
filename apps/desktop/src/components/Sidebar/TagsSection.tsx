@@ -1,11 +1,13 @@
-import { useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import clsx from 'clsx';
 import { useTagStore, useUIStore, useAssetStore } from '../../store';
-import { IconTag, IconTrash } from '../Icons';
+import { IconEdit, IconTag, IconTrash } from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { SidebarSection } from './SidebarSection';
 import { InlineCreateForm } from './InlineCreateForm';
-import { isNameTaken } from './sidebarHelpers';
+import { EditTagDialog } from './EditTagDialog';
+import { fitInViewport, isNameTaken } from './sidebarHelpers';
+import type { Tag } from '../../types';
 import styles from './Sidebar.module.css';
 
 interface TagsSectionProps {
@@ -29,6 +31,26 @@ export function TagsSection({ clearSmartFilter }: TagsSectionProps) {
   const [newName, setNewName] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; tag: Tag } | null>(null);
+  const [editTarget, setEditTarget] = useState<Tag | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // Opened at the cursor, then moved back inside the window once its size is known.
+  useLayoutEffect(() => {
+    const el = menuRef.current;
+    if (!menu || !el) return;
+    const { width, height } = el.getBoundingClientRect();
+    const { left, top } = fitInViewport(
+      menu.x,
+      menu.y,
+      width,
+      height,
+      window.innerWidth,
+      window.innerHeight
+    );
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+  }, [menu]);
 
   const cancelCreate = () => {
     setIsCreating(false);
@@ -123,6 +145,10 @@ export function TagsSection({ clearSmartFilter }: TagsSectionProps) {
               id={`tag-${tag.id}`}
               className={clsx(styles.item, isActiveFilter && styles.active)}
               onClick={() => handleTagFilter(tag.id)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setMenu({ x: e.clientX, y: e.clientY, tag });
+              }}
               title={isActiveFilter ? 'Click to clear filter' : 'Click to filter by tag'}
               role="button"
               tabIndex={0}
@@ -151,6 +177,51 @@ export function TagsSection({ clearSmartFilter }: TagsSectionProps) {
           );
         })}
       </SidebarSection>
+
+      {menu && (
+        <div
+          className={styles.contextBackdrop}
+          onClick={() => setMenu(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setMenu(null);
+          }}
+        >
+          <div
+            ref={menuRef}
+            className={styles.contextMenu}
+            style={{ left: menu.x, top: menu.y }}
+            role="menu"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              className={styles.contextMenuItem}
+              role="menuitem"
+              autoFocus
+              onKeyDown={(e) => e.key === 'Escape' && setMenu(null)}
+              onClick={() => {
+                setEditTarget(menu.tag);
+                setMenu(null);
+              }}
+            >
+              <IconEdit size={12} /> Edit tag…
+            </button>
+            <button
+              className={clsx(styles.contextMenuItem, styles.contextMenuItemDanger)}
+              role="menuitem"
+              onKeyDown={(e) => e.key === 'Escape' && setMenu(null)}
+              onClick={() => {
+                setDeleteTarget({ id: menu.tag.id, name: menu.tag.name });
+                setMenu(null);
+              }}
+            >
+              <IconTrash size={12} /> Delete tag…
+            </button>
+          </div>
+        </div>
+      )}
+
+      <EditTagDialog tag={editTarget} onClose={() => setEditTarget(null)} />
 
       <ConfirmDeleteDialog
         isOpen={Boolean(deleteTarget)}

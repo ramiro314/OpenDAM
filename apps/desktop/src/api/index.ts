@@ -4,6 +4,7 @@ import type {
   Library,
   Collection,
   Tag,
+  TagPatch,
   AddLibraryPayload,
   SearchPayload,
   SearchResult,
@@ -38,6 +39,7 @@ export const api = {
   // Tags
   listTags: () => invoke<Tag[]>('list_tags'),
   createTag: (name: string, parentId?: string) => invoke<Tag>('create_tag', { name, parentId }),
+  updateTag: (id: string, patch: TagPatch) => invoke<Tag>('update_tag', { id, patch }),
   deleteTag: (id: string) => invoke<void>('delete_tag', { id }),
 
   // Collections

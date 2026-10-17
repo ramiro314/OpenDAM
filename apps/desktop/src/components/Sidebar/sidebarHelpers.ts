@@ -13,6 +13,44 @@ export function isNameTaken(existing: { name: string }[], name: string): boolean
 }
 
 /**
+ * Top-left corner for a `width` x `height` menu opened at (`x`, `y`), moved back inside the
+ * viewport with `margin` to spare.
+ */
+export function fitInViewport(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  viewportWidth: number,
+  viewportHeight: number,
+  margin = 4
+) {
+  return {
+    left: Math.max(margin, Math.min(x, viewportWidth - width - margin)),
+    top: Math.max(margin, Math.min(y, viewportHeight - height - margin)),
+  };
+}
+
+/** Tags `id` may be nested under: every tag but itself and the tags nested in it. */
+export function parentCandidates<T extends { id: string; parentId?: string | null }>(
+  tags: T[],
+  id: string
+): T[] {
+  const excluded = new Set([id]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const tag of tags) {
+      if (tag.parentId && excluded.has(tag.parentId) && !excluded.has(tag.id)) {
+        excluded.add(tag.id);
+        grew = true;
+      }
+    }
+  }
+  return tags.filter((tag) => !excluded.has(tag.id));
+}
+
+/**
  * Asset id carried by a drop. A drag from outside the grid may carry a file path instead of an
  * id; it resolves to the loaded asset with that path, or stays as given if none matches.
  */

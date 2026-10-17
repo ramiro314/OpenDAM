@@ -1,0 +1,122 @@
+.dialog {
+  max-width: 400px;
+}
+
+.title {
+  text-transform: none;
+}
+
+.form {
+  gap: var(--space-2);
+}
+
+.label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  margin-top: var(--space-1);
+}
+
+.input {
+  width: 100%;
+  padding: 7px 10px;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.input:focus {
+  border-color: var(--color-border-focus);
+}
+
+/* WebKitGTK draws a native select with the light GTK theme, hiding its light text. */
+.select {
+  appearance: none;
+  padding-right: 28px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' fill='none' stroke='%23a0a4ab' stroke-width='1.5'%3E%3Cpath d='M1 1l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  cursor: pointer;
+}
+
+.select option {
+  background: var(--color-bg-elevated);
+  color: var(--color-text-primary);
+}
+
+.textarea {
+  resize: vertical;
+  line-height: 1.4;
+}
+
+.textarea::placeholder {
+  color: var(--color-text-disabled);
+}
+
+.colorRow {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.colorNone {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid var(--color-border);
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--color-text-muted);
+}
+
+.colorNoneActive {
+  border-color: var(--color-text-primary);
+  color: var(--color-text-primary);
+}
+
+.colorDot {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  transition:
+    transform var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+.colorDot:hover {
+  transform: scale(1.15);
+}
+
+.colorDotActive {
+  border-color: #fff;
+}
+
+.error {
+  font-size: 12.5px;
+  color: var(--color-danger);
+}
+
+.saveBtn {
+  background: var(--color-brand-500);
+  color: #fff;
+}
+
+.saveBtn:hover:not(:disabled) {
+  background: var(--color-brand-400);
+}
+
+.saveBtn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}

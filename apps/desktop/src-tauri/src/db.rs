@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Pool, Sqlite};
 use std::collections::HashMap;
@@ -33,24 +33,26 @@ pub type CollectionRow = (
     i64,
 );
 
-/// A tag definition as stored: id, name, color, parent_id.
-pub type TagRow = (String, String, Option<String>, Option<String>);
+/// A tag definition as stored: id, name, color, parent_id, description (the hint).
+pub type TagRow = (String, String, Option<String>, Option<String>, String);
 
 /// Writes a tag definition to a mirror, updating an existing row in place. Never `REPLACE`:
 /// it deletes the old row first, and `ON DELETE CASCADE` would take the library's memberships.
 pub async fn upsert_tag<'e, E: sqlx::Executor<'e, Database = Sqlite>>(
     executor: E,
-    (id, name, color, parent_id): &TagRow,
+    (id, name, color, parent_id, description): &TagRow,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO tags (id, name, color, parent_id) VALUES (?, ?, ?, ?)
+        "INSERT INTO tags (id, name, color, parent_id, description) VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
-             name = excluded.name, color = excluded.color, parent_id = excluded.parent_id",
+             name = excluded.name, color = excluded.color, parent_id = excluded.parent_id,
+             description = excluded.description",
     )
     .bind(id)
     .bind(name)
     .bind(color)
     .bind(parent_id)
+    .bind(description)
     .execute(executor)
     .await
     .map(|_| ())
@@ -80,6 +82,23 @@ pub async fn upsert_collection<'e, E: sqlx::Executor<'e, Database = Sqlite>>(
     .execute(executor)
     .await
     .map(|_| ())
+}
+
+/// Backward compatibility: tags gained a description (the hint the tagging providers get).
+/// Any failure other than the column already being there is an error: a database left without
+/// it fails every tag query later, far from the cause.
+async fn add_tag_description_column(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
+    let present: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('tags') WHERE name = 'description')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !present {
+        sqlx::query("ALTER TABLE tags ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Orders definitions so every parent comes before its children, so writing them in order
@@ -164,6 +183,9 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_assets_is_favorite ON assets(is_favorite)")
         .execute(&pool)
         .await;
+    add_tag_description_column(&pool)
+        .await
+        .context("Could not add the tag description column")?;
 
     // Purge any existing Revit backup files from database
     if let Ok(assets) = sqlx::query_as::<_, (String, String)>(
@@ -245,6 +267,9 @@ impl Database {
             sqlx::query("CREATE INDEX IF NOT EXISTS idx_assets_is_favorite ON assets(is_favorite)")
                 .execute(&master_pool)
                 .await;
+        add_tag_description_column(&master_pool)
+            .await
+            .context("Could not add the tag description column to the master DB")?;
 
         let mut open_libraries = HashMap::new();
 
@@ -318,18 +343,21 @@ impl Database {
     }
 
     async fn add_definitions_master_lacks(&self, lib_pool: &Pool<Sqlite>) {
-        if let Ok(tags) = sqlx::query_as::<_, TagRow>("SELECT id, name, color, parent_id FROM tags")
-            .fetch_all(lib_pool)
-            .await
+        if let Ok(tags) =
+            sqlx::query_as::<_, TagRow>("SELECT id, name, color, parent_id, description FROM tags")
+                .fetch_all(lib_pool)
+                .await
         {
-            for (id, name, color, parent_id) in tags {
+            for (id, name, color, parent_id, description) in tags {
                 let _ = sqlx::query(
-                    "INSERT OR IGNORE INTO tags (id, name, color, parent_id) VALUES (?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO tags (id, name, color, parent_id, description)
+                     VALUES (?, ?, ?, ?, ?)",
                 )
                 .bind(&id)
                 .bind(&name)
                 .bind(&color)
                 .bind(&parent_id)
+                .bind(&description)
                 .execute(&self.master_pool)
                 .await;
             }
@@ -347,9 +375,10 @@ impl Database {
     }
 
     async fn converge_mirror(&self, lib_pool: &Pool<Sqlite>) -> sqlx::Result<()> {
-        let tags = sqlx::query_as::<_, TagRow>("SELECT id, name, color, parent_id FROM tags")
-            .fetch_all(&self.master_pool)
-            .await?;
+        let tags =
+            sqlx::query_as::<_, TagRow>("SELECT id, name, color, parent_id, description FROM tags")
+                .fetch_all(&self.master_pool)
+                .await?;
         let cols = sqlx::query_as::<_, CollectionRow>(
             "SELECT id, name, description, parent_id, is_smart, filter_spec, created_at FROM collections",
         )
@@ -432,14 +461,14 @@ impl Database {
     /// so writing them in order never trips `parent_id`. Empty when master lacks the tag.
     pub async fn tag_with_ancestors(&self, id: &str) -> sqlx::Result<Vec<TagRow>> {
         sqlx::query_as(
-            "WITH RECURSIVE chain(id, name, color, parent_id, depth) AS (
-                 SELECT id, name, color, parent_id, 0 FROM tags WHERE id = ?
+            "WITH RECURSIVE chain(id, name, color, parent_id, description, depth) AS (
+                 SELECT id, name, color, parent_id, description, 0 FROM tags WHERE id = ?
                  UNION ALL
-                 SELECT t.id, t.name, t.color, t.parent_id, chain.depth + 1
+                 SELECT t.id, t.name, t.color, t.parent_id, t.description, chain.depth + 1
                  FROM tags t JOIN chain ON t.id = chain.parent_id
                  WHERE chain.depth < 64
              )
-             SELECT id, name, color, parent_id FROM chain ORDER BY depth DESC",
+             SELECT id, name, color, parent_id, description FROM chain ORDER BY depth DESC",
         )
         .bind(id)
         .fetch_all(&self.master_pool)
@@ -876,6 +905,143 @@ mod tests {
             mirrored,
             (Some("brought by b".into()), Some("brought by b".into()))
         );
+    }
+
+    async fn tag_description(pool: &Pool<Sqlite>, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT description FROM tags WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn set_description(pool: &Pool<Sqlite>, id: &str, description: &str) {
+        sqlx::query("UPDATE tags SET description = ? WHERE id = ?")
+            .bind(description)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn opening_a_library_carries_tag_hints_master_wins() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        let db = memory_database(vec![
+            memory_library("a", a.clone()),
+            memory_library("b", b.clone()),
+        ])
+        .await;
+        insert_tag(&db.master_pool, "t", "rock").await;
+        set_description(&db.master_pool, "t", "master hint").await;
+        insert_tag(&a, "t", "rock").await;
+        set_description(&a, "t", "stale hint").await;
+        insert_tag(&a, "u", "moss").await;
+        set_description(&a, "u", "hint only a had").await;
+
+        db.sync_open_libraries().await;
+
+        for pool in [&db.master_pool, &a, &b] {
+            assert_eq!(
+                tag_description(pool, "t").await.as_deref(),
+                Some("master hint")
+            );
+            assert_eq!(
+                tag_description(pool, "u").await.as_deref(),
+                Some("hint only a had")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_databases_made_before_tag_hints_adds_the_column_and_keeps_their_tags() {
+        let dir = std::env::temp_dir().join(format!("opendam-hints-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("lib/.opendam")).unwrap();
+        let master = dir.join("master.sqlite");
+        let old_tags = "CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                        color TEXT, parent_id TEXT REFERENCES tags(id) ON DELETE SET NULL);
+                        INSERT INTO tags (id, name, color) VALUES ('t', 'rock', 'red');";
+        for file in [master.clone(), dir.join("lib/.opendam/library.sqlite")] {
+            let options = SqliteConnectOptions::new()
+                .filename(&file)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .connect_with(options)
+                .await
+                .unwrap();
+            sqlx::query(old_tags).execute(&pool).await.unwrap();
+            pool.close().await;
+        }
+        let first_run = Database::new(master.to_str().unwrap()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO libraries (id, name, root_paths, created_at) VALUES ('lib', 'lib', ?, 0)",
+        )
+        .bind(serde_json::json!([dir.join("lib")]).to_string())
+        .execute(&first_run.master_pool)
+        .await
+        .unwrap();
+        first_run.master_pool.close().await;
+
+        let db = Database::new(master.to_str().unwrap()).await.unwrap();
+        let lib = db.get_library_handle("lib").await.unwrap().pool;
+        let rows = [
+            sqlx::query_as::<_, TagRow>("SELECT id, name, color, parent_id, description FROM tags")
+                .fetch_all(&db.master_pool)
+                .await,
+            sqlx::query_as::<_, TagRow>("SELECT id, name, color, parent_id, description FROM tags")
+                .fetch_all(&lib)
+                .await,
+        ];
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let expected: TagRow = (
+            "t".into(),
+            "rock".into(),
+            Some("red".into()),
+            None,
+            String::new(),
+        );
+        for row in rows {
+            assert_eq!(row.unwrap(), std::slice::from_ref(&expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn adding_the_tag_description_column_fails_loudly_unless_it_is_already_there() {
+        let dir = std::env::temp_dir().join(format!("opendam-ro-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("old.sqlite"), dir.join("new.sqlite"));
+        for (file, schema) in [
+            (
+                &old,
+                "CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
+            ),
+            (&new, include_str!("../migrations/002_library_schema.sql")),
+        ] {
+            let pool = SqlitePoolOptions::new()
+                .connect_with(
+                    SqliteConnectOptions::new()
+                        .filename(file)
+                        .create_if_missing(true),
+                )
+                .await
+                .unwrap();
+            sqlx::raw_sql(schema).execute(&pool).await.unwrap();
+            pool.close().await;
+        }
+        // Read-only stands in for any ALTER failure, such as a share locked by another machine.
+        let read_only = |file: &PathBuf| {
+            SqlitePoolOptions::new()
+                .connect_with(SqliteConnectOptions::new().filename(file).read_only(true))
+        };
+
+        let lacking = add_tag_description_column(&read_only(&old).await.unwrap()).await;
+        let present = add_tag_description_column(&read_only(&new).await.unwrap()).await;
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(lacking.is_err());
+        assert!(present.is_ok());
     }
 
     #[tokio::test]
