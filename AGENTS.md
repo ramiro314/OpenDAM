@@ -70,6 +70,9 @@ docs/plans                    Plans for this fork
   or disabled before the app is ever distributed. Its child process starts from an empty
   environment holding only `claude_cli::CHILD_ENV`, so no API key or other auth override set for
   the app reaches it. Keep it that way.
+- **Deterministic search order.** Every search `ORDER BY` in `commands/asset.rs` ends with
+  `a.rowid` in the sort direction, and the name sort is `COLLATE NOCASE`, so offset pages never
+  overlap or skip, even across assets that share a sort key.
 - **Master DB is the tag and collection catalog.** Tag and collection lists are read from master.
   Definition create, update and delete write to master, then mirror to every open library DB.
   `asset_tags` and `collection_assets` rows go only to the asset's own library

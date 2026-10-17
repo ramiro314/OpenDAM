@@ -161,6 +161,8 @@ export interface SearchPayload {
   query: SearchQuery;
   page: number;
   pageSize: number;
+  /** Whether to count every match into `SearchResult.total`; true when omitted. */
+  includeTotal?: boolean;
 }
 
 /** How `delete_assets` rejects when some assets were not deleted; the rest were. */
@@ -171,7 +173,8 @@ export interface DeleteAssetsError {
 
 export interface SearchResult {
   assets: Asset[];
-  total: number;
+  /** Every match, not only this page's; absent when the payload set `includeTotal` to false. */
+  total?: number;
   page: number;
   pageSize: number;
 }

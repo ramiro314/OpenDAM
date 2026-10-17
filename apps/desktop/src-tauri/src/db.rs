@@ -1079,6 +1079,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_library_open_has_the_name_and_size_sort_indexes_once() {
+        let dir = std::env::temp_dir().join(format!("opendam-idx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("library.sqlite");
+        // A library from before the indexes existed.
+        let old = connect_library_sqlite(&file).await.unwrap();
+        sqlx::raw_sql(
+            "DROP INDEX idx_assets_file_name_nocase;
+             DROP INDEX idx_assets_size_bytes;",
+        )
+        .execute(&old)
+        .await
+        .unwrap();
+        old.close().await;
+
+        for _ in 0..2 {
+            let pool = connect_library_sqlite(&file).await.unwrap();
+            let indexes: Vec<String> = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_master
+                 WHERE name IN ('idx_assets_file_name_nocase', 'idx_assets_size_bytes')
+                 ORDER BY name",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                indexes,
+                [
+                    "CREATE INDEX idx_assets_file_name_nocase ON assets(file_name COLLATE NOCASE)",
+                    "CREATE INDEX idx_assets_size_bytes   ON assets(size_bytes)",
+                ]
+            );
+            pool.close().await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn adding_the_tag_description_column_fails_loudly_unless_it_is_already_there() {
         let dir = std::env::temp_dir().join(format!("opendam-ro-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
