@@ -918,6 +918,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_review_with_a_bad_decision_writes_nothing() {
+        let cases = [
+            (
+                map("p-stones", "t-ghost", &["a2"]),
+                "The tag to map onto no longer exists",
+            ),
+            (
+                accept("p-stones", "   ", None, &["a2"]),
+                "A tag needs a name",
+            ),
+            (reject("p-moss"), "A proposal has two decisions"),
+        ];
+        for (bad, message) in cases {
+            let s = run_with_proposals("awaiting_review").await;
+            let master = &s.db.master_pool;
+
+            // A good decision goes first, so a partial write would show.
+            let error = apply(
+                &s.db,
+                "run",
+                vec![accept("p-moss", "Moss", None, &["a1"]), bad],
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error, message);
+            assert_eq!(
+                count(
+                    master,
+                    "SELECT COUNT(*) FROM tag_run_proposals WHERE status = 'pending'"
+                )
+                .await,
+                5,
+                "{message}: every proposal stays pending"
+            );
+            assert_eq!(
+                tag_names(master).await.len(),
+                2,
+                "{message}: no tag created"
+            );
+            assert_eq!(
+                count(master, "SELECT COUNT(*) FROM tag_run_applied").await,
+                0
+            );
+            assert!(asset_tag_names(&s.a).await.is_empty());
+            assert_eq!(run_status(&s.db).await, "awaiting_review");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ticked_asset_in_an_offline_library_waits_for_replay() {
+        let s = run_with_proposals("awaiting_review").await;
+        s.db.unregister_library("b-lib").await.unwrap();
+
+        let applied = apply(
+            &s.db,
+            "run",
+            vec![accept("p-rock", "Rock", Some("t-nature"), &["a1", "b1"])],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(applied.changed_assets, ["a1"]);
+        let master = &s.db.master_pool;
+        let rock: String = sqlx::query_scalar("SELECT id FROM tags WHERE name = 'Rock'")
+            .fetch_one(master)
+            .await
+            .unwrap();
+        assert!(tag_names(&s.a)
+            .await
+            .contains(&("Rock".into(), Some("Nature".into()))));
+        assert!(
+            tag_names(&s.b).await.is_empty(),
+            "an offline library's mirror isn't written"
+        );
+        assert_eq!(asset_tag_names(&s.a).await, [pair("a1", "Rock")]);
+        let recorded: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT asset_id, library_id, tag_id, state FROM tag_run_applied ORDER BY asset_id",
+        )
+        .fetch_all(master)
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded,
+            [
+                ("a1".into(), "a-lib".into(), rock.clone(), "applied".into()),
+                ("b1".into(), "b-lib".into(), rock, "pending".into()),
+            ],
+            "b1's pair is recorded for undo and waits for replay"
+        );
+    }
+
+    async fn count(pool: &Pool<Sqlite>, sql: &str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    #[tokio::test]
     async fn two_proposals_accepted_under_one_name_create_one_tag() {
         let s = run_with_proposals("awaiting_review").await;
 
