@@ -255,6 +255,8 @@ export interface RunSummary {
   total: number;
   done: number;
   failed: number;
+  /** Items a cancel left unprocessed */
+  skipped: number;
   running: number;
   queued: number;
   inputTokens: number;

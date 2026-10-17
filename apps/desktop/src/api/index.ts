@@ -96,4 +96,10 @@ export const api = {
   startAutotagRun: (scope: AutotagScope, provider: string, mode: AutotagMode) =>
     invoke<StartedRun>('start_autotag_run', { scope, provider, mode }),
   listAutotagRuns: () => invoke<RunSummary[]>('list_autotag_runs'),
+  pauseAutotagRun: (runId: string) => invoke<void>('pause_autotag_run', { runId }),
+  /** Fails, leaving the run paused, when its provider isn't ready */
+  resumeAutotagRun: (runId: string) => invoke<void>('resume_autotag_run', { runId }),
+  /** Resumes every paused run whose provider is ready; returns how many */
+  resumeAllAutotagRuns: () => invoke<number>('resume_all_autotag_runs'),
+  cancelAutotagRun: (runId: string) => invoke<void>('cancel_autotag_run', { runId }),
 };

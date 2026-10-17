@@ -150,7 +150,12 @@ export const useLibraryStore = create<LibraryStore>()((set) => ({
 
   addLibrary: async (name, rootPaths) => {
     const lib = await api.addLibrary({ name, rootPaths });
-    set((s) => ({ libraries: [...s.libraries, lib] }));
+    // Adding the folder of an offline library reopens that library: replace it, don't list it twice
+    set((s) => ({
+      libraries: s.libraries.some((l) => l.id === lib.id)
+        ? s.libraries.map((l) => (l.id === lib.id ? lib : l))
+        : [...s.libraries, lib],
+    }));
   },
 
   removeLibrary: async (id) => {

@@ -85,6 +85,7 @@ pub struct RunSummary {
     pub total: i64,
     pub done: i64,
     pub failed: i64,
+    pub skipped: i64,
     pub running: i64,
     pub queued: i64,
     pub input_tokens: i64,
@@ -105,6 +106,7 @@ pub async fn list_runs(master: &Pool<Sqlite>) -> sqlx::Result<Vec<RunSummary>> {
                 COUNT(i.asset_id) AS total,
                 COALESCE(SUM(i.status = 'done'), 0) AS done,
                 COALESCE(SUM(i.status = 'failed'), 0) AS failed,
+                COALESCE(SUM(i.status = 'skipped'), 0) AS skipped,
                 COALESCE(SUM(i.status = 'running'), 0) AS running,
                 COALESCE(SUM(i.status = 'queued'), 0) AS queued,
                 r.input_tokens, r.output_tokens, r.cost_usd, r.created_at, r.finished_at
@@ -168,7 +170,8 @@ pub struct NewRun<'a> {
 }
 
 /// Inserts the run and its queued items. The run is `queued` while its items go in, in batches,
-/// and `running` once they all have, so the scheduler never sees half a run.
+/// and `running` once they all have, so the scheduler never sees half a run. A run paused or
+/// cancelled meanwhile stays so.
 pub async fn create_run(
     master: &Pool<Sqlite>,
     run: NewRun<'_>,
@@ -201,11 +204,27 @@ pub async fn create_run(
         }
         tx.commit().await?;
     }
-    sqlx::query("UPDATE tag_runs SET status = 'running' WHERE id = ?")
-        .bind(run.id)
-        .execute(master)
+    finish_creating(master, run.id).await
+}
+
+/// Ends `create_run`: the run becomes `running`, unless it was paused or cancelled while its
+/// items went in. A cancel that landed between batches skipped only the items already in, so
+/// the later ones are skipped here rather than left queued in a run nobody schedules.
+async fn finish_creating(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<()> {
+    let mut tx = master.begin().await?;
+    sqlx::query("UPDATE tag_runs SET status = 'running' WHERE id = ? AND status = 'queued'")
+        .bind(run_id)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    sqlx::query(
+        "UPDATE tag_run_items SET status = 'skipped'
+         WHERE run_id = ?1 AND status = 'queued'
+           AND (SELECT status FROM tag_runs WHERE id = ?1) = 'cancelled'",
+    )
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
 }
 
 /// A claimed item, now `running`.
@@ -287,12 +306,158 @@ pub async fn finish_run_if_complete(master: &Pool<Sqlite>, run_id: &str) -> sqlx
     Ok(ended.rows_affected() > 0)
 }
 
-/// Items left `running` by a previous session go back to the queue.
-pub async fn requeue_running_items(master: &Pool<Sqlite>) -> sqlx::Result<()> {
-    sqlx::query("UPDATE tag_run_items SET status = 'queued' WHERE status = 'running'")
-        .execute(master)
+/// The `pause_reason` of every run a previous session left unfinished.
+pub const APP_RESTARTED: &str = "app restarted";
+/// How the `pause_reason` of a run a previous session left half-created begins.
+pub const APP_RESTARTED_WHILE_STARTING: &str = "app restarted while the run was starting";
+
+/// At startup, in one transaction: every `queued` or `running` run becomes `paused` with "app
+/// restarted", and every item left `running` goes back to the queue, or is `skipped` when its
+/// run was cancelled while the item was in flight.
+///
+/// A run still `queued` was being created, its items going in by batches, so it may hold only
+/// some of the assets asked for. Its reason says so and how many it holds, so Resume finishing
+/// it never passes for the whole run.
+pub async fn recover_after_restart(master: &Pool<Sqlite>) -> sqlx::Result<()> {
+    let mut tx = master.begin().await?;
+    sqlx::query(
+        "UPDATE tag_runs
+         SET status = 'paused',
+             pause_reason = ?1 || ': it holds only ' || n || CASE n WHEN 1 THEN ' asset' ELSE ' assets' END
+                            || ', and any others were never added'
+         FROM (SELECT r.id AS run_id, COUNT(i.asset_id) AS n
+               FROM tag_runs r LEFT JOIN tag_run_items i ON i.run_id = r.id
+               WHERE r.status = 'queued' GROUP BY r.id) AS counts
+         WHERE tag_runs.id = counts.run_id",
+    )
+    .bind(APP_RESTARTED_WHILE_STARTING)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE tag_runs SET status = 'paused', pause_reason = ? WHERE status = 'running'")
+        .bind(APP_RESTARTED)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE tag_run_items
+         SET status = CASE WHEN (SELECT status FROM tag_runs WHERE id = run_id) = 'cancelled'
+                           THEN 'skipped' ELSE 'queued' END
+         WHERE status = 'running'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+pub async fn run_status(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar("SELECT status FROM tag_runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(master)
         .await
-        .map(|_| ())
+}
+
+/// Pauses a `running` run. `reason` is shown in the Runs panel; a pause you asked for has none.
+/// Returns whether the run was paused.
+///
+/// A `queued` run is still being created and can't be paused: resumed before `create_run`
+/// finished, it could end `done` with later batches still to come, which would then sit
+/// `queued` in a run nobody schedules. It can be cancelled (`finish_creating` skips what comes
+/// after), and restart recovery pauses one a crash cut off.
+pub async fn pause_run(
+    master: &Pool<Sqlite>,
+    run_id: &str,
+    reason: Option<&str>,
+) -> sqlx::Result<bool> {
+    let paused = sqlx::query(
+        "UPDATE tag_runs SET status = 'paused', pause_reason = ?
+         WHERE id = ? AND status = 'running'",
+    )
+    .bind(reason)
+    .bind(run_id)
+    .execute(master)
+    .await?;
+    Ok(paused.rows_affected() > 0)
+}
+
+/// Sets the `paused` runs among `run_ids` running again. Returns the ones it resumed.
+pub async fn resume_runs(master: &Pool<Sqlite>, run_ids: &[String]) -> sqlx::Result<Vec<String>> {
+    let mut resumed = Vec::new();
+    for chunk in run_ids.chunks(BATCH) {
+        let sql = format!(
+            "UPDATE tag_runs SET status = 'running', pause_reason = NULL
+             WHERE status = 'paused' AND id IN ({}) RETURNING id",
+            vec!["?"; chunk.len()].join(", ")
+        );
+        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        resumed.extend(query.fetch_all(master).await?);
+    }
+    Ok(resumed)
+}
+
+/// Every paused run, oldest first, with its provider.
+pub async fn paused_runs(master: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, String)>> {
+    sqlx::query_as(
+        "SELECT id, provider FROM tag_runs WHERE status = 'paused' ORDER BY created_at, id",
+    )
+    .fetch_all(master)
+    .await
+}
+
+/// Cancels a `queued`, `running` or `paused` run, in one transaction: its queued items become
+/// `skipped`. Items in flight finish, and every tag already applied stays. Returns whether the
+/// run was cancelled.
+pub async fn cancel_run(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<bool> {
+    let mut tx = master.begin().await?;
+    let cancelled = sqlx::query(
+        "UPDATE tag_runs SET status = 'cancelled', pause_reason = NULL, finished_at = ?
+         WHERE id = ? AND status IN ('queued', 'running', 'paused')",
+    )
+    .bind(now_ms())
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?;
+    if cancelled.rows_affected() == 0 {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE tag_run_items SET status = 'skipped' WHERE run_id = ? AND status = 'queued'",
+    )
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Gives back an item that stopped before its result was written: it goes back to the queue,
+/// or is `skipped` when its run was cancelled meanwhile.
+pub async fn release_item(master: &Pool<Sqlite>, item: &Item) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE tag_run_items
+         SET status = CASE WHEN (SELECT status FROM tag_runs WHERE id = ?) = 'cancelled'
+                           THEN 'skipped' ELSE 'queued' END
+         WHERE run_id = ? AND asset_id = ? AND status = 'running'",
+    )
+    .bind(&item.run_id)
+    .bind(&item.run_id)
+    .bind(&item.asset_id)
+    .execute(master)
+    .await
+    .map(|_| ())
+}
+
+/// Counts one more call for the item, before a retry.
+pub async fn count_attempt(master: &Pool<Sqlite>, item: &Item) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE tag_run_items SET attempts = attempts + 1 WHERE run_id = ? AND asset_id = ?",
+    )
+    .bind(&item.run_id)
+    .bind(&item.asset_id)
+    .execute(master)
+    .await
+    .map(|_| ())
 }
 
 /// Write protocol step 1, in one master transaction: a `pending` row for every pair the
@@ -462,19 +627,38 @@ pub async fn apply_pairs(
     Ok(changed)
 }
 
-/// Replays every `pending` row whose library is open (steps 3 and 4, both idempotent). Rows of
-/// runs being undone are skipped: they wait to be removed, not applied. Rows for an offline
-/// library wait for it. Returns the assets whose tags changed.
-pub async fn replay_pending(db: &Database) -> sqlx::Result<Vec<String>> {
-    let rows: Vec<PendingPair> = sqlx::query_as(
+/// Replays every `pending` row whose library is open (steps 3 and 4, both idempotent), or only
+/// those of `library` when given. Returns the assets whose tags changed.
+///
+/// Replaying a library is safe only while no item can be writing to it: an item between its
+/// step 1 and step 3 has `pending` rows too, and replay claiming them first makes the item's own
+/// step 3 delete them as someone else's pairs, leaving tags undo can't find. So this runs at
+/// startup, before any scheduler; a library opening while runs are going instead takes its
+/// rows with `pending_rows` before it opens and replays only those with `replay_rows`.
+pub async fn replay_pending(db: &Database, library: Option<&str>) -> sqlx::Result<Vec<String>> {
+    let rows = pending_rows(db, library).await?;
+    Ok(replay_rows(db, rows).await)
+}
+
+/// Every `pending` row, or those of `library` when given, except rows of runs being undone:
+/// they wait to be removed, not applied.
+pub async fn pending_rows(db: &Database, library: Option<&str>) -> sqlx::Result<Vec<PendingPair>> {
+    sqlx::query_as(
         "SELECT a.run_id, a.asset_id, a.library_id, a.tag_id, (r.id IS NULL) AS run_cleared
          FROM tag_run_applied a LEFT JOIN tag_runs r ON r.id = a.run_id
-         WHERE a.state = 'pending'
+         WHERE a.state = 'pending' AND (?1 IS NULL OR a.library_id = ?1)
            AND (r.status IS NULL OR r.status NOT IN ('undoing', 'undo_partial', 'undone'))
          ORDER BY a.library_id, a.asset_id, a.tag_id",
     )
+    .bind(library)
     .fetch_all(&db.master_pool)
-    .await?;
+    .await
+}
+
+/// Write protocol steps 3 and 4 for `rows`, as replay. Rows for an offline library wait for
+/// it, and one library's failure (a NAS lock timeout) leaves its rows for the next replay.
+/// Returns the assets whose tags changed.
+pub async fn replay_rows(db: &Database, rows: Vec<PendingPair>) -> Vec<String> {
     let mut by_library: BTreeMap<String, Vec<PendingPair>> = BTreeMap::new();
     for row in rows {
         by_library
@@ -487,13 +671,12 @@ pub async fn replay_pending(db: &Database) -> sqlx::Result<Vec<String>> {
         let Some(lib) = db.get_library_handle(&library_id).await else {
             continue;
         };
-        // One library's failure (a NAS lock timeout) leaves its rows for the next replay.
         match apply_pairs(db, &lib, &pairs, Applier::Replay).await {
             Ok(assets) => changed.extend(assets),
             Err(e) => tracing::warn!("Pending tags for library {library_id} wait: {e}"),
         }
     }
-    Ok(changed)
+    changed
 }
 
 #[cfg(test)]
@@ -549,7 +732,7 @@ mod tests {
         insert_pending(&db, "cleared-run", "a1", "lib", "t2").await;
         insert_pending(&db, "done-run", "a9", "offline-lib", "t1").await;
 
-        let changed = replay_pending(&db).await.unwrap();
+        let changed = replay_pending(&db, None).await.unwrap();
 
         assert_eq!(changed, ["a1"]);
         assert_eq!(
@@ -570,6 +753,62 @@ mod tests {
                 ("undone-run".into(), "t2".into(), "pending".into()),
             ],
             "the cleared run's row is gone once applied; offline and undo rows wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_skips_a_cancelled_runs_in_flight_items_and_flags_half_made_runs() {
+        let db = memory_database(Vec::new()).await;
+        let master = &db.master_pool;
+        insert_run(&db, "cancelled-run", "cancelled").await;
+        insert_run(&db, "running-run", "running").await;
+        insert_run(&db, "half-made-run", "queued").await;
+        for run in ["cancelled-run", "half-made-run", "running-run"] {
+            sqlx::query(
+                "INSERT INTO tag_run_items (run_id, asset_id, library_id, status)
+                 VALUES (?, 'a1', 'lib', 'running')",
+            )
+            .bind(run)
+            .execute(master)
+            .await
+            .unwrap();
+        }
+
+        recover_after_restart(master).await.unwrap();
+
+        let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT r.id, r.status, r.pause_reason, i.status
+             FROM tag_runs r JOIN tag_run_items i ON i.run_id = r.id ORDER BY r.id",
+        )
+        .fetch_all(master)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "cancelled-run".into(),
+                    "cancelled".into(),
+                    None,
+                    "skipped".into()
+                ),
+                (
+                    "half-made-run".into(),
+                    "paused".into(),
+                    Some(
+                        "app restarted while the run was starting: it holds only 1 asset, \
+                         and any others were never added"
+                            .into()
+                    ),
+                    "queued".into()
+                ),
+                (
+                    "running-run".into(),
+                    "paused".into(),
+                    Some(APP_RESTARTED.into()),
+                    "queued".into()
+                ),
+            ]
         );
     }
 
@@ -595,7 +834,7 @@ mod tests {
         insert_pending(&db, "run", "a1", "lib", "t-tree").await;
 
         for _ in 0..2 {
-            assert!(replay_pending(&db).await.unwrap().len() <= 1);
+            assert!(replay_pending(&db, None).await.unwrap().len() <= 1);
             assert_eq!(
                 asset_tags(&lib_pool).await,
                 [("a1".into(), "t-tree".into())],
@@ -610,6 +849,143 @@ mod tests {
                 "the colliding pair waits, on every replay"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn replaying_one_library_leaves_another_librarys_in_flight_item_its_rows() {
+        let a = memory_library_pool().await;
+        let b = memory_library_pool().await;
+        insert_asset(&a, "a1").await;
+        insert_asset(&b, "b1").await;
+        let db = memory_database(vec![
+            memory_library("a-lib", a.clone()),
+            memory_library("b-lib", b.clone()),
+        ])
+        .await;
+        insert_tag(&db.master_pool, "t1", "Rock").await;
+        insert_run(&db, "run", "running").await;
+        // a1's item has recorded its intent (step 1) and is about to write library A.
+        insert_pending(&db, "run", "a1", "a-lib", "t1").await;
+        // b1's write waited for library B, which just opened.
+        insert_pending(&db, "run", "b1", "b-lib", "t1").await;
+
+        let replayed = replay_pending(&db, Some("b-lib")).await.unwrap();
+
+        assert_eq!(replayed, ["b1"]);
+        assert!(
+            asset_tags(&a).await.is_empty(),
+            "library A is left to its item"
+        );
+        let lib = db.get_library_handle("a-lib").await.unwrap();
+        let in_flight: Vec<PendingPair> = sqlx::query_as(
+            "SELECT run_id, asset_id, library_id, tag_id, 0 AS run_cleared FROM tag_run_applied
+             WHERE asset_id = 'a1'",
+        )
+        .fetch_all(&db.master_pool)
+        .await
+        .unwrap();
+        let written = apply_pairs(&db, &lib, &in_flight, Applier::Item)
+            .await
+            .unwrap();
+
+        assert_eq!(written, ["a1"]);
+        assert_eq!(
+            applied_rows(&db).await,
+            [
+                ("a1".into(), "t1".into(), "applied".into()),
+                ("b1".into(), "t1".into(), "applied".into()),
+            ],
+            "the item keeps its row, so undo can still remove the tag"
+        );
+    }
+
+    async fn insert_item(db: &Database, run: &str, asset: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO tag_run_items (run_id, asset_id, library_id, status)
+             VALUES (?, ?, 'lib', ?)",
+        )
+        .bind(run)
+        .bind(asset)
+        .bind(status)
+        .execute(&db.master_pool)
+        .await
+        .unwrap();
+    }
+
+    async fn items_of(db: &Database, run: &str) -> Vec<String> {
+        sqlx::query_scalar("SELECT status FROM tag_run_items WHERE run_id = ? ORDER BY asset_id")
+            .bind(run)
+            .fetch_all(&db.master_pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_creation_skips_the_items_inserted_after_it() {
+        let db = memory_database(Vec::new()).await;
+        // Cancelled after its first batch went in: that batch is skipped, later ones queued.
+        insert_run(&db, "cancelled", "cancelled").await;
+        insert_item(&db, "cancelled", "a1", "skipped").await;
+        insert_item(&db, "cancelled", "a2", "queued").await;
+        insert_item(&db, "cancelled", "a3", "queued").await;
+        insert_run(&db, "paused", "paused").await;
+        insert_item(&db, "paused", "a1", "queued").await;
+        insert_run(&db, "fresh", "queued").await;
+        insert_item(&db, "fresh", "a1", "queued").await;
+
+        for run in ["cancelled", "paused", "fresh"] {
+            finish_creating(&db.master_pool, run).await.unwrap();
+        }
+
+        assert_eq!(items_of(&db, "cancelled").await, ["skipped"; 3]);
+        assert_eq!(
+            items_of(&db, "paused").await,
+            ["queued"],
+            "resume hands them out"
+        );
+        assert_eq!(items_of(&db, "fresh").await, ["queued"]);
+        let statuses: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, status FROM tag_runs ORDER BY id")
+                .fetch_all(&db.master_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            statuses,
+            [
+                ("cancelled".into(), "cancelled".into()),
+                ("fresh".into(), "running".into()),
+                ("paused".into(), "paused".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn replaying_the_rows_read_before_a_library_opened_leaves_a_new_items_rows() {
+        let lib_pool = memory_library_pool().await;
+        insert_asset(&lib_pool, "a1").await;
+        insert_asset(&lib_pool, "a2").await;
+        let db = memory_database(vec![memory_library("lib", lib_pool.clone())]).await;
+        insert_tag(&db.master_pool, "t1", "Rock").await;
+        insert_run(&db, "old-run", "done").await;
+        insert_run(&db, "running-run", "running").await;
+        // Stranded while the library was offline.
+        insert_pending(&db, "old-run", "a1", "lib", "t1").await;
+        let waiting = pending_rows(&db, Some("lib")).await.unwrap();
+        // The library opens, and an item claims a2 and records its intent before replay runs.
+        insert_pending(&db, "running-run", "a2", "lib", "t1").await;
+
+        let replayed = replay_rows(&db, waiting).await;
+
+        assert_eq!(replayed, ["a1"]);
+        assert_eq!(asset_tags(&lib_pool).await, [("a1".into(), "t1".into())]);
+        assert_eq!(
+            applied_rows(&db).await,
+            [
+                ("a1".into(), "t1".into(), "applied".into()),
+                ("a2".into(), "t1".into(), "pending".into()),
+            ],
+            "the item's row is left to its own step 3"
+        );
     }
 
     #[tokio::test]
@@ -628,7 +1004,7 @@ mod tests {
         insert_pending(&db, "run", "b1", "b-lib", "t1").await;
         broken.close().await;
 
-        let changed = replay_pending(&db).await.unwrap();
+        let changed = replay_pending(&db, None).await.unwrap();
 
         assert_eq!(changed, ["b1"]);
         assert_eq!(
