@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { isKnownModel, settingsPatch } from './settingsHelpers';
+import { isKnownModel, parseNumberInput, settingsPatch } from './settingsHelpers';
 import type { AiSettings } from '../../types';
 
 const saved: AiSettings = {
@@ -28,5 +28,22 @@ describe('isKnownModel', () => {
   test('knows the Claude 5.5 models and treats any other id as custom', () => {
     expect(isKnownModel('claude-haiku-5-5')).toBe(true);
     expect(isKnownModel('claude-sonnet-4-6')).toBe(false);
+  });
+});
+
+describe('parseNumberInput', () => {
+  test('an emptied field commits nothing rather than 0', () => {
+    expect(parseNumberInput('', true)).toBeNull();
+    expect(parseNumberInput('  ', false)).toBeNull();
+  });
+
+  test('integer fields take only whole numbers', () => {
+    expect(parseNumberInput('12', true)).toBe(12);
+    expect(parseNumberInput('4.5', true)).toBeNull();
+  });
+
+  test('fractional fields take decimals, and nothing that is not a number', () => {
+    expect(parseNumberInput('0.85', false)).toBe(0.85);
+    expect(parseNumberInput('-', false)).toBeNull();
   });
 });

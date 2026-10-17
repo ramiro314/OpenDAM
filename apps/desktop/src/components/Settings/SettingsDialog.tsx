@@ -3,7 +3,7 @@ import clsx from 'clsx';
 import { api } from '../../api';
 import type { AiProvider, AiSettings, ProviderStatus } from '../../types';
 import { IconSettings, IconX } from '../Icons';
-import { ANTHROPIC_MODELS, isKnownModel, settingsPatch } from './settingsHelpers';
+import { ANTHROPIC_MODELS, isKnownModel, parseNumberInput, settingsPatch } from './settingsHelpers';
 import styles from './SettingsDialog.module.css';
 
 interface SettingsDialogProps {
@@ -239,18 +239,36 @@ interface NumberFieldProps {
   onChange: (value: number) => void;
 }
 
+/**
+ * Keeps what the user types, so emptying the field to retype it doesn't turn into 0. Only a
+ * valid number reaches `onChange` (a whole one unless `step` is fractional), and leaving the
+ * field shows the value that will be saved again.
+ */
 function NumberField({ label, value, min, max, step = 1, onChange }: NumberFieldProps) {
+  const integer = Number.isInteger(step);
+  const [text, setText] = useState(String(value));
+  // Follow outside changes, but keep a partial entry such as "0." that already means `value`
+  useEffect(
+    () => setText((t) => (parseNumberInput(t, integer) === value ? t : String(value))),
+    [value, integer]
+  );
+
   return (
     <label className={styles.numberField}>
       <span className={styles.label}>{label}</span>
       <input
         type="number"
         className={styles.input}
-        value={value}
+        value={text}
         min={min}
         max={max}
         step={step}
-        onChange={(e) => onChange(Number(e.target.value))}
+        onChange={(e) => {
+          setText(e.target.value);
+          const parsed = parseNumberInput(e.target.value, integer);
+          if (parsed !== null) onChange(parsed);
+        }}
+        onBlur={() => setText(String(value))}
       />
     </label>
   );
@@ -295,7 +313,7 @@ function ApiKeyField({ provider, status, onStatus }: ApiKeyFieldProps) {
           spellCheck={false}
           onChange={(e) => setKey(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && key.trim()) submit(key);
+            if (e.key === 'Enter' && !busy && key.trim()) submit(key);
           }}
         />
         <button

@@ -24,3 +24,11 @@ export function settingsPatch(saved: AiSettings, draft: AiSettings): AiSettingsP
   if (!anthropic && !jev) return null;
   return { ...(anthropic && { anthropic }), ...(jev && { jev }) };
 }
+
+/** The number typed in a settings field, or null while it is empty, partial or not allowed. */
+export function parseNumberInput(raw: string, integer: boolean): number | null {
+  if (raw.trim() === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || (integer && !Number.isInteger(n))) return null;
+  return n;
+}
