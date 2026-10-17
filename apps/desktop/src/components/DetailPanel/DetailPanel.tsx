@@ -26,6 +26,7 @@ import {
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { api } from '../../api';
 import { isWebviewDisplayable } from '../../utils/media';
+import { useImageScaling } from '../../hooks/useImageScaling';
 import { ThreeViewer } from './ThreeViewer';
 import { SuggestTags } from './SuggestTags';
 import styles from './DetailPanel.module.css';
@@ -54,6 +55,7 @@ export function DetailPanel() {
   const addToCollection = useCollectionStore((s) => s.addToCollection);
   const removeFromCollection = useCollectionStore((s) => s.removeFromCollection);
   const [tab, setTab] = useState<'info' | 'tags' | 'collections' | 'preview'>('info');
+  const scaling = useImageScaling('contain');
 
   const [isEditingName, setIsEditingName] = useState(false);
   const [editingName, setEditingName] = useState('');
@@ -164,12 +166,14 @@ export function DetailPanel() {
             src={convertFileSrc(asset.filePath)}
             alt={asset.fileName}
             className={styles.thumbImg}
+            ref={scaling}
           />
         ) : asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb') ? (
           <img
             src={convertFileSrc(asset.thumbnailPath)}
             alt={asset.fileName}
             className={styles.thumbImg}
+            ref={scaling}
           />
         ) : asset.kind === 'video' && asset.filePath ? (
           <video
@@ -695,6 +699,7 @@ function PreviewTab({ asset, onGeneratePreview }: { asset: Asset; onGeneratePrev
       : undefined;
   const isPending = asset.previewStatus === 'pending' || asset.previewStatus === 'generating';
   const isError = asset.previewStatus === 'error';
+  const scaling = useImageScaling('contain');
 
   return (
     <div className={styles.previewArea}>
@@ -725,7 +730,12 @@ function PreviewTab({ asset, onGeneratePreview }: { asset: Asset; onGeneratePrev
         </div>
       ) : imagePath ? (
         <div className={styles.previewViewerWrapper}>
-          <img src={convertFileSrc(imagePath)} alt={asset.fileName} className={styles.previewImg} />
+          <img
+            src={convertFileSrc(imagePath)}
+            alt={asset.fileName}
+            className={styles.previewImg}
+            ref={scaling}
+          />
           <button
             className={styles.reGenerateOverlayBtn}
             onClick={onGeneratePreview}

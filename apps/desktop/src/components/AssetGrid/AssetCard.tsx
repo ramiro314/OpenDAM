@@ -13,6 +13,7 @@ import {
   IconHeartFilled,
 } from '../Icons';
 import { formatSize } from '../../utils/format';
+import { useImageScaling } from '../../hooks/useImageScaling';
 import { tileMedia, tileState, type TileMedia } from './tileState';
 import styles from './AssetCard.module.css';
 
@@ -61,6 +62,7 @@ export const AssetCard = memo(function AssetCard({
   // `data-tile-state` reads "ready" once the image or video has loaded, or all media failed
   const [mediaLoaded, setMediaLoaded] = useState(false);
   const patchAsset = useAssetStore((s) => s.patchAsset);
+  const scaling = useImageScaling('cover');
 
   useEffect(() => {
     setFailed(undefined);
@@ -155,6 +157,7 @@ export const AssetCard = memo(function AssetCard({
             src={convertFileSrc(asset.thumbnailPath)}
             alt={asset.fileName}
             className={styles.thumbImg}
+            ref={scaling}
             decoding="async"
             onLoad={() => setMediaLoaded(true)}
             onError={() => setFailed(media)}
@@ -164,6 +167,7 @@ export const AssetCard = memo(function AssetCard({
             src={convertFileSrc(asset.filePath)}
             alt={asset.fileName}
             className={styles.thumbImg}
+            ref={scaling}
             decoding="async"
             onLoad={() => setMediaLoaded(true)}
             onError={() => setFailed(media)}

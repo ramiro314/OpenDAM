@@ -10,6 +10,7 @@ import {
   rowOfIndex,
   rowTop,
 } from '../components/AssetGrid/gridGeometry';
+import { shouldPixelate, type ImageFit, type ImageScaling } from '../utils/imageScaling';
 
 export interface UiCheckContext {
   /** The grid's scroll container (`#asset-scroll`). */
@@ -78,6 +79,51 @@ function firstVisibleRow(el: HTMLElement): number[] {
     .filter((t) => Math.abs(t.getBoundingClientRect().top - top) < 1)
     .map(indexOf)
     .sort((a, b) => a - b);
+}
+
+/** The loaded images under `root`. */
+function loadedImages(root: ParentNode): HTMLImageElement[] {
+  return [...root.querySelectorAll('img')].filter((img) => img.complete && img.naturalWidth > 0);
+}
+
+/** Whether `img`, laid out with `fit`, is shown larger than its pixel size in device pixels. */
+function isEnlarged(img: HTMLImageElement, fit: ImageFit): boolean {
+  return shouldPixelate(
+    'pixelated',
+    { width: img.naturalWidth, height: img.naturalHeight },
+    { width: img.clientWidth, height: img.clientHeight },
+    fit,
+    window.devicePixelRatio
+  );
+}
+
+const rendering = (img: HTMLImageElement) => getComputedStyle(img).imageRendering;
+
+/**
+ * Asserts every loaded image under `root` renders `pixelated` when `pref` is pixelated and it is
+ * enlarged, `auto` otherwise. Returns how many were enlarged and how many not.
+ */
+function assertScaling(
+  assert: UiCheckContext['assert'],
+  where: string,
+  root: ParentNode,
+  fit: ImageFit,
+  pref: ImageScaling
+) {
+  let enlarged = 0;
+  let shrunk = 0;
+  for (const img of loadedImages(root)) {
+    const big = isEnlarged(img, fit);
+    if (big) enlarged++;
+    else shrunk++;
+    const want = big && pref === 'pixelated' ? 'pixelated' : 'auto';
+    assert(
+      rendering(img) === want,
+      `${where}, ${pref}: a ${img.naturalWidth}x${img.naturalHeight} image in a ` +
+        `${img.clientWidth}x${img.clientHeight} box renders ${rendering(img)}, not ${want}`
+    );
+  }
+  return { enlarged, shrunk };
 }
 
 const FOOTER = /^([\d,]+)-([\d,]+) of ([\d,]+) assets?$/;
@@ -265,6 +311,150 @@ export const UI_CHECKS: UiCheck[] = [
       useUIStore.getState().setViewMode('list');
       await frames(3);
       await rightClick('list row', 'asset-row-', 'U5-list-menu');
+    },
+  },
+  {
+    id: 'U8',
+    title:
+      'The image scaling toggle flips enlarged small images between pixelated and smooth in the ' +
+      'grid, the list, the detail panel and QuickLook, and survives a reload',
+    run: async ({ scroll, assert, pause }) => {
+      const toggle = () => document.getElementById('image-scaling-toggle');
+      const ui = () => useUIStore.getState();
+      assert(toggle(), 'no #image-scaling-toggle in grid view');
+      assert(
+        ui().imageScaling === 'pixelated',
+        `a fresh profile starts ${ui().imageScaling}, not pixelated`
+      );
+      assert(
+        toggle()!.title === 'Image scaling: Pixelated',
+        `the toggle is titled "${toggle()!.title}"`
+      );
+
+      // Scroll through the results until the viewport shows an enlarged and a shrunk image
+      const el = scroll();
+      let small: HTMLImageElement | undefined;
+      let large: HTMLImageElement | undefined;
+      const steps = 40;
+      for (let step = 0; step <= steps && !(small && large); step++) {
+        el.scrollTop = (step / steps) * (el.scrollHeight - el.clientHeight);
+        await untilFrame(() => allReady(el), 5_000, `visible tiles ready at step ${step}`);
+        const shown = tilesInView(el).flatMap(loadedImages);
+        small = shown
+          .filter((img) => isEnlarged(img, 'cover'))
+          .sort((a, b) => a.naturalWidth - b.naturalWidth)[0];
+        large = shown.find((img) => !isEnlarged(img, 'cover'));
+      }
+      assert(small && large, 'no viewport showed both an enlarged and a shrunk image');
+      const tile = small!.closest<HTMLElement>('[data-tile]')!;
+      const id = tile.id.slice('asset-'.length);
+      const index = Number(tile.dataset.index);
+      const what = `asset ${index} (${small!.naturalWidth}x${small!.naturalHeight})`;
+
+      const quickLook = async (open: boolean) => {
+        const type = open ? 'keydown' : 'keyup';
+        window.dispatchEvent(new KeyboardEvent(type, { code: 'Space', key: ' ', bubbles: true }));
+        await frames(4);
+      };
+      const quickLookImage = () =>
+        document.querySelector<HTMLImageElement>('[role="dialog"][aria-modal="true"] img');
+
+      /** Checks the grid, the detail panel and QuickLook against `pref`, with screenshots. */
+      const everywhere = async (pref: ImageScaling) => {
+        assert(
+          rendering(small!) === (pref === 'pixelated' ? 'pixelated' : 'auto'),
+          `grid, ${pref}: ${what} renders ${rendering(small!)}`
+        );
+        assert(
+          rendering(large!) === 'auto',
+          `grid, ${pref}: a shrunk image renders ${rendering(large!)}`
+        );
+        assertScaling(assert, 'grid', el, 'cover', pref);
+        const panel = document.getElementById('detail-panel');
+        assert(panel, 'no detail panel');
+        await untilFrame(() => loadedImages(panel!).length > 0, 5_000, 'the detail preview');
+        assertScaling(assert, 'detail panel', panel!, 'contain', pref);
+        await pause(`U8-${pref}`);
+        await quickLook(true);
+        await untilFrame(
+          () => !!quickLookImage()?.complete && quickLookImage()!.naturalWidth > 0,
+          5_000,
+          'the QuickLook image'
+        );
+        const big = quickLookImage()!;
+        assert(isEnlarged(big, 'contain'), `QuickLook shows ${what} at ${big.clientWidth} px`);
+        assertScaling(assert, 'QuickLook', big.parentElement!, 'contain', pref);
+        await pause(`U8-quicklook-${pref}`);
+        await quickLook(false);
+        assert(!quickLookImage(), 'releasing Space left QuickLook open');
+      };
+
+      // Select the small image, so the detail panel and QuickLook show it too
+      ui().selectAsset(id);
+      if (!ui().detailPanelOpen) ui().toggleDetailPanel();
+      await frames(3);
+      await everywhere('pixelated');
+
+      toggle()!.click();
+      await frames(3);
+      assert(ui().imageScaling === 'smooth', 'the toggle did not switch to smooth');
+      assert(
+        toggle()!.title === 'Image scaling: Smooth',
+        `after a click the toggle is titled "${toggle()!.title}"`
+      );
+      await everywhere('smooth');
+
+      // The list shows the same small image, in both states
+      ui().setViewMode('list');
+      await frames(3);
+      assert(toggle(), 'no #image-scaling-toggle in list view');
+      const list = scroll();
+      const { columns, rowPitch } = layoutOf(list);
+      list.scrollTop = Math.max(
+        0,
+        rowTop(rowOfIndex(index, columns), rowPitch) - list.clientHeight / 2
+      );
+      const row = `[data-index="${index}"]:not([data-placeholder])`;
+      await untilFrame(
+        () => allReady(list) && !!list.querySelector(row),
+        5_000,
+        `list row ${index}`
+      );
+      for (const pref of ['smooth', 'pixelated'] as const) {
+        if (ui().imageScaling !== pref) {
+          toggle()!.click();
+          await frames(3);
+        }
+        assertScaling(assert, 'list', list, 'cover', pref);
+      }
+      ui().setViewMode('grid');
+      await frames(3);
+
+      // A reload reads the persisted preference back: save what smooth persists, clobber the
+      // store, put the saved value back and rehydrate, as a new page load would
+      toggle()!.click();
+      await frames(3);
+      const KEY = 'opendam-ui';
+      const saved = localStorage.getItem(KEY);
+      const persisted = saved ? JSON.parse(saved).state?.imageScaling : undefined;
+      assert(persisted === 'smooth', `localStorage holds imageScaling ${persisted}, not smooth`);
+      useUIStore.setState({ imageScaling: 'pixelated' });
+      localStorage.setItem(KEY, saved!);
+      await useUIStore.persist.rehydrate();
+      await frames(3);
+      assert(
+        ui().imageScaling === 'smooth',
+        `after a reload the preference is ${ui().imageScaling}`
+      );
+      assert(
+        toggle()!.title === 'Image scaling: Smooth',
+        `after a reload the toggle is titled "${toggle()!.title}"`
+      );
+
+      // Leave the default for whatever runs next
+      toggle()!.click();
+      await frames(3);
+      ui().clearSelection();
     },
   },
 ];
