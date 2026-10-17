@@ -8,6 +8,7 @@ import { StatusBar } from './components/StatusBar/StatusBar';
 import { QuickLookModal } from './components/QuickLook/QuickLookModal';
 import { ConfirmDeleteDialog } from './components/ConfirmDeleteDialog';
 import { RunsPanel } from './components/Autotag/RunsPanel';
+import { AutotagDialog } from './components/Autotag/AutotagDialog';
 import { IconCheck } from './components/Icons';
 import { useUIStore } from './store';
 import {
@@ -41,12 +42,14 @@ export default function App() {
   const fetchCollections = useCollectionStore((s) => s.fetchCollections);
   const search = useAssetStore((s) => s.search);
   const runsPanelOpen = useAutotagStore((s) => s.runsPanelOpen);
+  const autotagTarget = useAutotagStore((s) => s.dialogTarget);
+  const openAutotagDialog = useAutotagStore((s) => s.openAutotagDialog);
+  const assetsToDelete = useUIStore((s) => s.assetsToDelete);
+  const requestDelete = useUIStore((s) => s.requestDelete);
 
   const [quickLookOpen, setQuickLookOpen] = useState(false);
   const [copyToast, setCopyToast] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-  const [assetsToDelete, setAssetsToDelete] = useState<string[]>([]);
-  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const toastTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -164,8 +167,7 @@ export default function App() {
         const ids = selectedIds.size > 0 ? Array.from(selectedIds) : focusedId ? [focusedId] : [];
         if (ids.length > 0) {
           e.preventDefault();
-          setAssetsToDelete(ids);
-          setDeleteDialogOpen(true);
+          useUIStore.getState().requestDelete(ids);
           return;
         }
       }
@@ -226,12 +228,13 @@ export default function App() {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleConfirmAppDelete = async () => {
-    if (assetsToDelete.length === 0) return;
-    const count = assetsToDelete.length;
-    setDeleteDialogOpen(false);
+    const ids = assetsToDelete;
+    if (ids.length === 0) return;
+    const count = ids.length;
+    requestDelete([]);
     setDeleteError(null);
     try {
-      await useAssetStore.getState().deleteAssets(assetsToDelete, true);
+      await useAssetStore.getState().deleteAssets(ids, true);
       setCopyToast(
         count === 1 ? 'Moved file to Recycle Bin' : `Moved ${count} files to Recycle Bin`
       );
@@ -239,8 +242,6 @@ export default function App() {
       toastTimeoutRef.current = window.setTimeout(() => setCopyToast(null), 2200);
     } catch (err: any) {
       setDeleteError(err?.message || String(err));
-    } finally {
-      setAssetsToDelete([]);
     }
   };
 
@@ -259,10 +260,13 @@ export default function App() {
       {/* Spacebar Quick Look Modal */}
       <QuickLookModal asset={focusedAsset} isOpen={quickLookOpen} />
       {runsPanelOpen && <RunsPanel />}
+      {autotagTarget && (
+        <AutotagDialog target={autotagTarget} onClose={() => openAutotagDialog(null)} />
+      )}
 
       {/* Delete Confirmation Dialog */}
       <ConfirmDeleteDialog
-        isOpen={deleteDialogOpen}
+        isOpen={assetsToDelete.length > 0}
         itemType={assetsToDelete.length > 1 ? 'assets' : 'asset'}
         itemName={
           assetsToDelete.length === 1
@@ -270,10 +274,7 @@ export default function App() {
             : `${assetsToDelete.length} files`
         }
         onConfirm={handleConfirmAppDelete}
-        onCancel={() => {
-          setDeleteDialogOpen(false);
-          setAssetsToDelete([]);
-        }}
+        onCancel={() => requestDelete([])}
       />
 
       {/* Copy Path Feedback Toast */}

@@ -77,7 +77,7 @@ pub async fn test_provider(
 mod tests {
     use crate::autotag::anthropic::{mock, AnthropicProvider};
     use crate::autotag::credentials::{Credentials, MemoryKeyring, Provider};
-    use crate::autotag::engine::Engine;
+    use crate::autotag::engine::{Engine, RunScope};
     use crate::autotag::provider::Mode;
     use crate::autotag::settings;
     use crate::db::{insert_asset, insert_tag, memory_library, memory_library_pool, Database};
@@ -180,7 +180,13 @@ mod tests {
         );
         engine.start().await;
         payloads.push(json!(engine
-            .start_run(vec!["a1".into()], "anthropic", Mode::ExistingOnly)
+            .start_run(
+                RunScope::Assets {
+                    asset_ids: vec!["a1".into()],
+                },
+                "anthropic",
+                Mode::ExistingOnly,
+            )
             .await
             .unwrap()));
         for _ in 0..500 {

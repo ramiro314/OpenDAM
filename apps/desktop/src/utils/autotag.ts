@@ -1,4 +1,10 @@
-import type { AutotagMode, AutotagProviderOption, RunSummary } from '../types';
+import type {
+  AutotagMode,
+  AutotagProviderOption,
+  AutotagScope,
+  AutotagTarget,
+  RunSummary,
+} from '../types';
 
 export const MODES: { mode: AutotagMode; label: string; description: string }[] = [
   {
@@ -27,10 +33,15 @@ export interface Availability {
   reason: string | null;
 }
 
-/** Whether an auto-tag entry point can open the run dialog, and why not when it can't. */
+/**
+ * Whether an auto-tag entry point can open the run dialog, and why not when it can't.
+ * `assetCount` is what the entry point would tag (the selection, the right-clicked assets, a
+ * library's assets), and `emptyReason` says why it can't tag nothing.
+ */
 export function autotagAvailability(
   providers: AutotagProviderOption[] | null,
-  assetCount: number
+  assetCount: number,
+  emptyReason = 'Select assets to auto-tag'
 ): Availability {
   if (providers === null) return { enabled: false, reason: 'Checking tagging providers…' };
   if (!providers.some((p) => p.unavailableReason === null)) {
@@ -40,8 +51,15 @@ export function autotagAvailability(
       reason: ['No tagging provider is ready.', ...reasons].join(' '),
     };
   }
-  if (assetCount === 0) return { enabled: false, reason: 'Select assets to auto-tag' };
+  if (assetCount === 0) return { enabled: false, reason: emptyReason };
   return { enabled: true, reason: null };
+}
+
+/** What the run dialog asks the backend to tag: the chosen assets, or the library with its "All assets" choice. */
+export function scopeFor(target: AutotagTarget, allAssets: boolean): AutotagScope {
+  return target.kind === 'assets'
+    ? { kind: 'assets', assetIds: target.assetIds }
+    : { kind: 'library', libraryId: target.libraryId, allAssets };
 }
 
 export interface ModeOption {
@@ -93,11 +111,29 @@ export function taggingSummary(runs: RunSummary[]): string | null {
   return parts.join(' · ');
 }
 
-/** "120 / 400", plus the failed count when there is one. */
+/** "120 / 400", plus the failed and skipped counts when there are some. */
 export function runProgress(run: RunSummary): string {
   const processed = run.done + run.failed;
-  const text = `${processed.toLocaleString()} / ${run.total.toLocaleString()}`;
-  return run.failed > 0 ? `${text} · ${run.failed.toLocaleString()} failed` : text;
+  const parts = [`${processed.toLocaleString()} / ${run.total.toLocaleString()}`];
+  if (run.failed > 0) parts.push(`${run.failed.toLocaleString()} failed`);
+  if (run.skipped > 0) parts.push(`${run.skipped.toLocaleString()} skipped`);
+  return parts.join(' · ');
+}
+
+export interface RunActions {
+  pause: boolean;
+  resume: boolean;
+  cancel: boolean;
+}
+
+/** The Runs panel buttons a run in `status` offers. */
+export function runActions(status: RunSummary['status']): RunActions {
+  return {
+    // A queued run is still being created: it can be cancelled, not paused
+    pause: status === 'running',
+    resume: status === 'paused',
+    cancel: status === 'running' || status === 'queued' || status === 'paused',
+  };
 }
 
 /** Dollars, with enough decimals that a fraction of a cent doesn't read as $0.00. */

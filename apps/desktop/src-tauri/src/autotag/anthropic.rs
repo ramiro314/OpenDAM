@@ -1254,7 +1254,7 @@ mod tests {
     /// run row, `claim_item` and the engine.
     #[tokio::test]
     async fn a_run_sends_the_model_it_was_started_with() {
-        use crate::autotag::engine::Engine;
+        use crate::autotag::engine::{Engine, RunScope};
         use crate::autotag::settings;
         use crate::db::{insert_asset, memory_database, memory_library, memory_library_pool};
 
@@ -1276,7 +1276,13 @@ mod tests {
         engine.start().await;
 
         let started = engine
-            .start_run(vec!["a1".into()], "anthropic", Mode::ExistingOnly)
+            .start_run(
+                RunScope::Assets {
+                    asset_ids: vec!["a1".into()],
+                },
+                "anthropic",
+                Mode::ExistingOnly,
+            )
             .await
             .unwrap();
         // A later change to the setting doesn't touch a run already started

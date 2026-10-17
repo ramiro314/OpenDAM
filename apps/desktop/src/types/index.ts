@@ -267,6 +267,8 @@ export interface RunSummary {
   total: number;
   done: number;
   failed: number;
+  /** Items a cancel left unprocessed */
+  skipped: number;
   running: number;
   queued: number;
   inputTokens: number;
@@ -276,6 +278,16 @@ export interface RunSummary {
   createdAt: number;
   finishedAt: number | null;
 }
+
+/** What a run covers: chosen assets, or a library's untagged assets (every asset with `allAssets`) */
+export type AutotagScope =
+  | { kind: 'assets'; assetIds: string[] }
+  | { kind: 'library'; libraryId: string; allAssets: boolean };
+
+/** What the run dialog was opened for: chosen assets, or a sidebar library */
+export type AutotagTarget =
+  | { kind: 'assets'; assetIds: string[] }
+  | { kind: 'library'; libraryId: string; libraryName: string };
 
 export interface StartedRun {
   run: RunSummary;

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tauri::State;
 
-use crate::autotag::engine::{ProviderOption, StartedRun};
+use crate::autotag::engine::{ProviderOption, RunScope, StartedRun};
 use crate::autotag::provider::Mode;
 use crate::autotag::store::RunSummary;
 use crate::AppState;
@@ -20,19 +20,44 @@ pub async fn list_autotag_providers(
         .map_err(|e| e.to_string())
 }
 
-/// Starts a background run over `asset_ids`. Progress arrives as `autotag:updated` events.
+/// Starts a background run over chosen assets, or over a library's untagged assets (every
+/// asset with `allAssets`). Progress arrives as `autotag:updated` events.
 #[tauri::command]
 pub async fn start_autotag_run(
-    asset_ids: Vec<String>,
+    scope: RunScope,
     provider: String,
     mode: Mode,
     state: State<'_, Arc<AppState>>,
 ) -> Result<StartedRun> {
-    state.autotag.start_run(asset_ids, &provider, mode).await
+    state.autotag.start_run(scope, &provider, mode).await
 }
 
 /// Every run, newest first.
 #[tauri::command]
 pub async fn list_autotag_runs(state: State<'_, Arc<AppState>>) -> Result<Vec<RunSummary>> {
     state.autotag.list_runs().await.map_err(|e| e.to_string())
+}
+
+/// Stops handing out the run's items; requests in flight finish.
+#[tauri::command]
+pub async fn pause_autotag_run(run_id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
+    state.autotag.pause_run(&run_id).await
+}
+
+/// Resumes a paused run. Fails, leaving it paused, when its provider isn't ready.
+#[tauri::command]
+pub async fn resume_autotag_run(run_id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
+    state.autotag.resume_run(&run_id).await
+}
+
+/// Resumes every paused run whose provider is ready, and returns how many.
+#[tauri::command]
+pub async fn resume_all_autotag_runs(state: State<'_, Arc<AppState>>) -> Result<usize> {
+    state.autotag.resume_all().await
+}
+
+/// Cancels a run: its remaining items are skipped, and the tags it applied stay.
+#[tauri::command]
+pub async fn cancel_autotag_run(run_id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
+    state.autotag.cancel_run(&run_id).await
 }

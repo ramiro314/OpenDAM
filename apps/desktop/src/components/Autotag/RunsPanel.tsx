@@ -1,8 +1,9 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import clsx from 'clsx';
+import { api } from '../../api';
 import { useAutotagStore } from '../../store';
 import type { RunSummary } from '../../types';
-import { modeLabel, runProgress, runUsage } from '../../utils/autotag';
+import { modeLabel, runActions, runProgress, runUsage } from '../../utils/autotag';
 import { IconTag, IconX } from '../Icons';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './Autotag.module.css';
@@ -26,7 +27,12 @@ function statusClass(status: RunSummary['status']) {
   return undefined;
 }
 
-function RunRow({ run }: { run: RunSummary }) {
+/** Runs a panel action; a refusal comes back as the panel's error line. */
+type Act = (action: () => Promise<unknown>) => void;
+
+function RunRow({ run, act }: { run: RunSummary; act: Act }) {
+  const actions = runActions(run.status);
+  const button = clsx(dialog.btn, dialog.secondaryBtn, styles.runBtn);
   const processed = run.done + run.failed;
   const percent = run.total > 0 ? (processed / run.total) * 100 : 0;
   const provider = run.model ? `${run.providerLabel} · ${run.model}` : run.providerLabel;
@@ -50,6 +56,29 @@ function RunRow({ run }: { run: RunSummary }) {
         {runProgress(run)}
         {usage && ` · ${usage}`}
       </span>
+      {(actions.pause || actions.resume || actions.cancel) && (
+        <div className={styles.runActions}>
+          {actions.pause && (
+            <button className={button} onClick={() => act(() => api.pauseAutotagRun(run.id))}>
+              Pause
+            </button>
+          )}
+          {actions.resume && (
+            <button className={button} onClick={() => act(() => api.resumeAutotagRun(run.id))}>
+              Resume
+            </button>
+          )}
+          {actions.cancel && (
+            <button
+              className={button}
+              onClick={() => act(() => api.cancelAutotagRun(run.id))}
+              title="Skip the remaining assets. Tags already applied stay."
+            >
+              Cancel
+            </button>
+          )}
+        </div>
+      )}
     </li>
   );
 }
@@ -58,7 +87,23 @@ function RunRow({ run }: { run: RunSummary }) {
 export function RunsPanel() {
   const runs = useAutotagStore((s) => s.runs);
   const setRunsPanelOpen = useAutotagStore((s) => s.setRunsPanelOpen);
+  const [error, setError] = useState<string | null>(null);
   const onClose = () => setRunsPanelOpen(false);
+  const paused = runs.filter((r) => r.status === 'paused').length;
+
+  const act: Act = (action) => {
+    setError(null);
+    action().catch((e) => setError(String(e)));
+  };
+  const resumeAll = () =>
+    act(async () => {
+      const resumed = await api.resumeAllAutotagRuns();
+      const left = paused - resumed;
+      if (left > 0)
+        setError(
+          `${left} paused run${left === 1 ? '' : 's'} can't resume yet: the provider isn't ready`
+        );
+    });
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -84,17 +129,29 @@ export function RunsPanel() {
               Tagging runs
             </h3>
           </div>
-          <button className={dialog.closeBtn} onClick={onClose} title="Close">
-            <IconX size={14} />
-          </button>
+          <div className={styles.headerActions}>
+            {paused > 0 && (
+              <button
+                id="runs-resume-all"
+                className={clsx(dialog.btn, dialog.secondaryBtn, styles.runBtn)}
+                onClick={resumeAll}
+              >
+                Resume all
+              </button>
+            )}
+            <button className={dialog.closeBtn} onClick={onClose} title="Close">
+              <IconX size={14} />
+            </button>
+          </div>
         </div>
         <div className={dialog.content}>
+          {error && <p className={dialog.error}>{error}</p>}
           {runs.length === 0 ? (
             <p className={styles.empty}>No tagging runs yet.</p>
           ) : (
             <ul className={styles.runs}>
               {runs.map((run) => (
-                <RunRow key={run.id} run={run} />
+                <RunRow key={run.id} run={run} act={act} />
               ))}
             </ul>
           )}

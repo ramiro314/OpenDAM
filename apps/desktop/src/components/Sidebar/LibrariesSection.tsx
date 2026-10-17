@@ -1,9 +1,12 @@
 import { useState } from 'react';
 import clsx from 'clsx';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useLibraryStore, useUIStore, useAssetStore } from '../../store';
-import { IconFolder, IconTrash } from '../Icons';
+import { useLibraryStore, useUIStore, useAssetStore, useAutotagStore } from '../../store';
+import type { Library } from '../../types';
+import { autotagAvailability } from '../../utils/autotag';
+import { IconFolder, IconTag, IconTrash } from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
+import { ContextMenu } from '../ContextMenu/ContextMenu';
 import { SidebarSection } from './SidebarSection';
 import { libraryNameFromPath } from './sidebarHelpers';
 import styles from './Sidebar.module.css';
@@ -30,6 +33,9 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
 
   const [expanded, setExpanded] = useState(true);
   const [removeTarget, setRemoveTarget] = useState<{ id: string; name: string } | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; library: Library } | null>(null);
+  const providers = useAutotagStore((s) => s.providers);
+  const openAutotagDialog = useAutotagStore((s) => s.openAutotagDialog);
 
   const handleAddLibrary = async () => {
     try {
@@ -130,6 +136,10 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
               id={`lib-${lib.id}`}
               className={clsx(styles.item, isSelected && styles.active)}
               onClick={(e) => handleLibraryClick(lib.id, e)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setMenu({ x: e.clientX, y: e.clientY, library: lib });
+              }}
               role="button"
               tabIndex={0}
               title="Click to select library; Ctrl+Click to select multiple"
@@ -172,6 +182,32 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
           );
         })}
       </SidebarSection>
+
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          onClose={() => setMenu(null)}
+          items={[
+            {
+              id: 'library-menu-autotag',
+              label: 'Auto-tag library…',
+              icon: <IconTag size={12} />,
+              disabledReason: autotagAvailability(
+                providers,
+                menu.library.assetCount,
+                'This library has no assets'
+              ).reason,
+              onSelect: () =>
+                openAutotagDialog({
+                  kind: 'library',
+                  libraryId: menu.library.id,
+                  libraryName: menu.library.name,
+                }),
+            },
+          ]}
+        />
+      )}
 
       <ConfirmDeleteDialog
         isOpen={Boolean(removeTarget)}
