@@ -132,4 +132,10 @@ export const api = {
     invoke<string>('review_autotag_proposals', { runId, decisions }),
   /** Undo, or Finish undo on a partly undone run; returns `undone` or `undo_partial` */
   undoAutotagRun: (runId: string) => invoke<string>('undo_autotag_run', { runId }),
+  /** Starts "Retry of <label>" over the run's failed assets; the run itself doesn't change */
+  retryFailedAutotagRun: (runId: string) =>
+    invoke<StartedRun>('retry_failed_autotag_run', { runId }),
+  /** Clears one stopped run, or with none every finished run; returns how many it cleared */
+  clearAutotagRuns: (runId: string | null = null) =>
+    invoke<number>('clear_autotag_runs', { runId }),
 };

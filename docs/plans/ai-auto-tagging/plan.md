@@ -321,6 +321,14 @@ comes from ("from ANTHROPIC_API_KEY", "saved in keyring", "not set"), never the 
   - **Any other run:** Clear deletes the run's rows except its `pending` `tag_run_applied` rows.
     Those stay, without their run, until replay applies them, and replay then deletes them. A
     cleared run's waiting writes still land when their library comes back.
+  - **Clear finished (built):** takes `done`, `cancelled` and `undone` runs with no proposals
+    waiting for review. A run waiting for review, or partly undone, is cleared on its own, and a
+    partly undone one asks for a second click ("Confirm clear"). A run with an item still in
+    flight is refused, like undo. Command: `clear_autotag_runs(run_id | null)`, null for Clear
+    finished.
+  - **Shared pairs (built):** an `applied` row of a cleared run stays while another run records
+    the same pair, so undoing that run leaves the tag both added. Each clear drops the rows of
+    cleared runs no remaining run shares.
 - **Events.** The engine emits `autotag:updated`, carrying the run summary and the asset ids
   whose tags changed, throttled to about 4 per second. The asset store re-fetches only the
   loaded assets that changed. The Runs panel and status bar subscribe instead of polling.
@@ -429,6 +437,9 @@ Each failure falls into one of four classes:
   through undo, and each run undoes only its own tags.
 - It is offered on any run with failed items, except one that is `undoing`, `undo_partial` or
   `undone`.
+- **Built:** the retry also keeps the run's access and model, so a Claude-plan run retries on
+  the plan, and its `inline` flag. It doesn't change the last-used provider and mode (D32). Like
+  any new run, it leaves out failed assets another active run already has queued (D13).
 
 ### Providers
 

@@ -211,10 +211,16 @@ export interface RunActions {
   undo: boolean;
   /** Runs undo again on a run partly undone while a library was offline */
   finishUndo: boolean;
+  /** Starts a new run over the run's failed assets */
+  retryFailed: boolean;
+  /** Removes the run from the panel; its tags stay, no longer undoable */
+  clear: boolean;
 }
 
 /** The Runs panel buttons a run offers. */
-export function runActions(run: Pick<RunSummary, 'status' | 'pendingProposals'>): RunActions {
+export function runActions(
+  run: Pick<RunSummary, 'status' | 'pendingProposals' | 'failed'>
+): RunActions {
   const { status } = run;
   return {
     // A queued run is still being created: it can be cancelled, not paused
@@ -228,7 +234,22 @@ export function runActions(run: Pick<RunSummary, 'status' | 'pendingProposals'>)
       status === 'awaiting_review' ||
       status === 'paused',
     finishUndo: status === 'undo_partial',
+    retryFailed:
+      run.failed > 0 && status !== 'undoing' && status !== 'undo_partial' && status !== 'undone',
+    clear: !['queued', 'running', 'paused', 'undoing'].includes(status),
   };
+}
+
+/**
+ * Whether "Clear finished" takes the run: done, cancelled or undone, with nothing left to
+ * review. A run waiting for review, or partly undone, is cleared on its own. The backend
+ * applies the same rule.
+ */
+export function clearedWithFinished(run: Pick<RunSummary, 'status' | 'pendingProposals'>): boolean {
+  return (
+    (run.status === 'done' || run.status === 'cancelled' || run.status === 'undone') &&
+    run.pendingProposals === 0
+  );
 }
 
 /** Dollars, with enough decimals that a fraction of a cent doesn't read as $0.00. */

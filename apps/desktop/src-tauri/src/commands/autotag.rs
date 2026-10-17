@@ -123,3 +123,24 @@ pub async fn review_autotag_proposals(
 pub async fn undo_autotag_run(run_id: String, state: State<'_, Arc<AppState>>) -> Result<String> {
     state.autotag.undo_run(&run_id).await
 }
+
+/// Starts "Retry of <label>" over exactly the run's failed assets, with the same provider, mode
+/// and options, and returns it. The run itself doesn't change.
+#[tauri::command]
+pub async fn retry_failed_autotag_run(
+    run_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<StartedRun> {
+    state.autotag.retry_failed(&run_id).await
+}
+
+/// Clears a stopped run from the Runs panel, or with no `run_id` every finished run (done,
+/// cancelled or undone, with nothing to review). Its tags stay, no longer undoable. Returns how
+/// many runs it cleared.
+#[tauri::command]
+pub async fn clear_autotag_runs(
+    run_id: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<usize> {
+    state.autotag.clear_runs(run_id.as_deref()).await
+}

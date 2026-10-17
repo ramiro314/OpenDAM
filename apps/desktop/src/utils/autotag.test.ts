@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import type { AutotagProviderOption, ReviewProposal, RunEstimate, RunSummary } from '../types';
 import {
   autotagAvailability,
+  clearedWithFinished,
   estimateSkips,
   estimateSummary,
   formatCost,
@@ -218,9 +219,11 @@ describe('runActions', () => {
     review: false,
     undo: false,
     finishUndo: false,
+    retryFailed: false,
+    clear: false,
   };
 
-  test('a running run can be paused or cancelled', () => {
+  test('a running run can be paused or cancelled, not cleared', () => {
     expect(runActions(run('running', 1, 4))).toEqual({ ...none, pause: true, cancel: true });
   });
 
@@ -228,7 +231,7 @@ describe('runActions', () => {
     expect(runActions(run('queued', 0, 4))).toEqual({ ...none, cancel: true });
   });
 
-  test('a paused run can be resumed, cancelled or undone', () => {
+  test('a paused run can be resumed, cancelled or undone, not cleared', () => {
     expect(runActions(run('paused', 1, 4))).toEqual({
       ...none,
       resume: true,
@@ -237,17 +240,23 @@ describe('runActions', () => {
     });
   });
 
-  test('a stopped run offers Undo, until it is undone or being undone', () => {
+  test('a stopped run offers Undo and Clear, and an undone one only Clear', () => {
     for (const status of ['done', 'cancelled'] as const) {
-      expect(runActions(run(status, 4, 4))).toEqual({ ...none, undo: true });
+      expect(runActions(run(status, 4, 4))).toEqual({ ...none, undo: true, clear: true });
     }
-    for (const status of ['undoing', 'undone'] as const) {
-      expect(runActions(run(status, 4, 4))).toEqual(none);
-    }
+    expect(runActions(run('undone', 4, 4))).toEqual({ ...none, clear: true });
   });
 
-  test('a partly undone run offers Finish undo', () => {
-    expect(runActions(run('undo_partial', 4, 4))).toEqual({ ...none, finishUndo: true });
+  test('a run being undone offers nothing', () => {
+    expect(runActions(run('undoing', 4, 4))).toEqual(none);
+  });
+
+  test('a partly undone run offers Finish undo and Clear', () => {
+    expect(runActions(run('undo_partial', 4, 4))).toEqual({
+      ...none,
+      finishUndo: true,
+      clear: true,
+    });
   });
 
   test('a run waiting for review, or cancelled with proposals left, offers Review', () => {
@@ -255,13 +264,44 @@ describe('runActions', () => {
       ...none,
       review: true,
       undo: true,
+      clear: true,
     });
     expect(runActions({ ...run('cancelled', 2, 4), pendingProposals: 3 })).toEqual({
       ...none,
       review: true,
       undo: true,
+      clear: true,
     });
     expect(runActions({ ...run('paused', 2, 4), pendingProposals: 3 }).review).toBe(false);
+  });
+
+  test('a run with failed assets offers Retry failed, unless it is being or was undone', () => {
+    for (const status of ['running', 'paused', 'awaiting_review', 'done', 'cancelled'] as const) {
+      expect(runActions(run(status, 2, 4, 2)).retryFailed).toBe(true);
+    }
+    for (const status of ['undoing', 'undo_partial', 'undone'] as const) {
+      expect(runActions(run(status, 2, 4, 2)).retryFailed).toBe(false);
+    }
+    expect(runActions(run('done', 4, 4)).retryFailed).toBe(false);
+  });
+});
+
+describe('clearedWithFinished', () => {
+  test('takes done, cancelled and undone runs with nothing left to review', () => {
+    for (const status of ['done', 'cancelled', 'undone'] as const) {
+      expect(clearedWithFinished(run(status, 4, 4))).toBe(true);
+    }
+    for (const status of [
+      'queued',
+      'running',
+      'paused',
+      'undoing',
+      'awaiting_review',
+      'undo_partial',
+    ] as const) {
+      expect(clearedWithFinished(run(status, 4, 4))).toBe(false);
+    }
+    expect(clearedWithFinished({ ...run('cancelled', 2, 4), pendingProposals: 1 })).toBe(false);
   });
 });
 
