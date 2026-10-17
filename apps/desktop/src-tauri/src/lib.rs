@@ -258,6 +258,8 @@ pub fn run() {
             #[cfg(debug_assertions)]
             commands::bench::bench_log,
             #[cfg(debug_assertions)]
+            commands::bench::bench_only,
+            #[cfg(debug_assertions)]
             commands::bench::bench_report,
         ])
         .run(tauri::generate_context!())

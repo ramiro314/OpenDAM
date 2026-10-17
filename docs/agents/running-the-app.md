@@ -140,13 +140,15 @@ A dev-only harness, `apps/desktop/src/dev/scrollBench.ts`, measures how the asse
 the Kenney bench data, so every change to the grid is judged on the same numbers
 ([plan](../plans/fast-collection-browsing/plan.md), "Scroll benchmark"). `main.tsx` loads it only
 when `import.meta.env.DEV` is true and `VITE_SCROLL_BENCH` is set, so release builds don't contain
-it. Its Tauri commands (`bench_rss`, `bench_render_mode`, `bench_log`, `bench_report`) exist only
-under `debug_assertions`.
+it. Its Tauri commands (`bench_rss`, `bench_render_mode`, `bench_log`, `bench_only`,
+`bench_report`) exist only under `debug_assertions`.
 
 - `VITE_SCROLL_BENCH=1` runs the timing scenarios at sm, md and lg: continuous scroll (60 s at
   3,000 px/s), end to end, and 20 seeded random jumps. On the grid that appends pages,
   end to end jumps to the bottom until 20,000 tiles have loaded or 120 s pass, and random jumps
-  are reported as unsupported.
+  are reported as unsupported. Started by hand (`VITE_SCROLL_BENCH=1 make dev`), it runs all of
+  them in one process, so its RSS figures carry over between scenarios; use the script for
+  numbers to compare.
 - `VITE_SCROLL_BENCH=checks` runs the UI checks registered in `src/dev/uiChecks.ts` and writes
   PASS or FAIL for each. A check calls `pause(name)` where a screenshot should be taken; the
   harness always pauses once at the start, as `checks-start`.
@@ -166,7 +168,10 @@ The script:
 2. builds a debug binary with the frontend embedded and built in Vite's development mode
    (`NODE_ENV=development vite build --mode development`), with `VITE_SCROLL_BENCH` set;
 3. runs the app in a nested headless KWin with a virtual 1400x900 output, its own D-Bus session
-   and `OPENDAM_NO_KEYRING=1`, never on your desktop session;
+   and `OPENDAM_NO_KEYRING=1`, never on your desktop session. A timing run starts a fresh app
+   process for each size and scenario, naming it in `OPENDAM_SCROLL_BENCH_ONLY` (for example
+   `md/endToEnd`), because memory one scenario takes stays with the web process and would count
+   toward the next one's RSS. It then merges the nine reports into one. Checks run in one process;
 4. screenshots each `[scroll-bench] pause <name>` line the app prints, with `spectacle`, into
    `.evidence/scroll-bench/<name>.png`, and stops the app at `[scroll-bench] done`;
 5. deletes the run directory.
@@ -178,7 +183,7 @@ them. This was seen in the nested KWin; `make dev` on your own session is unveri
 
 To bench another rendering mode, export its variable for the script, for example
 `WEBKIT_DMABUF_RENDERER_FORCE_SHM=1`; the app inherits it and `bench_render_mode` reports it.
-`BENCH_TIMEOUT` (seconds, default 1800) stops a stuck run.
+`BENCH_TIMEOUT` (seconds, default 1800) stops a stuck app launch.
 
 **Reports** land in `apps/desktop/src-tauri/target/scroll-bench/` (gitignored), as
 `<render mode>-<unix ts>.json` for timing runs and `<render mode>-checks-<unix ts>.json` for

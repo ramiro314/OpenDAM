@@ -246,7 +246,12 @@ async function randomJumps() {
   };
 }
 
-async function runTiming() {
+/**
+ * Runs every scenario at every size, or only `only` (`<size>/<scenario>`). One page can't
+ * attribute RSS to a scenario, since memory an earlier scenario took stays with the web process,
+ * so the run script runs each scenario in a fresh app process.
+ */
+async function runTiming(only: string | null) {
   const results: Record<string, unknown> = {};
   for (const size of GRID_SIZES) {
     const scenarios: Record<string, unknown> = {};
@@ -255,13 +260,15 @@ async function runTiming() {
       ['endToEnd', endToEnd],
       ['randomJumps', randomJumps],
     ] as const) {
+      if (only && only !== `${size}/${name}`) continue;
       await resetGrid(size);
       await log(`${size} ${name}: start`);
       scenarios[name] = await run();
       await log(`${size} ${name}: ${JSON.stringify(scenarios[name]).slice(0, 300)}`);
     }
-    results[size] = scenarios;
+    if (Object.keys(scenarios).length > 0) results[size] = scenarios;
   }
+  if (Object.keys(results).length === 0) throw new Error(`No scenario is named ${only}`);
   return results;
 }
 
@@ -304,6 +311,7 @@ export async function startScrollBench(mode: string): Promise<void> {
   let renderMode = 'unknown';
   try {
     renderMode = await invoke<string>('bench_render_mode');
+    const only = kind === 'timing' ? await invoke<string | null>('bench_only') : null;
     const waitStart = performance.now();
     const indexingSettled = await waitFor(() => indexed, INDEXING_TIMEOUT_MS, 'library:updated')
       .then(() => true)
@@ -327,10 +335,11 @@ export async function startScrollBench(mode: string): Promise<void> {
       indexingSettled,
       waitedForStartupMs: Math.round(performance.now() - waitStart),
       userAgent: navigator.userAgent,
+      scenarioFilter: only,
     };
     await log(`${kind}: context ${JSON.stringify(report.context)}`);
     if (kind === 'checks') report.checks = await runChecks();
-    else report.scenarios = await runTiming();
+    else report.scenarios = await runTiming(only);
   } catch (e) {
     report.error = String(e);
     report.context ??= { renderMode, startedAt };

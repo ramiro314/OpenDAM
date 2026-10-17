@@ -8,7 +8,7 @@
 # Environment:
 #   OPENDAM_BENCH_GOLDEN  the golden snapshot (default ~/.cache/opendam-bench/kenney-golden)
 #   BENCH_SHOTS           where checks-mode screenshots go (default <repo>/.evidence/scroll-bench)
-#   BENCH_TIMEOUT         seconds before the app is stopped (default 1800)
+#   BENCH_TIMEOUT         seconds before each app launch is stopped (default 1800)
 #   WEBKIT_*, __NV_*      passed through to the app, to bench another rendering mode
 set -euo pipefail
 
@@ -48,35 +48,71 @@ echo "Building the debug binary with an embedded development-mode frontend"
   >"$run/build.log" 2>&1) || { tail -30 "$run/build.log" >&2; exit 1; }
 
 mkdir -p "$shots" "$reports"
+# Timing runs start a fresh app process for each scenario, so no scenario's RSS includes memory an
+# earlier one left in the web process. Checks run in one process.
+if [[ $mode == checks ]]; then
+  scenarios=(all)
+else
+  scenarios=()
+  for size in sm md lg; do
+    for name in continuousScroll endToEnd randomJumps; do scenarios+=("$size/$name"); done
+  done
+fi
+
 cat >"$run/session.sh" <<EOF
 #!/usr/bin/env bash
-# Runs inside the nested KWin: starts the app, screenshots each pause, stops at the report.
+# Runs inside the nested KWin: for each scenario, starts the app, screenshots each pause and stops
+# the app at its report.
 cd "$desktop/src-tauri"
-XDG_DATA_HOME="$run/xdg" OPENDAM_NO_KEYRING=1 ./target/debug/opendam-desktop >"$run/app.log" 2>&1 &
-app=\$!
-timeout $timeout tail -n +1 -F "$run/app.log" 2>/dev/null | while IFS= read -r line; do
-  case "\$line" in
-    *"[scroll-bench] pause "*)
-      name=\${line##*pause }
-      spectacle -b -n -a -o "$shots/\$name.png" && echo "screenshot $shots/\$name.png" ;;
-    *"[scroll-bench] done "* | *"[scroll-bench] failed"*)
-      echo "\$line"
-      break ;;
-  esac
+for only in ${scenarios[*]}; do
+  log="$run/app-\${only//\//-}.log"
+  [[ \$only == all ]] && only=
+  XDG_DATA_HOME="$run/xdg" OPENDAM_NO_KEYRING=1 OPENDAM_SCROLL_BENCH_ONLY=\$only \\
+    ./target/debug/opendam-desktop >"\$log" 2>&1 &
+  app=\$!
+  timeout $timeout tail -n +1 -F "\$log" 2>/dev/null | while IFS= read -r line; do
+    case "\$line" in
+      *"[scroll-bench] pause "*)
+        name=\${line##*pause }
+        spectacle -b -n -a -o "$shots/\$name.png" && echo "screenshot $shots/\$name.png" ;;
+      *"[scroll-bench] done "* | *"[scroll-bench] failed"*)
+        echo "\$line"
+        break ;;
+    esac
+  done
+  kill \$app 2>/dev/null
+  wait \$app 2>/dev/null
+  cat "\$log" >>"$run/app.log"
 done
-kill \$app 2>/dev/null
-wait \$app 2>/dev/null
 EOF
 chmod +x "$run/session.sh"
 
-echo "Running VITE_SCROLL_BENCH=$mode in a nested headless KWin (up to ${timeout}s)"
+echo "Running VITE_SCROLL_BENCH=$mode in a nested headless KWin (up to ${timeout}s per scenario)"
 dbus-run-session -- env -u DISPLAY kwin_wayland --virtual --no-lockscreen \
   --width 1400 --height 900 --socket "wayland-bench-$$" --exit-with-session "$run/session.sh" ||
   true # KWin exits non-zero when the session ends; the app log says whether the run finished
 
 cp "$run/app.log" "$reports/last-run.log"
-grep -q '\[scroll-bench\] done ' "$run/app.log" || {
+mapfile -t done_reports < <(sed -n 's/^\[scroll-bench\] done //p' "$run/app.log")
+if [[ ${#done_reports[@]} -ne ${#scenarios[@]} ]]; then
   echo "The run did not finish; see $reports/last-run.log" >&2
   exit 1
-}
-grep '\[scroll-bench\] done ' "$run/app.log"
+fi
+if [[ $mode == checks ]]; then
+  echo "[scroll-bench] done ${done_reports[0]}"
+  exit 0
+fi
+
+# One report from the per-scenario ones: the first run's context, every run's scenarios
+jq -s '. as $runs | {
+  kind: "timing",
+  context: (($runs[0].context | del(.scenarioFilter))
+    + {isolation: "each scenario in a fresh app process",
+       indexingSettled: ($runs | map(.context.indexingSettled) | all)}),
+  scenarios: ($runs | map(.scenarios) | reduce .[] as $s ({}; . * $s))
+}' "${done_reports[@]}" >"$run/merged.json"
+rm -f "${done_reports[@]}"
+# Named after the partials are gone: the last one may carry this same second's timestamp
+merged=$reports/$(jq -r .context.renderMode "$run/merged.json")-$(date +%s).json
+mv "$run/merged.json" "$merged"
+echo "[scroll-bench] done $merged"

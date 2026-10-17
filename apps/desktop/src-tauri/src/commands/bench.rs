@@ -72,6 +72,16 @@ pub fn bench_render_mode() -> &'static str {
     crate::render::current_render_mode()
 }
 
+/// The one timing scenario this app process runs, as `<size>/<scenario>` (for example
+/// `md/endToEnd`), from `OPENDAM_SCROLL_BENCH_ONLY`. The run script starts a fresh process per
+/// scenario, so no scenario's RSS includes memory an earlier one left behind. Unset runs them all.
+#[tauri::command]
+pub fn bench_only() -> Option<String> {
+    std::env::var("OPENDAM_SCROLL_BENCH_ONLY")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 /// Prints one harness line to the app's stdout, where the nested-KWin script watches for
 /// progress, screenshot pauses and the end of a run. The webview's console doesn't reach it.
 #[tauri::command]
