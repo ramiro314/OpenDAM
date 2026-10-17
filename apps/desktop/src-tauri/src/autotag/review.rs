@@ -351,15 +351,21 @@ pub async fn apply(
     pairs.retain(|p| !present.contains(&(p.asset_id.clone(), p.tag_id.clone())));
 
     // Step 1.
-    let (status, created) =
-        record_review(master, &open, run_id, &new_tags, &mut resolved, &mut pairs)
-            .await
-            .map_err(|e| match e {
-                ReviewError::AlreadyReviewed => {
-                    "A proposal was already reviewed, or isn't part of this run".to_string()
-                }
-                ReviewError::Db(e) => e.to_string(),
-            })?;
+    let (status, created) = record_review(
+        master,
+        &present,
+        run_id,
+        &new_tags,
+        &mut resolved,
+        &mut pairs,
+    )
+    .await
+    .map_err(|e| match e {
+        ReviewError::AlreadyReviewed => {
+            "A proposal was already reviewed, or isn't part of this run".to_string()
+        }
+        ReviewError::Db(e) => e.to_string(),
+    })?;
     // A name mapped onto a catalog tag can repeat a pair: write it once.
     pairs.sort();
     pairs.dedup();
@@ -393,7 +399,8 @@ pub async fn apply(
     })
 }
 
-/// The `(asset, tag)` pairs among `pairs` that their open library already has.
+/// Every `(asset, tag)` pair the open libraries hold for the assets of `pairs`, whatever the tag,
+/// so it also answers for a tag a pair is later remapped to (`record_review`).
 async fn present_pairs(
     open: &BTreeMap<String, LibraryHandle>,
     pairs: &[PendingPair],
@@ -443,13 +450,14 @@ impl From<sqlx::Error> for ReviewError {
 /// `new_tags` maps each normalized name to create to its planned id, name and parent. The
 /// transaction takes the write lock before it reads the catalog, so a name the catalog gained
 /// since the review read it (a Create freely run made it, say) maps onto that tag instead: its
-/// decisions in `resolved` become `mapped` and its `pairs` take the tag's id. Those pairs are
-/// checked against their `open` libraries again, since the caller's check knew only the planned
-/// id: a pair the library already has is dropped, so undo never removes a tag the review didn't
-/// add, even when its write waits for replay. A parent deleted meanwhile is dropped.
+/// decisions in `resolved` become `mapped` and its `pairs` take the tag's id. A remapped pair in
+/// `present` (every tag the pairs' assets held when the caller read their libraries) is dropped,
+/// so undo never removes a tag the review didn't add, even when its write waits for replay. No
+/// library is read here: the write lock on master is never held across library I/O. A parent
+/// deleted meanwhile is dropped.
 async fn record_review(
     master: &Pool<Sqlite>,
-    open: &BTreeMap<String, LibraryHandle>,
+    present: &HashSet<(String, String)>,
     run_id: &str,
     new_tags: &BTreeMap<String, (String, String, Option<String>)>,
     resolved: &mut [Resolved],
@@ -482,17 +490,12 @@ async fn record_review(
             r.created_tag = false;
         }
     }
-    let mut remapped = Vec::new();
     for pair in pairs.iter_mut() {
         if let Some(id) = existing.get(pair.tag_id.as_str()) {
             pair.tag_id = id.clone();
-            remapped.push(pair.clone());
         }
     }
-    if !remapped.is_empty() {
-        let present = present_pairs(open, &remapped).await?;
-        pairs.retain(|p| !present.contains(&(p.asset_id.clone(), p.tag_id.clone())));
-    }
+    pairs.retain(|p| !present.contains(&(p.asset_id.clone(), p.tag_id.clone())));
     for r in resolved.iter() {
         // Only a pending proposal: a review applied meanwhile rolls this one back.
         let updated = sqlx::query(
@@ -1078,7 +1081,9 @@ mod tests {
 
         let (_, created) = record_review(
             master,
-            &open_libraries(&s.db).await,
+            &present_pairs(&open_libraries(&s.db).await, &pairs)
+                .await
+                .unwrap(),
             "run",
             &new_tags,
             &mut resolved,
@@ -1125,7 +1130,8 @@ mod tests {
     async fn a_remapped_pair_the_library_already_has_is_not_recorded_as_the_reviews() {
         let s = run_with_proposals("awaiting_review").await;
         let master = &s.db.master_pool;
-        // A Create freely run made "ROCK" and applied it to a1 after the review checked a1.
+        // A Create freely run made "ROCK" and applied it to a1 before the review read the
+        // libraries, then the review planned "Rock" as new from an older catalog read.
         insert_tag(master, "t-made", "ROCK").await;
         insert_tag(&s.a, "t-made", "ROCK").await;
         sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES ('a1', 't-made')")
@@ -1154,7 +1160,9 @@ mod tests {
 
         record_review(
             master,
-            &open_libraries(&s.db).await,
+            &present_pairs(&open_libraries(&s.db).await, &pairs)
+                .await
+                .unwrap(),
             "run",
             &new_tags,
             &mut resolved,
