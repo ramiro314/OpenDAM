@@ -1173,8 +1173,6 @@ fn finish_notice(run: &RunSummary, status: &str) -> Notice {
     }
 }
 
-/// The thumbnail as a PNG at most `THUMBNAIL_EDGE` px on its long edge, or None when it can't
-/// be read: the request is then text only.
 /// A typical asset for the estimate: names and a path of usual length, and a little metadata.
 fn sample_asset() -> AssetInfo {
     AssetInfo {
@@ -1186,6 +1184,8 @@ fn sample_asset() -> AssetInfo {
     }
 }
 
+/// The thumbnail as a PNG at most `THUMBNAIL_EDGE` px on its long edge, or None when it can't
+/// be read: the request is then text only.
 fn load_thumbnail(path: &Path) -> Option<Thumbnail> {
     let image = image::open(path)
         .map_err(|e| tracing::debug!("No thumbnail for tagging from {path:?}: {e}"))
