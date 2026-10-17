@@ -423,7 +423,16 @@ fn push_collection_filter(filter: &mut SqlFilter, query: &SearchQuery) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: how many count queries this thread has started, so a test can tell a skipped
+    /// count from one whose result was dropped.
+    static COUNT_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 async fn count_assets(pool: &sqlx::Pool<sqlx::Sqlite>, filter: &SqlFilter) -> sqlx::Result<i64> {
+    #[cfg(test)]
+    COUNT_QUERIES.with(|c| c.set(c.get() + 1));
     let sql = format!("SELECT COUNT(*) FROM assets a {}", filter.where_clause());
     let mut query = sqlx::query_scalar::<_, i64>(&sql);
     for b in &filter.binds {
@@ -1632,7 +1641,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_search_without_the_total_skips_the_count() {
-        let pool = attribute_library().await;
+        let a = attribute_library().await;
+        let b = attribute_library().await;
         let payload = |include_total: Option<bool>| {
             let mut payload = serde_json::json!({
                 "query": { "text": "", "filter": {}, "sort": { "field": "name", "order": "asc" } },
@@ -1644,22 +1654,41 @@ mod tests {
             }
             serde_json::from_value::<SearchPayload>(payload).unwrap()
         };
-        let libs = [(pool.clone(), None)];
+        // The first page and every match, over one library and over two.
+        let cases = [
+            (vec![(a.clone(), None)], ids(&["m1", "m2"]), 5),
+            (vec![(a, None), (b, None)], ids(&["m1", "m1"]), 10),
+        ];
 
-        let without = search_libraries(&payload(Some(false)), &libs)
-            .await
-            .unwrap();
-        assert_eq!(without.total, None);
-        assert_eq!(without.assets.len(), 2);
-        assert!(serde_json::to_value(&without)
-            .unwrap()
-            .get("total")
-            .is_none());
+        for (libs, page, total) in cases {
+            let search = |include_total| {
+                let libs = &libs;
+                async move {
+                    let before = COUNT_QUERIES.with(|c| c.get());
+                    let result = search_libraries(&payload(include_total), libs)
+                        .await
+                        .unwrap();
+                    (result, COUNT_QUERIES.with(|c| c.get()) - before)
+                }
+            };
+            let n = libs.len();
 
-        let with = search_libraries(&payload(Some(true)), &libs).await.unwrap();
-        assert_eq!(with.total, Some(5));
-        let by_default = search_libraries(&payload(None), &libs).await.unwrap();
-        assert_eq!(by_default.total, Some(5));
+            let (without, counts) = search(Some(false)).await;
+            assert_eq!(counts, 0, "{n} libraries counted without includeTotal");
+            assert_eq!(without.total, None);
+            assert!(serde_json::to_value(&without)
+                .unwrap()
+                .get("total")
+                .is_none());
+            let found: Vec<String> = without.assets.into_iter().map(|a| a.id).collect();
+            assert_eq!(found, page);
+
+            for include_total in [Some(true), None] {
+                let (with, counts) = search(include_total).await;
+                assert_eq!(counts, n, "includeTotal {include_total:?}");
+                assert_eq!(with.total, Some(total), "includeTotal {include_total:?}");
+            }
+        }
     }
 
     async fn tagged(pool: &sqlx::Pool<sqlx::Sqlite>) -> Vec<(String, String)> {
