@@ -456,7 +456,18 @@ expected output. Update the table when prices change.
 - **Entry points (D8, D31):**
   - The toolbar "Auto-tag" button, enabled with a selection.
   - The new grid right-click menu (Auto-tag..., Reveal in file manager, Open, Delete).
-  - A right-click menu on a sidebar library row with "Auto-tag library...".
+    - **Selection (built):** right-clicking an asset outside the selection also selects it, so
+      the menu acts on what you see selected.
+    - **Open and Reveal cap (built):** both act on each target asset, up to 10. Past 10 they are
+      disabled with "Works on up to 10 assets at once", so a misclick can't launch hundreds of
+      apps.
+    - **Delete (built):** opens the same confirmation as the Delete key.
+  - A right-click menu on a sidebar library row with "Auto-tag library...". It opens the run
+    dialog with "All assets" unticked, so the run covers the library's untagged assets (D20).
+  - **Disabled items (built):** an item that can't run shows its reason under its label,
+    because disabled buttons show no tooltip in this webview. The menus share one
+    `ContextMenu`, which closes on Escape from anywhere in the window, since a menu whose items
+    are all disabled holds no focus.
 
 - **Detail panel Tags tab (D17):**
   - A "Suggest tags" button whose tooltip names the provider and mode.
@@ -494,10 +505,17 @@ expected output. Update the table when prices change.
   hint. Command: `update_tag(id, patch)`. It writes master, then mirrors through
   `db::upsert_tag`. A name collision returns an error the dialog shows.
 
-- **Run commands:** `estimate_autotag_run`, `start_autotag_run` (asset ids, or a library id with
-  `all_assets`; provider; mode; `inline`), `list_autotag_runs`, `get_autotag_run`,
+- **Run commands:** `estimate_autotag_run`, `start_autotag_run` (`scope`; provider; mode;
+  `inline`), `list_autotag_runs`, `get_autotag_run`,
   `pause_autotag_run`, `resume_autotag_run`, `resume_all_autotag_runs`, `cancel_autotag_run`,
   `retry_failed_autotag_run` (returns the new run), `undo_autotag_run`, `clear_autotag_runs`.
+  - **`scope` (built):** one argument instead of separate asset ids, library id and
+    `all_assets`, so a call can't name both or neither. It is `{ "kind": "assets", "assetIds":
+    [...] }` or `{ "kind": "library", "libraryId": "...", "allAssets": false }` (`RunScope` in
+    `autotag/engine.rs`).
+  - **Library runs:** `allAssets: false` covers the library's assets with no `asset_tags` row,
+    and `true` covers all of them. An offline library, or one with nothing to tag, is refused
+    and no run is created.
 
 ### New dependencies
 

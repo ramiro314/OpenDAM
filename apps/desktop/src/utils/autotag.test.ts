@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { AutotagProviderOption, RunSummary } from '../types';
-import { autotagAvailability, modeOptions, runProgress, taggingSummary } from './autotag';
+import { autotagAvailability, modeOptions, runProgress, scopeFor, taggingSummary } from './autotag';
 
 const ALL_MODES = ['existing_only', 'prefer_existing', 'create_freely'] as const;
 
@@ -61,8 +61,57 @@ describe('autotagAvailability', () => {
     expect(autotagAvailability(providers, 2)).toEqual({ enabled: true, reason: null });
   });
 
+  test('the grid menu item acts on at least the clicked asset', () => {
+    const unconfigured = [provider('anthropic', 'Set up Anthropic in Settings')];
+
+    expect(autotagAvailability(unconfigured, 1)).toEqual({
+      enabled: false,
+      reason: 'No tagging provider is ready. Set up Anthropic in Settings.',
+    });
+    expect(autotagAvailability([provider('fake', null)], 1)).toEqual({
+      enabled: true,
+      reason: null,
+    });
+  });
+
+  test('the sidebar library item says why a library cannot be tagged', () => {
+    const unconfigured = [provider('anthropic', 'Set up Anthropic in Settings')];
+    const ready = [provider('fake', null)];
+    const empty = 'This library has no assets';
+
+    expect(autotagAvailability(unconfigured, 40, empty).reason).toBe(
+      'No tagging provider is ready. Set up Anthropic in Settings.'
+    );
+    expect(autotagAvailability(ready, 0, empty)).toEqual({ enabled: false, reason: empty });
+    expect(autotagAvailability(ready, 40, empty)).toEqual({ enabled: true, reason: null });
+  });
+
   test('is disabled while providers load', () => {
     expect(autotagAvailability(null, 2).enabled).toBe(false);
+  });
+});
+
+describe('scopeFor', () => {
+  test('an assets target sends its asset ids, whatever the checkbox says', () => {
+    expect(scopeFor({ kind: 'assets', assetIds: ['a1', 'a2'] }, true)).toEqual({
+      kind: 'assets',
+      assetIds: ['a1', 'a2'],
+    });
+  });
+
+  test('a library target sends its id and the All assets choice', () => {
+    const library = { kind: 'library', libraryId: 'lib-1', libraryName: 'Kenney' } as const;
+
+    expect(scopeFor(library, false)).toEqual({
+      kind: 'library',
+      libraryId: 'lib-1',
+      allAssets: false,
+    });
+    expect(scopeFor(library, true)).toEqual({
+      kind: 'library',
+      libraryId: 'lib-1',
+      allAssets: true,
+    });
   });
 });
 

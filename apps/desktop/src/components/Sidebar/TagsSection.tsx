@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import clsx from 'clsx';
 import { useTagStore, useUIStore, useAssetStore } from '../../store';
 import { IconEdit, IconTag, IconTrash } from '../Icons';
@@ -6,7 +6,8 @@ import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { SidebarSection } from './SidebarSection';
 import { InlineCreateForm } from './InlineCreateForm';
 import { EditTagDialog } from './EditTagDialog';
-import { fitInViewport, isNameTaken } from './sidebarHelpers';
+import { isNameTaken } from './sidebarHelpers';
+import { ContextMenu } from '../ContextMenu/ContextMenu';
 import type { Tag } from '../../types';
 import styles from './Sidebar.module.css';
 
@@ -33,24 +34,6 @@ export function TagsSection({ clearSmartFilter }: TagsSectionProps) {
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; tag: Tag } | null>(null);
   const [editTarget, setEditTarget] = useState<Tag | null>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-
-  // Opened at the cursor, then moved back inside the window once its size is known.
-  useLayoutEffect(() => {
-    const el = menuRef.current;
-    if (!menu || !el) return;
-    const { width, height } = el.getBoundingClientRect();
-    const { left, top } = fitInViewport(
-      menu.x,
-      menu.y,
-      width,
-      height,
-      window.innerWidth,
-      window.innerHeight
-    );
-    el.style.left = `${left}px`;
-    el.style.top = `${top}px`;
-  }, [menu]);
 
   const cancelCreate = () => {
     setIsCreating(false);
@@ -179,46 +162,24 @@ export function TagsSection({ clearSmartFilter }: TagsSectionProps) {
       </SidebarSection>
 
       {menu && (
-        <div
-          className={styles.contextBackdrop}
-          onClick={() => setMenu(null)}
-          onContextMenu={(e) => {
-            e.preventDefault();
-            setMenu(null);
-          }}
-        >
-          <div
-            ref={menuRef}
-            className={styles.contextMenu}
-            style={{ left: menu.x, top: menu.y }}
-            role="menu"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <button
-              className={styles.contextMenuItem}
-              role="menuitem"
-              autoFocus
-              onKeyDown={(e) => e.key === 'Escape' && setMenu(null)}
-              onClick={() => {
-                setEditTarget(menu.tag);
-                setMenu(null);
-              }}
-            >
-              <IconEdit size={12} /> Edit tag…
-            </button>
-            <button
-              className={clsx(styles.contextMenuItem, styles.contextMenuItemDanger)}
-              role="menuitem"
-              onKeyDown={(e) => e.key === 'Escape' && setMenu(null)}
-              onClick={() => {
-                setDeleteTarget({ id: menu.tag.id, name: menu.tag.name });
-                setMenu(null);
-              }}
-            >
-              <IconTrash size={12} /> Delete tag…
-            </button>
-          </div>
-        </div>
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          onClose={() => setMenu(null)}
+          items={[
+            {
+              label: 'Edit tag…',
+              icon: <IconEdit size={12} />,
+              onSelect: () => setEditTarget(menu.tag),
+            },
+            {
+              label: 'Delete tag…',
+              icon: <IconTrash size={12} />,
+              danger: true,
+              onSelect: () => setDeleteTarget({ id: menu.tag.id, name: menu.tag.name }),
+            },
+          ]}
+        />
       )}
 
       <EditTagDialog tag={editTarget} onClose={() => setEditTarget(null)} />

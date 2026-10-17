@@ -19,6 +19,7 @@ export interface AssetCardProps {
   asset: Asset;
   selected: boolean;
   onClick: (asset: Asset, e: React.MouseEvent) => void;
+  onContextMenu: (asset: Asset, e: React.MouseEvent) => void;
 }
 
 const KIND_ICON: Record<AssetKind, React.FC<{ size?: number }>> = {
@@ -45,7 +46,12 @@ const KIND_COLOR: Record<AssetKind, string> = {
   other: 'hsl(220  8% 50%)',
 };
 
-export const AssetCard = memo(function AssetCard({ asset, selected, onClick }: AssetCardProps) {
+export const AssetCard = memo(function AssetCard({
+  asset,
+  selected,
+  onClick,
+  onContextMenu,
+}: AssetCardProps) {
   const [imgError, setImgError] = useState(false);
   const patchAsset = useAssetStore((s) => s.patchAsset);
 
@@ -62,6 +68,15 @@ export const AssetCard = memo(function AssetCard({ asset, selected, onClick }: A
       onClick(asset, e);
     },
     [asset, onClick]
+  );
+
+  const handleContextMenu = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      onContextMenu(asset, e);
+    },
+    [asset, onContextMenu]
   );
 
   const handleToggleFavorite = useCallback(
@@ -120,6 +135,7 @@ export const AssetCard = memo(function AssetCard({ asset, selected, onClick }: A
       id={`asset-${asset.id}`}
       className={clsx(styles.card, selected && styles.selected)}
       onClick={handleClick}
+      onContextMenu={handleContextMenu}
       draggable
       onDragStart={handleDragStart}
       title={asset.fileName}
