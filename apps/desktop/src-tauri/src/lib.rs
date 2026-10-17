@@ -47,8 +47,9 @@ fn tag_providers(
     providers
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
+/// Runs the app. `render_choice` is what `main.rs` did to the rendering environment, logged
+/// once tracing is up.
+pub fn run(render_choice: render::RenderChoice) {
     // Logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -58,6 +59,7 @@ pub fn run() {
         .init();
     tracing::info!(
         target: "render",
+        choice = %render_choice,
         mode = render::current_render_mode(),
         "WebKitGTK rendering mode"
     );

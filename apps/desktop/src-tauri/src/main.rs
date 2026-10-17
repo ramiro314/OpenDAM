@@ -1,9 +1,7 @@
 fn main() {
-    // WebKitGTK's DMA-BUF renderer crashes on Wayland with NVIDIA drivers.
-    // Set this before Tauri starts any threads; an explicit value still wins.
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-    }
+    // Pick the WebKitGTK rendering default (FORCE_SHM on NVIDIA, where the DMA-BUF renderer
+    // crashes on Wayland) before Tauri starts any threads. A variable you set yourself still wins.
+    let render_choice = opendam_desktop_lib::render::apply_render_env();
 
-    opendam_desktop_lib::run();
+    opendam_desktop_lib::run(render_choice);
 }

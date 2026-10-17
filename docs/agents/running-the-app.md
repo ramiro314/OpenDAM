@@ -14,10 +14,23 @@ make dev
 - The first run in a fresh worktree compiles about 660 crates, which takes several minutes. The
   app is up when the log prints ``Running `target/debug/opendam-desktop` `` and then
   `NAS-efficient indexing complete`.
-- Export nothing. `main.rs` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` when it is unset; without it
-  the window crashes with `Error 71 (Protocol error) dispatching to Wayland display`. At startup
-  the app logs the rendering mode this gives under the `render` target (`mode="cpu"` today);
-  `render::describe_render_env` names it from the variables that are set.
+- Export nothing. Before Tauri starts, `main.rs` picks the WebKitGTK rendering mode
+  (`render::choose_render_env`):
+  - If you set any of `WEBKIT_DISABLE_DMABUF_RENDERER`, `WEBKIT_DMABUF_RENDERER_FORCE_SHM`,
+    `__NV_DISABLE_EXPLICIT_SYNC`, `WEBKIT_DISABLE_COMPOSITING_MODE` or
+    `WEBKIT_SKIA_ENABLE_CPU_RENDERING`, whatever its value, it sets nothing (`user-set`).
+  - Otherwise, with the NVIDIA driver loaded (`/proc/driver/nvidia/version`), it sets
+    `WEBKIT_DMABUF_RENDERER_FORCE_SHM=1` (`gpu-shm`): GPU painting, compositing layers and threaded
+    scrolling, with frames sent through shared memory. WebKit's default DMA-BUF path, and
+    `WEBKIT_DISABLE_COMPOSITING_MODE=1`, crash there with `Error 71 (Protocol error) dispatching
+    to Wayland display`.
+  - Otherwise it sets nothing and WebKit keeps its default (`webkit-default`).
+
+  To override it, export a variable yourself: `WEBKIT_DISABLE_DMABUF_RENDERER=1` gives the old
+  CPU rendering, and `__NV_DISABLE_EXPLICIT_SYNC=1` the zero-copy DMA-BUF path. At startup the
+  app logs the choice and the resulting mode under the `render` target, for example
+  `choice=gpu-shm (...) mode="gpu-shm"`; `render::describe_render_env` names the mode from the
+  variables that are set.
 - Vite listens on port 1420, which every worktree's `make dev` shares. If another worktree holds
   it, run on 1430 from `apps/desktop`:
 
@@ -182,8 +195,9 @@ from the asset protocol fails in WebKitGTK 2.54 (libpng logs `Read Error`, while
 same URL returns the whole file), so the grid would show no images. The embedded frontend loads
 them. This was seen in the nested KWin; `make dev` on your own session is unverified.
 
-To bench another rendering mode, export its variable for the script, for example
-`WEBKIT_DMABUF_RENDERER_FORCE_SHM=1`; the app inherits it and `bench_render_mode` reports it.
+The app picks its usual rendering mode (`gpu-shm` on this machine). To bench another, export its
+variable for the script, for example `WEBKIT_DISABLE_DMABUF_RENDERER=1` for `cpu`; the app
+inherits it and `bench_render_mode` reports it.
 `BENCH_TIMEOUT` (seconds, default 1800) stops a stuck app launch.
 
 **Reports** land in `apps/desktop/src-tauri/target/scroll-bench/` (gitignored), as
