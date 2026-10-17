@@ -110,9 +110,9 @@ export const api = {
 
   // Auto-tagging runs. Progress arrives as `autotag:updated` events.
   listAutotagProviders: () => invoke<AutotagProviderOption[]>('list_autotag_providers'),
-  /** `inline` is "Suggest tags" on one asset, which sends no desktop notification */
   estimateAutotagRun: (scope: AutotagScope, provider: string, mode: AutotagMode) =>
     invoke<RunEstimate>('estimate_autotag_run', { scope, provider, mode }),
+  /** `inline` is "Suggest tags" on one asset, which sends no desktop notification */
   startAutotagRun: (scope: AutotagScope, provider: string, mode: AutotagMode, inline = false) =>
     invoke<StartedRun>('start_autotag_run', { scope, provider, mode, inline }),
   getAutotagLastUsed: () => invoke<AutotagLastUsed>('get_autotag_last_used'),
