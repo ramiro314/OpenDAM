@@ -160,6 +160,7 @@ function WindowedResults({
   onAssetContextMenu,
 }: WindowedResultsProps) {
   const pages = useAssetStore((s) => s.pages);
+  const deleted = useAssetStore((s) => s.deleted);
   const total = useAssetStore((s) => s.total);
   const epoch = useAssetStore((s) => s.epoch);
   const anchor = useAssetStore((s) => s.anchor);
@@ -292,7 +293,9 @@ function WindowedResults({
             const first = item.index * columns;
             const items: (Asset | undefined)[] = [];
             for (let i = first; i < Math.min(total, first + columns); i++) {
-              items.push(assetAt({ pages }, i));
+              const asset = assetAt({ pages }, i);
+              // A deleted asset shows as a placeholder until the refresh after it lands
+              items.push(asset && !deleted.has(asset.id) ? asset : undefined);
             }
             return (
               <ResultRow

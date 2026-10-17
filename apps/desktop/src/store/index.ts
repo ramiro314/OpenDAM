@@ -185,6 +185,11 @@ interface AssetStore extends PageCache {
   total: number;
   /** Copies of the selected and focused assets, kept when their pages are evicted (D3) */
   pinned: Map<string, Asset>;
+  /**
+   * Assets deleted since a search or refresh last replaced the cache: their tiles show as
+   * placeholders and lookups skip them until a refresh lands without them
+   */
+  deleted: Set<string>;
   /** Pages in flight */
   pending: Set<number>;
   /** The pages the grid last asked for; never evicted */
@@ -255,7 +260,7 @@ const defaultQuery: SearchQuery = {
 
 /** Clears the grid so a failed search can't leave results from an earlier query on screen */
 function failedSearch(e: unknown): Partial<AssetStore> {
-  return { ...emptyCache(), total: 0, wanted: [], searchError: String(e) };
+  return { ...emptyCache(), total: 0, wanted: [], deleted: new Set(), searchError: String(e) };
 }
 
 /** The cached asset `id`, if its page is cached. */
@@ -265,15 +270,18 @@ function cachedAsset(s: Pick<PageCache, 'pages' | 'indexById'>, id: string): Ass
 
 /** A pinned asset, or a cached one; for selectors, which `getById` can't serve. */
 export function lookupAsset(
-  s: Pick<AssetStore, 'pinned' | 'pages' | 'indexById'>,
+  s: Pick<AssetStore, 'pinned' | 'pages' | 'indexById' | 'deleted'>,
   id: string
 ): Asset | undefined {
+  if (s.deleted.has(id)) return undefined;
   return s.pinned.get(id) ?? cachedAsset(s, id);
 }
 
 /** Every cached and pinned asset, for lookups by something other than id. */
-export function cachedAssets(s: Pick<AssetStore, 'pinned' | 'pages'>): Asset[] {
-  return [...[...s.pages.values()].flat(), ...s.pinned.values()];
+export function cachedAssets(s: Pick<AssetStore, 'pinned' | 'pages' | 'deleted'>): Asset[] {
+  return [...[...s.pages.values()].flat(), ...s.pinned.values()].filter(
+    (a) => !s.deleted.has(a.id)
+  );
 }
 
 /** `pinned` with the copies `assets` holds newer versions of. */
@@ -289,6 +297,14 @@ function repin(pinned: Map<string, Asset>, assets: Iterable<Asset>): Map<string,
 // `refresh` reads it, so it stays out of the state that components subscribe to.
 let viewTop = 0;
 
+// Consecutive failed refreshes, for their retry backoff; reset when one lands.
+let refreshFailures = 0;
+
+/** Masks deleted assets until the refresh that follows a delete replaces the cache (C4). */
+function hideDeleted(ids: string[]) {
+  useAssetStore.setState((s) => ({ deleted: new Set([...s.deleted, ...ids]) }));
+}
+
 // Consecutive failures per page, for the retry backoff; reset by every search and refresh.
 let pageFailures = { generation: -1, counts: new Map<number, number>() };
 
@@ -301,6 +317,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
   ...emptyCache(),
   total: 0,
   pinned: new Map(),
+  deleted: new Set(),
   pending: new Set(),
   wanted: [],
   generation: 0,
@@ -361,6 +378,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
         total: result.total ?? result.assets.length,
         wanted: [0],
         pinned: repin(s.pinned, result.assets),
+        deleted: new Set(),
         epoch: s.epoch + 1,
         anchor: null,
         searchError: null,
@@ -447,6 +465,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       });
       const to = findAnchor(cache.pages, anchorId, from, total);
       viewTop = to;
+      refreshFailures = 0;
       set((cur) => ({
         ...cache,
         total,
@@ -454,14 +473,21 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
           cur.pinned,
           results.flatMap((r) => r.assets)
         ),
+        deleted: new Set(),
         epoch: cur.epoch + 1,
         anchor: { from, to },
         searchError: null,
       }));
     } catch (e) {
-      // The cached results belong to this same query, so keep them; the next event or search retries.
+      // The cached results belong to this same query, so keep them, and ask for the wanted pages
+      // that were in flight. Deleted assets stay masked and the rest stale until a refresh lands,
+      // so try again, waiting longer after each failure, unless a newer search or refresh ran.
       console.error('Failed to refresh assets:', e);
       get().ensurePages(get().wanted);
+      refreshFailures += 1;
+      setTimeout(() => {
+        if (get().generation === generation) void get().refresh();
+      }, retryDelay(refreshFailures));
     }
   },
 
@@ -484,6 +510,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
   deleteAsset: async (id, deleteFile = true) => {
     await api.deleteAsset(id, deleteFile);
     deselectAssets([id]);
+    hideDeleted([id]);
     await get().refresh();
   },
 
@@ -497,11 +524,13 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       const gone = ids.filter((id) => !failed.has(id));
       if (gone.length > 0) {
         deselectAssets(gone);
+        hideDeleted(gone);
         await get().refresh();
       }
       throw err;
     }
     deselectAssets(ids);
+    hideDeleted(ids);
     await get().refresh();
   },
 

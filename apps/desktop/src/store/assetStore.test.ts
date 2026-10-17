@@ -1,6 +1,13 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { api } from '../api';
-import { useAssetStore, useAutotagStore, useCollectionStore, useTagStore, useUIStore } from '.';
+import {
+  cachedAssets,
+  useAssetStore,
+  useAutotagStore,
+  useCollectionStore,
+  useTagStore,
+  useUIStore,
+} from '.';
 import { MAX_PAGES, PAGE_SIZE, RETRY_MS, emptyCache, retryDelay } from './pageCache';
 import type { Asset, DeleteAssetsError, SearchPayload, SearchResult, Tag } from '../types';
 
@@ -67,6 +74,7 @@ beforeEach(() => {
     ...emptyCache(),
     total: 0,
     pinned: new Map(),
+    deleted: new Set(),
     pending: new Set(),
     wanted: [],
     loading: false,
@@ -78,6 +86,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Stops any retry a test left scheduled: retries only run for the generation that failed
+  useAssetStore.setState((s) => ({ generation: s.generation + 1 }));
   api.searchAssets = realSearch;
   api.deleteAssets = realDeleteAssets;
   api.getAsset = realGetAsset;
@@ -523,6 +533,56 @@ describe('useAssetStore deleteAssets', () => {
     expect(useUIStore.getState().focusedAssetId).toBeNull();
     expect(useAssetStore.getState().getById('b')).toBeUndefined();
     expect(useAssetStore.getState().total).toBe(1);
+  });
+
+  test('a delete whose refresh fails masks the deleted assets, and the retried refresh drops them', async () => {
+    let all = ['a', 'b', 'c', 'd'].map(named);
+    const answer = pagesOf(() => all);
+    let refreshes = 0;
+    api.searchAssets = async (payload) => {
+      // The first refresh after the delete times out, as when the pool is starved
+      if (payload.includeTotal !== false && refreshes++ === 1) {
+        throw 'pool timed out while waiting for an open connection';
+      }
+      return answer(payload);
+    };
+    await useAssetStore.getState().search();
+    useUIStore.getState().selectAll(['a']);
+    api.deleteAssets = async (ids) => {
+      all = all.filter((a) => !ids.includes(a.id));
+    };
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+
+    await useAssetStore.getState().deleteAssets(['a']);
+
+    let s = useAssetStore.getState();
+    expect(s.pages.get(0)?.map((a) => a.id)).toEqual(['a', 'b', 'c', 'd']); // still stale
+    expect(s.deleted).toEqual(new Set(['a']));
+    expect(s.getById('a')).toBeUndefined();
+    expect(cachedAssets(s).map((a) => a.id)).toEqual(['b', 'c', 'd']);
+
+    await until(() => useAssetStore.getState().total === 3, 5_000);
+    consoleError.mockRestore();
+    s = useAssetStore.getState();
+    expect(s.pages.get(0)?.map((a) => a.id)).toEqual(['b', 'c', 'd']);
+    expect(s.deleted.size).toBe(0);
+  });
+
+  test('a failed refresh is not retried once a newer search ran', async () => {
+    const all = library(10);
+    serve(() => all);
+    await useAssetStore.getState().search();
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+    api.searchAssets = async () => {
+      throw 'database is locked';
+    };
+    await useAssetStore.getState().refresh();
+    const calls = serve(() => all);
+    await useAssetStore.getState().search();
+    await sleep(RETRY_MS * 2);
+    consoleError.mockRestore();
+
+    expect(calls.map((c) => c.page)).toEqual([0]);
   });
 
   test('a rejection without failed ids keeps every asset', async () => {
