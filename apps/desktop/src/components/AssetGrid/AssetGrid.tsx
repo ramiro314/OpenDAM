@@ -1,12 +1,20 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import clsx from 'clsx';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useUIStore, useAssetStore, useLibraryStore } from '../../store';
+import { api } from '../../api';
+import { useUIStore, useAssetStore, useLibraryStore, useAutotagStore } from '../../store';
+import { autotagAvailability } from '../../utils/autotag';
+import { menuTargets } from '../../utils/contextMenu';
+import { ContextMenu } from '../ContextMenu/ContextMenu';
+import { IconEye, IconExternal, IconTag, IconTrash } from '../Icons';
 import { AssetCard } from './AssetCard';
 import { AssetListRow } from './AssetListRow';
 import { FilterBar } from './FilterBar';
 import type { Asset } from '../../types';
 import styles from './AssetGrid.module.css';
+
+/** The most assets Open or Reveal acts on at once, so a misclick can't launch hundreds of apps */
+const MAX_OPEN = 10;
 
 const GRID_COLS: Record<'sm' | 'md' | 'lg', number> = {
   sm: 180,
@@ -20,6 +28,10 @@ export function AssetGrid() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const hasMore = assets.length < total;
+  const providers = useAutotagStore((s) => s.providers);
+  const openAutotagDialog = useAutotagStore((s) => s.openAutotagDialog);
+  const requestDelete = useUIStore((s) => s.requestDelete);
+  const [menu, setMenu] = useState<{ x: number; y: number; assetIds: string[] } | null>(null);
 
   const tileSize = GRID_COLS[gridSize];
 
@@ -48,6 +60,17 @@ export function AssetGrid() {
   const handleAssetClick = useCallback(
     (asset: Asset, e: React.MouseEvent) => {
       selectAsset(asset.id, e.metaKey || e.ctrlKey);
+    },
+    [selectAsset]
+  );
+
+  // Acts on the selection, or on the clicked asset alone if it isn't selected (it becomes the
+  // selection, so you see what the menu acts on).
+  const handleAssetContextMenu = useCallback(
+    (asset: Asset, e: React.MouseEvent) => {
+      const selected = useUIStore.getState().selectedAssetIds;
+      if (!selected.has(asset.id)) selectAsset(asset.id);
+      setMenu({ x: e.clientX, y: e.clientY, assetIds: menuTargets(selected, asset.id) });
     },
     [selectAsset]
   );
@@ -104,6 +127,7 @@ export function AssetGrid() {
                 asset={asset}
                 selected={selectedAssetIds.has(asset.id)}
                 onClick={handleAssetClick}
+                onContextMenu={handleAssetContextMenu}
               />
             ))}
           </div>
@@ -115,6 +139,7 @@ export function AssetGrid() {
                 asset={asset}
                 selected={selectedAssetIds.has(asset.id)}
                 onClick={handleAssetClick}
+                onContextMenu={handleAssetContextMenu}
               />
             ))}
           </div>
@@ -126,7 +151,84 @@ export function AssetGrid() {
           {assets.length.toLocaleString()} of {total.toLocaleString()} assets
         </span>
       </div>
+      {menu && (
+        <AssetContextMenu
+          {...menu}
+          autotagReason={autotagAvailability(providers, menu.assetIds.length).reason}
+          onAutotag={() => openAutotagDialog({ kind: 'assets', assetIds: menu.assetIds })}
+          onDelete={() => requestDelete(menu.assetIds)}
+          onClose={() => setMenu(null)}
+        />
+      )}
     </div>
+  );
+}
+
+interface AssetContextMenuProps {
+  x: number;
+  y: number;
+  assetIds: string[];
+  autotagReason: string | null;
+  onAutotag: () => void;
+  onDelete: () => void;
+  onClose: () => void;
+}
+
+/** The grid's right-click menu: Auto-tag..., Reveal in file manager, Open, Delete. */
+function AssetContextMenu({
+  x,
+  y,
+  assetIds,
+  autotagReason,
+  onAutotag,
+  onDelete,
+  onClose,
+}: AssetContextMenuProps) {
+  const tooMany = assetIds.length > MAX_OPEN ? `Works on up to ${MAX_OPEN} assets at once` : null;
+  const forEachPath = (action: (path: string) => Promise<void>, what: string) => {
+    const getById = useAssetStore.getState().getById;
+    for (const id of assetIds) {
+      const path = getById(id)?.filePath;
+      if (path) action(path).catch((err) => console.error(`Failed to ${what}:`, err));
+    }
+  };
+
+  return (
+    <ContextMenu
+      x={x}
+      y={y}
+      onClose={onClose}
+      items={[
+        {
+          id: 'grid-menu-autotag',
+          label: 'Auto-tag…',
+          icon: <IconTag size={12} />,
+          disabledReason: autotagReason,
+          onSelect: onAutotag,
+        },
+        {
+          id: 'grid-menu-reveal',
+          label: 'Reveal in file manager',
+          icon: <IconEye size={12} />,
+          disabledReason: tooMany,
+          onSelect: () => forEachPath(api.revealInFileManager, 'reveal in file manager'),
+        },
+        {
+          id: 'grid-menu-open',
+          label: 'Open',
+          icon: <IconExternal size={12} />,
+          disabledReason: tooMany,
+          onSelect: () => forEachPath(api.openWithDefault, 'open with default app'),
+        },
+        {
+          id: 'grid-menu-delete',
+          label: 'Delete…',
+          icon: <IconTrash size={12} />,
+          danger: true,
+          onSelect: onDelete,
+        },
+      ]}
+    />
   );
 }
 

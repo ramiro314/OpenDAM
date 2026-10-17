@@ -27,10 +27,15 @@ export interface Availability {
   reason: string | null;
 }
 
-/** Whether an auto-tag entry point can open the run dialog, and why not when it can't. */
+/**
+ * Whether an auto-tag entry point can open the run dialog, and why not when it can't.
+ * `assetCount` is what the entry point would tag (the selection, the right-clicked assets, a
+ * library's assets), and `emptyReason` says why it can't tag nothing.
+ */
 export function autotagAvailability(
   providers: AutotagProviderOption[] | null,
-  assetCount: number
+  assetCount: number,
+  emptyReason = 'Select assets to auto-tag'
 ): Availability {
   if (providers === null) return { enabled: false, reason: 'Checking tagging providers…' };
   if (!providers.some((p) => p.unavailableReason === null)) {
@@ -40,7 +45,7 @@ export function autotagAvailability(
       reason: ['No tagging provider is ready.', ...reasons].join(' '),
     };
   }
-  if (assetCount === 0) return { enabled: false, reason: 'Select assets to auto-tag' };
+  if (assetCount === 0) return { enabled: false, reason: emptyReason };
   return { enabled: true, reason: null };
 }
 

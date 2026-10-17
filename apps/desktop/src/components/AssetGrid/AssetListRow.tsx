@@ -11,6 +11,7 @@ interface AssetListRowProps {
   asset: Asset;
   selected: boolean;
   onClick: (asset: Asset, e: React.MouseEvent) => void;
+  onContextMenu: (asset: Asset, e: React.MouseEvent) => void;
 }
 
 function formatDate(ms: number): string {
@@ -22,6 +23,7 @@ export const AssetListRow = memo(function AssetListRow({
   asset,
   selected,
   onClick,
+  onContextMenu,
 }: AssetListRowProps) {
   const patchAsset = useAssetStore((s) => s.patchAsset);
 
@@ -31,6 +33,15 @@ export const AssetListRow = memo(function AssetListRow({
       onClick(asset, e);
     },
     [asset, onClick]
+  );
+
+  const handleContextMenu = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      onContextMenu(asset, e);
+    },
+    [asset, onContextMenu]
   );
 
   const handleToggleFavorite = useCallback(
@@ -54,6 +65,7 @@ export const AssetListRow = memo(function AssetListRow({
       id={`asset-row-${asset.id}`}
       className={clsx(styles.row, selected && styles.selected)}
       onClick={handleClick}
+      onContextMenu={handleContextMenu}
       draggable
       onDragStart={handleDragStart}
       role="button"

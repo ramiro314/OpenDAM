@@ -2,24 +2,28 @@ import { useEffect, useState } from 'react';
 import clsx from 'clsx';
 import { api } from '../../api';
 import { useAutotagStore } from '../../store';
-import type { AutotagMode } from '../../types';
+import type { AutotagMode, AutotagScope, AutotagTarget } from '../../types';
 import { modeOptions } from '../../utils/autotag';
 import { IconTag, IconX } from '../Icons';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './Autotag.module.css';
 
 interface AutotagDialogProps {
-  assetIds: string[];
+  target: AutotagTarget;
   onClose: () => void;
 }
 
-/** Picks a provider and a mode, then starts a background run over `assetIds`. */
-export function AutotagDialog({ assetIds, onClose }: AutotagDialogProps) {
+/**
+ * Picks a provider and a mode, then starts a background run over the target's assets: chosen
+ * assets, or a library's untagged assets unless "All assets" is ticked.
+ */
+export function AutotagDialog({ target, onClose }: AutotagDialogProps) {
   const providers = useAutotagStore((s) => s.providers);
   const fetchProviders = useAutotagStore((s) => s.fetchProviders);
   const setRunsPanelOpen = useAutotagStore((s) => s.setRunsPanelOpen);
   const [providerId, setProviderId] = useState<string | null>(null);
   const [mode, setMode] = useState<AutotagMode>('existing_only');
+  const [allAssets, setAllAssets] = useState(false);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -51,7 +55,11 @@ export function AutotagDialog({ assetIds, onClose }: AutotagDialogProps) {
     setStarting(true);
     setError(null);
     try {
-      await api.startAutotagRun(assetIds, provider.id, mode);
+      const scope: AutotagScope =
+        target.kind === 'assets'
+          ? { kind: 'assets', assetIds: target.assetIds }
+          : { kind: 'library', libraryId: target.libraryId, allAssets };
+      await api.startAutotagRun(scope, provider.id, mode);
       onClose();
       setRunsPanelOpen(true);
     } catch (e) {
@@ -61,7 +69,13 @@ export function AutotagDialog({ assetIds, onClose }: AutotagDialogProps) {
     }
   };
 
-  const count = assetIds.length;
+  let title: string;
+  if (target.kind === 'library') {
+    title = `Auto-tag library ${target.libraryName}`;
+  } else {
+    const count = target.assetIds.length;
+    title = `Auto-tag ${count.toLocaleString()} asset${count === 1 ? '' : 's'}`;
+  }
 
   return (
     <div className={dialog.overlay} onClick={onClose}>
@@ -76,7 +90,7 @@ export function AutotagDialog({ assetIds, onClose }: AutotagDialogProps) {
           <div className={dialog.titleArea}>
             <IconTag size={16} />
             <h3 id="autotag-title" className={dialog.title}>
-              Auto-tag {count.toLocaleString()} asset{count === 1 ? '' : 's'}
+              {title}
             </h3>
           </div>
           <button className={dialog.closeBtn} onClick={onClose} title="Close">
@@ -85,6 +99,30 @@ export function AutotagDialog({ assetIds, onClose }: AutotagDialogProps) {
         </div>
 
         <div className={dialog.content}>
+          {target.kind === 'library' && (
+            <>
+              <h4 className={dialog.sectionTitle}>Assets</h4>
+              <fieldset className={styles.fieldset}>
+                <label className={clsx(styles.choice, allAssets && styles.choiceSelected)}>
+                  <input
+                    id="autotag-all-assets"
+                    type="checkbox"
+                    checked={allAssets}
+                    onChange={(e) => setAllAssets(e.target.checked)}
+                  />
+                  <span className={styles.choiceText}>
+                    <span className={styles.choiceLabel}>All assets</span>
+                    <span className={styles.choiceNote}>
+                      {allAssets
+                        ? 'Every asset in the library, tagged or not. Existing tags are kept.'
+                        : 'Off: only assets with no tag yet.'}
+                    </span>
+                  </span>
+                </label>
+              </fieldset>
+            </>
+          )}
+
           <h4 className={dialog.sectionTitle}>Provider</h4>
           <fieldset className={styles.fieldset}>
             {providers?.map((p) => {

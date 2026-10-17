@@ -17,6 +17,7 @@ import type {
   ProviderStatus,
   AutotagMode,
   AutotagProviderOption,
+  AutotagScope,
   RunSummary,
   StartedRun,
 } from '../types';
@@ -92,7 +93,7 @@ export const api = {
 
   // Auto-tagging runs. Progress arrives as `autotag:updated` events.
   listAutotagProviders: () => invoke<AutotagProviderOption[]>('list_autotag_providers'),
-  startAutotagRun: (assetIds: string[], provider: string, mode: AutotagMode) =>
-    invoke<StartedRun>('start_autotag_run', { assetIds, provider, mode }),
+  startAutotagRun: (scope: AutotagScope, provider: string, mode: AutotagMode) =>
+    invoke<StartedRun>('start_autotag_run', { scope, provider, mode }),
   listAutotagRuns: () => invoke<RunSummary[]>('list_autotag_runs'),
 };

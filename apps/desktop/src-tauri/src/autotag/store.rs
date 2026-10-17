@@ -146,6 +146,18 @@ pub async fn locate_assets(
         .collect())
 }
 
+/// A library's assets with no tag, or all of them with `all_assets`, in file path order.
+pub async fn library_assets(lib: &Pool<Sqlite>, all_assets: bool) -> sqlx::Result<Vec<String>> {
+    let sql = if all_assets {
+        "SELECT id FROM assets ORDER BY file_path"
+    } else {
+        "SELECT id FROM assets a
+         WHERE NOT EXISTS (SELECT 1 FROM asset_tags t WHERE t.asset_id = a.id)
+         ORDER BY file_path"
+    };
+    sqlx::query_scalar(sql).fetch_all(lib).await
+}
+
 pub struct NewRun<'a> {
     pub id: &'a str,
     pub label: &'a str,

@@ -12,6 +12,7 @@ import type {
   SortField,
   SortOrder,
   AutotagProviderOption,
+  AutotagTarget,
   AutotagUpdate,
   RunSummary,
 } from '../types';
@@ -27,6 +28,8 @@ interface UIState {
   focusedAssetId: string | null;
   activeLibraryId: string | null;
   activeCollectionId: string | null;
+  /** Assets waiting for the delete confirmation, empty when none */
+  assetsToDelete: string[];
 
   setViewMode: (mode: 'grid' | 'list') => void;
   setGridSize: (size: 'sm' | 'md' | 'lg') => void;
@@ -42,6 +45,8 @@ interface UIState {
   clearLibrarySelection: () => void;
   setActiveLibrary: (id: string | null) => void;
   setActiveCollection: (id: string | null) => void;
+  /** Asks to delete `ids`, behind the confirmation dialog; [] dismisses it */
+  requestDelete: (ids: string[]) => void;
 }
 
 export const useUIStore = create<UIState>()(
@@ -56,6 +61,7 @@ export const useUIStore = create<UIState>()(
       activeLibraryId: null,
       selectedLibraryIds: [],
       activeCollectionId: null,
+      assetsToDelete: [],
 
       setViewMode: (viewMode) => set({ viewMode }),
       setGridSize: (gridSize) => set({ gridSize }),
@@ -105,6 +111,7 @@ export const useUIStore = create<UIState>()(
         set({ activeLibraryId: id, selectedLibraryIds: id ? [id] : [], activeCollectionId: null }),
       setActiveCollection: (id) =>
         set({ activeCollectionId: id, activeLibraryId: null, selectedLibraryIds: [] }),
+      requestDelete: (assetsToDelete) => set({ assetsToDelete }),
     }),
     {
       name: 'opendam-ui',
@@ -437,17 +444,21 @@ interface AutotagStore {
   /** null until loaded */
   providers: AutotagProviderOption[] | null;
   runsPanelOpen: boolean;
+  /** What the open run dialog would tag, or null when it is closed */
+  dialogTarget: AutotagTarget | null;
   fetchRuns: () => Promise<void>;
   fetchProviders: () => Promise<void>;
   /** Takes an `autotag:updated` event: the runs, and re-fetches the loaded assets that changed */
   applyUpdate: (update: AutotagUpdate) => void;
   setRunsPanelOpen: (open: boolean) => void;
+  openAutotagDialog: (target: AutotagTarget | null) => void;
 }
 
 export const useAutotagStore = create<AutotagStore>()((set) => ({
   runs: [],
   providers: null,
   runsPanelOpen: false,
+  dialogTarget: null,
 
   fetchRuns: async () => {
     set({ runs: await api.listAutotagRuns() });
@@ -463,6 +474,7 @@ export const useAutotagStore = create<AutotagStore>()((set) => ({
   },
 
   setRunsPanelOpen: (runsPanelOpen) => set({ runsPanelOpen }),
+  openAutotagDialog: (dialogTarget) => set({ dialogTarget }),
 }));
 
 // ── Tag Store ─────────────────────────────────────────────────────────────

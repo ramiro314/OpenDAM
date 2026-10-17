@@ -12,25 +12,6 @@ export function isNameTaken(existing: { name: string }[], name: string): boolean
   return existing.some((item) => item.name.trim().toLowerCase() === name.toLowerCase());
 }
 
-/**
- * Top-left corner for a `width` x `height` menu opened at (`x`, `y`), moved back inside the
- * viewport with `margin` to spare.
- */
-export function fitInViewport(
-  x: number,
-  y: number,
-  width: number,
-  height: number,
-  viewportWidth: number,
-  viewportHeight: number,
-  margin = 4
-) {
-  return {
-    left: Math.max(margin, Math.min(x, viewportWidth - width - margin)),
-    top: Math.max(margin, Math.min(y, viewportHeight - height - margin)),
-  };
-}
-
 /** Tags `id` may be nested under: every tag but itself and the tags nested in it. */
 export function parentCandidates<T extends { id: string; parentId?: string | null }>(
   tags: T[],
