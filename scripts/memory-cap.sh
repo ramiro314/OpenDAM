@@ -11,7 +11,8 @@
 #
 # The exit status is the command's. When the cap kills it, the whole scope goes (OOMPolicy=kill),
 # the status is 137 and a "killed at the memory cap" line goes to stderr. Without a reachable
-# `systemd-run --user` (macOS, CI containers) the command runs uncapped, after a one-line warning.
+# `systemd-run --user` (macOS, CI containers), or when it refuses the cap, the command runs
+# uncapped, after a one-line warning.
 set -uo pipefail
 
 if (($# == 0)); then
@@ -25,6 +26,21 @@ if ! command -v systemd-run >/dev/null || ! systemctl --user show-environment >/
   exec "$@"
 fi
 
+# Scopes take OOMPolicy= only from systemd 253 on, and an older user manager refuses the whole
+# unit, so try the properties on an empty scope first: without OOMPolicy the cap still holds, but
+# the kernel kills only the largest process in the scope.
+props=(-p MemoryMax="$max" -p MemorySwapMax=0 -p OOMPolicy=kill)
+accepts() { systemd-run --user --scope --quiet "${props[@]}" -- true >/dev/null 2>&1; }
+if ! accepts; then
+  props=(-p MemoryMax="$max" -p MemorySwapMax=0)
+  if ! accepts; then
+    echo "memory-cap: systemd-run --user refused MemoryMax=$max, running $1 without a memory cap" >&2
+    exec "$@"
+  fi
+  echo "memory-cap: this systemd has no OOMPolicy for scopes, so a cap kill may leave part of" \
+    "$1 running" >&2
+fi
+
 unit=opendam-capped-$$-$RANDOM.scope
 # In the background, so a signal sent to this script reaches the command: bash runs traps only
 # between commands, never while it waits on a foreground child. A background job starts with
@@ -34,8 +50,7 @@ unit=opendam-capped-$$-$RANDOM.scope
 # $child is the command.
 restore=(env --default-signal=INT,QUIT)
 "${restore[@]}" true 2>/dev/null || restore=()
-systemd-run --user --scope --quiet --unit="$unit" \
-  -p MemoryMax="$max" -p MemorySwapMax=0 -p OOMPolicy=kill -- "${restore[@]}" "$@" <&0 &
+systemd-run --user --scope --quiet --unit="$unit" "${props[@]}" -- "${restore[@]}" "$@" <&0 &
 child=$!
 # Each signal is forwarded as itself. Ctrl-C also reaches the command straight from the terminal,
 # as it shares this script's process group, so it gets SIGINT twice.
