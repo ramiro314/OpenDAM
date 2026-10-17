@@ -21,6 +21,8 @@ import type {
   ConnectionTest,
   AutotagProviderOption,
   AutotagScope,
+  AutotagLastUsed,
+  AutotagSuggestion,
   RunSummary,
   StartedRun,
   ReviewProposal,
@@ -107,8 +109,12 @@ export const api = {
 
   // Auto-tagging runs. Progress arrives as `autotag:updated` events.
   listAutotagProviders: () => invoke<AutotagProviderOption[]>('list_autotag_providers'),
-  startAutotagRun: (scope: AutotagScope, provider: string, mode: AutotagMode) =>
-    invoke<StartedRun>('start_autotag_run', { scope, provider, mode }),
+  /** `inline` is "Suggest tags" on one asset, which sends no desktop notification */
+  startAutotagRun: (scope: AutotagScope, provider: string, mode: AutotagMode, inline = false) =>
+    invoke<StartedRun>('start_autotag_run', { scope, provider, mode, inline }),
+  getAutotagLastUsed: () => invoke<AutotagLastUsed>('get_autotag_last_used'),
+  getAutotagSuggestions: (assetId: string) =>
+    invoke<AutotagSuggestion[]>('get_autotag_suggestions', { assetId }),
   listAutotagRuns: () => invoke<RunSummary[]>('list_autotag_runs'),
   pauseAutotagRun: (runId: string) => invoke<void>('pause_autotag_run', { runId }),
   /** Fails, leaving the run paused, when its provider isn't ready */

@@ -1,9 +1,10 @@
 use std::sync::Arc;
 use tauri::State;
 
-use crate::autotag::engine::{ProviderOption, RunScope, StartedRun};
+use crate::autotag::engine::{ProviderOption, RunScope, StartedRun, Suggestion};
 use crate::autotag::provider::Mode;
 use crate::autotag::review::{ProposalDecision, ReviewProposal};
+use crate::autotag::settings::LastUsed;
 use crate::autotag::store::RunSummary;
 use crate::AppState;
 
@@ -18,15 +19,37 @@ pub async fn list_autotag_providers(
 }
 
 /// Starts a background run over chosen assets, or over a library's untagged assets (every
-/// asset with `allAssets`). Progress arrives as `autotag:updated` events.
+/// asset with `allAssets`). An `inline` run is "Suggest tags" on one asset, which sends no
+/// desktop notification. Progress arrives as `autotag:updated` events.
 #[tauri::command]
 pub async fn start_autotag_run(
     scope: RunScope,
     provider: String,
     mode: Mode,
+    inline: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<StartedRun> {
-    state.autotag.start_run(scope, &provider, mode).await
+    state
+        .autotag
+        .queue_run(scope, &provider, mode, inline.unwrap_or(false))
+        .await
+}
+
+/// The provider and mode of the last run started, which "Suggest tags" uses: Anthropic and
+/// Prefer existing before any run.
+#[tauri::command]
+pub async fn get_autotag_last_used(state: State<'_, Arc<AppState>>) -> Result<LastUsed> {
+    state.autotag.last_used().await
+}
+
+/// The asset's "Suggest tags" runs, newest first: the newest, and older ones with new tag
+/// names still waiting for review.
+#[tauri::command]
+pub async fn get_autotag_suggestions(
+    asset_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<Suggestion>> {
+    state.autotag.suggestions(&asset_id).await
 }
 
 /// Every run, newest first.

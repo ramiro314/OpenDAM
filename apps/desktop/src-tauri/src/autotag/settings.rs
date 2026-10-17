@@ -1,11 +1,15 @@
 //! Non-secret AI tagging preferences, one row per field in the master DB's `settings` table
-//! (`ai.<provider>.<field>`, JSON value). API keys never go here: see `credentials`.
+//! (`ai.<provider>.<field>`, JSON value), and the provider and mode of the last run started
+//! (`autotag.lastUsed`). API keys never go here: see `credentials`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Pool, Sqlite};
 
+use super::provider::Mode;
+
 const PREFIX: &str = "ai.";
+const LAST_USED_KEY: &str = "autotag.lastUsed";
 
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-5-5";
 
@@ -190,6 +194,48 @@ pub async fn update(pool: &Pool<Sqlite>, patch: Value) -> Result<AiSettings, Str
     Ok(settings)
 }
 
+/// The provider and mode the last run started with, which "Suggest tags" uses (D32).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastUsed {
+    pub provider: String,
+    pub mode: Mode,
+}
+
+impl Default for LastUsed {
+    /// Before any run: Anthropic, Prefer existing.
+    fn default() -> Self {
+        Self {
+            provider: "anthropic".into(),
+            mode: Mode::PreferExisting,
+        }
+    }
+}
+
+/// The last-used provider and mode, or the defaults when no run has started or the saved value
+/// no longer parses.
+pub async fn last_used(pool: &Pool<Sqlite>) -> sqlx::Result<LastUsed> {
+    let raw: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+        .bind(LAST_USED_KEY)
+        .fetch_optional(pool)
+        .await?;
+    Ok(raw
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default())
+}
+
+pub async fn save_last_used(pool: &Pool<Sqlite>, last: &LastUsed) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(LAST_USED_KEY)
+    .bind(serde_json::to_string(last).expect("last used serializes"))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +398,34 @@ mod tests {
         assert_eq!(settings.anthropic.concurrency, 4);
         assert_eq!(settings.anthropic.max_tags, 8);
         assert_eq!(settings.jev.max_tags, 5);
+    }
+
+    #[tokio::test]
+    async fn last_used_defaults_to_anthropic_prefer_existing_and_round_trips() {
+        let db = memory_database(vec![]).await;
+        let pool = &db.master_pool;
+
+        assert_eq!(
+            last_used(pool).await.unwrap(),
+            LastUsed {
+                provider: "anthropic".into(),
+                mode: Mode::PreferExisting,
+            }
+        );
+
+        let jev = LastUsed {
+            provider: "jev".into(),
+            mode: Mode::ExistingOnly,
+        };
+        save_last_used(pool, &jev).await.unwrap();
+        assert_eq!(last_used(pool).await.unwrap(), jev);
+        assert_eq!(load(pool).await.unwrap(), AiSettings::default());
+
+        sqlx::query("UPDATE settings SET value = '\"garbled\"' WHERE key = ?")
+            .bind(LAST_USED_KEY)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(last_used(pool).await.unwrap(), LastUsed::default());
     }
 }

@@ -329,6 +329,21 @@ export interface StartedRun {
   skipped: number;
 }
 
+/** The provider and mode of the last run started, which "Suggest tags" uses */
+export interface AutotagLastUsed {
+  provider: string;
+  mode: AutotagMode;
+}
+
+/** A "Suggest tags" run as the asset's Tags tab shows it */
+export interface AutotagSuggestion {
+  run: RunSummary;
+  /** Why the asset's item failed, when it did */
+  error: string | null;
+  /** The new tag names waiting for review, shown as chips */
+  proposals: ReviewProposal[];
+}
+
 /** The payload of the `autotag:updated` event */
 export interface AutotagUpdate {
   runs: RunSummary[];
