@@ -374,7 +374,7 @@ impl Engine {
         // Steps 3 and 4. A failure leaves the rows pending for replay; the item stays done.
         let write = async {
             let pending = store::pending_pairs_of(&self.db.master_pool, item).await?;
-            store::apply_pairs(&self.db, &lib, &pending).await
+            store::apply_pairs(&self.db, &lib, &pending, store::Applier::Item).await
         };
         match write.await {
             Ok(changed) => Ok(changed),

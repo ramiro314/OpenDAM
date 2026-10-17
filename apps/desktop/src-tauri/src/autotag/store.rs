@@ -354,28 +354,60 @@ pub async fn pending_pairs_of(
     .await
 }
 
+/// Who runs steps 3 and 4: the item that just recorded the pairs in step 1, or replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applier {
+    Item,
+    Replay,
+}
+
+/// What step 3 did with one pair.
+enum Outcome {
+    Inserted,
+    AlreadyThere,
+    /// The tag left the catalog meanwhile: nothing to write.
+    Dropped,
+}
+
 /// Write protocol steps 3 and 4 for pairs of one open library, in batches: `INSERT OR IGNORE`
 /// into its `asset_tags` (with the tag's definition and ancestors, which a mirror can lack),
-/// then mark the rows `applied`. A pair whose tag left the catalog meanwhile is dropped.
-/// Returns the assets whose tags changed.
+/// then mark the rows `applied`. Returns the assets whose tags changed.
+///
+/// - A pair whose tag left the catalog is dropped, its row deleted.
+/// - A pair whose definition the mirror can't take (another mirror tag has its name, which
+///   `sync_open_libraries` leaves as it is) stays `pending`, and the rest of the batch goes on.
+/// - On the item path, a pair the library already holds was added after step 1 by someone
+///   else (you, or an overlapping run), so its row is deleted and undo never removes it.
+///   Replay can't tell that from its own step 3 committed before a crash, so it marks the row
+///   `applied`.
 pub async fn apply_pairs(
     db: &Database,
     lib: &LibraryHandle,
     pairs: &[PendingPair],
+    applier: Applier,
 ) -> sqlx::Result<Vec<String>> {
     let mut changed = Vec::new();
     for chunk in pairs.chunks(BATCH) {
-        let mut written = Vec::new();
-        let mut dropped = Vec::new();
+        let mut outcomes = Vec::new();
         let mut tx = lib.pool.begin().await?;
-        for pair in chunk {
+        'pairs: for pair in chunk {
             let chain = db.tag_with_ancestors(&pair.tag_id).await?;
             if chain.is_empty() {
-                dropped.push(pair);
+                outcomes.push((pair, Outcome::Dropped));
                 continue;
             }
             for definition in &chain {
-                upsert_tag(&mut *tx, definition).await?;
+                // A failed statement rolls back only itself; the transaction goes on.
+                if let Err(e) = upsert_tag(&mut *tx, definition).await {
+                    tracing::warn!(
+                        "Tag {} for asset {} waits in library {}: its mirror can't take {:?}: {e}",
+                        pair.tag_id,
+                        pair.asset_id,
+                        lib.id,
+                        definition.1
+                    );
+                    continue 'pairs;
+                }
             }
             let inserted =
                 sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
@@ -385,18 +417,25 @@ pub async fn apply_pairs(
                     .await?;
             if inserted.rows_affected() > 0 {
                 changed.push(pair.asset_id.clone());
+                outcomes.push((pair, Outcome::Inserted));
+            } else {
+                outcomes.push((pair, Outcome::AlreadyThere));
             }
-            written.push(pair);
         }
         tx.commit().await?;
 
         let mut tx = db.master_pool.begin().await?;
-        for pair in &written {
-            let sql = if pair.run_cleared {
-                "DELETE FROM tag_run_applied WHERE run_id = ? AND asset_id = ? AND tag_id = ?"
-            } else {
+        for (pair, outcome) in &outcomes {
+            let keep = match outcome {
+                Outcome::Dropped => false,
+                Outcome::AlreadyThere if applier == Applier::Item => false,
+                _ => !pair.run_cleared,
+            };
+            let sql = if keep {
                 "UPDATE tag_run_applied SET state = 'applied'
                  WHERE run_id = ? AND asset_id = ? AND tag_id = ?"
+            } else {
+                "DELETE FROM tag_run_applied WHERE run_id = ? AND asset_id = ? AND tag_id = ?"
             };
             sqlx::query(sql)
                 .bind(&pair.run_id)
@@ -404,16 +443,6 @@ pub async fn apply_pairs(
                 .bind(&pair.tag_id)
                 .execute(&mut *tx)
                 .await?;
-        }
-        for pair in &dropped {
-            sqlx::query(
-                "DELETE FROM tag_run_applied WHERE run_id = ? AND asset_id = ? AND tag_id = ?",
-            )
-            .bind(&pair.run_id)
-            .bind(&pair.asset_id)
-            .bind(&pair.tag_id)
-            .execute(&mut *tx)
-            .await?;
         }
         tx.commit().await?;
     }
@@ -446,7 +475,11 @@ pub async fn replay_pending(db: &Database) -> sqlx::Result<Vec<String>> {
         let Some(lib) = db.get_library_handle(&library_id).await else {
             continue;
         };
-        changed.extend(apply_pairs(db, &lib, &pairs).await?);
+        // One library's failure (a NAS lock timeout) leaves its rows for the next replay.
+        match apply_pairs(db, &lib, &pairs, Applier::Replay).await {
+            Ok(assets) => changed.extend(assets),
+            Err(e) => tracing::warn!("Pending tags for library {library_id} wait: {e}"),
+        }
     }
     Ok(changed)
 }
@@ -526,5 +559,116 @@ mod tests {
             ],
             "the cleared run's row is gone once applied; offline and undo rows wait"
         );
+    }
+
+    async fn applied_rows(db: &Database) -> Vec<(String, String, String)> {
+        sqlx::query_as(
+            "SELECT asset_id, tag_id, state FROM tag_run_applied ORDER BY asset_id, tag_id",
+        )
+        .fetch_all(&db.master_pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_name_colliding_mirror_tag_leaves_only_its_pair_pending() {
+        let lib_pool = memory_library_pool().await;
+        insert_asset(&lib_pool, "a1").await;
+        insert_tag(&lib_pool, "t-mirror-rock", "Rock").await;
+        let db = memory_database(vec![memory_library("lib", lib_pool.clone())]).await;
+        insert_tag(&db.master_pool, "t-rock", "Rock").await;
+        insert_tag(&db.master_pool, "t-tree", "Tree").await;
+        insert_run(&db, "run", "done").await;
+        insert_pending(&db, "run", "a1", "lib", "t-rock").await;
+        insert_pending(&db, "run", "a1", "lib", "t-tree").await;
+
+        for _ in 0..2 {
+            assert!(replay_pending(&db).await.unwrap().len() <= 1);
+            assert_eq!(
+                asset_tags(&lib_pool).await,
+                [("a1".into(), "t-tree".into())],
+                "the other pair in the batch still lands"
+            );
+            assert_eq!(
+                applied_rows(&db).await,
+                [
+                    ("a1".into(), "t-rock".into(), "pending".into()),
+                    ("a1".into(), "t-tree".into(), "applied".into()),
+                ],
+                "the colliding pair waits, on every replay"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_moves_on_when_a_library_fails() {
+        let broken = memory_library_pool().await;
+        let fine = memory_library_pool().await;
+        insert_asset(&fine, "b1").await;
+        let db = memory_database(vec![
+            memory_library("a-lib", broken.clone()),
+            memory_library("b-lib", fine.clone()),
+        ])
+        .await;
+        insert_tag(&db.master_pool, "t1", "Rock").await;
+        insert_run(&db, "run", "done").await;
+        insert_pending(&db, "run", "a1", "a-lib", "t1").await;
+        insert_pending(&db, "run", "b1", "b-lib", "t1").await;
+        broken.close().await;
+
+        let changed = replay_pending(&db).await.unwrap();
+
+        assert_eq!(changed, ["b1"]);
+        assert_eq!(
+            applied_rows(&db).await,
+            [
+                ("a1".into(), "t1".into(), "pending".into()),
+                ("b1".into(), "t1".into(), "applied".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pair_someone_else_added_after_step_one_is_not_claimed_by_the_item() {
+        let lib_pool = memory_library_pool().await;
+        insert_asset(&lib_pool, "a1").await;
+        insert_asset(&lib_pool, "a2").await;
+        let db = memory_database(vec![memory_library("lib", lib_pool.clone())]).await;
+        insert_tag(&db.master_pool, "t1", "Rock").await;
+        insert_run(&db, "run", "running").await;
+        insert_pending(&db, "run", "a1", "lib", "t1").await;
+        insert_pending(&db, "run", "a2", "lib", "t1").await;
+        // Between step 1 and step 3, the pair lands some other way: by hand, or another run.
+        for asset in ["a1", "a2"] {
+            sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES (?, 't1')")
+                .bind(asset)
+                .execute(&lib_pool)
+                .await
+                .unwrap();
+        }
+        let lib = db.get_library_handle("lib").await.unwrap();
+        let pending: Vec<PendingPair> = sqlx::query_as(
+            "SELECT run_id, asset_id, library_id, tag_id, 0 AS run_cleared FROM tag_run_applied
+             ORDER BY asset_id",
+        )
+        .fetch_all(&db.master_pool)
+        .await
+        .unwrap();
+
+        let item = apply_pairs(&db, &lib, &pending[..1], Applier::Item)
+            .await
+            .unwrap();
+        // Replay can't tell this from its own library write before a crash, so it keeps it.
+        let replay = apply_pairs(&db, &lib, &pending[1..], Applier::Replay)
+            .await
+            .unwrap();
+
+        assert!(item.is_empty() && replay.is_empty());
+        assert_eq!(
+            applied_rows(&db).await,
+            [("a2".into(), "t1".into(), "applied".into())],
+            "the item path deletes a1's row, so undo never removes a tag it didn't add"
+        );
+        assert_eq!(asset_tags(&lib_pool).await.len(), 2);
     }
 }
