@@ -5,10 +5,11 @@
 //!   probability) question, with ids `q0..qN` mapped back to tag ids.
 //! - **Selection:** tags scoring at or above the run's threshold are kept, highest first, up to
 //!   the run's cap.
-//! - **Chunking:** the API has no limit on the number of questions, only on context: 64k tokens
-//!   for the state plus every question, 32k for the state plus any one question
-//!   (docs.typesafe.ai/models). Questions are packed into requests under a conservative estimate
-//!   of the first limit, so a large catalog takes several requests and a small one takes one.
+//! - **Chunking:** at most 50 questions per request, the plan's default until a live call
+//!   confirms the limit. TypeSafe's docs state no limit on the number of questions, only on
+//!   context: 64k tokens for the state plus every question, 32k for the state plus any one
+//!   question (docs.typesafe.ai/models). A request is also closed before a conservative estimate
+//!   of the first limit, which matters only for very long hints.
 //! - **Never an image:** the request builder has no image field, whatever the request holds.
 
 use reqwest::header::HeaderValue;
@@ -33,6 +34,9 @@ pub const MODEL: &str = "jev-latest";
 /// The estimated tokens one request may hold: the state once plus its questions. Jev's limit is
 /// 64k; the estimate is rough, so it keeps a wide margin.
 const REQUEST_TOKEN_BUDGET: usize = 40_000;
+/// The most questions one request holds. TypeSafe documents no such limit, but none has been
+/// confirmed with a live call yet, so the plan's chunks of 50 stay until one is.
+const MAX_QUESTIONS_PER_REQUEST: usize = 50;
 /// What a question costs beyond its instructions: its type and the JSON around it.
 const QUESTION_OVERHEAD_TOKENS: usize = 8;
 /// Used when Settings has no threshold for a run, as for runs started before it was recorded.
@@ -76,8 +80,9 @@ fn question(tag: &VocabularyTag) -> String {
     text
 }
 
-/// Every request for one asset, each holding as many questions as fit `budget` estimated
-/// tokens alongside the state. A question too long to share a request gets one to itself.
+/// Every request for one asset, each holding at most `MAX_QUESTIONS_PER_REQUEST` questions, and
+/// no more than fit `budget` estimated tokens alongside the state. A question too long to share
+/// a request gets one to itself.
 fn build_requests_within(request: &TagRequest, budget: usize) -> Vec<JevRequest> {
     let state = state(&request.asset);
     let state_tokens = estimate_tokens(&state.to_string());
@@ -101,7 +106,7 @@ fn build_requests_within(request: &TagRequest, budget: usize) -> Vec<JevRequest>
     for (index, tag) in request.vocabulary.tags.iter().enumerate() {
         let instructions = question(tag);
         let cost = estimate_tokens(&instructions) + QUESTION_OVERHEAD_TOKENS;
-        if !ids.is_empty() && tokens + cost > budget {
+        if ids.len() == MAX_QUESTIONS_PER_REQUEST || (!ids.is_empty() && tokens + cost > budget) {
             flush(&mut questions, &mut ids);
             tokens = state_tokens;
         }
@@ -650,11 +655,12 @@ mod tests {
 
         let requests = build_requests(&request);
 
-        assert!(requests.len() > 1, "5,000 questions take several requests");
+        assert_eq!(requests.len(), 100, "5,000 questions in chunks of 50");
         let mut asked = Vec::new();
         for chunk in &requests {
             let questions = chunk.body["questions"].as_object().unwrap();
             assert_eq!(questions.len(), chunk.questions.len());
+            assert_eq!(questions.len(), MAX_QUESTIONS_PER_REQUEST);
             let estimate = estimate_tokens(&chunk.body["state"].to_string())
                 + questions
                     .values()
@@ -698,6 +704,21 @@ mod tests {
         assert_eq!(sizes(state + per_question * 4 - 1), [3, 3, 3, 1]);
         assert_eq!(sizes(usize::MAX), [10]);
         assert_eq!(sizes(0), vec![1; 10], "an oversized question goes alone");
+    }
+
+    #[test]
+    fn a_request_holds_at_most_50_questions_however_much_room_is_left() {
+        let sizes = |tags: usize| -> Vec<usize> {
+            build_requests_within(&request_with(big_catalog(tags), false), usize::MAX)
+                .iter()
+                .map(|r| r.questions.len())
+                .collect()
+        };
+
+        assert_eq!(sizes(49), [49]);
+        assert_eq!(sizes(50), [50]);
+        assert_eq!(sizes(51), [50, 1]);
+        assert_eq!(sizes(120), [50, 50, 20]);
     }
 
     #[test]
