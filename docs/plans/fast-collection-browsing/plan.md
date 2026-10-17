@@ -33,7 +33,7 @@ the approved decisions; no decision changed:
   - A card whose thumbnail fails to load falls back to the original.
   - A test covers the interruption.
 
-Revised a third time 2026-10-16 after the GitHub Inspector review of PR #66. These are
+Revised a third time 2026-10-16 after the GitHub Inspector reviews of PR #66. These are
 corrections inside the approved decisions; no decision changed:
 
 - **No double scrolling from real key presses.** The container's key handler calls
@@ -42,6 +42,10 @@ corrections inside the approved decisions; no decision changed:
   never trigger built-in scrolling.
 - **User-set compositing gets its own mode name.** `WEBKIT_DISABLE_COMPOSITING_MODE` on its own now
   reports `no-compositing` instead of `webkit-default`, and the tests cover it.
+- **A rerun of the cleanup pass doesn't queue TGA or TIFF twice.** Small TGA and TIFF rows keep a
+  thumbnail path, so a rerun would select them again. The pass now skips one whose preview job is
+  still active, or whose thumbnail already has the source's size. The interruption test covers a
+  small TGA and the job queue.
 
 ## Problem
 
@@ -178,7 +182,7 @@ kept them at review (D20).
 | C7 | The multi-library merge compares exactly as SQLite does. | Each library's list arrives sorted by SQLite, so the merge must use the same comparator or the global top N can miss rows. Names compare with NOCASE semantics (ASCII-only folding, then bytewise), `kind` bytewise, and numbers numerically. Ties break by library position, then `rowid`. Today's Rust comparator uses Unicode `to_lowercase` and has no tie-break. |
 | C8 | Cards stop building per-card maps. | One shared memoized collection-name map replaces the map each `AssetCard` builds on every render. |
 | C9 | Without a thumbnail, the grid and list choose the original by file extension, not by asset kind. | The rule is: show the original if it is webview-displayable (png, jpg, jpeg, webp, bmp, gif, svg). `DetailPanel` already uses this list. Today a small PNG of kind `material` would show a placeholder once its thumbnail is gone. A thumbnail that fails to load falls back to the original the same way, before the placeholder. |
-| C10 | The cleanup pass is recorded in a new per-library `library_meta (key, value)` table, under key `thumbs_no_upscale`. | Once recorded, it never re-reads 57k image headers on later opens, which matters on network shares. It is resumable, because cleared rows no longer match. |
+| C10 | The cleanup pass is recorded in a new per-library `library_meta (key, value)` table, under key `thumbs_no_upscale`. | Once recorded, it never re-reads 57k image headers on later opens, which matters on network shares. It is resumable: cleared rows no longer match, and a small TGA or TIFF is skipped while its preview job is active or once its thumbnail has the source's size. |
 | C11 | The cleanup pass only touches assets whose own extension is a raster image. | 3D-model thumbnails are also named `<id>_thumb.png`, so matching on the file name would delete them. |
 | C12 | The footer shows the visible range, `41,201-41,236 of 83,095 assets`. | "Loaded of total" means nothing once pages are evicted. |
 | C13 | Bench support is debug-only: Tauri commands compiled under `#[cfg(debug_assertions)]` read RSS and write the report. | JavaScript can't read `/proc`, and WebKit has no `performance.memory`. Nothing reaches release builds. |
@@ -368,7 +372,11 @@ These callers move off `assets`, all in the same build step (step 3):
          the next open redoes the batch. No file is orphaned and no row is lost.
        - Until then, a card whose thumbnail fails to load shows the original (C9).
      - **TGA and TIFF:** it re-queues a preview job, so the image queue rewrites the thumbnail at
-       native size.
+       native size. These rows keep their `thumbnail_path`, so a rerun selects them again. The
+       pass therefore skips a row in two cases, and never queues one twice:
+       - its preview job is still active (`pending`, `queued`, `processing` or `fallback`);
+       - its thumbnail's header already has the source's dimensions, because an earlier run
+         rewrote it.
   4. It sets the meta key to `done` and emits `library:updated` once.
 
   On Kenney, expect about 57k rows cleared and up to 3.2 GB freed.
@@ -577,8 +585,12 @@ Tests run by file, as `AGENTS.md` says. Each regression test must fail on `main`
     - It re-queues small TGAs.
     - It records `library_meta`, and a second run does nothing.
     - It is safe to interrupt. A test hook stops the pass after it deletes a batch's files but
-      before it commits the batch. A rerun redoes that batch and finishes the rest. It sets
-      `library_meta` only at the end, and leaves the same rows and files as an uninterrupted run.
+      before it commits the batch.
+      - The library includes a small TGA.
+      - A rerun redoes that batch and finishes the rest, and sets `library_meta` only at the end.
+      - It leaves the same rows, files and preview-job queue as an uninterrupted run, with one job
+        for the TGA, never two.
+    - A rerun after the small TGA's native-size thumbnail is written queues nothing for it.
   - `choose_render_env`: user-set variables win, NVIDIA gets FORCE_SHM, and other GPUs keep the
     default.
   - `describe_render_env`: each variable maps to its mode, `WEBKIT_DISABLE_DMABUF_RENDERER` wins
