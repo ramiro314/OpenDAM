@@ -934,4 +934,123 @@ mod tests {
             "C doesn't bring it back"
         );
     }
+    /// Makes library `pool` refuse every delete from `table`, as a locked share would, until
+    /// `allow_deletes` drops the trigger.
+    async fn refuse_deletes(pool: &Pool<Sqlite>, table: &str) {
+        sqlx::query(&format!(
+            "CREATE TRIGGER refuse_{table} BEFORE DELETE ON {table}
+             BEGIN SELECT RAISE(ABORT, 'share is locked'); END"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn allow_deletes(pool: &Pool<Sqlite>, table: &str) {
+        sqlx::query(&format!("DROP TRIGGER refuse_{table}"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_open_library_that_refuses_the_undo_keeps_its_rows_until_finish_undo() {
+        let (db, pools) = libraries(&["A"], &[&["rock-moss-a1"]]).await;
+        let a = &pools[0];
+        let engine = started_engine(&db).await;
+        let before = snapshot(&db, &[a]).await;
+        let run_id = run(&engine, &db, &["rock-moss-a1"], Mode::CreateFreely, "done").await;
+        let tagged = asset_tags(a).await;
+        assert_eq!(tagged.len(), 2);
+        refuse_deletes(a, "asset_tags").await;
+
+        assert_eq!(engine.undo_run(&run_id).await.unwrap(), "undo_partial");
+
+        let reason = status(&db, &run_id).await.1.unwrap();
+        assert!(
+            reason.starts_with("Library A: 2 tags not removed (")
+                && reason.contains("share is locked"),
+            "{reason}"
+        );
+        assert_eq!(asset_tags(a).await, tagged, "the library is untouched");
+        assert_eq!(
+            count(&db.master_pool, "SELECT COUNT(*) FROM tag_run_applied").await,
+            2,
+            "and so are the run's rows"
+        );
+        assert_eq!(moss_count(&db.master_pool).await, 1, "Moss stays");
+
+        allow_deletes(a, "asset_tags").await;
+        assert_eq!(engine.undo_run(&run_id).await.unwrap(), "undone");
+        assert_eq!(snapshot(&db, &[a]).await, before);
+    }
+
+    #[tokio::test]
+    async fn rows_of_a_library_removed_from_opendam_are_dropped_and_the_run_ends_undone() {
+        let (db, pools) = libraries(&["A", "B"], &[&["rock-moss-a1"], &["rock-moss-b1"]]).await;
+        let a = &pools[0];
+        let engine = started_engine(&db).await;
+        let run_id = run(
+            &engine,
+            &db,
+            &["rock-moss-a1", "rock-moss-b1"],
+            Mode::CreateFreely,
+            "done",
+        )
+        .await;
+        // B is removed from OpenDAM, as `remove_library` does.
+        db.unregister_library("B").await.unwrap();
+        sqlx::query("DELETE FROM libraries WHERE id = 'B'")
+            .execute(&db.master_pool)
+            .await
+            .unwrap();
+
+        assert_eq!(engine.undo_run(&run_id).await.unwrap(), "undone");
+
+        assert_eq!(status(&db, &run_id).await, ("undone".into(), None));
+        assert_eq!(
+            count(&db.master_pool, "SELECT COUNT(*) FROM tag_run_applied").await,
+            0,
+            "B's rows are gone with it"
+        );
+        assert!(asset_tags(a).await.is_empty(), "A is restored");
+        for pool in [&db.master_pool, a] {
+            assert_eq!(moss_count(pool).await, 0, "nothing holds Moss back");
+        }
+    }
+
+    #[tokio::test]
+    async fn created_tags_the_tag_delete_path_refuses_stay_until_finish_undo() {
+        let (db, pools) = libraries(&["A"], &[&["rock-moss-a1"]]).await;
+        let a = &pools[0];
+        let engine = started_engine(&db).await;
+        let before = snapshot(&db, &[a]).await;
+        let run_id = run(&engine, &db, &["rock-moss-a1"], Mode::CreateFreely, "done").await;
+        refuse_deletes(a, "tags").await;
+
+        assert_eq!(engine.undo_run(&run_id).await.unwrap(), "undo_partial");
+
+        let reason = status(&db, &run_id).await.1.unwrap();
+        assert!(
+            reason.starts_with("Created tags kept: Could not delete the tag from library A")
+                && reason.contains("share is locked"),
+            "{reason}"
+        );
+        assert!(asset_tags(a).await.is_empty(), "the pairs are removed");
+        assert_eq!(
+            count(&db.master_pool, "SELECT COUNT(*) FROM tag_run_applied").await,
+            0
+        );
+        for pool in [&db.master_pool, a] {
+            assert_eq!(
+                moss_count(pool).await,
+                1,
+                "master keeps Moss while a mirror does"
+            );
+        }
+
+        allow_deletes(a, "tags").await;
+        assert_eq!(engine.undo_run(&run_id).await.unwrap(), "undone");
+        assert_eq!(snapshot(&db, &[a]).await, before);
+    }
 }
