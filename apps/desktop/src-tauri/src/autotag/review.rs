@@ -351,14 +351,15 @@ pub async fn apply(
     pairs.retain(|p| !present.contains(&(p.asset_id.clone(), p.tag_id.clone())));
 
     // Step 1.
-    let (status, created) = record_review(master, run_id, &new_tags, &mut resolved, &mut pairs)
-        .await
-        .map_err(|e| match e {
-            ReviewError::AlreadyReviewed => {
-                "A proposal was already reviewed, or isn't part of this run".to_string()
-            }
-            ReviewError::Db(e) => e.to_string(),
-        })?;
+    let (status, created) =
+        record_review(master, &open, run_id, &new_tags, &mut resolved, &mut pairs)
+            .await
+            .map_err(|e| match e {
+                ReviewError::AlreadyReviewed => {
+                    "A proposal was already reviewed, or isn't part of this run".to_string()
+                }
+                ReviewError::Db(e) => e.to_string(),
+            })?;
     // A name mapped onto a catalog tag can repeat a pair: write it once.
     pairs.sort();
     pairs.dedup();
@@ -442,14 +443,17 @@ impl From<sqlx::Error> for ReviewError {
 /// `new_tags` maps each normalized name to create to its planned id, name and parent. The
 /// transaction takes the write lock before it reads the catalog, so a name the catalog gained
 /// since the review read it (a Create freely run made it, say) maps onto that tag instead: its
-/// decisions in `resolved` become `mapped` and its `pairs` take the tag's id. A parent deleted
-/// meanwhile is dropped.
+/// decisions in `resolved` become `mapped` and its `pairs` take the tag's id. Those pairs are
+/// checked against their `open` libraries again, since the caller's check knew only the planned
+/// id: a pair the library already has is dropped, so undo never removes a tag the review didn't
+/// add, even when its write waits for replay. A parent deleted meanwhile is dropped.
 async fn record_review(
     master: &Pool<Sqlite>,
+    open: &BTreeMap<String, LibraryHandle>,
     run_id: &str,
     new_tags: &BTreeMap<String, (String, String, Option<String>)>,
     resolved: &mut [Resolved],
-    pairs: &mut [PendingPair],
+    pairs: &mut Vec<PendingPair>,
 ) -> Result<(String, Vec<String>), ReviewError> {
     let mut tx = master.begin_with("BEGIN IMMEDIATE").await?;
     let catalog: Vec<(String, String)> = sqlx::query_as("SELECT id, name FROM tags")
@@ -478,10 +482,16 @@ async fn record_review(
             r.created_tag = false;
         }
     }
+    let mut remapped = Vec::new();
     for pair in pairs.iter_mut() {
         if let Some(id) = existing.get(pair.tag_id.as_str()) {
             pair.tag_id = id.clone();
+            remapped.push(pair.clone());
         }
+    }
+    if !remapped.is_empty() {
+        let present = present_pairs(open, &remapped).await?;
+        pairs.retain(|p| !present.contains(&(p.asset_id.clone(), p.tag_id.clone())));
     }
     for r in resolved.iter() {
         // Only a pending proposal: a review applied meanwhile rolls this one back.
@@ -1057,7 +1067,7 @@ mod tests {
             created_tag: true,
             ticked: vec!["a1".into()],
         }];
-        let mut pairs = [PendingPair {
+        let mut pairs = vec![PendingPair {
             run_id: "run".into(),
             asset_id: "a1".into(),
             library_id: "a-lib".into(),
@@ -1066,9 +1076,16 @@ mod tests {
         }];
         insert_tag(master, "t-made", "ROCK").await;
 
-        let (_, created) = record_review(master, "run", &new_tags, &mut resolved, &mut pairs)
-            .await
-            .unwrap_or_else(|_| panic!("the review failed"));
+        let (_, created) = record_review(
+            master,
+            &open_libraries(&s.db).await,
+            "run",
+            &new_tags,
+            &mut resolved,
+            &mut pairs,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the review failed"));
 
         assert!(created.is_empty(), "nothing created: {created:?}");
         let rocks: Vec<String> =
@@ -1094,5 +1111,69 @@ mod tests {
             pairs[0].tag_id, "t-made",
             "steps 3 and 4 write the catalog tag"
         );
+    }
+
+    async fn open_libraries(db: &Database) -> BTreeMap<String, LibraryHandle> {
+        db.get_all_libraries()
+            .await
+            .into_iter()
+            .map(|lib| (lib.id.clone(), lib))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_remapped_pair_the_library_already_has_is_not_recorded_as_the_reviews() {
+        let s = run_with_proposals("awaiting_review").await;
+        let master = &s.db.master_pool;
+        // A Create freely run made "ROCK" and applied it to a1 after the review checked a1.
+        insert_tag(master, "t-made", "ROCK").await;
+        insert_tag(&s.a, "t-made", "ROCK").await;
+        sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES ('a1', 't-made')")
+            .execute(&s.a)
+            .await
+            .unwrap();
+        let new_tags = BTreeMap::from([(
+            "rock".to_string(),
+            ("t-planned".to_string(), "Rock".to_string(), None),
+        )]);
+        let mut resolved = [Resolved {
+            proposal_id: "p-rock".into(),
+            status: "accepted",
+            tag_id: Some("t-planned".into()),
+            created_tag: true,
+            ticked: vec!["a1".into(), "a2".into()],
+        }];
+        let pair = |asset: &str| PendingPair {
+            run_id: "run".into(),
+            asset_id: asset.into(),
+            library_id: "a-lib".into(),
+            tag_id: "t-planned".into(),
+            run_cleared: false,
+        };
+        let mut pairs = vec![pair("a1"), pair("a2")];
+
+        record_review(
+            master,
+            &open_libraries(&s.db).await,
+            "run",
+            &new_tags,
+            &mut resolved,
+            &mut pairs,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the review failed"));
+
+        let recorded: Vec<(String, String)> =
+            sqlx::query_as("SELECT asset_id, tag_id FROM tag_run_applied")
+                .fetch_all(master)
+                .await
+                .unwrap();
+        assert_eq!(
+            recorded,
+            [("a2".into(), "t-made".into())],
+            "a1 already had the tag, so the review never owns that pair"
+        );
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].asset_id, "a2");
     }
 }
