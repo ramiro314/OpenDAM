@@ -262,9 +262,14 @@ mod tests {
         .await
         .unwrap();
 
-        let library = open_library(&db, &engine_over(&db), "Picked again", &[root.clone()])
-            .await
-            .unwrap();
+        let library = open_library(
+            &db,
+            &engine_over(&db),
+            "Picked again",
+            std::slice::from_ref(&root),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             (
@@ -299,9 +304,14 @@ mod tests {
         let root = dir.path().to_string_lossy().into_owned();
         let db = Arc::new(memory_database(Vec::new()).await);
 
-        let library = open_library(&db, &engine_over(&db), "Sprites", &[root.clone()])
-            .await
-            .unwrap();
+        let library = open_library(
+            &db,
+            &engine_over(&db),
+            "Sprites",
+            std::slice::from_ref(&root),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(library.name, "Sprites");
         assert_eq!(library.root_paths, [root]);
@@ -318,7 +328,7 @@ mod tests {
         let root = dir.path().to_string_lossy().into_owned();
         let db = Arc::new(memory_database(Vec::new()).await);
         let engine = engine_over(&db);
-        let open = open_library(&db, &engine, "Sprites", &[root.clone()])
+        let open = open_library(&db, &engine, "Sprites", std::slice::from_ref(&root))
             .await
             .unwrap();
         let lib = db.get_library_handle(&open.id).await.unwrap().pool;
