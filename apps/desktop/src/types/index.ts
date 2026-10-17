@@ -218,6 +218,18 @@ export interface ProviderStatus {
   keyringProblem: string | null;
 }
 
+/** The result of "Test connection". It never carries the key. */
+export interface ConnectionTest {
+  ok: boolean;
+  model: string;
+  message: string;
+  /** The test tags the model picked, as paths */
+  tags: string[];
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+}
+
 // ── Auto-tagging runs ────────────────────────────────────────────────────
 export type AutotagMode = 'existing_only' | 'prefer_existing' | 'create_freely';
 

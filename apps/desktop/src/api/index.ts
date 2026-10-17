@@ -16,6 +16,7 @@ import type {
   AiSettingsPatch,
   ProviderStatus,
   AutotagMode,
+  ConnectionTest,
   AutotagProviderOption,
   RunSummary,
   StartedRun,
@@ -89,6 +90,9 @@ export const api = {
   setApiKey: (provider: AiProvider, key: string | null) =>
     invoke<ProviderStatus>('set_api_key', { provider, key }),
   getProviderStatus: () => invoke<ProviderStatus[]>('get_provider_status'),
+  /** One small request with the configured key, to `model` or the saved model */
+  testProvider: (provider: AiProvider, model?: string) =>
+    invoke<ConnectionTest>('test_provider', { provider, model: model ?? null }),
 
   // Auto-tagging runs. Progress arrives as `autotag:updated` events.
   listAutotagProviders: () => invoke<AutotagProviderOption[]>('list_autotag_providers'),

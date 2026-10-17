@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import clsx from 'clsx';
 import { api } from '../../api';
-import type { AiProvider, AiSettings, ProviderStatus } from '../../types';
+import type { AiProvider, AiSettings, ConnectionTest, ProviderStatus } from '../../types';
+import { formatCost } from '../../utils/autotag';
 import { IconSettings, IconX } from '../Icons';
 import { ANTHROPIC_MODELS, isKnownModel, parseNumberInput, settingsPatch } from './settingsHelpers';
 import styles from './SettingsDialog.module.css';
@@ -168,6 +169,11 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
                     onChange={(maxProposals) => setAnthropic({ maxProposals })}
                   />
                 </div>
+                <TestConnection
+                  provider="anthropic"
+                  model={draft.anthropic.model.trim()}
+                  configured={statusOf('anthropic')?.configured ?? false}
+                />
               </section>
 
               <section className={styles.provider}>
@@ -348,6 +354,75 @@ function ApiKeyField({ provider, status, onStatus }: ApiKeyFieldProps) {
         </p>
       )}
       {status?.keyringProblem && <p className={styles.warning}>{status.keyringProblem}</p>}
+      {error && (
+        <p className={styles.error} role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+interface TestConnectionProps {
+  provider: AiProvider;
+  /** The model in the form, which may not be saved yet */
+  model: string;
+  configured: boolean;
+}
+
+/** Sends one small tagging request with the configured key and shows how it went. */
+function TestConnection({ provider, model, configured }: TestConnectionProps) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<ConnectionTest | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const run = async () => {
+    setBusy(true);
+    setResult(null);
+    setError(null);
+    try {
+      setResult(await api.testProvider(provider, model || undefined));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className={styles.keyBlock}>
+      <div className={styles.row}>
+        <span className={styles.label} />
+        <button
+          id={`settings-${provider}-test`}
+          type="button"
+          className={clsx(styles.btn, styles.secondaryBtn)}
+          disabled={busy || !configured}
+          onClick={run}
+          title={configured ? 'Send one small request with this key' : 'Save an API key first'}
+        >
+          {busy ? 'Testing…' : 'Test connection'}
+        </button>
+      </div>
+      {result && (
+        <p
+          id={`settings-${provider}-test-result`}
+          className={result.ok ? styles.keyStatus : styles.error}
+          role="status"
+        >
+          {result.ok && <span className={clsx(styles.dot, styles.dotOn)} aria-hidden />}
+          <span>
+            {result.message}
+            {result.ok && (
+              <span className={styles.hint}>
+                {' '}
+                · {(result.inputTokens + result.outputTokens).toLocaleString()} tokens ·{' '}
+                {formatCost(result.costUsd)}
+              </span>
+            )}
+          </span>
+        </p>
+      )}
       {error && (
         <p className={styles.error} role="alert">
           {error}

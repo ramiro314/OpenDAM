@@ -56,6 +56,13 @@ real data:
    - `OPENDAM_NO_KEYRING=1` ignores the OS keyring. With `ANTHROPIC_API_KEY` and
      `TYPESAFE_API_KEY` unset too, the app shows the unconfigured state even on a machine with
      saved keys.
+   - `OPENDAM_ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` sends Anthropic requests to a local
+     stand-in instead of `https://api.anthropic.com`, so the real provider can be exercised and
+     photographed with a dummy key and no spend. It must answer `POST /v1/messages` like the API,
+     for example with a file from `src-tauri/src/autotag/fixtures/anthropic/`.
+   - `OPENDAM_ANTHROPIC_FIXTURE=<path>` saves the response of a successful Settings "Test
+     connection" there, after checking it holds no key. That is how the parser fixture is
+     captured with a real key (see that folder's `README.md`).
 
 ```sh
 XDG_DATA_HOME=$XDG_DATA_HOME OPENDAM_AUTOTAG_FAKE=1 OPENDAM_AUTOTAG_FAKE_DELAY_MS=1500 \

@@ -189,7 +189,10 @@ impl Engine {
                 provider: provider_id,
                 model: pool.provider.model(&settings).as_deref(),
                 mode: mode.as_str(),
-                options: serde_json::json!({ "maxTags": pool.provider.max_tags(&settings) }),
+                options: serde_json::json!({
+                    "maxTags": pool.provider.max_tags(&settings),
+                    "maxProposals": pool.provider.max_proposals(&settings),
+                }),
             },
             &items,
         )
@@ -322,11 +325,15 @@ impl Engine {
                 .await
                 .map_err(|e| e.to_string())?,
         );
+        let max_tags = item.options["maxTags"].as_u64().unwrap_or(8) as usize;
         let mode: Mode = serde_json::from_value(serde_json::Value::String(item.mode.clone()))
             .map_err(|_| format!("Unknown mode {}", item.mode))?;
         let request = TagRequest {
             run_id: item.run_id.clone(),
             mode,
+            model: item.model.clone(),
+            max_tags: max_tags as u32,
+            max_proposals: item.options["maxProposals"].as_u64().unwrap_or(0) as u32,
             asset: AssetInfo {
                 file_name,
                 relative_path,
@@ -336,6 +343,8 @@ impl Engine {
             },
             image,
             vocabulary: vocabulary.clone(),
+            // Proposals arrive with Prefer existing and Create freely
+            run_proposals: Vec::new(),
         };
 
         // Every class fails the item for now; retries and pausing the run come later.
@@ -343,7 +352,6 @@ impl Engine {
             tracing::debug!("{} error ({:?}): {}", provider.id(), e.class, e.message);
             e.message
         })?;
-        let max_tags = item.options["maxTags"].as_u64().unwrap_or(8) as usize;
         let accepted = vocabulary.accepted_tags(&result, max_tags);
 
         // Step 1: record every pair the library lacks before the library sees it.

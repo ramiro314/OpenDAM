@@ -203,6 +203,7 @@ pub struct Item {
     pub asset_id: String,
     pub library_id: String,
     pub mode: String,
+    pub model: Option<String>,
     pub options: serde_json::Value,
 }
 
@@ -233,8 +234,8 @@ pub async fn claim_item(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<Opt
     let Some((asset_id, library_id)) = claimed else {
         return Ok(None);
     };
-    let (mode, options): (String, String) =
-        sqlx::query_as("SELECT mode, options FROM tag_runs WHERE id = ?")
+    let (mode, model, options): (String, Option<String>, String) =
+        sqlx::query_as("SELECT mode, model, options FROM tag_runs WHERE id = ?")
             .bind(run_id)
             .fetch_one(master)
             .await?;
@@ -243,6 +244,7 @@ pub async fn claim_item(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<Opt
         asset_id,
         library_id,
         mode,
+        model,
         options: serde_json::from_str(&options).unwrap_or_default(),
     }))
 }

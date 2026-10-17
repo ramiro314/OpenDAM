@@ -1,0 +1,21 @@
+{
+  "id": "msg_01SynthesizedUnknownIds",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-sonnet-5-5",
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"existing\":[\"rock\",\"ghost\",\"tree\",\"nature\"],\"proposed\":[{\"name\":\"Mossy\",\"parent_id\":null}]}"
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "stop_details": null,
+  "usage": {
+    "input_tokens": 900,
+    "cache_creation_input_tokens": 100,
+    "cache_read_input_tokens": 3000,
+    "output_tokens": 40
+  }
+}

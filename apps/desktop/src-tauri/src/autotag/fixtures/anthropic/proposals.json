@@ -1,0 +1,26 @@
+{
+  "id": "msg_01SynthesizedProposals",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-sonnet-5-5",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "",
+      "signature": "c3ludGhlc2l6ZWQ="
+    },
+    {
+      "type": "text",
+      "text": "{\"existing\":[\"rock\"],\"proposed\":[{\"name\":\" Mossy \",\"parent_id\":\"rock\"},{\"name\":\"Ruins\",\"parent_id\":null},{\"name\":\"Ancient\",\"parent_id\":null}]}"
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "stop_details": null,
+  "usage": {
+    "input_tokens": 700,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 2800,
+    "output_tokens": 60
+  }
+}

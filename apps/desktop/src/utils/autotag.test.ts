@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import type { AutotagProviderOption, RunSummary } from '../types';
-import { autotagAvailability, modeOptions, runProgress, taggingSummary } from './autotag';
+import {
+  autotagAvailability,
+  formatCost,
+  modeOptions,
+  runProgress,
+  runUsage,
+  taggingSummary,
+} from './autotag';
 
 const ALL_MODES = ['existing_only', 'prefer_existing', 'create_freely'] as const;
 
@@ -118,5 +125,23 @@ describe('runProgress', () => {
   test('shows processed over total, and failures', () => {
     expect(runProgress(run('running', 3, 10))).toBe('3 / 10');
     expect(runProgress(run('done', 8, 10, 2))).toBe('10 / 10 · 2 failed');
+  });
+});
+
+describe('formatCost', () => {
+  test('keeps a fraction of a cent visible', () => {
+    expect(formatCost(0)).toBe('$0.00');
+    expect(formatCost(0.0021)).toBe('$0.0021');
+    expect(formatCost(0.000184)).toBe('$0.00018');
+    expect(formatCost(0.01)).toBe('$0.01');
+    expect(formatCost(12.345)).toBe('$12.35');
+  });
+});
+
+describe('runUsage', () => {
+  test('shows tokens and the running cost once the run has used any', () => {
+    expect(runUsage(run('running', 0, 10))).toBeNull();
+    const used = { ...run('running', 2, 10), inputTokens: 3500, outputTokens: 80, costUsd: 0.0043 };
+    expect(runUsage(used)).toBe(`${(3580).toLocaleString()} tokens · $0.0043`);
   });
 });
