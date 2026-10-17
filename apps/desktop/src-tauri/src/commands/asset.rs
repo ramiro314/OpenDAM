@@ -169,36 +169,31 @@ async fn search_libraries(
     // Multiple libraries: each returns only the rowid and sort key of its first `offset + limit`
     // matches, and only the merged page's rows are fetched in full.
     let mut total: i64 = 0;
-    let mut keys: Vec<(usize, i64, SortKey)> = Vec::new();
-    for (lib, (pool, _)) in target_libs.iter().enumerate() {
-        if payload.include_total {
+    if payload.include_total {
+        for (pool, _) in target_libs {
             if let Ok(c) = count_assets(pool, &filter).await {
                 total += c;
             }
         }
-        match fetch_sort_keys(pool, &filter, sort_field, &order_by, offset + limit).await {
-            Ok(lib_keys) => keys.extend(lib_keys.into_iter().map(|(rowid, key)| (lib, rowid, key))),
-            Err(e) => tracing::warn!("Left library {lib} out of a search: {e}"),
-        }
     }
-
-    // Each library's keys are already in its order, so the stable sort merges sorted runs.
-    keys.sort_by(|(lib_a, rowid_a, key_a), (lib_b, rowid_b, key_b)| {
-        let by_key = key_a.cmp_like_sqlite(key_b);
-        let by_key = if is_asc { by_key } else { by_key.reverse() };
-        let by_rowid = if is_asc {
-            rowid_a.cmp(rowid_b)
-        } else {
-            rowid_b.cmp(rowid_a)
-        };
-        by_key.then(lib_a.cmp(lib_b)).then(by_rowid)
-    });
-    let page: Vec<(usize, i64)> = keys
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .map(|(lib, rowid, _)| (lib, rowid))
-        .collect();
+    let (libs, f) = (target_libs, &filter);
+    let page = match sort_column(sort_field).1 {
+        SortKind::NoCase => {
+            merged_page::<String>(libs, f, sort_field, is_asc, offset, limit, |a, b| {
+                nocase_cmp(a, b)
+            })
+            .await
+        }
+        SortKind::Binary => {
+            merged_page::<String>(libs, f, sort_field, is_asc, offset, limit, |a, b| {
+                a.as_bytes().cmp(b.as_bytes())
+            })
+            .await
+        }
+        SortKind::Integer => {
+            merged_page::<i64>(libs, f, sort_field, is_asc, offset, limit, i64::cmp).await
+        }
+    };
 
     let mut fetched: HashMap<(usize, i64), Asset> = HashMap::new();
     for (lib, (pool, root_opt)) in target_libs.iter().enumerate() {
@@ -229,47 +224,94 @@ async fn search_libraries(
     })
 }
 
-/// The value an asset is sorted by, compared as SQLite compares it in `order_by`.
-#[derive(Debug)]
-enum SortKey {
-    /// `COLLATE NOCASE` text.
-    NoCase(String),
-    /// `BINARY` text.
-    Binary(String),
-    Integer(i64),
-}
-
-impl SortKey {
-    fn cmp_like_sqlite(&self, other: &SortKey) -> Ordering {
-        match (self, other) {
-            // NOCASE folds only ASCII letters, then compares bytes, a prefix first.
-            (SortKey::NoCase(a), SortKey::NoCase(b)) => a
-                .bytes()
-                .map(|c| c.to_ascii_lowercase())
-                .cmp(b.bytes().map(|c| c.to_ascii_lowercase())),
-            (SortKey::Binary(a), SortKey::Binary(b)) => a.as_bytes().cmp(b.as_bytes()),
-            (SortKey::Integer(a), SortKey::Integer(b)) => a.cmp(b),
-            _ => Ordering::Equal,
+/// The (library position, rowid) of each asset on the page `offset..offset + limit` of a search
+/// over `target_libs` sorted by `field`, in the order one SQLite query over all of them would
+/// return. Each library returns only the rowid and sort key of its first `offset + limit` matches,
+/// whose keys `cmp` compares as SQLite does. Ties break by library position, then rowid.
+async fn merged_page<K>(
+    target_libs: &[(sqlx::Pool<sqlx::Sqlite>, Option<std::path::PathBuf>)],
+    filter: &SqlFilter,
+    field: &str,
+    is_asc: bool,
+    offset: i64,
+    limit: i64,
+    cmp: fn(&K, &K) -> Ordering,
+) -> Vec<(usize, i64)>
+where
+    K: Send + Unpin + for<'r> sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite>,
+{
+    let sql = format!(
+        "SELECT a.rowid, {} FROM assets a {} ORDER BY {} LIMIT ?",
+        sort_column(field).0,
+        filter.where_clause(),
+        order_by(field, is_asc),
+    );
+    let mut keys: Vec<(usize, i64, K)> = Vec::new();
+    for (lib, (pool, _)) in target_libs.iter().enumerate() {
+        let mut query = sqlx::query_as::<_, (i64, K)>(&sql);
+        for b in &filter.binds {
+            query = query.bind(b.clone());
+        }
+        match query.bind(offset + limit).fetch_all(pool).await {
+            Ok(rows) => keys.extend(rows.into_iter().map(|(rowid, key)| (lib, rowid, key))),
+            Err(e) => tracing::warn!("Left library {lib} out of a search: {e}"),
         }
     }
+
+    // Each library's keys are already in its order, so the stable sort merges sorted runs.
+    keys.sort_by(|(lib_a, rowid_a, key_a), (lib_b, rowid_b, key_b)| {
+        let by_key = cmp(key_a, key_b);
+        let by_key = if is_asc { by_key } else { by_key.reverse() };
+        let by_rowid = if is_asc {
+            rowid_a.cmp(rowid_b)
+        } else {
+            rowid_b.cmp(rowid_a)
+        };
+        by_key.then(lib_a.cmp(lib_b)).then(by_rowid)
+    });
+    keys.into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .map(|(lib, rowid, _)| (lib, rowid))
+        .collect()
+}
+
+/// Compares text as SQLite's `NOCASE` collation does: ASCII letters fold to lowercase, then the
+/// bytes compare, a prefix first.
+fn nocase_cmp(a: &str, b: &str) -> Ordering {
+    a.bytes()
+        .map(|c| c.to_ascii_lowercase())
+        .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
 }
 
 /// The `ORDER BY` terms of a search over `assets a` sorted by `field`. The `rowid` tie-break makes
 /// the order total, so offset pages never overlap or skip.
 fn order_by(field: &str, is_asc: bool) -> String {
     let dir = if is_asc { "ASC" } else { "DESC" };
-    format!("{} {dir}, a.rowid {dir}", sort_column(field))
+    format!("{} {dir}, a.rowid {dir}", sort_column(field).0)
 }
 
-/// The column of `assets a` a search sorted by `field` orders on, with its collation.
-fn sort_column(field: &str) -> &'static str {
+/// How SQLite compares a sort column's values, and so how the multi-library merge decodes and
+/// compares them.
+#[derive(Clone, Copy)]
+enum SortKind {
+    /// Text under `COLLATE NOCASE`.
+    NoCase,
+    /// Text under the default `BINARY` collation.
+    Binary,
+    Integer,
+}
+
+/// The column of `assets a` a search sorted by `field` orders on, with its collation, and how
+/// its values compare.
+fn sort_column(field: &str) -> (&'static str, SortKind) {
     match field {
-        "name" => "a.file_name COLLATE NOCASE",
-        "size" => "a.size_bytes",
-        "rating" => "a.rating",
-        "kind" => "a.kind",
-        "favorite" => "a.is_favorite",
-        _ => "a.modified_at",
+        "name" => ("a.file_name COLLATE NOCASE", SortKind::NoCase),
+        "size" => ("a.size_bytes", SortKind::Integer),
+        "rating" => ("a.rating", SortKind::Integer),
+        "kind" => ("a.kind", SortKind::Binary),
+        "favorite" => ("a.is_favorite", SortKind::Integer),
+        _ => ("a.modified_at", SortKind::Integer),
     }
 }
 
@@ -497,48 +539,6 @@ const ASSET_COLUMNS: &str = r#"
     a.preview_status, a.metadata,
     (SELECT json_group_array(tag_id) FROM asset_tags WHERE asset_id = a.id) AS tags,
     (SELECT json_group_array(collection_id) FROM collection_assets WHERE asset_id = a.id) AS collections"#;
-
-/// The rowid and sort key of the first `limit` assets matching `filter` in `order_by` order, the
-/// order of a search sorted by `field`.
-async fn fetch_sort_keys(
-    pool: &sqlx::Pool<sqlx::Sqlite>,
-    filter: &SqlFilter,
-    field: &str,
-    order_by: &str,
-    limit: i64,
-) -> sqlx::Result<Vec<(i64, SortKey)>> {
-    let sql = format!(
-        "SELECT a.rowid, {} FROM assets a {} ORDER BY {order_by} LIMIT ?",
-        sort_column(field),
-        filter.where_clause(),
-    );
-    match field {
-        "name" | "kind" => {
-            let mut query = sqlx::query_as::<_, (i64, String)>(&sql);
-            for b in &filter.binds {
-                query = query.bind(b.clone());
-            }
-            let rows = query.bind(limit).fetch_all(pool).await?;
-            let key = if field == "name" {
-                SortKey::NoCase
-            } else {
-                SortKey::Binary
-            };
-            Ok(rows.into_iter().map(|(rowid, k)| (rowid, key(k))).collect())
-        }
-        _ => {
-            let mut query = sqlx::query_as::<_, (i64, i64)>(&sql);
-            for b in &filter.binds {
-                query = query.bind(b.clone());
-            }
-            let rows = query.bind(limit).fetch_all(pool).await?;
-            Ok(rows
-                .into_iter()
-                .map(|(rowid, k)| (rowid, SortKey::Integer(k)))
-                .collect())
-        }
-    }
-}
 
 #[derive(sqlx::FromRow)]
 struct RowidAssetRow {
@@ -1822,7 +1822,7 @@ mod tests {
         let dir = if order == "asc" { "ASC" } else { "DESC" };
         sqlx::query_scalar(&format!(
             "SELECT id FROM merged a ORDER BY {} {dir}, a.lib ASC, a.rid {dir}",
-            sort_column(field)
+            sort_column(field).0
         ))
         .fetch_all(&merged)
         .await

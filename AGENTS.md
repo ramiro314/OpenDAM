@@ -74,7 +74,7 @@ docs/plans                    Plans for this fork
   `a.rowid` in the sort direction, and the name sort is `COLLATE NOCASE`, so offset pages never
   overlap or skip, even across assets that share a sort key. Across libraries, ties break by the
   library's position in `get_all_libraries` order, then `rowid`, and the merge compares keys
-  exactly as SQLite does (`SortKey::cmp_like_sqlite`: NOCASE folds only ASCII).
+  exactly as SQLite does (`sort_column` names each field's `SortKind`; NOCASE folds only ASCII).
 - **Master DB is the tag and collection catalog.** Tag and collection lists are read from master.
   Definition create, update and delete write to master, then mirror to every open library DB.
   `asset_tags` and `collection_assets` rows go only to the asset's own library
