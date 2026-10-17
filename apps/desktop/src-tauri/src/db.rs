@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Pool, Sqlite};
 use std::collections::HashMap;
@@ -85,11 +85,20 @@ pub async fn upsert_collection<'e, E: sqlx::Executor<'e, Database = Sqlite>>(
 }
 
 /// Backward compatibility: tags gained a description (the hint the tagging providers get).
-/// Fails harmlessly when the column is already there.
-async fn add_tag_description_column(pool: &Pool<Sqlite>) {
-    let _ = sqlx::query("ALTER TABLE tags ADD COLUMN description TEXT NOT NULL DEFAULT ''")
-        .execute(pool)
-        .await;
+/// Any failure other than the column already being there is an error: a database left without
+/// it fails every tag query later, far from the cause.
+async fn add_tag_description_column(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
+    let present: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('tags') WHERE name = 'description')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !present {
+        sqlx::query("ALTER TABLE tags ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Orders definitions so every parent comes before its children, so writing them in order
@@ -174,7 +183,9 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_assets_is_favorite ON assets(is_favorite)")
         .execute(&pool)
         .await;
-    add_tag_description_column(&pool).await;
+    add_tag_description_column(&pool)
+        .await
+        .context("Could not add the tag description column")?;
 
     // Purge any existing Revit backup files from database
     if let Ok(assets) = sqlx::query_as::<_, (String, String)>(
@@ -246,7 +257,9 @@ impl Database {
             sqlx::query("CREATE INDEX IF NOT EXISTS idx_assets_is_favorite ON assets(is_favorite)")
                 .execute(&master_pool)
                 .await;
-        add_tag_description_column(&master_pool).await;
+        add_tag_description_column(&master_pool)
+            .await
+            .context("Could not add the tag description column to the master DB")?;
 
         let mut open_libraries = HashMap::new();
 
@@ -980,6 +993,43 @@ mod tests {
         for row in rows {
             assert_eq!(row.unwrap(), std::slice::from_ref(&expected));
         }
+    }
+
+    #[tokio::test]
+    async fn adding_the_tag_description_column_fails_loudly_unless_it_is_already_there() {
+        let dir = std::env::temp_dir().join(format!("opendam-ro-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("old.sqlite"), dir.join("new.sqlite"));
+        for (file, schema) in [
+            (
+                &old,
+                "CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
+            ),
+            (&new, include_str!("../migrations/002_library_schema.sql")),
+        ] {
+            let pool = SqlitePoolOptions::new()
+                .connect_with(
+                    SqliteConnectOptions::new()
+                        .filename(file)
+                        .create_if_missing(true),
+                )
+                .await
+                .unwrap();
+            sqlx::raw_sql(schema).execute(&pool).await.unwrap();
+            pool.close().await;
+        }
+        // Read-only stands in for any ALTER failure, such as a share locked by another machine.
+        let read_only = |file: &PathBuf| {
+            SqlitePoolOptions::new()
+                .connect_with(SqliteConnectOptions::new().filename(file).read_only(true))
+        };
+
+        let lacking = add_tag_description_column(&read_only(&old).await.unwrap()).await;
+        let present = add_tag_description_column(&read_only(&new).await.unwrap()).await;
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(lacking.is_err());
+        assert!(present.is_ok());
     }
 
     #[tokio::test]
