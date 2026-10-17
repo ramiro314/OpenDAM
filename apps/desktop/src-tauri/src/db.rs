@@ -192,6 +192,29 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     Ok(pool)
 }
 
+/// Tables only the master DB has: the registered libraries, and non-secret settings as
+/// key/JSON-value rows (API keys live in the OS keyring, never here).
+async fn create_master_tables(master_pool: &Pool<Sqlite>) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS libraries (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            root_paths  TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            asset_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(master_pool)
+    .await
+    .map(|_| ())
+}
+
 impl Database {
     pub async fn new(master_db_url: &str) -> Result<Self> {
         let master_path = Path::new(master_db_url);
@@ -208,20 +231,7 @@ impl Database {
             .connect_with(master_options)
             .await?;
 
-        // Ensure libraries table exists in master DB
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS libraries (
-                id          TEXT PRIMARY KEY,
-                name        TEXT NOT NULL,
-                root_paths  TEXT NOT NULL,
-                created_at  INTEGER NOT NULL,
-                asset_count INTEGER NOT NULL DEFAULT 0
-            );
-            "#,
-        )
-        .execute(&master_pool)
-        .await?;
+        create_master_tables(&master_pool).await?;
 
         // Also ensure library schema tables exist on master_pool as fallback
         let _ = sqlx::query(include_str!("../migrations/002_library_schema.sql"))
@@ -534,8 +544,10 @@ async fn memory_pool(foreign_keys: bool) -> Pool<Sqlite> {
 /// A database over an in-memory master and the given open libraries, for tests.
 #[cfg(test)]
 pub(crate) async fn memory_database(libraries: Vec<LibraryHandle>) -> Database {
+    let master_pool = memory_library_pool().await;
+    create_master_tables(&master_pool).await.unwrap();
     Database {
-        master_pool: memory_library_pool().await,
+        master_pool,
         libraries: Arc::new(RwLock::new(
             libraries.into_iter().map(|h| (h.id.clone(), h)).collect(),
         )),

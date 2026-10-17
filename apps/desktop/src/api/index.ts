@@ -10,6 +10,10 @@ import type {
   PreviewJob,
   PendingModelThumbnail,
   PreviewProgress,
+  AiProvider,
+  AiSettings,
+  AiSettingsPatch,
+  ProviderStatus,
 } from '../types';
 
 /** Thin wrapper around Tauri IPC commands */
@@ -71,4 +75,12 @@ export const api = {
   // Reveal in file manager / open with default app
   revealInFileManager: (filePath: string) => invoke<void>('reveal_in_file_manager', { filePath }),
   openWithDefault: (filePath: string) => invoke<void>('open_with_default', { filePath }),
+
+  // AI tagging settings. Keys are write-only: no command returns one.
+  getAiSettings: () => invoke<AiSettings>('get_ai_settings'),
+  setAiSettings: (patch: AiSettingsPatch) => invoke<AiSettings>('set_ai_settings', { patch }),
+  /** Saves `key` in the OS keyring, or clears the saved key when `key` is null */
+  setApiKey: (provider: AiProvider, key: string | null) =>
+    invoke<ProviderStatus>('set_api_key', { provider, key }),
+  getProviderStatus: () => invoke<ProviderStatus[]>('get_provider_status'),
 };

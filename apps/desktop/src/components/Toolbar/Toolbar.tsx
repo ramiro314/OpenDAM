@@ -10,7 +10,9 @@ import {
   IconPanel,
   IconRefresh,
   IconPlus,
+  IconSettings,
 } from '../Icons';
+import { SettingsDialog } from '../Settings/SettingsDialog';
 import styles from './Toolbar.module.css';
 import clsx from 'clsx';
 
@@ -28,6 +30,7 @@ export function Toolbar() {
   const { query, setQuery, search, loading } = useAssetStore();
   const { addLibrary } = useLibraryStore();
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const handleRefresh = async () => {
     setIsRefreshing(true);
@@ -214,6 +217,15 @@ export function Toolbar() {
         </button>
 
         <button
+          id="open-settings"
+          className={styles.iconBtn}
+          onClick={() => setSettingsOpen(true)}
+          title="Settings"
+        >
+          <IconSettings />
+        </button>
+
+        <button
           id="add-library"
           className={styles.primaryBtn}
           title="Add Library"
@@ -223,6 +235,8 @@ export function Toolbar() {
           <span>Add Library</span>
         </button>
       </div>
+
+      {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
     </header>
   );
 }

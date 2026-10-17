@@ -165,3 +165,45 @@ export interface SearchResult {
   page: number;
   pageSize: number;
 }
+
+// ── AI tagging settings ──────────────────────────────────────────────────
+export type AiProvider = 'anthropic' | 'jev';
+
+export interface AnthropicSettings {
+  /** A Claude model id, one of ANTHROPIC_MODELS or a custom id */
+  model: string;
+  /** Requests in flight at once, shared by every run */
+  concurrency: number;
+  maxTags: number;
+  maxProposals: number;
+}
+
+export interface JevSettings {
+  concurrency: number;
+  /** Tags scoring at least this (0-1) are kept */
+  threshold: number;
+  maxTags: number;
+}
+
+export interface AiSettings {
+  anthropic: AnthropicSettings;
+  jev: JevSettings;
+}
+
+export interface AiSettingsPatch {
+  anthropic?: Partial<AnthropicSettings>;
+  jev?: Partial<JevSettings>;
+}
+
+/** Where a provider's key comes from. It never carries the key. */
+export interface ProviderStatus {
+  provider: AiProvider;
+  configured: boolean;
+  keySource: 'env' | 'keyring' | 'none';
+  /** "from ANTHROPIC_API_KEY", "saved in keyring" or "not set" */
+  sourceLabel: string;
+  envVar: string;
+  /** A key is saved in the keyring, even if the env var overrides it */
+  savedInKeyring: boolean;
+  keyringProblem: string | null;
+}
