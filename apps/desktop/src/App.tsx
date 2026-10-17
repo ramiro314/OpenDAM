@@ -23,14 +23,8 @@ import {
 import type { AutotagUpdate } from './types';
 import { api } from './api';
 import { startModelThumbnailer } from './preview/modelThumbnailer';
+import { isEditingText } from './utils/keyboard';
 import styles from './App.module.css';
-
-function isEditingText(): boolean {
-  const active = document.activeElement;
-  if (!active) return false;
-  const tag = active.tagName.toLowerCase();
-  return tag === 'input' || tag === 'textarea' || (active as HTMLElement).isContentEditable;
-}
 
 export default function App() {
   const { sidebarOpen, detailPanelOpen, focusedAssetId } = useUIStore();

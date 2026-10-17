@@ -8,6 +8,8 @@ import { PAGE_SIZE, assetAt, createSettler } from '../../store/pageCache';
 import { autotagAvailability } from '../../utils/autotag';
 import { menuTargets, openLimitReason } from '../../utils/contextMenu';
 import { formatVisibleRange } from '../../utils/format';
+import { isEditingText } from '../../utils/keyboard';
+import { scrubKey, scrubLabelText } from '../../utils/scrubKey';
 import { ContextMenu } from '../ContextMenu/ContextMenu';
 import { IconEye, IconExternal, IconTag, IconTrash } from '../Icons';
 import { AssetCard } from './AssetCard';
@@ -24,16 +26,23 @@ import {
   anchoredScrollTop,
   gridLayout,
   listLayout,
+  pagingTarget,
   rowCount,
   rowTop,
   rowsToIndexRange,
+  scrubLabelTop,
   visibleRows,
   wantedPages,
 } from './gridGeometry';
+import type { PagingKey } from './gridGeometry';
 import type { Asset } from '../../types';
 import styles from './AssetGrid.module.css';
 
 type AssetHandler = (asset: Asset, e: React.MouseEvent) => void;
+
+const PAGING_KEYS = new Set<string>(['Home', 'End', 'PageUp', 'PageDown'] satisfies PagingKey[]);
+/** What the browser focuses on a click by itself; `closest` finds the container at the latest. */
+const FOCUSABLE = 'a[href], button, input, select, textarea, [tabindex], [contenteditable]';
 
 export function AssetGrid() {
   const viewMode = useUIStore((s) => s.viewMode);
@@ -267,52 +276,86 @@ function WindowedResults({
   );
   const range = visible && rowsToIndexRange(visible.first, visible.last, columns, total);
 
+  // A click on the grid's background focuses it, so the paging keys work; a click on a card
+  // focuses the card, and its keys bubble up here
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if ((e.target as Element).closest(FOCUSABLE) === e.currentTarget) {
+      e.currentTarget.focus({ preventScroll: true });
+    }
+  };
+
+  // Every key handled here is prevented, or WebKit's own scrolling of the focused container would
+  // run as well and one Page Down would scroll twice. Space bubbles on to App's QuickLook handler.
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (isEditingText()) return;
+    if (e.code === 'Space') {
+      e.preventDefault();
+      return;
+    }
+    if (!PAGING_KEYS.has(e.key)) return;
+    e.preventDefault();
+    const el = e.currentTarget;
+    el.scrollTop = pagingTarget(
+      e.key as PagingKey,
+      el.scrollTop,
+      el.clientHeight,
+      el.scrollHeight,
+      rowPitch
+    );
+  };
+
   return (
     <>
-      <div
-        id="asset-scroll"
-        className={styles.scrollArea}
-        onClick={onBackdropClick}
-        ref={scrollRef}
-        data-columns={columns}
-        data-row-pitch={rowPitch}
-        style={
-          {
-            '--scroll-padding': `${SCROLL_PADDING}px`,
-            '--grid-gap': `${GRID_GAP}px`,
-            '--list-row-height': `${LIST_ROW_HEIGHT}px`,
-            '--card-body-height': `${CARD_BODY_HEIGHT}px`,
-          } as React.CSSProperties
-        }
-      >
+      <div className={styles.scrollFrame}>
         <div
-          className={styles.rows}
-          style={{ height: rows > 0 ? (rows - 1) * rowPitch + rowHeight : 0 }}
+          id="asset-scroll"
+          className={styles.scrollArea}
+          onClick={onBackdropClick}
+          onPointerDown={handlePointerDown}
+          onKeyDown={handleKeyDown}
+          tabIndex={0}
+          ref={scrollRef}
+          data-columns={columns}
+          data-row-pitch={rowPitch}
+          style={
+            {
+              '--scroll-padding': `${SCROLL_PADDING}px`,
+              '--grid-gap': `${GRID_GAP}px`,
+              '--list-row-height': `${LIST_ROW_HEIGHT}px`,
+              '--card-body-height': `${CARD_BODY_HEIGHT}px`,
+            } as React.CSSProperties
+          }
         >
-          {virtualizer.getVirtualItems().map((item) => {
-            const first = item.index * columns;
-            const items: (Asset | undefined)[] = [];
-            for (let i = first; i < Math.min(total, first + columns); i++) {
-              const asset = assetAt({ pages }, i);
-              // A deleted asset shows as a placeholder until the refresh after it lands
-              items.push(asset && !deleted.has(asset.id) ? asset : undefined);
-            }
-            return (
-              <ResultRow
-                key={item.key}
-                viewMode={viewMode}
-                first={first}
-                items={items}
-                top={item.index * rowPitch}
-                height={rowHeight}
-                columns={columns}
-                selected={selectedAssetIds}
-                onClick={onAssetClick}
-                onContextMenu={onAssetContextMenu}
-              />
-            );
-          })}
+          <div
+            className={styles.rows}
+            style={{ height: rows > 0 ? (rows - 1) * rowPitch + rowHeight : 0 }}
+          >
+            {virtualizer.getVirtualItems().map((item) => {
+              const first = item.index * columns;
+              const items: (Asset | undefined)[] = [];
+              for (let i = first; i < Math.min(total, first + columns); i++) {
+                const asset = assetAt({ pages }, i);
+                // A deleted asset shows as a placeholder until the refresh after it lands
+                items.push(asset && !deleted.has(asset.id) ? asset : undefined);
+              }
+              return (
+                <ResultRow
+                  key={item.key}
+                  viewMode={viewMode}
+                  first={first}
+                  items={items}
+                  top={item.index * rowPitch}
+                  height={rowHeight}
+                  columns={columns}
+                  selected={selectedAssetIds}
+                  onClick={onAssetClick}
+                  onContextMenu={onAssetContextMenu}
+                />
+              );
+            })}
+          </div>
         </div>
+        <ScrubLabel scrollRef={scrollRef} columns={columns} rowPitch={rowPitch} rows={rows} />
       </div>
       <div className={styles.footer}>
         <span id="asset-range" className={styles.footerCount}>
@@ -320,6 +363,99 @@ function WindowedResults({
         </span>
       </div>
     </>
+  );
+}
+
+/** Scroll speed, in viewport heights a second, above which the scrub label shows (D5). */
+const SCRUB_SPEED = 2;
+/** How long the scrub label stays after the last scroll event. */
+const SCRUB_HIDE_MS = 600;
+const SCRUB_LABEL_HEIGHT = 26;
+
+interface ScrubView {
+  scrollTop: number;
+  viewportHeight: number;
+  scrollHeight: number;
+  scrollbarWidth: number;
+}
+
+/**
+ * The floating `41,200 of 83,095 - M` beside the scrollbar thumb while you fling or drag the
+ * thumb. It keys off scroll speed, not pointer events, since WebKitGTK may not dispatch those for
+ * the native scrollbar; on a big collection any thumb drag moves several viewports a second. It
+ * re-renders on its own, so the rows don't re-render on every scroll event.
+ */
+function ScrubLabel({
+  scrollRef,
+  columns,
+  rowPitch,
+  rows,
+}: {
+  scrollRef: React.RefObject<HTMLDivElement | null>;
+  columns: number;
+  rowPitch: number;
+  rows: number;
+}) {
+  const pages = useAssetStore((s) => s.pages);
+  const total = useAssetStore((s) => s.total);
+  const sortField = useAssetStore((s) => s.query.sort.field);
+  const [view, setView] = useState<ScrubView | null>(null);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let last = { top: el.scrollTop, time: performance.now() };
+    let shown = false;
+    let hideTimer: ReturnType<typeof setTimeout> | undefined;
+    const onScroll = () => {
+      const now = performance.now();
+      const seconds = (now - last.time) / 1000;
+      const viewports = Math.abs(el.scrollTop - last.top) / Math.max(1, el.clientHeight);
+      last = { top: el.scrollTop, time: now };
+      if (!shown && !(seconds > 0 && viewports / seconds > SCRUB_SPEED)) return;
+      shown = true;
+      setView({
+        scrollTop: el.scrollTop,
+        viewportHeight: el.clientHeight,
+        scrollHeight: el.scrollHeight,
+        scrollbarWidth: el.offsetWidth - el.clientWidth,
+      });
+      clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => {
+        shown = false;
+        setView(null);
+      }, SCRUB_HIDE_MS);
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      clearTimeout(hideTimer);
+    };
+  }, [scrollRef]);
+
+  if (!view) return null;
+  const visible = visibleRows(view.scrollTop, view.viewportHeight, rowPitch, rows);
+  if (!visible) return null;
+  const index = Math.min(total - 1, visible.first * columns);
+  const asset = assetAt({ pages }, index);
+  return (
+    <div
+      id="scrub-label"
+      className={styles.scrubLabel}
+      aria-hidden="true"
+      style={{
+        top: scrubLabelTop(
+          view.scrollTop,
+          view.viewportHeight,
+          view.scrollHeight,
+          SCRUB_LABEL_HEIGHT
+        ),
+        right: view.scrollbarWidth + 8,
+        height: SCRUB_LABEL_HEIGHT,
+      }}
+    >
+      {scrubLabelText(index, total, asset ? scrubKey(asset, sortField) : null)}
+    </div>
   );
 }
 

@@ -5,6 +5,15 @@
   overflow: hidden;
 }
 
+/* The scroll area and the scrub label floating over it */
+.scrollFrame {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .scrollArea {
   flex: 1;
   overflow-y: auto;
@@ -14,6 +23,28 @@
   /* --scroll-padding, --grid-gap and --list-row-height come from gridGeometry.ts, which the
      virtualizer positions rows by */
   padding: var(--scroll-padding);
+}
+
+.scrollArea:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Position and sort key beside the scrollbar thumb during a fast scroll; its top, height and
+   right edge come from AssetGrid.tsx */
+.scrubLabel {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  padding: 0 var(--space-3);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  color: var(--color-text-primary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
 }
 
 /* Windowed rows: the container is as tall as every row, and only the rendered rows are in it,

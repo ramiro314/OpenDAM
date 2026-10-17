@@ -3,6 +3,8 @@
 // check here.
 
 import { useAssetStore, useUIStore } from '../store';
+import { assetAt } from '../store/pageCache';
+import { scrubKey } from '../utils/scrubKey';
 import {
   GRID_GAP,
   SCROLL_PADDING,
@@ -81,7 +83,34 @@ function firstVisibleRow(el: HTMLElement): number[] {
 }
 
 const FOOTER = /^([\d,]+)-([\d,]+) of ([\d,]+) assets?$/;
+const SCRUB_LABEL = /^([\d,]+) of ([\d,]+)(?: - (.+))?$/;
 const parseCount = (s: string) => Number(s.replace(/,/g, ''));
+
+const scrubLabel = () => document.getElementById('scrub-label');
+
+/**
+ * Scrolls `el` down at `viewportsPerSecond` viewport heights a second, a step every frame, until
+ * `during` settles. Resolves with the time of the last step.
+ */
+async function scrollAt(el: HTMLElement, viewportsPerSecond: number, during: Promise<unknown>) {
+  let done = false;
+  void during.finally(() => (done = true));
+  const from = el.scrollTop;
+  const start = performance.now();
+  let last = start;
+  while (!done) {
+    last = await nextFrame();
+    el.scrollTop = from + (viewportsPerSecond * el.clientHeight * (last - start)) / 1000;
+  }
+  return performance.now();
+}
+
+/** A cancelable `keydown` on `el`, as a real press reaches the grid; returns the event. */
+function press(el: HTMLElement, key: string, code = key): KeyboardEvent {
+  const event = new KeyboardEvent('keydown', { key, code, bubbles: true, cancelable: true });
+  el.dispatchEvent(event);
+  return event;
+}
 
 export const UI_CHECKS: UiCheck[] = [
   {
@@ -265,6 +294,144 @@ export const UI_CHECKS: UiCheck[] = [
       useUIStore.getState().setViewMode('list');
       await frames(3);
       await rightClick('list row', 'asset-row-', 'U5-list-menu');
+    },
+  },
+  {
+    id: 'U6',
+    title:
+      'A scroll faster than 2 viewports a second shows the scrub label under name and date sort, ' +
+      'and it hides 0.6 s after the scroll stops',
+    run: async ({ scroll, assert, pause, sleep }) => {
+      const { field, order } = useAssetStore.getState().query.sort;
+      try {
+        for (const sort of ['name', 'date'] as const) {
+          const store = useAssetStore.getState();
+          store.setSort(sort, 'asc');
+          await store.search();
+          await frames(3);
+          const el = scroll();
+          el.scrollTop = 0.3 * (el.scrollHeight - el.clientHeight);
+          await frames(3);
+          // Slower than the threshold: no label
+          await scrollAt(el, 1, sleep(700));
+          assert(!scrubLabel(), `${sort}: the label showed at 1 viewport a second`);
+          // Faster: the label, and for name sort the screenshot while it shows
+          const stoppedAt = await scrollAt(
+            el,
+            4,
+            sort === 'name' ? pause('U6-scrub-label') : sleep(1_000)
+          );
+          assert(scrubLabel(), `${sort}: no label at 4 viewports a second`);
+          assert(scrubLabel()!.getAttribute('aria-hidden') === 'true', `${sort}: not aria-hidden`);
+          // The key arrives with the page under the viewport, while the label still shows
+          await untilFrame(
+            () => SCRUB_LABEL.exec(scrubLabel()?.textContent ?? '')?.[3] !== undefined,
+            500,
+            `${sort}: the label's key (it reads "${scrubLabel()?.textContent}")`
+          );
+          const [, position, count, key] = SCRUB_LABEL.exec(scrubLabel()!.textContent!)!;
+          const { total, pages } = useAssetStore.getState();
+          assert(parseCount(count) === total, `${sort}: the label counts ${count} of ${total}`);
+          // The first visible asset, or the first of the row above when only its gap shows, as
+          // the footer counts it
+          const index = parseCount(position) - 1;
+          const row = firstVisibleRow(el);
+          const { columns } = layoutOf(el);
+          const rowTopPx = el
+            .querySelector<HTMLElement>(`[data-index="${row[0]}"]`)!
+            .getBoundingClientRect().top;
+          const gapShows = rowTopPx > el.getBoundingClientRect().top + 0.5;
+          assert(
+            index === row[0] || (gapShows && index === row[0] - columns),
+            `${sort}: the label reads ${position}, asset ${row[0] + 1} is the first visible`
+          );
+          const asset = assetAt({ pages }, index);
+          assert(asset, `${sort}: asset ${index} is not cached`);
+          const expected = scrubKey(asset!, sort);
+          assert(
+            key === expected,
+            `${sort}: the key is "${key}", asset ${index} has "${expected}"`
+          );
+          await untilFrame(() => !scrubLabel(), 1_500, `${sort}: the label hides`);
+          const hidAfter = Math.round(performance.now() - stoppedAt);
+          assert(
+            hidAfter >= 550 && hidAfter <= 900,
+            `${sort}: the label hid ${hidAfter} ms after the scroll stopped`
+          );
+        }
+      } finally {
+        useAssetStore.getState().setSort(field, order);
+      }
+    },
+  },
+  {
+    id: 'U7',
+    title:
+      'With the container focused, End, Home, Page Down and Page Up page through the results, ' +
+      'and they and Space are prevented',
+    run: async ({ scroll, assert }) => {
+      const el = scroll();
+      const { total } = useAssetStore.getState();
+      const { rowPitch } = layoutOf(el);
+      const atTop = () => el.scrollTop;
+      const inView = (index: number) => tilesInView(el).some((t) => indexOf(t) === index);
+
+      // A pointerdown on a card leaves focus to the card; on the background it focuses the grid
+      const down = (target: Element) =>
+        target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+      (document.activeElement as HTMLElement | null)?.blur();
+      down(el.querySelector('[data-index="0"]')!.firstElementChild!);
+      assert(document.activeElement !== el, 'a pointerdown on a card focused the container');
+      down(el);
+      assert(document.activeElement === el, 'a pointerdown on the background did not focus it');
+
+      for (const [key, code] of [
+        ['Home', 'Home'],
+        ['End', 'End'],
+        ['PageUp', 'PageUp'],
+        ['PageDown', 'PageDown'],
+        [' ', 'Space'],
+      ]) {
+        const event = press(el, key, code);
+        assert(event.defaultPrevented, `${code} was not prevented`);
+        if (code === 'Space') el.dispatchEvent(new KeyboardEvent('keyup', { key, code }));
+      }
+      assert(!press(el, 'ArrowDown').defaultPrevented, 'ArrowDown was prevented');
+
+      el.scrollTop = 0;
+      await frames(2);
+      press(el, 'End');
+      await frames(3);
+      assert(
+        Math.abs(atTop() - (el.scrollHeight - el.clientHeight)) <= 1,
+        `End scrolled to ${atTop()}, not ${el.scrollHeight - el.clientHeight}`
+      );
+      assert(inView(total - 1), `End: the last asset (${total - 1}) is not in view`);
+      press(el, 'Home');
+      await frames(3);
+      assert(atTop() === 0 && inView(0), `Home scrolled to ${atTop()}`);
+      press(el, 'PageDown');
+      await frames(3);
+      const step = el.clientHeight - rowPitch;
+      assert(
+        Math.abs(atTop() - step) <= 1,
+        `Page Down moved ${atTop()} px, one viewport minus one row is ${step}`
+      );
+      press(el, 'PageDown');
+      await frames(3);
+      assert(Math.abs(atTop() - 2 * step) <= 2, `a second Page Down reached ${atTop()}`);
+      press(el, 'PageUp');
+      await frames(3);
+      assert(Math.abs(atTop() - step) <= 2, `Page Up went back to ${atTop()}, not ${step}`);
+
+      // The keys belong to a text field while one has focus
+      const input = document.querySelector<HTMLInputElement>('#toolbar-search');
+      assert(input, 'no text field to focus');
+      input!.focus();
+      const before = atTop();
+      assert(!press(el, 'End').defaultPrevented, 'End was prevented while a text field had focus');
+      assert(atTop() === before, 'End scrolled while a text field had focus');
+      input!.blur();
     },
   },
 ];
