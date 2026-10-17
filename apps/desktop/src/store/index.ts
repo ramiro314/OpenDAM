@@ -195,7 +195,8 @@ interface AssetStore {
   deleteAsset: (id: string, deleteFile?: boolean) => Promise<void>;
   deleteAssets: (ids: string[], deleteFile?: boolean) => Promise<void>;
   renameAsset: (id: string, newName: string) => Promise<Asset>;
-  updateAssetPreview: (id: string, thumbnailPath?: string, previewModel?: string) => void;
+  /** Applies a finished preview: `thumbnailPath` replaces the old one, and `null` clears it. */
+  updateAssetPreview: (id: string, thumbnailPath: string | null, previewModel?: string) => void;
   setPreviewStatus: (id: string, status: Asset['previewStatus']) => void;
   getById: (id: string) => Asset | undefined;
   /** Re-fetches the given assets that are loaded; ids not loaded are ignored */
@@ -397,7 +398,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       if (!asset) return s;
       const updated: Asset = {
         ...asset,
-        thumbnailPath: thumbnailPath || asset.thumbnailPath,
+        thumbnailPath: thumbnailPath ?? undefined,
         previewStatus: 'done',
         metadata: previewModel
           ? { ...asset.metadata, preview_model: previewModel }

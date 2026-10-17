@@ -5,7 +5,7 @@ import type { Asset } from '../../types';
 import { useAssetStore } from '../../store';
 import { IconImage, IconVideo, IconStar, IconHeart, IconHeartFilled } from '../Icons';
 import { formatSize } from '../../utils/format';
-import { tileMedia, tileState } from './tileState';
+import { tileMedia, tileState, type TileMedia } from './tileState';
 import styles from './AssetListRow.module.css';
 
 interface AssetListRowProps {
@@ -27,14 +27,17 @@ export const AssetListRow = memo(function AssetListRow({
   onContextMenu,
 }: AssetListRowProps) {
   const patchAsset = useAssetStore((s) => s.patchAsset);
-  // The thumbnail has loaded or failed; `data-tile-state` reads "ready" once it has
+  // The media that failed to load, so the row falls back to the next one
+  const [failed, setFailed] = useState<TileMedia>();
+  // The image has loaded; `data-tile-state` reads "ready" once it has, or all media failed
   const [mediaSettled, setMediaSettled] = useState(false);
 
   useEffect(() => {
+    setFailed(undefined);
     setMediaSettled(false);
   }, [asset.thumbnailPath, asset.filePath]);
 
-  const media = tileMedia(asset);
+  const media = tileMedia(asset, { failed });
   const settle = () => setMediaSettled(true);
 
   const handleClick = useCallback(
@@ -108,7 +111,7 @@ export const AssetListRow = memo(function AssetListRow({
             className={styles.thumbImg}
             loading="lazy"
             onLoad={settle}
-            onError={settle}
+            onError={() => setFailed(media)}
           />
         ) : media === 'original' ? (
           <img
@@ -117,7 +120,7 @@ export const AssetListRow = memo(function AssetListRow({
             className={styles.thumbImg}
             loading="lazy"
             onLoad={settle}
-            onError={settle}
+            onError={() => setFailed(media)}
           />
         ) : (
           <div className={styles.thumbPlaceholder}>

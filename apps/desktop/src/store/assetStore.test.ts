@@ -110,6 +110,36 @@ describe('useAssetStore deleteAssets', () => {
   });
 });
 
+describe('useAssetStore updateAssetPreview', () => {
+  const thumbnailed = { ...asset, thumbnailPath: '/lib/.opendam/thumbs/a1_thumb.png' } as Asset;
+
+  async function loadAsset() {
+    api.searchAssets = async () => ({ ...found, assets: [thumbnailed] });
+    await useAssetStore.getState().search();
+  }
+
+  test('a null thumbnail clears the stored path', async () => {
+    await loadAsset();
+
+    useAssetStore.getState().updateAssetPreview('a1', null);
+
+    const s = useAssetStore.getState();
+    expect(s.assetMap.get('a1')?.thumbnailPath).toBeUndefined();
+    expect(s.assets[0].thumbnailPath).toBeUndefined();
+    expect(s.assets[0].previewStatus).toBe('done');
+  });
+
+  test('a new thumbnail replaces the stored path', async () => {
+    await loadAsset();
+
+    useAssetStore.getState().updateAssetPreview('a1', '/lib/.opendam/thumbs/a1_thumb.jpg');
+
+    expect(useAssetStore.getState().assets[0].thumbnailPath).toBe(
+      '/lib/.opendam/thumbs/a1_thumb.jpg'
+    );
+  });
+});
+
 describe('useAutotagStore applyUpdate', () => {
   test('re-fetches only the changed assets that are loaded', async () => {
     const loaded = ['a', 'b'].map(
