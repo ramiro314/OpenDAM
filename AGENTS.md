@@ -58,6 +58,11 @@ docs/plans                    Plans for this fork
 - **Batched writes.** Database writes go in transactions of about 200 rows, as `watcher.rs` does.
 - **Rust-native raster decoding.** Standard rasters (jpg, png, tga, tif, bmp, webp) are decoded in
   Rust with the `image` crate. Only formats Rust can't decode go to Python.
+- **No upscaled thumbnails.** `generate_image_thumb` reads a raster's size from its header first.
+  Sources 512 px or smaller that the webview can display (png, jpg, jpeg, webp, bmp, gif) get no
+  thumbnail, and the UI shows the original, chosen by extension (`utils/media.ts`). Smaller TGA
+  and TIFF get a PNG at their own size. A changed raster gets a fresh preview job, and a job that
+  clears or renames a thumbnail deletes the old `_thumb` file before it updates the row.
 - **One persistent Python worker.** The worker is a long-lived JSON-over-stdio daemon. Send it
   requests over the existing stream; one process serves every file.
 - **Zero telemetry.** The app makes no network calls to analytics or tracking services. The only

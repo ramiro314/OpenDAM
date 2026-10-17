@@ -1,15 +1,22 @@
 import { describe, expect, test } from 'bun:test';
 import { tileMedia, tileState } from './tileState';
 
-const png = { kind: 'texture' as const, filePath: '/lib/rock.png' };
+const png = { kind: 'texture' as const, filePath: '/lib/rock.png', extension: 'png' };
 const thumbnailed = { ...png, thumbnailPath: '/lib/.opendam/thumbs/a_thumb.png' };
-const video = { kind: 'video' as const, filePath: '/lib/clip.mp4' };
-const model = { kind: '3d_model' as const, filePath: '/lib/ship.glb' };
+const tga = { kind: 'texture' as const, filePath: '/lib/rock.tga', extension: 'tga' };
+const video = { kind: 'video' as const, filePath: '/lib/clip.mp4', extension: 'mp4' };
+const model = { kind: '3d_model' as const, filePath: '/lib/ship.glb', extension: 'glb' };
 
 describe('tileMedia', () => {
   test('prefers the thumbnail, then the original image', () => {
     expect(tileMedia(thumbnailed)).toBe('thumbnail');
     expect(tileMedia(png)).toBe('original');
+  });
+
+  test('chooses the original by extension, not kind', () => {
+    expect(tileMedia({ ...png, kind: 'material' })).toBe('original');
+    expect(tileMedia({ ...png, kind: 'other', extension: 'SVG' })).toBe('original');
+    expect(tileMedia(tga)).toBe('none');
   });
 
   test('skips a .glb thumbnail and falls back to the icon for a model', () => {
@@ -21,8 +28,10 @@ describe('tileMedia', () => {
     expect(tileMedia(video)).toBe('none');
   });
 
-  test('a failed load falls back to the icon', () => {
-    expect(tileMedia(thumbnailed, { failed: true })).toBe('none');
+  test('a failed thumbnail falls back to the original, then the icon', () => {
+    expect(tileMedia(thumbnailed, { failed: 'thumbnail' })).toBe('original');
+    expect(tileMedia(thumbnailed, { failed: 'original' })).toBe('none');
+    expect(tileMedia({ ...tga, thumbnailPath: '/t.png' }, { failed: 'thumbnail' })).toBe('none');
   });
 });
 
@@ -37,8 +46,8 @@ describe('tileState', () => {
     expect(tileState(media, true)).toBe('ready');
   });
 
-  test('a grid card whose image failed is ready', () => {
-    expect(tileState(tileMedia(thumbnailed, { failed: true }), false)).toBe('ready');
+  test('a grid card whose media all failed is ready', () => {
+    expect(tileState(tileMedia(thumbnailed, { failed: 'original' }), false)).toBe('ready');
   });
 
   test('a video is a placeholder until its metadata loads', () => {

@@ -19,6 +19,7 @@ import {
 } from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { api } from '../../api';
+import { isWebviewDisplayable } from '../../utils/media';
 import { ThreeViewer } from './ThreeViewer';
 import { SuggestTags } from './SuggestTags';
 import styles from './DetailPanel.module.css';
@@ -154,9 +155,7 @@ export function DetailPanel() {
     <aside className={styles.panel} id="detail-panel">
       {/* Preview thumbnail */}
       <div className={styles.thumbArea}>
-        {['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'svg'].includes(
-          asset.extension.toLowerCase()
-        ) ? (
+        {isWebviewDisplayable(asset.extension) ? (
           <img
             src={convertFileSrc(asset.filePath)}
             alt={asset.fileName}
@@ -165,12 +164,6 @@ export function DetailPanel() {
         ) : asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb') ? (
           <img
             src={convertFileSrc(asset.thumbnailPath)}
-            alt={asset.fileName}
-            className={styles.thumbImg}
-          />
-        ) : ['image', 'texture'].includes(asset.kind) && asset.filePath ? (
-          <img
-            src={convertFileSrc(asset.filePath)}
             alt={asset.fileName}
             className={styles.thumbImg}
           />
@@ -690,12 +683,12 @@ function PreviewTab({ asset, onGeneratePreview }: { asset: Asset; onGeneratePrev
   const modelPath =
     (asset.metadata?.preview_model as string) ||
     (asset.thumbnailPath?.endsWith('.glb') ? asset.thumbnailPath : undefined);
-  const imagePath =
-    asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb')
+  // The original where the webview can display it, as in the header preview
+  const imagePath = isWebviewDisplayable(asset.extension)
+    ? asset.filePath
+    : asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb')
       ? asset.thumbnailPath
-      : ['image', 'texture'].includes(asset.kind)
-        ? asset.filePath
-        : undefined;
+      : undefined;
   const isPending = asset.previewStatus === 'pending' || asset.previewStatus === 'generating';
   const isError = asset.previewStatus === 'error';
 

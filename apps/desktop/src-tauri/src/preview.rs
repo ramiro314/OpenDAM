@@ -1,4 +1,4 @@
-use crate::db::{make_relative_path, resolve_path};
+use crate::db::{make_relative_path, resolve_path, LibraryHandle};
 use crate::AppState;
 use anyhow::{anyhow, Result};
 use image::imageops::FilterType;
@@ -21,35 +21,71 @@ pub fn is_native_image(ext: &str) -> bool {
     )
 }
 
-/// Blazingly fast in-process image downsampling using the native Rust `image` crate.
-/// Uses Triangle (bilinear) filtering for 4x–8x faster performance than Lanczos3.
-pub fn generate_image_thumb(source: &Path, output: &Path) -> Result<()> {
-    let img = image::open(source)?;
-    let thumb = img.resize(THUMB_SIZE, THUMB_SIZE, FilterType::Triangle);
+/// Checks if an extension is a raster image the webview displays itself, so a small one needs
+/// no thumbnail.
+pub fn is_webview_displayable(ext: &str) -> bool {
+    matches!(
+        ext.to_lowercase().as_str(),
+        "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp"
+    )
+}
 
-    if let Some(parent) = output.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let is_jpg = output
+/// Writes `asset_id`'s thumbnail for `source` into `thumb_dir` and returns its file name, or
+/// `None` when the original is shown instead. Thumbnails are never upscaled: a source
+/// `THUMB_SIZE` px or smaller gets no thumbnail if the webview can display it, and otherwise
+/// (TGA, TIFF) a PNG at its own size. Larger sources are downsampled with Triangle (bilinear)
+/// filtering, 4x-8x faster than Lanczos3.
+pub fn generate_image_thumb(
+    source: &Path,
+    thumb_dir: &Path,
+    asset_id: &str,
+) -> Result<Option<String>> {
+    let ext = source
         .extension()
         .and_then(|s| s.to_str())
-        .map(|s| s.eq_ignore_ascii_case("jpg") || s.eq_ignore_ascii_case("jpeg"))
-        .unwrap_or(false);
-
-    if is_jpg {
-        let rgb = thumb.to_rgb8();
-        rgb.save_with_format(output, image::ImageFormat::Jpeg)?;
-    } else {
-        thumb.save(output)?;
+        .unwrap_or("")
+        .to_lowercase();
+    // The header alone gives the size, so a small displayable image is never decoded.
+    let (width, height) = image::image_dimensions(source)?;
+    let small = width.max(height) <= THUMB_SIZE;
+    if small && is_webview_displayable(&ext) {
+        return Ok(None);
     }
-    Ok(())
+
+    let img = image::open(source)?;
+    // Named by asset id: file names repeat across folders, asset ids don't.
+    let (thumb, file_name) = if small {
+        (img, format!("{}_thumb.png", asset_id))
+    } else {
+        let thumb_ext = if ext == "png" || ext == "webp" {
+            "png"
+        } else {
+            "jpg"
+        };
+        (
+            img.resize(THUMB_SIZE, THUMB_SIZE, FilterType::Triangle),
+            format!("{}_thumb.{}", asset_id, thumb_ext),
+        )
+    };
+
+    let _ = std::fs::create_dir_all(thumb_dir);
+    let output = thumb_dir.join(&file_name);
+    if file_name.ends_with(".jpg") {
+        thumb
+            .to_rgb8()
+            .save_with_format(&output, image::ImageFormat::Jpeg)?;
+    } else {
+        thumb.save(&output)?;
+    }
+    Ok(Some(file_name))
 }
 
 /// Runs `decode`, turning a panic into `Err`: a malformed file can panic inside
 /// the decoder, and that should fail one image, not the app. Relies on
 /// `[profile.release]` unwinding on panic.
-fn catch_decoder_panic(decode: impl FnOnce() -> Result<()> + std::panic::UnwindSafe) -> Result<()> {
+fn catch_decoder_panic<T>(
+    decode: impl FnOnce() -> Result<T> + std::panic::UnwindSafe,
+) -> Result<T> {
     std::panic::catch_unwind(decode).unwrap_or_else(|_| Err(anyhow!("image decoder panicked")))
 }
 
@@ -265,17 +301,37 @@ fn resolve_source(root_path: &Path, file_path: &str) -> PathBuf {
     }
 }
 
-/// Marks a job done, stores the asset's preview paths and notifies the UI.
-/// `rel_thumb` is relative to the library root; `model_path` is absolute.
+/// A finished preview job, as `preview:done` reports it. Both paths are absolute; a `None`
+/// `thumb_path` means the asset has no thumbnail.
+#[derive(Debug)]
+pub(crate) struct PreviewDone {
+    asset_id: String,
+    thumb_path: Option<String>,
+    model_path: Option<String>,
+}
+
+fn emit_done(state: &AppState, done: &PreviewDone) {
+    let _ = state.app_handle.emit(
+        "preview:done",
+        json!({
+            "assetId": &done.asset_id,
+            "thumbnailPath": &done.thumb_path,
+            "previewModel": &done.model_path,
+        }),
+    );
+}
+
+/// Marks a job done and stores the asset's preview paths, replacing any old ones: a `None`
+/// `rel_thumb` clears `thumbnail_path`. `rel_thumb` is relative to the library root;
+/// `model_path` is absolute.
 async fn complete_job(
-    state: &AppState,
     pool: &Pool<Sqlite>,
     root_path: &Path,
     job_id: &str,
     asset_id: &str,
     rel_thumb: Option<String>,
     model_path: Option<String>,
-) {
+) -> PreviewDone {
     let _ = sqlx::query("UPDATE preview_jobs SET status = 'done' WHERE id = ?")
         .bind(job_id)
         .execute(pool)
@@ -292,22 +348,51 @@ async fn complete_job(
         .execute(pool)
         .await;
     } else {
-        let _ = sqlx::query("UPDATE assets SET preview_status = 'done', thumbnail_path = COALESCE(?, thumbnail_path) WHERE id = ?")
-            .bind(&rel_thumb)
-            .bind(asset_id)
-            .execute(pool)
-            .await;
+        let _ = sqlx::query(
+            "UPDATE assets SET preview_status = 'done', thumbnail_path = ? WHERE id = ?",
+        )
+        .bind(&rel_thumb)
+        .bind(asset_id)
+        .execute(pool)
+        .await;
     }
 
-    let resolved_thumb = rel_thumb.as_ref().map(|r| resolve_path(root_path, r));
-    let _ = state.app_handle.emit(
-        "preview:done",
-        json!({
-            "assetId": asset_id,
-            "thumbnailPath": &resolved_thumb,
-            "previewModel": &model_path,
-        }),
-    );
+    PreviewDone {
+        asset_id: asset_id.to_string(),
+        thumb_path: rel_thumb.as_ref().map(|r| resolve_path(root_path, r)),
+        model_path,
+    }
+}
+
+/// Deletes the asset's current thumbnail file under `.opendam/thumbs` unless it is
+/// `new_rel_thumb`, so a thumbnail that is cleared or renamed leaves no orphaned file. It runs
+/// before the row changes: if the app stops in between, the row points at a missing file and
+/// the UI falls back to the original.
+async fn delete_replaced_thumb(
+    pool: &Pool<Sqlite>,
+    root_path: &Path,
+    asset_id: &str,
+    new_rel_thumb: Option<&str>,
+) {
+    let old: Option<String> = sqlx::query_scalar("SELECT thumbnail_path FROM assets WHERE id = ?")
+        .bind(asset_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    let Some(old) = old.filter(|old| Some(old.as_str()) != new_rel_thumb) else {
+        return;
+    };
+    let old_path = PathBuf::from(resolve_path(root_path, &old));
+    if !old_path.starts_with(root_path.join(".opendam").join("thumbs")) {
+        return;
+    }
+    if let Err(e) = tokio::fs::remove_file(&old_path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("Could not delete old thumbnail {:?}: {}", old_path, e);
+        }
+    }
 }
 
 async fn fail_job(state: &AppState, pool: &Pool<Sqlite>, job_id: &str, asset_id: &str) {
@@ -335,83 +420,15 @@ async fn run_image_queue(state: Arc<AppState>) {
     let parallelism = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let filter = format!(
-        "p.status IN ('queued', 'pending') AND lower(coalesce(a.extension, '')) IN {}",
-        NATIVE_EXTS_SQL
-    );
 
     loop {
         let mut processed_any = false;
 
         for lib in state.db.get_all_libraries().await {
-            let thumb_dir = lib.root_path.join(".opendam").join("thumbs");
-            let _ = tokio::fs::create_dir_all(&thumb_dir).await;
-
-            let jobs = claim_jobs(&lib.pool, &filter, parallelism * 8).await;
-            processed_any |= !jobs.is_empty();
-
-            let mut tasks = tokio::task::JoinSet::new();
-            let mut results = Vec::new();
-            for (job_id, asset_id, file_path) in jobs {
-                let source = resolve_source(&lib.root_path, &file_path);
-                let ext = source
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                // Named by asset id: file names repeat across folders, asset ids don't.
-                let thumb_file_name = if ext == "png" || ext == "webp" {
-                    format!("{}_thumb.png", asset_id)
-                } else {
-                    format!("{}_thumb.jpg", asset_id)
-                };
-                let dest = thumb_dir.join(&thumb_file_name);
-
-                tasks.spawn_blocking(move || {
-                    let res = catch_decoder_panic(|| generate_image_thumb(&source, &dest))
-                        .map_err(|e| format!("{}: {}", source.display(), e));
-                    (job_id, asset_id, thumb_file_name, res)
-                });
-
-                while tasks.len() >= parallelism {
-                    if let Some(Ok(r)) = tasks.join_next().await {
-                        results.push(r);
-                    }
-                }
-            }
-            while let Some(r) = tasks.join_next().await {
-                if let Ok(r) = r {
-                    results.push(r);
-                }
-            }
-
-            for (job_id, asset_id, thumb_file_name, res) in results {
-                match res {
-                    Ok(()) => {
-                        let rel_thumb = format!(".opendam/thumbs/{}", thumb_file_name);
-                        complete_job(
-                            &state,
-                            &lib.pool,
-                            &lib.root_path,
-                            &job_id,
-                            &asset_id,
-                            Some(rel_thumb),
-                            None,
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Native Rust image thumbnail failed for {}. Falling back to Python.",
-                            e
-                        );
-                        let _ =
-                            sqlx::query("UPDATE preview_jobs SET status = 'fallback' WHERE id = ?")
-                                .bind(&job_id)
-                                .execute(&lib.pool)
-                                .await;
-                    }
-                }
+            let (claimed, done) = process_image_jobs(&lib, parallelism).await;
+            processed_any |= claimed;
+            for d in &done {
+                emit_done(&state, d);
             }
         }
 
@@ -419,6 +436,79 @@ async fn run_image_queue(state: Arc<AppState>) {
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
         }
     }
+}
+
+/// Claims and runs one round of `lib`'s image jobs. Returns whether any job was claimed, and the
+/// jobs that finished, for `preview:done`.
+pub(crate) async fn process_image_jobs(
+    lib: &LibraryHandle,
+    parallelism: usize,
+) -> (bool, Vec<PreviewDone>) {
+    let filter = format!(
+        "p.status IN ('queued', 'pending') AND lower(coalesce(a.extension, '')) IN {}",
+        NATIVE_EXTS_SQL
+    );
+    let thumb_dir = lib.root_path.join(".opendam").join("thumbs");
+
+    let jobs = claim_jobs(&lib.pool, &filter, parallelism * 8).await;
+    let claimed = !jobs.is_empty();
+
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut results = Vec::new();
+    for (job_id, asset_id, file_path) in jobs {
+        let source = resolve_source(&lib.root_path, &file_path);
+        let thumb_dir = thumb_dir.clone();
+
+        tasks.spawn_blocking(move || {
+            let res = catch_decoder_panic(|| generate_image_thumb(&source, &thumb_dir, &asset_id))
+                .map_err(|e| format!("{}: {}", source.display(), e));
+            (job_id, asset_id, res)
+        });
+
+        while tasks.len() >= parallelism {
+            if let Some(Ok(r)) = tasks.join_next().await {
+                results.push(r);
+            }
+        }
+    }
+    while let Some(r) = tasks.join_next().await {
+        if let Ok(r) = r {
+            results.push(r);
+        }
+    }
+
+    let mut done = Vec::new();
+    for (job_id, asset_id, res) in results {
+        match res {
+            Ok(thumb_file_name) => {
+                let rel_thumb = thumb_file_name.map(|f| format!(".opendam/thumbs/{}", f));
+                delete_replaced_thumb(&lib.pool, &lib.root_path, &asset_id, rel_thumb.as_deref())
+                    .await;
+                done.push(
+                    complete_job(
+                        &lib.pool,
+                        &lib.root_path,
+                        &job_id,
+                        &asset_id,
+                        rel_thumb,
+                        None,
+                    )
+                    .await,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Native Rust image thumbnail failed for {}. Falling back to Python.",
+                    e
+                );
+                let _ = sqlx::query("UPDATE preview_jobs SET status = 'fallback' WHERE id = ?")
+                    .bind(&job_id)
+                    .execute(&lib.pool)
+                    .await;
+            }
+        }
+    }
+    (claimed, done)
 }
 
 /// Runs 3D/CAD/DCC formats (and images Rust couldn't decode) through the persistent Python worker.
@@ -524,16 +614,10 @@ async fn run_python_queue(state: Arc<AppState>, py_exec: PathBuf, worker_py: Pat
                     let rel_thumb = result_thumb
                         .or_else(|| result_model.clone())
                         .map(|abs| make_relative_path(root_path, Path::new(&abs)));
-                    complete_job(
-                        &state,
-                        pool,
-                        root_path,
-                        &job_id,
-                        &asset_id,
-                        rel_thumb,
-                        result_model,
-                    )
-                    .await;
+                    let done =
+                        complete_job(pool, root_path, &job_id, &asset_id, rel_thumb, result_model)
+                            .await;
+                    emit_done(&state, &done);
                 } else {
                     fail_job(&state, pool, &job_id, &asset_id).await;
                 }
@@ -555,7 +639,7 @@ mod tests {
 
     #[test]
     fn decoder_panic_becomes_err() {
-        let res = catch_decoder_panic(|| panic!("malformed image"));
+        let res: Result<()> = catch_decoder_panic(|| panic!("malformed image"));
         assert_eq!(res.unwrap_err().to_string(), "image decoder panicked");
     }
 
@@ -651,10 +735,131 @@ mod tests {
         assert_eq!(lines, ["first", "bad \u{fffd} byte", "last"]);
     }
 
+    /// Writes a `width` x `height` image to `path`, in the format its extension names.
+    fn write_image(path: &Path, width: u32, height: u32) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        image::RgbImage::new(width, height).save(path).unwrap();
+    }
+
+    #[test]
+    fn small_displayable_image_gets_no_thumbnail() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("icon.png");
+        write_image(&source, 64, 32);
+        let thumbs = dir.path().join("thumbs");
+
+        let name = generate_image_thumb(&source, &thumbs, "a1").unwrap();
+
+        assert_eq!(name, None);
+        assert!(!thumbs.exists());
+    }
+
+    #[test]
+    fn small_tga_gets_a_native_size_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("sprite.tga");
+        write_image(&source, 48, 20);
+        let thumbs = dir.path().join("thumbs");
+
+        let name = generate_image_thumb(&source, &thumbs, "a1").unwrap();
+
+        assert_eq!(name.as_deref(), Some("a1_thumb.png"));
+        assert_eq!(
+            image::image_dimensions(thumbs.join("a1_thumb.png")).unwrap(),
+            (48, 20)
+        );
+    }
+
+    #[test]
+    fn large_png_is_downscaled_to_512() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("rock.png");
+        write_image(&source, 1024, 600);
+        let thumbs = dir.path().join("thumbs");
+
+        let name = generate_image_thumb(&source, &thumbs, "a1").unwrap();
+
+        assert_eq!(name.as_deref(), Some("a1_thumb.png"));
+        assert_eq!(
+            image::image_dimensions(thumbs.join("a1_thumb.png")).unwrap(),
+            (512, 300)
+        );
+    }
+
+    #[test]
+    fn image_of_exactly_512_is_not_resized() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("edge.png");
+        let tif = dir.path().join("edge.tif");
+        write_image(&png, 512, 512);
+        write_image(&tif, 512, 100);
+        let thumbs = dir.path().join("thumbs");
+
+        assert_eq!(generate_image_thumb(&png, &thumbs, "p").unwrap(), None);
+        assert_eq!(
+            generate_image_thumb(&tif, &thumbs, "t").unwrap().as_deref(),
+            Some("t_thumb.png")
+        );
+        assert_eq!(
+            image::image_dimensions(thumbs.join("t_thumb.png")).unwrap(),
+            (512, 100)
+        );
+    }
+
+    #[tokio::test]
+    async fn job_for_a_source_that_shrank_deletes_its_old_thumbnail_and_clears_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The old thumbnail, from when the source was larger.
+        let old_thumb = root.join(".opendam/thumbs/a1_thumb.png");
+        write_image(&old_thumb, 512, 512);
+        write_image(&root.join("textures/rock.png"), 256, 256);
+        let pool = crate::db::memory_library_pool().await;
+        sqlx::query(
+            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, thumbnail_path, preview_status)
+             VALUES ('a1', 'textures/rock.png', 'rock.png', 'png', 'texture', 0, 0, 0, '.opendam/thumbs/a1_thumb.png', 'pending')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO preview_jobs (id, asset_id, status, created_at) VALUES ('j1', 'a1', 'pending', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let lib = LibraryHandle {
+            id: "lib".into(),
+            name: "lib".into(),
+            root_path: root.to_path_buf(),
+            pool: pool.clone(),
+        };
+
+        let (claimed, done) = process_image_jobs(&lib, 2).await;
+
+        assert!(claimed);
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].asset_id, "a1");
+        assert_eq!(done[0].thumb_path, None);
+        assert!(!old_thumb.exists());
+        let (thumb, status): (Option<String>, String) =
+            sqlx::query_as("SELECT thumbnail_path, preview_status FROM assets WHERE id = 'a1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(thumb, None);
+        assert_eq!(status, "done");
+        let job: String = sqlx::query_scalar("SELECT status FROM preview_jobs WHERE id = 'j1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(job, "done");
+    }
+
     #[test]
     fn decoder_result_passes_through() {
         assert!(catch_decoder_panic(|| Ok(())).is_ok());
-        let res = catch_decoder_panic(|| Err(anyhow!("bad header")));
+        let res: Result<()> = catch_decoder_panic(|| Err(anyhow!("bad header")));
         assert_eq!(res.unwrap_err().to_string(), "bad header");
     }
 }

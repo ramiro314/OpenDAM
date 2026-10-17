@@ -13,7 +13,7 @@ import {
   IconHeartFilled,
 } from '../Icons';
 import { formatSize } from '../../utils/format';
-import { tileMedia, tileState } from './tileState';
+import { tileMedia, tileState, type TileMedia } from './tileState';
 import styles from './AssetCard.module.css';
 
 export interface AssetCardProps {
@@ -53,17 +53,18 @@ export const AssetCard = memo(function AssetCard({
   onClick,
   onContextMenu,
 }: AssetCardProps) {
-  const [imgError, setImgError] = useState(false);
-  // `data-tile-state` reads "ready" once the image or video has loaded, or failed (`imgError`)
+  // The media that failed to load, so the card falls back to the next one
+  const [failed, setFailed] = useState<TileMedia>();
+  // `data-tile-state` reads "ready" once the image or video has loaded, or all media failed
   const [mediaLoaded, setMediaLoaded] = useState(false);
   const patchAsset = useAssetStore((s) => s.patchAsset);
 
   useEffect(() => {
-    setImgError(false);
+    setFailed(undefined);
     setMediaLoaded(false);
   }, [asset.thumbnailPath, asset.filePath]);
 
-  const media = tileMedia(asset, { failed: imgError, withVideo: true });
+  const media = tileMedia(asset, { failed, withVideo: true });
 
   const KindIcon = KIND_ICON[asset.kind] ?? IconImage;
   const kindColor = KIND_COLOR[asset.kind];
@@ -160,7 +161,7 @@ export const AssetCard = memo(function AssetCard({
             className={styles.thumbImg}
             loading="lazy"
             onLoad={() => setMediaLoaded(true)}
-            onError={() => setImgError(true)}
+            onError={() => setFailed(media)}
           />
         ) : media === 'original' ? (
           <img
@@ -169,7 +170,7 @@ export const AssetCard = memo(function AssetCard({
             className={styles.thumbImg}
             loading="lazy"
             onLoad={() => setMediaLoaded(true)}
-            onError={() => setImgError(true)}
+            onError={() => setFailed(media)}
           />
         ) : media === 'video' ? (
           <div className={styles.videoThumbWrapper}>
@@ -185,7 +186,7 @@ export const AssetCard = memo(function AssetCard({
                   e.currentTarget.currentTime = 0.1;
                 } catch {}
               }}
-              onError={() => setImgError(true)}
+              onError={() => setFailed(media)}
             />
             <div className={styles.videoPlayOverlay}>
               <IconVideo size={13} />

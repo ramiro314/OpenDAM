@@ -8,6 +8,7 @@ use walkdir::WalkDir;
 
 use crate::db::{make_relative_path, Database, LibraryHandle};
 use crate::models::AssetKind;
+use crate::preview::is_native_image;
 
 // ── Advisory lock guard ─────────────────────────────────────────────────────
 
@@ -275,15 +276,7 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
                     | "ai"
                     | "exr"
                     | "hdr"
-                    | "jpg"
-                    | "jpeg"
-                    | "png"
-                    | "tif"
-                    | "tiff"
-                    | "tga"
-                    | "bmp"
-                    | "webp"
-            );
+            ) || is_native_image(&ext);
             if needs_preview {
                 preview_status = "pending";
                 needs_job = true;
@@ -291,7 +284,9 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
 
             let (id, is_update) =
                 if let Some((existing_id, _, _, existing_thumb)) = existing_map.get(&rel_path) {
-                    if thumbnail_path.is_none() && existing_thumb.is_some() {
+                    // A changed raster is re-previewed (see `commit_asset_batch`): it may have
+                    // crossed THUMB_SIZE either way. Other kinds keep their preview.
+                    if !is_native_image(&ext) && existing_thumb.is_some() {
                         thumbnail_path = existing_thumb.clone();
                         preview_status = "done";
                         needs_job = false;
@@ -380,7 +375,30 @@ async fn commit_asset_batch(pool: &sqlx::Pool<sqlx::Sqlite>, batch: &[PendingAss
     let mut tx = pool.begin().await?;
 
     for item in batch {
-        if item.is_update {
+        if item.is_update && is_native_image(&item.extension) {
+            // A changed raster gets a fresh preview, and keeps its old thumbnail until then.
+            sqlx::query(
+                "UPDATE assets SET size_bytes = ?, modified_at = ?, preview_status = 'pending' WHERE id = ?",
+            )
+            .bind(item.size_bytes)
+            .bind(item.modified_at)
+            .bind(&item.id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO preview_jobs (id, asset_id, status, created_at)
+                 SELECT ?, ?, 'pending', ? WHERE NOT EXISTS (
+                     SELECT 1 FROM preview_jobs WHERE asset_id = ?
+                     AND status IN ('pending', 'queued', 'processing', 'fallback'))",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&item.id)
+            .bind(item.now)
+            .bind(&item.id)
+            .execute(&mut *tx)
+            .await?;
+        } else if item.is_update {
             sqlx::query(
                 r#"UPDATE assets SET
                     size_bytes = ?,
@@ -519,5 +537,113 @@ mod tests {
 
         result.unwrap();
         assert_eq!(file_paths, ["notes.txt"]);
+    }
+
+    /// Writes a `size` x `size` PNG to `path`.
+    fn write_png(path: &Path, size: u32) {
+        image::RgbImage::new(size, size).save(path).unwrap();
+    }
+
+    /// A library rooted at a fresh temp dir, open in a fresh database.
+    async fn temp_library() -> (tempfile::TempDir, Database, LibraryHandle) {
+        // Not `tempfile::tempdir()`: the walker skips hidden dirs, and that names it `.tmpXXXX`.
+        let dir = tempfile::Builder::new()
+            .prefix("opendam-lib-")
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join(".opendam")).unwrap();
+        let lib = LibraryHandle {
+            id: "lib".into(),
+            name: "lib".into(),
+            root_path: dir.path().to_path_buf(),
+            pool: memory_library_pool().await,
+        };
+        let db = memory_database(vec![lib.clone()]).await;
+        (dir, db, lib)
+    }
+
+    async fn reindex(db: &Database, lib: &LibraryHandle) {
+        index_paths(db, &lib.id, &[lib.root_path.to_string_lossy().to_string()])
+            .await
+            .unwrap();
+    }
+
+    /// The asset's (thumbnail_path, preview_status) and its active preview job count.
+    async fn preview_state(pool: &Pool<Sqlite>) -> (Option<String>, String, i64) {
+        let (thumb, status): (Option<String>, String) =
+            sqlx::query_as("SELECT thumbnail_path, preview_status FROM assets")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM preview_jobs WHERE status IN ('pending', 'queued', 'processing', 'fallback')",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (thumb, status, active)
+    }
+
+    #[tokio::test]
+    async fn small_png_that_grows_past_512_gets_a_thumbnail() {
+        let (dir, db, lib) = temp_library().await;
+        let source = dir.path().join("sprite.png");
+        write_png(&source, 64);
+        reindex(&db, &lib).await;
+        crate::preview::process_image_jobs(&lib, 2).await;
+        assert_eq!(preview_state(&lib.pool).await, (None, "done".into(), 0));
+
+        write_png(&source, 1024);
+        reindex(&db, &lib).await;
+        assert_eq!(preview_state(&lib.pool).await, (None, "pending".into(), 1));
+
+        crate::preview::process_image_jobs(&lib, 2).await;
+        let (thumb, status, active) = preview_state(&lib.pool).await;
+        let thumb = thumb.expect("a thumbnail once the source is larger than 512 px");
+        assert_eq!((status.as_str(), active), ("done", 0));
+        assert_eq!(
+            image::image_dimensions(dir.path().join(&thumb)).unwrap(),
+            (512, 512)
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_raster_with_an_active_job_gets_no_second_one() {
+        let (dir, db, lib) = temp_library().await;
+        let source = dir.path().join("sprite.png");
+        write_png(&source, 64);
+        reindex(&db, &lib).await;
+        assert_eq!(preview_state(&lib.pool).await.2, 1);
+
+        write_png(&source, 1024);
+        reindex(&db, &lib).await;
+
+        assert_eq!(preview_state(&lib.pool).await, (None, "pending".into(), 1));
+    }
+
+    #[tokio::test]
+    async fn changed_model_keeps_its_preview() {
+        let (dir, db, lib) = temp_library().await;
+        let source = dir.path().join("ship.glb");
+        std::fs::write(&source, "v1").unwrap();
+        reindex(&db, &lib).await;
+        sqlx::query("UPDATE preview_jobs SET status = 'done'")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE assets SET preview_status = 'done', thumbnail_path = '.opendam/thumbs/s.png'",
+        )
+        .execute(&lib.pool)
+        .await
+        .unwrap();
+
+        std::fs::write(&source, "version 2").unwrap();
+        reindex(&db, &lib).await;
+
+        assert_eq!(
+            preview_state(&lib.pool).await,
+            (Some(".opendam/thumbs/s.png".into()), "done".into(), 0)
+        );
     }
 }

@@ -59,18 +59,19 @@ export default function App() {
     Promise.all([fetchLibraries(), fetchTags(), fetchCollections()]).then(() => search());
 
     // Real-time preview updates from background engine
-    const unlistenDone = listen<{ assetId: string; thumbnailPath?: string; previewModel?: string }>(
-      'preview:done',
-      (event) => {
-        useAssetStore
-          .getState()
-          .updateAssetPreview(
-            event.payload.assetId,
-            event.payload.thumbnailPath,
-            event.payload.previewModel
-          );
-      }
-    );
+    const unlistenDone = listen<{
+      assetId: string;
+      thumbnailPath: string | null;
+      previewModel?: string;
+    }>('preview:done', (event) => {
+      useAssetStore
+        .getState()
+        .updateAssetPreview(
+          event.payload.assetId,
+          event.payload.thumbnailPath,
+          event.payload.previewModel
+        );
+    });
 
     const unlistenError = listen<{ assetId: string }>('preview:error', (event) => {
       useAssetStore.getState().setPreviewStatus(event.payload.assetId, 'error');
