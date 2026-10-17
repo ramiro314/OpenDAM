@@ -23,3 +23,40 @@ export interface UiCheck {
 }
 
 export const UI_CHECKS: UiCheck[] = [];
+
+export interface UiCheckResult {
+  id: string;
+  title: string;
+  result: 'PASS' | 'FAIL';
+  /** Why a check failed */
+  detail?: string;
+}
+
+/**
+ * Runs `checks` in order, recording PASS when a check resolves and FAIL, with the error as
+ * detail, when it throws. `before` runs ahead of each check, `after` gets each result.
+ */
+export async function runUiChecks(
+  checks: UiCheck[],
+  ctx: UiCheckContext,
+  hooks: { before?: () => Promise<void>; after?: (result: UiCheckResult) => Promise<void> } = {}
+): Promise<{ passed: number; failed: number; results: UiCheckResult[] }> {
+  const results: UiCheckResult[] = [];
+  for (const check of checks) {
+    await hooks.before?.();
+    let result: UiCheckResult;
+    try {
+      await check.run(ctx);
+      result = { id: check.id, title: check.title, result: 'PASS' };
+    } catch (e) {
+      result = { id: check.id, title: check.title, result: 'FAIL', detail: String(e) };
+    }
+    results.push(result);
+    await hooks.after?.(result);
+  }
+  return {
+    passed: results.filter((r) => r.result === 'PASS').length,
+    failed: results.filter((r) => r.result === 'FAIL').length,
+    results,
+  };
+}

@@ -9,7 +9,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAssetStore, useUIStore } from '../store';
 import { frameStats, minMax, rssStats, seededRandom, timeStats } from './benchStats';
-import { UI_CHECKS, type UiCheckContext } from './uiChecks';
+import { UI_CHECKS, runUiChecks, type UiCheckContext } from './uiChecks';
 
 type GridSize = 'sm' | 'md' | 'lg';
 const GRID_SIZES: GridSize[] = ['sm', 'md', 'lg'];
@@ -30,7 +30,7 @@ const INDEXING_TIMEOUT_MS = 180_000;
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const nextFrame = () => new Promise<number>((resolve) => requestAnimationFrame(resolve));
 
-const log = (line: string) => invoke('bench_log', { line }).catch(() => {});
+const log = (line: string) => invoke<void>('bench_log', { line }).catch(() => {});
 const readRss = () => invoke<number>('bench_rss');
 const domNodes = () => document.getElementsByTagName('*').length;
 
@@ -100,7 +100,10 @@ async function resetGrid(size: GridSize): Promise<void> {
   await useAssetStore.getState().search();
   await waitFor(() => document.getElementById('asset-scroll') !== null, 10_000, '#asset-scroll');
   scrollEl().scrollTop = 0;
-  await waitFor(visibleTilesReady, 10_000, 'visible tiles ready after reset').catch(() => {});
+  // A stuck tile shows in the log; the scenario still runs and measures what it finds
+  await waitFor(visibleTilesReady, 10_000, 'visible tiles ready after reset').catch((e) =>
+    log(`warning: ${String(e)}`)
+  );
   await sleep(500);
 }
 
@@ -268,7 +271,6 @@ async function pause(name: string) {
 }
 
 async function runChecks() {
-  const results: { id: string; title: string; result: 'PASS' | 'FAIL'; detail?: string }[] = [];
   const ctx: UiCheckContext = {
     scroll: scrollEl,
     assert: (condition, message) => {
@@ -282,22 +284,10 @@ async function runChecks() {
   // Shows the runner's screenshot step works, and what the grid looked like when checks began
   await pause('checks-start');
   if (UI_CHECKS.length === 0) await log('no UI checks registered yet');
-  for (const check of UI_CHECKS) {
-    await resetGrid('md');
-    try {
-      await check.run(ctx);
-      results.push({ id: check.id, title: check.title, result: 'PASS' });
-    } catch (e) {
-      results.push({ id: check.id, title: check.title, result: 'FAIL', detail: String(e) });
-    }
-    const last = results[results.length - 1];
-    await log(`${last.id} ${last.result}: ${last.title}${last.detail ? ` (${last.detail})` : ''}`);
-  }
-  return {
-    passed: results.filter((r) => r.result === 'PASS').length,
-    failed: results.filter((r) => r.result === 'FAIL').length,
-    results,
-  };
+  return runUiChecks(UI_CHECKS, ctx, {
+    before: () => resetGrid('md'),
+    after: (r) => log(`${r.id} ${r.result}: ${r.title}${r.detail ? ` (${r.detail})` : ''}`),
+  });
 }
 
 export async function startScrollBench(mode: string): Promise<void> {

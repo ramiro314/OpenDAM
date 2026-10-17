@@ -5,6 +5,7 @@ import type { Asset } from '../../types';
 import { useAssetStore } from '../../store';
 import { IconImage, IconVideo, IconStar, IconHeart, IconHeartFilled } from '../Icons';
 import { formatSize } from '../../utils/format';
+import { tileMedia, tileState } from './tileState';
 import styles from './AssetListRow.module.css';
 
 interface AssetListRowProps {
@@ -33,12 +34,7 @@ export const AssetListRow = memo(function AssetListRow({
     setMediaSettled(false);
   }, [asset.thumbnailPath, asset.filePath]);
 
-  const media =
-    asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb')
-      ? 'thumbnail'
-      : ['image', 'texture'].includes(asset.kind) && asset.filePath
-        ? 'original'
-        : 'none';
+  const media = tileMedia(asset);
   const settle = () => setMediaSettled(true);
 
   const handleClick = useCallback(
@@ -85,7 +81,7 @@ export const AssetListRow = memo(function AssetListRow({
       role="button"
       tabIndex={0}
       data-tile
-      data-tile-state={media === 'none' || mediaSettled ? 'ready' : 'placeholder'}
+      data-tile-state={tileState(media, mediaSettled)}
     >
       {/* Favorite Button */}
       <button

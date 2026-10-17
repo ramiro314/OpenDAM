@@ -13,6 +13,7 @@ import {
   IconHeartFilled,
 } from '../Icons';
 import { formatSize } from '../../utils/format';
+import { tileMedia, tileState } from './tileState';
 import styles from './AssetCard.module.css';
 
 export interface AssetCardProps {
@@ -62,16 +63,7 @@ export const AssetCard = memo(function AssetCard({
     setMediaLoaded(false);
   }, [asset.thumbnailPath, asset.filePath]);
 
-  const media = imgError
-    ? 'none'
-    : asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb')
-      ? 'thumbnail'
-      : ['image', 'texture'].includes(asset.kind) && asset.filePath
-        ? 'original'
-        : asset.kind === 'video' && asset.filePath
-          ? 'video'
-          : 'none';
-  const tileState = media === 'none' || mediaLoaded ? 'ready' : 'placeholder';
+  const media = tileMedia(asset, { failed: imgError, withVideo: true });
 
   const KindIcon = KIND_ICON[asset.kind] ?? IconImage;
   const kindColor = KIND_COLOR[asset.kind];
@@ -156,7 +148,7 @@ export const AssetCard = memo(function AssetCard({
       role="button"
       tabIndex={0}
       data-tile
-      data-tile-state={tileState}
+      data-tile-state={tileState(media, mediaLoaded)}
       onKeyDown={(e) => e.key === 'Enter' && handleClick(e as unknown as React.MouseEvent)}
     >
       {/* Thumbnail / preview area */}

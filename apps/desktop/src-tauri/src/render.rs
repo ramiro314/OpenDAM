@@ -61,6 +61,41 @@ mod tests {
     }
 
     #[test]
+    fn force_shm_wins_over_explicit_sync_and_compositing() {
+        assert_eq!(
+            mode_with(&[
+                "__NV_DISABLE_EXPLICIT_SYNC",
+                "WEBKIT_DISABLE_COMPOSITING_MODE",
+                "WEBKIT_DMABUF_RENDERER_FORCE_SHM",
+            ]),
+            "gpu-shm"
+        );
+    }
+
+    #[test]
+    fn explicit_sync_wins_over_compositing() {
+        assert_eq!(
+            mode_with(&[
+                "WEBKIT_DISABLE_COMPOSITING_MODE",
+                "__NV_DISABLE_EXPLICIT_SYNC"
+            ]),
+            "explicit-sync"
+        );
+    }
+
+    #[test]
+    fn skia_cpu_rendering_wins_over_the_gpu_modes() {
+        assert_eq!(
+            mode_with(&[
+                "WEBKIT_DMABUF_RENDERER_FORCE_SHM",
+                "__NV_DISABLE_EXPLICIT_SYNC",
+                "WEBKIT_SKIA_ENABLE_CPU_RENDERING",
+            ]),
+            "cpu"
+        );
+    }
+
+    #[test]
     fn compositing_mode_alone_gives_no_compositing() {
         assert_eq!(
             mode_with(&["WEBKIT_DISABLE_COMPOSITING_MODE"]),
