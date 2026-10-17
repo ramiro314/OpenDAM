@@ -106,3 +106,11 @@ pub async fn review_autotag_proposals(
 ) -> Result<String> {
     state.autotag.review_proposals(&run_id, decisions).await
 }
+
+/// Undoes a run: removes exactly the tags it added, then deletes the tags it created that no
+/// asset uses any more. Finish undo too, on a partly undone run. Returns `undone`, or
+/// `undo_partial` while a library is offline, with the reason on the run.
+#[tauri::command]
+pub async fn undo_autotag_run(run_id: String, state: State<'_, Arc<AppState>>) -> Result<String> {
+    state.autotag.undo_run(&run_id).await
+}

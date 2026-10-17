@@ -390,6 +390,21 @@ Undo works on a run that is `done`, `cancelled` or `awaiting_review`. It moves t
    - **Crash during undo:** a crash leaves the run `undoing`, which startup turns into
      `undo_partial`. A crash between the library delete and the master delete leaves master rows
      for pairs the library no longer has. Replay skips them, and Finish undo removes them.
+4. **Built differently, or added:**
+   - **In flight (built):** undo is refused, with "Wait for the requests still in flight to
+     finish", while any of the run's items is `running`. An engine lock keeps an item's steps 1-4,
+     a review's apply and replay from running at the same time as an undo, and replay re-reads
+     its rows under that lock, so a row read before the undo started is never applied.
+   - **Offline libraries (built):** a registered library that is offline holds back only created
+     tags. A run that created none, and whose rows are all gone, ends `undone`.
+   - **Removed libraries (built):** rows for a library no longer registered are dropped, since
+     there is nothing left to undo there.
+   - **Kept parents (built):** a created tag stays when a tag that stays sits under it, so undo
+     never moves your own tag to the top level.
+   - **Restart (built):** the reason reads "App restarted during undo: Finish undo removes the
+     rest".
+   - **Runs panel (built):** Undo is also offered on a paused run and cancels it first. It asks
+     for a second click ("Confirm undo"). The status bar counts runs partly undone.
 
 ### Failures (D27)
 

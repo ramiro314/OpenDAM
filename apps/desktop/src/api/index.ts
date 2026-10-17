@@ -119,4 +119,6 @@ export const api = {
   /** Applies the review; returns the run's status afterwards */
   reviewAutotagProposals: (runId: string, decisions: ProposalDecision[]) =>
     invoke<string>('review_autotag_proposals', { runId, decisions }),
+  /** Undo, or Finish undo on a partly undone run; returns `undone` or `undo_partial` */
+  undoAutotagRun: (runId: string) => invoke<string>('undo_autotag_run', { runId }),
 };
