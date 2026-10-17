@@ -297,6 +297,7 @@ pub fn test_request(threshold: f64, max_tags: u32) -> TagRequest {
     TagRequest {
         run_id: "connection-test".into(),
         mode: Mode::ExistingOnly,
+        access: None,
         model: None,
         max_tags,
         max_proposals: 0,
@@ -474,6 +475,7 @@ impl JevProvider {
                     input_tokens: scores.usage.input_tokens,
                     output_tokens: scores.usage.output_tokens,
                     cost_usd: scores.usage.cost_usd,
+                    on_plan: false,
                 }
             }
             Err(error) => ConnectionTest {
@@ -484,6 +486,7 @@ impl JevProvider {
                 input_tokens: 0,
                 output_tokens: 0,
                 cost_usd: 0.0,
+                on_plan: false,
             },
         }
     }
@@ -519,7 +522,7 @@ impl TagProvider for JevProvider {
         false
     }
 
-    fn unavailable_reason(&self) -> Option<String> {
+    fn unavailable_reason(&self, _access: Option<&str>) -> Option<String> {
         if let Err(e) = &self.http {
             return Some(e.clone());
         }
@@ -541,6 +544,7 @@ impl TagProvider for JevProvider {
                 existing: select(&scores.scores, threshold, request.max_tags as usize),
                 proposed: Vec::new(),
                 usage: scores.usage,
+                notice: None,
             })
         })
     }
@@ -574,6 +578,7 @@ mod tests {
         TagRequest {
             run_id: "run".into(),
             mode: Mode::ExistingOnly,
+            access: None,
             model: None,
             max_tags: 8,
             max_proposals: 0,
@@ -1081,7 +1086,7 @@ mod tests {
         let jev = provider(&api.url, None);
 
         assert_eq!(
-            jev.unavailable_reason().as_deref(),
+            jev.unavailable_reason(None).as_deref(),
             Some("Set up Jev in Settings")
         );
         let error = jev.tag(&test_request(0.7, 8)).await.unwrap_err();

@@ -1,10 +1,24 @@
 import { useEffect, useState } from 'react';
 import clsx from 'clsx';
 import { api } from '../../api';
-import type { AiProvider, AiSettings, ConnectionTest, ProviderStatus } from '../../types';
+import type {
+  AiProvider,
+  AiSettings,
+  AnthropicAccess,
+  ClaudePlanStatus,
+  ConnectionTest,
+  ProviderStatus,
+} from '../../types';
 import { formatCost } from '../../utils/autotag';
 import { IconSettings, IconX } from '../Icons';
-import { ANTHROPIC_MODELS, isKnownModel, parseNumberInput, settingsPatch } from './settingsHelpers';
+import {
+  ANTHROPIC_MODELS,
+  claudePlanLines,
+  ignoredOverridesNote,
+  isKnownModel,
+  parseNumberInput,
+  settingsPatch,
+} from './settingsHelpers';
 import styles from './SettingsDialog.module.css';
 
 interface SettingsDialogProps {
@@ -18,6 +32,8 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
   const [draft, setDraft] = useState<AiSettings | null>(null);
   const [customModel, setCustomModel] = useState(false);
   const [statuses, setStatuses] = useState<ProviderStatus[]>([]);
+  const [claudeStatus, setClaudeStatus] = useState<ClaudePlanStatus | null>(null);
+  const [claudeError, setClaudeError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -31,6 +47,17 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
       })
       .catch((e) => setError(String(e)));
   }, []);
+
+  // Runs `claude` twice, so it doesn't hold up the rest of the dialog
+  const checkClaude = () => {
+    setClaudeStatus(null);
+    setClaudeError(null);
+    api
+      .getClaudePlanStatus()
+      .then(setClaudeStatus)
+      .catch((e) => setClaudeError(String(e)));
+  };
+  useEffect(checkClaude, []);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -73,6 +100,10 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
   };
 
   const modelSelectValue = customModel ? CUSTOM_MODEL : draft?.anthropic.model;
+  const onPlan = draft?.anthropic.access === 'claude_plan';
+  const anthropicReady = onPlan
+    ? (claudeStatus?.configured ?? false)
+    : (statusOf('anthropic')?.configured ?? false);
 
   return (
     <div className={styles.overlay} onClick={onClose}>
@@ -104,11 +135,31 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
                 <div className={styles.providerHeader}>
                   <span className={styles.providerName}>Anthropic</span>
                 </div>
-                <ApiKeyField
-                  provider="anthropic"
-                  status={statusOf('anthropic')}
-                  onStatus={updateStatus}
-                />
+                <label className={styles.row}>
+                  <span className={styles.label}>Access</span>
+                  <select
+                    id="settings-anthropic-access"
+                    className={styles.input}
+                    value={draft.anthropic.access}
+                    onChange={(e) => setAnthropic({ access: e.target.value as AnthropicAccess })}
+                  >
+                    <option value="api_key">API key</option>
+                    <option value="claude_plan">Claude plan (your installed claude)</option>
+                  </select>
+                </label>
+                {onPlan ? (
+                  <ClaudePlanField
+                    status={claudeStatus}
+                    error={claudeError}
+                    onCheckAgain={checkClaude}
+                  />
+                ) : (
+                  <ApiKeyField
+                    provider="anthropic"
+                    status={statusOf('anthropic')}
+                    onStatus={updateStatus}
+                  />
+                )}
 
                 <label className={styles.row}>
                   <span className={styles.label}>Model</span>
@@ -172,7 +223,8 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
                 <TestConnection
                   provider="anthropic"
                   model={draft.anthropic.model.trim()}
-                  configured={statusOf('anthropic')?.configured ?? false}
+                  access={draft.anthropic.access}
+                  configured={anthropicReady}
                 />
               </section>
 
@@ -364,16 +416,78 @@ function ApiKeyField({ provider, status, onStatus }: ApiKeyFieldProps) {
   );
 }
 
+interface ClaudePlanFieldProps {
+  status: ClaudePlanStatus | null;
+  error: string | null;
+  onCheckAgain: () => void;
+}
+
+/**
+ * Where `claude` is, its version and its login, read with the same cleaned environment runs
+ * use, so an ANTHROPIC_API_KEY set for the app can't make it look like the plan is in use.
+ */
+function ClaudePlanField({ status, error, onCheckAgain }: ClaudePlanFieldProps) {
+  const lines = status && claudePlanLines(status);
+  const overrides = status && ignoredOverridesNote(status.ignoredOverrides);
+  return (
+    <div className={styles.keyBlock} id="settings-claude-plan">
+      <div className={styles.row}>
+        <span className={styles.label}>Claude CLI</span>
+        <span className={styles.cliStatus}>
+          {!status && !error && 'Checking claude…'}
+          {lines && (
+            <>
+              <span className={styles.cliLine}>{lines.found}</span>
+              <span className={styles.cliLine}>
+                <span
+                  className={clsx(styles.dot, status.configured ? styles.dotOn : styles.dotOff)}
+                  aria-hidden
+                />
+                {lines.login}
+              </span>
+            </>
+          )}
+        </span>
+        <button
+          type="button"
+          className={clsx(styles.btn, styles.secondaryBtn)}
+          disabled={!status && !error}
+          onClick={onCheckAgain}
+          title="Ask claude for its login again"
+        >
+          Check again
+        </button>
+      </div>
+      {status?.problem && <p className={styles.warning}>{status.problem}</p>}
+      {overrides && <p className={styles.keyStatus}>{overrides}</p>}
+      <p className={styles.keyStatus}>
+        <span className={styles.hint}>
+          Personal use only: OpenDAM runs your own logged-in claude, and its requests count against
+          your plan&apos;s limits.
+        </span>
+      </p>
+      {error && (
+        <p className={styles.error} role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 interface TestConnectionProps {
   provider: AiProvider;
   /** The model in the form, which may not be saved yet. Jev has none and tests with the saved
    * threshold and cap. */
   model?: string;
+  /** The access in the form, for Anthropic */
+  access?: AnthropicAccess;
   configured: boolean;
 }
 
-/** Sends one small tagging request with the configured key and shows how it went. */
-function TestConnection({ provider, model, configured }: TestConnectionProps) {
+/** Sends one small tagging request with the configured key, or on your Claude plan. */
+function TestConnection({ provider, model, access, configured }: TestConnectionProps) {
+  const onPlan = access === 'claude_plan';
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<ConnectionTest | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -383,7 +497,7 @@ function TestConnection({ provider, model, configured }: TestConnectionProps) {
     setResult(null);
     setError(null);
     try {
-      setResult(await api.testProvider(provider, model || undefined));
+      setResult(await api.testProvider(provider, model || undefined, access));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -401,7 +515,15 @@ function TestConnection({ provider, model, configured }: TestConnectionProps) {
           className={clsx(styles.btn, styles.secondaryBtn)}
           disabled={busy || !configured}
           onClick={run}
-          title={configured ? 'Send one small request with this key' : 'Save an API key first'}
+          title={
+            onPlan
+              ? configured
+                ? 'Send one small request through claude, on your plan'
+                : 'Log claude in to your Claude plan first'
+              : configured
+                ? 'Send one small request with this key'
+                : 'Save an API key first'
+          }
         >
           {busy ? 'Testing…' : 'Test connection'}
         </button>
@@ -419,7 +541,7 @@ function TestConnection({ provider, model, configured }: TestConnectionProps) {
               <span className={styles.hint}>
                 {' '}
                 · {(result.inputTokens + result.outputTokens).toLocaleString()} tokens ·{' '}
-                {formatCost(result.costUsd)}
+                {result.onPlan ? 'on your plan' : formatCost(result.costUsd)}
               </span>
             )}
           </span>

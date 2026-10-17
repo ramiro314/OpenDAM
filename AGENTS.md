@@ -64,6 +64,12 @@ docs/plans                    Plans for this fork
   outbound calls are AI tagging requests to the provider you configured (the Anthropic API, your
   local `claude` CLI, or TypeSafe's Jev). They are made only for runs you start, and nothing is
   sent until a provider is set up.
+- **Claude-plan access is personal use only.** Anthropic's "Claude plan" access runs the owner's
+  own installed, logged-in `claude` CLI (`autotag/claude_cli.rs`). Anthropic doesn't let
+  third-party products offer claude.ai login or plan limits, so this access mode must be removed
+  or disabled before the app is ever distributed. Its child process starts from an empty
+  environment holding only `claude_cli::CHILD_ENV`, so no API key or other auth override set for
+  the app reaches it. Keep it that way.
 - **Master DB is the tag and collection catalog.** Tag and collection lists are read from master.
   Definition create, update and delete write to master, then mirror to every open library DB.
   `asset_tags` and `collection_assets` rows go only to the asset's own library

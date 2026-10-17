@@ -224,9 +224,13 @@ export function formatCost(usd: number): string {
   return `$${usd.toFixed(2)}`;
 }
 
-/** "4,000 tokens · $0.0021", or null before the run has used any tokens. */
+/**
+ * "4,000 tokens · $0.0021", or "4,000 tokens · on your plan" for a Claude-plan run, or null
+ * before the run has used any tokens.
+ */
 export function runUsage(run: RunSummary): string | null {
   const tokens = run.inputTokens + run.outputTokens;
   if (tokens === 0) return null;
-  return `${tokens.toLocaleString()} tokens · ${formatCost(run.costUsd)}`;
+  const cost = run.access === 'claude_plan' ? 'on your plan' : formatCost(run.costUsd);
+  return `${tokens.toLocaleString()} tokens · ${cost}`;
 }

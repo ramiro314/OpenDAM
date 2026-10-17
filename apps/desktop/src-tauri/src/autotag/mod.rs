@@ -2,6 +2,7 @@
 //! that tag assets in the background through a `TagProvider`.
 
 pub mod anthropic;
+pub mod claude_cli;
 pub mod credentials;
 pub mod engine;
 #[cfg(debug_assertions)]

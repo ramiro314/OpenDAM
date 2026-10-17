@@ -1,4 +1,4 @@
-import type { AiSettings, AiSettingsPatch } from '../../types';
+import type { AiSettings, AiSettingsPatch, ClaudePlanStatus } from '../../types';
 
 /** The Claude models Settings offers by name. Any other id is a custom model. */
 export const ANTHROPIC_MODELS = [
@@ -23,6 +23,32 @@ export function settingsPatch(saved: AiSettings, draft: AiSettings): AiSettingsP
   const jev = changedFields(saved.jev, draft.jev);
   if (!anthropic && !jev) return null;
   return { ...(anthropic && { anthropic }), ...(jev && { jev }) };
+}
+
+/** What Settings says about Claude-plan access: where `claude` is, and which login it uses. */
+export function claudePlanLines(status: ClaudePlanStatus): { found: string; login: string } {
+  const found = status.path
+    ? `claude ${status.version ?? '(version unknown)'} at ${status.path}`
+    : 'claude not found on PATH';
+  let login = 'Logged out';
+  if (status.loggedIn && status.authMethod === 'claude.ai') {
+    const plan = status.subscriptionType ? `, ${status.subscriptionType} plan` : '';
+    login = `Logged in with your Claude account (claude.ai${plan})`;
+  } else if (status.loggedIn) {
+    login = `Logged in with ${status.authMethod ?? 'an unknown method'}, not your Claude plan`;
+  } else if (!status.path) {
+    login = 'Not checked';
+  }
+  return { found, login };
+}
+
+/** "ANTHROPIC_API_KEY is set for the app, but claude never gets it", or null when none is set. */
+export function ignoredOverridesNote(names: string[]): string | null {
+  if (names.length === 0) return null;
+  const list = names.join(', ');
+  return names.length === 1
+    ? `${list} is set for the app, but claude never gets it`
+    : `${list} are set for the app, but claude never gets them`;
 }
 
 /** The number typed in a settings field, or null while it is empty, partial or not allowed. */

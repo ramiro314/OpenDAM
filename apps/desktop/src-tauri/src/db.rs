@@ -119,6 +119,28 @@ async fn add_tag_description_column(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// Backward compatibility: the run tables' `store::ADDED_COLUMNS`. As with tag descriptions, any
+/// failure other than a column already being there is an error, since every run query selects
+/// them.
+async fn add_run_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
+    for (table, column, definition) in crate::autotag::store::ADDED_COLUMNS {
+        let present: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)")
+                .bind(table)
+                .bind(column)
+                .fetch_one(pool)
+                .await?;
+        if !present {
+            sqlx::query(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Orders definitions so every parent comes before its children, so writing them in order
 /// never trips a `parent_id` foreign key. Rows in a parent cycle go last.
 fn parents_first<T>(rows: Vec<T>, id_and_parent: impl Fn(&T) -> (&str, Option<&str>)) -> Vec<T> {
@@ -238,6 +260,7 @@ async fn create_master_tables(master_pool: &Pool<Sqlite>) -> sqlx::Result<()> {
     sqlx::query(crate::autotag::store::SCHEMA)
         .execute(master_pool)
         .await?;
+    add_run_columns(master_pool).await?;
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS libraries (
@@ -976,6 +999,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_master_db_made_before_run_notices_gains_the_column_and_keeps_its_runs() {
+        let pool = memory_library_pool().await;
+        sqlx::query(
+            "CREATE TABLE tag_runs (id TEXT PRIMARY KEY, label TEXT NOT NULL,
+                 provider TEXT NOT NULL, access TEXT, model TEXT, mode TEXT NOT NULL,
+                 status TEXT NOT NULL, pause_reason TEXT, inline INTEGER NOT NULL DEFAULT 0,
+                 options TEXT NOT NULL DEFAULT '{}', input_tokens INTEGER NOT NULL DEFAULT 0,
+                 output_tokens INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL, finished_at INTEGER);
+             INSERT INTO tag_runs (id, label, provider, mode, status, created_at)
+             VALUES ('r', 'old run', 'anthropic', 'existing_only', 'done', 0);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        create_master_tables(&pool).await.unwrap();
+        create_master_tables(&pool).await.unwrap();
+
+        let run: (String, Option<String>) = sqlx::query_as("SELECT label, notice FROM tag_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(run, ("old run".to_string(), None));
+    }
+
+    #[tokio::test]
     async fn opening_databases_made_before_tag_hints_adds_the_column_and_keeps_their_tags() {
         let dir = std::env::temp_dir().join(format!("opendam-hints-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("lib/.opendam")).unwrap();
@@ -1059,6 +1109,46 @@ mod tests {
 
         let lacking = add_tag_description_column(&read_only(&old).await.unwrap()).await;
         let present = add_tag_description_column(&read_only(&new).await.unwrap()).await;
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(lacking.is_err());
+        assert!(present.is_ok());
+    }
+
+    #[tokio::test]
+    async fn adding_the_run_notice_column_fails_loudly_unless_it_is_already_there() {
+        let dir = std::env::temp_dir().join(format!("opendam-ro-runs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("old.sqlite"), dir.join("new.sqlite"));
+        for (file, schema) in [
+            (
+                &old,
+                "CREATE TABLE tag_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL)",
+            ),
+            (
+                &new,
+                "CREATE TABLE tag_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, notice TEXT)",
+            ),
+        ] {
+            let pool = SqlitePoolOptions::new()
+                .connect_with(
+                    SqliteConnectOptions::new()
+                        .filename(file)
+                        .create_if_missing(true),
+                )
+                .await
+                .unwrap();
+            sqlx::raw_sql(schema).execute(&pool).await.unwrap();
+            pool.close().await;
+        }
+        // Read-only stands in for any ALTER failure, such as SQLITE_BUSY
+        let read_only = |file: &PathBuf| {
+            SqlitePoolOptions::new()
+                .connect_with(SqliteConnectOptions::new().filename(file).read_only(true))
+        };
+
+        let lacking = add_run_columns(&read_only(&old).await.unwrap()).await;
+        let present = add_run_columns(&read_only(&new).await.unwrap()).await;
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(lacking.is_err());

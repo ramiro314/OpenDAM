@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS tag_runs (
     mode          TEXT NOT NULL,
     status        TEXT NOT NULL,
     pause_reason  TEXT,
+    notice        TEXT,
     inline        INTEGER NOT NULL DEFAULT 0,
     options       TEXT NOT NULL DEFAULT '{}',
     input_tokens  INTEGER NOT NULL DEFAULT 0,
@@ -71,6 +72,10 @@ CREATE TABLE IF NOT EXISTS tag_run_applied (
 CREATE INDEX IF NOT EXISTS idx_tag_run_applied_state ON tag_run_applied(state, library_id);
 "#;
 
+/// Columns added to the run tables after they first shipped, for master DBs made before: table,
+/// column and definition (`db::add_run_columns`).
+pub const ADDED_COLUMNS: [(&str, &str, &str); 1] = [("tag_runs", "notice", "TEXT")];
+
 /// A run as the status bar and the Runs panel show it.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -80,10 +85,14 @@ pub struct RunSummary {
     pub provider: String,
     #[sqlx(skip)]
     pub provider_label: String,
+    /// "api_key" or "claude_plan" for Anthropic runs, none for providers with one access.
+    pub access: Option<String>,
     pub model: Option<String>,
     pub mode: String,
     pub status: String,
     pub pause_reason: Option<String>,
+    /// What the provider last reported without pausing, such as Claude plan usage.
+    pub notice: Option<String>,
     /// Started by "Suggest tags" on one asset.
     pub inline: bool,
     pub total: i64,
@@ -106,7 +115,8 @@ pub fn now_ms() -> i64 {
 }
 
 const RUN_SUMMARY: &str =
-    "SELECT r.id, r.label, r.provider, r.model, r.mode, r.status, r.pause_reason, r.inline,
+    "SELECT r.id, r.label, r.provider, r.access, r.model, r.mode, r.status, r.pause_reason,
+            r.notice, r.inline,
             COUNT(i.asset_id) AS total,
             COALESCE(SUM(i.status = 'done'), 0) AS done,
             COALESCE(SUM(i.status = 'failed'), 0) AS failed,
@@ -195,6 +205,7 @@ pub struct NewRun<'a> {
     pub id: &'a str,
     pub label: &'a str,
     pub provider: &'a str,
+    pub access: Option<&'a str>,
     pub model: Option<&'a str>,
     pub mode: &'a str,
     pub options: serde_json::Value,
@@ -211,13 +222,14 @@ pub async fn create_run(
     items: &[(String, String)],
 ) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO tag_runs (id, label, provider, model, mode, status, options, inline,
-                               created_at)
-         VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
+        "INSERT INTO tag_runs (id, label, provider, access, model, mode, status, options,
+                               inline, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
     )
     .bind(run.id)
     .bind(run.label)
     .bind(run.provider)
+    .bind(run.access)
     .bind(run.model)
     .bind(run.mode)
     .bind(run.options.to_string())
@@ -269,6 +281,7 @@ pub struct Item {
     pub asset_id: String,
     pub library_id: String,
     pub mode: String,
+    pub access: Option<String>,
     pub model: Option<String>,
     pub options: serde_json::Value,
 }
@@ -300,8 +313,8 @@ pub async fn claim_item(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<Opt
     let Some((asset_id, library_id)) = claimed else {
         return Ok(None);
     };
-    let (mode, model, options): (String, Option<String>, String) =
-        sqlx::query_as("SELECT mode, model, options FROM tag_runs WHERE id = ?")
+    let (mode, access, model, options): (String, Option<String>, Option<String>, String) =
+        sqlx::query_as("SELECT mode, access, model, options FROM tag_runs WHERE id = ?")
             .bind(run_id)
             .fetch_one(master)
             .await?;
@@ -310,6 +323,7 @@ pub async fn claim_item(master: &Pool<Sqlite>, run_id: &str) -> sqlx::Result<Opt
         asset_id,
         library_id,
         mode,
+        access,
         model,
         options: serde_json::from_str(&options).unwrap_or_default(),
     }))
@@ -440,13 +454,35 @@ pub async fn resume_runs(master: &Pool<Sqlite>, run_ids: &[String]) -> sqlx::Res
     Ok(resumed)
 }
 
-/// Every paused run, oldest first, with its provider.
-pub async fn paused_runs(master: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, String)>> {
+/// A paused run, and how it reaches its provider.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct PausedRun {
+    pub id: String,
+    pub provider: String,
+    pub access: Option<String>,
+}
+
+/// Every paused run, oldest first.
+pub async fn paused_runs(master: &Pool<Sqlite>) -> sqlx::Result<Vec<PausedRun>> {
     sqlx::query_as(
-        "SELECT id, provider FROM tag_runs WHERE status = 'paused' ORDER BY created_at, id",
+        "SELECT id, provider, access FROM tag_runs WHERE status = 'paused'
+         ORDER BY created_at, id",
     )
     .fetch_all(master)
     .await
+}
+
+/// Every run that can't send a request any more: not `queued`, `running` or `paused`, and with
+/// no item in flight, as a cancelled run can have. A run never leaves that state: Retry failed
+/// starts a new run.
+pub async fn ended_run_ids(master: &Pool<Sqlite>) -> sqlx::Result<HashSet<String>> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM tag_runs WHERE status NOT IN ('queued', 'running', 'paused')
+         EXCEPT SELECT run_id FROM tag_run_items WHERE status = 'running'",
+    )
+    .fetch_all(master)
+    .await?;
+    Ok(ids.into_iter().collect())
 }
 
 /// Cancels a `queued`, `running` or `paused` run, in one transaction: its queued items become
@@ -554,8 +590,8 @@ pub enum NewNames<'a> {
 /// Write protocol step 1, in one master transaction: the item's new tag names merged into the
 /// run's proposals by normalized name, or created as tags (`NewNames`), then a `pending` row
 /// for every pair of `tag_ids` and created tags the library lacks (`present` holds the asset's
-/// tags), then the item `done` with its result, and the run's usage. Returns the tags it
-/// created.
+/// tags), then the item `done` with its result, and the run's usage and notice from the
+/// provider's `outcome`. Returns the tags it created.
 ///
 /// The transaction takes the write lock before it reads the catalog, so no other creator (an
 /// item, a review, you) can add the same name between the read and the insert, and items
@@ -567,7 +603,7 @@ pub async fn record_intent(
     present: &HashSet<String>,
     names: NewNames<'_>,
     result: &serde_json::Value,
-    usage: &super::provider::Usage,
+    outcome: &super::provider::TagResult,
 ) -> sqlx::Result<Vec<String>> {
     // Taking the write lock up front: a deferred transaction that reads the catalog first
     // would hold a read lock, and SQLite fails it at once rather than wait when another
@@ -610,12 +646,13 @@ pub async fn record_intent(
     .await?;
     sqlx::query(
         "UPDATE tag_runs SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ?,
-                             cost_usd = cost_usd + ?
+                             cost_usd = cost_usd + ?, notice = ?
          WHERE id = ?",
     )
-    .bind(usage.input_tokens)
-    .bind(usage.output_tokens)
-    .bind(usage.cost_usd)
+    .bind(outcome.usage.input_tokens)
+    .bind(outcome.usage.output_tokens)
+    .bind(outcome.usage.cost_usd)
+    .bind(&outcome.notice)
     .bind(&item.run_id)
     .execute(&mut *tx)
     .await?;
@@ -1367,6 +1404,7 @@ mod tests {
                 asset_id: asset.into(),
                 library_id: "lib".into(),
                 mode: "create_freely".into(),
+                access: None,
                 model: None,
                 options: serde_json::json!({}),
             };
