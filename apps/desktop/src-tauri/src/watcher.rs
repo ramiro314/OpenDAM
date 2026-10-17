@@ -376,7 +376,9 @@ async fn commit_asset_batch(pool: &sqlx::Pool<sqlx::Sqlite>, batch: &[PendingAss
 
     for item in batch {
         if item.is_update && is_native_image(&item.extension) {
-            // A changed raster gets a fresh preview, and keeps its old thumbnail until then.
+            // A changed raster gets a fresh preview, and keeps its old thumbnail until then. A job
+            // that hasn't started reads the new file, so it is reused. A 'processing' one may be
+            // decoding the old pixels, so the change gets a job of its own.
             sqlx::query(
                 "UPDATE assets SET size_bytes = ?, modified_at = ?, preview_status = 'pending' WHERE id = ?",
             )
@@ -390,7 +392,7 @@ async fn commit_asset_batch(pool: &sqlx::Pool<sqlx::Sqlite>, batch: &[PendingAss
                 "INSERT INTO preview_jobs (id, asset_id, status, created_at)
                  SELECT ?, ?, 'pending', ? WHERE NOT EXISTS (
                      SELECT 1 FROM preview_jobs WHERE asset_id = ?
-                     AND status IN ('pending', 'queued', 'processing', 'fallback'))",
+                     AND status IN ('pending', 'queued', 'fallback'))",
             )
             .bind(Uuid::new_v4().to_string())
             .bind(&item.id)
@@ -619,6 +621,47 @@ mod tests {
         reindex(&db, &lib).await;
 
         assert_eq!(preview_state(&lib.pool).await, (None, "pending".into(), 1));
+    }
+
+    #[tokio::test]
+    async fn raster_that_changes_while_its_job_runs_gets_a_second_job() {
+        let (dir, db, lib) = temp_library().await;
+        let source = dir.path().join("sprite.png");
+        write_png(&source, 64, 64);
+        reindex(&db, &lib).await;
+        // The image queue has claimed the job and is decoding the 64 px file.
+        sqlx::query("UPDATE preview_jobs SET status = 'processing'")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+
+        write_png(&source, 1024, 32);
+        reindex(&db, &lib).await;
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM preview_jobs WHERE status = 'pending'")
+                .fetch_one(&lib.pool)
+                .await
+                .unwrap();
+        assert_eq!(pending, 1);
+
+        // The claimed job finishes from the old pixels: no thumbnail, and the row says done.
+        sqlx::query("UPDATE preview_jobs SET status = 'done' WHERE status = 'processing'")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE assets SET preview_status = 'done', thumbnail_path = NULL")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+        crate::preview::process_image_jobs(&lib, 2).await;
+
+        let (thumb, status, active) = preview_state(&lib.pool).await;
+        let thumb = thumb.expect("the second job thumbnails the 1024 px file");
+        assert_eq!((status.as_str(), active), ("done", 0));
+        assert_eq!(
+            image::image_dimensions(dir.path().join(&thumb)).unwrap(),
+            (512, 16)
+        );
     }
 
     #[tokio::test]
