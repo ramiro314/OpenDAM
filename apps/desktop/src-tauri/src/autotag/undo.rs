@@ -277,8 +277,10 @@ async fn remove(
 }
 
 /// Deletes the run's pairs from an open library's `asset_tags`, then their master rows, a batch
-/// at a time. Deleting a `pending` pair the library never got is a no-op. Returns the assets
-/// whose tags changed.
+/// at a time. Deleting a `pending` pair the library never got is a no-op. A pair another run
+/// still records, one not being undone, stays in the library: that run added it too (replay
+/// confirms a pair already there as its own), so only the master row of this run goes.
+/// Returns the assets whose tags changed.
 async fn remove_pairs(
     db: &Database,
     lib: &LibraryHandle,
@@ -288,8 +290,25 @@ async fn remove_pairs(
 ) -> sqlx::Result<Vec<String>> {
     let mut changed = Vec::new();
     for chunk in pairs.chunks(BATCH) {
-        let mut tx = lib.pool.begin().await?;
+        let mut shared = HashSet::new();
         for (asset_id, tag_id) in chunk {
+            let owned_elsewhere: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM tag_run_applied a LEFT JOIN tag_runs r ON r.id = a.run_id
+                                WHERE a.asset_id = ? AND a.tag_id = ? AND a.run_id != ?
+                                  AND (r.status IS NULL
+                                       OR r.status NOT IN ('undoing', 'undo_partial', 'undone')))",
+            )
+            .bind(asset_id)
+            .bind(tag_id)
+            .bind(run_id)
+            .fetch_one(&db.master_pool)
+            .await?;
+            if owned_elsewhere {
+                shared.insert((asset_id, tag_id));
+            }
+        }
+        let mut tx = lib.pool.begin().await?;
+        for (asset_id, tag_id) in chunk.iter().filter(|p| !shared.contains(&(&p.0, &p.1))) {
             let deleted = sqlx::query("DELETE FROM asset_tags WHERE asset_id = ? AND tag_id = ?")
                 .bind(asset_id)
                 .bind(tag_id)
@@ -1052,5 +1071,60 @@ mod tests {
         allow_deletes(a, "tags").await;
         assert_eq!(engine.undo_run(&run_id).await.unwrap(), "undone");
         assert_eq!(snapshot(&db, &[a]).await, before);
+    }
+    #[tokio::test]
+    async fn undoing_one_of_two_runs_that_share_a_pair_leaves_the_tag_to_the_other() {
+        let (db, pools) = libraries(&["A"], &[&["rock-a1"]]).await;
+        let a = &pools[0];
+        let engine = started_engine(&db).await;
+        // Run Y adds Rock to rock-a1.
+        let y = run(&engine, &db, &["rock-a1"], Mode::ExistingOnly, "done").await;
+        // Run X recorded the same pair, but its library write failed: its row waits, and a
+        // restart's replay then finds the pair there and confirms it as X's too.
+        sqlx::query(
+            "INSERT INTO tag_runs (id, label, provider, mode, status, created_at)
+             VALUES ('x', 'run', 'fake', 'existing_only', 'done', 0)",
+        )
+        .execute(&db.master_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tag_run_applied (run_id, asset_id, library_id, tag_id)
+             VALUES ('x', 'rock-a1', 'A', 't-rock')",
+        )
+        .execute(&db.master_pool)
+        .await
+        .unwrap();
+        started_engine(&db).await;
+        let states: Vec<(String, String)> =
+            sqlx::query_as("SELECT run_id, state FROM tag_run_applied ORDER BY run_id = 'x' DESC")
+                .fetch_all(&db.master_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            states,
+            [
+                ("x".into(), "applied".into()),
+                (y.clone(), "applied".into())
+            ]
+        );
+
+        assert_eq!(engine.undo_run("x").await.unwrap(), "undone");
+        assert_eq!(
+            asset_tags(a).await,
+            [("rock-a1".into(), "t-rock".into())],
+            "Y's tag stays"
+        );
+        assert_eq!(
+            count(
+                &db.master_pool,
+                "SELECT COUNT(*) FROM tag_run_applied WHERE run_id = 'x'"
+            )
+            .await,
+            0
+        );
+
+        assert_eq!(engine.undo_run(&y).await.unwrap(), "undone");
+        assert!(asset_tags(a).await.is_empty(), "undoing Y removes it");
     }
 }

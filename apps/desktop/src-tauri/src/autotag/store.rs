@@ -605,6 +605,10 @@ pub enum NewNames<'a> {
 /// The caller commits `tx`, which it opens with `begin_intent` so no other creator (an item, a
 /// review, you) can add the same name between the catalog read and the insert, and items
 /// proposing a name at once create it once.
+///
+/// A tag of `tag_ids` deleted since the provider answered (by you, or by undoing the run that
+/// created it) is left out, of the pairs and of `result["tags"]`, so the item never lists a tag
+/// the asset can't get.
 pub async fn record_intent(
     tx: &mut sqlx::SqliteConnection,
     item: &Item,
@@ -614,7 +618,11 @@ pub async fn record_intent(
     result: &serde_json::Value,
     outcome: &super::provider::TagResult,
 ) -> sqlx::Result<Vec<String>> {
-    let mut tag_ids = tag_ids.to_vec();
+    let mut tag_ids = still_in_catalog(tx, item, tag_ids).await?;
+    let mut result = result.clone();
+    if let Some(tags) = result.get_mut("tags") {
+        *tags = serde_json::json!(tag_ids);
+    }
     let mut created = Vec::new();
     match names {
         NewNames::Propose(proposals) => propose(tx, item, proposals).await?,
@@ -662,6 +670,36 @@ pub async fn record_intent(
     .execute(&mut *tx)
     .await?;
     Ok(created)
+}
+
+/// The tags among `tag_ids` master still has, in order. Logs the others.
+async fn still_in_catalog(
+    tx: &mut sqlx::SqliteConnection,
+    item: &Item,
+    tag_ids: &[String],
+) -> sqlx::Result<Vec<String>> {
+    if tag_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT id FROM tags WHERE id IN ({})",
+        vec!["?"; tag_ids.len()].join(", ")
+    );
+    let mut query = sqlx::query_scalar::<_, String>(&sql);
+    for id in tag_ids {
+        query = query.bind(id);
+    }
+    let found: HashSet<String> = query.fetch_all(&mut *tx).await?.into_iter().collect();
+    let (kept, gone): (Vec<String>, Vec<String>) =
+        tag_ids.iter().cloned().partition(|id| found.contains(id));
+    if !gone.is_empty() {
+        tracing::warn!(
+            "Asset {} of run {} doesn't get {gone:?}: deleted while the provider answered",
+            item.asset_id,
+            item.run_id
+        );
+    }
+    Ok(kept)
 }
 
 /// Opens step 1's transaction for `record_intent`, taking the write lock up front: a deferred
@@ -1532,6 +1570,56 @@ mod tests {
                 ("a2".into(), created[0].clone()),
                 ("a3".into(), recreated[0].clone()),
             ]
+        );
+    }
+    #[tokio::test]
+    async fn step_one_leaves_out_a_tag_deleted_since_the_provider_answered() {
+        let db = memory_database(vec![]).await;
+        let master = &db.master_pool;
+        insert_tag(master, "t-rock", "Rock").await;
+        insert_run(&db, "r", "running").await;
+        insert_item(&db, "r", "a1", "running").await;
+        let item = Item {
+            run_id: "r".into(),
+            asset_id: "a1".into(),
+            library_id: "lib".into(),
+            mode: "existing_only".into(),
+            access: None,
+            model: None,
+            options: serde_json::json!({}),
+        };
+        // The provider answered Rock and Moss; Moss was deleted (an undo) before step 1.
+        let accepted = ["t-rock".to_string(), "t-moss".to_string()];
+
+        let mut tx = begin_intent(master).await.unwrap();
+        record_intent(
+            &mut tx,
+            &item,
+            &accepted,
+            &HashSet::new(),
+            NewNames::Propose(&[]),
+            &serde_json::json!({ "tags": accepted, "proposed": [] }),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let pairs: Vec<String> = sqlx::query_scalar("SELECT tag_id FROM tag_run_applied")
+            .fetch_all(master)
+            .await
+            .unwrap();
+        assert_eq!(pairs, ["t-rock"]);
+        let result: String =
+            sqlx::query_scalar("SELECT result FROM tag_run_items WHERE asset_id = 'a1'")
+                .fetch_one(master)
+                .await
+                .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            result["tags"],
+            serde_json::json!(["t-rock"]),
+            "the result agrees"
         );
     }
 }
