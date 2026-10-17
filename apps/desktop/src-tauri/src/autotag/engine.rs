@@ -2724,6 +2724,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepting_a_name_two_inline_runs_proposed_creates_one_tag_and_ends_both_reviews() {
+        let s = setup(
+            Recording {
+                proposed: [("a1.glb".to_string(), vec![proposal("Moss", None)])]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            &["a1"],
+        )
+        .await;
+        let master = &s.engine.db.master_pool;
+        s.engine.start().await;
+        let e = &s.engine;
+        let first = run_until(e, &["a1"], Mode::PreferExisting, true, "awaiting_review").await;
+        let second = run_until(e, &["a1"], Mode::PreferExisting, true, "awaiting_review").await;
+
+        // What the Tags tab's merged "Moss" chip sends: one Accept per run holding the name.
+        for suggestion in e.suggestions("a1").await.unwrap() {
+            let moss = &suggestion.proposals[0];
+            let status = e
+                .review_proposals(
+                    &suggestion.run.id,
+                    vec![ProposalDecision::Accept {
+                        proposal_id: moss.id.clone(),
+                        name: moss.name.clone(),
+                        parent_id: None,
+                        asset_ids: ids(&["a1"]),
+                    }],
+                )
+                .await
+                .unwrap();
+            assert_eq!(status, "done");
+        }
+
+        assert_eq!(
+            count(master, "SELECT COUNT(*) FROM tags WHERE name = 'Moss'").await,
+            1
+        );
+        let moss_id: String = sqlx::query_scalar("SELECT id FROM tags WHERE name = 'Moss'")
+            .fetch_one(master)
+            .await
+            .unwrap();
+        let applied: Vec<String> =
+            sqlx::query_scalar("SELECT tag_id FROM asset_tags WHERE asset_id = 'a1'")
+                .fetch_all(&s.lib_pool)
+                .await
+                .unwrap();
+        assert_eq!(applied, std::slice::from_ref(&moss_id), "applied once");
+        let resolved: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
+            "SELECT run_id, status, final_tag_id, created_tag FROM tag_run_proposals
+             ORDER BY run_id = ?",
+        )
+        .bind(&second)
+        .fetch_all(master)
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved,
+            [
+                (first.clone(), "mapped".into(), Some(moss_id.clone()), false),
+                (second.clone(), "accepted".into(), Some(moss_id), true),
+            ],
+            "the newest run, decided first, creates the tag, and the older run maps onto it"
+        );
+        assert!(e.suggestions("a1").await.unwrap()[0].proposals.is_empty());
+    }
+
+    #[tokio::test]
     async fn suggestions_carry_the_error_of_a_failed_inline_item() {
         let s = setup(
             Recording {
