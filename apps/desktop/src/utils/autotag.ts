@@ -102,8 +102,11 @@ export function suggestTagsAvailability(
 export interface SuggestionChip {
   name: string;
   parentId: string | null;
-  /** Each run's proposal of this name; a decision on the chip applies to all of them */
-  proposals: { runId: string; proposalId: string }[];
+  /**
+   * Each run's proposal of this name, with the assets it is for; a decision on the chip applies
+   * to all of them
+   */
+  proposals: { runId: string; proposalId: string; assetIds: string[] }[];
 }
 
 /**
@@ -116,7 +119,11 @@ export function suggestionChips(suggestions: AutotagSuggestion[]): SuggestionChi
     for (const p of proposals) {
       const key = p.name.trim().replace(/\s+/g, ' ').toLowerCase();
       const chip = chips.get(key) ?? { name: p.name, parentId: p.parentId, proposals: [] };
-      chip.proposals.push({ runId: run.id, proposalId: p.id });
+      chip.proposals.push({
+        runId: run.id,
+        proposalId: p.id,
+        assetIds: p.assets.map((a) => a.assetId),
+      });
       chips.set(key, chip);
     }
   }

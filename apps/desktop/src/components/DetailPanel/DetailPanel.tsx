@@ -563,7 +563,8 @@ function TagsTab({
 
   return (
     <div className={styles.tagsSection}>
-      <SuggestTags assetId={asset.id} />
+      {/* Keyed so another asset gets a fresh instance: a late reply for the last one is dropped */}
+      <SuggestTags key={asset.id} assetId={asset.id} />
 
       {tags.length === 0 && (
         <p className={styles.noTags}>No tags yet. Create tags in the sidebar.</p>

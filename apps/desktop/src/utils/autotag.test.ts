@@ -348,13 +348,34 @@ describe('suggestionChips', () => {
         name: 'Moss',
         parentId: 't-nature',
         proposals: [
-          { runId: 'r2', proposalId: 'p3' },
-          { runId: 'r1', proposalId: 'p1' },
+          { runId: 'r2', proposalId: 'p3', assetIds: ['a1'] },
+          { runId: 'r1', proposalId: 'p1', assetIds: ['a1'] },
         ],
       },
-      { name: 'Large', parentId: null, proposals: [{ runId: 'r2', proposalId: 'p4' }] },
-      { name: 'Lichen', parentId: null, proposals: [{ runId: 'r1', proposalId: 'p2' }] },
+      {
+        name: 'Large',
+        parentId: null,
+        proposals: [{ runId: 'r2', proposalId: 'p4', assetIds: ['a1'] }],
+      },
+      {
+        name: 'Lichen',
+        parentId: null,
+        proposals: [{ runId: 'r1', proposalId: 'p2', assetIds: ['a1'] }],
+      },
     ]);
+  });
+
+  test("a chip's assets are its proposals' own, whatever asset is shown", () => {
+    const other = {
+      ...proposal('p9', 'Sand'),
+      assets: [{ ...proposal('x', 'x').assets[0], assetId: 'a9' }],
+    };
+
+    const [chip] = suggestionChips([
+      { run: { ...run('awaiting_review', 1, 1), id: 'r9' }, error: null, proposals: [other] },
+    ]);
+
+    expect(chip.proposals).toEqual([{ runId: 'r9', proposalId: 'p9', assetIds: ['a9'] }]);
   });
 
   test('no proposals, no chips', () => {

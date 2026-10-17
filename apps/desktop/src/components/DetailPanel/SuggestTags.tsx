@@ -37,12 +37,6 @@ export function SuggestTags({ assetId }: { assetId: string }) {
   );
 
   useEffect(() => {
-    setSuggestions([]);
-    setError(null);
-    setReasonShown(false);
-  }, [assetId]);
-
-  useEffect(() => {
     let current = true;
     api.getAutotagSuggestions(assetId).then(
       (s) => current && setSuggestions(s),
@@ -86,14 +80,15 @@ export function SuggestTags({ assetId }: { assetId: string }) {
     setApplying(chip.name);
     setError(null);
     try {
-      for (const { runId, proposalId } of chip.proposals) {
+      for (const { runId, proposalId, assetIds } of chip.proposals) {
         const decision: ProposalDecision = accept
           ? {
               action: 'accept',
               proposalId,
               name: chip.name,
               parentId: chip.parentId,
-              assetIds: [assetId],
+              // The proposal's own asset, never whichever asset is shown now
+              assetIds,
             }
           : { action: 'reject', proposalId };
         await api.reviewAutotagProposals(runId, [decision]);
