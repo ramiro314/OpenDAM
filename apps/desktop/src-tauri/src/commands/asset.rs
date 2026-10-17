@@ -1,4 +1,6 @@
 use serde_json;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tauri::{Emitter, State};
@@ -8,6 +10,9 @@ use crate::models::{Asset, AssetPatch, FilterSpec, SearchPayload, SearchQuery, S
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
+
+/// A read transaction on one library's pool.
+type LibraryTx = sqlx::Transaction<'static, sqlx::Sqlite>;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct RawAssetRow {
@@ -164,65 +169,179 @@ async fn search_libraries(
         });
     }
 
-    // Multiple libraries: query each, combine counts, and merge-sort
+    // Multiple libraries: each returns only the rowid and sort key of its first `offset + limit`
+    // matches, and only the merged page's rows are fetched in full.
     let mut total: i64 = 0;
-    let mut all_assets: Vec<Asset> = Vec::new();
-    for (pool, root_opt) in target_libs {
-        if payload.include_total {
+    if payload.include_total {
+        for (pool, _) in target_libs {
             if let Ok(c) = count_assets(pool, &filter).await {
                 total += c;
             }
         }
-        if let Ok(assets) =
-            fetch_assets(pool, root_opt, &filter, &order_by, offset + limit, None).await
-        {
-            all_assets.extend(assets);
+    }
+    // Each library's keys and its page rows are read in one transaction, one snapshot, so an
+    // asset the watcher deletes in between can't drop out of the page, nor a new asset that
+    // reuses its rowid take its place. Under rollback journaling, writers wait for it to end.
+    let mut txs: Vec<Option<LibraryTx>> = Vec::new();
+    for (lib, (pool, _)) in target_libs.iter().enumerate() {
+        match pool.begin().await {
+            Ok(tx) => txs.push(Some(tx)),
+            Err(e) => {
+                tracing::warn!("Left library {lib} out of a search: {e}");
+                txs.push(None);
+            }
         }
     }
-
-    all_assets.sort_by(|a, b| {
-        let cmp = match sort_field {
-            "name" => a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()),
-            "size" => a.size_bytes.cmp(&b.size_bytes),
-            "rating" => a.rating.cmp(&b.rating),
-            "kind" => a.kind.cmp(&b.kind),
-            "favorite" => a.is_favorite.cmp(&b.is_favorite),
-            _ => a.modified_at.cmp(&b.modified_at),
-        };
-        if is_asc {
-            cmp
-        } else {
-            cmp.reverse()
+    let (libs, f) = (&mut txs, &filter);
+    let page = match sort_column(sort_field).1 {
+        SortKind::NoCase => {
+            merged_page::<String>(libs, f, sort_field, is_asc, offset, limit, |a, b| {
+                nocase_cmp(a, b)
+            })
+            .await
         }
-    });
+        SortKind::Binary => {
+            merged_page::<String>(libs, f, sort_field, is_asc, offset, limit, |a, b| {
+                a.as_bytes().cmp(b.as_bytes())
+            })
+            .await
+        }
+        SortKind::Integer => {
+            merged_page::<i64>(libs, f, sort_field, is_asc, offset, limit, i64::cmp).await
+        }
+    };
 
-    let paged_assets: Vec<Asset> = all_assets
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect();
+    #[cfg(test)]
+    if let Some(hook) = BETWEEN_KEYS_AND_ROWS.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+    let mut fetched: HashMap<(usize, i64), Asset> = HashMap::new();
+    for (lib, (tx, (_, root_opt))) in txs.iter_mut().zip(target_libs).enumerate() {
+        let Some(tx) = tx else { continue };
+        let rowids: Vec<i64> = page
+            .iter()
+            .filter(|(l, _)| *l == lib)
+            .map(|(_, rowid)| *rowid)
+            .collect();
+        if rowids.is_empty() {
+            continue;
+        }
+        match fetch_assets_by_rowid(tx, root_opt, &rowids).await {
+            Ok(assets) => fetched.extend(
+                assets
+                    .into_iter()
+                    .map(|(rowid, asset)| ((lib, rowid), asset)),
+            ),
+            Err(e) => tracing::warn!("Left library {lib} out of a search page: {e}"),
+        }
+    }
+    for tx in txs.into_iter().flatten() {
+        // Ending the read transaction now releases its lock instead of leaving it on the idle
+        // connection.
+        if let Err(e) = tx.commit().await {
+            tracing::warn!("Could not end a search's read transaction: {e}");
+        }
+    }
+    let assets = page.iter().filter_map(|key| fetched.remove(key)).collect();
 
     Ok(SearchResult {
-        assets: paged_assets,
+        assets,
         total: payload.include_total.then_some(total),
         page: payload.page,
         page_size: payload.page_size,
     })
 }
 
+/// The (library position, rowid) of each asset on the page `offset..offset + limit` of a search
+/// over the libraries read by `txs` sorted by `field`, in the order one SQLite query over all of
+/// them would return. Each library returns only the rowid and sort key of its first `offset + limit` matches,
+/// whose keys `cmp` compares as SQLite does. Ties break by library position, then rowid.
+async fn merged_page<K>(
+    txs: &mut [Option<LibraryTx>],
+    filter: &SqlFilter,
+    field: &str,
+    is_asc: bool,
+    offset: i64,
+    limit: i64,
+    cmp: fn(&K, &K) -> Ordering,
+) -> Vec<(usize, i64)>
+where
+    K: Send + Unpin + for<'r> sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite>,
+{
+    let sql = format!(
+        "SELECT a.rowid, {} FROM assets a {} ORDER BY {} LIMIT ?",
+        sort_column(field).0,
+        filter.where_clause(),
+        order_by(field, is_asc),
+    );
+    let mut keys: Vec<(usize, i64, K)> = Vec::new();
+    for (lib, tx) in txs.iter_mut().enumerate() {
+        let Some(tx) = tx else { continue };
+        let mut query = sqlx::query_as::<_, (i64, K)>(&sql);
+        for b in &filter.binds {
+            query = query.bind(b.clone());
+        }
+        match query.bind(offset + limit).fetch_all(&mut **tx).await {
+            Ok(rows) => keys.extend(rows.into_iter().map(|(rowid, key)| (lib, rowid, key))),
+            Err(e) => tracing::warn!("Left library {lib} out of a search: {e}"),
+        }
+    }
+
+    // Each library's keys are already in its order, so the stable sort merges sorted runs.
+    keys.sort_by(|(lib_a, rowid_a, key_a), (lib_b, rowid_b, key_b)| {
+        let by_key = cmp(key_a, key_b);
+        let by_key = if is_asc { by_key } else { by_key.reverse() };
+        let by_rowid = if is_asc {
+            rowid_a.cmp(rowid_b)
+        } else {
+            rowid_b.cmp(rowid_a)
+        };
+        by_key.then(lib_a.cmp(lib_b)).then(by_rowid)
+    });
+    keys.into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .map(|(lib, rowid, _)| (lib, rowid))
+        .collect()
+}
+
+/// Compares text as SQLite's `NOCASE` collation does: ASCII letters fold to lowercase, then the
+/// bytes compare, a prefix first.
+fn nocase_cmp(a: &str, b: &str) -> Ordering {
+    a.bytes()
+        .map(|c| c.to_ascii_lowercase())
+        .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+}
+
 /// The `ORDER BY` terms of a search over `assets a` sorted by `field`. The `rowid` tie-break makes
 /// the order total, so offset pages never overlap or skip.
 fn order_by(field: &str, is_asc: bool) -> String {
-    let sort_col = match field {
-        "name" => "a.file_name COLLATE NOCASE",
-        "size" => "a.size_bytes",
-        "rating" => "a.rating",
-        "kind" => "a.kind",
-        "favorite" => "a.is_favorite",
-        _ => "a.modified_at",
-    };
     let dir = if is_asc { "ASC" } else { "DESC" };
-    format!("{sort_col} {dir}, a.rowid {dir}")
+    format!("{} {dir}, a.rowid {dir}", sort_column(field).0)
+}
+
+/// How SQLite compares a sort column's values, and so how the multi-library merge decodes and
+/// compares them.
+#[derive(Clone, Copy)]
+enum SortKind {
+    /// Text under `COLLATE NOCASE`.
+    NoCase,
+    /// Text under the default `BINARY` collation.
+    Binary,
+    Integer,
+}
+
+/// The column of `assets a` a search sorted by `field` orders on, with its collation, and how
+/// its values compare.
+fn sort_column(field: &str) -> (&'static str, SortKind) {
+    match field {
+        "name" => ("a.file_name COLLATE NOCASE", SortKind::NoCase),
+        "size" => ("a.size_bytes", SortKind::Integer),
+        "rating" => ("a.rating", SortKind::Integer),
+        "kind" => ("a.kind", SortKind::Binary),
+        "favorite" => ("a.is_favorite", SortKind::Integer),
+        _ => ("a.modified_at", SortKind::Integer),
+    }
 }
 
 /// The `WHERE` conditions of a search over `assets a`, and the values bound to their `?`
@@ -430,6 +549,14 @@ thread_local! {
     static COUNT_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: runs once in the next multi-library search, after the keys are merged and
+    /// before the page's rows are fetched.
+    static BETWEEN_KEYS_AND_ROWS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 async fn count_assets(pool: &sqlx::Pool<sqlx::Sqlite>, filter: &SqlFilter) -> sqlx::Result<i64> {
     #[cfg(test)]
     COUNT_QUERIES.with(|c| c.set(c.get() + 1));
@@ -439,6 +566,43 @@ async fn count_assets(pool: &sqlx::Pool<sqlx::Sqlite>, filter: &SqlFilter) -> sq
         query = query.bind(b.clone());
     }
     query.fetch_one(pool).await
+}
+
+/// The columns of a `RawAssetRow` selected from `assets a`.
+const ASSET_COLUMNS: &str = r#"
+    a.id, a.file_path, a.file_name, a.extension, a.kind,
+    a.size_bytes, a.modified_at, a.indexed_at, a.rating,
+    a.color_label, a.is_favorite, a.description, a.thumbnail_path,
+    a.preview_status, a.metadata,
+    (SELECT json_group_array(tag_id) FROM asset_tags WHERE asset_id = a.id) AS tags,
+    (SELECT json_group_array(collection_id) FROM collection_assets WHERE asset_id = a.id) AS collections"#;
+
+#[derive(sqlx::FromRow)]
+struct RowidAssetRow {
+    rowid: i64,
+    #[sqlx(flatten)]
+    row: RawAssetRow,
+}
+
+/// The assets with `rowids`, each with its rowid, in no particular order.
+async fn fetch_assets_by_rowid(
+    tx: &mut LibraryTx,
+    root: &Option<std::path::PathBuf>,
+    rowids: &[i64],
+) -> sqlx::Result<Vec<(i64, Asset)>> {
+    let sql = format!(
+        "SELECT a.rowid AS rowid, {ASSET_COLUMNS} FROM assets a WHERE a.rowid IN ({})",
+        placeholders(rowids.len())
+    );
+    let mut query = sqlx::query_as::<_, RowidAssetRow>(&sql);
+    for rowid in rowids {
+        query = query.bind(rowid);
+    }
+    let rows = query.fetch_all(&mut **tx).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.rowid, row_to_asset(root.as_deref(), r.row)))
+        .collect())
 }
 
 /// The first `limit` assets matching `filter` in `order_by` order, after skipping `offset`.
@@ -451,13 +615,7 @@ async fn fetch_assets(
     offset: Option<i64>,
 ) -> sqlx::Result<Vec<Asset>> {
     let sql = format!(
-        r#"SELECT
-            a.id, a.file_path, a.file_name, a.extension, a.kind,
-            a.size_bytes, a.modified_at, a.indexed_at, a.rating,
-            a.color_label, a.is_favorite, a.description, a.thumbnail_path,
-            a.preview_status, a.metadata,
-            (SELECT json_group_array(tag_id) FROM asset_tags WHERE asset_id = a.id) AS tags,
-            (SELECT json_group_array(collection_id) FROM collection_assets WHERE asset_id = a.id) AS collections
+        r#"SELECT {ASSET_COLUMNS}
            FROM assets a
            {}
            ORDER BY {}
@@ -1637,6 +1795,208 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A library holding `names`, in that order, whose other sort keys repeat so that many tie.
+    async fn mixed_library(prefix: &str, names: &[&str]) -> Pool<Sqlite> {
+        let pool = memory_library_pool().await;
+        for (i, name) in names.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at,
+                    indexed_at, rating, is_favorite)
+                 VALUES (?, ?, ?, 'png', ?, ?, ?, 0, ?, ?)",
+            )
+            .bind(format!("{prefix}{i:02}"))
+            .bind(format!("{i}/{name}"))
+            .bind(name)
+            .bind(["model", "texture", "Model", "sprite"][i % 4])
+            .bind((i % 3) as i64 * 1024)
+            .bind((i % 5) as i64)
+            .bind((i % 2) as i64)
+            .bind((i % 3 == 0) as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool
+    }
+
+    /// The ids of every asset in `libs` sorted by `field` in `order`, as one SQLite query over all
+    /// of them sorts them, ties broken by library position and then rowid.
+    async fn sorted_by_sqlite(libs: &[Pool<Sqlite>], field: &str, order: &str) -> Vec<String> {
+        let merged = memory_library_pool().await;
+        sqlx::query(
+            "CREATE TABLE merged (lib INTEGER, rid INTEGER, id TEXT, file_name TEXT, kind TEXT,
+                size_bytes INTEGER, modified_at INTEGER, rating INTEGER, is_favorite INTEGER)",
+        )
+        .execute(&merged)
+        .await
+        .unwrap();
+        for (lib, pool) in libs.iter().enumerate() {
+            let rows = sqlx::query(
+                "SELECT rowid, id, file_name, kind, size_bytes, modified_at, rating, is_favorite
+                 FROM assets",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            for row in rows {
+                sqlx::query("INSERT INTO merged VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                    .bind(lib as i64)
+                    .bind(row.get::<i64, _>(0))
+                    .bind(row.get::<String, _>(1))
+                    .bind(row.get::<String, _>(2))
+                    .bind(row.get::<String, _>(3))
+                    .bind(row.get::<i64, _>(4))
+                    .bind(row.get::<i64, _>(5))
+                    .bind(row.get::<i64, _>(6))
+                    .bind(row.get::<i64, _>(7))
+                    .execute(&merged)
+                    .await
+                    .unwrap();
+            }
+        }
+        let dir = if order == "asc" { "ASC" } else { "DESC" };
+        sqlx::query_scalar(&format!(
+            "SELECT id FROM merged a ORDER BY {} {dir}, a.lib ASC, a.rid {dir}",
+            sort_column(field).0
+        ))
+        .fetch_all(&merged)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pages_over_several_libraries_match_one_full_sort() {
+        // Case variants, non-ASCII letters that only Unicode folds (`Ä`/`ä`, `É`/`é`) and
+        // punctuation between the ASCII cases, with names repeated within and across libraries.
+        let names = [
+            "Ä_b.png",
+            "ä_a.png",
+            "rock.png",
+            "Rock.png",
+            "ROCK.png",
+            "zebra.png",
+            "Éclair.png",
+            "éclair.png",
+            "_under.png",
+            "[bracket].png",
+            "Straße.png",
+            "STRASSE.png",
+            "rock.png",
+            "Zebra.png",
+            "a.png",
+        ];
+        let reversed: Vec<&str> = names.iter().rev().copied().collect();
+        let libs = [
+            mixed_library("a", &names).await,
+            mixed_library("b", &reversed[..10]).await,
+        ];
+        let targets: Vec<_> = libs.iter().map(|pool| (pool.clone(), None)).collect();
+        let count = names.len() + 10;
+
+        for field in ["name", "kind", "size", "modified", "rating", "favorite"] {
+            for order in ["asc", "desc"] {
+                let expected = sorted_by_sqlite(&libs, field, order).await;
+                for page_size in [1, 4, 7, count as i64] {
+                    let mut found = Vec::new();
+                    // One page past the end, which is empty.
+                    for page in 0..=(count as i64 / page_size) {
+                        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+                            "query": {
+                                "text": "", "filter": {}, "sort": { "field": field, "order": order }
+                            },
+                            "page": page,
+                            "pageSize": page_size,
+                            "includeTotal": false,
+                        }))
+                        .unwrap();
+                        let result = search_libraries(&payload, &targets).await.unwrap();
+                        let start = (page * page_size) as usize;
+                        let end = (start + page_size as usize).min(count);
+                        let ids: Vec<String> = result.assets.into_iter().map(|a| a.id).collect();
+                        assert_eq!(
+                            ids,
+                            expected[start..end],
+                            "{field} {order}, page {page} of {page_size}"
+                        );
+                        found.extend(ids);
+                    }
+                    assert_eq!(found, expected, "{field} {order}, pages of {page_size}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_asset_deleted_between_the_key_and_row_reads_stays_on_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut libs = Vec::new();
+        for lib in ["a", "b"] {
+            let path = dir.path().join(format!("{lib}.sqlite"));
+            let pool = crate::db::connect_library_sqlite(&path).await.unwrap();
+            for name in ["x", "y"] {
+                sqlx::query(
+                    "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+                     VALUES (?, ?, ?, 'png', 'texture', 0, 0, 0)",
+                )
+                .bind(format!("{lib}-{name}"))
+                .bind(format!("{name}.png"))
+                .bind(format!("{name}.png"))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            libs.push((path, pool));
+        }
+        // A writer on its own connection, as the watcher is, that waits for no lock.
+        let delete = |path: PathBuf, id: &'static str| {
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let options = sqlx::sqlite::SqliteConnectOptions::new()
+                            .filename(&path)
+                            .busy_timeout(std::time::Duration::ZERO);
+                        let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+                        sqlx::query("DELETE FROM assets WHERE id = ?")
+                            .bind(id)
+                            .execute(&pool)
+                            .await
+                            .is_ok()
+                    })
+            })
+            .join()
+            .unwrap()
+        };
+        let deleted_mid_search = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (path_a, deleted) = (libs[0].0.clone(), deleted_mid_search.clone());
+        BETWEEN_KEYS_AND_ROWS.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || deleted.set(Some(delete(path_a, "a-y")))))
+        });
+
+        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+            "query": { "text": "", "filter": {}, "sort": { "field": "name", "order": "asc" } },
+            "page": 0,
+            "pageSize": 4,
+        }))
+        .unwrap();
+        let targets: Vec<_> = libs.iter().map(|(_, pool)| (pool.clone(), None)).collect();
+        let result = search_libraries(&payload, &targets).await.unwrap();
+
+        assert_eq!(
+            deleted_mid_search.get(),
+            Some(false),
+            "a write landed between the key and row reads"
+        );
+        let found: Vec<String> = result.assets.into_iter().map(|a| a.id).collect();
+        assert_eq!(found, ["a-x", "b-x", "a-y", "b-y"]);
+        assert!(
+            delete(libs[0].0.clone(), "a-y"),
+            "the search left its read lock held"
+        );
     }
 
     #[tokio::test]
