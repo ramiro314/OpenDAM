@@ -23,6 +23,7 @@ import {
   assetAt,
   emptyCache,
   findAnchor,
+  findCached,
   insertPage,
   pageOf,
   patchAssets,
@@ -259,10 +260,7 @@ function failedSearch(e: unknown): Partial<AssetStore> {
 
 /** The cached asset `id`, if its page is cached. */
 function cachedAsset(s: Pick<PageCache, 'pages' | 'indexById'>, id: string): Asset | undefined {
-  const index = s.indexById.get(id);
-  if (index === undefined) return undefined;
-  const asset = assetAt(s, index);
-  return asset?.id === id ? asset : undefined;
+  return findCached(s, id)?.asset;
 }
 
 /** A pinned asset, or a cached one; for selectors, which `getById` can't serve. */

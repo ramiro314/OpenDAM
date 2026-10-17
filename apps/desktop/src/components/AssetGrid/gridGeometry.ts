@@ -5,9 +5,11 @@ import { CARD_BODY_HEIGHT } from './cardMetrics';
 
 /** Smallest tile width per grid size, as `minmax(<tile>, 1fr)` had it. */
 export const TILE_MIN: Record<'sm' | 'md' | 'lg', number> = { sm: 180, md: 220, lg: 280 };
-/** Gap between cards, both ways (`--space-3`). */
+// The grid sets these as CSS variables (--grid-gap, --scroll-padding, --list-row-height), so the
+// stylesheets lay out with the same values the virtualizer positions rows by.
+/** Gap between cards, both ways. */
 export const GRID_GAP = 12;
-/** The scroll area's padding on every side (`--space-4`). */
+/** The scroll area's padding on every side. */
 export const SCROLL_PADDING = 16;
 /** A list row's height, and the gap below it. */
 export const LIST_ROW_HEIGHT = 36;

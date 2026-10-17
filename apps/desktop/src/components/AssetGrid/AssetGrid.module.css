@@ -11,7 +11,9 @@
   overflow-x: hidden;
   /* The grid places the view itself when rows change (gridGeometry.ts); the browser mustn't */
   overflow-anchor: none;
-  padding: var(--space-4);
+  /* --scroll-padding, --grid-gap and --list-row-height come from gridGeometry.ts, which the
+     virtualizer positions rows by */
+  padding: var(--scroll-padding);
 }
 
 /* Windowed rows: the container is as tall as every row, and only the rendered rows are in it,
@@ -28,7 +30,7 @@
 }
 .gridRow {
   display: grid;
-  gap: var(--space-3);
+  gap: var(--grid-gap);
 }
 
 /* A static tile where an asset's page isn't cached yet */

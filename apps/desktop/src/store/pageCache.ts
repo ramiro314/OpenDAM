@@ -42,6 +42,20 @@ export function assetAt(cache: Pick<PageCache, 'pages'>, index: number): Asset |
   return cache.pages.get(pageOf(index))?.[index % PAGE_SIZE];
 }
 
+/**
+ * Where asset `id` is cached: its index and the asset there. `indexById` can still point at a slot
+ * that a refetched page has since filled with another asset, so the slot must hold `id`.
+ */
+export function findCached(
+  cache: Pick<PageCache, 'pages' | 'indexById'>,
+  id: string
+): { index: number; asset: Asset } | undefined {
+  const index = cache.indexById.get(id);
+  if (index === undefined) return undefined;
+  const asset = assetAt(cache, index);
+  return asset?.id === id ? { index, asset } : undefined;
+}
+
 /** Moves `indices` that are cached to the most recently wanted end, in their order. */
 export function touch(cache: PageCache, indices: number[]): PageCache {
   const wanted = indices.filter((i) => cache.pages.has(i));
@@ -111,19 +125,17 @@ export function patchAssets(
   let nextPinned: Map<string, Asset> | null = null;
   const copied = new Set<number>();
   for (const id of ids) {
-    const index = cache.indexById.get(id);
-    const page = index === undefined ? undefined : (pages ?? cache.pages).get(pageOf(index));
-    const slot = index === undefined ? -1 : index % PAGE_SIZE;
-    const cached = page?.[slot]?.id === id ? page[slot] : undefined;
-    const current = cached ?? pinned.get(id);
+    const cached = findCached({ pages: pages ?? cache.pages, indexById: cache.indexById }, id);
+    const current = cached?.asset ?? pinned.get(id);
     if (!current) continue;
     const updated = fn(current);
-    if (cached && page && index !== undefined) {
+    if (cached) {
       pages ??= new Map(cache.pages);
-      const p = pageOf(index);
+      const p = pageOf(cached.index);
+      const page = pages.get(p)!;
       const copy = copied.has(p) ? page : [...page];
       copied.add(p);
-      copy[slot] = updated;
+      copy[cached.index % PAGE_SIZE] = updated;
       pages.set(p, copy);
     }
     if (pinned.has(id)) {

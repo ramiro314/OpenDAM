@@ -1,6 +1,6 @@
 .row {
-  /* LIST_ROW_HEIGHT in gridGeometry.ts */
-  height: 36px;
+  /* LIST_ROW_HEIGHT in gridGeometry.ts, set by the grid */
+  height: var(--list-row-height);
   display: flex;
   align-items: center;
   gap: var(--space-3);

@@ -9,6 +9,7 @@ import {
   createSettler,
   emptyCache,
   findAnchor,
+  findCached,
   insertPage,
   patchAssets,
   refreshPages,
@@ -64,6 +65,26 @@ describe('insertPage and eviction', () => {
     expect(cache.indexById.has('p0-0')).toBe(false);
     expect(cache.indexById.get('x')).toBe(0);
     expect(assetAt(cache, 0)?.id).toBe('x');
+  });
+});
+
+describe('findCached', () => {
+  test('finds a cached asset with its index', () => {
+    const cache = cacheOf([0, 1]);
+    expect(findCached(cache, 'p1-7')).toEqual({
+      index: PAGE_SIZE + 7,
+      asset: assetAt(cache, PAGE_SIZE + 7)!,
+    });
+    expect(findCached(cache, 'nope')).toBeUndefined();
+  });
+
+  test('ignores an index whose slot now holds another asset', () => {
+    // A refetched page 1 put `x` where p1-7 was; a stale entry still points p0-3 there
+    let cache = insertPage(cacheOf([0, 1]), 1, [{ id: 'x' } as Asset], [1]);
+    cache = { ...cache, indexById: new Map(cache.indexById).set('p0-3', PAGE_SIZE) };
+    expect(findCached(cache, 'p0-3')).toBeUndefined();
+    expect(patchAssets(cache, new Map(), ['p0-3'], (a) => ({ ...a, rating: 5 }))).toBeNull();
+    expect(assetAt(cache, PAGE_SIZE)?.id).toBe('x');
   });
 });
 

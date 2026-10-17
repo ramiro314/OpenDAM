@@ -15,6 +15,8 @@ import { CARD_BODY_HEIGHT } from './cardMetrics';
 import { AssetListRow } from './AssetListRow';
 import { FilterBar } from './FilterBar';
 import {
+  GRID_GAP,
+  LIST_ROW_HEIGHT,
   OVERSCAN_ROWS,
   SCROLL_PADDING,
   TILE_MIN,
@@ -273,15 +275,18 @@ function WindowedResults({
         ref={scrollRef}
         data-columns={columns}
         data-row-pitch={rowPitch}
+        style={
+          {
+            '--scroll-padding': `${SCROLL_PADDING}px`,
+            '--grid-gap': `${GRID_GAP}px`,
+            '--list-row-height': `${LIST_ROW_HEIGHT}px`,
+            '--card-body-height': `${CARD_BODY_HEIGHT}px`,
+          } as React.CSSProperties
+        }
       >
         <div
           className={styles.rows}
-          style={
-            {
-              height: rows > 0 ? (rows - 1) * rowPitch + rowHeight : 0,
-              '--card-body-height': `${CARD_BODY_HEIGHT}px`,
-            } as React.CSSProperties
-          }
+          style={{ height: rows > 0 ? (rows - 1) * rowPitch + rowHeight : 0 }}
         >
           {virtualizer.getVirtualItems().map((item) => {
             const first = item.index * columns;

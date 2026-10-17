@@ -3,7 +3,7 @@
 // check here.
 
 import { useAssetStore, useUIStore } from '../store';
-import { rowOfIndex, rowTop } from '../components/AssetGrid/gridGeometry';
+import { GRID_GAP, rowOfIndex, rowTop } from '../components/AssetGrid/gridGeometry';
 
 export interface UiCheckContext {
   /** The grid's scroll container (`#asset-scroll`). */
@@ -107,8 +107,8 @@ export const UI_CHECKS: UiCheck[] = [
       );
       assert(Math.abs(lastInRow!.top - first!.top) < 1, `row 0 does not hold ${columns} cards`);
       assert(
-        Math.abs(first!.height + 12 - rowPitch) < 1,
-        `a card is ${first!.height} px tall, the row pitch ${rowPitch} wants ${rowPitch - 12}`
+        Math.abs(first!.height + GRID_GAP - rowPitch) < 1,
+        `a card is ${first!.height} px tall, the row pitch ${rowPitch} wants ${rowPitch - GRID_GAP}`
       );
       await pause('U1-full-scrollbar');
     },
