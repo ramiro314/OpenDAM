@@ -4,13 +4,16 @@
 use std::ffi::OsString;
 use std::fmt;
 
-/// The variables that select a rendering mode. If any is set, the app sets none of its own.
-pub const RENDER_VARS: [&str; 5] = [
-    "WEBKIT_DISABLE_DMABUF_RENDERER",
-    "WEBKIT_DMABUF_RENDERER_FORCE_SHM",
-    "__NV_DISABLE_EXPLICIT_SYNC",
-    "WEBKIT_DISABLE_COMPOSITING_MODE",
-    "WEBKIT_SKIA_ENABLE_CPU_RENDERING",
+/// The variables that select a rendering mode, each with the mode it gives, in priority order:
+/// the first one set names the mode. If any is set, the app sets none of its own. Both
+/// `choose_render_env` and `describe_render_env` read this one list, so they agree on which
+/// variables count.
+pub const RENDER_VARS: [(&str, &str); 5] = [
+    ("WEBKIT_DISABLE_DMABUF_RENDERER", "cpu"),
+    ("WEBKIT_SKIA_ENABLE_CPU_RENDERING", "cpu"),
+    ("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "gpu-shm"),
+    ("__NV_DISABLE_EXPLICIT_SYNC", "explicit-sync"),
+    ("WEBKIT_DISABLE_COMPOSITING_MODE", "no-compositing"),
 ];
 
 /// Present when the NVIDIA kernel driver is loaded.
@@ -59,6 +62,7 @@ pub fn choose_render_env(
 ) -> RenderChoice {
     let user_set: Vec<_> = RENDER_VARS
         .into_iter()
+        .map(|(name, _)| name)
         .filter(|name| lookup_env(name).is_some())
         .collect();
     if !user_set.is_empty() {
@@ -84,24 +88,18 @@ pub fn apply_render_env() -> RenderChoice {
 /// Names the effective rendering mode from the variables set once `main.rs` has applied its
 /// default. A variable counts as set whatever its value, as `choose_render_env` treats it.
 ///
+/// The mode of the first variable in `RENDER_VARS` that is set, or `webkit-default` if none is:
+///
 /// - `cpu`: `WEBKIT_DISABLE_DMABUF_RENDERER` or `WEBKIT_SKIA_ENABLE_CPU_RENDERING`
 /// - `gpu-shm`: otherwise `WEBKIT_DMABUF_RENDERER_FORCE_SHM`
 /// - `explicit-sync`: otherwise `__NV_DISABLE_EXPLICIT_SYNC`
 /// - `no-compositing`: otherwise `WEBKIT_DISABLE_COMPOSITING_MODE`
 /// - `webkit-default`: none of them
 pub fn describe_render_env(lookup_env: impl Fn(&str) -> Option<OsString>) -> &'static str {
-    let set = |name: &str| lookup_env(name).is_some();
-    if set("WEBKIT_DISABLE_DMABUF_RENDERER") || set("WEBKIT_SKIA_ENABLE_CPU_RENDERING") {
-        "cpu"
-    } else if set("WEBKIT_DMABUF_RENDERER_FORCE_SHM") {
-        "gpu-shm"
-    } else if set("__NV_DISABLE_EXPLICIT_SYNC") {
-        "explicit-sync"
-    } else if set("WEBKIT_DISABLE_COMPOSITING_MODE") {
-        "no-compositing"
-    } else {
-        "webkit-default"
-    }
+    RENDER_VARS
+        .into_iter()
+        .find(|(name, _)| lookup_env(name).is_some())
+        .map_or("webkit-default", |(_, mode)| mode)
 }
 
 /// The mode for this process's environment.
@@ -144,10 +142,10 @@ mod tests {
 
     #[test]
     fn each_user_set_variable_wins() {
-        for var in RENDER_VARS {
+        for (var, mode) in RENDER_VARS {
+            let env = |name: &str| (name == var).then(|| OsString::from("1"));
             for nvidia in [true, false] {
-                let choice =
-                    choose_render_env(|name| (name == var).then(|| OsString::from("1")), nvidia);
+                let choice = choose_render_env(env, nvidia);
                 assert_eq!(
                     choice,
                     RenderChoice::UserSet(vec![var]),
@@ -155,6 +153,9 @@ mod tests {
                 );
                 assert_eq!(choice.var_to_set(), None);
             }
+            // Nothing was added, so the variable you set is the one that names the mode.
+            assert_eq!(describe_render_env(env), mode, "{var}");
+            assert_ne!(mode, "webkit-default", "{var}");
         }
     }
 
@@ -169,7 +170,7 @@ mod tests {
         );
         assert_eq!(
             choice.to_string(),
-            "user-set (__NV_DISABLE_EXPLICIT_SYNC, WEBKIT_SKIA_ENABLE_CPU_RENDERING)"
+            "user-set (WEBKIT_SKIA_ENABLE_CPU_RENDERING, __NV_DISABLE_EXPLICIT_SYNC)"
         );
     }
 
