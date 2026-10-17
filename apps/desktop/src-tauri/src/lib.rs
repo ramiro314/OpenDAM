@@ -4,6 +4,7 @@ pub mod db;
 pub mod models;
 pub mod preview;
 pub mod render;
+pub mod thumb_cleanup;
 pub mod watcher;
 
 use std::sync::Arc;
@@ -154,6 +155,9 @@ pub fn run(render_choice: render::RenderChoice) {
 
             // Start the background preview worker queue
             crate::preview::start_preview_worker(state.clone());
+
+            // Removes upscaled thumbnails once per library; `Database::new` already synced them
+            thumb_cleanup::spawn(state.clone(), None);
 
             // Auto-tagging runs: replays writes left pending, then serves queued items
             tauri::async_runtime::spawn(async move { autotag.start().await });
