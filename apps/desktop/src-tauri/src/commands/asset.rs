@@ -11,6 +11,9 @@ use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
 
+/// A read transaction on one library's pool.
+type LibraryTx = sqlx::Transaction<'static, sqlx::Sqlite>;
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct RawAssetRow {
     pub id: String,
@@ -176,7 +179,20 @@ async fn search_libraries(
             }
         }
     }
-    let (libs, f) = (target_libs, &filter);
+    // Each library's keys and its page rows are read in one transaction, one snapshot, so an
+    // asset the watcher deletes in between can't drop out of the page, nor a new asset that
+    // reuses its rowid take its place. Under rollback journaling, writers wait for it to end.
+    let mut txs: Vec<Option<LibraryTx>> = Vec::new();
+    for (lib, (pool, _)) in target_libs.iter().enumerate() {
+        match pool.begin().await {
+            Ok(tx) => txs.push(Some(tx)),
+            Err(e) => {
+                tracing::warn!("Left library {lib} out of a search: {e}");
+                txs.push(None);
+            }
+        }
+    }
+    let (libs, f) = (&mut txs, &filter);
     let page = match sort_column(sort_field).1 {
         SortKind::NoCase => {
             merged_page::<String>(libs, f, sort_field, is_asc, offset, limit, |a, b| {
@@ -195,8 +211,13 @@ async fn search_libraries(
         }
     };
 
+    #[cfg(test)]
+    if let Some(hook) = BETWEEN_KEYS_AND_ROWS.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
     let mut fetched: HashMap<(usize, i64), Asset> = HashMap::new();
-    for (lib, (pool, root_opt)) in target_libs.iter().enumerate() {
+    for (lib, (tx, (_, root_opt))) in txs.iter_mut().zip(target_libs).enumerate() {
+        let Some(tx) = tx else { continue };
         let rowids: Vec<i64> = page
             .iter()
             .filter(|(l, _)| *l == lib)
@@ -205,13 +226,20 @@ async fn search_libraries(
         if rowids.is_empty() {
             continue;
         }
-        match fetch_assets_by_rowid(pool, root_opt, &rowids).await {
+        match fetch_assets_by_rowid(tx, root_opt, &rowids).await {
             Ok(assets) => fetched.extend(
                 assets
                     .into_iter()
                     .map(|(rowid, asset)| ((lib, rowid), asset)),
             ),
             Err(e) => tracing::warn!("Left library {lib} out of a search page: {e}"),
+        }
+    }
+    for tx in txs.into_iter().flatten() {
+        // Ending the read transaction now releases its lock instead of leaving it on the idle
+        // connection.
+        if let Err(e) = tx.commit().await {
+            tracing::warn!("Could not end a search's read transaction: {e}");
         }
     }
     let assets = page.iter().filter_map(|key| fetched.remove(key)).collect();
@@ -225,11 +253,11 @@ async fn search_libraries(
 }
 
 /// The (library position, rowid) of each asset on the page `offset..offset + limit` of a search
-/// over `target_libs` sorted by `field`, in the order one SQLite query over all of them would
-/// return. Each library returns only the rowid and sort key of its first `offset + limit` matches,
+/// over the libraries read by `txs` sorted by `field`, in the order one SQLite query over all of
+/// them would return. Each library returns only the rowid and sort key of its first `offset + limit` matches,
 /// whose keys `cmp` compares as SQLite does. Ties break by library position, then rowid.
 async fn merged_page<K>(
-    target_libs: &[(sqlx::Pool<sqlx::Sqlite>, Option<std::path::PathBuf>)],
+    txs: &mut [Option<LibraryTx>],
     filter: &SqlFilter,
     field: &str,
     is_asc: bool,
@@ -247,12 +275,13 @@ where
         order_by(field, is_asc),
     );
     let mut keys: Vec<(usize, i64, K)> = Vec::new();
-    for (lib, (pool, _)) in target_libs.iter().enumerate() {
+    for (lib, tx) in txs.iter_mut().enumerate() {
+        let Some(tx) = tx else { continue };
         let mut query = sqlx::query_as::<_, (i64, K)>(&sql);
         for b in &filter.binds {
             query = query.bind(b.clone());
         }
-        match query.bind(offset + limit).fetch_all(pool).await {
+        match query.bind(offset + limit).fetch_all(&mut **tx).await {
             Ok(rows) => keys.extend(rows.into_iter().map(|(rowid, key)| (lib, rowid, key))),
             Err(e) => tracing::warn!("Left library {lib} out of a search: {e}"),
         }
@@ -520,6 +549,14 @@ thread_local! {
     static COUNT_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: runs once in the next multi-library search, after the keys are merged and
+    /// before the page's rows are fetched.
+    static BETWEEN_KEYS_AND_ROWS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 async fn count_assets(pool: &sqlx::Pool<sqlx::Sqlite>, filter: &SqlFilter) -> sqlx::Result<i64> {
     #[cfg(test)]
     COUNT_QUERIES.with(|c| c.set(c.get() + 1));
@@ -549,7 +586,7 @@ struct RowidAssetRow {
 
 /// The assets with `rowids`, each with its rowid, in no particular order.
 async fn fetch_assets_by_rowid(
-    pool: &sqlx::Pool<sqlx::Sqlite>,
+    tx: &mut LibraryTx,
     root: &Option<std::path::PathBuf>,
     rowids: &[i64],
 ) -> sqlx::Result<Vec<(i64, Asset)>> {
@@ -561,7 +598,7 @@ async fn fetch_assets_by_rowid(
     for rowid in rowids {
         query = query.bind(rowid);
     }
-    let rows = query.fetch_all(pool).await?;
+    let rows = query.fetch_all(&mut **tx).await?;
     Ok(rows
         .into_iter()
         .map(|r| (r.rowid, row_to_asset(root.as_deref(), r.row)))
@@ -1889,6 +1926,77 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn an_asset_deleted_between_the_key_and_row_reads_stays_on_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut libs = Vec::new();
+        for lib in ["a", "b"] {
+            let path = dir.path().join(format!("{lib}.sqlite"));
+            let pool = crate::db::connect_library_sqlite(&path).await.unwrap();
+            for name in ["x", "y"] {
+                sqlx::query(
+                    "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+                     VALUES (?, ?, ?, 'png', 'texture', 0, 0, 0)",
+                )
+                .bind(format!("{lib}-{name}"))
+                .bind(format!("{name}.png"))
+                .bind(format!("{name}.png"))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            libs.push((path, pool));
+        }
+        // A writer on its own connection, as the watcher is, that waits for no lock.
+        let delete = |path: PathBuf, id: &'static str| {
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let options = sqlx::sqlite::SqliteConnectOptions::new()
+                            .filename(&path)
+                            .busy_timeout(std::time::Duration::ZERO);
+                        let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+                        sqlx::query("DELETE FROM assets WHERE id = ?")
+                            .bind(id)
+                            .execute(&pool)
+                            .await
+                            .is_ok()
+                    })
+            })
+            .join()
+            .unwrap()
+        };
+        let deleted_mid_search = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (path_a, deleted) = (libs[0].0.clone(), deleted_mid_search.clone());
+        BETWEEN_KEYS_AND_ROWS.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || deleted.set(Some(delete(path_a, "a-y")))))
+        });
+
+        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+            "query": { "text": "", "filter": {}, "sort": { "field": "name", "order": "asc" } },
+            "page": 0,
+            "pageSize": 4,
+        }))
+        .unwrap();
+        let targets: Vec<_> = libs.iter().map(|(_, pool)| (pool.clone(), None)).collect();
+        let result = search_libraries(&payload, &targets).await.unwrap();
+
+        assert_eq!(
+            deleted_mid_search.get(),
+            Some(false),
+            "a write landed between the key and row reads"
+        );
+        let found: Vec<String> = result.assets.into_iter().map(|a| a.id).collect();
+        assert_eq!(found, ["a-x", "b-x", "a-y", "b-y"]);
+        assert!(
+            delete(libs[0].0.clone(), "a-y"),
+            "the search left its read lock held"
+        );
     }
 
     #[tokio::test]
