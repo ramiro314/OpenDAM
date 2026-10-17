@@ -121,15 +121,15 @@ async fn update_tag_in(db: &Database, id: &str, patch: TagPatch) -> Result<Tag> 
         description = new_description.trim().to_string();
     }
 
-    // Case-insensitive, like the sidebar's check when a tag is created.
-    let taken: Option<String> =
-        sqlx::query_scalar("SELECT name FROM tags WHERE lower(name) = lower(?) AND id != ?")
-            .bind(&name)
-            .bind(id)
-            .fetch_optional(&db.master_pool)
-            .await
-            .map_err(|e| e.to_string())?;
-    if let Some(taken) = taken {
+    // Case-insensitive, like the sidebar's check when a tag is created. Folded in Rust, since
+    // SQLite's lower() only folds ASCII.
+    let others: Vec<String> = sqlx::query_scalar("SELECT name FROM tags WHERE id != ?")
+        .bind(id)
+        .fetch_all(&db.master_pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let folded = name.to_lowercase();
+    if let Some(taken) = others.into_iter().find(|n| n.to_lowercase() == folded) {
         return Err(format!("A tag named \"{taken}\" already exists"));
     }
 
@@ -472,6 +472,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tag_row(&db.master_pool, "t").await.unwrap().1, "Rock");
+    }
+
+    #[tokio::test]
+    async fn update_tag_refuses_a_name_that_differs_only_by_non_ascii_case() {
+        let db = memory_database(vec![]).await;
+        insert_tag(&db.master_pool, "t", "rock").await;
+        insert_tag(&db.master_pool, "u", "écorce").await;
+
+        let collision =
+            update_tag_in(&db, "t", patch(serde_json::json!({ "name": "ÉCORCE" }))).await;
+
+        assert_eq!(
+            collision.unwrap_err(),
+            "A tag named \"écorce\" already exists"
+        );
+        assert_eq!(tag_row(&db.master_pool, "t").await.unwrap().1, "rock");
     }
 
     #[tokio::test]
