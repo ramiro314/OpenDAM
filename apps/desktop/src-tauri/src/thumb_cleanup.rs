@@ -34,19 +34,27 @@ pub(crate) enum Pass {
 /// `library:updated` once for each library it finishes.
 pub fn spawn(state: Arc<AppState>, library_id: Option<String>) {
     tauri::async_runtime::spawn(async move {
-        for lib in state.db.get_all_libraries().await {
-            if library_id.as_ref().is_some_and(|id| *id != lib.id) {
-                continue;
-            }
-            match run_pass(&lib, BATCH_SIZE, None).await {
-                Ok(Pass::Finished) => {
-                    let _ = state.app_handle.emit("library:updated", ());
-                }
-                Ok(_) => {}
-                Err(e) => tracing::error!("Thumbnail cleanup of library {} failed: {}", lib.id, e),
-            }
-        }
+        let libs = state.db.get_all_libraries().await;
+        run_libraries(&libs, library_id.as_deref(), || {
+            let _ = state.app_handle.emit("library:updated", ());
+        })
+        .await;
     });
+}
+
+/// Runs the pass over each of `libs`, or only `library_id`, in order, and calls `on_finished`
+/// once for each library whose pass finishes now: never for one already recorded.
+async fn run_libraries(libs: &[LibraryHandle], library_id: Option<&str>, on_finished: impl Fn()) {
+    for lib in libs {
+        if library_id.is_some_and(|id| id != lib.id) {
+            continue;
+        }
+        match run_pass(lib, BATCH_SIZE, None).await {
+            Ok(Pass::Finished) => on_finished(),
+            Ok(_) => {}
+            Err(e) => tracing::error!("Thumbnail cleanup of library {} failed: {}", lib.id, e),
+        }
+    }
 }
 
 /// An asset with a thumbnail: (id, file_path, lowercase extension, thumbnail_path).
@@ -196,6 +204,17 @@ mod tests {
     }
 
     async fn add_asset(pool: &Pool<Sqlite>, id: &str, file_path: &str, thumb: &str) {
+        let ext = file_path.rsplit('.').next().unwrap();
+        add_asset_with_extension(pool, id, file_path, ext, thumb).await;
+    }
+
+    async fn add_asset_with_extension(
+        pool: &Pool<Sqlite>,
+        id: &str,
+        file_path: &str,
+        ext: &str,
+        thumb: &str,
+    ) {
         sqlx::query(
             "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, thumbnail_path, preview_status)
              VALUES (?, ?, ?, ?, 'texture', 0, 0, 0, ?, 'done')",
@@ -203,7 +222,7 @@ mod tests {
         .bind(id)
         .bind(file_path)
         .bind(file_path.rsplit('/').next().unwrap())
-        .bind(file_path.rsplit('.').next().unwrap())
+        .bind(ext)
         .bind(thumb)
         .execute(pool)
         .await
@@ -404,5 +423,123 @@ mod tests {
         let (rows, _, jobs) = snapshot(&lib).await;
         assert!(rows.contains(&row("t1", Some(".opendam/thumbs/t1_thumb.png"), "done")));
         assert_eq!(jobs, vec![("t1".to_string(), "done".to_string())]);
+    }
+
+    /// The ids of assets that keep a thumbnail path, and of assets with a job, each sorted.
+    async fn kept_and_queued(lib: &LibraryHandle) -> (Vec<String>, Vec<String>) {
+        let kept = sqlx::query_scalar(
+            "SELECT id FROM assets WHERE thumbnail_path IS NOT NULL ORDER BY id",
+        )
+        .fetch_all(&lib.pool)
+        .await
+        .unwrap();
+        let queued = sqlx::query_scalar("SELECT asset_id FROM preview_jobs ORDER BY asset_id")
+            .fetch_all(&lib.pool)
+            .await
+            .unwrap();
+        (kept, queued)
+    }
+
+    fn handle(root: &Path, id: &str, pool: Pool<Sqlite>) -> LibraryHandle {
+        LibraryHandle {
+            id: id.into(),
+            name: id.into(),
+            root_path: root.to_path_buf(),
+            pool,
+        }
+    }
+
+    #[tokio::test]
+    async fn acts_only_on_sources_whose_long_side_is_512_px_or_smaller() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let thumbs = root.join(".opendam/thumbs");
+        let pool = crate::db::memory_library_pool().await;
+        // (id, extension, width, height); each has a thumbnail of another size.
+        for (id, ext, w, h) in [
+            ("png512", "png", 512, 8),
+            ("png513", "png", 8, 513),
+            ("tga512", "tga", 8, 512),
+            ("tga513", "tga", 513, 8),
+        ] {
+            write_image(&root.join(format!("tex/{id}.{ext}")), w, h);
+            write_image(&thumbs.join(format!("{id}_thumb.png")), 16, 16);
+            let thumb = format!(".opendam/thumbs/{id}_thumb.png");
+            add_asset(&pool, id, &format!("tex/{id}.{ext}"), &thumb).await;
+        }
+        let lib = handle(root, "lib", pool);
+
+        assert_eq!(run_pass(&lib, 200, None).await.unwrap(), Pass::Finished);
+
+        assert_eq!(
+            kept_and_queued(&lib).await,
+            (
+                vec!["png513".into(), "tga512".into(), "tga513".into()],
+                vec!["tga512".into()]
+            )
+        );
+        assert!(!thumbs.join("png512_thumb.png").exists());
+        assert!(thumbs.join("png513_thumb.png").exists());
+    }
+
+    #[tokio::test]
+    async fn keeps_unreadable_sources_and_any_non_raster_asset() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let thumbs = root.join(".opendam/thumbs");
+        let pool = crate::db::memory_library_pool().await;
+        // A PNG that isn't one, and a small TGA that isn't one.
+        std::fs::create_dir_all(root.join("tex")).unwrap();
+        std::fs::write(root.join("tex/bad.png"), "not a png").unwrap();
+        std::fs::write(root.join("tex/bad.tga"), "not a tga").unwrap();
+        // A model whose file decodes as a small image: only its extension keeps it out.
+        write_image(&root.join("tex/ship.png"), 32, 32);
+        for (id, file_path, ext) in [
+            ("bad", "tex/bad.png", "png"),
+            ("badtga", "tex/bad.tga", "tga"),
+            ("m1", "tex/ship.png", "glb"),
+        ] {
+            write_image(&thumbs.join(format!("{id}_thumb.png")), 64, 64);
+            let thumb = format!(".opendam/thumbs/{id}_thumb.png");
+            add_asset_with_extension(&pool, id, file_path, ext, &thumb).await;
+        }
+        let lib = handle(root, "lib", pool);
+
+        assert_eq!(run_pass(&lib, 200, None).await.unwrap(), Pass::Finished);
+
+        assert_eq!(
+            kept_and_queued(&lib).await,
+            (vec!["bad".into(), "badtga".into(), "m1".into()], vec![])
+        );
+        for id in ["bad", "badtga", "m1"] {
+            assert!(thumbs.join(format!("{id}_thumb.png")).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn signals_each_library_it_finishes_once_and_only_the_one_named() {
+        let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut a = library(a_dir.path()).await;
+        a.id = "a".into();
+        let mut b = library(b_dir.path()).await;
+        b.id = "b".into();
+        let libs = [a, b];
+        let finished = std::sync::atomic::AtomicUsize::new(0);
+        let count = || {
+            finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+        let finished_so_far = || finished.load(std::sync::atomic::Ordering::SeqCst);
+
+        run_libraries(&libs, Some("b"), count).await;
+        assert_eq!(finished_so_far(), 1);
+        assert_eq!(meta(&libs[0]).await, None);
+        assert_eq!(meta(&libs[1]).await.as_deref(), Some("done"));
+
+        // b is recorded, so only a finishes now; then neither does.
+        run_libraries(&libs, None, count).await;
+        assert_eq!(finished_so_far(), 2);
+        assert_eq!(meta(&libs[0]).await.as_deref(), Some("done"));
+        run_libraries(&libs, None, count).await;
+        assert_eq!(finished_so_far(), 2);
     }
 }
