@@ -542,11 +542,13 @@ describe('useAssetStore deleteAssets', () => {
 });
 
 describe('useAssetStore updateAssetPreview', () => {
-  const thumbnailed = { ...asset, thumbnailPath: '/lib/.opendam/thumbs/a1_thumb.png' } as Asset;
+  const thumbnailed = { ...named('a1'), thumbnailPath: '/lib/.opendam/thumbs/a1_thumb.png' };
 
   async function loadAsset() {
-    api.searchAssets = async () => ({ ...found, assets: [thumbnailed] });
+    serve(() => [thumbnailed]);
     await useAssetStore.getState().search();
+    // Focused, so it has a pinned copy too
+    useUIStore.getState().focusAsset('a1');
   }
 
   test('a null thumbnail clears the stored path', async () => {
@@ -555,9 +557,9 @@ describe('useAssetStore updateAssetPreview', () => {
     useAssetStore.getState().updateAssetPreview('a1', null);
 
     const s = useAssetStore.getState();
-    expect(s.assetMap.get('a1')?.thumbnailPath).toBeUndefined();
-    expect(s.assets[0].thumbnailPath).toBeUndefined();
-    expect(s.assets[0].previewStatus).toBe('done');
+    expect(s.pinned.get('a1')?.thumbnailPath).toBeUndefined();
+    expect(s.assetAt(0)?.thumbnailPath).toBeUndefined();
+    expect(s.assetAt(0)?.previewStatus).toBe('done');
   });
 
   test('a new thumbnail replaces the stored path', async () => {
@@ -565,7 +567,7 @@ describe('useAssetStore updateAssetPreview', () => {
 
     useAssetStore.getState().updateAssetPreview('a1', '/lib/.opendam/thumbs/a1_thumb.jpg');
 
-    expect(useAssetStore.getState().assets[0].thumbnailPath).toBe(
+    expect(useAssetStore.getState().assetAt(0)?.thumbnailPath).toBe(
       '/lib/.opendam/thumbs/a1_thumb.jpg'
     );
   });
