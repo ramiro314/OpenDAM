@@ -31,7 +31,8 @@ function statusClass(status: RunSummary['status']) {
 type Act = (action: () => Promise<unknown>) => void;
 
 function RunRow({ run, act }: { run: RunSummary; act: Act }) {
-  const actions = runActions(run.status);
+  const actions = runActions(run);
+  const openReview = useAutotagStore((s) => s.openReview);
   const button = clsx(dialog.btn, dialog.secondaryBtn, styles.runBtn);
   const processed = run.done + run.failed;
   const percent = run.total > 0 ? (processed / run.total) * 100 : 0;
@@ -57,8 +58,17 @@ function RunRow({ run, act }: { run: RunSummary; act: Act }) {
         {runProgress(run)}
         {usage && ` · ${usage}`}
       </span>
-      {(actions.pause || actions.resume || actions.cancel) && (
+      {(actions.pause || actions.resume || actions.cancel || actions.review) && (
         <div className={styles.runActions}>
+          {actions.review && (
+            <button
+              className={clsx(dialog.btn, dialog.primaryBtn, styles.runBtn)}
+              onClick={() => openReview(run.id)}
+              title="Accept, rename or reject the new tags this run proposed"
+            >
+              Review ({run.pendingProposals.toLocaleString()})
+            </button>
+          )}
           {actions.pause && (
             <button className={button} onClick={() => act(() => api.pauseAutotagRun(run.id))}>
               Pause

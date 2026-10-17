@@ -1399,6 +1399,7 @@ exit 1
             db.clone(),
             vec![anthropic as Arc<dyn TagProvider>],
             Arc::new(|_| {}),
+            Arc::new(|_| {}),
             vec![Duration::from_millis(1); 3],
         );
         engine.start().await;

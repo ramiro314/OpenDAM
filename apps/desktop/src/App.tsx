@@ -9,6 +9,7 @@ import { QuickLookModal } from './components/QuickLook/QuickLookModal';
 import { ConfirmDeleteDialog } from './components/ConfirmDeleteDialog';
 import { RunsPanel } from './components/Autotag/RunsPanel';
 import { AutotagDialog } from './components/Autotag/AutotagDialog';
+import { ReviewModal } from './components/Autotag/ReviewModal';
 import { IconCheck } from './components/Icons';
 import { useUIStore } from './store';
 import {
@@ -44,6 +45,7 @@ export default function App() {
   const runsPanelOpen = useAutotagStore((s) => s.runsPanelOpen);
   const autotagTarget = useAutotagStore((s) => s.dialogTarget);
   const openAutotagDialog = useAutotagStore((s) => s.openAutotagDialog);
+  const reviewRunId = useAutotagStore((s) => s.reviewRunId);
   const assetsToDelete = useUIStore((s) => s.assetsToDelete);
   const requestDelete = useUIStore((s) => s.requestDelete);
 
@@ -260,6 +262,7 @@ export default function App() {
       {/* Spacebar Quick Look Modal */}
       <QuickLookModal asset={focusedAsset} isOpen={quickLookOpen} />
       {runsPanelOpen && <RunsPanel />}
+      {reviewRunId && <ReviewModal key={reviewRunId} runId={reviewRunId} />}
       {autotagTarget && (
         <AutotagDialog target={autotagTarget} onClose={() => openAutotagDialog(null)} />
       )}

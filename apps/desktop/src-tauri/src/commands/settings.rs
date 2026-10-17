@@ -194,6 +194,7 @@ mod tests {
             db.clone(),
             vec![anthropic.clone()],
             Arc::new(move |update| recorded.lock().unwrap().push(json!(update))),
+            Arc::new(|_| {}),
         );
         engine.start().await;
         payloads.push(json!(engine

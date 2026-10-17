@@ -222,7 +222,7 @@ mod tests {
     use crate::db::{connect_library_sqlite, insert_asset, insert_tag, memory_database};
 
     fn engine_over(db: &Arc<Database>) -> Arc<Engine> {
-        Engine::new(db.clone(), Vec::new(), Arc::new(|_| {}))
+        Engine::new(db.clone(), Vec::new(), Arc::new(|_| {}), Arc::new(|_| {}))
     }
 
     async fn library_rows(db: &Database) -> Vec<(String, String)> {

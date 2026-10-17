@@ -293,6 +293,8 @@ export interface RunSummary {
   pauseReason: string | null;
   /** What the provider last reported without pausing, such as Claude plan usage */
   notice: string | null;
+  /** Started by "Suggest tags" on one asset */
+  inline: boolean;
   total: number;
   done: number;
   failed: number;
@@ -300,6 +302,8 @@ export interface RunSummary {
   skipped: number;
   running: number;
   queued: number;
+  /** New tag names waiting for review */
+  pendingProposals: number;
   inputTokens: number;
   outputTokens: number;
   costUsd: number;
@@ -331,3 +335,33 @@ export interface AutotagUpdate {
   /** Assets whose tags changed since the last event */
   changedAssetIds: string[];
 }
+
+/** An asset a proposed tag is for, as the review shows it */
+export interface ReviewAsset {
+  assetId: string;
+  /** null when its library is offline or the asset is gone */
+  fileName: string | null;
+  thumbnailPath: string | null;
+  included: boolean;
+}
+
+/** A new tag name a Prefer existing run collected, waiting for review */
+export interface ReviewProposal {
+  id: string;
+  name: string;
+  /** The catalog tag the model suggested as its parent */
+  parentId: string | null;
+  assets: ReviewAsset[];
+}
+
+/** What the review decided for one proposal; `assetIds` are the ticked assets */
+export type ProposalDecision =
+  | {
+      action: 'accept';
+      proposalId: string;
+      name: string;
+      parentId: string | null;
+      assetIds: string[];
+    }
+  | { action: 'map'; proposalId: string; tagId: string; assetIds: string[] }
+  | { action: 'reject'; proposalId: string };

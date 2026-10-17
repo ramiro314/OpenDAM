@@ -451,12 +451,16 @@ interface AutotagStore {
   runsPanelOpen: boolean;
   /** What the open run dialog would tag, or null when it is closed */
   dialogTarget: AutotagTarget | null;
+  /** The run whose review modal is open */
+  reviewRunId: string | null;
   fetchRuns: () => Promise<void>;
   fetchProviders: () => Promise<void>;
   /** Takes an `autotag:updated` event: the runs, and re-fetches the loaded assets that changed */
   applyUpdate: (update: AutotagUpdate) => void;
   setRunsPanelOpen: (open: boolean) => void;
   openAutotagDialog: (target: AutotagTarget | null) => void;
+  /** Opens a run's review in place of the Runs panel, or closes it with null */
+  openReview: (runId: string | null) => void;
 }
 
 export const useAutotagStore = create<AutotagStore>()((set) => ({
@@ -464,6 +468,7 @@ export const useAutotagStore = create<AutotagStore>()((set) => ({
   providers: null,
   runsPanelOpen: false,
   dialogTarget: null,
+  reviewRunId: null,
 
   fetchRuns: async () => {
     set({ runs: await api.listAutotagRuns() });
@@ -480,6 +485,8 @@ export const useAutotagStore = create<AutotagStore>()((set) => ({
 
   setRunsPanelOpen: (runsPanelOpen) => set({ runsPanelOpen }),
   openAutotagDialog: (dialogTarget) => set({ dialogTarget }),
+  openReview: (reviewRunId) =>
+    set(reviewRunId ? { reviewRunId, runsPanelOpen: false } : { reviewRunId }),
 }));
 
 // ── Tag Store ─────────────────────────────────────────────────────────────
