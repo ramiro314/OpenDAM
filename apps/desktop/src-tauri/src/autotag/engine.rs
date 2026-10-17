@@ -2,12 +2,13 @@
 //! provider's running runs, each item is written through the write protocol, and progress goes
 //! to the UI as throttled `autotag:updated` events. Runs can be paused, resumed and cancelled,
 //! and provider failures are retried, pause the run or fail the item by their class. A Prefer
-//! existing run collects new tag names and ends waiting for one review.
+//! existing run collects new tag names and ends waiting for one review; a Create freely run
+//! creates them, one tag per name however many items propose it at once.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -15,7 +16,7 @@ use tokio::sync::Notify;
 use super::provider::{AssetInfo, ErrorClass, Mode, TagProvider, TagRequest, TagResult, Thumbnail};
 use super::review::{self, ProposalDecision, ReviewProposal};
 use super::settings::{self, AiSettings};
-use super::store::{self, Item, NewRun, PendingPair, RunSummary};
+use super::store::{self, Item, NewNames, NewRun, PendingPair, RunSummary};
 use super::vocabulary::Vocabulary;
 use crate::db::{resolve_path, Database};
 
@@ -40,6 +41,8 @@ pub struct AutotagUpdate {
     pub runs: Vec<RunSummary>,
     /// Assets whose tags changed since the last event.
     pub changed_asset_ids: Vec<String>,
+    /// A run created tags since the last event, so the tag catalog changed.
+    pub tags_changed: bool,
 }
 
 pub type EventSink = Arc<dyn Fn(AutotagUpdate) + Send + Sync>;
@@ -147,6 +150,7 @@ pub struct Engine {
     db: Arc<Database>,
     pools: Vec<ProviderPool>,
     changed_assets: Mutex<HashSet<String>>,
+    tags_changed: AtomicBool,
     events_wake: Notify,
     sink: EventSink,
     notifier: Notifier,
@@ -156,10 +160,14 @@ pub struct Engine {
     run_stopped: Notify,
     /// Test-only fault: the library write of every item fails, as a NAS lock timeout would.
     #[cfg(test)]
-    fail_library_writes: std::sync::atomic::AtomicBool,
+    fail_library_writes: AtomicBool,
+    /// Test-only fault: step 2 never mirrors a created tag, as when the creating item's mirror
+    /// to a slow share hasn't reached a library yet.
+    #[cfg(test)]
+    skip_mirroring: AtomicBool,
     /// Test-only fault: `resume` can't run its finish check, as with a locked master DB.
     #[cfg(test)]
-    fail_finishing: std::sync::atomic::AtomicBool,
+    fail_finishing: AtomicBool,
 }
 
 impl Engine {
@@ -191,6 +199,7 @@ impl Engine {
             db,
             pools,
             changed_assets: Mutex::new(HashSet::new()),
+            tags_changed: AtomicBool::new(false),
             events_wake: Notify::new(),
             sink,
             notifier,
@@ -198,6 +207,8 @@ impl Engine {
             run_stopped: Notify::new(),
             #[cfg(test)]
             fail_library_writes: Default::default(),
+            #[cfg(test)]
+            skip_mirroring: Default::default(),
             #[cfg(test)]
             fail_finishing: Default::default(),
         })
@@ -465,9 +476,6 @@ impl Engine {
         if !pool.provider.modes().contains(&mode) {
             return Err(format!("{label} can't do {}", mode.as_str()));
         }
-        if mode == Mode::CreateFreely {
-            return Err("Create freely runs aren't available yet".into());
-        }
 
         let (items, requested, run_label) = match scope {
             RunScope::Assets { asset_ids } => {
@@ -732,7 +740,7 @@ impl Engine {
             }
             None => None,
         };
-        let vocabulary = Arc::new(
+        let catalog = Arc::new(
             Vocabulary::load(&self.db.master_pool)
                 .await
                 .map_err(|e| e.to_string())?,
@@ -740,12 +748,26 @@ impl Engine {
         let max_tags = item.options["maxTags"].as_u64().unwrap_or(8) as usize;
         let mode: Mode = serde_json::from_value(serde_json::Value::String(item.mode.clone()))
             .map_err(|_| format!("Unknown mode {}", item.mode))?;
-        let run_proposals = if mode == Mode::PreferExisting {
-            store::pending_proposals(&self.db.master_pool, &item.run_id)
-                .await
-                .map_err(|e| e.to_string())?
-        } else {
-            Vec::new()
+        // The run's own vocabulary (D26) goes beside the catalog rather than in it, so the
+        // catalog part of the request stays the same all run long and its cache holds (D24).
+        let (vocabulary, run_proposals) = match mode {
+            Mode::ExistingOnly => (catalog.clone(), Vec::new()),
+            Mode::PreferExisting => (
+                catalog.clone(),
+                store::pending_proposals(&self.db.master_pool, &item.run_id)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            ),
+            Mode::CreateFreely => {
+                let created = store::created_tags(&self.db.master_pool, &item.run_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let ids: HashSet<String> = created.iter().map(|(id, _)| id.clone()).collect();
+                (
+                    Arc::new(catalog.without(&ids)),
+                    created.into_iter().map(|(_, tag)| tag).collect(),
+                )
+            }
         };
         let request = TagRequest {
             run_id: item.run_id.clone(),
@@ -767,11 +789,13 @@ impl Engine {
         };
 
         let result = self.call_provider(provider, &request, item).await?;
-        let accepted = vocabulary.accepted_tags(&result, max_tags);
-        let proposals = if mode == Mode::PreferExisting {
-            vocabulary.new_proposals(&result, request.max_proposals as usize)
-        } else {
+        let accepted = catalog.accepted_tags(&result, max_tags);
+        // A name the run created stays among the new names, so step 1 records the asset on
+        // the run's tag as well as applying it.
+        let proposals = if mode == Mode::ExistingOnly {
             Vec::new()
+        } else {
+            vocabulary.new_proposals(&result, request.max_proposals as usize)
         };
 
         // Step 1: record every pair the library lacks before the library sees it.
@@ -783,22 +807,40 @@ impl Engine {
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .collect();
-        let new_tags: Vec<String> = accepted
-            .iter()
-            .filter(|id| !present.contains(*id))
-            .cloned()
-            .collect();
         let summary = serde_json::json!({ "tags": accepted, "proposed": proposals });
-        store::record_intent(
+        let names = if mode == Mode::CreateFreely {
+            NewNames::Create(&proposals)
+        } else {
+            NewNames::Propose(&proposals)
+        };
+        let created = store::record_intent(
             &self.db.master_pool,
             item,
-            &new_tags,
-            &proposals,
+            &accepted,
+            &present,
+            names,
             &summary,
             &result.usage,
         )
         .await
         .map_err(|e| e.to_string())?;
+
+        // Step 2. An item that resolves a name to this tag before the mirror reaches its library
+        // is fine: step 3 writes the tag's definition into that library with the pair.
+        if !created.is_empty() {
+            let open = self.db.get_all_libraries().await;
+            #[cfg(test)]
+            let open = if self.skip_mirroring.load(Ordering::SeqCst) {
+                Vec::new()
+            } else {
+                open
+            };
+            for tag_id in &created {
+                store::mirror_tag(&self.db, &open, tag_id).await;
+            }
+            self.tags_changed.store(true, Ordering::SeqCst);
+            self.events_wake.notify_one();
+        }
 
         // Steps 3 and 4. A failure leaves the rows pending for replay; the item stays done.
         let write = async {
@@ -909,10 +951,12 @@ impl Engine {
         loop {
             self.events_wake.notified().await;
             let changed: Vec<String> = self.changed_assets.lock().unwrap().drain().collect();
+            let tags_changed = self.tags_changed.swap(false, Ordering::SeqCst);
             match self.list_runs().await {
                 Ok(runs) => (self.sink)(AutotagUpdate {
                     runs,
                     changed_asset_ids: changed,
+                    tags_changed,
                 }),
                 Err(e) => tracing::error!("Could not list auto-tag runs: {e}"),
             }
@@ -970,8 +1014,10 @@ fn load_thumbnail(path: &Path) -> Option<Thumbnail> {
 mod tests {
     use super::*;
     use crate::autotag::provider::{ProposedTag, ProviderError, TagFuture};
+    use crate::autotag::vocabulary::normalize_name;
     use crate::db::{
         insert_asset, insert_tag, memory_database, memory_library, memory_library_pool,
+        memory_library_pool_enforcing_foreign_keys,
     };
     use sqlx::{Pool, Sqlite};
     use std::collections::VecDeque;
@@ -987,6 +1033,8 @@ mod tests {
         proposed: std::collections::HashMap<String, Vec<ProposedTag>>,
         /// The run's earlier proposals each call was given, in call order.
         run_proposals_seen: Mutex<Vec<Vec<String>>>,
+        /// The catalog paths each call was given, in call order.
+        vocabularies_seen: Mutex<Vec<Vec<String>>>,
         failures: Mutex<VecDeque<ProviderError>>,
         hang: bool,
         delay: Duration,
@@ -1026,6 +1074,14 @@ mod tests {
                         .run_proposals
                         .iter()
                         .map(|p| p.name.clone())
+                        .collect(),
+                );
+                self.vocabularies_seen.lock().unwrap().push(
+                    request
+                        .vocabulary
+                        .tags
+                        .iter()
+                        .map(|t| t.path.clone())
                         .collect(),
                 );
                 let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1275,20 +1331,6 @@ mod tests {
         assert_eq!(error, "Set up Recording in Settings");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(s.provider.calls.lock().unwrap().is_empty());
-        assert!(s.engine.list_runs().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn modes_not_built_yet_are_refused() {
-        let s = setup(Recording::default(), &["a1"]).await;
-
-        let error = s
-            .engine
-            .start_run(scope(&["a1"]), "recording", Mode::CreateFreely)
-            .await
-            .unwrap_err();
-
-        assert!(error.contains("Create freely"), "{error}");
         assert!(s.engine.list_runs().await.unwrap().is_empty());
     }
 
@@ -1556,6 +1598,198 @@ mod tests {
             ("done", 0)
         );
         assert_eq!(notices.lock().unwrap().len(), 1, "still one notification");
+    }
+
+    struct MossRun {
+        db: Arc<Database>,
+        _dir: tempfile::TempDir,
+        provider: Arc<Recording>,
+        updates: Arc<Mutex<Vec<AutotagUpdate>>>,
+        runs: Vec<RunSummary>,
+    }
+
+    /// A Create freely run at concurrency 4 over eight assets, four in library `a` and four in
+    /// `b`, each proposing Moss under Nature, spelled four ways. Library `c` holds none of them.
+    /// The master is a file with several connections, as in the app, so items really write at
+    /// once. With `skip_mirroring`, step 2 never runs.
+    async fn moss_run(
+        a: &Pool<Sqlite>,
+        b: &Pool<Sqlite>,
+        c: &Pool<Sqlite>,
+        skip_mirroring: bool,
+    ) -> MossRun {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(dir.path().join("master.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let assets: Vec<String> = (0..8).map(|i| format!("m{i}")).collect();
+        for (i, id) in assets.iter().enumerate() {
+            insert_asset(if i % 2 == 0 { a } else { b }, id).await;
+        }
+        for (id, pool) in [("a-lib", a), ("b-lib", b), ("c-lib", c)] {
+            let lib = memory_library(id, pool.clone());
+            db.libraries.write().await.insert(lib.id.clone(), lib);
+        }
+        let db = Arc::new(db);
+        let master = &db.master_pool;
+        insert_tag(master, "t-nature", "Nature").await;
+        settings::update(master, serde_json::json!({"anthropic": {"concurrency": 4}}))
+            .await
+            .unwrap();
+        // Every asset proposes Moss under Nature, spelled four ways.
+        let proposed = assets
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let moss = ["Moss", "moss", " MOSS ", "mOSS"][i % 4];
+                (format!("{id}.glb"), vec![proposal(moss, Some("t-nature"))])
+            })
+            .collect();
+        let (engine, provider, updates, _) = engine_on(
+            db.clone(),
+            Recording {
+                proposed,
+                delay: Duration::from_millis(30),
+                ..Default::default()
+            },
+        );
+        engine
+            .skip_mirroring
+            .store(skip_mirroring, Ordering::SeqCst);
+        engine.start().await;
+
+        engine
+            .start_run(
+                RunScope::Assets { asset_ids: assets },
+                "recording",
+                Mode::CreateFreely,
+            )
+            .await
+            .unwrap();
+        let runs = wait_until_done(&engine).await;
+        // An item is done at step 1, so the run can be done while one is still writing.
+        while engine.pools[0].in_flight.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        MossRun {
+            db,
+            _dir: dir,
+            provider,
+            updates,
+            runs,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_freely_under_parallel_items_creates_a_tag_once_and_mirrors_it_everywhere() {
+        let (a, b, c) = (
+            memory_library_pool().await,
+            memory_library_pool().await,
+            memory_library_pool().await,
+        );
+        let MossRun {
+            db,
+            _dir,
+            provider,
+            updates,
+            runs,
+        } = moss_run(&a, &b, &c, false).await;
+        let master = &db.master_pool;
+
+        assert_eq!(
+            (runs[0].done, runs[0].failed, runs[0].pending_proposals),
+            (8, 0, 0),
+            "applied without asking"
+        );
+        assert_eq!(provider.max_in_flight.load(Ordering::SeqCst), 4);
+        let moss = "SELECT id, lower(name), parent_id FROM tags WHERE lower(name) = 'moss'";
+        let created: Vec<(String, String, Option<String>)> =
+            sqlx::query_as(moss).fetch_all(master).await.unwrap();
+        assert_eq!(created.len(), 1, "one tag for the name: {created:?}");
+        let (tag_id, _, parent) = created[0].clone();
+        assert_eq!(
+            parent.as_deref(),
+            Some("t-nature"),
+            "under the suggested parent"
+        );
+        for pool in [&a, &b, &c] {
+            let mirrored: Vec<(String, String, Option<String>)> =
+                sqlx::query_as(moss).fetch_all(pool).await.unwrap();
+            assert_eq!(mirrored, created, "mirrored to every open library");
+        }
+        let tagged = format!("SELECT COUNT(*) FROM asset_tags WHERE tag_id = '{tag_id}'");
+        assert_eq!(count(&a, &tagged).await + count(&b, &tagged).await, 8);
+        let owned: Vec<(String, String, bool, i64)> = sqlx::query_as(
+            "SELECT status, final_tag_id, created_tag,
+                    (SELECT COUNT(*) FROM tag_run_proposal_assets WHERE proposal_id = p.id)
+             FROM tag_run_proposals p",
+        )
+        .fetch_all(master)
+        .await
+        .unwrap();
+        assert_eq!(
+            owned,
+            [("accepted".into(), tag_id.clone(), true, 8)],
+            "the run owns the tag"
+        );
+        assert_eq!(
+            count(
+                master,
+                "SELECT COUNT(*) FROM tag_run_applied WHERE state = 'applied'"
+            )
+            .await,
+            8,
+            "every pair is recorded for undo"
+        );
+        // Calls 5 to 8 start once an earlier item is written: they get the created tag as the
+        // run's vocabulary, while the catalog part never changes.
+        let seen = provider.run_proposals_seen.lock().unwrap().clone();
+        assert!(seen[..4].iter().all(Vec::is_empty), "{seen:?}");
+        assert!(
+            seen[4..]
+                .iter()
+                .all(|names| names.len() == 1 && normalize_name(&names[0]) == "moss"),
+            "{seen:?}"
+        );
+        let catalogs = provider.vocabularies_seen.lock().unwrap().clone();
+        assert!(catalogs.iter().all(|c| c == &["Nature"]), "{catalogs:?}");
+        tokio::time::sleep(EVENT_INTERVAL * 2).await;
+        assert!(
+            updates.lock().unwrap().iter().any(|u| u.tags_changed),
+            "the UI hears the catalog changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_item_applies_a_tag_another_item_created_before_its_mirror_reaches_the_library() {
+        let (a, b, c) = (
+            memory_library_pool_enforcing_foreign_keys().await,
+            memory_library_pool_enforcing_foreign_keys().await,
+            memory_library_pool_enforcing_foreign_keys().await,
+        );
+        let run = moss_run(&a, &b, &c, true).await;
+        let master = &run.db.master_pool;
+
+        assert_eq!((run.runs[0].done, run.runs[0].failed), (8, 0));
+        assert_eq!(
+            count(
+                master,
+                "SELECT COUNT(*) FROM tag_run_applied WHERE state = 'pending'"
+            )
+            .await,
+            0,
+            "no pair waits for replay"
+        );
+        let tagged = "SELECT COUNT(*) FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+                      WHERE lower(t.name) = 'moss'";
+        assert_eq!(count(&a, tagged).await, 4);
+        assert_eq!(count(&b, tagged).await, 4);
+        let moss = "SELECT COUNT(*) FROM tags WHERE lower(name) = 'moss'";
+        assert_eq!(
+            count(&c, moss).await,
+            0,
+            "step 2 never ran: only the pairs' own writes carried the tag"
+        );
     }
 
     async fn items_of(engine: &Engine, run_id: &str) -> Vec<(String, String)> {
@@ -2860,7 +3094,7 @@ mod tests {
         );
         let refused = s
             .engine
-            .start_run(scope(&["a1"]), "recording", Mode::CreateFreely)
+            .start_run(scope(&["ghost"]), "recording", Mode::CreateFreely)
             .await;
         assert!(refused.is_err());
         assert_eq!(

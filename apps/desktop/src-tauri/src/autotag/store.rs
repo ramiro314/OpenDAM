@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::provider::ProposedTag;
 use super::vocabulary::normalize_name;
-use crate::db::{upsert_tag, Database, LibraryHandle};
+use crate::db::{create_master_tag, upsert_tag, Database, LibraryHandle};
 
 /// Rows per transaction, the repository's batch size.
 pub const BATCH: usize = 200;
@@ -522,43 +522,73 @@ pub async fn pending_proposals(
         .collect())
 }
 
-/// Write protocol step 1, in one master transaction: a `pending` row for every pair the
-/// library lacks, the item's new tag names merged into the run's proposals by normalized name,
-/// then the item `done` with its result, and the run's usage.
+/// The tags this Create freely run created, as later assets see them (D26): their current
+/// names and parents, oldest first, with their ids.
+pub async fn created_tags(
+    master: &Pool<Sqlite>,
+    run_id: &str,
+) -> sqlx::Result<Vec<(String, ProposedTag)>> {
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT t.id, t.name, t.parent_id
+         FROM tag_run_proposals p JOIN tags t ON t.id = p.final_tag_id
+         WHERE p.run_id = ? AND p.created_tag = 1 ORDER BY p.rowid",
+    )
+    .bind(run_id)
+    .fetch_all(master)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, parent_id)| (id, ProposedTag { name, parent_id }))
+        .collect())
+}
+
+/// What an item does with the new tag names in its result.
+#[derive(Debug, Clone, Copy)]
+pub enum NewNames<'a> {
+    /// Prefer existing: merged into the run's proposals, for review.
+    Propose(&'a [ProposedTag]),
+    /// Create freely: each becomes a tag, recorded as the run's, and is applied.
+    Create(&'a [ProposedTag]),
+}
+
+/// Write protocol step 1, in one master transaction: the item's new tag names merged into the
+/// run's proposals by normalized name, or created as tags (`NewNames`), then a `pending` row
+/// for every pair of `tag_ids` and created tags the library lacks (`present` holds the asset's
+/// tags), then the item `done` with its result, and the run's usage. Returns the tags it
+/// created.
+///
+/// The transaction takes the write lock before it reads the catalog, so no other creator (an
+/// item, a review, you) can add the same name between the read and the insert, and items
+/// proposing a name at once create it once.
 pub async fn record_intent(
     master: &Pool<Sqlite>,
     item: &Item,
-    new_tag_ids: &[String],
-    proposals: &[ProposedTag],
+    tag_ids: &[String],
+    present: &HashSet<String>,
+    names: NewNames<'_>,
     result: &serde_json::Value,
     usage: &super::provider::Usage,
-) -> sqlx::Result<()> {
-    let mut tx = master.begin().await?;
-    for proposal in proposals {
-        // The first spelling stays, and the first parent suggested.
-        let proposal_id: String = sqlx::query_scalar(
-            "INSERT INTO tag_run_proposals (id, run_id, name, normalized_name, parent_id)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT (run_id, normalized_name)
-             DO UPDATE SET parent_id = COALESCE(tag_run_proposals.parent_id, excluded.parent_id)
-             RETURNING id",
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(&item.run_id)
-        .bind(&proposal.name)
-        .bind(normalize_name(&proposal.name))
-        .bind(&proposal.parent_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO tag_run_proposal_assets (proposal_id, asset_id) VALUES (?, ?)",
-        )
-        .bind(&proposal_id)
-        .bind(&item.asset_id)
-        .execute(&mut *tx)
-        .await?;
+) -> sqlx::Result<Vec<String>> {
+    // Taking the write lock up front: a deferred transaction that reads the catalog first
+    // would hold a read lock, and SQLite fails it at once rather than wait when another
+    // connection is already writing.
+    let mut tx = master.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tag_ids = tag_ids.to_vec();
+    let mut created = Vec::new();
+    match names {
+        NewNames::Propose(proposals) => propose(&mut tx, item, proposals).await?,
+        NewNames::Create(proposals) => {
+            for (tag_id, new) in create(&mut tx, item, proposals).await? {
+                if new {
+                    created.push(tag_id.clone());
+                }
+                tag_ids.push(tag_id);
+            }
+        }
     }
-    let pairs: Vec<PendingPair> = new_tag_ids
+    let mut seen = HashSet::new();
+    tag_ids.retain(|id| !present.contains(id) && seen.insert(id.clone()));
+    let pairs: Vec<PendingPair> = tag_ids
         .iter()
         .map(|tag_id| PendingPair {
             run_id: item.run_id.clone(),
@@ -589,7 +619,155 @@ pub async fn record_intent(
     .bind(&item.run_id)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await
+    tx.commit().await?;
+    Ok(created)
+}
+
+/// Merges the item's new tag names into the run's proposals, for review.
+async fn propose(
+    tx: &mut sqlx::SqliteConnection,
+    item: &Item,
+    proposals: &[ProposedTag],
+) -> sqlx::Result<()> {
+    for proposal in proposals {
+        // The first spelling stays, and the first parent suggested.
+        let proposal_id: String = sqlx::query_scalar(
+            "INSERT INTO tag_run_proposals (id, run_id, name, normalized_name, parent_id)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (run_id, normalized_name)
+             DO UPDATE SET parent_id = COALESCE(tag_run_proposals.parent_id, excluded.parent_id)
+             RETURNING id",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&item.run_id)
+        .bind(&proposal.name)
+        .bind(normalize_name(&proposal.name))
+        .bind(&proposal.parent_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        add_proposal_asset(tx, &proposal_id, &item.asset_id).await?;
+    }
+    Ok(())
+}
+
+async fn add_proposal_asset(
+    tx: &mut sqlx::SqliteConnection,
+    proposal_id: &str,
+    asset_id: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO tag_run_proposal_assets (proposal_id, asset_id) VALUES (?, ?)",
+    )
+    .bind(proposal_id)
+    .bind(asset_id)
+    .execute(&mut *tx)
+    .await
+    .map(|_| ())
+}
+
+/// Resolves each of the item's new tag names to a tag, creating the ones the catalog lacks, in
+/// the caller's transaction. A created tag goes into master `tags` together with its proposal
+/// row (`accepted`, `created_tag = 1`), so the run always owns it. Returns each name's tag, and
+/// whether this call created it.
+///
+/// A name the catalog has by now (another item of the run created it, or you did) is that
+/// tag. A name the run created before but which was renamed since is still the run's tag.
+async fn create(
+    tx: &mut sqlx::SqliteConnection,
+    item: &Item,
+    proposals: &[ProposedTag],
+) -> sqlx::Result<Vec<(String, bool)>> {
+    let catalog: Vec<(String, String)> = sqlx::query_as("SELECT id, name FROM tags")
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut ids: HashSet<String> = catalog.iter().map(|(id, _)| id.clone()).collect();
+    let mut by_name: std::collections::HashMap<String, String> = catalog
+        .into_iter()
+        .map(|(id, name)| (normalize_name(&name), id))
+        .collect();
+    let mut resolved = Vec::new();
+    for proposal in proposals {
+        let normalized = normalize_name(&proposal.name);
+        let earlier: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, final_tag_id FROM tag_run_proposals
+             WHERE run_id = ? AND normalized_name = ?",
+        )
+        .bind(&item.run_id)
+        .bind(&normalized)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (mut proposal_id, earlier_tag) = earlier.unzip();
+        let known = by_name
+            .get(&normalized)
+            .cloned()
+            .or_else(|| earlier_tag.flatten().filter(|id| ids.contains(id)));
+        let (tag_id, new) = match known {
+            Some(tag_id) => (tag_id, false),
+            None => {
+                let tag_id = uuid::Uuid::new_v4().to_string();
+                let parent_id = proposal.parent_id.clone().filter(|p| ids.contains(p));
+                create_master_tag(tx, &tag_id, &proposal.name, parent_id.as_deref()).await?;
+                // A row left from a tag of the run that was deleted since now owns this one.
+                proposal_id = Some(
+                    sqlx::query_scalar(
+                        "INSERT INTO tag_run_proposals
+                             (id, run_id, name, normalized_name, parent_id, status, final_tag_id,
+                              created_tag)
+                         VALUES (?, ?, ?, ?, ?, 'accepted', ?, 1)
+                         ON CONFLICT (run_id, normalized_name)
+                         DO UPDATE SET name = excluded.name, parent_id = excluded.parent_id,
+                                       status = 'accepted', final_tag_id = excluded.final_tag_id,
+                                       created_tag = 1
+                         RETURNING id",
+                    )
+                    .bind(uuid::Uuid::new_v4().to_string())
+                    .bind(&item.run_id)
+                    .bind(&proposal.name)
+                    .bind(&normalized)
+                    .bind(&parent_id)
+                    .bind(&tag_id)
+                    .fetch_one(&mut *tx)
+                    .await?,
+                );
+                ids.insert(tag_id.clone());
+                by_name.insert(normalized, tag_id.clone());
+                (tag_id, true)
+            }
+        };
+        if let Some(proposal_id) = proposal_id {
+            add_proposal_asset(tx, &proposal_id, &item.asset_id).await?;
+        }
+        resolved.push((tag_id, new));
+    }
+    Ok(resolved)
+}
+
+/// Write protocol step 2: a created tag, with its ancestors, into every open library's mirror.
+/// Idempotent, and `sync_open_libraries` repairs a mirror that misses it at the next open.
+pub async fn mirror_tag<'a>(
+    db: &Database,
+    libraries: impl IntoIterator<Item = &'a LibraryHandle>,
+    tag_id: &str,
+) {
+    let chain = match db.tag_with_ancestors(tag_id).await {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::warn!("Could not read created tag {tag_id} to mirror it: {e}");
+            return;
+        }
+    };
+    for lib in libraries {
+        let mirror = async {
+            let mut tx = lib.pool.begin().await?;
+            for definition in &chain {
+                upsert_tag(&mut *tx, definition).await?;
+            }
+            tx.commit().await
+        };
+        if let Err(e) = mirror.await {
+            tracing::warn!("Failed to mirror tag {tag_id} to library {}: {e}", lib.id);
+        }
+    }
 }
 
 /// Write protocol step 1's record of the pairs about to be written, inside the caller's master
@@ -1167,5 +1345,94 @@ mod tests {
             "the item path deletes a1's row, so undo never removes a tag it didn't add"
         );
         assert_eq!(asset_tags(&lib_pool).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_create_freely_name_keeps_the_run_tag_it_was_renamed_to_and_recreates_a_deleted_one()
+    {
+        let db = memory_database(vec![]).await;
+        let master = &db.master_pool;
+        insert_run(&db, "r", "running").await;
+        /// One Create freely item over `asset` that proposes "Moss". Returns the tags it created.
+        async fn intent(master: &Pool<Sqlite>, asset: &str) -> Vec<String> {
+            sqlx::query(
+                "INSERT INTO tag_run_items (run_id, asset_id, library_id) VALUES ('r', ?, 'lib')",
+            )
+            .bind(asset)
+            .execute(master)
+            .await
+            .unwrap();
+            let item = Item {
+                run_id: "r".into(),
+                asset_id: asset.into(),
+                library_id: "lib".into(),
+                mode: "create_freely".into(),
+                model: None,
+                options: serde_json::json!({}),
+            };
+            let moss = [ProposedTag {
+                name: "Moss".into(),
+                parent_id: None,
+            }];
+            record_intent(
+                master,
+                &item,
+                &[],
+                &HashSet::new(),
+                NewNames::Create(&moss),
+                &serde_json::json!({}),
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+        }
+        let owned = || async {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT p.final_tag_id, group_concat(pa.asset_id, ',')
+                 FROM tag_run_proposals p JOIN tag_run_proposal_assets pa ON pa.proposal_id = p.id
+                 WHERE p.created_tag = 1 GROUP BY p.id",
+            )
+            .fetch_all(master)
+            .await
+            .unwrap()
+        };
+
+        let created = intent(master, "a1").await;
+        assert_eq!(created.len(), 1);
+        sqlx::query("UPDATE tags SET name = 'Lichen'")
+            .execute(master)
+            .await
+            .unwrap();
+        assert!(
+            intent(master, "a2").await.is_empty(),
+            "renamed, it is still the run's Moss"
+        );
+        assert_eq!(owned().await, [(created[0].clone(), "a1,a2".into())]);
+
+        sqlx::query("DELETE FROM tags")
+            .execute(master)
+            .await
+            .unwrap();
+        let recreated = intent(master, "a3").await;
+        assert_eq!(recreated.len(), 1);
+        assert_ne!(recreated, created);
+        assert_eq!(
+            owned().await,
+            [(recreated[0].clone(), "a1,a2,a3".into())],
+            "the run owns the new tag"
+        );
+        let pairs: Vec<(String, String)> =
+            sqlx::query_as("SELECT asset_id, tag_id FROM tag_run_applied ORDER BY asset_id")
+                .fetch_all(master)
+                .await
+                .unwrap();
+        assert_eq!(
+            pairs,
+            [
+                ("a1".into(), created[0].clone()),
+                ("a2".into(), created[0].clone()),
+                ("a3".into(), recreated[0].clone()),
+            ]
+        );
     }
 }

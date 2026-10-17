@@ -460,7 +460,10 @@ interface AutotagStore {
   fetchProviders: () => Promise<void>;
   /** Reads the last-used provider and mode, which every run start saves */
   fetchLastUsed: () => Promise<void>;
-  /** Takes an `autotag:updated` event: the runs, and re-fetches the loaded assets that changed */
+  /**
+   * Takes an `autotag:updated` event: the runs, and re-fetches the loaded assets that changed,
+   * and the tags when a run created some
+   */
   applyUpdate: (update: AutotagUpdate) => void;
   setRunsPanelOpen: (open: boolean) => void;
   openAutotagDialog: (target: AutotagTarget | null) => void;
@@ -488,8 +491,9 @@ export const useAutotagStore = create<AutotagStore>()((set) => ({
     set({ lastUsed: await api.getAutotagLastUsed() });
   },
 
-  applyUpdate: ({ runs, changedAssetIds }) => {
+  applyUpdate: ({ runs, changedAssetIds, tagsChanged }) => {
     set({ runs });
+    if (tagsChanged) useTagStore.getState().fetchTags().catch(console.error);
     if (changedAssetIds.length > 0) useAssetStore.getState().refreshAssets(changedAssetIds);
   },
 

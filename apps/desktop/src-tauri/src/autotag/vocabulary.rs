@@ -70,6 +70,18 @@ impl Vocabulary {
         Self { tags }
     }
 
+    /// The vocabulary without the tags in `ids`.
+    pub fn without(&self, ids: &HashSet<String>) -> Self {
+        Self {
+            tags: self
+                .tags
+                .iter()
+                .filter(|t| !ids.contains(&t.id))
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// The catalog tag a name stands for: the tag whose own name (the last part of its path)
     /// matches it by normalized name.
     fn by_name(&self) -> HashMap<String, &str> {
