@@ -369,9 +369,12 @@ pub const APP_RESTARTED: &str = "app restarted";
 /// How the `pause_reason` of a run a previous session left half-created begins.
 pub const APP_RESTARTED_WHILE_STARTING: &str = "app restarted while the run was starting";
 
+/// The `pause_reason` of a run whose undo a previous session left unfinished.
+pub const UNDO_INTERRUPTED: &str = "App restarted during undo: Finish undo removes the rest";
+
 /// At startup, in one transaction: every `queued` or `running` run becomes `paused` with "app
 /// restarted", and every item left `running` goes back to the queue, or is `skipped` when its
-/// run was cancelled while the item was in flight.
+/// run was cancelled while the item was in flight. A run left `undoing` becomes `undo_partial`.
 ///
 /// A run still `queued` was being created, its items going in by batches, so it may hold only
 /// some of the assets asked for. Its reason says so and how many it holds, so Resume finishing
@@ -401,6 +404,12 @@ pub async fn recover_after_restart(master: &Pool<Sqlite>) -> sqlx::Result<()> {
                            THEN 'skipped' ELSE 'queued' END
          WHERE status = 'running'",
     )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE tag_runs SET status = 'undo_partial', pause_reason = ? WHERE status = 'undoing'",
+    )
+    .bind(UNDO_INTERRUPTED)
     .execute(&mut *tx)
     .await?;
     tx.commit().await
@@ -593,11 +602,15 @@ pub enum NewNames<'a> {
 /// tags), then the item `done` with its result, and the run's usage and notice from the
 /// provider's `outcome`. Returns the tags it created.
 ///
-/// The transaction takes the write lock before it reads the catalog, so no other creator (an
-/// item, a review, you) can add the same name between the read and the insert, and items
+/// The caller commits `tx`, which it opens with `begin_intent` so no other creator (an item, a
+/// review, you) can add the same name between the catalog read and the insert, and items
 /// proposing a name at once create it once.
+///
+/// A tag of `tag_ids` deleted since the provider answered (by you, or by undoing the run that
+/// created it) is left out, of the pairs and of `result["tags"]`, so the item never lists a tag
+/// the asset can't get.
 pub async fn record_intent(
-    master: &Pool<Sqlite>,
+    tx: &mut sqlx::SqliteConnection,
     item: &Item,
     tag_ids: &[String],
     present: &HashSet<String>,
@@ -605,16 +618,16 @@ pub async fn record_intent(
     result: &serde_json::Value,
     outcome: &super::provider::TagResult,
 ) -> sqlx::Result<Vec<String>> {
-    // Taking the write lock up front: a deferred transaction that reads the catalog first
-    // would hold a read lock, and SQLite fails it at once rather than wait when another
-    // connection is already writing.
-    let mut tx = master.begin_with("BEGIN IMMEDIATE").await?;
-    let mut tag_ids = tag_ids.to_vec();
+    let mut tag_ids = still_in_catalog(tx, item, tag_ids).await?;
+    let mut result = result.clone();
+    if let Some(tags) = result.get_mut("tags") {
+        *tags = serde_json::json!(tag_ids);
+    }
     let mut created = Vec::new();
     match names {
-        NewNames::Propose(proposals) => propose(&mut tx, item, proposals).await?,
+        NewNames::Propose(proposals) => propose(tx, item, proposals).await?,
         NewNames::Create(proposals) => {
-            for (tag_id, new) in create(&mut tx, item, proposals).await? {
+            for (tag_id, new) in create(tx, item, proposals).await? {
                 if new {
                     created.push(tag_id.clone());
                 }
@@ -634,7 +647,7 @@ pub async fn record_intent(
             run_cleared: false,
         })
         .collect();
-    insert_pending(&mut tx, &pairs).await?;
+    insert_pending(tx, &pairs).await?;
     sqlx::query(
         "UPDATE tag_run_items SET status = 'done', error = NULL, result = ?
          WHERE run_id = ? AND asset_id = ?",
@@ -656,8 +669,44 @@ pub async fn record_intent(
     .bind(&item.run_id)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
     Ok(created)
+}
+
+/// The tags among `tag_ids` master still has, in order. Logs the others.
+async fn still_in_catalog(
+    tx: &mut sqlx::SqliteConnection,
+    item: &Item,
+    tag_ids: &[String],
+) -> sqlx::Result<Vec<String>> {
+    if tag_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT id FROM tags WHERE id IN ({})",
+        vec!["?"; tag_ids.len()].join(", ")
+    );
+    let mut query = sqlx::query_scalar::<_, String>(&sql);
+    for id in tag_ids {
+        query = query.bind(id);
+    }
+    let found: HashSet<String> = query.fetch_all(&mut *tx).await?.into_iter().collect();
+    let (kept, gone): (Vec<String>, Vec<String>) =
+        tag_ids.iter().cloned().partition(|id| found.contains(id));
+    if !gone.is_empty() {
+        tracing::warn!(
+            "Asset {} of run {} doesn't get {gone:?}: deleted while the provider answered",
+            item.asset_id,
+            item.run_id
+        );
+    }
+    Ok(kept)
+}
+
+/// Opens step 1's transaction for `record_intent`, taking the write lock up front: a deferred
+/// transaction that reads the catalog first would hold a read lock, and SQLite fails it at
+/// once rather than wait when another connection is already writing.
+pub async fn begin_intent(master: &Pool<Sqlite>) -> sqlx::Result<sqlx::Transaction<'_, Sqlite>> {
+    master.begin_with("BEGIN IMMEDIATE").await
 }
 
 /// Merges the item's new tag names into the run's proposals, for review.
@@ -830,7 +879,7 @@ pub async fn insert_pending(
 }
 
 /// A `tag_run_applied` row still waiting for its library write.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, sqlx::FromRow)]
 pub struct PendingPair {
     pub run_id: String,
     pub asset_id: String,
@@ -870,6 +919,11 @@ enum Outcome {
     Dropped,
 }
 
+/// One batch after step 3, waiting for step 4 (`confirm_batch`).
+pub struct Written<'a> {
+    outcomes: Vec<(&'a PendingPair, Outcome)>,
+}
+
 /// Write protocol steps 3 and 4 for pairs of one open library, in batches: `INSERT OR IGNORE`
 /// into its `asset_tags` (with the tag's definition and ancestors, which a mirror can lack),
 /// then mark the rows `applied`. Returns the assets whose tags changed.
@@ -889,64 +943,91 @@ pub async fn apply_pairs(
 ) -> sqlx::Result<Vec<String>> {
     let mut changed = Vec::new();
     for chunk in pairs.chunks(BATCH) {
-        let mut outcomes = Vec::new();
-        let mut tx = lib.pool.begin().await?;
-        'pairs: for pair in chunk {
-            let chain = db.tag_with_ancestors(&pair.tag_id).await?;
-            if chain.is_empty() {
-                outcomes.push((pair, Outcome::Dropped));
-                continue;
-            }
-            for definition in &chain {
-                // A failed statement rolls back only itself; the transaction goes on.
-                if let Err(e) = upsert_tag(&mut *tx, definition).await {
-                    tracing::warn!(
-                        "Tag {} for asset {} waits in library {}: its mirror can't take {:?}: {e}",
-                        pair.tag_id,
-                        pair.asset_id,
-                        lib.id,
-                        definition.1
-                    );
-                    continue 'pairs;
-                }
-            }
-            let inserted =
-                sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
-                    .bind(&pair.asset_id)
-                    .bind(&pair.tag_id)
-                    .execute(&mut *tx)
-                    .await?;
-            if inserted.rows_affected() > 0 {
-                changed.push(pair.asset_id.clone());
-                outcomes.push((pair, Outcome::Inserted));
-            } else {
-                outcomes.push((pair, Outcome::AlreadyThere));
+        let written = write_batch(db, lib, chunk).await?;
+        changed.extend(confirm_batch(db, written, applier).await?);
+    }
+    changed.dedup();
+    Ok(changed)
+}
+
+/// Step 3 for one batch of at most `BATCH` pairs, in one library transaction.
+pub async fn write_batch<'a>(
+    db: &Database,
+    lib: &LibraryHandle,
+    chunk: &'a [PendingPair],
+) -> sqlx::Result<Written<'a>> {
+    let mut outcomes = Vec::new();
+    let mut tx = lib.pool.begin().await?;
+    'pairs: for pair in chunk {
+        let chain = db.tag_with_ancestors(&pair.tag_id).await?;
+        if chain.is_empty() {
+            outcomes.push((pair, Outcome::Dropped));
+            continue;
+        }
+        for definition in &chain {
+            // A failed statement rolls back only itself; the transaction goes on.
+            if let Err(e) = upsert_tag(&mut *tx, definition).await {
+                tracing::warn!(
+                    "Tag {} for asset {} waits in library {}: its mirror can't take {:?}: {e}",
+                    pair.tag_id,
+                    pair.asset_id,
+                    lib.id,
+                    definition.1
+                );
+                continue 'pairs;
             }
         }
-        tx.commit().await?;
-
-        let mut tx = db.master_pool.begin().await?;
-        for (pair, outcome) in &outcomes {
-            let keep = match outcome {
-                Outcome::Dropped => false,
-                Outcome::AlreadyThere if applier == Applier::Item => false,
-                _ => !pair.run_cleared,
-            };
-            let sql = if keep {
-                "UPDATE tag_run_applied SET state = 'applied'
-                 WHERE run_id = ? AND asset_id = ? AND tag_id = ?"
-            } else {
-                "DELETE FROM tag_run_applied WHERE run_id = ? AND asset_id = ? AND tag_id = ?"
-            };
-            sqlx::query(sql)
-                .bind(&pair.run_id)
+        let inserted =
+            sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
                 .bind(&pair.asset_id)
                 .bind(&pair.tag_id)
                 .execute(&mut *tx)
                 .await?;
-        }
-        tx.commit().await?;
+        outcomes.push((
+            pair,
+            if inserted.rows_affected() > 0 {
+                Outcome::Inserted
+            } else {
+                Outcome::AlreadyThere
+            },
+        ));
     }
+    tx.commit().await?;
+    Ok(Written { outcomes })
+}
+
+/// Step 4 for a batch `write_batch` wrote, in one master transaction. Returns the assets whose
+/// tags changed.
+pub async fn confirm_batch(
+    db: &Database,
+    written: Written<'_>,
+    applier: Applier,
+) -> sqlx::Result<Vec<String>> {
+    let mut changed = Vec::new();
+    let mut tx = db.master_pool.begin().await?;
+    for (pair, outcome) in &written.outcomes {
+        if matches!(outcome, Outcome::Inserted) {
+            changed.push(pair.asset_id.clone());
+        }
+        let keep = match outcome {
+            Outcome::Dropped => false,
+            Outcome::AlreadyThere if applier == Applier::Item => false,
+            _ => !pair.run_cleared,
+        };
+        let sql = if keep {
+            "UPDATE tag_run_applied SET state = 'applied'
+             WHERE run_id = ? AND asset_id = ? AND tag_id = ?"
+        } else {
+            "DELETE FROM tag_run_applied WHERE run_id = ? AND asset_id = ? AND tag_id = ?"
+        };
+        sqlx::query(sql)
+            .bind(&pair.run_id)
+            .bind(&pair.asset_id)
+            .bind(&pair.tag_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     changed.dedup();
     Ok(changed)
 }
@@ -977,6 +1058,21 @@ pub async fn pending_rows(db: &Database, library: Option<&str>) -> sqlx::Result<
     .bind(library)
     .fetch_all(&db.master_pool)
     .await
+}
+
+/// The rows among `rows` that `pending_rows` would still return: an undo that started since
+/// they were read leaves its run's rows out, to be removed rather than applied.
+pub async fn still_pending(
+    db: &Database,
+    rows: Vec<PendingPair>,
+) -> sqlx::Result<Vec<PendingPair>> {
+    let libraries: std::collections::BTreeSet<String> =
+        rows.iter().map(|r| r.library_id.clone()).collect();
+    let mut current = HashSet::new();
+    for library in libraries {
+        current.extend(pending_rows(db, Some(&library)).await?);
+    }
+    Ok(rows.into_iter().filter(|r| current.contains(r)).collect())
 }
 
 /// Write protocol steps 3 and 4 for `rows`, as replay. Rows for an offline library wait for
@@ -1412,8 +1508,9 @@ mod tests {
                 name: "Moss".into(),
                 parent_id: None,
             }];
-            record_intent(
-                master,
+            let mut tx = begin_intent(master).await.unwrap();
+            let created = record_intent(
+                &mut tx,
                 &item,
                 &[],
                 &HashSet::new(),
@@ -1422,7 +1519,9 @@ mod tests {
                 &Default::default(),
             )
             .await
-            .unwrap()
+            .unwrap();
+            tx.commit().await.unwrap();
+            created
         }
         let owned = || async {
             sqlx::query_as::<_, (String, String)>(
@@ -1471,6 +1570,56 @@ mod tests {
                 ("a2".into(), created[0].clone()),
                 ("a3".into(), recreated[0].clone()),
             ]
+        );
+    }
+    #[tokio::test]
+    async fn step_one_leaves_out_a_tag_deleted_since_the_provider_answered() {
+        let db = memory_database(vec![]).await;
+        let master = &db.master_pool;
+        insert_tag(master, "t-rock", "Rock").await;
+        insert_run(&db, "r", "running").await;
+        insert_item(&db, "r", "a1", "running").await;
+        let item = Item {
+            run_id: "r".into(),
+            asset_id: "a1".into(),
+            library_id: "lib".into(),
+            mode: "existing_only".into(),
+            access: None,
+            model: None,
+            options: serde_json::json!({}),
+        };
+        // The provider answered Rock and Moss; Moss was deleted (an undo) before step 1.
+        let accepted = ["t-rock".to_string(), "t-moss".to_string()];
+
+        let mut tx = begin_intent(master).await.unwrap();
+        record_intent(
+            &mut tx,
+            &item,
+            &accepted,
+            &HashSet::new(),
+            NewNames::Propose(&[]),
+            &serde_json::json!({ "tags": accepted, "proposed": [] }),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let pairs: Vec<String> = sqlx::query_scalar("SELECT tag_id FROM tag_run_applied")
+            .fetch_all(master)
+            .await
+            .unwrap();
+        assert_eq!(pairs, ["t-rock"]);
+        let result: String =
+            sqlx::query_scalar("SELECT result FROM tag_run_items WHERE asset_id = 'a1'")
+                .fetch_one(master)
+                .await
+                .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            result["tags"],
+            serde_json::json!(["t-rock"]),
+            "the result agrees"
         );
     }
 }

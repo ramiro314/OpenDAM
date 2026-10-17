@@ -1,7 +1,7 @@
 //! The run engine: one permit pool per provider hands queued items out round-robin across that
 //! provider's running runs, each item is written through the write protocol, and progress goes
-//! to the UI as throttled `autotag:updated` events. Runs can be paused, resumed and cancelled,
-//! and provider failures are retried, pause the run or fail the item by their class. A Prefer
+//! to the UI as throttled `autotag:updated` events. Runs can be paused, resumed, cancelled and
+//! undone (`undo`), and provider failures are retried, pause the run or fail the item by their class. A Prefer
 //! existing run collects new tag names and ends waiting for one review; a Create freely run
 //! creates them, one tag per name however many items propose it at once.
 
@@ -17,6 +17,7 @@ use super::provider::{AssetInfo, ErrorClass, Mode, TagProvider, TagRequest, TagR
 use super::review::{self, ProposalDecision, ReviewProposal};
 use super::settings::{self, AiSettings};
 use super::store::{self, Item, NewNames, NewRun, PendingPair, RunSummary};
+use super::undo::{self, CrashPoint, Crashes};
 use super::vocabulary::Vocabulary;
 use crate::db::{resolve_path, Database};
 
@@ -163,6 +164,10 @@ pub struct Engine {
     /// Woken when a run is paused or cancelled, so items waiting to retry let go of their
     /// provider permit at once instead of at the end of the wait.
     run_stopped: Notify,
+    /// Undo holds it to write, and an item's write protocol steps, a review's apply and replay
+    /// hold it to read, so none of their library writes lands while undo removes a run's pairs.
+    writes: tokio::sync::RwLock<()>,
+    crashes: Crashes,
     /// Test-only fault: the library write of every item fails, as a NAS lock timeout would.
     #[cfg(test)]
     fail_library_writes: AtomicBool,
@@ -211,6 +216,8 @@ impl Engine {
             notifier,
             retry_delays,
             run_stopped: Notify::new(),
+            writes: Default::default(),
+            crashes: Default::default(),
             #[cfg(test)]
             fail_library_writes: Default::default(),
             #[cfg(test)]
@@ -218,6 +225,11 @@ impl Engine {
             #[cfg(test)]
             fail_finishing: Default::default(),
         })
+    }
+
+    #[cfg(test)]
+    pub fn crashes(&self) -> &Crashes {
+        &self.crashes
     }
 
     /// Pauses the runs a previous session left unfinished ("app restarted") and puts their
@@ -251,10 +263,15 @@ impl Engine {
     /// once the library is open a scheduler can claim one of its items, whose own `pending`
     /// rows replay must leave to it, and other libraries' rows may belong to items in flight.
     pub async fn library_opened(&self, waiting: Vec<PendingPair>) {
-        self.assets_changed(store::replay_rows(&self.db, waiting).await);
+        let _writes = self.writes.read().await;
+        match store::still_pending(&self.db, waiting).await {
+            Ok(waiting) => self.assets_changed(store::replay_rows(&self.db, waiting).await),
+            Err(e) => tracing::error!("Could not replay the auto-tag writes waiting: {e}"),
+        }
     }
 
     async fn replay(&self, library: Option<&str>) {
+        let _writes = self.writes.read().await;
         match store::replay_pending(&self.db, library).await {
             Ok(changed) => self.assets_changed(changed),
             Err(e) => tracing::error!("Could not replay pending auto-tag writes: {e}"),
@@ -777,11 +794,39 @@ impl Engine {
         run_id: &str,
         decisions: Vec<ProposalDecision>,
     ) -> Result<String, String> {
+        let _writes = self.writes.read().await;
         let applied = review::apply(&self.db, run_id, decisions).await?;
         tracing::info!("Applied the review of auto-tag run {run_id}");
         self.assets_changed(applied.changed_assets);
         self.events_wake.notify_one();
         Ok(applied.status)
+    }
+
+    /// Undoes a run that has stopped (`done`, `cancelled` or `awaiting_review`), rejecting its
+    /// pending proposals first; a paused run is cancelled first. Also Finish undo, on an
+    /// `undo_partial` run. Returns `undone`, or `undo_partial` when a library is offline.
+    pub async fn undo_run(&self, run_id: &str) -> Result<String, String> {
+        let _writes = self.writes.write().await;
+        let master = &self.db.master_pool;
+        let status = store::run_status(master, run_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if status.as_deref() == Some("paused") {
+            store::cancel_run(master, run_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            self.run_stopped.notify_waiters();
+        }
+        let begun = undo::begin(master, run_id).await;
+        self.events_wake.notify_one();
+        begun?;
+        let finished = undo::finish(&self.db, run_id, &self.crashes).await;
+        self.assets_changed(finished.changed_assets);
+        if finished.tags_deleted {
+            self.tags_changed.store(true, Ordering::SeqCst);
+        }
+        self.events_wake.notify_one();
+        Ok(finished.status.to_string())
     }
 
     /// Asks the provider about one asset and writes the result through the write protocol.
@@ -871,6 +916,8 @@ impl Engine {
             vocabulary.new_proposals(&result, request.max_proposals as usize)
         };
 
+        // Undo waits for steps 1 to 4, and is refused while this item is still `running`.
+        let _writes = self.writes.read().await;
         // Step 1: record every pair the library lacks before the library sees it.
         let present: HashSet<String> =
             sqlx::query_scalar::<_, String>("SELECT tag_id FROM asset_tags WHERE asset_id = ?")
@@ -886,17 +933,20 @@ impl Engine {
         } else {
             NewNames::Propose(&proposals)
         };
-        let created = store::record_intent(
-            &self.db.master_pool,
-            item,
-            &accepted,
-            &present,
-            names,
-            &summary,
-            &result,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let intent = async {
+            let mut tx = store::begin_intent(&self.db.master_pool).await?;
+            let created =
+                store::record_intent(&mut tx, item, &accepted, &present, names, &summary, &result)
+                    .await?;
+            if !created.is_empty() && self.crashes.at(CrashPoint::AfterTagInsert) {
+                drop(tx);
+                match self.crashes.stop().await {}
+            }
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(created)
+        };
+        let created = intent.await.map_err(|e| e.to_string())?;
+        self.crashes.check(CrashPoint::AfterIntent).await;
 
         // Step 2. An item that resolves a name to this tag before the mirror reaches its library
         // is fine: step 3 writes the tag's definition into that library with the pair.
@@ -922,7 +972,14 @@ impl Engine {
                 return Err(sqlx::Error::PoolTimedOut);
             }
             let pending = store::pending_pairs_of(&self.db.master_pool, item).await?;
-            store::apply_pairs(&self.db, &lib, &pending, store::Applier::Item).await
+            let mut changed = Vec::new();
+            for chunk in pending.chunks(store::BATCH) {
+                let written = store::write_batch(&self.db, &lib, chunk).await?;
+                self.crashes.check(CrashPoint::AfterLibraryCommit).await;
+                changed
+                    .extend(store::confirm_batch(&self.db, written, store::Applier::Item).await?);
+            }
+            Ok::<_, sqlx::Error>(changed)
         };
         match write.await {
             Ok(changed) => Ok(changed),

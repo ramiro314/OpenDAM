@@ -184,6 +184,12 @@ describe('taggingSummary', () => {
     );
   });
 
+  test('names runs partly undone, which wait for Finish undo', () => {
+    expect(taggingSummary([run('undo_partial', 5, 5), run('undone', 2, 2)])).toBe(
+      '1 run partly undone'
+    );
+  });
+
   test('with only finished runs it still offers the Runs panel', () => {
     expect(taggingSummary([run('done', 5, 5), run('done', 2, 2)])).toBe('2 tagging runs finished');
   });
@@ -203,7 +209,14 @@ describe('runProgress', () => {
 });
 
 describe('runActions', () => {
-  const none = { pause: false, resume: false, cancel: false, review: false };
+  const none = {
+    pause: false,
+    resume: false,
+    cancel: false,
+    review: false,
+    undo: false,
+    finishUndo: false,
+  };
 
   test('a running run can be paused or cancelled', () => {
     expect(runActions(run('running', 1, 4))).toEqual({ ...none, pause: true, cancel: true });
@@ -213,21 +226,38 @@ describe('runActions', () => {
     expect(runActions(run('queued', 0, 4))).toEqual({ ...none, cancel: true });
   });
 
-  test('a paused run can be resumed or cancelled', () => {
-    expect(runActions(run('paused', 1, 4))).toEqual({ ...none, resume: true, cancel: true });
+  test('a paused run can be resumed, cancelled or undone', () => {
+    expect(runActions(run('paused', 1, 4))).toEqual({
+      ...none,
+      resume: true,
+      cancel: true,
+      undo: true,
+    });
   });
 
-  test('a stopped run offers none of them', () => {
-    for (const status of ['done', 'cancelled', 'undone'] as const) {
+  test('a stopped run offers Undo, until it is undone or being undone', () => {
+    for (const status of ['done', 'cancelled'] as const) {
+      expect(runActions(run(status, 4, 4))).toEqual({ ...none, undo: true });
+    }
+    for (const status of ['undoing', 'undone'] as const) {
       expect(runActions(run(status, 4, 4))).toEqual(none);
     }
   });
 
+  test('a partly undone run offers Finish undo', () => {
+    expect(runActions(run('undo_partial', 4, 4))).toEqual({ ...none, finishUndo: true });
+  });
+
   test('a run waiting for review, or cancelled with proposals left, offers Review', () => {
-    expect(runActions(run('awaiting_review', 4, 4))).toEqual({ ...none, review: true });
+    expect(runActions(run('awaiting_review', 4, 4))).toEqual({
+      ...none,
+      review: true,
+      undo: true,
+    });
     expect(runActions({ ...run('cancelled', 2, 4), pendingProposals: 3 })).toEqual({
       ...none,
       review: true,
+      undo: true,
     });
     expect(runActions({ ...run('paused', 2, 4), pendingProposals: 3 }).review).toBe(false);
   });

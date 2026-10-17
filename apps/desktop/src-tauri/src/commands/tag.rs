@@ -171,7 +171,7 @@ pub async fn delete_tag(id: String, state: State<'_, Arc<AppState>>) -> Result<(
 }
 
 /// Deletes the definition from master and every open library, with its memberships.
-async fn delete_tag_in(db: &Database, id: &str) -> Result<()> {
+pub(crate) async fn delete_tag_in(db: &Database, id: &str) -> Result<()> {
     // Mirrors first, each in one transaction, and master last: if a library can't take the
     // delete, master keeps the tag, so the next open doesn't bring a "deleted" tag back.
     for lib in db.get_all_libraries().await {

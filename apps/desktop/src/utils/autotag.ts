@@ -167,6 +167,7 @@ export function taggingSummary(runs: RunSummary[]): string | null {
   const active = runs.filter((r) => r.status === 'running' || r.status === 'queued');
   const review = runs.filter(needsReview).length;
   const paused = runs.filter((r) => r.status === 'paused').length;
+  const partlyUndone = runs.filter((r) => r.status === 'undo_partial').length;
 
   const parts: string[] = [];
   if (active.length > 0) {
@@ -178,6 +179,7 @@ export function taggingSummary(runs: RunSummary[]): string | null {
   }
   if (review > 0) parts.push(`${plural(review, 'run')} ${review === 1 ? 'needs' : 'need'} review`);
   if (paused > 0) parts.push(`${plural(paused, 'run')} paused`);
+  if (partlyUndone > 0) parts.push(`${plural(partlyUndone, 'run')} partly undone`);
   if (parts.length === 0) parts.push(`${plural(runs.length, 'tagging run')} finished`);
   return parts.join(' · ');
 }
@@ -204,6 +206,10 @@ export interface RunActions {
   cancel: boolean;
   /** "Review (N)" */
   review: boolean;
+  /** Removes the tags the run added. A paused run is cancelled first. */
+  undo: boolean;
+  /** Runs undo again on a run partly undone while a library was offline */
+  finishUndo: boolean;
 }
 
 /** The Runs panel buttons a run offers. */
@@ -215,6 +221,12 @@ export function runActions(run: Pick<RunSummary, 'status' | 'pendingProposals'>)
     resume: status === 'paused',
     cancel: status === 'running' || status === 'queued' || status === 'paused',
     review: needsReview(run),
+    undo:
+      status === 'done' ||
+      status === 'cancelled' ||
+      status === 'awaiting_review' ||
+      status === 'paused',
+    finishUndo: status === 'undo_partial',
   };
 }
 

@@ -60,6 +60,11 @@ fn capitalize(word: &str) -> String {
 }
 
 impl FakeProvider {
+    #[cfg(test)]
+    pub fn new(text_only: bool, delay: Duration) -> Self {
+        Self { text_only, delay }
+    }
+
     fn result(&self, request: &TagRequest) -> TagResult {
         let words = file_name_words(&request.asset.file_name);
         let mut existing = Vec::new();

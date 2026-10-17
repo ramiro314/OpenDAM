@@ -30,9 +30,20 @@ function statusClass(status: RunSummary['status']) {
 /** Runs a panel action; a refusal comes back as the panel's error line. */
 type Act = (action: () => Promise<unknown>) => void;
 
+function undoTitle(run: RunSummary): string {
+  const parts = [
+    'Remove the tags this run added, and delete the tags it created that no asset uses.',
+  ];
+  if (run.status === 'paused') parts.push('The run is cancelled first.');
+  if (run.pendingProposals > 0) parts.push('Its proposals waiting for review are rejected.');
+  return parts.join(' ');
+}
+
 function RunRow({ run, act }: { run: RunSummary; act: Act }) {
   const actions = runActions(run);
   const openReview = useAutotagStore((s) => s.openReview);
+  // Undo can't be taken back, so it asks for a second click
+  const [confirmingUndo, setConfirmingUndo] = useState(false);
   const button = clsx(dialog.btn, dialog.secondaryBtn, styles.runBtn);
   const processed = run.done + run.failed;
   const percent = run.total > 0 ? (processed / run.total) * 100 : 0;
@@ -58,7 +69,12 @@ function RunRow({ run, act }: { run: RunSummary; act: Act }) {
         {runProgress(run)}
         {usage && ` · ${usage}`}
       </span>
-      {(actions.pause || actions.resume || actions.cancel || actions.review) && (
+      {(actions.pause ||
+        actions.resume ||
+        actions.cancel ||
+        actions.review ||
+        actions.undo ||
+        actions.finishUndo) && (
         <div className={styles.runActions}>
           {actions.review && (
             <button
@@ -86,6 +102,29 @@ function RunRow({ run, act }: { run: RunSummary; act: Act }) {
               title="Skip the remaining assets. Tags already applied stay."
             >
               Cancel
+            </button>
+          )}
+          {actions.undo && (
+            <button
+              className={button}
+              onClick={() => {
+                if (!confirmingUndo) return setConfirmingUndo(true);
+                setConfirmingUndo(false);
+                act(() => api.undoAutotagRun(run.id));
+              }}
+              onBlur={() => setConfirmingUndo(false)}
+              title={undoTitle(run)}
+            >
+              {confirmingUndo ? 'Confirm undo' : 'Undo'}
+            </button>
+          )}
+          {actions.finishUndo && (
+            <button
+              className={button}
+              onClick={() => act(() => api.undoAutotagRun(run.id))}
+              title="Remove the tags left once the offline library is back"
+            >
+              Finish undo
             </button>
           )}
         </div>
