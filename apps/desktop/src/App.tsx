@@ -18,6 +18,7 @@ import {
   useCollectionStore,
   useAssetStore,
   useAutotagStore,
+  lookupAsset,
 } from './store';
 import type { AutotagUpdate } from './types';
 import { api } from './api';
@@ -34,9 +35,7 @@ function isEditingText(): boolean {
 export default function App() {
   const { sidebarOpen, detailPanelOpen, focusedAssetId } = useUIStore();
   const focusedAsset = useAssetStore((s) =>
-    focusedAssetId
-      ? (s.assets.find((a) => a.id === focusedAssetId) ?? s.assetMap.get(focusedAssetId) ?? null)
-      : null
+    focusedAssetId ? (lookupAsset(s, focusedAssetId) ?? null) : null
   );
   const fetchLibraries = useLibraryStore((s) => s.fetchLibraries);
   const fetchTags = useTagStore((s) => s.fetchTags);

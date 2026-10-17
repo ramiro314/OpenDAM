@@ -9,14 +9,38 @@
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
+  /* The grid places the view itself when rows change (gridGeometry.ts); the browser mustn't */
+  overflow-anchor: none;
   padding: var(--space-4);
 }
 
-/* Grid */
-.grid {
+/* Windowed rows: the container is as tall as every row, and only the rendered rows are in it,
+   each moved to its place. Heights come from gridGeometry.ts. */
+.rows {
+  position: relative;
+}
+.gridRow,
+.listRow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+}
+.gridRow {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(var(--tile-size, 220px), 1fr));
   gap: var(--space-3);
+}
+
+/* A static tile where an asset's page isn't cached yet */
+.placeholderCard {
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+}
+.placeholderRow {
+  height: 100%;
+  background: var(--color-bg-surface);
+  border-radius: var(--radius-sm);
 }
 
 /* Skeleton loading grid */
@@ -29,13 +53,6 @@
 .skeletonCard {
   aspect-ratio: 1;
   border-radius: var(--radius-lg);
-}
-
-/* List */
-.list {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
 }
 
 /* Footer */

@@ -10,6 +10,8 @@ import styles from './AssetListRow.module.css';
 
 interface AssetListRowProps {
   asset: Asset;
+  /** Position in the results, as `data-index` for the UI checks */
+  index: number;
   selected: boolean;
   onClick: (asset: Asset, e: React.MouseEvent) => void;
   onContextMenu: (asset: Asset, e: React.MouseEvent) => void;
@@ -22,6 +24,7 @@ function formatDate(ms: number): string {
 
 export const AssetListRow = memo(function AssetListRow({
   asset,
+  index,
   selected,
   onClick,
   onContextMenu,
@@ -84,6 +87,7 @@ export const AssetListRow = memo(function AssetListRow({
       role="button"
       tabIndex={0}
       data-tile
+      data-index={index}
       data-tile-state={tileState(media, mediaSettled)}
     >
       {/* Favorite Button */}
@@ -109,7 +113,7 @@ export const AssetListRow = memo(function AssetListRow({
             src={convertFileSrc(asset.thumbnailPath)}
             alt={asset.fileName}
             className={styles.thumbImg}
-            loading="lazy"
+            decoding="async"
             onLoad={settle}
             onError={() => setFailed(media)}
           />
@@ -118,7 +122,7 @@ export const AssetListRow = memo(function AssetListRow({
             src={convertFileSrc(asset.filePath)}
             alt={asset.fileName}
             className={styles.thumbImg}
-            loading="lazy"
+            decoding="async"
             onLoad={settle}
             onError={() => setFailed(media)}
           />

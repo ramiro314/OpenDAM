@@ -212,7 +212,10 @@ The CPU-mode baseline of the grid before windowing is
 
 **DOM markers** the harness reads: the grid's scroll container is `#asset-scroll`, and every
 tile carries `data-tile`, with `data-tile-state="ready"` once its asset is loaded and its image
-has loaded or failed, `"placeholder"` before that.
+has loaded or failed, `"placeholder"` before that. The windowed grid also gives every tile
+`data-index` (its position in the results) and a tile whose page isn't cached yet
+`data-placeholder`; `#asset-scroll` carries the layout as `data-columns` and `data-row-pitch`,
+and the footer's visible range is `#asset-range`.
 
 ### Bench data
 

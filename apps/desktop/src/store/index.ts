@@ -18,6 +18,18 @@ import type {
   RunSummary,
 } from '../types';
 import { api } from '../api';
+import {
+  PAGE_SIZE,
+  assetAt,
+  emptyCache,
+  findAnchor,
+  insertPage,
+  pageOf,
+  patchAssets,
+  refreshPages,
+  touch,
+  type PageCache,
+} from './pageCache';
 
 // ── UI State ──────────────────────────────────────────────────────────────
 interface UIState {
@@ -166,18 +178,28 @@ export const useLibraryStore = create<LibraryStore>()((set) => ({
 }));
 
 // ── Asset / Search Store ──────────────────────────────────────────────────
-interface AssetStore {
-  assets: Asset[];
+interface AssetStore extends PageCache {
+  /** Result count for the current query, counted once per search or refresh */
   total: number;
-  /** Last page loaded into `assets` (pages are appended as the grid scrolls) */
-  page: number;
-  pageSize: number;
+  /** Copies of the selected and focused assets, kept when their pages are evicted (D3) */
+  pinned: Map<string, Asset>;
+  /** Pages in flight */
+  pending: Set<number>;
+  /** The pages the grid last asked for; never evicted */
+  wanted: number[];
+  /** Bumped by every search and refresh; page results from an older one are dropped */
+  generation: number;
+  /** Bumped each time a search or refresh replaces the cache, so the grid re-sends its pages */
+  epoch: number;
+  /**
+   * Where the last refresh found the asset that was at the top of the view: `from` its old
+   * index, `to` its new one. Null after a search, which starts at the top.
+   */
+  anchor: { from: number; to: number } | null;
   loading: boolean;
-  loadingMore: boolean;
   /** Why the last search failed; the grid shows it instead of results */
   searchError: string | null;
   query: SearchQuery;
-  assetMap: Map<string, Asset>;
 
   setQuery: (q: Partial<SearchQuery>) => void;
   setFilter: (f: Partial<FilterSpec>) => void;
@@ -185,12 +207,22 @@ interface AssetStore {
   resetFilter: () => void;
   clearFilter: (key: keyof FilterSpec) => void;
   setSort: (field: SortField, order?: SortOrder) => void;
-  /** Runs the query from the first page, replacing the loaded assets */
+  /** Runs the query: clears the cache and fetches page 0 with the total */
   search: () => Promise<void>;
-  /** Appends the next page, if there is one */
-  loadMore: () => Promise<void>;
-  /** Re-fetches every page loaded so far, keeping the grid's scroll position */
+  /** Fetches the wanted pages that aren't cached or in flight, then evicts beyond the limit */
+  ensurePages: (indices: number[]) => void;
+  /** The grid reports the first visible index, which a refresh keeps in place */
+  setViewTop: (index: number) => void;
+  /**
+   * Refetches the total and the wanted pages, keeping the stale ones on screen until they
+   * arrive, then re-anchors on the asset that was at the top (C5)
+   */
   refresh: () => Promise<void>;
+  assetAt: (index: number) => Asset | undefined;
+  /** A pinned asset, or a cached one */
+  getById: (id: string) => Asset | undefined;
+  /** Replaces each of `ids` with `fn(asset)` in its page and its pinned copy */
+  patchCached: (ids: string | string[], fn: (asset: Asset) => Asset) => void;
   patchAsset: (id: string, patch: Partial<Asset>) => Promise<void>;
   deleteAsset: (id: string, deleteFile?: boolean) => Promise<void>;
   deleteAssets: (ids: string[], deleteFile?: boolean) => Promise<void>;
@@ -198,8 +230,7 @@ interface AssetStore {
   /** Applies a finished preview: `thumbnailPath` replaces the old one, and `null` clears it. */
   updateAssetPreview: (id: string, thumbnailPath: string | null, previewModel?: string) => void;
   setPreviewStatus: (id: string, status: Asset['previewStatus']) => void;
-  getById: (id: string) => Asset | undefined;
-  /** Re-fetches the given assets that are loaded; ids not loaded are ignored */
+  /** Re-fetches the given assets that are cached or pinned; other ids are ignored */
   refreshAssets: (ids: string[]) => Promise<void>;
 }
 
@@ -222,48 +253,70 @@ const defaultQuery: SearchQuery = {
 
 /** Clears the grid so a failed search can't leave results from an earlier query on screen */
 function failedSearch(e: unknown): Partial<AssetStore> {
-  return { assets: [], total: 0, page: 0, assetMap: new Map(), searchError: String(e) };
+  return { ...emptyCache(), total: 0, wanted: [], searchError: String(e) };
 }
 
-// Bumped by every search/refresh so a slower loadMore can't append results from an older query.
-let queryGeneration = 0;
+/** The cached asset `id`, if its page is cached. */
+function cachedAsset(s: Pick<PageCache, 'pages' | 'indexById'>, id: string): Asset | undefined {
+  const index = s.indexById.get(id);
+  if (index === undefined) return undefined;
+  const asset = assetAt(s, index);
+  return asset?.id === id ? asset : undefined;
+}
+
+/** A pinned asset, or a cached one; for selectors, which `getById` can't serve. */
+export function lookupAsset(
+  s: Pick<AssetStore, 'pinned' | 'pages' | 'indexById'>,
+  id: string
+): Asset | undefined {
+  return s.pinned.get(id) ?? cachedAsset(s, id);
+}
+
+/** Every cached and pinned asset, for lookups by something other than id. */
+export function cachedAssets(s: Pick<AssetStore, 'pinned' | 'pages'>): Asset[] {
+  return [...[...s.pages.values()].flat(), ...s.pinned.values()];
+}
+
+/** `pinned` with the copies `assets` holds newer versions of. */
+function repin(pinned: Map<string, Asset>, assets: Iterable<Asset>): Map<string, Asset> {
+  let next: Map<string, Asset> | null = null;
+  for (const a of assets) {
+    if (pinned.has(a.id) && pinned.get(a.id) !== a) (next ??= new Map(pinned)).set(a.id, a);
+  }
+  return next ?? pinned;
+}
+
+// The first visible index the grid last reported. It changes on every row scrolled, and only
+// `refresh` reads it, so it stays out of the state that components subscribe to.
+let viewTop = 0;
 
 export const useAssetStore = create<AssetStore>()((set, get) => ({
-  assets: [],
+  ...emptyCache(),
   total: 0,
-  page: 0,
-  pageSize: 100,
+  pinned: new Map(),
+  pending: new Set(),
+  wanted: [],
+  generation: 0,
+  epoch: 0,
+  anchor: null,
   loading: false,
-  loadingMore: false,
   searchError: null,
   query: defaultQuery,
-  assetMap: new Map(),
 
-  setQuery: (q) => set((s) => ({ query: { ...s.query, ...q }, page: 0 })),
+  setQuery: (q) => set((s) => ({ query: { ...s.query, ...q } })),
 
-  setFilter: (f) =>
-    set((s) => ({
-      query: { ...s.query, filter: { ...s.query.filter, ...f } },
-      page: 0,
-    })),
+  setFilter: (f) => set((s) => ({ query: { ...s.query, filter: { ...s.query.filter, ...f } } })),
 
   replaceFilter: (f, collectionId) =>
-    set((s) => ({
-      query: { ...s.query, collectionId, filter: f },
-      page: 0,
-    })),
+    set((s) => ({ query: { ...s.query, collectionId, filter: f } })),
 
-  resetFilter: () =>
-    set((s) => ({
-      query: { ...s.query, collectionId: undefined, filter: {} },
-      page: 0,
-    })),
+  resetFilter: () => set((s) => ({ query: { ...s.query, collectionId: undefined, filter: {} } })),
 
   clearFilter: (key) =>
     set((s) => {
       const filter = { ...s.query.filter };
       delete filter[key];
-      return { query: { ...s.query, filter }, page: 0 };
+      return { query: { ...s.query, filter } };
     }),
 
   setSort: (field, order) =>
@@ -278,155 +331,179 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
               order ?? (field === s.query.sort.field && currentOrder === 'desc' ? 'asc' : 'desc'),
           },
         },
-        page: 0,
       };
     }),
 
   search: async () => {
-    const { query, pageSize } = get();
-    const generation = ++queryGeneration;
-    set({ loading: true, page: 0 });
+    const { query } = get();
+    const generation = get().generation + 1;
+    // The old results stay on screen until page 0 replaces them
+    set({ generation, loading: true, pending: new Set() });
     try {
-      const result = await api.searchAssets({ query, page: 0, pageSize });
-      if (generation !== queryGeneration) return;
-      const assetMap = new Map(result.assets.map((a) => [a.id, a]));
-      set({ assets: result.assets, total: result.total, assetMap, searchError: null });
+      const result = await api.searchAssets({
+        query,
+        page: 0,
+        pageSize: PAGE_SIZE,
+        includeTotal: true,
+      });
+      if (generation !== get().generation) return;
+      viewTop = 0;
+      const cache = insertPage(emptyCache(), 0, result.assets, [0]);
+      set((s) => ({
+        ...cache,
+        total: result.total ?? result.assets.length,
+        wanted: [0],
+        pinned: repin(s.pinned, result.assets),
+        epoch: s.epoch + 1,
+        anchor: null,
+        searchError: null,
+      }));
     } catch (e) {
-      if (generation === queryGeneration) set(failedSearch(e));
+      if (generation === get().generation) set(failedSearch(e));
     } finally {
-      if (generation === queryGeneration) set({ loading: false });
+      if (generation === get().generation) set({ loading: false });
     }
   },
 
-  loadMore: async () => {
-    const { query, page, pageSize, assets, total, loading, loadingMore } = get();
-    if (loading || loadingMore || assets.length >= total) return;
-    const generation = queryGeneration;
-    set({ loadingMore: true });
-    try {
-      const result = await api.searchAssets({ query, page: page + 1, pageSize });
-      if (generation !== queryGeneration) return;
-      set((s) => {
-        // Pages can shift if assets change between requests; skip ones already shown.
-        const assetMap = new Map(s.assetMap);
-        const added = result.assets.filter((a) => !assetMap.has(a.id));
-        for (const a of added) assetMap.set(a.id, a);
-        return { assets: [...s.assets, ...added], total: result.total, page: page + 1, assetMap };
-      });
-    } finally {
-      set({ loadingMore: false });
+  ensurePages: (indices) => {
+    const s = get();
+    const lastPage = pageOf(Math.max(0, s.total - 1));
+    const wanted = indices.filter((p) => p >= 0 && p <= lastPage);
+    set({ wanted, lru: touch(s, wanted).lru });
+    // A search in flight replaces the cache, and the grid asks again once it has
+    if (s.loading || s.total === 0) return;
+    const missing = wanted.filter((p) => !s.pages.has(p) && !s.pending.has(p));
+    if (missing.length === 0) return;
+    const { generation, query } = s;
+    set({ pending: new Set([...s.pending, ...missing]) });
+    for (const page of missing) {
+      api
+        .searchAssets({ query, page, pageSize: PAGE_SIZE, includeTotal: false })
+        .then((result) => {
+          if (generation !== get().generation) return;
+          set((cur) => ({
+            ...insertPage(cur, page, result.assets, cur.wanted),
+            pinned: repin(cur.pinned, result.assets),
+          }));
+        })
+        .catch((e) => console.error(`Failed to load page ${page}:`, e))
+        .finally(() => {
+          if (generation !== get().generation) return;
+          set((cur) => {
+            const pending = new Set(cur.pending);
+            pending.delete(page);
+            return { pending };
+          });
+        });
     }
+  },
+
+  setViewTop: (index) => {
+    viewTop = index;
   },
 
   refresh: async () => {
-    const { query, page, pageSize } = get();
-    const generation = ++queryGeneration;
-    // One request covering every loaded page, so the grid keeps its length and scroll position.
+    const s = get();
+    // The search in flight may have read the library before it changed
+    if (s.loading) return get().search();
+    const generation = s.generation + 1;
+    set({ generation, pending: new Set() });
+    const from = viewTop;
+    const anchorId = assetAt(s, from)?.id;
+    const pages = refreshPages(s.wanted.length > 0 ? s.wanted : [pageOf(from)], from, s.total);
     try {
-      const result = await api.searchAssets({ query, page: 0, pageSize: (page + 1) * pageSize });
-      if (generation !== queryGeneration) return;
-      const assetMap = new Map(result.assets.map((a) => [a.id, a]));
-      set({ assets: result.assets, total: result.total, assetMap, searchError: null });
+      const results = await Promise.all(
+        pages.map((page, i) =>
+          api.searchAssets({ query: s.query, page, pageSize: PAGE_SIZE, includeTotal: i === 0 })
+        )
+      );
+      if (generation !== get().generation) return;
+      const total = results[0].total ?? s.total;
+      let cache = emptyCache();
+      results.forEach((r, i) => {
+        if (r.assets.length > 0) cache = insertPage(cache, pages[i], r.assets, pages);
+      });
+      const to = findAnchor(cache.pages, anchorId, from, total);
+      viewTop = to;
+      set((cur) => ({
+        ...cache,
+        total,
+        pinned: repin(
+          cur.pinned,
+          results.flatMap((r) => r.assets)
+        ),
+        epoch: cur.epoch + 1,
+        anchor: { from, to },
+        searchError: null,
+      }));
     } catch (e) {
-      // The loaded results belong to this same query, so keep them; the next event or search retries.
+      // The cached results belong to this same query, so keep them; the next event or search retries.
       console.error('Failed to refresh assets:', e);
+      get().ensurePages(get().wanted);
     }
+  },
+
+  assetAt: (index) => assetAt(get(), index),
+
+  getById: (id) => lookupAsset(get(), id),
+
+  patchCached: (ids, fn) => {
+    const s = get();
+    const patched = patchAssets(s, s.pinned, typeof ids === 'string' ? [ids] : ids, fn);
+    if (patched) set(patched);
   },
 
   patchAsset: async (id, patch) => {
     const updated = await api.updateAsset(id, patch);
-    set((s) => ({
-      assets: s.assets.map((a) => (a.id === id ? updated : a)),
-      assetMap: new Map(s.assetMap).set(id, updated),
-    }));
+    get().patchCached(id, () => updated);
   },
 
+  // Deletes shift every later index, so they refetch the wanted pages rather than splice (C4)
   deleteAsset: async (id, deleteFile = true) => {
     await api.deleteAsset(id, deleteFile);
-    set((s) => {
-      const assets = s.assets.filter((a) => a.id !== id);
-      const assetMap = new Map(s.assetMap);
-      assetMap.delete(id);
-      return { assets, total: Math.max(0, s.total - 1), assetMap };
-    });
-    const ui = useUIStore.getState();
-    if (ui.focusedAssetId === id) {
-      ui.focusAsset(null);
-    }
-    if (ui.selectedAssetIds.has(id)) {
-      const next = new Set(ui.selectedAssetIds);
-      next.delete(id);
-      ui.selectAll(Array.from(next));
-    }
+    deselectAssets([id]);
+    await get().refresh();
   },
 
   deleteAssets: async (ids, deleteFile = true) => {
-    const remove = (gone: string[]) => {
-      const goneSet = new Set(gone);
-      set((s) => {
-        const assets = s.assets.filter((a) => !goneSet.has(a.id));
-        const assetMap = new Map(s.assetMap);
-        for (const id of gone) assetMap.delete(id);
-        return { assets, total: Math.max(0, s.total - gone.length), assetMap };
-      });
-      deselectAssets(gone);
-    };
     try {
       await api.deleteAssets(ids, deleteFile);
     } catch (err) {
       // A partial failure names the assets that were not deleted; the rest are gone, so drop
       // them now rather than leave them selected for a second delete to send again.
       const failed = new Set((err as Partial<DeleteAssetsError> | null)?.failedIds ?? ids);
-      remove(ids.filter((id) => !failed.has(id)));
+      const gone = ids.filter((id) => !failed.has(id));
+      if (gone.length > 0) {
+        deselectAssets(gone);
+        await get().refresh();
+      }
       throw err;
     }
-    remove(ids);
+    deselectAssets(ids);
+    await get().refresh();
   },
 
   renameAsset: async (id, newName) => {
     const updated = await api.renameAsset(id, newName);
-    set((s) => ({
-      assets: s.assets.map((a) => (a.id === id ? updated : a)),
-      assetMap: new Map(s.assetMap).set(id, updated),
-    }));
+    get().patchCached(id, () => updated);
     return updated;
   },
 
   updateAssetPreview: (id, thumbnailPath, previewModel) => {
-    set((s) => {
-      const asset = s.assetMap.get(id);
-      if (!asset) return s;
-      const updated: Asset = {
-        ...asset,
-        thumbnailPath: thumbnailPath ?? undefined,
-        previewStatus: 'done',
-        metadata: previewModel
-          ? { ...asset.metadata, preview_model: previewModel }
-          : asset.metadata,
-      };
-      return {
-        assets: s.assets.map((a) => (a.id === id ? updated : a)),
-        assetMap: new Map(s.assetMap).set(id, updated),
-      };
-    });
+    get().patchCached(id, (asset) => ({
+      ...asset,
+      thumbnailPath: thumbnailPath ?? undefined,
+      previewStatus: 'done',
+      metadata: previewModel ? { ...asset.metadata, preview_model: previewModel } : asset.metadata,
+    }));
   },
 
   setPreviewStatus: (id, status) => {
-    set((s) => {
-      const asset = s.assetMap.get(id);
-      if (!asset) return s;
-      const updated: Asset = { ...asset, previewStatus: status };
-      return {
-        assets: s.assets.map((a) => (a.id === id ? updated : a)),
-        assetMap: new Map(s.assetMap).set(id, updated),
-      };
-    });
+    get().patchCached(id, (asset) => ({ ...asset, previewStatus: status }));
   },
 
-  getById: (id) => get().assetMap.get(id),
-
   refreshAssets: async (ids) => {
-    const loaded = ids.filter((id) => get().assetMap.has(id));
+    const loaded = ids.filter((id) => lookupAsset(get(), id));
     const fetched = await Promise.all(
       loaded.map((id) =>
         api.getAsset(id).catch((e) => {
@@ -437,13 +514,27 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
     );
     const updated = new Map(fetched.filter((a): a is Asset => a !== null).map((a) => [a.id, a]));
     if (updated.size === 0) return;
-    set((s) => {
-      const assetMap = new Map(s.assetMap);
-      for (const [id, asset] of updated) if (assetMap.has(id)) assetMap.set(id, asset);
-      return { assets: s.assets.map((a) => updated.get(a.id) ?? a), assetMap };
-    });
+    get().patchCached([...updated.keys()], (a) => updated.get(a.id) ?? a);
   },
 }));
+
+// Pins copies of the selected and focused assets, so evicting their pages keeps them (D3)
+useUIStore.subscribe((ui, prev) => {
+  if (ui.selectedAssetIds === prev.selectedAssetIds && ui.focusedAssetId === prev.focusedAssetId) {
+    return;
+  }
+  const s = useAssetStore.getState();
+  const ids = new Set(ui.selectedAssetIds);
+  if (ui.focusedAssetId) ids.add(ui.focusedAssetId);
+  const pinned = new Map<string, Asset>();
+  for (const id of ids) {
+    const asset = cachedAsset(s, id) ?? s.pinned.get(id);
+    if (asset) pinned.set(id, asset);
+  }
+  const same =
+    pinned.size === s.pinned.size && [...pinned].every(([id, a]) => s.pinned.get(id) === a);
+  if (!same) useAssetStore.setState({ pinned });
+});
 
 // ── Auto-tagging Store ────────────────────────────────────────────────────
 interface AutotagStore {
@@ -600,24 +691,10 @@ export const useCollectionStore = create<CollectionStore>()((set) => ({
         c.id === collectionId ? { ...c, assetIds: [...new Set([...c.assetIds, ...assetIds])] } : c
       ),
     }));
-    useAssetStore.setState((s) => {
-      const assets = s.assets.map((a) => {
-        if (assetIds.includes(a.id)) {
-          const cur = a.collections ?? [];
-          return { ...a, collections: [...new Set([...cur, collectionId])] };
-        }
-        return a;
-      });
-      const assetMap = new Map(s.assetMap);
-      for (const aid of assetIds) {
-        const a = assetMap.get(aid);
-        if (a) {
-          const cur = a.collections ?? [];
-          assetMap.set(aid, { ...a, collections: [...new Set([...cur, collectionId])] });
-        }
-      }
-      return { assets, assetMap };
-    });
+    useAssetStore.getState().patchCached(assetIds, (a) => ({
+      ...a,
+      collections: [...new Set([...(a.collections ?? []), collectionId])],
+    }));
   },
 
   removeFromCollection: async (collectionId, assetIds) => {
@@ -629,24 +706,10 @@ export const useCollectionStore = create<CollectionStore>()((set) => ({
           : c
       ),
     }));
-    useAssetStore.setState((s) => {
-      const assets = s.assets.map((a) => {
-        if (assetIds.includes(a.id)) {
-          const cur = a.collections ?? [];
-          return { ...a, collections: cur.filter((cid) => cid !== collectionId) };
-        }
-        return a;
-      });
-      const assetMap = new Map(s.assetMap);
-      for (const aid of assetIds) {
-        const a = assetMap.get(aid);
-        if (a) {
-          const cur = a.collections ?? [];
-          assetMap.set(aid, { ...a, collections: cur.filter((cid) => cid !== collectionId) });
-        }
-      }
-      return { assets, assetMap };
-    });
+    useAssetStore.getState().patchCached(assetIds, (a) => ({
+      ...a,
+      collections: (a.collections ?? []).filter((cid) => cid !== collectionId),
+    }));
   },
 
   deleteCollection: async (id) => {

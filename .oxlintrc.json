@@ -9,7 +9,9 @@
   },
   "rules": {
     // React Compiler rules. The app doesn't use the compiler, and the code they
-    // flag (resetting edit state on selection change, Date.now() in date filters) is intended.
+    // flag (resetting edit state on selection change, Date.now() in date filters, the
+    // virtualizer's non-memoizable API) is intended.
+    "react/incompatible-library": "off",
     "react/purity": "off",
     "react/set-state-in-effect": "off"
   }
