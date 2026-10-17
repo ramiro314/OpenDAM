@@ -46,6 +46,10 @@ corrections inside the approved decisions; no decision changed:
   thumbnail path, so a rerun would select them again. The pass now skips one whose preview job is
   still active, or whose thumbnail already has the source's size. The interruption test covers a
   small TGA and the job queue.
+- **A changed raster gets a new preview job.** The watcher's update path kept `preview_status =
+  'done'` and the old `thumbnail_path`, and queued nothing. So a small image that grew past 512 px
+  would never get a thumbnail. Now a changed raster is re-queued, and the image job applies the
+  size rule. When a job clears a thumbnail, it deletes the old file. Tests cover both.
 
 ## Problem
 
@@ -356,7 +360,20 @@ These callers move off `assets`, all in the same build step (step 3):
 
   `complete_job` needs an explicit clear, since today's `COALESCE(?, thumbnail_path)` keeps the old
   path. The `preview:done` event carries `thumbnailPath: null`, and `updateAssetPreview` clears the
-  path instead of keeping it.
+  path instead of keeping it. When the job clears a path that pointed at an existing `_thumb` file,
+  it deletes that file first and then clears the row, as the cleanup pass does. So an image that
+  shrank to 512 px or smaller leaves no orphaned thumbnail.
+- **Changed files (`watcher.rs`).** The update branch of `commit_asset_batch` runs only when a
+  file's size or modification time changed.
+  - Today it keeps `preview_status` at `'done'` through its `CASE`, keeps the old path through
+    `COALESCE(?, thumbnail_path)`, and queues a preview job only on insert. So a small PNG that grew
+    past 512 px would keep `thumbnail_path = NULL`, and every card would decode the full-size file.
+  - For a raster (png, jpg, jpeg, webp, bmp, gif, tga, tif, tiff), the update now sets
+    `preview_status = 'pending'` and inserts a `pending` preview job in the same batch transaction,
+    unless the asset already has an active one.
+  - The image queue then applies the rule above, writing, replacing or clearing the thumbnail. The
+    old thumbnail stays on screen until then.
+  - Other previewable kinds (models, PSD, EXR) keep today's update behavior (see Out of scope).
 - **Fallback (C9).** `isWebviewDisplayable(ext)` lives in `utils/`. The grid, list and detail panel
   all use it.
 - **One-time cleanup pass (D10, C10, C11).** It runs in the background for each open library after
@@ -578,7 +595,12 @@ Tests run by file, as `AGENTS.md` says. Each regression test must fail on `main`
     - A small PNG gets no thumbnail and `thumbnail_path` NULL.
     - A small TGA gets a native-size PNG.
     - A large PNG gets a 512 px thumbnail.
-    - A job over an existing thumbnail clears the path.
+    - A job for a source that shrank to 512 px or smaller deletes the old thumbnail file and clears
+      the path.
+  - `watcher`:
+    - A small PNG with no thumbnail is overwritten by a 1024 px version. The next index gives it a
+      `pending` preview job, and the image queue then writes a 512 px thumbnail.
+    - A changed raster that already has an active preview job doesn't get a second one.
   - The cleanup pass:
     - It clears small rasters and deletes their files.
     - It keeps large rasters and leaves model thumbnails alone.
@@ -620,9 +642,10 @@ implies:
      land here.
    - Checks U1-U5.
 4. **Navigation.** Keyboard paging and the scrub label. Checks U6-U7. Depends on step 3.
-5. **Thumbnails.** The no-upscale rule, the extension-based fallback and the cleanup pass.
-   Independent of step 3, apart from a small overlap in `AssetCard`'s image branch. Its tests
-   include the interrupted pass.
+5. **Thumbnails.** The no-upscale rule, the extension-based fallback, the watcher's re-queue of
+   changed rasters, and the cleanup pass. Independent of step 3, apart from a small overlap in
+   `AssetCard`'s image branch. Its tests include the interrupted pass and a PNG that grows past
+   512 px.
 6. **Image scaling toggle.** Check U8. After steps 3 and 5.
 7. **GPU default and mode comparison.** Independent. The comparison uses step 1's harness and
    `bench_render_mode` unchanged, and means most after step 3.
@@ -666,6 +689,8 @@ implies:
 
 - **SVG thumbnails.** The 5,907 SVGs are still rasterized from their originals. A Rust rasterizer
   such as `resvg` would be a follow-up.
+- **Stale thumbnails for other kinds.** When a model, PSD or EXR file changes, the watcher keeps
+  today's behavior and doesn't re-queue its preview. Only rasters are covered here.
 - **Arrow-key tile navigation** (D17 chose paging keys only).
 - **Natural sort**, so that `tile_2` comes before `tile_10`.
 - **Libraries beyond the WebKit layout height limit**, roughly half a million assets.
