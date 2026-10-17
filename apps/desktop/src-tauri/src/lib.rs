@@ -231,6 +231,7 @@ pub fn run() {
             commands::settings::test_provider,
             commands::settings::get_claude_plan_status,
             commands::autotag::list_autotag_providers,
+            commands::autotag::estimate_autotag_run,
             commands::autotag::start_autotag_run,
             commands::autotag::get_autotag_last_used,
             commands::autotag::get_autotag_suggestions,

@@ -5,6 +5,7 @@ import type {
   AutotagScope,
   AutotagSuggestion,
   AutotagTarget,
+  RunEstimate,
   RunSummary,
 } from '../types';
 
@@ -233,4 +234,30 @@ export function runUsage(run: RunSummary): string | null {
   if (tokens === 0) return null;
   const cost = run.access === 'claude_plan' ? 'on your plan' : formatCost(run.costUsd);
   return `${tokens.toLocaleString()} tokens · ${cost}`;
+}
+
+/**
+ * The run dialog's estimate: "120 assets · about $0.42", or "120 assets · 120 requests on your
+ * Claude plan".
+ */
+export function estimateSummary({ assets, estimate }: RunEstimate): string {
+  let usage: string;
+  if (estimate.kind === 'requests') {
+    usage = `${plural(estimate.count, 'request')} on your Claude plan`;
+  } else if (estimate.usd === null) {
+    usage = `cost unknown: no price for ${estimate.model ?? 'this model'}`;
+  } else {
+    usage = `about ${formatCost(estimate.usd)}`;
+  }
+  return `${plural(assets, 'asset')} · ${usage}`;
+}
+
+/** Why the run leaves assets out, one line per reason. */
+export function estimateSkips({ skipped, missing }: RunEstimate): string[] {
+  const lines = [];
+  if (skipped > 0) {
+    lines.push(`Skips ${plural(skipped, 'asset')} already queued in another run`);
+  }
+  if (missing > 0) lines.push(`Skips ${plural(missing, 'asset')} not in an open library`);
+  return lines;
 }

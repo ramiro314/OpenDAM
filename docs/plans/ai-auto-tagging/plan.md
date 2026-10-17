@@ -310,6 +310,9 @@ comes from ("from ANTHROPIC_API_KEY", "saved in keyring", "not set"), never the 
 - **Overlap (D13).** Creating a run leaves out assets that have a `queued` or `running` item in
   another run that is `queued`, `running` or `paused`. The response reports `queued` and
   `skipped` counts.
+  - **Built:** the item insert itself rechecks the overlap, so a run created at the same moment
+    can't take the same asset. A run left with nothing to tag is refused and not created.
+    `missing` counts assets no open library holds, which `skipped` used to count.
 - **Clear (D28)** removes a run from the Runs panel. It isn't offered while the run is `running`,
   `paused` or `undoing`.
   - **`undo_partial` run:** Clear asks first, then deletes every row of the run, `pending` ones
@@ -427,6 +430,15 @@ with no `proposed` field.
 A `pricing.rs` table gives per-model input and output prices for the run-dialog estimate and the
 running cost. The estimate per asset is: image tokens + text + vocabulary tokens (by length) +
 expected output. Update the table when prices change.
+- **Estimate (built):** `estimate_autotag_run(scope, provider, mode)` sends nothing and returns
+  the asset count, the skipped and missing counts, and a cost or a Claude-plan request count.
+  - **By length:** text counts at three bytes per token, an overestimate. Every asset is
+    counted with a 350-token thumbnail and a typical asset text. The expected output is 120
+    tokens plus 20 per tag or new name the caps allow.
+  - **Caching:** the cached system block is billed as one cache write, then cache reads, when
+    it reaches the 512-token caching minimum. Without that, a large catalog would read about
+    ten times its real cost.
+  - **Jev:** every question chunk of one asset, by length, at Jev's input-only rate.
 
 ### Settings and credentials
 

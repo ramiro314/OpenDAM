@@ -325,8 +325,26 @@ export type AutotagTarget =
 export interface StartedRun {
   run: RunSummary;
   queued: number;
-  /** Assets left out because no open library holds them */
+  /** Assets left out because another active run already has them queued */
   skipped: number;
+  /** Assets left out because no open library holds them */
+  missing: number;
+}
+
+/** What a run would use: a cost with an API key, or a request count on the Claude plan */
+export type AutotagEstimate =
+  | { kind: 'cost'; usd: number | null; model: string | null }
+  | { kind: 'requests'; count: number };
+
+/** What the run dialog shows before Start */
+export interface RunEstimate {
+  /** The assets the run would tag */
+  assets: number;
+  /** Assets it would leave out because another active run already has them queued */
+  skipped: number;
+  /** Assets it would leave out because no open library holds them */
+  missing: number;
+  estimate: AutotagEstimate;
 }
 
 /** The provider and mode of the last run started, which "Suggest tags" uses */

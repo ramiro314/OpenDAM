@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 
+use super::pricing::Estimate;
 use super::provider::{AssetInfo, ErrorClass, Mode, TagProvider, TagRequest, TagResult, Thumbnail};
 use super::review::{self, ProposalDecision, ReviewProposal};
 use super::settings::{self, AiSettings};
@@ -92,8 +93,32 @@ pub enum RunScope {
 pub struct StartedRun {
     pub run: RunSummary,
     pub queued: usize,
-    /// Assets left out because no open library holds them.
+    /// Assets left out because another active run already has them queued (D13).
     pub skipped: usize,
+    /// Assets left out because no open library holds them.
+    pub missing: usize,
+}
+
+/// What the run dialog shows before Start (D22).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunEstimate {
+    /// The assets the run would tag.
+    pub assets: usize,
+    /// Assets it would leave out because another active run already has them queued (D13).
+    pub skipped: usize,
+    /// Assets it would leave out because no open library holds them.
+    pub missing: usize,
+    pub estimate: Estimate,
+}
+
+/// A scope resolved to the assets an open library holds.
+struct ScopeItems {
+    /// `(asset id, library id)`.
+    items: Vec<(String, String)>,
+    /// The assets the scope named, found or not.
+    requested: usize,
+    label: String,
 }
 
 /// A "Suggest tags" run as the asset's Tags tab shows it.
@@ -493,9 +518,130 @@ impl Engine {
         self.queue_run(scope, provider_id, mode, false).await
     }
 
+    /// The assets `scope` covers in open libraries, with the run's label. A scope with nothing
+    /// to tag is refused.
+    async fn scope_items(&self, scope: RunScope, inline: bool) -> Result<ScopeItems, String> {
+        match scope {
+            RunScope::Assets { asset_ids } => {
+                if asset_ids.is_empty() {
+                    return Err("No assets to tag".into());
+                }
+                let items = store::locate_assets(&self.db, &asset_ids)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if items.is_empty() {
+                    return Err("None of these assets is in an open library".into());
+                }
+                let label = match items.len() {
+                    _ if inline => format!(
+                        "Suggest tags: {}",
+                        self.file_name(&items[0]).await.unwrap_or_default()
+                    ),
+                    1 => "1 asset".to_string(),
+                    n => format!("{n} assets"),
+                };
+                Ok(ScopeItems {
+                    items,
+                    requested: asset_ids.len(),
+                    label,
+                })
+            }
+            RunScope::Library {
+                library_id,
+                all_assets,
+            } => {
+                let lib = self
+                    .db
+                    .get_library_handle(&library_id)
+                    .await
+                    .ok_or("This library is offline")?;
+                let asset_ids = store::library_assets(&lib.pool, all_assets)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if asset_ids.is_empty() {
+                    return Err(if all_assets {
+                        format!("{} has no assets", lib.name)
+                    } else {
+                        format!("Every asset in {} already has a tag", lib.name)
+                    });
+                }
+                let label = if all_assets {
+                    format!("{}: all assets", lib.name)
+                } else {
+                    format!("{}: untagged assets", lib.name)
+                };
+                Ok(ScopeItems {
+                    requested: asset_ids.len(),
+                    items: asset_ids
+                        .into_iter()
+                        .map(|id| (id, lib.id.clone()))
+                        .collect(),
+                    label,
+                })
+            }
+        }
+    }
+
+    /// Leaves out the items another active run already has queued (D13), and returns how many
+    /// it left out. Refuses when that leaves nothing.
+    async fn drop_taken(&self, items: &mut Vec<(String, String)>) -> Result<usize, String> {
+        let taken = store::taken_elsewhere(&self.db.master_pool, items)
+            .await
+            .map_err(|e| e.to_string())?;
+        let before = items.len();
+        items.retain(|(asset_id, _)| !taken.contains(asset_id));
+        match items.len() {
+            0 if before == 1 => Err("This asset is already queued in another run".into()),
+            0 => Err("Every one of these assets is already queued in another run".into()),
+            n => Ok(before - n),
+        }
+    }
+
+    /// What a run over `scope` would cover and use, for the run dialog (D22): its assets, the
+    /// ones it would skip, and an estimated cost, or a request count on the Claude plan. Sends
+    /// nothing, and works whether or not the provider is set up.
+    pub async fn estimate_run(
+        &self,
+        scope: RunScope,
+        provider_id: &str,
+        mode: Mode,
+    ) -> Result<RunEstimate, String> {
+        let pool = self.pool(provider_id)?;
+        let master = &self.db.master_pool;
+        let settings = settings::load(master).await.map_err(|e| e.to_string())?;
+        let ScopeItems {
+            mut items,
+            requested,
+            ..
+        } = self.scope_items(scope, false).await?;
+        let missing = requested - items.len();
+        let skipped = self.drop_taken(&mut items).await?;
+        let provider = &pool.provider;
+        let sample = TagRequest {
+            run_id: String::new(),
+            mode,
+            access: provider.access(&settings).map(str::to_string),
+            model: provider.model(&settings),
+            max_tags: provider.max_tags(&settings),
+            max_proposals: provider.max_proposals(&settings),
+            threshold: provider.threshold(&settings),
+            asset: sample_asset(),
+            image: None,
+            vocabulary: Arc::new(Vocabulary::load(master).await.map_err(|e| e.to_string())?),
+            run_proposals: Vec::new(),
+        };
+        Ok(RunEstimate {
+            assets: items.len(),
+            skipped,
+            missing,
+            estimate: provider.estimate(&sample, items.len()),
+        })
+    }
+
     /// Queues a run over `scope`. Nothing is created, and nothing is sent, unless the provider
-    /// is set up and can do `mode`. An `inline` run is "Suggest tags" on one asset: it sends no
-    /// desktop notification. Every run started saves its provider and mode as last used.
+    /// is set up and can do `mode`. Assets another active run already has queued are left out
+    /// (D13). An `inline` run is "Suggest tags" on one asset: it sends no desktop notification.
+    /// Every run started saves its provider and mode as last used.
     pub async fn queue_run(
         &self,
         scope: RunScope,
@@ -522,61 +668,15 @@ impl Engine {
             return Err(format!("{label} can't do {}", mode.as_str()));
         }
 
-        let (items, requested, run_label) = match scope {
-            RunScope::Assets { asset_ids } => {
-                if asset_ids.is_empty() {
-                    return Err("No assets to tag".into());
-                }
-                let items = store::locate_assets(&self.db, &asset_ids)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if items.is_empty() {
-                    return Err("None of these assets is in an open library".into());
-                }
-                let run_label = match items.len() {
-                    _ if inline => format!(
-                        "Suggest tags: {}",
-                        self.file_name(&items[0]).await.unwrap_or_default()
-                    ),
-                    1 => "1 asset".to_string(),
-                    n => format!("{n} assets"),
-                };
-                (items, asset_ids.len(), run_label)
-            }
-            RunScope::Library {
-                library_id,
-                all_assets,
-            } => {
-                let lib = self
-                    .db
-                    .get_library_handle(&library_id)
-                    .await
-                    .ok_or("This library is offline")?;
-                let asset_ids = store::library_assets(&lib.pool, all_assets)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if asset_ids.is_empty() {
-                    return Err(if all_assets {
-                        format!("{} has no assets", lib.name)
-                    } else {
-                        format!("Every asset in {} already has a tag", lib.name)
-                    });
-                }
-                let run_label = if all_assets {
-                    format!("{}: all assets", lib.name)
-                } else {
-                    format!("{}: untagged assets", lib.name)
-                };
-                let n = asset_ids.len();
-                let items = asset_ids
-                    .into_iter()
-                    .map(|id| (id, lib.id.clone()))
-                    .collect();
-                (items, n, run_label)
-            }
-        };
+        let ScopeItems {
+            mut items,
+            requested,
+            label: run_label,
+        } = self.scope_items(scope, inline).await?;
+        let missing = requested - items.len();
+        let mut skipped = self.drop_taken(&mut items).await?;
         let id = uuid::Uuid::new_v4().to_string();
-        store::create_run(
+        let queued = store::create_run(
             &self.db.master_pool,
             NewRun {
                 id: &id,
@@ -596,6 +696,14 @@ impl Engine {
         )
         .await
         .map_err(|e| e.to_string())?;
+        // Another run took some of the assets while this one was being created
+        skipped += items.len() - queued;
+        if queued == 0 {
+            if let Err(e) = store::discard_run(&self.db.master_pool, &id).await {
+                tracing::warn!("Could not delete the empty auto-tag run {id}: {e}");
+            }
+            return Err("Every one of these assets is already queued in another run".into());
+        }
         tracing::info!("Started auto-tag run {id}: {} with {label}", run_label);
         let last = settings::LastUsed {
             provider: provider_id.to_string(),
@@ -616,8 +724,9 @@ impl Engine {
             .ok_or("The new run is missing")?;
         Ok(StartedRun {
             run,
-            queued: items.len(),
-            skipped: requested - items.len(),
+            queued,
+            skipped,
+            missing,
         })
     }
 
@@ -1066,6 +1175,17 @@ fn finish_notice(run: &RunSummary, status: &str) -> Notice {
 
 /// The thumbnail as a PNG at most `THUMBNAIL_EDGE` px on its long edge, or None when it can't
 /// be read: the request is then text only.
+/// A typical asset for the estimate: names and a path of usual length, and a little metadata.
+fn sample_asset() -> AssetInfo {
+    AssetInfo {
+        file_name: "barrel_wooden_large.glb".into(),
+        relative_path: "props/containers/barrel_wooden_large.glb".into(),
+        kind: "model".into(),
+        extension: "glb".into(),
+        metadata: serde_json::json!({ "vertices": 1240, "materials": 2, "animations": 0 }),
+    }
+}
+
 fn load_thumbnail(path: &Path) -> Option<Thumbnail> {
     let image = image::open(path)
         .map_err(|e| tracing::debug!("No thumbnail for tagging from {path:?}: {e}"))
@@ -1115,6 +1235,8 @@ mod tests {
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
         calls: Mutex<Vec<String>>,
+        /// Each estimate's asset count, cap and catalog size.
+        estimates: Mutex<Vec<(usize, u32, usize)>>,
     }
 
     impl TagProvider for Recording {
@@ -1138,6 +1260,14 @@ mod tests {
         }
         fn unavailable_reason(&self, _access: Option<&str>) -> Option<String> {
             self.unavailable.clone()
+        }
+        fn estimate(&self, sample: &TagRequest, assets: usize) -> Estimate {
+            self.estimates.lock().unwrap().push((
+                assets,
+                sample.max_tags,
+                sample.vocabulary.tags.len(),
+            ));
+            Estimate::Requests { count: assets }
         }
         fn tag<'a>(&'a self, request: &'a TagRequest) -> TagFuture<'a> {
             Box::pin(async move {
@@ -1920,6 +2050,8 @@ mod tests {
             .start_run(library(false), "recording", Mode::ExistingOnly)
             .await
             .unwrap();
+        // Ended, so it no longer holds its assets
+        engine.cancel_run(&untagged.run.id).await.unwrap();
         let all = engine
             .start_run(library(true), "recording", Mode::ExistingOnly)
             .await
@@ -1930,7 +2062,10 @@ mod tests {
             items_of(&engine, &untagged.run.id).await,
             [pair("a1"), pair("a3")]
         );
-        assert_eq!((untagged.queued, untagged.skipped), (2, 0));
+        assert_eq!(
+            (untagged.queued, untagged.skipped, untagged.missing),
+            (2, 0, 0)
+        );
         assert_eq!(untagged.run.label, "lib: untagged assets");
         assert_eq!(
             items_of(&engine, &all.run.id).await,
@@ -2002,7 +2137,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!((started.queued, started.skipped), (2, 1));
+        assert_eq!(
+            (started.queued, started.skipped, started.missing),
+            (2, 0, 1)
+        );
         sqlx::query("DELETE FROM assets WHERE id = 'a2'")
             .execute(&s.lib_pool)
             .await
@@ -3199,5 +3337,212 @@ mod tests {
                 mode: Mode::ExistingOnly,
             }
         );
+    }
+
+    /// Inserts a run with `status` holding each asset's item with its status.
+    async fn insert_run(master: &Pool<Sqlite>, id: &str, status: &str, items: &[(&str, &str)]) {
+        sqlx::query(
+            "INSERT INTO tag_runs (id, label, provider, mode, status, created_at)
+             VALUES (?, 'run', 'recording', 'existing_only', ?, 0)",
+        )
+        .bind(id)
+        .bind(status)
+        .execute(master)
+        .await
+        .unwrap();
+        for (asset, item_status) in items {
+            sqlx::query(
+                "INSERT INTO tag_run_items (run_id, asset_id, library_id, status)
+                 VALUES (?, ?, 'lib', ?)",
+            )
+            .bind(id)
+            .bind(asset)
+            .bind(item_status)
+            .execute(master)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// a1 is queued in a paused run and a2 in flight in a running one, so a new run skips
+    /// both. a3 is only in an ended run, and a4's item is done, so both are free again.
+    async fn overlapping_runs() -> Setup {
+        let s = setup(Recording::default(), &["a1", "a2", "a3", "a4"]).await;
+        let master = &s.engine.db.master_pool;
+        insert_run(master, "paused", "paused", &[("a1", "queued")]).await;
+        insert_run(
+            master,
+            "running",
+            "running",
+            &[("a2", "running"), ("a4", "done")],
+        )
+        .await;
+        insert_run(master, "cancelled", "cancelled", &[("a3", "skipped")]).await;
+        insert_run(master, "done", "done", &[("a4", "done")]).await;
+        s
+    }
+
+    #[tokio::test]
+    async fn a_new_run_skips_assets_another_active_run_has_queued() {
+        let s = overlapping_runs().await;
+
+        let started = s
+            .engine
+            .start_run(
+                scope(&["a1", "a2", "a3", "a4", "gone"]),
+                "recording",
+                Mode::ExistingOnly,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (started.queued, started.skipped, started.missing),
+            (2, 2, 1)
+        );
+        let items = items_of(&s.engine, &started.run.id).await;
+        let assets: Vec<&str> = items.iter().map(|(a, _)| a.as_str()).collect();
+        assert_eq!(assets, ["a3", "a4"]);
+    }
+
+    #[tokio::test]
+    async fn the_estimate_reports_the_same_assets_and_skips_without_sending_anything() {
+        let s = overlapping_runs().await;
+        let master = &s.engine.db.master_pool;
+        insert_tag(master, "t-rock", "Rock").await;
+        insert_tag(master, "t-wood", "Wood").await;
+        settings::update(master, serde_json::json!({"anthropic": {"maxTags": 5}}))
+            .await
+            .unwrap();
+
+        let estimate = s
+            .engine
+            .estimate_run(
+                scope(&["a1", "a2", "a3", "a4", "gone"]),
+                "recording",
+                Mode::ExistingOnly,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (estimate.assets, estimate.skipped, estimate.missing),
+            (2, 2, 1)
+        );
+        assert_eq!(estimate.estimate, Estimate::Requests { count: 2 });
+        // The provider was given the run's settings and the catalog, and asked nothing
+        assert_eq!(*s.provider.estimates.lock().unwrap(), [(2, 5, 2)]);
+        assert!(s.provider.calls.lock().unwrap().is_empty());
+        assert_eq!(count(master, "SELECT COUNT(*) FROM tag_runs").await, 4);
+    }
+
+    #[tokio::test]
+    async fn a_provider_not_set_up_still_gets_an_estimate() {
+        let s = setup(
+            Recording {
+                unavailable: Some("Set up Recording in Settings".into()),
+                ..Default::default()
+            },
+            &["a1"],
+        )
+        .await;
+
+        let estimate = s
+            .engine
+            .estimate_run(scope(&["a1"]), "recording", Mode::ExistingOnly)
+            .await
+            .unwrap();
+
+        assert_eq!(estimate.assets, 1);
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_assets_are_all_queued_elsewhere_is_refused_and_nothing_is_created() {
+        let s = overlapping_runs().await;
+        let master = &s.engine.db.master_pool;
+
+        let several = s
+            .engine
+            .start_run(scope(&["a1", "a2"]), "recording", Mode::ExistingOnly)
+            .await
+            .unwrap_err();
+        let estimate = s
+            .engine
+            .estimate_run(scope(&["a1", "a2"]), "recording", Mode::ExistingOnly)
+            .await
+            .unwrap_err();
+        let inline = s
+            .engine
+            .queue_run(scope(&["a1"]), "recording", Mode::ExistingOnly, true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            several,
+            "Every one of these assets is already queued in another run"
+        );
+        assert_eq!(estimate, several);
+        assert_eq!(inline, "This asset is already queued in another run");
+        assert_eq!(count(master, "SELECT COUNT(*) FROM tag_runs").await, 4);
+    }
+
+    #[tokio::test]
+    async fn a_library_run_skips_the_assets_another_run_has_queued() {
+        let s = overlapping_runs().await;
+
+        let started = s
+            .engine
+            .start_run(
+                RunScope::Library {
+                    library_id: "lib".into(),
+                    all_assets: true,
+                },
+                "recording",
+                Mode::ExistingOnly,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (started.queued, started.skipped, started.missing),
+            (2, 2, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_a_run_leaves_out_assets_another_run_took_meanwhile() {
+        let s = setup(Recording::default(), &["a1", "a2"]).await;
+        let master = &s.engine.db.master_pool;
+        // Taken after the new run checked, before its items went in
+        insert_run(master, "other", "queued", &[("a1", "queued")]).await;
+        let items = vec![
+            ("a1".to_string(), "lib".to_string()),
+            ("a2".into(), "lib".into()),
+        ];
+
+        let queued = store::create_run(
+            master,
+            NewRun {
+                id: "new",
+                label: "2 assets",
+                provider: "recording",
+                access: None,
+                model: None,
+                mode: "existing_only",
+                options: serde_json::json!({}),
+                inline: false,
+            },
+            &items,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(queued, 1);
+        let assets: Vec<String> =
+            sqlx::query_scalar("SELECT asset_id FROM tag_run_items WHERE run_id = 'new'")
+                .fetch_all(master)
+                .await
+                .unwrap();
+        assert_eq!(assets, ["a2"]);
     }
 }

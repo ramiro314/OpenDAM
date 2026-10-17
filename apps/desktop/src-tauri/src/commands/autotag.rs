@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tauri::State;
 
-use crate::autotag::engine::{ProviderOption, RunScope, StartedRun, Suggestion};
+use crate::autotag::engine::{ProviderOption, RunEstimate, RunScope, StartedRun, Suggestion};
 use crate::autotag::provider::Mode;
 use crate::autotag::review::{ProposalDecision, ReviewProposal};
 use crate::autotag::settings::LastUsed;
@@ -18,8 +18,21 @@ pub async fn list_autotag_providers(
     state.autotag.provider_options().await
 }
 
+/// What a run over `scope` would cover before it starts: its asset count, the assets it would
+/// skip because another active run has them queued, and an estimated cost with an API key or a
+/// request count on the Claude plan. There is no budget cap.
+#[tauri::command]
+pub async fn estimate_autotag_run(
+    scope: RunScope,
+    provider: String,
+    mode: Mode,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RunEstimate> {
+    state.autotag.estimate_run(scope, &provider, mode).await
+}
+
 /// Starts a background run over chosen assets, or over a library's untagged assets (every
-/// asset with `allAssets`). An `inline` run is "Suggest tags" on one asset, which sends no
+/// asset with `allAssets`), leaving out assets another active run has queued. An `inline` run is "Suggest tags" on one asset, which sends no
 /// desktop notification. Progress arrives as `autotag:updated` events.
 #[tauri::command]
 pub async fn start_autotag_run(

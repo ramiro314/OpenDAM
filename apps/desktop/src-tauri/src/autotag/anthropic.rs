@@ -19,7 +19,7 @@ use std::time::Duration;
 use super::claude_cli::ClaudeCli;
 use super::credentials::{self, Credentials};
 use super::http::{self, classify_status, retry_after};
-use super::pricing::{self, TokenUsage};
+use super::pricing::{self, tokens_by_length, Estimate, RequestTokens, TokenUsage};
 use super::provider::{
     AssetInfo, ErrorClass, Mode, ProposedTag, ProviderError, TagFuture, TagProvider, TagRequest,
     TagResult, Thumbnail, Usage,
@@ -33,6 +33,13 @@ const API_VERSION: &str = "2023-06-01";
 pub const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 /// Room for low-effort thinking plus the answer, which is about 100 tokens.
 const MAX_TOKENS: u32 = 2048;
+
+/// A thumbnail downscaled to 512 px, at about width x height / 750 tokens.
+const IMAGE_TOKENS: i64 = 350;
+/// The expected output: low-effort thinking and the answer's JSON, about 120 tokens in the
+/// recorded responses, plus about 20 for each tag id or name it holds.
+const OUTPUT_TOKENS: i64 = 120;
+const OUTPUT_TOKENS_PER_TAG: i64 = 20;
 
 /// Models with a server-side refusal fallback. Haiku 5.5 has none, and a custom id may not.
 fn supports_fallback(model: &str) -> bool {
@@ -201,6 +208,23 @@ pub(crate) fn system_text(request: &TagRequest) -> String {
         max_proposals,
         &request.vocabulary,
     )
+}
+
+/// One asset's request by length, for the run dialog's estimate: the cached system block (the
+/// instructions and catalog vocabulary), a thumbnail plus the asset text, and an answer with as
+/// many tags and new names as the caps allow. Every asset is counted with a thumbnail.
+pub(crate) fn request_tokens(request: &TagRequest) -> RequestTokens {
+    let max_proposals = if request.mode == Mode::ExistingOnly {
+        0
+    } else {
+        request.max_proposals
+    };
+    let text = asset_text(&request.asset, &request.run_proposals, &request.vocabulary);
+    RequestTokens {
+        shared: tokens_by_length(&system_text(request)) as i64,
+        own: IMAGE_TOKENS + tokens_by_length(&text) as i64,
+        output: OUTPUT_TOKENS + OUTPUT_TOKENS_PER_TAG * i64::from(request.max_tags + max_proposals),
+    }
 }
 
 /// The production request for one asset.
@@ -721,6 +745,18 @@ impl TagProvider for AnthropicProvider {
             return Some("Set up Anthropic in Settings".into());
         }
         None
+    }
+
+    /// A cost with an API key, or a request count on the Claude plan, which bills no tokens.
+    fn estimate(&self, sample: &TagRequest, assets: usize) -> Estimate {
+        if sample.access.as_deref() == Some(AnthropicAccess::ClaudePlan.as_str()) {
+            return Estimate::Requests { count: assets };
+        }
+        let model = sample.model.as_deref().unwrap_or(DEFAULT_ANTHROPIC_MODEL);
+        Estimate::Cost {
+            usd: pricing::estimate_usd(model, request_tokens(sample), assets),
+            model: Some(model.to_string()),
+        }
     }
 
     fn tag<'a>(&'a self, request: &'a TagRequest) -> TagFuture<'a> {
@@ -1360,5 +1396,87 @@ mod tests {
         let image = test_image();
         let decoded = image::load_from_memory(&image.data).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (64, 64));
+    }
+
+    #[test]
+    fn an_estimate_counts_the_vocabulary_by_length_a_thumbnail_the_text_and_the_answer() {
+        let existing = request(Mode::ExistingOnly, false);
+        let prefer = request(Mode::PreferExisting, false);
+
+        let tokens = request_tokens(&existing);
+        assert_eq!(
+            tokens.shared,
+            tokens_by_length(&system_text(&existing)) as i64
+        );
+        let text = asset_text(&existing.asset, &[], &existing.vocabulary);
+        assert_eq!(tokens.own, 350 + tokens_by_length(&text) as i64);
+        // 8 tags; Prefer existing adds room for 3 new names
+        assert_eq!(tokens.output, 120 + 20 * 8);
+        assert_eq!(request_tokens(&prefer).output, 120 + 20 * 11);
+    }
+
+    #[test]
+    fn api_key_access_estimates_a_cost_from_the_pricing_table() {
+        let anthropic = provider("http://unused", None);
+        let sample = request(Mode::ExistingOnly, false);
+
+        let estimate = anthropic.estimate(&sample, 40);
+
+        let usd = pricing::estimate_usd("claude-sonnet-5-5", request_tokens(&sample), 40);
+        assert!(usd.unwrap() > 0.0);
+        assert_eq!(
+            estimate,
+            Estimate::Cost {
+                usd,
+                model: Some("claude-sonnet-5-5".into())
+            }
+        );
+    }
+
+    #[test]
+    fn a_larger_catalog_or_a_pricier_model_raises_the_estimate() {
+        let anthropic = provider("http://unused", None);
+        let usd = |request: &TagRequest| match anthropic.estimate(request, 100) {
+            Estimate::Cost { usd, .. } => usd.unwrap(),
+            other => panic!("{other:?}"),
+        };
+        let small = request(Mode::ExistingOnly, false);
+        let mut large = small.clone();
+        let rows: Vec<TagRow> = (0..2_000)
+            .map(|i| row(&format!("tag-{i}"), &format!("Tag {i}"), None, "a hint"))
+            .collect();
+        large.vocabulary = Arc::new(Vocabulary::from_rows(&rows));
+        let mut opus = small.clone();
+        opus.model = Some("claude-opus-5-5".into());
+
+        assert!(usd(&large) > usd(&small));
+        assert!(usd(&opus) > usd(&small));
+    }
+
+    #[test]
+    fn a_custom_model_has_no_price_to_estimate() {
+        let anthropic = provider("http://unused", None);
+        let mut sample = request(Mode::ExistingOnly, false);
+        sample.model = Some("my-custom-model".into());
+
+        assert_eq!(
+            anthropic.estimate(&sample, 10),
+            Estimate::Cost {
+                usd: None,
+                model: Some("my-custom-model".into())
+            }
+        );
+    }
+
+    #[test]
+    fn claude_plan_access_estimates_one_request_per_asset() {
+        let anthropic = provider("http://unused", None);
+        let mut sample = request(Mode::PreferExisting, false);
+        sample.access = Some(AnthropicAccess::ClaudePlan.as_str().into());
+
+        assert_eq!(
+            anthropic.estimate(&sample, 40),
+            Estimate::Requests { count: 40 }
+        );
     }
 }
