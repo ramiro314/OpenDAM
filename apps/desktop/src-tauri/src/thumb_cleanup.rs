@@ -57,8 +57,17 @@ async fn run_libraries(libs: &[LibraryHandle], library_id: Option<&str>, on_fini
     }
 }
 
-/// An asset with a thumbnail: (id, file_path, lowercase extension, thumbnail_path).
-type Candidate = (String, String, String, String);
+/// An asset with a thumbnail, as the pass read it.
+#[derive(Clone, sqlx::FromRow)]
+struct Candidate {
+    id: String,
+    file_path: String,
+    /// Lowercase.
+    extension: String,
+    thumbnail_path: String,
+    modified_at: i64,
+    size_bytes: i64,
+}
 
 enum Action {
     /// Delete the thumbnail file and clear `thumbnail_path`.
@@ -85,19 +94,58 @@ pub(crate) async fn run_pass(
     if done.as_deref() == Some("done") {
         return Ok(Pass::AlreadyDone);
     }
+    let candidates = read_candidates(lib).await?;
+    process(lib, &candidates, batch_size, stop_before_commit).await
+}
 
-    // Only rasters: a model's thumbnail is also named `<id>_thumb.png`. An asset with an active
-    // job is left to it, since the job applies the size rule and deletes the old file itself.
-    let candidates: Vec<Candidate> = sqlx::query_as(&format!(
-        "SELECT a.id, a.file_path, lower(a.extension), a.thumbnail_path FROM assets a
+/// Only rasters: a model's thumbnail is also named `<id>_thumb.png`. An asset with an active job
+/// is left to it, since the job applies the size rule and deletes the old file itself.
+async fn read_candidates(lib: &LibraryHandle) -> sqlx::Result<Vec<Candidate>> {
+    sqlx::query_as(&format!(
+        "SELECT a.id, a.file_path, lower(a.extension) AS extension, a.thumbnail_path,
+                a.modified_at, a.size_bytes
+         FROM assets a
          WHERE a.thumbnail_path IS NOT NULL AND lower(a.extension) IN {NATIVE_EXTS_SQL}
          AND NOT EXISTS (SELECT 1 FROM preview_jobs p
                          WHERE p.asset_id = a.id AND p.status IN {ACTIVE_JOB_STATUSES})
          ORDER BY a.rowid"
     ))
     .fetch_all(&lib.pool)
-    .await?;
+    .await
+}
 
+/// Matches a candidate's row only while it is as the pass read it: the same thumbnail path,
+/// source size and modification time, and no active job. Thumbnail names are fixed per asset, so
+/// a job that rewrote the thumbnail since keeps the path; but the watcher records a changed
+/// source before it queues that job, and a job that hasn't finished is active.
+fn unchanged_sql() -> String {
+    format!(
+        "id = ? AND thumbnail_path = ? AND modified_at = ? AND size_bytes = ?
+         AND NOT EXISTS (SELECT 1 FROM preview_jobs p
+                         WHERE p.asset_id = assets.id AND p.status IN {ACTIVE_JOB_STATUSES})"
+    )
+}
+
+/// Whether `c`'s row is still as the pass read it (see `unchanged_sql`).
+async fn unchanged(pool: &sqlx::Pool<sqlx::Sqlite>, c: &Candidate) -> sqlx::Result<bool> {
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM assets WHERE {})",
+        unchanged_sql()
+    ))
+    .bind(&c.id)
+    .bind(&c.thumbnail_path)
+    .bind(c.modified_at)
+    .bind(c.size_bytes)
+    .fetch_one(pool)
+    .await
+}
+
+async fn process(
+    lib: &LibraryHandle,
+    candidates: &[Candidate],
+    batch_size: usize,
+    stop_before_commit: Option<usize>,
+) -> Result<Pass> {
     let (mut cleared, mut requeued) = (0, 0);
     for (batch_no, batch) in candidates.chunks(batch_size).enumerate() {
         let root = lib.root_path.clone();
@@ -110,9 +158,20 @@ pub(crate) async fn run_pass(
         })
         .await?;
 
-        for (c, action) in &actions {
-            if let (Action::Clear, Some(file)) = (action, owned_thumb_file(&lib.root_path, &c.3)) {
-                remove_thumb_file(&file).await;
+        // Reading headers takes a while, so a row is checked again right before its file goes:
+        // a job may have rewritten the thumbnail under the same name since.
+        let mut to_clear = Vec::new();
+        let mut to_requeue = Vec::new();
+        for (c, action) in actions {
+            match action {
+                Action::Clear if unchanged(&lib.pool, &c).await? => {
+                    if let Some(file) = owned_thumb_file(&lib.root_path, &c.thumbnail_path) {
+                        remove_thumb_file(&file).await;
+                    }
+                    to_clear.push(c);
+                }
+                Action::Clear => {}
+                Action::Requeue => to_requeue.push(c),
             }
         }
         if stop_before_commit == Some(batch_no) {
@@ -121,39 +180,38 @@ pub(crate) async fn run_pass(
 
         let now = chrono::Utc::now().timestamp_millis();
         let mut tx = lib.pool.begin().await?;
-        for ((id, _, _, thumb), action) in &actions {
-            match action {
-                Action::Clear => {
-                    // Unless a job changed the row since it was read.
-                    sqlx::query(
-                        "UPDATE assets SET thumbnail_path = NULL WHERE id = ? AND thumbnail_path = ?",
-                    )
-                    .bind(id)
-                    .bind(thumb)
-                    .execute(&mut *tx)
-                    .await?;
-                    cleared += 1;
-                }
-                Action::Requeue => {
-                    sqlx::query("UPDATE assets SET preview_status = 'pending' WHERE id = ?")
-                        .bind(id)
-                        .execute(&mut *tx)
-                        .await?;
-                    sqlx::query(&format!(
-                        "INSERT INTO preview_jobs (id, asset_id, status, created_at)
-                         SELECT ?, ?, 'pending', ? WHERE NOT EXISTS (
-                             SELECT 1 FROM preview_jobs WHERE asset_id = ?
-                             AND status IN {ACTIVE_JOB_STATUSES})"
-                    ))
-                    .bind(Uuid::new_v4().to_string())
-                    .bind(id)
-                    .bind(now)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-                    requeued += 1;
-                }
-            }
+        for c in &to_clear {
+            // The same check: a row a job took over in the meantime keeps its new thumbnail.
+            cleared += sqlx::query(&format!(
+                "UPDATE assets SET thumbnail_path = NULL WHERE {}",
+                unchanged_sql()
+            ))
+            .bind(&c.id)
+            .bind(&c.thumbnail_path)
+            .bind(c.modified_at)
+            .bind(c.size_bytes)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        for c in &to_requeue {
+            sqlx::query("UPDATE assets SET preview_status = 'pending' WHERE id = ?")
+                .bind(&c.id)
+                .execute(&mut *tx)
+                .await?;
+            requeued += sqlx::query(&format!(
+                "INSERT INTO preview_jobs (id, asset_id, status, created_at)
+                 SELECT ?, ?, 'pending', ? WHERE NOT EXISTS (
+                     SELECT 1 FROM preview_jobs WHERE asset_id = ?
+                     AND status IN {ACTIVE_JOB_STATUSES})"
+            ))
+            .bind(Uuid::new_v4().to_string())
+            .bind(&c.id)
+            .bind(now)
+            .bind(&c.id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         }
         tx.commit().await?;
     }
@@ -178,19 +236,19 @@ pub(crate) async fn run_pass(
 /// What the pass does with one candidate, from image headers alone. Sources larger than
 /// `THUMB_SIZE`, missing or unreadable get nothing, nor does a small TGA or TIFF whose thumbnail
 /// already has its size.
-fn classify(root: &Path, (_, file_path, ext, thumb): &Candidate) -> Option<Action> {
+fn classify(root: &Path, c: &Candidate) -> Option<Action> {
     let dimensions = |rel: &str| {
         let path = PathBuf::from(resolve_path(root, rel));
         catch_decoder_panic(|| Ok(image::image_dimensions(&path)?)).ok()
     };
-    let (width, height) = dimensions(file_path)?;
+    let (width, height) = dimensions(&c.file_path)?;
     if width.max(height) > THUMB_SIZE {
         return None;
     }
-    if is_webview_displayable(ext) {
+    if is_webview_displayable(&c.extension) {
         return Some(Action::Clear);
     }
-    (dimensions(thumb) != Some((width, height))).then_some(Action::Requeue)
+    (dimensions(&c.thumbnail_path) != Some((width, height))).then_some(Action::Requeue)
 }
 
 #[cfg(test)]
@@ -541,5 +599,47 @@ mod tests {
         assert_eq!(meta(&libs[0]).await.as_deref(), Some("done"));
         run_libraries(&libs, None, count).await;
         assert_eq!(finished_so_far(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_thumbnail_a_job_rewrites_after_the_pass_reads_its_row_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let thumbs = root.join(".opendam/thumbs");
+        let pool = crate::db::memory_library_pool().await;
+        for id in ["grown", "regen", "still"] {
+            write_image(&root.join(format!("tex/{id}.png")), 32, 32);
+            write_image(&thumbs.join(format!("{id}_thumb.png")), 64, 64);
+            let thumb = format!(".opendam/thumbs/{id}_thumb.png");
+            add_asset(&pool, id, &format!("tex/{id}.png"), &thumb).await;
+        }
+        let lib = handle(root, "lib", pool);
+        let candidates = read_candidates(&lib).await.unwrap();
+
+        // Meanwhile: `grown` changed and its finished job rewrote the thumbnail under the same
+        // name, but the pass still holds the old header; `regen` got a job of its own.
+        sqlx::query("UPDATE assets SET modified_at = 1, size_bytes = 9 WHERE id = 'grown'")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO preview_jobs (id, asset_id, status, created_at) VALUES ('j', 'regen', 'processing', 0)",
+        )
+        .execute(&lib.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            process(&lib, &candidates, 200, None).await.unwrap(),
+            Pass::Finished
+        );
+
+        assert_eq!(
+            kept_and_queued(&lib).await,
+            (vec!["grown".into(), "regen".into()], vec!["regen".into()])
+        );
+        assert!(thumbs.join("grown_thumb.png").exists());
+        assert!(thumbs.join("regen_thumb.png").exists());
+        assert!(!thumbs.join("still_thumb.png").exists());
     }
 }
