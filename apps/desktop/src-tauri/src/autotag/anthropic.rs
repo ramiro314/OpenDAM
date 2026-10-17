@@ -727,26 +727,47 @@ pub(crate) mod mock {
 
     /// Answers every request with `status`, the extra `headers` and `body`.
     pub async fn serve(status: u16, headers: &[(&str, &str)], body: &str) -> MockApi {
+        serve_sequence(&[(status, headers, body)]).await
+    }
+
+    /// A status, extra headers and a body.
+    pub type Reply<'a> = (u16, &'a [(&'a str, &'a str)], &'a str);
+
+    /// Answers the requests in the order they arrive with `replies`, one each, then repeats the
+    /// last one.
+    pub async fn serve_sequence(replies: &[Reply<'_>]) -> MockApi {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let received = Arc::new(Mutex::new(Vec::new()));
-        let mut reply = format!(
-            "HTTP/1.1 {status} Mock\r\ncontent-type: application/json\r\n\
-             content-length: {}\r\nconnection: close\r\n",
-            body.len()
+        let replies: Arc<Vec<String>> = Arc::new(
+            replies
+                .iter()
+                .map(|(status, headers, body)| {
+                    let mut reply = format!(
+                        "HTTP/1.1 {status} Mock\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n",
+                        body.len()
+                    );
+                    for (name, value) in *headers {
+                        reply.push_str(&format!("{name}: {value}\r\n"));
+                    }
+                    reply.push_str("\r\n");
+                    reply.push_str(body);
+                    reply
+                })
+                .collect(),
         );
-        for (name, value) in headers {
-            reply.push_str(&format!("{name}: {value}\r\n"));
-        }
-        reply.push_str("\r\n");
-        reply.push_str(body);
         let recorded = received.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let (recorded, reply) = (recorded.clone(), reply.clone());
+                let (recorded, replies) = (recorded.clone(), replies.clone());
                 tokio::spawn(async move {
                     if let Some(request) = read_request(&mut socket).await {
-                        recorded.lock().unwrap().push(request);
+                        let reply = {
+                            let mut recorded = recorded.lock().unwrap();
+                            recorded.push(request);
+                            replies[(recorded.len() - 1).min(replies.len() - 1)].clone()
+                        };
                         let _ = socket.write_all(reply.as_bytes()).await;
                         let _ = socket.shutdown().await;
                     }

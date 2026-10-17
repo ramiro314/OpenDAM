@@ -117,11 +117,6 @@ fn build_requests_within(request: &TagRequest, budget: usize) -> Vec<JevRequest>
     requests
 }
 
-/// The requests for one asset: none for an empty catalog.
-pub fn build_requests(request: &TagRequest) -> Vec<JevRequest> {
-    build_requests_within(request, REQUEST_TOKEN_BUDGET)
-}
-
 #[derive(Debug, Deserialize)]
 struct Response {
     #[serde(default)]
@@ -314,6 +309,8 @@ pub struct JevProvider {
     credentials: Arc<Credentials>,
     base_url: String,
     http: Result<reqwest::Client, String>,
+    /// Estimated tokens per request; tests lower it to split a small catalog.
+    budget: usize,
 }
 
 impl JevProvider {
@@ -333,6 +330,7 @@ impl JevProvider {
             credentials,
             base_url: base_url.trim_end_matches('/').to_string(),
             http: http::client(),
+            budget: REQUEST_TOKEN_BUDGET,
         }
     }
 
@@ -372,7 +370,7 @@ impl JevProvider {
     /// Every tag's score for one asset, one request per chunk of questions, sent one after
     /// another so a run stays within its requests-in-flight setting. Usage is summed.
     async fn score(&self, request: &TagRequest) -> Result<Scores, ProviderError> {
-        let requests = build_requests(request);
+        let requests = build_requests_within(request, self.budget);
         let mut total = Scores {
             scores: Vec::new(),
             model: MODEL.to_string(),
@@ -575,6 +573,11 @@ mod tests {
             })
             .collect();
         Vocabulary::from_rows(&rows)
+    }
+
+    /// The production requests for one asset: none for an empty catalog.
+    fn build_requests(request: &TagRequest) -> Vec<JevRequest> {
+        build_requests_within(request, REQUEST_TOKEN_BUDGET)
     }
 
     fn test_ids() -> JevRequest {
@@ -851,6 +854,85 @@ mod tests {
         assert_eq!(error.retry_after, Some(Duration::from_secs(3)));
     }
 
+    /// One answer per question of the test catalog, in its own response, with its own usage.
+    fn one_answer(question: usize, noul: f64) -> String {
+        format!(
+            r#"{{"model":"jev-1.14.0","answers":{{"q{question}":{{"type":"noul","noul":{noul}}}}},
+                "usage":{{"input_tokens":{},"output_tokens":20}}}}"#,
+            100 + question
+        )
+    }
+
+    #[tokio::test]
+    async fn scores_and_usage_from_every_chunk_are_combined() {
+        // The test catalog's scores, one question per request
+        let nouls = [0.66, 0.03, 0.93, 0.70, 0.97, 0.08];
+        let bodies: Vec<String> = nouls
+            .iter()
+            .enumerate()
+            .map(|(q, noul)| one_answer(q, *noul))
+            .collect();
+        let replies: Vec<mock::Reply> = bodies.iter().map(|b| (200, &[][..], b.as_str())).collect();
+        let api = mock::serve_sequence(&replies).await;
+        let mut jev = provider(&api.url, Some("key"));
+        jev.budget = 0;
+
+        let result = jev.tag(&test_request(0.7, 8)).await.unwrap();
+
+        let received = api.received();
+        assert_eq!(received.len(), 6, "one request per question");
+        for (q, request) in received.iter().enumerate() {
+            let body: Value = serde_json::from_str(&request.body).unwrap();
+            let questions: Vec<&String> = body["questions"].as_object().unwrap().keys().collect();
+            assert_eq!(questions, [&format!("q{q}")]);
+        }
+        assert_eq!(
+            result.existing,
+            ["test-material-brick", "test-color-red", "test-material"],
+            "highest first across chunks 5, 3 and 4"
+        );
+        let input: i64 = (100..106).sum();
+        assert_eq!(result.usage.input_tokens, input);
+        assert_eq!(result.usage.output_tokens, 6 * 20);
+        assert!((result.usage.cost_usd - input as f64 * 0.042 / 1e6).abs() < 1e-15);
+    }
+
+    #[tokio::test]
+    async fn a_failing_chunk_fails_the_asset_with_its_class_and_stops() {
+        let first = one_answer(0, 0.9);
+        let api = mock::serve_sequence(&[
+            (200, &[], first.as_str()),
+            (401, &[], r#"{"detail":"Invalid API key"}"#),
+            (200, &[], first.as_str()),
+        ])
+        .await;
+        let mut jev = provider(&api.url, Some("key"));
+        jev.budget = 0;
+
+        let error = jev.tag(&test_request(0.7, 8)).await.unwrap_err();
+
+        assert_eq!(error.class, ErrorClass::Fatal);
+        assert_eq!(
+            error.message,
+            "TypeSafe rejected the Jev API key (401 Invalid API key)"
+        );
+        assert_eq!(api.received().len(), 2, "no request after the failure");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_api_is_retryable() {
+        let jev = provider("http://127.0.0.1:1", Some("key"));
+
+        let error = jev.tag(&test_request(0.7, 8)).await.unwrap_err();
+
+        assert_eq!(error.class, ErrorClass::Retryable, "{}", error.message);
+        assert!(
+            error.message.starts_with("Could not reach the Jev API: "),
+            "{}",
+            error.message
+        );
+    }
+
     #[tokio::test]
     async fn with_no_key_nothing_is_sent() {
         let api = mock::serve(200, &[], SCORES).await;
@@ -896,8 +978,8 @@ mod tests {
         assert!(!jev.sees_images());
     }
 
-    /// The threshold and cap saved in Settings when a run starts reach the request, through the
-    /// run's options, and the run's cost is priced at Jev's rate.
+    /// The threshold saved in Settings when a run starts reaches the request through the run's
+    /// options, and the run's cost is priced at Jev's rate.
     #[tokio::test]
     async fn a_run_keeps_the_tags_its_settings_allow() {
         use crate::autotag::engine::{Engine, RunScope};
@@ -927,7 +1009,7 @@ mod tests {
         }
         settings::update(
             &db.master_pool,
-            json!({"jev": {"threshold": 0.9, "maxTags": 1}}),
+            json!({"jev": {"threshold": 0.95, "maxTags": 8}}),
         )
         .await
         .unwrap();
@@ -965,7 +1047,11 @@ mod tests {
                 .fetch_all(&lib_pool)
                 .await
                 .unwrap();
-        assert_eq!(tags, ["test-material-brick"], "0.9 and at most 1");
+        assert_eq!(
+            tags,
+            ["test-material-brick"],
+            "0.95 keeps Brick alone, where the 0.7 default would add Red and Material"
+        );
         let body: Value = serde_json::from_str(&api.received()[0].body).unwrap();
         assert_eq!(body["questions"].as_object().unwrap().len(), 6);
     }
