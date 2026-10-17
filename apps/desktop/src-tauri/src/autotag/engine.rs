@@ -2640,6 +2640,110 @@ mod tests {
         );
     }
 
+    /// Starts a run and waits until it ends `status`. Returns its id.
+    async fn run_until(
+        engine: &Engine,
+        assets: &[&str],
+        mode: Mode,
+        inline: bool,
+        status: &str,
+    ) -> String {
+        let id = engine
+            .queue_run(scope(assets), "recording", mode, inline)
+            .await
+            .unwrap()
+            .run
+            .id;
+        wait_for(engine, |runs| {
+            runs.iter().any(|r| r.id == id && r.status == status)
+        })
+        .await;
+        id
+    }
+
+    #[tokio::test]
+    async fn suggestions_list_the_newest_inline_run_then_older_ones_still_under_review() {
+        let s = setup(
+            Recording {
+                proposed: [("a1.glb".to_string(), vec![proposal("Moss", None)])]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            &["a1", "a2"],
+        )
+        .await;
+        let master = &s.engine.db.master_pool;
+        s.engine.start().await;
+        let e = &s.engine;
+
+        let done = run_until(e, &["a1"], Mode::ExistingOnly, true, "done").await;
+        let review = run_until(e, &["a1"], Mode::PreferExisting, true, "awaiting_review").await;
+        let cancelled = run_until(e, &["a1"], Mode::PreferExisting, true, "awaiting_review").await;
+        sqlx::query("UPDATE tag_runs SET status = 'cancelled' WHERE id = ?")
+            .bind(&cancelled)
+            .execute(master)
+            .await
+            .unwrap();
+        let reviewed = run_until(e, &["a1"], Mode::PreferExisting, true, "awaiting_review").await;
+        let moss = e.proposals(&reviewed).await.unwrap()[0].id.clone();
+        e.review_proposals(
+            &reviewed,
+            vec![ProposalDecision::Reject { proposal_id: moss }],
+        )
+        .await
+        .unwrap();
+        let batch = run_until(
+            e,
+            &["a1", "a2"],
+            Mode::PreferExisting,
+            false,
+            "awaiting_review",
+        )
+        .await;
+        let newest = run_until(e, &["a1"], Mode::ExistingOnly, true, "done").await;
+
+        let suggestions = e.suggestions("a1").await.unwrap();
+
+        let listed: Vec<(&str, usize)> = suggestions
+            .iter()
+            .map(|s| (s.run.id.as_str(), s.proposals.len()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (newest.as_str(), 0),
+                (cancelled.as_str(), 1),
+                (review.as_str(), 1),
+            ],
+            "newest first; older inline runs only with proposals waiting; never the \
+             non-inline run {batch}, the done run {done} or the fully reviewed run {reviewed}"
+        );
+        assert_eq!(suggestions[1].proposals[0].name, "Moss");
+        assert!(suggestions.iter().all(|s| s.error.is_none()));
+    }
+
+    #[tokio::test]
+    async fn suggestions_carry_the_error_of_a_failed_inline_item() {
+        let s = setup(
+            Recording {
+                failures: failures(vec![ProviderError::new(ErrorClass::Item, "Refused")]),
+                ..Default::default()
+            },
+            &["a1"],
+        )
+        .await;
+        s.engine.start().await;
+
+        run_until(&s.engine, &["a1"], Mode::PreferExisting, true, "done").await;
+        let suggestions = s.engine.suggestions("a1").await.unwrap();
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].run.failed, 1);
+        assert_eq!(suggestions[0].error.as_deref(), Some("Refused"));
+        assert!(suggestions[0].proposals.is_empty());
+    }
+
     #[tokio::test]
     async fn an_inline_run_covers_exactly_one_asset() {
         let s = setup(Recording::default(), &["a1", "a2"]).await;
