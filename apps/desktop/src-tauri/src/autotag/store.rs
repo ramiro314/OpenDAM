@@ -689,6 +689,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn restart_skips_the_in_flight_items_of_a_cancelled_run() {
+        let db = memory_database(Vec::new()).await;
+        let master = &db.master_pool;
+        insert_run(&db, "cancelled-run", "cancelled").await;
+        insert_run(&db, "running-run", "running").await;
+        for run in ["cancelled-run", "running-run"] {
+            sqlx::query(
+                "INSERT INTO tag_run_items (run_id, asset_id, library_id, status)
+                 VALUES (?, 'a1', 'lib', 'running')",
+            )
+            .bind(run)
+            .execute(master)
+            .await
+            .unwrap();
+        }
+
+        recover_after_restart(master).await.unwrap();
+
+        let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT r.id, r.status, r.pause_reason, i.status
+             FROM tag_runs r JOIN tag_run_items i ON i.run_id = r.id ORDER BY r.id",
+        )
+        .fetch_all(master)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "cancelled-run".into(),
+                    "cancelled".into(),
+                    None,
+                    "skipped".into()
+                ),
+                (
+                    "running-run".into(),
+                    "paused".into(),
+                    Some(APP_RESTARTED.into()),
+                    "queued".into()
+                ),
+            ]
+        );
+    }
+
     async fn applied_rows(db: &Database) -> Vec<(String, String, String)> {
         sqlx::query_as(
             "SELECT asset_id, tag_id, state FROM tag_run_applied ORDER BY asset_id, tag_id",
