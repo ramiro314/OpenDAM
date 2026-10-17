@@ -112,3 +112,9 @@ CREATE TRIGGER IF NOT EXISTS assets_au AFTER UPDATE ON assets BEGIN
     INSERT INTO assets_fts(rowid, id, file_name, description, metadata)
     VALUES (new.rowid, new.id, new.file_name, new.description, new.metadata);
 END;
+
+-- ── Library meta: one-time maintenance passes record themselves here ──────
+CREATE TABLE IF NOT EXISTS library_meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);

@@ -49,6 +49,7 @@ pub async fn add_library(
     )
     .await?;
     allow_library_roots(&state.app_handle, &library.root_paths);
+    crate::thumb_cleanup::spawn(Arc::clone(&state), Some(library.id.clone()));
 
     // Kick off background NAS-efficient indexing
     let state_clone = Arc::clone(&state);

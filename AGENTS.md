@@ -62,7 +62,9 @@ docs/plans                    Plans for this fork
   Sources 512 px or smaller that the webview can display (png, jpg, jpeg, webp, bmp, gif) get no
   thumbnail, and the UI shows the original, chosen by extension (`utils/media.ts`). Smaller TGA
   and TIFF get a PNG at their own size. A changed raster gets a fresh preview job, and a job that
-  clears or renames a thumbnail deletes the old `_thumb` file before it updates the row.
+  clears or renames a thumbnail deletes the old `_thumb` file before it updates the row. Libraries
+  made before this rule lose their upscaled thumbnails once, in the background, through
+  `thumb_cleanup.rs`, which records `thumbs_no_upscale` in the library's `library_meta` table.
 - **One persistent Python worker.** The worker is a long-lived JSON-over-stdio daemon. Send it
   requests over the existing stream; one process serves every file.
 - **Zero telemetry.** The app makes no network calls to analytics or tracking services. The only

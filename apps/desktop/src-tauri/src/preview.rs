@@ -83,7 +83,7 @@ pub fn generate_image_thumb(
 /// Runs `decode`, turning a panic into `Err`: a malformed file can panic inside
 /// the decoder, and that should fail one image, not the app. Relies on
 /// `[profile.release]` unwinding on panic.
-fn catch_decoder_panic<T>(
+pub(crate) fn catch_decoder_panic<T>(
     decode: impl FnOnce() -> Result<T> + std::panic::UnwindSafe,
 ) -> Result<T> {
     std::panic::catch_unwind(decode).unwrap_or_else(|_| Err(anyhow!("image decoder panicked")))
@@ -264,7 +264,8 @@ pub fn start_preview_worker(state: Arc<AppState>) {
 }
 
 /// SQL list of the extensions `is_native_image` accepts, matched against `assets.extension`.
-const NATIVE_EXTS_SQL: &str = "('jpg','jpeg','png','bmp','gif','tif','tiff','tga','webp')";
+pub(crate) const NATIVE_EXTS_SQL: &str =
+    "('jpg','jpeg','png','bmp','gif','tif','tiff','tga','webp')";
 
 /// A claimed job: (job_id, asset_id, file_path)
 type Job = (String, String, String);
@@ -386,17 +387,27 @@ async fn delete_replaced_thumb(
     let Some(old) = old.filter(|old| Some(old.as_str()) != new_rel_thumb) else {
         return;
     };
-    let old_path = PathBuf::from(resolve_path(root_path, &old));
-    let is_thumb_file = old_path
+    if let Some(old_path) = owned_thumb_file(root_path, &old) {
+        remove_thumb_file(&old_path).await;
+    }
+}
+
+/// `rel_thumb` as an absolute path if it names a `_thumb` file under the library's
+/// `.opendam/thumbs`, the only files a preview job or the thumbnail cleanup pass deletes.
+pub(crate) fn owned_thumb_file(root_path: &Path, rel_thumb: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(resolve_path(root_path, rel_thumb));
+    let is_thumb_file = path
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.contains("_thumb."));
-    if !is_thumb_file || !old_path.starts_with(root_path.join(".opendam").join("thumbs")) {
-        return;
-    }
-    if let Err(e) = tokio::fs::remove_file(&old_path).await {
+    (is_thumb_file && path.starts_with(root_path.join(".opendam").join("thumbs"))).then_some(path)
+}
+
+/// Deletes a thumbnail file. One that is already gone is not an error.
+pub(crate) async fn remove_thumb_file(path: &Path) {
+    if let Err(e) = tokio::fs::remove_file(path).await {
         if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!("Could not delete old thumbnail {:?}: {}", old_path, e);
+            tracing::warn!("Could not delete old thumbnail {:?}: {}", path, e);
         }
     }
 }
