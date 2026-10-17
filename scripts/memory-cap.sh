@@ -26,23 +26,31 @@ if ! command -v systemd-run >/dev/null || ! systemctl --user show-environment >/
 fi
 
 unit=opendam-capped-$$-$RANDOM.scope
-# In the background, so a TERM or INT sent to this script reaches the command: bash runs traps
-# only between commands, never while it waits on a foreground child. A background job's stdin
-# is /dev/null unless it is redirected, hence <&0. With --scope, systemd-run execs the command,
-# so $child is the command itself.
+# In the background, so a signal sent to this script reaches the command: bash runs traps only
+# between commands, never while it waits on a foreground child. A background job starts with
+# SIGINT and SIGQUIT ignored, which the command and its children would keep, so Ctrl-C would
+# never reach them; GNU env --default-signal restores both, where env has it. Its stdin is
+# /dev/null unless it is redirected, hence <&0. With --scope, systemd-run execs the command, so
+# $child is the command.
+restore=(env --default-signal=INT,QUIT)
+"${restore[@]}" true 2>/dev/null || restore=()
 systemd-run --user --scope --quiet --unit="$unit" \
-  -p MemoryMax="$max" -p MemorySwapMax=0 -p OOMPolicy=kill -- "$@" <&0 &
+  -p MemoryMax="$max" -p MemorySwapMax=0 -p OOMPolicy=kill -- "${restore[@]}" "$@" <&0 &
 child=$!
-trap 'kill -TERM "$child" 2>/dev/null' TERM INT HUP
+# Each signal is forwarded as itself. Ctrl-C also reaches the command straight from the terminal,
+# as it shares this script's process group, so it gets SIGINT twice.
+for sig in TERM INT HUP; do
+  trap "kill -$sig \"\$child\" 2>/dev/null" "$sig"
+done
 
-# wait also returns when a trapped signal arrives, so wait again until the command has exited.
+# wait also returns, with 128 + the signal, when a trapped signal arrives, so wait until the
+# command has exited, then once more for its own status, which bash keeps for a finished child.
 # Its stderr is muted so bash's "Killed" job notice doesn't stand in for the report below.
-{ wait "$child"; } 2>/dev/null
-status=$?
 while kill -0 "$child" 2>/dev/null; do
   { wait "$child"; } 2>/dev/null
-  status=$?
 done
+{ wait "$child"; } 2>/dev/null
+status=$?
 
 # The command can exit while the kernel is still killing the rest of the scope and before systemd
 # has recorded the oom-kill, so wait for the scope to stop before reading its result. A scope the
