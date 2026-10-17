@@ -322,8 +322,8 @@ fn emit_done(state: &AppState, done: &PreviewDone) {
 }
 
 /// Marks a job done and stores the asset's preview paths, replacing any old ones: a `None`
-/// `rel_thumb` clears `thumbnail_path`. `rel_thumb` is relative to the library root;
-/// `model_path` is absolute.
+/// `rel_thumb` clears `thumbnail_path`, and an old `_thumb` file the new path doesn't name is
+/// deleted first. `rel_thumb` is relative to the library root; `model_path` is absolute.
 async fn complete_job(
     pool: &Pool<Sqlite>,
     root_path: &Path,
@@ -337,6 +337,7 @@ async fn complete_job(
         .execute(pool)
         .await;
 
+    delete_replaced_thumb(pool, root_path, asset_id, rel_thumb.as_deref()).await;
     if let Some(ref model_path) = model_path {
         let rel_model = make_relative_path(root_path, Path::new(model_path));
         let _ = sqlx::query(
@@ -364,10 +365,11 @@ async fn complete_job(
     }
 }
 
-/// Deletes the asset's current thumbnail file under `.opendam/thumbs` unless it is
+/// Deletes the asset's current `_thumb` file under `.opendam/thumbs` unless it is
 /// `new_rel_thumb`, so a thumbnail that is cleared or renamed leaves no orphaned file. It runs
 /// before the row changes: if the app stops in between, the row points at a missing file and
-/// the UI falls back to the original.
+/// the UI falls back to the original. Other files there, such as a model's `_preview.glb`
+/// stored as its thumbnail, may be the job's new output and are kept.
 async fn delete_replaced_thumb(
     pool: &Pool<Sqlite>,
     root_path: &Path,
@@ -385,7 +387,11 @@ async fn delete_replaced_thumb(
         return;
     };
     let old_path = PathBuf::from(resolve_path(root_path, &old));
-    if !old_path.starts_with(root_path.join(".opendam").join("thumbs")) {
+    let is_thumb_file = old_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains("_thumb."));
+    if !is_thumb_file || !old_path.starts_with(root_path.join(".opendam").join("thumbs")) {
         return;
     }
     if let Err(e) = tokio::fs::remove_file(&old_path).await {
@@ -482,8 +488,6 @@ pub(crate) async fn process_image_jobs(
         match res {
             Ok(thumb_file_name) => {
                 let rel_thumb = thumb_file_name.map(|f| format!(".opendam/thumbs/{}", f));
-                delete_replaced_thumb(&lib.pool, &lib.root_path, &asset_id, rel_thumb.as_deref())
-                    .await;
                 done.push(
                     complete_job(
                         &lib.pool,
@@ -933,6 +937,48 @@ mod tests {
                 "done".into()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn model_job_deletes_a_renamed_thumb_but_keeps_its_new_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let thumbs = root.join(".opendam/thumbs");
+        // The converted model from an earlier Python job, and an old JPEG thumbnail.
+        let model = thumbs.join("a1_preview.glb");
+        let old_thumb = thumbs.join("a1_thumb.jpg");
+        std::fs::create_dir_all(&thumbs).unwrap();
+        std::fs::write(&model, "glb").unwrap();
+        write_image(&old_thumb, 64, 64);
+        let lib =
+            library_with_pending_job(root, "models/ship.fbx", ".opendam/thumbs/a1_thumb.jpg").await;
+
+        // A re-preview with no thumbnail stores the model as one, as Python jobs do.
+        let model_abs = model.to_string_lossy().to_string();
+        complete_job(
+            &lib.pool,
+            root,
+            "j1",
+            "a1",
+            Some(".opendam/thumbs/a1_preview.glb".into()),
+            Some(model_abs.clone()),
+        )
+        .await;
+        assert!(!old_thumb.exists());
+        assert!(model.exists());
+
+        // A later job that writes a thumbnail keeps the model the row pointed at, which is
+        // still its `preview_model`.
+        complete_job(
+            &lib.pool,
+            root,
+            "j1",
+            "a1",
+            Some(".opendam/thumbs/a1_thumb.png".into()),
+            Some(model_abs),
+        )
+        .await;
+        assert!(model.exists());
     }
 
     #[test]
