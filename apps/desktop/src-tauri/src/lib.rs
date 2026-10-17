@@ -1,3 +1,4 @@
+pub mod autotag;
 pub mod commands;
 pub mod db;
 pub mod models;
@@ -8,10 +9,12 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use tracing_subscriber::EnvFilter;
 
+use autotag::credentials::Credentials;
 use db::Database;
 
 pub struct AppState {
     pub db: Database,
+    pub credentials: Arc<Credentials>,
     pub app_handle: tauri::AppHandle,
 }
 
@@ -71,6 +74,7 @@ pub fn run() {
 
             let state = Arc::new(AppState {
                 db,
+                credentials: Arc::new(Credentials::from_process_env()),
                 app_handle: app.handle().clone(),
             });
 
@@ -158,6 +162,10 @@ pub fn run() {
             commands::preview::get_preview_progress,
             commands::shell::reveal_in_file_manager,
             commands::shell::open_with_default,
+            commands::settings::get_ai_settings,
+            commands::settings::set_ai_settings,
+            commands::settings::set_api_key,
+            commands::settings::get_provider_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

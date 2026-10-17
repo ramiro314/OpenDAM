@@ -30,6 +30,9 @@ image = { version = "0.25", features = ["jpeg", "png", "tiff", "bmp", "gif", "tg
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trash = "5"
+# API keys in the Secret Service, through zbus (no libdbus)
+keyring-core = "1"
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 [profile.release]
 codegen-units = 1
@@ -40,3 +43,4 @@ strip = true
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
 toml = "0.8"
+tempfile = "3"

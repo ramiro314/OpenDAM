@@ -1,0 +1,264 @@
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+
+.dialog {
+  width: 90%;
+  max-width: 560px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-xl);
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-4) var(--space-4) var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.titleArea {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-text-secondary);
+}
+
+.title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.closeBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.closeBtn:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-elevated);
+}
+
+.content {
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  overflow-y: auto;
+}
+
+.sectionTitle {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-text-muted);
+}
+
+.provider {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-base);
+}
+
+.providerHeader {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.providerName {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.providerNote {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.label {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.row > .label {
+  width: 72px;
+  flex-shrink: 0;
+}
+
+.input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  outline: none;
+}
+
+.input:focus {
+  border-color: var(--color-border-focus);
+}
+
+/* Native controls follow the GTK theme, which may be light: draw the select ourselves. */
+.dialog {
+  color-scheme: dark;
+}
+
+select.input {
+  appearance: none;
+  padding-right: 28px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--color-text-secondary) 50%),
+    linear-gradient(135deg, var(--color-text-secondary) 50%, transparent 50%);
+  background-position:
+    calc(100% - 15px) center,
+    calc(100% - 10px) center;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+}
+
+.numbers {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-3);
+}
+
+.numberField {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.keyBlock {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.keyStatus {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 80px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.hint {
+  color: var(--color-text-muted);
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+}
+
+.dotOn {
+  background: var(--color-success);
+}
+
+.dotOff {
+  background: var(--color-text-disabled);
+}
+
+.warning,
+.error {
+  margin-left: 80px;
+  font-size: 12px;
+}
+
+.warning {
+  color: var(--color-warning);
+}
+
+.error {
+  color: var(--color-danger);
+}
+
+.content > .error {
+  margin-left: 0;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-border);
+}
+
+.btn {
+  padding: 6px 12px;
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.secondaryBtn {
+  background: transparent;
+  color: var(--color-text-secondary);
+  border-color: var(--color-border);
+}
+
+.secondaryBtn:not(:disabled):hover {
+  background: var(--color-bg-elevated);
+  color: var(--color-text-primary);
+}
+
+.primaryBtn {
+  background: var(--color-brand-500);
+  color: #fff;
+}
+
+.primaryBtn:not(:disabled):hover {
+  background: var(--color-brand-600);
+}
