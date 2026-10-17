@@ -3,7 +3,13 @@
 // check here.
 
 import { useAssetStore, useUIStore } from '../store';
-import { GRID_GAP, rowOfIndex, rowTop } from '../components/AssetGrid/gridGeometry';
+import {
+  GRID_GAP,
+  SCROLL_PADDING,
+  TILE_MIN,
+  rowOfIndex,
+  rowTop,
+} from '../components/AssetGrid/gridGeometry';
 
 export interface UiCheckContext {
   /** The grid's scroll container (`#asset-scroll`). */
@@ -190,51 +196,75 @@ export const UI_CHECKS: UiCheck[] = [
             `layout and scrollTop went from ${JSON.stringify(was)} to ${JSON.stringify(now)}, ` +
             `its row's top is ${rowTop(rowOfIndex(before, now.columns), now.rowPitch)}`
         );
+        return { was: was.columns, now: now.columns };
       };
       const ui = useUIStore.getState();
       await keeps('md to lg', () => ui.setGridSize('lg'));
       await keeps('lg to sm', () => ui.setGridSize('sm'));
       await keeps('sm to md', () => ui.setGridSize('md'));
-      await keeps('narrower', () => (el.style.width = '900px'));
+      // Narrow the scroll area to a width that fits one column fewer at md, as a narrower window
+      // would, then let it fill the window again
+      const { columns } = layoutOf(el);
+      assert(columns > 1, `md shows ${columns} column`);
+      const scrollbar = el.offsetWidth - el.clientWidth;
+      const fewer = columns - 1;
+      const width =
+        fewer * TILE_MIN.md + (fewer - 1) * GRID_GAP + 2 * SCROLL_PADDING + scrollbar + 40;
+      const narrowed = await keeps('narrower', () => (el.style.width = `${width}px`));
+      assert(
+        narrowed.now === fewer,
+        `narrowing to ${width} px went from ${narrowed.was} to ${narrowed.now} columns`
+      );
       await untilFrame(() => allReady(el), 5_000, 'visible tiles ready after narrowing');
       await pause('U4-narrowed');
-      await keeps('wider again', () => (el.style.width = ''));
+      const widened = await keeps('wider again', () => (el.style.width = ''));
+      assert(
+        widened.now === columns,
+        `widening went from ${widened.was} to ${widened.now} columns, not back to ${columns}`
+      );
     },
   },
   {
     id: 'U5',
-    title: 'Right-clicking a card at offset 60,000 opens the menu, and Escape closes it',
+    title:
+      'Right-clicking a card, then a list row, at offset 60,000 opens the menu, and Escape closes it',
     run: async ({ scroll, assert, pause }) => {
-      const el = scroll();
       const target = 60_000;
       const { total } = useAssetStore.getState();
       assert(total > target, `only ${total} results`);
-      const { columns, rowPitch } = layoutOf(el);
-      el.scrollTop = rowTop(rowOfIndex(target, columns), rowPitch);
-      const selector = `[data-index="${target}"]:not([data-placeholder])`;
-      await untilFrame(() => el.querySelector(selector) !== null, 5_000, `card ${target}`);
-      const card = el.querySelector<HTMLElement>(selector)!;
-      const r = card.getBoundingClientRect();
-      card.dispatchEvent(
-        new MouseEvent('contextmenu', {
-          bubbles: true,
-          cancelable: true,
-          button: 2,
-          clientX: r.left + r.width / 2,
-          clientY: r.top + r.height / 2,
-        })
-      );
-      await frames(2);
-      assert(document.getElementById('grid-menu-autotag'), 'no Auto-tag item in the menu');
-      const id = card.id.replace(/^asset-/, '');
-      assert(
-        useUIStore.getState().selectedAssetIds.has(id),
-        'the right-clicked card is not selected'
-      );
-      await pause('U5-context-menu');
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-      await frames(2);
-      assert(!document.getElementById('grid-menu-autotag'), 'Escape left the menu open');
+      const rightClick = async (what: string, idPrefix: string, shot: string) => {
+        const el = scroll();
+        const { columns, rowPitch } = layoutOf(el);
+        el.scrollTop = Math.ceil(rowTop(rowOfIndex(target, columns), rowPitch));
+        const selector = `[data-index="${target}"]:not([data-placeholder])`;
+        await untilFrame(() => el.querySelector(selector) !== null, 5_000, `${what} ${target}`);
+        const tile = el.querySelector<HTMLElement>(selector)!;
+        const r = tile.getBoundingClientRect();
+        tile.dispatchEvent(
+          new MouseEvent('contextmenu', {
+            bubbles: true,
+            cancelable: true,
+            button: 2,
+            clientX: r.left + r.width / 2,
+            clientY: r.top + r.height / 2,
+          })
+        );
+        await frames(2);
+        assert(document.getElementById('grid-menu-autotag'), `${what}: no Auto-tag item`);
+        const id = tile.id.slice(idPrefix.length);
+        assert(
+          tile.id.startsWith(idPrefix) && useUIStore.getState().selectedAssetIds.has(id),
+          `${what}: the right-clicked ${what} is not selected`
+        );
+        await pause(shot);
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        await frames(2);
+        assert(!document.getElementById('grid-menu-autotag'), `${what}: Escape left the menu open`);
+      };
+      await rightClick('card', 'asset-', 'U5-context-menu');
+      useUIStore.getState().setViewMode('list');
+      await frames(3);
+      await rightClick('list row', 'asset-row-', 'U5-list-menu');
     },
   },
 ];
