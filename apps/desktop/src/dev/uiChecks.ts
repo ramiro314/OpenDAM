@@ -5,7 +5,7 @@
 
 import { api } from '../api';
 import { useAssetStore, useFolderTreeStore, useLibraryStore, useUIStore } from '../store';
-import type { FolderNode } from '../types';
+import type { FolderNode, SortField, SortOrder } from '../types';
 import { assetAt } from '../store/pageCache';
 import { scrubKey } from '../utils/scrubKey';
 import {
@@ -55,6 +55,16 @@ async function untilFrame(predicate: () => boolean, timeoutMs: number, what: str
     await nextFrame();
   }
   return performance.now() - start;
+}
+
+/**
+ * Sorts the results and searches again. `setSort` alone only changes the query, so the grid
+ * would keep the old order while the store and the filter bar named the new one.
+ */
+async function sortResults(field: SortField, order: SortOrder) {
+  useAssetStore.getState().setSort(field, order);
+  await useAssetStore.getState().search();
+  await frames(3);
 }
 
 /** The tiles at least partly inside the scroll container's viewport. */
@@ -444,10 +454,7 @@ export const UI_CHECKS: UiCheck[] = [
       const { field, order } = useAssetStore.getState().query.sort;
       try {
         for (const sort of ['name', 'date'] as const) {
-          const store = useAssetStore.getState();
-          store.setSort(sort, 'asc');
-          await store.search();
-          await frames(3);
+          await sortResults(sort, 'asc');
           const el = scroll();
           el.scrollTop = 0.3 * (el.scrollHeight - el.clientHeight);
           await frames(3);
@@ -535,7 +542,7 @@ export const UI_CHECKS: UiCheck[] = [
           }
         }
       } finally {
-        useAssetStore.getState().setSort(field, order);
+        await sortResults(field, order);
       }
     },
   },
@@ -753,9 +760,7 @@ export const UI_CHECKS: UiCheck[] = [
       // pass has run, no viewport of 41 holds both kinds, and the search below finds nothing.
       const { field, order } = useAssetStore.getState().query.sort;
       try {
-        useAssetStore.getState().setSort('name', 'asc');
-        await useAssetStore.getState().search();
-        await frames(3);
+        await sortResults('name', 'asc');
         // Scroll through the results until the viewport shows an enlarged raster and a shrunk image
         const el = scroll();
         let small: HTMLImageElement | undefined;
@@ -921,7 +926,7 @@ export const UI_CHECKS: UiCheck[] = [
         await frames(3);
         ui().clearSelection();
       } finally {
-        useAssetStore.getState().setSort(field, order);
+        await sortResults(field, order);
       }
     },
   },
