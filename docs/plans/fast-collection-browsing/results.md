@@ -7,7 +7,14 @@ Status: **incomplete.** This is step 8 of the [plan](plan.md) ("Suggested build 
 - the `cpu` and `explicit-sync` runs were not made;
 - U1-U8 were not run in `checks` mode.
 
-This record keeps what was measured, so the next attempt starts from it.
+This record keeps what was measured, so the next attempt starts from it. Two of the ticket's
+acceptance criteria are therefore **not met**, by the owner's decision rather than by a measured
+failure:
+
+- `cpu` and `explicit-sync` runs beside `gpu-shm`, and so the explicit-sync 15% test;
+- U1-U8 passing in `checks` mode on the final state, with screenshots.
+
+Meeting them needs a rerun the owner approves. GPU-mode runs risk the same hang on this machine.
 
 ## Setup
 
@@ -110,6 +117,12 @@ nested KWin plus WebKit's GPU painting with shared-memory readback (`gpu-shm`). 
 three minutes before the monitor event fits the GPU already misbehaving. This does not prove the
 bench caused the firmware stall, but it is the likely contributor. Rerunning the GPU modes on this
 machine risks the same hang.
+
+A closer look is in the [hang report](../../reports/gpu-hang-2026-10-18/report.html). KWin was
+applying the reconnected monitor's mode, and the driver's VRR-off DisplayPort AUX write went to the
+GPU firmware, which never replied. Two freshly started GPU programs had already failed before that:
+the bench app at 11:56:33 and KSplash at 11:59:58. So the firmware probably stopped answering when
+the bench killed one GPU-rendering app and started the next.
 
 Separately, at 11:30:48, during the bench script's cargo and Vite build, which runs outside the
 memory cap, the machine hit a global OOM. The kernel killed a 1.7 GB `node` process in another
