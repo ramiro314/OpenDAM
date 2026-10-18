@@ -6,13 +6,13 @@ Status: **partly complete.** This is step 8 of the [plan](plan.md) ("Suggested b
 |---|---|
 | T1-T4 at md in `gpu-shm` | Measured on a clean run: T2 and T3 PASS, T1 and T4 FAIL |
 | `explicit-sync` runs of the same scenarios | 8 of 9 scenarios measured, including every md scenario. lg end to end stalled at launch (below). |
-| `cpu` runs of the same scenarios | **Not measured.** The run was killed by a Mission Control restart before its first scenario. |
+| `cpu` runs of the same scenarios | All 9 scenarios measured (2d130b7, the same code as 0e79743) |
 | U1-U8 in `checks` mode, with screenshots | **Not run** |
 | The explicit-sync 15% test | Applied: 0% better, **fails** |
 | The default stays `gpu-shm` | Yes. No render-mode code changed. |
 
-The `cpu` run and the checks wait for the owner. A GPU-mode launch on this machine has twice
-stalled at startup, and once that froze the desktop ([The hang](#the-hang-on-2026-10-18)).
+The checks wait for the owner. A GPU-mode launch on this machine has twice stalled at startup, and
+once that froze the desktop ([The hang](#the-hang-on-2026-10-18)).
 
 ## Setup
 
@@ -24,27 +24,29 @@ stalled at startup, and once that froze the desktop ([The hang](#the-hang-on-202
     every scenario's fresh app process restarted the pass. The scenarios then ran beside its reads
     of 58k image headers, on thumbnails it had not cleared yet.
   - 0e79743 waits 10 s after each app exits before starting the next.
-- **The final runs** used 0e79743 with a clean tree. Each warm-up cleared 56,698 thumbnails out of
+- **The final runs** used a clean tree: `gpu-shm` and `explicit-sync` on 0e79743, and `cpu` on
+  2d130b7, which only adds this record. Each warm-up cleared 56,698 thumbnails out of
   58,147 checked.
 
 ## Targets at md
 
-| # | Target | `gpu-shm` | `explicit-sync` |
-|---|---|---|---|
-| T1 | DOM nodes max/min ≤ 1.10, end to end | 759 / 549 = 1.38, **FAIL** | 759 / 549 = 1.38, **FAIL** |
-| T2 | Jump to filled tiles ≤ 300 ms at p95 | p95 123 ms (p50 121, max 129), 0 of 20 timed out, **PASS** | p95 122 ms (p50 122, max 122), 0 of 20 timed out, **PASS** |
-| T3 | Continuous scroll p95 ≤ 20 ms, no frame over 100 ms | p95 18 ms, max 21 ms, 0 over 100 ms, **PASS** | p95 18 ms, max 21 ms, 0 over 100 ms, **PASS** |
-| T4 | Web-process RSS grows < 150 MB end to end | 539.0 → 1,249.6 MB (+711), **FAIL** | 523.7 → 1,298.7 MB (+775), **FAIL** |
+| # | Target | `gpu-shm` | `explicit-sync` | `cpu` |
+|---|---|---|---|---|
+| T1 | DOM nodes max/min ≤ 1.10, end to end | 759 / 549 = 1.38, **FAIL** | 759 / 549 = 1.38, **FAIL** | 759 / 549 = 1.38, **FAIL** |
+| T2 | Jump to filled tiles ≤ 300 ms at p95 | p95 123 ms (p50 121, max 129), 0 of 20 timed out, **PASS** | p95 122 ms (p50 122, max 122), 0 of 20 timed out, **PASS** | p95 138 ms (p50 117, max 143), 0 of 20 timed out, **PASS** |
+| T3 | Continuous scroll p95 ≤ 20 ms, no frame over 100 ms | p95 18 ms, max 21 ms, 0 over 100 ms, **PASS** | p95 18 ms, max 21 ms, 0 over 100 ms, **PASS** | p95 18 ms, max 20 ms, 0 over 100 ms, **PASS** |
+| T4 | Web-process RSS grows < 150 MB end to end | 539.0 → 1,249.6 MB (+711), **FAIL** | 523.7 → 1,298.7 MB (+775), **FAIL** | 513.8 → 822.7 MB (+309), **FAIL** |
 
-`cpu`: not measured.
+The GPU modes grow about 400 MB more than `cpu` over the same end-to-end scroll. Frame times are
+the same in all three, held to the nested KWin's 60 Hz output.
 
 All sizes, for reference:
 
-| | `gpu-shm` continuous p95 / max | `explicit-sync` continuous p95 / max | `gpu-shm` end to end RSS | `explicit-sync` end to end RSS | `gpu-shm` jumps p95 | `explicit-sync` jumps p95 |
-|---|---|---|---|---|---|---|
-| sm | 18 / 29 ms | 18 / 23 ms | +540 MB | +909 MB | 139 ms | 138 ms |
-| md | 18 / 21 ms | 18 / 21 ms | +711 MB | +775 MB | 123 ms | 122 ms |
-| lg | 18 / 20 ms | 18 / 21 ms | +345 MB | stalled at launch | 122 ms | 122 ms |
+| | Continuous p95 / max (`gpu-shm`, `explicit-sync`, `cpu`) | End to end RSS growth (`gpu-shm`, `explicit-sync`, `cpu`) | Jumps p95 (`gpu-shm`, `explicit-sync`, `cpu`) |
+|---|---|---|---|
+| sm | 18 / 29, 18 / 23, 18 / 21 ms | +540, +909, +710 MB | 139, 138, 153 ms |
+| md | 18 / 21, 18 / 21, 18 / 20 ms | +711, +775, +309 MB | 123, 122, 138 ms |
+| lg | 18 / 20, 18 / 21, 18 / 21 ms | +345, stalled at launch, +284 MB | 122, 122, 116 ms |
 
 ## Comparison with the baseline
 
@@ -52,16 +54,19 @@ The baseline is [`baseline-cpu.json`](baseline-cpu.json): the grid before window
 on the same snapshot. Its end to end is a different scenario: it jumps to the bottom until 120 s
 pass, and only reached 9,400 tiles. So its RSS and DOM figures understate the old grid's cost.
 
-| md | Baseline (`cpu`, old grid) | Now (`gpu-shm`) |
-|---|---|---|
-| Continuous scroll frame interval p50 / p95 / max | 17 / 18 / 197 ms | 17 / 18 / 21 ms |
-| Continuous scroll frames over 50 / 100 ms | 18 / 14 | 0 / 0 |
-| Continuous scroll DOM nodes | 1,790 → 24,198 | 578-719 |
-| Continuous scroll RSS growth | +322 MB | +335 MB |
-| End to end DOM nodes | 1,790 → 132,090 (9,400 tiles) | 549-759 (all 83,095) |
-| End to end RSS growth | +1,840 MB (9,400 tiles) | +711 MB (all 83,095) |
-| End to end frame p95 / max | 1,219 / 1,372 ms | 21 / 47 ms |
-| Random jumps | not possible | p95 123 ms |
+| md | Baseline (`cpu`, old grid) | Now, `cpu` (same mode) | Now, `gpu-shm` |
+|---|---|---|---|
+| Continuous scroll frame interval p50 / p95 / max | 17 / 18 / 197 ms | 17 / 18 / 20 ms | 17 / 18 / 21 ms |
+| Continuous scroll frames over 50 / 100 ms | 18 / 14 | 0 / 0 | 0 / 0 |
+| Continuous scroll DOM nodes | 1,790 → 24,198 | 578-719 | 578-719 |
+| Continuous scroll RSS growth | +322 MB | +181 MB | +335 MB |
+| End to end DOM nodes | 1,790 → 132,090 (9,400 tiles) | 549-759 (all 83,095) | 549-759 (all 83,095) |
+| End to end RSS growth | +1,840 MB (9,400 tiles) | +309 MB (all 83,095) | +711 MB (all 83,095) |
+| End to end frame p95 / max | 1,219 / 1,372 ms | 18 / 58 ms | 21 / 47 ms |
+| Random jumps | not possible | p95 138 ms | p95 123 ms |
+
+In the same `cpu` mode, the windowed grid scrolls all 83,095 assets with a sixth of the memory
+growth the old grid needed for 9,400.
 
 Without the cleanup pass running, md end to end grows +711 MB, against +1,015 MB in an earlier run
 on 6a0ec6e with the pass running.
@@ -132,11 +137,11 @@ Mission Control session.
   - The spread between top, middle and bottom is wider than the target allows.
   - Likely cause, not investigated: rows only partly filled near the end, and placeholder tiles
     having fewer nodes than full cards.
-- **T4 misses** (+711 MB in `gpu-shm`, +775 MB in `explicit-sync`, at md).
-  - Likely cause, not investigated: WebKit keeping decoded images and GPU tiles for the thousands
-    of tiles visited, which a 150 MB budget can't hold.
+- **T4 misses** at md: +711 MB in `gpu-shm`, +775 MB in `explicit-sync`, +309 MB in `cpu`.
+  - Likely cause, not investigated: WebKit keeping decoded images for the thousands of tiles
+    visited, which a 150 MB budget can't hold. The GPU modes add about 400 MB more, probably GPU
+    tile or texture memory.
   - Not a small fix inside the plan's design.
-- **No `cpu` run** beside the GPU modes.
 - **U1-U8 not run** on the final state, so there are no screenshots.
 - **`explicit-sync` lg end to end not measured,** because its launch stalled.
 - **GPU-mode launch stalls,** cause not established (above). They risk freezing the desktop.
@@ -149,6 +154,7 @@ Raw reports are in `apps/desktop/src-tauri/target/scroll-bench/` (gitignored):
 | Report | Contents |
 |---|---|
 | `gpu-shm-1792355648.json` | Final `gpu-shm` run on 0e79743, all nine scenarios merged |
+| `cpu-1792362604.json` | Final `cpu` run on 2d130b7, all nine scenarios merged |
 | `explicit-sync-1792357296.json`, `-357339`, `-357356` | `explicit-sync` sm continuous scroll, end to end, random jumps |
 | `explicit-sync-1792357428.json`, `-357470`, `-357488` | `explicit-sync` md continuous scroll, end to end, random jumps |
 | `explicit-sync-1792357559.json`, `-359392` | `explicit-sync` lg continuous scroll, random jumps |
