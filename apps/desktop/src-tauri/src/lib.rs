@@ -167,7 +167,9 @@ pub fn run(render_choice: render::RenderChoice) {
             let startup_state = state.clone();
             tauri::async_runtime::spawn(async move {
                 for (id, paths) in libraries {
-                    let _ = watcher::index_paths(&startup_state.db, &id, &paths).await;
+                    if let Err(e) = watcher::index_paths(&startup_state.db, &id, &paths).await {
+                        tracing::error!("Failed to index library {}: {}", id, e);
+                    }
                 }
                 let _ = startup_state.app_handle.emit("library:updated", ());
             });

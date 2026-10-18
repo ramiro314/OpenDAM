@@ -316,6 +316,12 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
         }
     }
 
+    // The folder tree, so a library has it from its first open even when the index run that
+    // follows fails. Nothing else holds this new pool yet, so the pass needs no index lock.
+    if let Err(e) = crate::structure::rebuild(&pool).await {
+        tracing::warn!("Could not derive the folder tree of {db_path:?}: {e}");
+    }
+
     Ok(pool)
 }
 
@@ -985,6 +991,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(converted, (true, Some("done".to_string()), vec![1], false));
+    }
+
+    #[tokio::test]
+    async fn opening_a_library_derives_its_folder_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("library.sqlite");
+        let pool = connect_library_sqlite(&file).await.unwrap();
+        sqlx::query(
+            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+             VALUES ('a', 'kits/rocks/rock.glb', 'rock.glb', 'glb', '3d_model', 1, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let reopened = connect_library_sqlite(&file).await.unwrap();
+
+        assert_eq!(
+            crate::structure::tests::folder_rows(&reopened).await,
+            crate::structure::tests::fresh_pass(&["kits/rocks/rock.glb"]).await
+        );
     }
 
     #[tokio::test]

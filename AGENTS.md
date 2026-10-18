@@ -105,8 +105,9 @@ docs/plans                    Plans for this fork
 - **Structure is derived.** `folders` (each folder's path, parent, name and recursive
   `item_count`, the root being `path = ''`) is recomputed by `structure.rs` from the indexed
   paths: `structure::derive` is a pure function, and `structure::apply` writes only the rows that
-  changed, in 200-row transactions. Every `watcher::index_paths` run ends with the pass, under the
-  library's `Database::index_lock`. Only `structure.rs` writes `folders`: a command that changes
+  changed, in 200-row transactions. Opening a library DB (`connect_library_sqlite`) runs the pass
+  once, and every `watcher::index_paths` run ends with it, under the library's
+  `Database::index_lock`. Only `structure.rs` writes `folders`: a command that changes
   the indexed paths (`delete_asset`, `delete_assets`, `rename_asset`) calls
   `structure::rebuild_library` before it returns, rather than patching rows, and that waits for
   any index run holding the lock.
