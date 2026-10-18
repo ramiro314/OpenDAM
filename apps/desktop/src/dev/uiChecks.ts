@@ -398,6 +398,29 @@ export const UI_CHECKS: UiCheck[] = [
       await frames(3);
       await everywhere('pixelated');
 
+      // A resize alone re-checks: shrink the loaded small image's box below its pixel size, then
+      // give it back. The src doesn't change, so no load event fires.
+      const box = small!.parentElement!;
+      const shrunkPx = Math.floor(
+        Math.min(small!.naturalWidth, small!.naturalHeight) / window.devicePixelRatio / 2
+      );
+      assert(shrunkPx >= 1, `${what} is too small to shrink`);
+      box.style.width = box.style.height = `${shrunkPx}px`;
+      await untilFrame(
+        () => rendering(small!) === 'auto',
+        1_000,
+        `${what} shrunk to ${small!.clientWidth}x${small!.clientHeight} to render auto, ` +
+          `it renders ${rendering(small!)}`
+      );
+      assert(!isEnlarged(small!, 'cover'), `${what} is still enlarged at ${shrunkPx} px`);
+      box.style.width = box.style.height = '';
+      await untilFrame(
+        () => rendering(small!) === 'pixelated',
+        1_000,
+        `${what} back at ${small!.clientWidth}x${small!.clientHeight} to render pixelated, ` +
+          `it renders ${rendering(small!)}`
+      );
+
       toggle()!.click();
       await frames(3);
       assert(ui().imageScaling === 'smooth', 'the toggle did not switch to smooth');
