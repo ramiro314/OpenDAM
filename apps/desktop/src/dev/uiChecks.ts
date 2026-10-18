@@ -150,6 +150,9 @@ const scrubLabel = () => document.getElementById('scrub-label');
 /** The library the bench registers its run copy as (`OPENDAM_BENCH_LIBRARY`). */
 const BENCH_LIBRARY = 'bench';
 
+/** How long U9 waits for the startup index run's structure pass. */
+const STRUCTURE_TIMEOUT_MS = 900_000;
+
 /** The sidebar row of folder `path` in the bench library, if it is shown. */
 function folderRow(path: string): HTMLElement | null {
   return document.querySelector<HTMLElement>(
@@ -938,13 +941,23 @@ export const UI_CHECKS: UiCheck[] = [
     title:
       'The library row expands into its folders with their counts, a folder shows exactly ' +
       'its files, and a delete updates the counts and drops a folder it empties',
-    run: async ({ assert, waitFor, pause }) => {
+    run: async ({ assert, waitFor, pause, sleep }) => {
       const toggle = document.getElementById(`lib-toggle-${BENCH_LIBRARY}`);
       assert(toggle, `no #lib-toggle-${BENCH_LIBRARY} on the library row`);
       if (!useFolderTreeStore.getState().expanded[BENCH_LIBRARY]?.includes('')) toggle!.click();
-      const top = await api.getFolders(BENCH_LIBRARY, '');
-      assert(top.length > 0, 'the library has no top-level folders');
-      await waitFor(() => top.every((f) => folderRow(f.path)), 5_000, 'the top-level folders');
+      // The checks can start before the startup index run, and the first structure pass it ends
+      // with, are done. The expanded row then fills on that run's `library:updated`.
+      const deadline = performance.now() + STRUCTURE_TIMEOUT_MS;
+      let top = await api.getFolders(BENCH_LIBRARY, '');
+      while (top.length === 0) {
+        assert(
+          performance.now() < deadline,
+          `the library has no top-level folders after ${STRUCTURE_TIMEOUT_MS / 1000} s`
+        );
+        await sleep(1_000);
+        top = await api.getFolders(BENCH_LIBRARY, '');
+      }
+      await waitFor(() => top.every((f) => folderRow(f.path)), 10_000, 'the top-level folders');
       const rows = [
         ...document.querySelectorAll<HTMLElement>(`[data-library-id="${BENCH_LIBRARY}"]`),
       ]
