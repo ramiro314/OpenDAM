@@ -1,12 +1,19 @@
 import { useState } from 'react';
 import clsx from 'clsx';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useLibraryStore, useUIStore, useAssetStore, useAutotagStore } from '../../store';
+import {
+  useLibraryStore,
+  useUIStore,
+  useAssetStore,
+  useAutotagStore,
+  useFolderTreeStore,
+} from '../../store';
 import type { Library } from '../../types';
 import { autotagAvailability } from '../../utils/autotag';
-import { IconFolder, IconTag, IconTrash } from '../Icons';
+import { IconChevronDown, IconChevronRight, IconFolder, IconTag, IconTrash } from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { ContextMenu } from '../ContextMenu/ContextMenu';
+import { FolderTree } from './FolderTree';
 import { SidebarSection } from './SidebarSection';
 import { libraryNameFromPath } from './sidebarHelpers';
 import styles from './Sidebar.module.css';
@@ -30,6 +37,8 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
   } = useUIStore();
   const setQuery = useAssetStore((s) => s.setQuery);
   const search = useAssetStore((s) => s.search);
+  const expandedFolders = useFolderTreeStore((s) => s.expanded);
+  const toggleFolder = useFolderTreeStore((s) => s.toggle);
 
   const [expanded, setExpanded] = useState(true);
   const [removeTarget, setRemoveTarget] = useState<{ id: string; name: string } | null>(null);
@@ -61,6 +70,7 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
       libraryIds: undefined,
       libraryId: undefined,
       collectionId: undefined,
+      folder: undefined,
     });
     search();
   };
@@ -76,6 +86,21 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
       libraryIds: nextSelected.length > 0 ? nextSelected : undefined,
       libraryId: nextSelected.length === 1 ? nextSelected[0] : undefined,
       collectionId: undefined,
+      folder: undefined,
+    });
+    search();
+  };
+
+  // A folder names its own library, so it replaces the library selection
+  const handleFolderClick = (libraryId: string, path: string) => {
+    clearSmartFilter();
+    setActiveCollection(null);
+    clearLibrarySelection();
+    setQuery({
+      libraryIds: undefined,
+      libraryId: undefined,
+      collectionId: undefined,
+      folder: { libraryId, path },
     });
     search();
   };
@@ -90,6 +115,9 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
       if (activeLibraryId === id) {
         setActiveLibrary(null);
         setQuery({ libraryId: undefined });
+      }
+      if (useAssetStore.getState().query.folder?.libraryId === id) {
+        setQuery({ folder: undefined });
       }
       search();
     } catch (err) {
@@ -130,54 +158,70 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
         )}
         {libraries.map((lib) => {
           const isSelected = selectedLibraryIds.includes(lib.id);
+          const isExpanded = expandedFolders[lib.id]?.includes('') ?? false;
           return (
-            <div
-              key={lib.id}
-              id={`lib-${lib.id}`}
-              className={clsx(styles.item, isSelected && styles.active)}
-              onClick={(e) => handleLibraryClick(lib.id, e)}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                setMenu({ x: e.clientX, y: e.clientY, library: lib });
-              }}
-              role="button"
-              tabIndex={0}
-              title="Click to select library; Ctrl+Click to select multiple"
-            >
-              {libraries.length > 1 && (
-                <input
-                  type="checkbox"
-                  checked={isSelected}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleLibraryClick(lib.id, e);
-                  }}
-                  onChange={() => {}}
-                  style={{
-                    width: 13,
-                    height: 13,
-                    accentColor: 'var(--color-brand-500)',
-                    cursor: 'pointer',
-                    marginRight: 6,
-                  }}
-                  title="Toggle this library in filter"
-                />
-              )}
-              <IconFolder size={13} />
-              <span className={clsx(styles.itemName, 'truncate')}>{lib.name}</span>
-              <span className={styles.badge}>{(lib.assetCount || 0).toLocaleString()}</span>
-              <span
-                className={clsx(styles.itemActionBtn, styles.itemActionBtnDanger)}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setRemoveTarget({ id: lib.id, name: lib.name });
+            <div key={lib.id}>
+              <div
+                id={`lib-${lib.id}`}
+                className={clsx(styles.item, isSelected && styles.active)}
+                onClick={(e) => handleLibraryClick(lib.id, e)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setMenu({ x: e.clientX, y: e.clientY, library: lib });
                 }}
-                title="Remove library"
                 role="button"
                 tabIndex={0}
+                title="Click to select library; Ctrl+Click to select multiple"
               >
-                <IconTrash size={11} />
-              </span>
+                {libraries.length > 1 && (
+                  <input
+                    type="checkbox"
+                    checked={isSelected}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleLibraryClick(lib.id, e);
+                    }}
+                    onChange={() => {}}
+                    style={{
+                      width: 13,
+                      height: 13,
+                      accentColor: 'var(--color-brand-500)',
+                      cursor: 'pointer',
+                      marginRight: 6,
+                    }}
+                    title="Toggle this library in filter"
+                  />
+                )}
+                <span
+                  id={`lib-toggle-${lib.id}`}
+                  className={styles.chevronBtn}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void toggleFolder(lib.id, '');
+                  }}
+                  title={isExpanded ? 'Collapse folders' : 'Expand folders'}
+                >
+                  {isExpanded ? <IconChevronDown size={11} /> : <IconChevronRight size={11} />}
+                </span>
+                <IconFolder size={13} />
+                <span className={clsx(styles.itemName, 'truncate')}>{lib.name}</span>
+                <span className={styles.badge}>{(lib.assetCount || 0).toLocaleString()}</span>
+                <span
+                  className={clsx(styles.itemActionBtn, styles.itemActionBtnDanger)}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setRemoveTarget({ id: lib.id, name: lib.name });
+                  }}
+                  title="Remove library"
+                  role="button"
+                  tabIndex={0}
+                >
+                  <IconTrash size={11} />
+                </span>
+              </div>
+              {isExpanded && (
+                <FolderTree libraryId={lib.id} parentPath="" onSelect={handleFolderClick} />
+              )}
             </div>
           );
         })}

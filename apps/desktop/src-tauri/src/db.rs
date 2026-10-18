@@ -19,6 +19,8 @@ pub struct LibraryHandle {
 pub struct Database {
     pub master_pool: Pool<Sqlite>,
     pub libraries: Arc<RwLock<HashMap<String, LibraryHandle>>>,
+    /// One lock per library id, held by an index run and by each structure pass (`index_lock`).
+    index_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// A collection definition as stored: id, name, description, parent_id, is_smart, filter_spec,
@@ -423,6 +425,7 @@ impl Database {
         let db = Self {
             master_pool,
             libraries: Arc::new(RwLock::new(open_libraries)),
+            index_locks: Default::default(),
         };
 
         db.sync_open_libraries().await;
@@ -553,6 +556,14 @@ impl Database {
     /// re-index delete that library's rows.
     pub async fn get_library_handle(&self, id: &str) -> Option<LibraryHandle> {
         self.libraries.read().await.get(id).cloned()
+    }
+
+    /// The lock that serializes library `id`'s index runs and structure passes within this app:
+    /// an index run holds it from its walk to its structure pass, so a command's pass waits for
+    /// the run and never writes over the run's result with one derived from older rows.
+    pub fn index_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.index_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks.entry(id.to_string()).or_default().clone()
     }
 
     /// Every open library, in library-id order.
@@ -736,6 +747,7 @@ pub(crate) async fn memory_database(libraries: Vec<LibraryHandle>) -> Database {
         libraries: Arc::new(RwLock::new(
             libraries.into_iter().map(|h| (h.id.clone(), h)).collect(),
         )),
+        index_locks: Default::default(),
     }
 }
 

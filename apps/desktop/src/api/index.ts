@@ -3,6 +3,7 @@ import type {
   Asset,
   Library,
   Collection,
+  FolderNode,
   Tag,
   TagPatch,
   AddLibraryPayload,
@@ -48,6 +49,10 @@ export const api = {
   deleteAssets: (ids: string[], deleteFile?: boolean) =>
     invoke<void>('delete_assets', { ids, deleteFile: deleteFile ?? true }),
   renameAsset: (id: string, newName: string) => invoke<Asset>('rename_asset', { id, newName }),
+
+  // Folder tree: the children of one node, `''` being the library root
+  getFolders: (libraryId: string, parentPath: string) =>
+    invoke<FolderNode[]>('get_folders', { libraryId, parentPath }),
 
   // Tags
   listTags: () => invoke<Tag[]>('list_tags'),

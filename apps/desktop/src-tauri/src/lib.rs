@@ -4,6 +4,7 @@ pub mod db;
 pub mod models;
 pub mod preview;
 pub mod render;
+pub mod structure;
 pub mod thumb_cleanup;
 pub mod watcher;
 
@@ -226,6 +227,7 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::asset::delete_asset,
             commands::asset::delete_assets,
             commands::asset::rename_asset,
+            commands::folder::get_folders,
             commands::tag::list_tags,
             commands::tag::create_tag,
             commands::tag::update_tag,

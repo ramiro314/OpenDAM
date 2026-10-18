@@ -779,3 +779,5 @@ export const useCollectionStore = create<CollectionStore>()((set) => ({
     set((s) => ({ collections: s.collections.filter((c) => c.id !== id) }));
   },
 }));
+
+export { useFolderTreeStore } from './folderTree';

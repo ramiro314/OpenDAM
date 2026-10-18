@@ -18,6 +18,7 @@ import {
   useCollectionStore,
   useAssetStore,
   useAutotagStore,
+  useFolderTreeStore,
   lookupAsset,
 } from './store';
 import type { AutotagUpdate } from './types';
@@ -84,6 +85,7 @@ export default function App() {
     const unlistenLib = listen('library:updated', () => {
       useAssetStore.getState().refresh();
       useLibraryStore.getState().fetchLibraries();
+      useFolderTreeStore.getState().refetch();
     });
 
     // Keyboard shortcuts: F5, Space hold for QuickLook, Ctrl+C to copy path
