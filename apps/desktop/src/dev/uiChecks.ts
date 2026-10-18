@@ -331,6 +331,10 @@ export const UI_CHECKS: UiCheck[] = [
         toggle()!.title === 'Image scaling: Pixelated',
         `the toggle is titled "${toggle()!.title}"`
       );
+      // The hook re-checks on a devicePixelRatio change through this media query, so the webview
+      // must evaluate it
+      const resolution = `(resolution: ${window.devicePixelRatio}dppx)`;
+      assert(window.matchMedia(resolution).matches, `${resolution} doesn't match`);
 
       // Scroll through the results until the viewport shows an enlarged and a shrunk image
       const el = scroll();

@@ -1,12 +1,13 @@
 import { useCallback, useRef } from 'react';
 import { useUIStore } from '../store';
+import { onDevicePixelRatioChange } from '../utils/devicePixelRatio';
 import { shouldPixelate, type ImageFit } from '../utils/imageScaling';
 
 /**
  * A callback ref for an `<img>` laid out with `fit`, that sets `image-rendering: pixelated` on
  * it when the image scaling preference is pixelated and the image is enlarged in device pixels
- * (`shouldPixelate`). It re-checks when the image loads, when its box resizes and when the
- * preference changes.
+ * (`shouldPixelate`). It re-checks when the image loads, when its box resizes, when
+ * `devicePixelRatio` changes and when the preference changes.
  */
 export function useImageScaling(fit: ImageFit): (img: HTMLImageElement | null) => void {
   const pref = useUIStore((s) => s.imageScaling);
@@ -30,9 +31,11 @@ export function useImageScaling(fit: ImageFit): (img: HTMLImageElement | null) =
       img.addEventListener('load', apply);
       const observer = new ResizeObserver(apply);
       observer.observe(img);
+      const unsubscribe = onDevicePixelRatioChange(apply);
       cleanup.current = () => {
         img.removeEventListener('load', apply);
         observer.disconnect();
+        unsubscribe();
       };
     },
     [pref, fit]
