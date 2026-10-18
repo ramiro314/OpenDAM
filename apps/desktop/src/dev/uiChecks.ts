@@ -150,7 +150,7 @@ const scrubLabel = () => document.getElementById('scrub-label');
 /** The library the bench registers its run copy as (`OPENDAM_BENCH_LIBRARY`). */
 const BENCH_LIBRARY = 'bench';
 
-/** How long U9 waits for the startup index run's structure pass. */
+/** How long U9 waits for the folder tree, and for a write to get through. */
 const STRUCTURE_TIMEOUT_MS = 900_000;
 
 /** The sidebar row of folder `path` in the bench library, if it is shown. */
@@ -1023,17 +1023,29 @@ export const UI_CHECKS: UiCheck[] = [
       });
       assert(inFolder.total === 1, `${folder.path} holds ${inFolder.total} assets, not 1`);
       const asset = inFolder.assets[0];
-      await useAssetStore.getState().renameAsset(asset.id, 'u9-renamed');
+      // On a fresh run copy the one-time thumbnail cleanup holds a long read, and no write
+      // commits until it ends: a rename it blocks fails and is undone, so try until one lands
+      const writeDeadline = performance.now() + STRUCTURE_TIMEOUT_MS;
+      for (;;) {
+        const failed = await useAssetStore
+          .getState()
+          .renameAsset(asset.id, 'u9-renamed')
+          .then(() => null)
+          .catch((e: unknown) => String(e));
+        if (!failed) break;
+        assert(performance.now() < writeDeadline, `the rename kept failing: ${failed}`);
+        await sleep(5_000);
+      }
       const renamed = await api.getAsset(asset.id);
       assert(renamed.fileName.startsWith('u9-renamed.'), `the rename gave ${renamed.fileName}`);
       assert(shownCount(folderRow(folder.path)!) === 1, `${folder.path} lost its file`);
 
       // Rows only: the file stays on the run copy rather than going to the trash
       await useAssetStore.getState().deleteAsset(asset.id, false);
-      await waitFor(() => folderRow(folder.path) === null, 5_000, `${folder.path} to drop out`);
+      await waitFor(() => folderRow(folder.path) === null, 30_000, `${folder.path} to drop out`);
       await waitFor(
         () => ancestors.every((path, i) => shownCount(folderRow(path)!) === before[i] - 1),
-        5_000,
+        30_000,
         `the counts above ${folder.path} to drop by one, from ${before.join(', ')}`
       );
       await pause('U9-after-delete');

@@ -1036,7 +1036,8 @@ async fn rename_asset_with(db: &Database, id: &str, new_name: &str) -> Result<()
     }
 
     // Rename file on disk
-    if old_abs_path.exists() {
+    let renamed_on_disk = old_abs_path.exists();
+    if renamed_on_disk {
         std::fs::rename(&old_abs_path, &new_abs_path)
             .map_err(|e| format!("Failed to rename file on disk: {}", e))?;
     }
@@ -1044,20 +1045,36 @@ async fn rename_asset_with(db: &Database, id: &str, new_name: &str) -> Result<()
     let new_rel_fp = make_relative_path(&lib.root_path, &new_abs_path);
     let now = chrono::Utc::now().timestamp_millis();
 
-    // Update in all relevant databases
-    let pools_to_update = vec![lib.pool.clone(), db.master_pool.clone()];
-    for pool in pools_to_update {
-        let _ = sqlx::query(
-            "UPDATE assets SET file_name = ?, file_path = ?, extension = ?, modified_at = ? WHERE id = ?"
-        )
-        .bind(&final_name)
-        .bind(&new_rel_fp)
-        .bind(&new_ext)
-        .bind(now)
-        .bind(id)
-        .execute(&pool)
-        .await;
+    // Update in all relevant databases. The library's row must follow the file: if it can't
+    // (a busy NAS), the file takes its old name back, so the index never sees a new file.
+    let update = |pool: sqlx::Pool<sqlx::Sqlite>| {
+        let (name, path, ext) = (final_name.clone(), new_rel_fp.clone(), new_ext.clone());
+        async move {
+            sqlx::query(
+                "UPDATE assets SET file_name = ?, file_path = ?, extension = ?, modified_at = ? WHERE id = ?",
+            )
+            .bind(name)
+            .bind(path)
+            .bind(ext)
+            .bind(now)
+            .bind(id)
+            .execute(&pool)
+            .await
+        }
+    };
+    if let Err(e) = update(lib.pool.clone()).await {
+        if renamed_on_disk {
+            if let Err(undo) = std::fs::rename(&new_abs_path, &old_abs_path) {
+                return Err(format!(
+                    "Could not record the rename ({e}), and could not undo it on disk: {undo}"
+                ));
+            }
+        }
+        return Err(format!(
+            "Could not record the rename, so it was undone: {e}"
+        ));
     }
+    let _ = update(db.master_pool.clone()).await;
 
     structure::rebuild_library(db, &lib).await;
     Ok(())
@@ -2550,6 +2567,25 @@ mod tests {
             FOLDER_FILES[3],
         ];
         assert_eq!(folders, crate::structure::tests::fresh_pass(&after).await);
+    }
+
+    #[tokio::test]
+    async fn a_rename_the_library_db_refuses_is_undone_on_disk() {
+        let (root, db, pool) = library_in_folders(&FOLDER_FILES).await;
+        sqlx::query(
+            "CREATE TRIGGER refuse BEFORE UPDATE ON assets BEGIN SELECT RAISE(ABORT, 'busy'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = rename_asset_with(&db, FOLDER_FILES[3], "oak").await;
+
+        let kept = root.join("tree.glb").exists();
+        let renamed = root.join("oak.glb").exists();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(result.unwrap_err().contains("so it was undone"));
+        assert!(kept && !renamed);
     }
 
     #[tokio::test]

@@ -177,7 +177,9 @@ The UI checks, each defined in its plan:
   its node's count, every result lies below it, and the status bar shows its path. Then, on a
   folder holding one file, a rename keeps the count, and deleting the file's rows (not the file)
   drops the folder from the tree and takes one from every folder above it, with no manual
-  refresh. It also checks that every `get_folders` call on the way took under 50 ms.
+  refresh. It also checks that every `get_folders` call on the way took under 50 ms. On a fresh
+  run copy no write commits while the thumbnail cleanup's long read runs, so U9 retries the
+  rename, which a failed write undoes, until one lands.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 1. Screenshots:
   `U9-top-level-folders`, `U9-platformer-kit`, `U9-after-delete`.
 
