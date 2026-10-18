@@ -8,7 +8,7 @@ import { PAGE_SIZE, assetAt, createSettler } from '../../store/pageCache';
 import { autotagAvailability } from '../../utils/autotag';
 import { menuTargets, openLimitReason } from '../../utils/contextMenu';
 import { formatVisibleRange } from '../../utils/format';
-import { isEditingText } from '../../utils/keyboard';
+import { isEditingText, isInControl } from '../../utils/keyboard';
 import { scrubKey, scrubLabelText } from '../../utils/scrubKey';
 import { ContextMenu } from '../ContextMenu/ContextMenu';
 import { IconEye, IconExternal, IconTag, IconTrash } from '../Icons';
@@ -41,8 +41,6 @@ import styles from './AssetGrid.module.css';
 type AssetHandler = (asset: Asset, e: React.MouseEvent) => void;
 
 const PAGING_KEYS = new Set<string>(['Home', 'End', 'PageUp', 'PageDown'] satisfies PagingKey[]);
-/** Controls a click focuses for themselves; a click anywhere else in the results focuses the grid. */
-const CONTROLS = 'a[href], button, input, select, textarea, [contenteditable]';
 
 export function AssetGrid() {
   const viewMode = useUIStore((s) => s.viewMode);
@@ -312,7 +310,7 @@ function WindowedResults({
   // keep working once that card scrolls out of the window and unmounts. Controls such as a card's
   // favorite button keep their focus. Cards stay focusable with Tab.
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if ((e.target as Element).closest(CONTROLS)) return;
+    if (isInControl(e.target)) return;
     pointerFocus.current = true;
     setTimeout(() => (pointerFocus.current = false));
     e.currentTarget.focus({ preventScroll: true });
@@ -331,7 +329,7 @@ function WindowedResults({
     if (isEditingText()) return;
     if (e.code === 'Space') {
       // A control, such as a card's favorite button, keeps Space for its own activation
-      if (!(e.target as Element).closest(CONTROLS)) e.preventDefault();
+      if (!isInControl(e.target)) e.preventDefault();
       return;
     }
     if (!PAGING_KEYS.has(e.key)) return;

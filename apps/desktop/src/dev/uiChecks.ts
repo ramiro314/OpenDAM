@@ -563,6 +563,20 @@ export const UI_CHECKS: UiCheck[] = [
       useUIStore.getState().focusAsset(asset!.id);
       try {
         await frames(2);
+        // With an asset focused too, Space on the favorite button is still left to the button
+        const button = (await card0()).querySelector<HTMLElement>('button')!;
+        button.focus();
+        assert(
+          !press(button, ' ', 'Space').defaultPrevented,
+          'Space on the favorite button was prevented while an asset was focused'
+        );
+        await frames(2);
+        assert(!quickLook(), 'Space on the favorite button opened QuickLook');
+        button.dispatchEvent(
+          new KeyboardEvent('keyup', { key: ' ', code: 'Space', bubbles: true })
+        );
+        el.focus();
+        await frames(2);
         assert(press(el, ' ', 'Space').defaultPrevented, 'Space was not prevented');
         await frames(2);
         assert(quickLook(), 'Space on the focused grid did not open QuickLook');

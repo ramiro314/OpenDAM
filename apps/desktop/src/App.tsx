@@ -23,7 +23,7 @@ import {
 import type { AutotagUpdate } from './types';
 import { api } from './api';
 import { startModelThumbnailer } from './preview/modelThumbnailer';
-import { isEditingText } from './utils/keyboard';
+import { isEditingText, isInControl } from './utils/keyboard';
 import styles from './App.module.css';
 
 export default function App() {
@@ -181,7 +181,8 @@ export default function App() {
       }
 
       // Hold Spacebar for Quick Look preview
-      if (e.code === 'Space' && !isEditingText()) {
+      // A focused control, such as a card's favorite button, keeps Space for its own activation
+      if (e.code === 'Space' && !isEditingText() && !isInControl(e.target)) {
         const focusedId = useUIStore.getState().focusedAssetId;
         if (focusedId) {
           e.preventDefault();
