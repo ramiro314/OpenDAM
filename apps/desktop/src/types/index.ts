@@ -116,6 +116,8 @@ export interface FilterSpec {
   collectionIds?: string[];
   collectionLogic?: 'and' | 'or' | 'and_or' | 'none';
   includeSubcollections?: boolean;
+  /** Whether packs' support files (licenses, readmes, preview and sample images) show too */
+  showHidden?: boolean;
 }
 
 export interface SearchQuery {
@@ -141,9 +143,16 @@ export interface FolderNode {
   name: string;
   /** Relative to the library root */
   path: string;
-  /** Files below the folder, at any depth */
+  isPack: boolean;
+  /** Visible files below the folder, at any depth */
   itemCount: number;
+  /** Support files below the folder, at any depth, hidden unless "Show hidden files" is on */
+  hiddenCount: number;
   hasChildren: boolean;
+  /** Whether a pack lies below the folder */
+  holdsPack: boolean;
+  /** Whether a child has visible files or is or holds a pack */
+  hasVisibleChildren: boolean;
 }
 
 // ── Preview job ──────────────────────────────────────────────────────────
@@ -194,6 +203,8 @@ export interface SearchResult {
   assets: Asset[];
   /** Every match, not only this page's; absent when the payload set `includeTotal` to false. */
   total?: number;
+  /** The files the matches stand for, hidden support files included, counted with `total` */
+  fileTotal?: number;
   page: number;
   pageSize: number;
 }

@@ -183,6 +183,23 @@ async fn add_tag_description_column(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// Backward compatibility: assets gained `support_role`, which the structure pass derives. As with
+/// tag descriptions, any failure other than the column already being there is an error, since
+/// every search reads it.
+async fn add_support_role_column(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
+    let present: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('assets') WHERE name = 'support_role')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !present {
+        sqlx::query("ALTER TABLE assets ADD COLUMN support_role TEXT")
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Backward compatibility: the run tables' `store::ADDED_COLUMNS`. As with tag descriptions, any
 /// failure other than a column already being there is an error, since every run query selects
 /// them.
@@ -287,6 +304,9 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     add_tag_description_column(&pool)
         .await
         .context("Could not add the tag description column")?;
+    add_support_role_column(&pool)
+        .await
+        .context("Could not add the support role column")?;
     // Search still works on the old index, so a failed conversion only waits for the next open.
     if let Err(e) = index_file_paths(&pool, false).await {
         tracing::warn!("Could not index folder names for search in {db_path:?}: {e}");
@@ -1010,8 +1030,41 @@ mod tests {
         let reopened = connect_library_sqlite(&file).await.unwrap();
 
         assert_eq!(
-            crate::structure::tests::folder_rows(&reopened).await,
+            crate::structure::tests::derived_rows(&reopened).await,
             crate::structure::tests::fresh_pass(&["kits/rocks/rock.glb"]).await
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_library_made_before_support_roles_adds_them_and_derives_its_packs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("library.sqlite");
+        let pool = connect_library_sqlite(&file).await.unwrap();
+        let paths = ["kits/rocks/License.txt", "kits/rocks/rock.glb"];
+        for path in paths {
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+                 VALUES (?, ?, 'f', 'glb', '3d_model', 1, 0, 0)",
+            )
+            .bind(path)
+            .bind(path)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("ALTER TABLE assets DROP COLUMN support_role; DELETE FROM folders;")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let reopened = connect_library_sqlite(&file).await.unwrap();
+
+        let derived = crate::structure::tests::derived_rows(&reopened).await;
+        assert_eq!(derived, crate::structure::tests::fresh_pass(&paths).await);
+        assert_eq!(
+            derived.roles[0],
+            (paths[0].to_string(), Some("doc".to_string()))
         );
     }
 

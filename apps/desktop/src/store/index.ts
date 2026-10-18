@@ -190,6 +190,8 @@ export const useLibraryStore = create<LibraryStore>()((set) => ({
 interface AssetStore extends PageCache {
   /** Result count for the current query, counted once per search or refresh */
   total: number;
+  /** The files the results stand for, hidden support files included, counted with `total` */
+  fileTotal: number;
   /** Copies of the selected and focused assets, kept when their pages are evicted (D3) */
   pinned: Map<string, Asset>;
   /**
@@ -267,7 +269,14 @@ const defaultQuery: SearchQuery = {
 
 /** Clears the grid so a failed search can't leave results from an earlier query on screen */
 function failedSearch(e: unknown): Partial<AssetStore> {
-  return { ...emptyCache(), total: 0, wanted: [], deleted: new Set(), searchError: String(e) };
+  return {
+    ...emptyCache(),
+    total: 0,
+    fileTotal: 0,
+    wanted: [],
+    deleted: new Set(),
+    searchError: String(e),
+  };
 }
 
 /** The cached asset `id`, if its page is cached. */
@@ -323,6 +332,7 @@ function failuresOf(generation: number) {
 export const useAssetStore = create<AssetStore>()((set, get) => ({
   ...emptyCache(),
   total: 0,
+  fileTotal: 0,
   pinned: new Map(),
   deleted: new Set(),
   pending: new Set(),
@@ -384,6 +394,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       set((s) => ({
         ...cache,
         total: result.total ?? result.assets.length,
+        fileTotal: result.fileTotal ?? result.total ?? result.assets.length,
         wanted: [0],
         pinned: repin(s.pinned, result.assets),
         deleted: new Set(),
@@ -467,6 +478,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       );
       if (generation !== get().generation) return;
       const total = results[0].total ?? s.total;
+      const fileTotal = results[0].fileTotal ?? s.fileTotal;
       let cache = emptyCache();
       results.forEach((r, i) => {
         if (r.assets.length > 0) cache = insertPage(cache, pages[i], r.assets, pages);
@@ -477,6 +489,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       set((cur) => ({
         ...cache,
         total,
+        fileTotal,
         pinned: repin(
           cur.pinned,
           results.flatMap((r) => r.assets)

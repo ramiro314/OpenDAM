@@ -1,12 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 import {
   datePresets,
+  folderCount,
   isFilterEmpty,
+  isFolderShown,
   isNameTaken,
   libraryNameFromPath,
   parentCandidates,
   resolveDroppedAssetId,
 } from './sidebarHelpers';
+import type { FolderNode } from '../../types';
 
 describe('parentCandidates', () => {
   const tags = [
@@ -98,6 +101,43 @@ describe('isFilterEmpty', () => {
 
   test('ignores the library root and filters the sidebar does not offer', () => {
     expect(isFilterEmpty({ directory: ' / ', extensions: ['png'] })).toBe(true);
+  });
+
+  test('is false while hidden files show', () => {
+    expect(isFilterEmpty({ showHidden: true })).toBe(false);
+    expect(isFilterEmpty({ showHidden: false })).toBe(true);
+  });
+});
+
+describe('isFolderShown and folderCount', () => {
+  const node = (patch: Partial<FolderNode>): FolderNode => ({
+    name: 'f',
+    path: 'f',
+    isPack: false,
+    itemCount: 0,
+    hiddenCount: 0,
+    hasChildren: false,
+    holdsPack: false,
+    hasVisibleChildren: false,
+    ...patch,
+  });
+
+  test('a folder holding only hidden files shows only with hidden files on', () => {
+    const docs = node({ hiddenCount: 4 });
+    expect(isFolderShown(docs, false)).toBe(false);
+    expect(isFolderShown(docs, true)).toBe(true);
+    expect(isFolderShown(node({ itemCount: 1, hiddenCount: 4 }), false)).toBe(true);
+  });
+
+  test('a pack, or a folder holding one, always shows', () => {
+    expect(isFolderShown(node({ isPack: true, hiddenCount: 3 }), false)).toBe(true);
+    expect(isFolderShown(node({ holdsPack: true, hiddenCount: 30 }), false)).toBe(true);
+  });
+
+  test('the count takes in hidden files while they show', () => {
+    const kit = node({ itemCount: 200, hiddenCount: 3 });
+    expect(folderCount(kit, false)).toBe(200);
+    expect(folderCount(kit, true)).toBe(203);
   });
 });
 

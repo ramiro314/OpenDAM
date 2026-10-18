@@ -14,9 +14,16 @@ pub struct FolderNode {
     pub name: String,
     /// Relative to the library root
     pub path: String,
-    /// Files below the folder, at any depth
+    pub is_pack: bool,
+    /// Visible files below the folder, at any depth
     pub item_count: i64,
+    /// Support files below the folder, at any depth, hidden unless "Show hidden files" is on
+    pub hidden_count: i64,
     pub has_children: bool,
+    /// Whether a pack lies below the folder
+    pub holds_pack: bool,
+    /// Whether a child has visible files or is or holds a pack, so it shows with hidden files off
+    pub has_visible_children: bool,
 }
 
 /// The child folders of `parent_path` (`""` for the root) in library `library_id`, sorted by
@@ -39,17 +46,28 @@ pub async fn get_folders(
 
 /// Reads one node's children from `idx_folders_parent_name`; `path` breaks ties between names
 /// that differ only in case. Only edge slashes are dropped from `parent_path`: folder names keep
-/// their spaces, as on disk.
+/// their spaces, as on disk. A pack below a folder lies in the primary key range
+/// `path/ <= p < path0` (`0` follows `/`), and makes the child holding it visible too.
 pub(crate) async fn child_folders(
     pool: &Pool<Sqlite>,
     parent_path: &str,
 ) -> sqlx::Result<Vec<FolderNode>> {
     sqlx::query_as(
-        "SELECT f.name, f.path, f.item_count,
-                EXISTS (SELECT 1 FROM folders c WHERE c.parent_path = f.path) AS has_children
-         FROM folders f
-         WHERE f.parent_path = ?
-         ORDER BY f.name COLLATE NOCASE, f.path",
+        "SELECT name, path, is_pack, item_count, hidden_count, has_children, holds_pack,
+                holds_pack OR EXISTS (
+                    SELECT 1 FROM folders c WHERE c.parent_path = n.path AND c.item_count > 0
+                ) AS has_visible_children
+         FROM (
+             SELECT f.name, f.path, f.is_pack, f.item_count, f.hidden_count,
+                    EXISTS (SELECT 1 FROM folders c WHERE c.parent_path = f.path) AS has_children,
+                    EXISTS (
+                        SELECT 1 FROM folders p
+                        WHERE p.path >= f.path || '/' AND p.path < f.path || '0' AND p.is_pack
+                    ) AS holds_pack
+             FROM folders f
+             WHERE f.parent_path = ?
+         ) n
+         ORDER BY name COLLATE NOCASE, path",
     )
     .bind(parent_path.trim_matches('/'))
     .fetch_all(pool)
@@ -78,13 +96,96 @@ mod tests {
         pool
     }
 
+    /// A node with no pack in or below it and no hidden file.
     fn node(name: &str, path: &str, item_count: i64, has_children: bool) -> FolderNode {
         FolderNode {
             name: name.into(),
             path: path.into(),
+            is_pack: false,
             item_count,
+            hidden_count: 0,
             has_children,
+            holds_pack: false,
+            has_visible_children: has_children,
         }
+    }
+
+    #[tokio::test]
+    async fn nodes_carry_packs_hidden_counts_and_whether_they_show_with_hidden_files_off() {
+        let pool = library(&[
+            "3D assets/Car Kit/License.txt",
+            "3D assets/Car Kit/Models/sedan.png",
+            "Audio/Casino Audio/License.txt",
+            "Audio/Casino Audio/Preview.png",
+            "Docs/Readme.txt",
+            "Docs/Old/License.txt",
+        ])
+        .await;
+        let top = child_folders(&pool, "").await.unwrap();
+        let summary: Vec<(&str, bool, i64, i64, bool, bool)> = top
+            .iter()
+            .map(|n| {
+                (
+                    n.name.as_str(),
+                    n.is_pack,
+                    n.item_count,
+                    n.hidden_count,
+                    n.holds_pack,
+                    n.has_visible_children,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("3D assets", false, 1, 1, true, true),
+                // Every file of the pack below is hidden, but the pack still shows.
+                ("Audio", false, 0, 2, true, true),
+                // `Docs/Old` is a pack too, by its license.
+                ("Docs", false, 1, 1, true, true),
+            ]
+        );
+        let kit = child_folders(&pool, "3D assets").await.unwrap();
+        assert_eq!(
+            (
+                kit[0].is_pack,
+                kit[0].has_children,
+                kit[0].has_visible_children
+            ),
+            (true, true, true)
+        );
+        let casino = child_folders(&pool, "Audio").await.unwrap();
+        assert_eq!(
+            (
+                casino[0].is_pack,
+                casino[0].item_count,
+                casino[0].hidden_count
+            ),
+            (true, 0, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folder_holding_only_support_files_has_no_visible_children() {
+        let pool = library(&[
+            "kit/License.txt",
+            "kit/rock.png",
+            "kit/Sources/Preview.png",
+            "kit/Sources/game.txt",
+        ])
+        .await;
+        let kit = &child_folders(&pool, "").await.unwrap()[0];
+        assert_eq!(
+            (
+                kit.is_pack,
+                kit.item_count,
+                kit.hidden_count,
+                kit.has_children
+            ),
+            (true, 1, 3, true)
+        );
+        assert!(!kit.has_visible_children);
+        assert!(!kit.holds_pack);
     }
 
     #[tokio::test]

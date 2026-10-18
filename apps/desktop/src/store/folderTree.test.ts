@@ -16,8 +16,12 @@ function serve(tree: () => Record<string, Record<string, string[]>>) {
     return childPaths.map((path): FolderNode => ({
       name: path.slice(path.lastIndexOf('/') + 1),
       path,
+      isPack: false,
       itemCount: 1,
+      hiddenCount: 0,
       hasChildren: (library[path] ?? []).length > 0,
+      holdsPack: false,
+      hasVisibleChildren: (library[path] ?? []).length > 0,
     }));
   };
   return calls;
@@ -139,8 +143,12 @@ describe('useFolderTreeStore', () => {
             ['2D assets', '3D assets'].map((path) => ({
               name: path,
               path,
+              isPack: false,
               itemCount: 1,
+              hiddenCount: 0,
               hasChildren: true,
+              holdsPack: false,
+              hasVisibleChildren: true,
             }))
           );
       });

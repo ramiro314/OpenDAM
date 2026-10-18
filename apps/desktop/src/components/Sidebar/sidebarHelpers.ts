@@ -1,4 +1,4 @@
-import type { Asset, FilterSpec } from '../../types';
+import type { Asset, FilterSpec, FolderNode } from '../../types';
 import { normalizeFolderPath } from '../../utils/folders';
 
 const DAY_MS = 86400000;
@@ -54,8 +54,22 @@ export function isFilterEmpty(filter: FilterSpec): boolean {
     !filter.dateRange &&
     !filter.sizeRange &&
     !filter.previewStatus &&
+    !filter.showHidden &&
     (!filter.tags || filter.tags.length === 0)
   );
+}
+
+/**
+ * Whether a tree node shows. With hidden files off, a folder whose files are all hidden support
+ * files goes, unless it is or holds a pack: every pack shows, even one with no visible item.
+ */
+export function isFolderShown(node: FolderNode, showHidden: boolean): boolean {
+  return showHidden || node.itemCount > 0 || node.isPack || node.holdsPack;
+}
+
+/** A tree node's badge: the files it shows, which counts its hidden ones when they show. */
+export function folderCount(node: FolderNode, showHidden: boolean): number {
+  return showHidden ? node.itemCount + node.hiddenCount : node.itemCount;
 }
 
 /**

@@ -73,6 +73,7 @@ beforeEach(() => {
   useAssetStore.setState({
     ...emptyCache(),
     total: 0,
+    fileTotal: 0,
     pinned: new Map(),
     deleted: new Set(),
     pending: new Set(),
@@ -164,6 +165,22 @@ describe('useAssetStore page cache', () => {
     expect(s.assetAt(450)?.id).toBe('a450');
     expect(s.assetAt(250)).toBeUndefined(); // page 1 was never wanted
     expect(s.indexById.get('a799')).toBe(799);
+  });
+
+  test('search and refresh keep the files behind the items, counted with the total', async () => {
+    let counts = { total: 2, fileTotal: 5 };
+    api.searchAssets = async (payload) => ({
+      assets: library(2),
+      page: payload.page,
+      pageSize: payload.pageSize,
+      ...(payload.includeTotal !== false ? counts : {}),
+    });
+    await useAssetStore.getState().search();
+    expect(useAssetStore.getState()).toMatchObject({ total: 2, fileTotal: 5 });
+
+    counts = { total: 2, fileTotal: 4 };
+    await useAssetStore.getState().refresh();
+    expect(useAssetStore.getState()).toMatchObject({ total: 2, fileTotal: 4 });
   });
 
   test('a page already cached or in flight is not fetched again', async () => {

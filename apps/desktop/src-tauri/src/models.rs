@@ -236,6 +236,9 @@ pub struct FilterSpec {
     pub collection_logic: Option<String>,
     #[serde(rename = "includeSubcollections")]
     pub include_subcollections: Option<bool>,
+    /// Whether packs' support files (licenses, readmes, preview and sample images) show too
+    #[serde(rename = "showHidden")]
+    pub show_hidden: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -268,6 +271,9 @@ pub struct SearchResult {
     /// Every match, not only this page's; absent when the payload set `includeTotal` to false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total: Option<i64>,
+    /// The files the matches stand for, hidden support files included, counted with `total`.
+    #[serde(rename = "fileTotal", skip_serializing_if = "Option::is_none")]
+    pub file_total: Option<i64>,
     pub page: i64,
     #[serde(rename = "pageSize")]
     pub page_size: i64,

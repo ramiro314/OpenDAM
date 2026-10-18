@@ -416,3 +416,16 @@
   text-decoration: underline;
   color: var(--color-brand-300);
 }
+
+.filterCheckbox {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--color-brand-500);
+  cursor: pointer;
+}
+
+.packIcon {
+  flex-shrink: 0;
+  color: var(--color-brand-400);
+}

@@ -1,6 +1,7 @@
 import clsx from 'clsx';
 import { useAssetStore, useFolderTreeStore } from '../../store';
-import { IconChevronDown, IconChevronRight, IconFolder } from '../Icons';
+import { IconChevronDown, IconChevronRight, IconFolder, IconPackage } from '../Icons';
+import { folderCount, isFolderShown } from './sidebarHelpers';
 import styles from './Sidebar.module.css';
 
 interface FolderTreeProps {
@@ -10,19 +11,26 @@ interface FolderTreeProps {
   onSelect: (libraryId: string, path: string) => void;
 }
 
-/** One level of a library's folder tree, each expanded node listing its own children below it. */
+/**
+ * One level of a library's folder tree, each expanded node listing its own children below it.
+ * Packs get a pack icon. With hidden files off, folders holding only support files are left out.
+ */
 export function FolderTree({ libraryId, parentPath, onSelect }: FolderTreeProps) {
   const nodes = useFolderTreeStore((s) => s.children[libraryId]?.[parentPath]);
   const expanded = useFolderTreeStore((s) => s.expanded[libraryId]);
   const toggle = useFolderTreeStore((s) => s.toggle);
   const selected = useAssetStore((s) => s.query.folder);
+  const showHidden = useAssetStore((s) => Boolean(s.query.filter.showHidden));
 
-  if (!nodes || nodes.length === 0) return null;
+  const shown = nodes?.filter((node) => isFolderShown(node, showHidden));
+  if (!shown || shown.length === 0) return null;
   return (
     <div className={styles.subTree} role="group">
-      {nodes.map((node) => {
+      {shown.map((node) => {
         const isOpen = expanded?.includes(node.path) ?? false;
         const isSelected = selected?.libraryId === libraryId && selected.path === node.path;
+        const hasChildren = showHidden ? node.hasChildren : node.hasVisibleChildren;
+        const hidden = node.hiddenCount > 0 ? `, ${node.hiddenCount.toLocaleString()} hidden` : '';
         return (
           <div key={node.path}>
             <div
@@ -30,13 +38,14 @@ export function FolderTree({ libraryId, parentPath, onSelect }: FolderTreeProps)
               onClick={() => onSelect(libraryId, node.path)}
               data-library-id={libraryId}
               data-folder-path={node.path}
+              data-pack={node.isPack || undefined}
               role="treeitem"
               aria-selected={isSelected}
-              aria-expanded={node.hasChildren ? isOpen : undefined}
+              aria-expanded={hasChildren ? isOpen : undefined}
               tabIndex={0}
-              title={node.path}
+              title={`${node.path}${node.isPack ? ' (pack)' : ''}: ${node.itemCount.toLocaleString()} items${hidden}`}
             >
-              {node.hasChildren ? (
+              {hasChildren ? (
                 <span
                   className={styles.chevronBtn}
                   onClick={(e) => {
@@ -49,12 +58,13 @@ export function FolderTree({ libraryId, parentPath, onSelect }: FolderTreeProps)
                   {isOpen ? <IconChevronDown size={11} /> : <IconChevronRight size={11} />}
                 </span>
               ) : (
-                <IconFolder size={13} />
+                !node.isPack && <IconFolder size={13} />
               )}
+              {node.isPack && <IconPackage size={13} className={styles.packIcon} />}
               <span className={clsx(styles.itemName, 'truncate')}>{node.name}</span>
-              <span className={styles.badge}>{node.itemCount.toLocaleString()}</span>
+              <span className={styles.badge}>{folderCount(node, showHidden).toLocaleString()}</span>
             </div>
-            {isOpen && (
+            {isOpen && hasChildren && (
               <FolderTree libraryId={libraryId} parentPath={node.path} onSelect={onSelect} />
             )}
           </div>

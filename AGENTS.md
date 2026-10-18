@@ -102,15 +102,16 @@ docs/plans                    Plans for this fork
   `db::upsert_collection`), never `REPLACE`, which cascade-deletes memberships and child
   collections.
 
-- **Structure is derived.** `folders` (each folder's path, parent, name and recursive
-  `item_count`, the root being `path = ''`) is recomputed by `structure.rs` from the indexed
-  paths: `structure::derive` is a pure function, and `structure::apply` writes only the rows that
-  changed, in 200-row transactions. Opening a library DB (`connect_library_sqlite`) runs the pass
-  once, and every `watcher::index_paths` run ends with it, under the library's
-  `Database::index_lock`. Only `structure.rs` writes `folders`: a command that changes
-  the indexed paths (`delete_asset`, `delete_assets`, `rename_asset`) calls
-  `structure::rebuild_library` before it returns, rather than patching rows, and that waits for
-  any index run holding the lock.
+- **Structure is derived.** `folders` (each folder's path, parent, name, `is_pack`, and its
+  recursive `item_count` and `hidden_count`, the root being `path = ''`) and `assets.support_role`
+  are recomputed by `structure.rs` from the indexed paths: `structure::derive` is a pure
+  function, and the pass writes only the rows that changed, in 200-row transactions. Opening a
+  library DB (`connect_library_sqlite`) runs the pass once, and every `watcher::index_paths` run
+  ends with it, under the library's `Database::index_lock`. Only `structure.rs` writes `folders`
+  and `support_role`: a command that changes the indexed paths (`delete_asset`, `delete_assets`,
+  `rename_asset`) calls `structure::rebuild_library` before it returns, rather than patching rows,
+  and that waits for any index run holding the lock. Searches hide support files
+  (`support_role IS NOT NULL`) unless the filter's `showHidden` is set.
 
 ## Python preview worker
 

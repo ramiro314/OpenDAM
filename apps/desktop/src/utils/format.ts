@@ -7,7 +7,7 @@ export function formatSize(bytes: number): string {
 }
 
 /**
- * The grid footer: the visible range out of every result, `41,201-41,236 of 83,095 assets` (C12),
+ * The grid footer: the visible range out of every result, `41,201-41,236 of 82,292 items` (C12),
  * from 0-based `first` and `last`. Just the total when nothing is visible.
  */
 export function formatVisibleRange(
@@ -15,6 +15,12 @@ export function formatVisibleRange(
   total: number
 ): string {
   const n = (x: number) => x.toLocaleString('en-US');
-  const assets = `${n(total)} ${total === 1 ? 'asset' : 'assets'}`;
-  return range ? `${n(range.first + 1)}-${n(range.last + 1)} of ${assets}` : assets;
+  const items = `${n(total)} ${total === 1 ? 'item' : 'items'}`;
+  return range ? `${n(range.first + 1)}-${n(range.last + 1)} of ${items}` : items;
+}
+
+/** The status bar's result count: grid items, then the files they stand for, hidden ones included. */
+export function formatItemsAndFiles(items: number, files: number): string {
+  const n = (x: number) => x.toLocaleString('en-US');
+  return `${n(items)} ${items === 1 ? 'item' : 'items'} (${n(files)} ${files === 1 ? 'file' : 'files'})`;
 }

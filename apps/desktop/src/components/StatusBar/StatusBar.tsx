@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useAssetStore, useAutotagStore, useLibraryStore } from '../../store';
 import { taggingSummary } from '../../utils/autotag';
+import { formatItemsAndFiles } from '../../utils/format';
 import autotagStyles from '../Autotag/Autotag.module.css';
 import { api } from '../../api';
 import type { PreviewProgress } from '../../types';
@@ -35,7 +36,7 @@ function usePreviewProgress(): PreviewProgress | null {
 }
 
 export function StatusBar() {
-  const { total, loading, query } = useAssetStore();
+  const { total, fileTotal, loading, query } = useAssetStore();
   const previewProgress = usePreviewProgress();
   const tagging = taggingSummary(useAutotagStore((s) => s.runs));
   const setRunsPanelOpen = useAutotagStore((s) => s.setRunsPanelOpen);
@@ -49,8 +50,8 @@ export function StatusBar() {
         {loading ? (
           <span className={styles.item}>Indexing…</span>
         ) : (
-          <span className={styles.item}>
-            {total.toLocaleString()} asset{total !== 1 ? 's' : ''}
+          <span className={styles.item} id="status-count">
+            {formatItemsAndFiles(total, fileTotal)}
           </span>
         )}
         {query.folder && (

@@ -182,6 +182,14 @@ The UI checks, each defined in its plan:
   rename, which a failed write undoes, until one lands.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 1. Screenshots:
   `U9-top-level-folders`, `U9-platformer-kit`, `U9-after-delete`.
+- **U10** (packs and hidden files): `3D assets/Car Kit` is marked as a pack in the tree, a pack
+  in `Audio/` whose files are all hidden still shows with a count of 0, and the kit's grid holds
+  neither `License.txt` nor `Preview.png`, while the status bar reads `<items> items (<files>
+  files)` with the kit's hidden files counted as files only. A search for "license" in the kit
+  then reads `0 items (1 file)`, and "Show hidden files" brings `License.txt` back and makes the
+  kit's badge count its hidden files.
+  [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 2. Screenshots:
+  `U10-license-hidden`, `U10-license-shown`.
 
 Run it with the script, from the repo root:
 
