@@ -336,6 +336,9 @@ function WindowedResults({
     if (!PAGING_KEYS.has(e.key)) return;
     e.preventDefault();
     const el = e.currentTarget;
+    // Focus moves to the grid first: WebKit reveals a just-focused card on its next layout, which
+    // would scroll it back into view, and a card paged out of the window unmounts
+    if (document.activeElement !== el) el.focus({ preventScroll: true });
     el.scrollTop = pagingTarget(
       e.key as PagingKey,
       el.scrollTop,

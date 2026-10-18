@@ -374,16 +374,34 @@ export const UI_CHECKS: UiCheck[] = [
               `${sort}: no label at 4 viewports a second (${fast.summary})`
             );
             assert(watch.ariaHidden, `${sort}: the label is not aria-hidden`);
-            // It hides 0.6 s after the last scroll event
+            // It hides 0.6 s after the last scroll event. A stalled webview runs the timer late:
+            // a hide past 900 ms passes only when the main thread was stalled across the 600 ms
+            // deadline and the label hid as soon as it resumed.
+            const frameTimes = [fast.lastScroll];
             await untilFrame(
-              () => !scrubLabel() && watch.hiddenAt() > fast.lastScroll,
+              () => {
+                frameTimes.push(performance.now());
+                return !scrubLabel() && watch.hiddenAt() > fast.lastScroll;
+              },
               30_000,
               `${sort}: the label hides after the last scroll event`
             );
+            const deadline = fast.lastScroll + 600;
+            const after = frameTimes.findIndex((t) => t >= deadline);
+            const stalledUntil =
+              after > 0 && frameTimes[after] - frameTimes[after - 1] > 300
+                ? frameTimes[after]
+                : null;
             const hidAfter = Math.round(watch.hiddenAt() - fast.lastScroll);
             assert(
-              hidAfter >= 550 && hidAfter <= 900,
-              `${sort}: the label hid ${hidAfter} ms after the last scroll event (${fast.summary})`
+              hidAfter >= 550 &&
+                (hidAfter <= 900 ||
+                  (stalledUntil !== null && watch.hiddenAt() <= stalledUntil + 200)),
+              `${sort}: the label hid ${hidAfter} ms after the last scroll event ` +
+                `(${fast.summary}; ` +
+                (stalledUntil === null
+                  ? 'no stall over the deadline)'
+                  : `stalled until ${Math.round(stalledUntil - fast.lastScroll)} ms)`)
             );
             // What it showed last: the first visible asset's position and, once its page
             // arrived, its key
@@ -528,8 +546,10 @@ export const UI_CHECKS: UiCheck[] = [
       el.scrollTop = 0;
       await frames(3);
       const tabbed = await card0();
-      tabbed!.focus();
+      tabbed.focus();
       assert(document.activeElement === tabbed, `Tab focus went to ${focused()}, not card 0`);
+      // WebKit reveals a newly focused element on its next layout; a real key press comes later
+      await frames(3);
       press(document.activeElement as HTMLElement, 'End');
       await frames(3);
       assert(
@@ -556,6 +576,7 @@ export const UI_CHECKS: UiCheck[] = [
       assert(button, "card 0's favorite button is not rendered");
       button!.focus();
       assert(document.activeElement === button, `the favorite button left focus on ${focused()}`);
+      await frames(3);
       el.scrollTop = el.scrollHeight - el.clientHeight;
       await frames(3);
       assert(!button!.isConnected, 'the favorite button is still mounted at the bottom');
