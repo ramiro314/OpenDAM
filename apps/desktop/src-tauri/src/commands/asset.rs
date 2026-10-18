@@ -479,8 +479,9 @@ fn search_filter(query: &SearchQuery) -> SqlFilter {
     fn trimmed(s: &Option<String>) -> Option<&str> {
         s.as_deref().map(str::trim).filter(|s| !s.is_empty())
     }
+    // Typed by hand, so padding is dropped; a tree folder's path is used exactly.
     if let Some(dir) = &f.directory {
-        push_folder_range(&mut filter, dir);
+        push_folder_range(&mut filter, dir.trim());
     }
     if let Some(prefix) = trimmed(&f.name_prefix) {
         filter.push("a.file_name LIKE ?", [format!("{prefix}%")]);
@@ -494,9 +495,9 @@ fn search_filter(query: &SearchQuery) -> SqlFilter {
 /// Requires files below `folder`, a path relative to the library root, recursively. The range
 /// `p/ <= file_path < p0` (`0` follows `/`) holds exactly the paths starting with `p/`, uses the
 /// unique `file_path` index and needs no `LIKE` escaping. The root (`""`, or only slashes) adds
-/// no condition.
+/// no condition. Spaces are kept: a folder name may start or end with one.
 fn push_folder_range(filter: &mut SqlFilter, folder: &str) {
-    let path = folder.trim().trim_matches('/');
+    let path = folder.trim_matches('/');
     if !path.is_empty() {
         filter.push(
             "a.file_path >= ? AND a.file_path < ?",
@@ -2745,7 +2746,7 @@ mod tests {
         for path in [
             "3D assets/Platformer Kit",
             "3D assets/Platformer Kit/",
-            " /3D assets/Platformer Kit/ ",
+            "/3D assets/Platformer Kit/",
         ] {
             let mut found = folder_search(
                 &libs,
@@ -2766,6 +2767,40 @@ mod tests {
             )
             .await,
             ["3D assets/Platformer Kit/Models/OBJ format/block.obj"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folder_named_with_edge_spaces_matches_only_its_own_files() {
+        let libs = [library_of(
+            "lib",
+            &["Textures /a.png", "Textures/b.png", " Models/c.png"],
+        )
+        .await];
+        for (path, expected) in [
+            ("Textures ", "Textures /a.png"),
+            ("Textures", "Textures/b.png"),
+            (" Models", " Models/c.png"),
+        ] {
+            let found = folder_search(
+                &libs,
+                serde_json::json!({ "folder": { "libraryId": "lib", "path": path } }),
+                "name",
+                "asc",
+            )
+            .await;
+            assert_eq!(found, [expected], "folder {path:?}");
+        }
+        // The Smart Filter's hand-typed folder still drops its padding.
+        assert_eq!(
+            folder_search(
+                &libs,
+                serde_json::json!({ "filter": { "directory": " Textures/ " } }),
+                "name",
+                "asc",
+            )
+            .await,
+            ["Textures/b.png"]
         );
     }
 
@@ -2828,7 +2863,7 @@ mod tests {
             library_of("a", &["3D assets/a.glb", "b.glb"]).await,
             library_of("b", &["3D assets/c.glb", "d.glb"]).await,
         ];
-        for root in ["", "/", " "] {
+        for root in ["", "/"] {
             let mut found = folder_search(
                 &libs,
                 serde_json::json!({ "folder": { "libraryId": "b", "path": root }, "libraryIds": ["a", "b"] }),

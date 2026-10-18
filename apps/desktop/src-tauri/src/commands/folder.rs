@@ -38,7 +38,8 @@ pub async fn get_folders(
 }
 
 /// Reads one node's children from `idx_folders_parent_name`; `path` breaks ties between names
-/// that differ only in case.
+/// that differ only in case. Only edge slashes are dropped from `parent_path`: folder names keep
+/// their spaces, as on disk.
 pub(crate) async fn child_folders(
     pool: &Pool<Sqlite>,
     parent_path: &str,
@@ -50,7 +51,7 @@ pub(crate) async fn child_folders(
          WHERE f.parent_path = ?
          ORDER BY f.name COLLATE NOCASE, f.path",
     )
-    .bind(parent_path.trim().trim_matches('/'))
+    .bind(parent_path.trim_matches('/'))
     .fetch_all(pool)
     .await
 }
@@ -101,7 +102,7 @@ mod tests {
             node("Models", "Models", 2, true),
             node("textures", "textures", 1, false),
         ];
-        for root in ["", "/", " "] {
+        for root in ["", "/"] {
             assert_eq!(child_folders(&pool, root).await.unwrap(), expected);
         }
     }
@@ -121,6 +122,32 @@ mod tests {
             [node("Models", "3D assets/Platformer Kit/Models", 1, false)]
         );
         assert_eq!(child_folders(&pool, "nowhere").await.unwrap(), []);
+    }
+
+    #[tokio::test]
+    async fn a_folder_named_with_edge_spaces_lists_its_own_children() {
+        let pool = library(&[
+            "Textures /Rock/a.png",
+            "Textures/Wood/b.png",
+            " Models/c.png",
+        ])
+        .await;
+        assert_eq!(
+            child_folders(&pool, "Textures ").await.unwrap(),
+            [node("Rock", "Textures /Rock", 1, false)]
+        );
+        assert_eq!(
+            child_folders(&pool, "Textures").await.unwrap(),
+            [node("Wood", "Textures/Wood", 1, false)]
+        );
+        assert_eq!(child_folders(&pool, " Models").await.unwrap(), []);
+        let top: Vec<String> = child_folders(&pool, "")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|n| n.path)
+            .collect();
+        assert_eq!(top, [" Models", "Textures", "Textures "]);
     }
 
     #[tokio::test]
