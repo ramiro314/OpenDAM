@@ -1,7 +1,25 @@
 # Smarter big collections: folder tree, packs and grouped files
 
-Status: draft for review. Shaped 2026-10-18 in a four-round interview (D1-D23). Once this plan
-merges, Mission Control slices it into dependency-linked tickets.
+Status: approved 2026-10-18. Shaped in a four-round interview (D1-D23) and approved at review, where
+you kept the Readme refinement to D9. Once this plan merges, Mission Control slices it into
+dependency-linked tickets.
+
+Revised 2026-10-18 after Plan Validation repair round 1. These close gaps inside the approved
+decisions. No decision changed:
+
+- **Tagging a model reaches three files, not four.** The bundled preview is a support file, not a
+  group member, so metadata writes skip it (C20). Only delete and rename include it (C21). Step 3's
+  check now says three files for tagging, and four for rename.
+- **Packs whose files are all hidden.** A folder gets a row when at least one indexed file lies below
+  it, hidden support files included.
+  - The 11 zip-only folders in `Archive/` have no indexed file, so they get no row and appear nowhere.
+  - 24 of the 254 packs hold only hidden files, and they show as cards labelled "No visible items"
+    (C16, C17).
+- **Step 2 adds what it needs.** Step 2 needs the `support_role` column and the support-file half
+  of the grid rule, with `showHidden`, so it now adds them itself. Step 3 adds `group_id`,
+  `bundled_preview` and the group half (C4, C5).
+- **The items-and-files status bar (C24) lands in step 2,** which is where the two numbers first
+  differ.
 
 ## Problem
 
@@ -70,7 +88,7 @@ A read-only simulation of this plan's final rules over your live library DB (0.7
 | Rule | Result |
 |---|---|
 | Files indexed today | 83,095 |
-| Packs detected (C8) | **254**, all at `<category>/<pack>/`. `Goodies/Wallpapers` is correctly not a pack, and no category folder is one. |
+| Packs detected (C8) | **254**, all at `<category>/<pack>/`. `Goodies/Wallpapers` is correctly not a pack, and no category folder is one. 24 of the 254 hold only hidden files (C17). |
 | Format groups (C11) | 5,515 groups covering 18,828 files. This includes the `Models/*/Textures/colormap.png` copies. |
 | Bundled model previews (C12) | All 3,741 `Previews/*.png` files match a model in the same pack. |
 | Pack cover images and docs (C10) | 506 images, 297 docs |
@@ -126,8 +144,8 @@ them at review.
 | C1 | **Structure is derived data, recomputed by one pass after every index run.** `structure::rebuild` runs at the end of `watcher::index_paths` (at startup, on add and on refresh), under the same index lock. It reads every asset row, derives folders, packs, groups and roles in memory, and writes only the rows that changed. | No second disk walk: the paths are already in the DB. Existing libraries get their structure on their next open with no backfill flag. A rerun on unchanged files writes nothing. |
 | C2 | **The derivation is a pure function,** `structure::derive(rows, overrides, license_texts) -> Structure`. A thin `structure::apply` diffs the result against the DB and writes it in 200-row transactions. | The rules can be tested on plain path lists modeled on each source in D3, with no database. Writes follow the batched-writes invariant. |
 | C3 | **New tables.** `folders(path PK, parent_path, name, is_pack, item_count, hidden_count, pack_json)` is derived and rewritten by the pass. `pack_overrides(path PK, mark, name, license, source_url, cover_path, updated_at)` is your data, and the pass never deletes it. The library root is the row with `path = ''`, so a library that is itself one pack works. | Derived and user data stay apart. Because overrides are keyed by relative path, an in-place update (D4) that removes a folder and brings it back keeps its edits. |
-| C4 | **New asset columns.** `group_id` holds the main item's id on every member, the main item included, and is `NULL` for a file on its own. `support_role` is one of `doc`, `cover` or `model_preview`, or `NULL`. `bundled_preview` is the relative path of a matched render. They are added with idempotent `ALTER`s in `connect_library_sqlite`, following `add_tag_description_column`: they fail loudly unless the column is already there. Indexes are chosen with `EXPLAIN QUERY PLAN` in step 3. | Grouping and hiding live on the rows the windowed grid already pages through, so pages by index, sorting and the page cache work unchanged. |
-| C5 | **Grid visibility.** The grid shows a row when `(group_id IS NULL OR group_id = id)` and `support_role IS NULL` both hold. With "Show hidden files" on, the `support_role` condition is dropped. Members never appear in the grid, even with that filter on. | One grid item per group. The filter (D11) reveals support files, not group members. |
+| C4 | **New asset columns.** `group_id` holds the main item's id on every member, the main item included, and is `NULL` for a file on its own. `support_role` is one of `doc`, `cover` or `model_preview`, or `NULL`. `bundled_preview` is the relative path of a matched render. They are added with idempotent `ALTER`s in `connect_library_sqlite`, following `add_tag_description_column`: they fail loudly unless the column is already there. `support_role` arrives in step 2, `group_id` and `bundled_preview` in step 3. Indexes are chosen with `EXPLAIN QUERY PLAN` in the step that adds each column. | Grouping and hiding live on the rows the windowed grid already pages through, so pages by index, sorting and the page cache work unchanged. |
+| C5 | **Grid visibility.** The grid shows a row when `(group_id IS NULL OR group_id = id)` and `support_role IS NULL` both hold. With "Show hidden files" on, the `support_role` condition is dropped. Members never appear in the grid, even with that filter on. Step 2 adds the `support_role` half, with `showHidden` in `search_filter`, and step 3 adds the group half. | One grid item per group. The filter (D11) reveals support files, not group members. |
 | C6 | **Matching a group.** File-level filters (kind, extension, folder, name prefix and suffix) match a group if any member matches, through `EXISTS (... m.group_id = a.id ...)`. Metadata filters read the main item, since D18 keeps members equal. Search text matches the main item's index row, because members share its name. Sort keys come from the main item. | This applies D12's "any member matches a format filter" to every file-level filter, so selecting `Models/FBX format/` still shows the kit's models. |
 | C7 | **Folder filter.** `SearchQuery.folder = { libraryId, path }` becomes the range `file_path >= 'p/' AND file_path < 'p0'` on the unique `file_path` index. The Smart Filter's `directory` field becomes this prefix-anchored relative path. Its Browse button strips the library root, which fixes the absolute-path bug, and `isFilterEmpty` counts the field. | A range uses the index and needs no `LIKE` escaping. No smart filters exist on this machine, so changing the field's meaning breaks nothing. |
 | C8 | **The pack rule, in order:** <br>1. A folder is **marked** if a doc (`txt`, `md`, `pdf`) or an image directly inside it has a stem starting with `license`, `licence`, `preview` or `sample` (case-insensitive). <br>2. The outermost marked folder is the pack. <br>3. **Sibling rule:** a folder that isn't inside a pack is also a pack when its parent has at least 2 pack children and packs are more than half of its child folders. <br>4. Overrides apply last. "Mark as pack" always wins, and can nest a pack inside a pack. "Not a pack" removes a detection. | This is D9 with the refinement the simulation forced: Readme files don't mark a pack. It yields 254 packs on your library, with no false category packs. |
@@ -138,15 +156,15 @@ them at review.
 | C13 | **2D stacks.** <br>- **Who stacks:** images (kind `texture` or `image`) that are not grouped, not support files, and have an equal lowercase stem and an equal directory once scale and format folders are removed. <br>- **Scale and format folders:** one table, `Default`, `Default size`, `Double`, `Retina`, `HD`, `1x`-`4x`, `x2`, `PNG`, `SVG`, `Vector`, `Vectors`, each with an optional parenthesized note (`Default (64px)`, `Large (2×)`). A trailing ` X2`, ` HD` or ` (2×)` is also stripped from a folder name (`Sprites X2`, `Poses HD`). <br>- **Main item:** a PNG before other formats, then the default scale (no scale folder, `Default`, `Default size`, `1x`) before larger ones. <br>- They reuse `group_id`. | This is D13. Style and color folders are not in the table, so `Dark`/`Light` and `Blue`/`Red` stay separate items. |
 | C14 | **Metadata when a group forms or grows.** Every member receives the union of the group's tags and collections, plus the main item's rating, color label, favorite and description. A dissolved group's files keep what they had. | This is D18. No tag is lost when a new format joins, or when the main item changes after an update. |
 | C15 | **The preview queue skips non-main members and models with a bundled preview.** It leaves them at `preview_status = 'none'`. Members' existing rendered `_thumb` files stay on disk. A member that becomes a main item without a picture gets a job from the pass. | This saves about 13k renders on a fresh index of a library like yours. Thumbnail deletion stays limited to `owned_thumb_file`. |
-| C16 | **Tree.** <br>- `get_folders(libraryId, parentPath)` returns the children of one node: name, path, `isPack`, item and hidden counts, `hasChildren` and cover, sorted NOCASE. <br>- Nodes load lazily as they expand. Expanded nodes are kept per library for the session and refetched on `library:updated`. <br>- Pack nodes get a pack icon and start collapsed. Folders with no visible items hide unless "Show hidden files" is on. <br>- The selected folder goes into `SearchQuery.folder`, and the status bar shows its path. | This is D6, D7 and D21. Lazy loading keeps a 2,234-folder tree cheap. |
-| C17 | **Packs view.** <br>- **The toggle:** a Packs/Assets toggle in the toolbar appears when the selected node has packs below it, and starts on Packs. Any search text or filter shows Assets (D23), and clearing it returns to the toggle's state, which lasts the session. <br>- **Data:** `get_packs(libraryIds, underPath)` returns the packs flat, NOCASE by name, each with its parent folder path as the subtitle (D20). <br>- **Rendering:** a windowed grid of pack cards in `components/AssetGrid/`. Packs with no indexed files still show, labelled "No indexed files". | 254 cards load at once, with no paging. Living in `AssetGrid/`, the cards are covered by `gridStyles.test.ts`, so no `backdrop-filter` gets in. |
+| C16 | **Tree.** <br>- `get_folders(libraryId, parentPath)` returns the children of one node: name, path, `isPack`, item and hidden counts, `hasChildren` and cover, sorted NOCASE. <br>- Nodes load lazily as they expand. Expanded nodes are kept per library for the session and refetched on `library:updated`. <br>- Pack nodes get a pack icon and start collapsed. Folders with no visible items hide unless "Show hidden files" is on, but pack nodes always show. <br>- The selected folder goes into `SearchQuery.folder`, and the status bar shows its path. | This is D6, D7 and D21. Lazy loading keeps a 2,234-folder tree cheap. |
+| C17 | **Packs view.** <br>- **The toggle:** a Packs/Assets toggle in the toolbar appears when the selected node has packs below it, and starts on Packs. Any search text or filter shows Assets (D23), and clearing it returns to the toggle's state, which lasts the session. <br>- **Data:** `get_packs(libraryIds, underPath)` returns the packs flat, NOCASE by name, each with its parent folder path as the subtitle (D20). <br>- **Rendering:** a windowed grid of pack cards in `components/AssetGrid/`. A pack whose files are all hidden still shows, labelled "No visible items". On your library that is 24 of the 254: 16 Audio packs (audio isn't indexed), 5 `Isometric Miniature *` packs (a `.zip` plus previews) and 3 under `Other/`. Folders with no indexed file at all have no row, so they never show. | 254 cards load at once, with no paging. Living in `AssetGrid/`, the cards are covered by `gridStyles.test.ts`, so no `backdrop-filter` gets in. |
 | C18 | **Pack detail.** <br>- **Clicks:** a click on a pack card selects it, and the detail panel shows the pack. Double-click or Enter selects the pack in the tree (D19). <br>- **Inside a pack:** with no asset selected, the panel shows that pack. <br>- **Contents:** cover, gallery, license with "Open license", header fields, counts and size, and source URL with "Open". <br>- **Editing:** an edit form for name, license and source URL. "Use as pack cover" in the context menu of any image inside a pack sets the cover override. | This is D10 and D19. Every edit writes `pack_overrides`. |
 | C19 | **Group card and group detail.** <br>- **Card badge:** a corner badge shows the formats of a 3D group (`GLB +2`, with every format in its tooltip) or the member count of a 2D stack (`x3`). The badge has a solid background. <br>- **Detail panel:** lists the members with format, folder and size, plus Open, Reveal and Copy path. 2D members show their image. <br>- **Members:** clicking one shows its file details with "Back to group", while the grid selection stays on the card. <br>- **Main item:** Open, drag-out and QuickLook on the card use it. | This is D14. Nothing expands inside the grid, so indices never shift. |
-| C20 | **Group writes.** Every command that writes metadata expands the asset id to its members in the same transaction, through one helper, `group_members(pool, id)`. That covers `update_asset` (rating, color label, favorite, description), tag and collection add and remove, and auto-tag apply. | This is D18. |
+| C20 | **Group writes.** Every command that writes metadata expands the asset id to its members in the same transaction, through one helper, `group_members(pool, id)`. That covers `update_asset` (rating, color label, favorite, description), tag and collection add and remove, and auto-tag apply. The bundled preview is a support file, not a member, so these writes don't reach it. Only delete and rename include it (C21). | This is D18, which gives metadata to every member file. |
 | C21 | **Delete and rename on a group.** <br>- **Delete:** one confirm dialog ("Move 4 files to the trash"), then every member and the bundled preview go to the trash. A trash failure stops there and reports which files remain, as `delete_asset_with` does for one file. <br>- **Rename:** every member and the bundled preview take the new stem, each keeping its extension and folder. A pre-check refuses if any target exists, and a failure midway reverts the renames already done. | This is D22. |
 | C22 | **Folder and pack actions.** The context menu of a tree node or pack card offers: <br>- **Auto-tag:** `AutotagScope` gains `{ kind: 'folder', libraryId, path, allAssets }`. The run covers the visible items below the folder (main items and single files, not support files), and only untagged ones unless `allAssets` is set, as the library scope does. <br>- **Add everything to a collection, Add a tag to everything:** new bulk commands that take `(libraryId, folderPath)` and write every file below, members included, in 200-row transactions. <br>- **Reveal in file manager:** the existing opener. | This is D16. |
 | C23 | **Live counts.** <br>- **When:** while search text or any filter is active. <br>- **Tree:** `get_folder_counts(query, libraryId, parentPaths)` returns, for the children of each expanded node, the number of matching visible items. It uses the same `SqlFilter` plus a `GROUP BY` on the child path segment. <br>- **Types and formats:** the sidebar's Types filter and the FilterBar's format filter get one `GROUP BY kind` and one `GROUP BY extension`. <br>- **Display:** folders with zero matches dim. Counts are computed once per query, like the total. | This is D15. Counts follow the same visibility and group rules as the grid, so they always add up. |
-| C24 | **Status bar.** It shows items and files, `51,139 items (83,095 files)`, and the footer's visible range counts items. | Once groups exist, both numbers are useful. |
+| C24 | **Status bar.** It shows items and files, `51,139 items (83,095 files)`, and the footer's visible range counts items. Step 1 adds the selected folder's path. Step 2 adds the items-and-files count and the footer change, and steps 3 and 4 lower the item count. | Once support files are hidden, the two numbers differ, and both are useful. |
 | C25 | **Several libraries.** The tree is per library. "All libraries" shows the Packs view across every library that has packs. A folder filter always names one library. | This keeps the existing rule that every caller names a library or iterates all of them. |
 | C26 | **"Show hidden files"** is a checkbox in the sidebar's Filters section (`FilterSpec.showHidden`). It counts as a filter, so it switches the Packs view to Assets. | You turn it on to see files, so Assets is the useful view. |
 
@@ -186,8 +204,9 @@ flowchart LR
 1. **Read.** One query returns every asset row: `id, file_path, extension, kind, size_bytes` and its
    current `group_id, support_role, bundled_preview`. A second query returns `pack_overrides`.
 2. **Derive** (C2). Each step reads only the results of the steps before it:
-   1. **Folders:** every ancestor of every `file_path`, plus the root. Folders holding no indexed
-      file, such as zip-only packs, don't exist.
+   1. **Folders:** every ancestor of every `file_path`, plus the root. A folder gets a row when at
+      least one indexed file lies below it, hidden support files included. Folders with no indexed
+      file at all, such as the 11 zip-only folders in `Archive/`, get no row and appear nowhere.
    2. **Packs** (C8), then **pack info** (C9), which reads the license files that changed.
    3. **Support roles** (C10).
    4. **Format groups** (C11), then **bundled previews** (C12).
@@ -250,16 +269,22 @@ Covers D6, D7, D17, D21, C1-C3 (folders only), C7, C16, C24 (folder path) and C2
 
 ### Step 2: Packs and support files
 
-Covers D8-D11, D19, D20, D23, C3 (overrides), C8-C10, C17, C18 and C26.
+Covers D8-D11, D19, D20, D23, C3 (overrides), C4 (`support_role` only), C5 (the `support_role`
+half), C8-C10, C17, C18, C24 (items and files) and C26.
 
+- Add the `support_role` column, plus the support-file half of the grid rule, with `showHidden`
+  in `search_filter`.
 - Detect packs, parse pack info and set support roles.
 - Add `pack_overrides` with the "Mark as pack" and "Not a pack" menu items.
 - Add the "Show hidden files" filter.
 - Build the Packs view with its toggle, the pack cards and the pack detail.
+- Show items and files in the status bar, and count items in the footer's range.
 
 **Done when:**
 
-- The library root's Packs view shows 254 cards with covers.
+- The library root's Packs view shows 254 cards with covers. That includes the 24 packs whose
+  files are all hidden, which are labelled "No visible items". The 11 zip-only folders in
+  `Archive/` don't appear.
 - `License.txt` and `Preview.png` no longer appear in the grid, and "Show hidden files" brings them
   back.
 - Editing a pack's name survives a refresh.
@@ -267,10 +292,12 @@ Covers D8-D11, D19, D20, D23, C3 (overrides), C8-C10, C17, C18 and C26.
 
 ### Step 3: Format groups and bundled previews
 
-Covers D12, D14, D18, D22, C4-C6, C11, C12, C14, C15 and C19-C21.
+Covers D12, D14, D18, D22, C4 (`group_id`, `bundled_preview`), C5 (the group half), C6, C11, C12,
+C14, C15 and C19-C21.
 
-- Add the asset columns and group derivation, and match bundled previews.
-- Apply the visibility and any-member rules in `search_filter`.
+- Add the `group_id` and `bundled_preview` columns and group derivation, and match bundled
+  previews.
+- Apply the group half of the visibility rule and the any-member rules in `search_filter`.
 - Add the card badge and the detail panel's member list.
 - Make group writes expand to members, union metadata when groups form, and add group delete and
   rename.
@@ -280,8 +307,9 @@ Covers D12, D14, D18, D22, C4-C6, C11, C12, C14, C15 and C19-C21.
 
 - Each Kenney kit model shows once, as GLB, with Kenney's render.
 - Filtering by FBX still lists the models.
-- Tagging a model tags all four files.
-- Renaming a model renames all four files.
+- Tagging a model tags its three format files (GLB, FBX, OBJ). The bundled preview isn't a member
+  and gets no tag (C20).
+- Renaming a model renames all four files, its bundled preview included (C21).
 - UI check U11 passes.
 
 ### Step 4: 2D stacks
@@ -325,7 +353,7 @@ data"). Never on the live library.
 | # | Target |
 |---|---|
 | A1 | **Pass speed:** the first structure pass, writes included, finishes in under 10 s. A rerun with no file changes writes 0 rows and finishes in under 2 s. |
-| A2 | **Packs:** 254 packs are detected, all at `<category>/<pack>/`. No category folder is a pack. |
+| A2 | **Packs:** 254 packs are detected, all at `<category>/<pack>/`, including the 24 whose files are all hidden. No category folder is a pack. |
 | A3 | **Grid items:** the library root's Assets view shows 51,139 items. If a rule is tuned, the pull request explains the new number. |
 | A4 | **Previews:** all 3,741 Kenney renders are bundled previews, and no `Previews/` file shows in the grid without "Show hidden files". |
 | A5 | **Query speed:** the first page of the library root, and of `3D assets`, takes no more than 1.2x today's time for the same query, as logged by a debug-only timer around `search_assets`. `get_folders` takes under 50 ms for any node, and `get_folder_counts` under 300 ms for a one-word search. |
@@ -353,7 +381,7 @@ Run by file locally, as `AGENTS.md` says. CI runs the rest.
   - FTS on folder names;
   - sorting by the main item.
 - **Group write tests:**
-  - `update_asset` and tag and collection writes reach every member.
+  - `update_asset` and tag and collection writes reach every member, and not the bundled preview.
   - The union when a group forms.
   - Delete and rename of every member, the rename's pre-check, and its rollback on a failure.
 - **License parsing** runs on Kenney, KayKit and MIT texts.
@@ -385,7 +413,10 @@ New `AGENTS.md` architecture invariants:
 - **Heuristics misfire on new layouts.** "Mark as pack" and "Not a pack" are the escape hatch, and
   each misfire found becomes a fixture.
 - **Zip-only packs are invisible.** 11 folders in `Archive/` hold only a `.zip`, and archives
-  aren't indexed. `Isometric Miniature *` packs show as packs with "No indexed files".
+  aren't indexed, so these folders get no row. Some packs hold a `.zip`, audio, fonts or Construct
+  projects next to their previews: the 5 `Isometric Miniature *` packs, the 16 Audio packs, and 3
+  packs under `Other/`. They show as cards labelled "No visible items", because their only indexed
+  files are hidden previews and docs.
 - **The first pass on a network share writes about 45k rows,** and the FTS rebuild rewrites the
   whole index once. Both run in the background, in batches.
 - **Metadata unions can surprise.** A tag added to `barrel.fbx` before grouping existed appears on
