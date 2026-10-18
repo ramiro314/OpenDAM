@@ -505,10 +505,16 @@ export const UI_CHECKS: UiCheck[] = [
         target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
       const blur = () => (document.activeElement as HTMLElement | null)?.blur();
       const focused = () => document.activeElement?.id || document.activeElement?.tagName;
-      // Card 0, once its page has arrived: a stalled webview can outlast the reset's wait
+      // Card 0 at the top, once its page has arrived: a stalled webview can outlast the reset's
+      // wait, and the steps before may have paged away
       const card0 = async () => {
         const selector = '[data-index="0"]:not([data-placeholder])';
-        await untilFrame(() => el.querySelector(selector) !== null, 30_000, 'card 0 rendered');
+        if (el.scrollTop !== 0) el.scrollTop = 0;
+        await untilFrame(
+          () => el.querySelector(selector) !== null,
+          30_000,
+          `card 0 rendered (scrollTop ${el.scrollTop})`
+        );
         return el.querySelector<HTMLElement>(selector)!;
       };
       const card = await card0();
