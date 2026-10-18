@@ -95,7 +95,7 @@ export function CollectionsSection({ clearSmartFilter }: CollectionsSectionProps
       setQuery({ collectionId: undefined });
     } else {
       setActiveCollection(id);
-      setQuery({ collectionId: id, libraryId: undefined });
+      setQuery({ collectionId: id, libraryId: undefined, folder: undefined });
     }
     search();
   };

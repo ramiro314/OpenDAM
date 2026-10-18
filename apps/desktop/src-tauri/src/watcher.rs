@@ -141,6 +141,7 @@ struct PendingAsset {
 /// 3. Reuses each asset's existing thumbnail from the DB to never re-render previews across network.
 /// 4. Groups writes into chunks of 200 inside single transactions (cutting NAS I/O by 99%).
 /// 5. Advisory index.lock prevents two machines from indexing the same library simultaneously.
+/// 6. Ends with the structure pass (`structure::rebuild`), under the same locks.
 pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> Result<()> {
     // An offline library is skipped: walking a missing root finds nothing, and the
     // deleted-file pass below would then remove every asset row.
@@ -159,6 +160,10 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
         );
         return Ok(());
     }
+
+    // ── This app's lock: a command's structure pass waits for the run's own ──
+    let index_lock = db.index_lock(library_id);
+    let _index_guard = index_lock.lock().await;
 
     // ── Advisory lock: skip if another machine is already indexing ────────
     let opendam_dir = root_path.join(".opendam");
@@ -362,6 +367,13 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
         .execute(&db.master_pool)
         .await;
 
+    // ── 5. Derive the folder tree, still under both locks ─────────────────
+    // A failed pass is logged, not returned: the run's writes went through, so the caller still
+    // emits `library:updated`, and the next pass derives the folders again.
+    if let Err(e) = crate::structure::rebuild(&pool).await {
+        tracing::error!(target: "structure", "Structure pass failed for library {library_id}: {e}");
+    }
+
     tracing::info!(
         "NAS-efficient indexing complete for library {}: {} total assets",
         library_id,
@@ -538,6 +550,49 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
 
         result.unwrap();
+        assert_eq!(file_paths, ["notes.txt"]);
+    }
+
+    #[tokio::test]
+    async fn an_index_run_ends_with_the_folder_tree_of_what_it_found() {
+        let (dir, db, lib) = temp_library().await;
+        std::fs::create_dir_all(dir.path().join("kits/rocks")).unwrap();
+        std::fs::write(dir.path().join("kits/rocks/rock.glb"), "glTF").unwrap();
+        std::fs::write(dir.path().join("kits/readme.txt"), "hi").unwrap();
+        reindex(&db, &lib).await;
+        let first = crate::structure::tests::folder_rows(&lib.pool).await;
+
+        std::fs::remove_dir_all(dir.path().join("kits/rocks")).unwrap();
+        reindex(&db, &lib).await;
+
+        assert_eq!(
+            first,
+            crate::structure::tests::fresh_pass(&["kits/rocks/rock.glb", "kits/readme.txt"]).await
+        );
+        assert_eq!(
+            crate::structure::tests::folder_rows(&lib.pool).await,
+            crate::structure::tests::fresh_pass(&["kits/readme.txt"]).await
+        );
+    }
+
+    #[tokio::test]
+    async fn an_index_run_whose_structure_pass_fails_still_succeeds() {
+        let (dir, db, lib) = temp_library().await;
+        std::fs::write(dir.path().join("notes.txt"), "hi").unwrap();
+        // The pass reads `folders` first, so without it the pass fails after the run's writes.
+        sqlx::query("DROP TABLE folders")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+
+        let result =
+            index_paths(&db, &lib.id, &[lib.root_path.to_string_lossy().to_string()]).await;
+
+        let file_paths: Vec<String> = sqlx::query_scalar("SELECT file_path FROM assets")
+            .fetch_all(&lib.pool)
+            .await
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
         assert_eq!(file_paths, ["notes.txt"]);
     }
 

@@ -1,8 +1,11 @@
 // The UI checks `VITE_SCROLL_BENCH=checks` runs (U1-U8 in
-// docs/plans/fast-collection-browsing/plan.md, and M1 for the web process's memory). Each ticket
-// that delivers a behavior adds its check here.
+// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9 in
+// docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
+// check here.
 
-import { useAssetStore, useUIStore } from '../store';
+import { api } from '../api';
+import { useAssetStore, useFolderTreeStore, useLibraryStore, useUIStore } from '../store';
+import type { FolderNode } from '../types';
 import { assetAt } from '../store/pageCache';
 import { scrubKey } from '../utils/scrubKey';
 import {
@@ -29,7 +32,7 @@ export interface UiCheckContext {
 }
 
 export interface UiCheck {
-  /** `U1` to `U8` */
+  /** `U1`, `M1` and so on */
   id: string;
   title: string;
   /** Throws to fail. Starts in grid view at md size, scrolled to the top of a fresh search. */
@@ -143,6 +146,47 @@ const SCRUB_LABEL = /^([\d,]+) of ([\d,]+)(?: - (.+))?$/;
 const parseCount = (s: string) => Number(s.replace(/,/g, ''));
 
 const scrubLabel = () => document.getElementById('scrub-label');
+
+/** The library the bench registers its run copy as (`OPENDAM_BENCH_LIBRARY`). */
+const BENCH_LIBRARY = 'bench';
+
+/** How long U9 waits for the folder tree, and for a write to get through. */
+const STRUCTURE_TIMEOUT_MS = 900_000;
+
+/** The sidebar row of folder `path` in the bench library, if it is shown. */
+function folderRow(path: string): HTMLElement | null {
+  return document.querySelector<HTMLElement>(
+    `[data-library-id="${BENCH_LIBRARY}"][data-folder-path="${CSS.escape(path)}"]`
+  );
+}
+
+/** The item count a folder row's badge shows. */
+const shownCount = (row: HTMLElement) => parseCount(row.lastElementChild?.textContent ?? '');
+
+/** The folder holding `path`; `''` for a top-level folder. */
+const parentFolder = (path: string) => path.slice(0, Math.max(0, path.lastIndexOf('/')));
+
+/**
+ * The shallowest folder at least two levels deep that holds exactly one file, found breadth
+ * first through `get_folders`, with the slowest node load on the way.
+ */
+async function singleFileFolder(): Promise<{ folder: FolderNode; slowestMs: number }> {
+  let slowestMs = 0;
+  let level = [''];
+  while (level.length > 0) {
+    const next: string[] = [];
+    for (const parent of level) {
+      const start = performance.now();
+      const children = await api.getFolders(BENCH_LIBRARY, parent);
+      slowestMs = Math.max(slowestMs, performance.now() - start);
+      const found = children.find((c) => c.itemCount === 1 && c.path.includes('/'));
+      if (found) return { folder: found, slowestMs };
+      next.push(...children.filter((c) => c.hasChildren).map((c) => c.path));
+    }
+    level = next;
+  }
+  throw new Error('no folder holds exactly one file');
+}
 
 /**
  * Records, from DOM mutations rather than frames, each time the scrub label shows or hides and the
@@ -890,6 +934,123 @@ export const UI_CHECKS: UiCheck[] = [
       const grewMb = Math.round((most - start) / 2 ** 20);
       assert(grewMb < 200, `the web process grew ${grewMb} MB in 10 s of holding still`);
       await pause('M1-held-still');
+    },
+  },
+  {
+    id: 'U9',
+    title:
+      'The library row expands into its folders with their counts, a folder shows exactly ' +
+      'its files, and a delete updates the counts and drops a folder it empties',
+    run: async ({ assert, waitFor, pause, sleep }) => {
+      const toggle = document.getElementById(`lib-toggle-${BENCH_LIBRARY}`);
+      assert(toggle, `no #lib-toggle-${BENCH_LIBRARY} on the library row`);
+      if (!useFolderTreeStore.getState().expanded[BENCH_LIBRARY]?.includes('')) toggle!.click();
+      // The checks can start before the startup index run, and the first structure pass it ends
+      // with, are done. The expanded row then fills on that run's `library:updated`.
+      const deadline = performance.now() + STRUCTURE_TIMEOUT_MS;
+      let top = await api.getFolders(BENCH_LIBRARY, '');
+      while (top.length === 0) {
+        assert(
+          performance.now() < deadline,
+          `the library has no top-level folders after ${STRUCTURE_TIMEOUT_MS / 1000} s`
+        );
+        await sleep(1_000);
+        top = await api.getFolders(BENCH_LIBRARY, '');
+      }
+      await waitFor(() => top.every((f) => folderRow(f.path)), 10_000, 'the top-level folders');
+      const rows = [
+        ...document.querySelectorAll<HTMLElement>(`[data-library-id="${BENCH_LIBRARY}"]`),
+      ]
+        .filter((row) => !row.dataset.folderPath!.includes('/'))
+        .map((row) => `${row.dataset.folderPath} (${shownCount(row)})`);
+      const expected = top.map((f) => `${f.path} (${f.itemCount})`);
+      assert(
+        rows.join(', ') === expected.join(', '),
+        `the library row shows [${rows.join(', ')}], get_folders lists [${expected.join(', ')}]`
+      );
+      await pause('U9-top-level-folders');
+
+      // Selecting a kit shows exactly the files below it, as many as its node counts
+      const kitPath = '3D assets/Platformer Kit';
+      folderRow('3D assets')!.querySelector<HTMLElement>('[data-folder-toggle]')!.click();
+      await waitFor(() => folderRow(kitPath) !== null, 5_000, kitPath);
+      const kitCount = shownCount(folderRow(kitPath)!);
+      folderRow(kitPath)!.click();
+      await waitFor(
+        () => {
+          const s = useAssetStore.getState();
+          return s.query.folder?.path === kitPath && !s.loading && s.total > 0;
+        },
+        10_000,
+        `the search for ${kitPath}`
+      );
+      const { query, total } = useAssetStore.getState();
+      assert(query.folder?.libraryId === BENCH_LIBRARY, 'the folder names another library');
+      assert(total === kitCount, `the grid holds ${total} assets, the node counts ${kitCount}`);
+      const all = await api.searchAssets({
+        query,
+        page: 0,
+        pageSize: total + 1,
+        includeTotal: true,
+      });
+      const root = useLibraryStore.getState().libraries.find((l) => l.id === BENCH_LIBRARY)!
+        .rootPaths[0];
+      const outside = all.assets.filter((a) => !a.filePath.startsWith(`${root}/${kitPath}/`));
+      assert(all.assets.length === kitCount, `the search returned ${all.assets.length} assets`);
+      assert(outside.length === 0, `${outside[0]?.filePath} is not below ${kitPath}`);
+      const status = document.getElementById('status-folder')?.textContent ?? '';
+      assert(status.includes(kitPath), `the status bar reads "${status}"`);
+      await pause('U9-platformer-kit');
+
+      // A rename keeps a one-file folder's counts, and deleting the file drops the folder and
+      // takes one from every folder above it, with no manual refresh
+      const { folder, slowestMs } = await singleFileFolder();
+      assert(slowestMs < 50, `a node took ${Math.round(slowestMs)} ms to load`);
+      const ancestors: string[] = [];
+      for (let p = parentFolder(folder.path); p !== ''; p = parentFolder(p)) ancestors.unshift(p);
+      for (const path of ancestors) {
+        if (!useFolderTreeStore.getState().expanded[BENCH_LIBRARY]?.includes(path)) {
+          await useFolderTreeStore.getState().toggle(BENCH_LIBRARY, path);
+        }
+      }
+      await waitFor(() => folderRow(folder.path) !== null, 5_000, folder.path);
+      const before = ancestors.map((path) => shownCount(folderRow(path)!));
+      const inFolder = await api.searchAssets({
+        query: { ...query, folder: { libraryId: BENCH_LIBRARY, path: folder.path } },
+        page: 0,
+        pageSize: 2,
+        includeTotal: true,
+      });
+      assert(inFolder.total === 1, `${folder.path} holds ${inFolder.total} assets, not 1`);
+      const asset = inFolder.assets[0];
+      // On a fresh run copy the one-time thumbnail cleanup holds a long read, and no write
+      // commits until it ends: a rename it blocks fails and is undone, so try until one lands
+      const writeDeadline = performance.now() + STRUCTURE_TIMEOUT_MS;
+      for (;;) {
+        const failed = await useAssetStore
+          .getState()
+          .renameAsset(asset.id, 'u9-renamed')
+          .then(() => null)
+          .catch((e: unknown) => String(e));
+        if (!failed) break;
+        assert(performance.now() < writeDeadline, `the rename kept failing: ${failed}`);
+        await sleep(5_000);
+      }
+      const renamed = await api.getAsset(asset.id);
+      assert(renamed.fileName.startsWith('u9-renamed.'), `the rename gave ${renamed.fileName}`);
+      assert(shownCount(folderRow(folder.path)!) === 1, `${folder.path} lost its file`);
+
+      // Rows only: the file stays on the run copy rather than going to the trash
+      await useAssetStore.getState().deleteAsset(asset.id, false);
+      await waitFor(() => folderRow(folder.path) === null, 30_000, `${folder.path} to drop out`);
+      await waitFor(
+        () => ancestors.every((path, i) => shownCount(folderRow(path)!) === before[i] - 1),
+        30_000,
+        `the counts above ${folder.path} to drop by one, from ${before.join(', ')}`
+      );
+      await pause('U9-after-delete');
+
+      useAssetStore.getState().setQuery({ folder: undefined });
     },
   },
 ];

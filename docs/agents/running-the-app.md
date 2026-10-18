@@ -166,6 +166,23 @@ it. Its Tauri commands (`bench_rss`, `bench_render_mode`, `bench_log`, `bench_on
   PASS or FAIL for each. A check calls `pause(name)` where a screenshot should be taken; the
   harness always pauses once at the start, as `checks-start`.
 
+The UI checks, each defined in its plan:
+
+- **U1-U8** (grid windowing, scrub label, keyboard, image scaling):
+  [fast-collection-browsing](../plans/fast-collection-browsing/plan.md), "UI checks".
+- **M1**: the web process grows under 200 MB in 10 s held still deep in the grid (AGENTS.md, "No
+  `backdrop-filter` in the grid or the list").
+- **U9** (folder tree): the bench library's row expands into its top-level folders, each showing
+  its `get_folders` item count. Selecting `3D assets/Platformer Kit` gives a grid total equal to
+  its node's count, every result lies below it, and the status bar shows its path. Then, on a
+  folder holding one file, a rename keeps the count, and deleting the file's rows (not the file)
+  drops the folder from the tree and takes one from every folder above it, with no manual
+  refresh. It also checks that every `get_folders` call on the way took under 50 ms. On a fresh
+  run copy no write commits while the thumbnail cleanup's long read runs, so U9 retries the
+  rename, which a failed write undoes, until one lands.
+  [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 1. Screenshots:
+  `U9-top-level-folders`, `U9-platformer-kit`, `U9-after-delete`.
+
 Run it with the script, from the repo root:
 
 ```sh

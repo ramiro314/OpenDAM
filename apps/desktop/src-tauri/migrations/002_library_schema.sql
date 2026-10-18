@@ -85,6 +85,23 @@ CREATE TABLE IF NOT EXISTS preview_jobs (
     created_at    INTEGER NOT NULL
 );
 
+-- ── Folders: derived by the structure pass (structure.rs), never edited ──────
+-- Every folder with at least one indexed file below it, and the root (`path = ''`, no parent).
+-- `item_count` counts the files below it, recursively. The pack columns keep their defaults
+-- until packs are detected.
+CREATE TABLE IF NOT EXISTS folders (
+    path          TEXT PRIMARY KEY,   -- relative to library root, no edge slashes
+    parent_path   TEXT,               -- NULL for the root
+    name          TEXT NOT NULL,
+    is_pack       INTEGER NOT NULL DEFAULT 0,
+    item_count    INTEGER NOT NULL DEFAULT 0,
+    hidden_count  INTEGER NOT NULL DEFAULT 0,
+    pack_json     TEXT
+);
+
+-- `get_folders` reads one node's children in name order from this index alone.
+CREATE INDEX IF NOT EXISTS idx_folders_parent_name ON folders(parent_path, name COLLATE NOCASE);
+
 -- The full-text table and its triggers are in 003_assets_fts.sql, so a library made before
 -- `file_path` was indexed can recreate them inside a transaction (db::index_file_paths).
 

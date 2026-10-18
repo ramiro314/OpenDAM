@@ -136,6 +136,16 @@ export interface FolderRef {
   path: string;
 }
 
+/** One node of a library's folder tree (`get_folders`) */
+export interface FolderNode {
+  name: string;
+  /** Relative to the library root */
+  path: string;
+  /** Files below the folder, at any depth */
+  itemCount: number;
+  hasChildren: boolean;
+}
+
 // ── Preview job ──────────────────────────────────────────────────────────
 export interface PreviewJob {
   id: string;

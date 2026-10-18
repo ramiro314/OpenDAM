@@ -7,6 +7,7 @@ use tauri::{Emitter, State};
 
 use crate::db::{make_relative_path, resolve_path, upsert_tag, Database, LibraryHandle};
 use crate::models::{Asset, AssetPatch, FilterSpec, SearchPayload, SearchQuery, SearchResult};
+use crate::structure;
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -478,8 +479,9 @@ fn search_filter(query: &SearchQuery) -> SqlFilter {
     fn trimmed(s: &Option<String>) -> Option<&str> {
         s.as_deref().map(str::trim).filter(|s| !s.is_empty())
     }
+    // Typed by hand, so padding is dropped; a tree folder's path is used exactly.
     if let Some(dir) = &f.directory {
-        push_folder_range(&mut filter, dir);
+        push_folder_range(&mut filter, dir.trim());
     }
     if let Some(prefix) = trimmed(&f.name_prefix) {
         filter.push("a.file_name LIKE ?", [format!("{prefix}%")]);
@@ -493,9 +495,9 @@ fn search_filter(query: &SearchQuery) -> SqlFilter {
 /// Requires files below `folder`, a path relative to the library root, recursively. The range
 /// `p/ <= file_path < p0` (`0` follows `/`) holds exactly the paths starting with `p/`, uses the
 /// unique `file_path` index and needs no `LIKE` escaping. The root (`""`, or only slashes) adds
-/// no condition.
+/// no condition. Spaces are kept: a folder name may start or end with one.
 fn push_folder_range(filter: &mut SqlFilter, folder: &str) {
-    let path = folder.trim().trim_matches('/');
+    let path = folder.trim_matches('/');
     if !path.is_empty() {
         filter.push(
             "a.file_path >= ? AND a.file_path < ?",
@@ -812,25 +814,31 @@ pub async fn delete_asset(
     delete_file: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
-    delete_asset_with(&state.db, &id, delete_file.unwrap_or(true), |path| {
-        trash::delete(path)
-    })
-    .await?;
+    delete_assets_with(
+        &state.db,
+        std::slice::from_ref(&id),
+        delete_file.unwrap_or(true),
+        |path| trash::delete(path),
+    )
+    .await
+    .map_err(|e| e.message)?;
     let _ = state.app_handle.emit("library:updated", ());
     Ok(())
 }
 
 /// Deletes an asset's rows and, when `delete_file` is set, moves its file to the trash with
 /// `trash`. If the trash fails, it returns the error and leaves the file and the rows alone.
+/// Returns the library that held the asset, whose structure pass the caller reruns.
 async fn delete_asset_with<E: std::fmt::Display>(
     db: &Database,
     id: &str,
     delete_file: bool,
     trash: impl Fn(&Path) -> std::result::Result<(), E>,
-) -> Result<()> {
+) -> Result<Option<LibraryHandle>> {
     let libs = db.get_all_libraries().await;
     let mut target_pools = Vec::new();
     let mut file_to_delete: Option<std::path::PathBuf> = None;
+    let mut holder = None;
 
     for lib in &libs {
         let row: Option<(String,)> = sqlx::query_as("SELECT file_path FROM assets WHERE id = ?")
@@ -847,6 +855,7 @@ async fn delete_asset_with<E: std::fmt::Display>(
             };
             file_to_delete = Some(abs_path);
             target_pools.push(lib.pool.clone());
+            holder = Some(lib.clone());
         }
     }
 
@@ -890,7 +899,7 @@ async fn delete_asset_with<E: std::fmt::Display>(
             .await;
     }
 
-    Ok(())
+    Ok(holder)
 }
 
 #[tauri::command]
@@ -919,6 +928,7 @@ pub struct DeleteAssetsError {
 }
 
 /// Deletes each asset with `delete_asset_with`, carrying on past failures, and reports them.
+/// Before it returns, it reruns the structure pass once for each library it deleted from.
 async fn delete_assets_with<E: std::fmt::Display>(
     db: &Database,
     ids: &[String],
@@ -926,10 +936,16 @@ async fn delete_assets_with<E: std::fmt::Display>(
     trash: impl Fn(&Path) -> std::result::Result<(), E>,
 ) -> std::result::Result<(), DeleteAssetsError> {
     let mut failures = Vec::new();
+    let mut changed: Vec<LibraryHandle> = Vec::new();
     for id in ids {
-        if let Err(e) = delete_asset_with(db, id, delete_file, &trash).await {
-            failures.push((id.clone(), e));
+        match delete_asset_with(db, id, delete_file, &trash).await {
+            Ok(Some(lib)) if !changed.iter().any(|l| l.id == lib.id) => changed.push(lib),
+            Ok(_) => {}
+            Err(e) => failures.push((id.clone(), e)),
         }
+    }
+    for lib in &changed {
+        structure::rebuild_library(db, lib).await;
     }
     let message = match failures.len() {
         0 => return Ok(()),
@@ -948,6 +964,13 @@ pub async fn rename_asset(
     new_name: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Asset> {
+    rename_asset_with(&state.db, &id, &new_name).await?;
+    let _ = state.app_handle.emit("library:updated", ());
+    get_asset(id, state).await
+}
+
+/// Renames an asset's file in its folder and its rows, then reruns its library's structure pass.
+async fn rename_asset_with(db: &Database, id: &str, new_name: &str) -> Result<()> {
     let trimmed = new_name.trim();
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
         return Err("Asset file name cannot be empty, '.' or '..'".into());
@@ -957,7 +980,7 @@ pub async fn rename_asset(
         return Err("File name cannot contain '/' or NUL".into());
     }
 
-    let libs = state.db.get_all_libraries().await;
+    let libs = db.get_all_libraries().await;
     let mut found_lib = None;
     let mut current_fp = None;
     let mut current_ext = None;
@@ -965,7 +988,7 @@ pub async fn rename_asset(
     for lib in &libs {
         let row: Option<(String, String)> =
             sqlx::query_as("SELECT file_path, extension FROM assets WHERE id = ?")
-                .bind(&id)
+                .bind(id)
                 .fetch_optional(&lib.pool)
                 .await
                 .unwrap_or(None);
@@ -1014,7 +1037,8 @@ pub async fn rename_asset(
     }
 
     // Rename file on disk
-    if old_abs_path.exists() {
+    let renamed_on_disk = old_abs_path.exists();
+    if renamed_on_disk {
         std::fs::rename(&old_abs_path, &new_abs_path)
             .map_err(|e| format!("Failed to rename file on disk: {}", e))?;
     }
@@ -1022,23 +1046,39 @@ pub async fn rename_asset(
     let new_rel_fp = make_relative_path(&lib.root_path, &new_abs_path);
     let now = chrono::Utc::now().timestamp_millis();
 
-    // Update in all relevant databases
-    let pools_to_update = vec![lib.pool.clone(), state.db.master_pool.clone()];
-    for pool in pools_to_update {
-        let _ = sqlx::query(
-            "UPDATE assets SET file_name = ?, file_path = ?, extension = ?, modified_at = ? WHERE id = ?"
-        )
-        .bind(&final_name)
-        .bind(&new_rel_fp)
-        .bind(&new_ext)
-        .bind(now)
-        .bind(&id)
-        .execute(&pool)
-        .await;
+    // Update in all relevant databases. The library's row must follow the file: if it can't
+    // (a busy NAS), the file takes its old name back, so the index never sees a new file.
+    let update = |pool: sqlx::Pool<sqlx::Sqlite>| {
+        let (name, path, ext) = (final_name.clone(), new_rel_fp.clone(), new_ext.clone());
+        async move {
+            sqlx::query(
+                "UPDATE assets SET file_name = ?, file_path = ?, extension = ?, modified_at = ? WHERE id = ?",
+            )
+            .bind(name)
+            .bind(path)
+            .bind(ext)
+            .bind(now)
+            .bind(id)
+            .execute(&pool)
+            .await
+        }
+    };
+    if let Err(e) = update(lib.pool.clone()).await {
+        if renamed_on_disk {
+            if let Err(undo) = std::fs::rename(&new_abs_path, &old_abs_path) {
+                return Err(format!(
+                    "Could not record the rename ({e}), and could not undo it on disk: {undo}"
+                ));
+            }
+        }
+        return Err(format!(
+            "Could not record the rename, so it was undone: {e}"
+        ));
     }
+    let _ = update(db.master_pool.clone()).await;
 
-    let _ = state.app_handle.emit("library:updated", ());
-    get_asset(id, state).await
+    structure::rebuild_library(db, &lib).await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2436,7 +2476,7 @@ mod tests {
         let file_exists = root.join("tree.glb").exists();
         let row_kept = has_row(&pool, "tree").await;
         std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(result, Err(trash_error(&root, "tree")));
+        assert_eq!(result.map(|_| ()), Err(trash_error(&root, "tree")));
         assert!(file_exists);
         assert!(row_kept);
     }
@@ -2454,9 +2494,99 @@ mod tests {
 
         let row_kept = has_row(&pool, "tree").await;
         std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(result, Ok(()));
+        assert_eq!(result.map(|lib| lib.map(|l| l.id)), Ok(Some("lib".into())));
         assert_eq!(trashed.into_inner(), vec![root.join("tree.glb")]);
         assert!(!row_kept);
+    }
+
+    /// A library in a temporary root holding a file at each of `paths`, indexed as an asset whose
+    /// id is its path, with its first structure pass run.
+    async fn library_in_folders(paths: &[&str]) -> (PathBuf, Database, Pool<Sqlite>) {
+        let (root, db, pool) = library_with(&[]).await;
+        for path in paths {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "glTF").unwrap();
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+                 VALUES (?, ?, ?, 'glb', 'model', 4, 0, 0)",
+            )
+            .bind(path)
+            .bind(path)
+            .bind(path.rsplit('/').next().unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        crate::structure::rebuild(&pool).await.unwrap();
+        (root, db, pool)
+    }
+
+    const FOLDER_FILES: [&str; 4] = [
+        "3D assets/Platformer Kit/Models/block.glb",
+        "3D assets/Platformer Kit/Models/crate.glb",
+        "3D assets/Nature Kit/Rocks/rock.glb",
+        "tree.glb",
+    ];
+
+    #[tokio::test]
+    async fn deleting_assets_leaves_the_folders_a_fresh_pass_would() {
+        let (root, db, pool) = library_in_folders(&FOLDER_FILES).await;
+
+        // The rock empties `Nature Kit` and `Nature Kit/Rocks`.
+        let deleted = ids(&[
+            "3D assets/Platformer Kit/Models/crate.glb",
+            "3D assets/Nature Kit/Rocks/rock.glb",
+        ]);
+        let result = delete_assets_with(&db, &deleted, true, trash_failing_for(&[])).await;
+
+        let folders = crate::structure::tests::folder_rows(&pool).await;
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Ok(()));
+        let rest = [FOLDER_FILES[0], FOLDER_FILES[3]];
+        assert_eq!(folders, crate::structure::tests::fresh_pass(&rest).await);
+        assert!(!folders
+            .iter()
+            .any(|f| f.0.starts_with("3D assets/Nature Kit")));
+    }
+
+    #[tokio::test]
+    async fn renaming_an_asset_leaves_the_folders_a_fresh_pass_would() {
+        let (root, db, pool) = library_in_folders(&FOLDER_FILES).await;
+
+        let result = rename_asset_with(&db, FOLDER_FILES[2], "boulder").await;
+
+        let folders = crate::structure::tests::folder_rows(&pool).await;
+        let renamed = root.join("3D assets/Nature Kit/Rocks/boulder.glb").exists();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(renamed);
+        let after = [
+            FOLDER_FILES[0],
+            FOLDER_FILES[1],
+            "3D assets/Nature Kit/Rocks/boulder.glb",
+            FOLDER_FILES[3],
+        ];
+        assert_eq!(folders, crate::structure::tests::fresh_pass(&after).await);
+    }
+
+    #[tokio::test]
+    async fn a_rename_the_library_db_refuses_is_undone_on_disk() {
+        let (root, db, pool) = library_in_folders(&FOLDER_FILES).await;
+        sqlx::query(
+            "CREATE TRIGGER refuse BEFORE UPDATE ON assets BEGIN SELECT RAISE(ABORT, 'busy'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = rename_asset_with(&db, FOLDER_FILES[3], "oak").await;
+
+        let kept = root.join("tree.glb").exists();
+        let renamed = root.join("oak.glb").exists();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(result.unwrap_err().contains("so it was undone"));
+        assert!(kept && !renamed);
     }
 
     #[tokio::test]
@@ -2616,7 +2746,7 @@ mod tests {
         for path in [
             "3D assets/Platformer Kit",
             "3D assets/Platformer Kit/",
-            " /3D assets/Platformer Kit/ ",
+            "/3D assets/Platformer Kit/",
         ] {
             let mut found = folder_search(
                 &libs,
@@ -2637,6 +2767,40 @@ mod tests {
             )
             .await,
             ["3D assets/Platformer Kit/Models/OBJ format/block.obj"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folder_named_with_edge_spaces_matches_only_its_own_files() {
+        let libs = [library_of(
+            "lib",
+            &["Textures /a.png", "Textures/b.png", " Models/c.png"],
+        )
+        .await];
+        for (path, expected) in [
+            ("Textures ", "Textures /a.png"),
+            ("Textures", "Textures/b.png"),
+            (" Models", " Models/c.png"),
+        ] {
+            let found = folder_search(
+                &libs,
+                serde_json::json!({ "folder": { "libraryId": "lib", "path": path } }),
+                "name",
+                "asc",
+            )
+            .await;
+            assert_eq!(found, [expected], "folder {path:?}");
+        }
+        // The Smart Filter's hand-typed folder still drops its padding.
+        assert_eq!(
+            folder_search(
+                &libs,
+                serde_json::json!({ "filter": { "directory": " Textures/ " } }),
+                "name",
+                "asc",
+            )
+            .await,
+            ["Textures/b.png"]
         );
     }
 
@@ -2699,7 +2863,7 @@ mod tests {
             library_of("a", &["3D assets/a.glb", "b.glb"]).await,
             library_of("b", &["3D assets/c.glb", "d.glb"]).await,
         ];
-        for root in ["", "/", " "] {
+        for root in ["", "/"] {
             let mut found = folder_search(
                 &libs,
                 serde_json::json!({ "folder": { "libraryId": "b", "path": root }, "libraryIds": ["a", "b"] }),
@@ -2817,5 +2981,150 @@ mod tests {
         let all = count(&pool, "SELECT COUNT(*) FROM assets WHERE ?1 = ''", "").await;
         println!("library root: search total {root}, SQL count {all}");
         assert_eq!(root, all);
+    }
+
+    /// The structure pass's targets (A1) and the tree's node load time (A5) on a copy of the
+    /// golden snapshot's library DB, named by `OPENDAM_GOLDEN_DB` as above. It writes to the copy:
+    /// it clears `folders` for a first pass, then deletes and renames one asset. Run it with
+    /// `cargo nextest run --run-ignored only golden_snapshot --no-capture`.
+    #[tokio::test]
+    #[ignore = "needs OPENDAM_GOLDEN_DB, a copy of the golden snapshot's library.sqlite"]
+    async fn the_folder_tree_of_the_golden_snapshot_meets_its_time_targets() {
+        use crate::commands::folder::child_folders;
+        use std::time::{Duration, Instant};
+        let file = std::env::var("OPENDAM_GOLDEN_DB").expect("OPENDAM_GOLDEN_DB is set");
+        let pool = crate::db::connect_library_sqlite(Path::new(&file))
+            .await
+            .unwrap();
+        // A root that doesn't exist, so the rename and the delete touch no file.
+        let library = LibraryHandle {
+            id: "golden".to_string(),
+            name: "golden".to_string(),
+            root_path: PathBuf::from("/golden-snapshot-not-mounted"),
+            pool: pool.clone(),
+        };
+        let db = memory_database(vec![library.clone()]).await;
+        let timed = |what: &str, took: Duration, limit: Duration| {
+            println!("{what}: {took:?} (target under {limit:?})");
+            assert!(took < limit, "{what} took {took:?}");
+        };
+
+        sqlx::query("DELETE FROM folders")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let written = crate::structure::rebuild(&pool).await.unwrap();
+        timed(
+            &format!("first pass, {written} rows written"),
+            started.elapsed(),
+            Duration::from_secs(10),
+        );
+        let started = Instant::now();
+        let written = crate::structure::rebuild(&pool).await.unwrap();
+        timed(
+            &format!("rerun with no changes, {written} rows written"),
+            started.elapsed(),
+            Duration::from_secs(2),
+        );
+        assert_eq!(written, 0);
+
+        // Every node's children load within 50 ms, and each count equals its folder's search total.
+        let mut slowest = (Duration::ZERO, String::new());
+        let mut nodes = 0;
+        let mut queue = vec![String::new()];
+        while let Some(parent) = queue.pop() {
+            let started = Instant::now();
+            let children = child_folders(&pool, &parent).await.unwrap();
+            let took = started.elapsed();
+            if took > slowest.0 {
+                slowest = (took, parent);
+            }
+            nodes += 1;
+            queue.extend(children.into_iter().map(|c| c.path));
+        }
+        timed(
+            &format!("slowest of {nodes} node loads ({:?})", slowest.1),
+            slowest.0,
+            Duration::from_millis(50),
+        );
+        let top = child_folders(&pool, "").await.unwrap();
+        println!(
+            "top-level folders: {}",
+            top.iter()
+                .map(|f| format!("{} ({})", f.name, f.item_count))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let kit = child_folders(&pool, "3D assets")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|f| f.name == "Platformer Kit")
+            .expect("a 3D assets/Platformer Kit node");
+        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+            "query": {
+                "text": "",
+                "filter": {},
+                "sort": { "field": "name", "order": "asc" },
+                "folder": { "libraryId": "golden", "path": kit.path },
+            },
+            "page": 0,
+            "pageSize": 10_000,
+        }))
+        .unwrap();
+        let libs = [library.clone()];
+        let found = search_libraries(&payload, &target_libraries(&payload.query, &libs))
+            .await
+            .unwrap();
+        let prefix = format!("/golden-snapshot-not-mounted/{}/", kit.path);
+        println!(
+            "{}: node count {}, search total {:?}",
+            kit.path, kit.item_count, found.total
+        );
+        assert_eq!(found.total, Some(kit.item_count));
+        assert!(found
+            .assets
+            .iter()
+            .all(|a| a.file_path.starts_with(&prefix)));
+
+        // A rename and a delete each rerun the pass before they return.
+        let (id, path): (String, String) = sqlx::query_as(
+            "SELECT id, file_path FROM assets WHERE file_path LIKE '3D assets/Platformer Kit/%'
+             ORDER BY file_path LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let started = Instant::now();
+        rename_asset_with(&db, &id, "renamed-by-golden-test")
+            .await
+            .unwrap();
+        timed(
+            &format!("rename of {path}, with its pass"),
+            started.elapsed(),
+            Duration::from_secs(2),
+        );
+        let started = Instant::now();
+        delete_assets_with(&db, &[id], false, |_| Ok::<(), &str>(()))
+            .await
+            .unwrap();
+        timed(
+            "delete with its pass",
+            started.elapsed(),
+            Duration::from_secs(2),
+        );
+        let after = child_folders(&pool, "3D assets")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|f| f.name == "Platformer Kit")
+            .unwrap();
+        println!(
+            "after the delete, {} counts {}",
+            after.path, after.item_count
+        );
+        assert_eq!(after.item_count, kit.item_count - 1);
+        assert_eq!(crate::structure::rebuild(&pool).await.unwrap(), 0);
     }
 }

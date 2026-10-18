@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useAssetStore, useAutotagStore } from '../../store';
+import { useAssetStore, useAutotagStore, useLibraryStore } from '../../store';
 import { taggingSummary } from '../../utils/autotag';
 import autotagStyles from '../Autotag/Autotag.module.css';
 import { api } from '../../api';
@@ -39,6 +39,9 @@ export function StatusBar() {
   const previewProgress = usePreviewProgress();
   const tagging = taggingSummary(useAutotagStore((s) => s.runs));
   const setRunsPanelOpen = useAutotagStore((s) => s.setRunsPanelOpen);
+  const folderLibrary = useLibraryStore((s) =>
+    s.libraries.find((l) => l.id === query.folder?.libraryId)
+  );
 
   return (
     <footer className={styles.statusBar} id="status-bar">
@@ -48,6 +51,11 @@ export function StatusBar() {
         ) : (
           <span className={styles.item}>
             {total.toLocaleString()} asset{total !== 1 ? 's' : ''}
+          </span>
+        )}
+        {query.folder && (
+          <span className={styles.item} id="status-folder" title={folderLibrary?.name}>
+            · Folder: {query.folder.path || folderLibrary?.name || 'library root'}
           </span>
         )}
         {query.text && (
