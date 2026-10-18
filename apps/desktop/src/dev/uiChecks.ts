@@ -389,6 +389,9 @@ export const UI_CHECKS: UiCheck[] = [
         await untilFrame(() => loadedImages(panel!).length > 0, 5_000, 'the detail preview');
         await assertScaling(assert, 'detail panel', panel!, 'contain', pref);
         await pause(`U8-${pref}`);
+        // What the screenshot shows must still be the state asserted before it
+        await assertScaling(assert, 'grid after the screenshot', el, 'cover', pref);
+        await assertScaling(assert, 'detail panel after the screenshot', panel!, 'contain', pref);
         await quickLook(true);
         await untilFrame(
           () => !!quickLookImage()?.complete && quickLookImage()!.naturalWidth > 0,
