@@ -16,6 +16,10 @@ A GPU-mode launch on this machine has twice stalled at startup, and once that fr
 
 ## Setup
 
+Commit hashes below are the ones the runs recorded, before this branch was rebased onto `main` at
+63fb507. After the rebase they are: 6a0ec6e is unchanged (`main` then), 6302416 is 7403926,
+0e79743 is 2a221ab, 2d130b7 is 33dd8a2, 93d9a92 is 6a90102, and 9008525 is a24f14c.
+
 - **Machine:** RTX 5080, NVIDIA driver 615.78.08, WebKitGTK 2.54.1.
 - **Where:** the scroll bench's nested headless KWin, 1400x900, `devicePixelRatio` 1.
 - **Data:** a fresh run copy of the golden Kenney snapshot for each run, 83,095 assets.
