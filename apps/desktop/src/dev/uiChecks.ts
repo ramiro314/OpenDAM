@@ -543,6 +543,17 @@ export const UI_CHECKS: UiCheck[] = [
       }
       assert(!press(el, 'ArrowDown').defaultPrevented, 'ArrowDown was prevented');
 
+      // Space on a control is left to it: a favorite button focused with Tab keeps its activation
+      const fav = (await card0()).querySelector<HTMLElement>('button');
+      assert(fav, "card 0's favorite button is not rendered");
+      fav!.focus();
+      assert(
+        !press(fav!, ' ', 'Space').defaultPrevented,
+        'Space on the favorite button was prevented'
+      );
+      fav!.dispatchEvent(new KeyboardEvent('keyup', { key: ' ', code: 'Space', bubbles: true }));
+      el.focus();
+
       // Space, though prevented, still reaches App's QuickLook handler: holding it opens
       // QuickLook on the focused asset, releasing it closes it
       const quickLook = () => document.querySelector('[role="dialog"][aria-modal="true"]');

@@ -330,7 +330,8 @@ function WindowedResults({
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (isEditingText()) return;
     if (e.code === 'Space') {
-      e.preventDefault();
+      // A control, such as a card's favorite button, keeps Space for its own activation
+      if (!(e.target as Element).closest(CONTROLS)) e.preventDefault();
       return;
     }
     if (!PAGING_KEYS.has(e.key)) return;
