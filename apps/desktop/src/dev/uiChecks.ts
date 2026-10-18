@@ -440,9 +440,15 @@ export const UI_CHECKS: UiCheck[] = [
         target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
       const blur = () => (document.activeElement as HTMLElement | null)?.blur();
       const focused = () => document.activeElement?.id || document.activeElement?.tagName;
-      const card = el.querySelector<HTMLElement>('[data-index="0"]:not([data-placeholder])');
-      const favorite = card?.querySelector('button');
-      assert(card && favorite, 'card 0 or its favorite button is not rendered');
+      // Card 0, once its page has arrived: a stalled webview can outlast the reset's wait
+      const card0 = async () => {
+        const selector = '[data-index="0"]:not([data-placeholder])';
+        await untilFrame(() => el.querySelector(selector) !== null, 30_000, 'card 0 rendered');
+        return el.querySelector<HTMLElement>(selector)!;
+      };
+      const card = await card0();
+      const favorite = card.querySelector('button');
+      assert(favorite, "card 0's favorite button is not rendered");
       blur();
       down(favorite!);
       assert(
@@ -521,8 +527,7 @@ export const UI_CHECKS: UiCheck[] = [
       // grid, and the keys still page from there
       el.scrollTop = 0;
       await frames(3);
-      const tabbed = el.querySelector<HTMLElement>('[data-index="0"]:not([data-placeholder])');
-      assert(tabbed, 'card 0 is not rendered');
+      const tabbed = await card0();
       tabbed!.focus();
       assert(document.activeElement === tabbed, `Tab focus went to ${focused()}, not card 0`);
       press(document.activeElement as HTMLElement, 'End');
@@ -547,9 +552,7 @@ export const UI_CHECKS: UiCheck[] = [
       // hands focus to the grid too
       el.scrollTop = 0;
       await frames(3);
-      const button = el.querySelector<HTMLElement>(
-        '[data-index="0"]:not([data-placeholder]) button'
-      );
+      const button = (await card0()).querySelector<HTMLElement>('button');
       assert(button, "card 0's favorite button is not rendered");
       button!.focus();
       assert(document.activeElement === button, `the favorite button left focus on ${focused()}`);
