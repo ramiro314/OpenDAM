@@ -921,12 +921,26 @@ mod tests {
         .unwrap();
         assert_eq!(index().await, before);
 
-        sqlx::query("UPDATE assets SET description = 'wooden'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert_ne!(index().await, before);
-        assert_eq!(indexed_rowids(&pool, "wooden").await, [1]);
+        // Each indexed column alone reindexes, and the trigger's 'delete' removes its old value.
+        for column in ["file_name", "description", "metadata", "file_path"] {
+            let word = column.replace('_', "");
+            for value in ["first", "second"] {
+                sqlx::query(&format!("UPDATE assets SET {column} = '{value}{word}'"))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    indexed_rowids(&pool, &format!("{value}{word}")).await,
+                    [1],
+                    "{column}"
+                );
+            }
+            assert_eq!(
+                indexed_rowids(&pool, &format!("first{word}")).await,
+                Vec::<i64>::new(),
+                "{column}"
+            );
+        }
     }
 
     #[tokio::test]
