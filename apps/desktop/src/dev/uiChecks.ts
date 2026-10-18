@@ -354,12 +354,21 @@ export const UI_CHECKS: UiCheck[] = [
         // has loaded rather than fail on how fast it loads
         await untilFrame(() => allReady(el), 20_000, '').catch(() => {});
         const shown = tilesInView(el).flatMap(loadedImages);
+        // A card cut off by the viewport edge would hide the toggle's effect in the screenshots
+        const view = el.getBoundingClientRect();
+        const whole = (img: HTMLImageElement) => {
+          const r = img.closest('[data-tile]')!.getBoundingClientRect();
+          return r.top >= view.top && r.bottom <= view.bottom;
+        };
         small = shown
-          .filter((img) => isRaster(img) && isEnlarged(img, 'cover'))
+          .filter((img) => whole(img) && isRaster(img) && isEnlarged(img, 'cover'))
           .sort((a, b) => a.naturalWidth - b.naturalWidth)[0];
         large = shown.find((img) => !isEnlarged(img, 'cover'));
       }
-      assert(small && large, 'no viewport showed both an enlarged raster and a shrunk image');
+      assert(
+        small && large,
+        'no viewport showed both a whole card with an enlarged raster and a shrunk image'
+      );
       const tile = small!.closest<HTMLElement>('[data-tile]')!;
       const id = tile.id.slice('asset-'.length);
       const index = Number(tile.dataset.index);
