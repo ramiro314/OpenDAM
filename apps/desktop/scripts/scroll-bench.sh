@@ -82,6 +82,7 @@ if ! cleaned; then
   until cleaned || ! kill -0 \$app 2>/dev/null || ((SECONDS > deadline)); do sleep 10; done
   kill \$app 2>/dev/null
   wait \$app 2>/dev/null
+  sleep 10 # as between scenarios below
   # The warm-up's own report, if it got that far, is not a result: no scenario or check is named
   # warmup, so it holds an error or no checks
   sed -n 's/^\[scroll-bench\] \(done\|failed\) \([^:]*\).*/\2/p' "$run/warmup.log" | xargs -r rm -f
@@ -120,6 +121,10 @@ for only in ${scenarios[*]}; do
   cat "\$log" >>"$run/app.log"
   # A cap kill is a finding: report it rather than start the next scenario's app
   grep -q '^memory-cap: .* killed at the' "\$log" && break
+  # Let the GPU driver finish tearing down the killed web process before the next one starts. On
+  # 2026-10-18 the GPU firmware stopped answering right at a kill-and-start, and froze the desktop
+  # (docs/reports/gpu-hang-2026-10-18/report.html).
+  sleep 10
 done
 EOF
 chmod +x "$run/session.sh"
