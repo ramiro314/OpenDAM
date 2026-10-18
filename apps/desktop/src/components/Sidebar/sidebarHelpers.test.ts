@@ -92,8 +92,12 @@ describe('isFilterEmpty', () => {
     expect(isFilterEmpty({ tags: ['t1'] })).toBe(false);
   });
 
-  test('ignores filters the sidebar does not offer', () => {
-    expect(isFilterEmpty({ directory: 'props', extensions: ['png'] })).toBe(true);
+  test('is false when a smart filter sets a folder', () => {
+    expect(isFilterEmpty({ directory: '3D assets/Platformer Kit' })).toBe(false);
+  });
+
+  test('ignores the library root and filters the sidebar does not offer', () => {
+    expect(isFilterEmpty({ directory: ' / ', extensions: ['png'] })).toBe(true);
   });
 });
 

@@ -128,6 +128,12 @@
   justify-content: space-between;
 }
 
+.fieldError {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--color-danger);
+}
+
 .optional {
   font-size: 10.5px;
   color: var(--color-text-disabled);

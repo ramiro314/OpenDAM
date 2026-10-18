@@ -107,6 +107,7 @@ export interface FilterSpec {
   extensions?: string[];
   previewStatus?: Asset['previewStatus'];
   unorganized?: boolean;
+  /** A folder path relative to the root of each library searched; `''` is the root */
   directory?: string;
   namePrefix?: string;
   nameSuffix?: string;
@@ -125,6 +126,14 @@ export interface SearchQuery {
   libraryIds?: string[];
   collectionId?: string;
   includeSubcollections?: boolean;
+  /** One folder of one library: only that library's files below the folder, recursively */
+  folder?: FolderRef;
+}
+
+/** A library folder by its path relative to the library root; the root is `''` */
+export interface FolderRef {
+  libraryId: string;
+  path: string;
 }
 
 // ── Preview job ──────────────────────────────────────────────────────────
