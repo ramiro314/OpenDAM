@@ -102,6 +102,68 @@ pub async fn upsert_collection<'e, E: sqlx::Executor<'e, Database = Sqlite>>(
     .map(|_| ())
 }
 
+/// The per-library schema. The full-text table and its triggers are a separate script so
+/// `index_file_paths` can recreate them inside a transaction, which the schema's pragmas forbid.
+const LIBRARY_SCHEMA: &str = include_str!("../migrations/002_library_schema.sql");
+const ASSETS_FTS_SCHEMA: &str = include_str!("../migrations/003_assets_fts.sql");
+
+/// Creates whatever the library schema lacks on `pool`, the full-text index included.
+async fn create_library_schema(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
+    sqlx::query(LIBRARY_SCHEMA).execute(pool).await?;
+    sqlx::query(ASSETS_FTS_SCHEMA).execute(pool).await?;
+    Ok(())
+}
+
+/// The `library_meta` key recording that `index_file_paths` converted a library.
+const FTS_FILE_PATH_KEY: &str = "fts_file_path";
+
+/// Backward compatibility: `assets_fts` gained `file_path`, so search finds an asset by the
+/// folder names in its path. FTS5 can't add a column, and `IF NOT EXISTS` keeps an old table and
+/// its triggers, so a library whose index lacks the column drops the table and its three
+/// triggers, recreates them and rebuilds the index from `assets`. That is one transaction: a
+/// conversion interrupted before its commit leaves the old index, and the next open runs it
+/// again. A converted library has the column, so it is never converted twice, and
+/// `library_meta` records the conversion. Returns whether it converted. `stop_before_commit` is
+/// a test hook that rolls the conversion back instead of committing it.
+pub(crate) async fn index_file_paths(
+    pool: &Pool<Sqlite>,
+    stop_before_commit: bool,
+) -> sqlx::Result<bool> {
+    let indexed: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('assets_fts') WHERE name = 'file_path')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if indexed {
+        return Ok(false);
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "DROP TRIGGER IF EXISTS assets_ai;
+         DROP TRIGGER IF EXISTS assets_ad;
+         DROP TRIGGER IF EXISTS assets_au;
+         DROP TABLE IF EXISTS assets_fts;",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(ASSETS_FTS_SCHEMA).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO assets_fts(assets_fts) VALUES ('rebuild')")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO library_meta (key, value) VALUES (?, 'done')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(FTS_FILE_PATH_KEY)
+    .execute(&mut *tx)
+    .await?;
+    if stop_before_commit {
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// Backward compatibility: tags gained a description (the hint the tagging providers get).
 /// Any failure other than the column already being there is an error: a database left without
 /// it fails every tag query later, far from the cause.
@@ -197,10 +259,7 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     .execute(&pool)
     .await?;
 
-    // Execute the per-library schema
-    sqlx::query(include_str!("../migrations/002_library_schema.sql"))
-        .execute(&pool)
-        .await?;
+    create_library_schema(&pool).await?;
 
     // Backward compatibility: ensure dir_mtimes table exists
     let _ = sqlx::query(
@@ -226,6 +285,10 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     add_tag_description_column(&pool)
         .await
         .context("Could not add the tag description column")?;
+    // Search still works on the old index, so a failed conversion only waits for the next open.
+    if let Err(e) = index_file_paths(&pool, false).await {
+        tracing::warn!("Could not index folder names for search in {db_path:?}: {e}");
+    }
 
     // Purge any existing Revit backup files from database
     if let Ok(assets) = sqlx::query_as::<_, (String, String)>(
@@ -300,9 +363,7 @@ impl Database {
         create_master_tables(&master_pool).await?;
 
         // Also ensure library schema tables exist on master_pool as fallback
-        let _ = sqlx::query(include_str!("../migrations/002_library_schema.sql"))
-            .execute(&master_pool)
-            .await;
+        let _ = create_library_schema(&master_pool).await;
 
         let _ = sqlx::query("ALTER TABLE assets ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
             .execute(&master_pool)
@@ -599,10 +660,7 @@ async fn memory_pool(foreign_keys: bool) -> Pool<Sqlite> {
         .connect_with(options)
         .await
         .unwrap();
-    sqlx::query(include_str!("../migrations/002_library_schema.sql"))
-        .execute(&pool)
-        .await
-        .unwrap();
+    create_library_schema(&pool).await.unwrap();
     // The schema script sets the pragma itself, so pin it again afterwards.
     sqlx::query(&format!(
         "PRAGMA foreign_keys = {}",
@@ -612,6 +670,60 @@ async fn memory_pool(foreign_keys: bool) -> Pool<Sqlite> {
     .await
     .unwrap();
     pool
+}
+
+/// The full-text table and triggers of libraries made before `file_path` was indexed.
+#[cfg(test)]
+const OLD_ASSETS_FTS_SCHEMA: &str = "
+    DROP TRIGGER assets_ai;
+    DROP TRIGGER assets_ad;
+    DROP TRIGGER assets_au;
+    DROP TABLE assets_fts;
+    CREATE VIRTUAL TABLE assets_fts USING fts5(
+        id UNINDEXED, file_name, description, metadata, content='assets', content_rowid='rowid'
+    );
+    CREATE TRIGGER assets_ai AFTER INSERT ON assets BEGIN
+        INSERT INTO assets_fts(rowid, id, file_name, description, metadata)
+        VALUES (new.rowid, new.id, new.file_name, new.description, new.metadata);
+    END;
+    CREATE TRIGGER assets_ad AFTER DELETE ON assets BEGIN
+        INSERT INTO assets_fts(assets_fts, rowid, id, file_name, description, metadata)
+        VALUES ('delete', old.rowid, old.id, old.file_name, old.description, old.metadata);
+    END;
+    CREATE TRIGGER assets_au AFTER UPDATE ON assets BEGIN
+        INSERT INTO assets_fts(assets_fts, rowid, id, file_name, description, metadata)
+        VALUES ('delete', old.rowid, old.id, old.file_name, old.description, old.metadata);
+        INSERT INTO assets_fts(rowid, id, file_name, description, metadata)
+        VALUES (new.rowid, new.id, new.file_name, new.description, new.metadata);
+    END;";
+
+/// Like `memory_library_pool`, but with the full-text table and triggers libraries had before
+/// `file_path` was indexed, so `index_file_paths` has a library to convert.
+#[cfg(test)]
+pub(crate) async fn memory_library_pool_with_old_fts() -> Pool<Sqlite> {
+    let pool = memory_library_pool().await;
+    sqlx::query(OLD_ASSETS_FTS_SCHEMA)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool
+}
+
+/// The rowids the full-text index itself matches for the FTS5 query `fts`, read without
+/// `assets`, so a row whose index entries outlived it still shows. Fails the test unless the
+/// index agrees with `assets`, which a trigger's `'delete'` with values that were never indexed
+/// breaks.
+#[cfg(test)]
+pub(crate) async fn indexed_rowids(pool: &Pool<Sqlite>, fts: &str) -> Vec<i64> {
+    sqlx::query("INSERT INTO assets_fts(assets_fts, rank) VALUES ('integrity-check', 1)")
+        .execute(pool)
+        .await
+        .expect("the full-text index disagrees with assets");
+    sqlx::query_scalar("SELECT rowid FROM assets_fts WHERE assets_fts MATCH ? ORDER BY rowid")
+        .bind(fts)
+        .fetch_all(pool)
+        .await
+        .unwrap()
 }
 
 /// A database over an in-memory master and the given open libraries, for tests.
@@ -742,6 +854,111 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(ids, ["a1"]);
+    }
+
+    async fn has_file_path_column(pool: &Pool<Sqlite>) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('assets_fts') WHERE name = 'file_path')",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn fts_conversion_record(pool: &Pool<Sqlite>) -> Option<String> {
+        sqlx::query_scalar("SELECT value FROM library_meta WHERE key = ?")
+            .bind(FTS_FILE_PATH_KEY)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_new_library_indexes_file_paths_with_no_conversion() {
+        let pool = memory_library_pool().await;
+        insert_asset(&pool, "crate").await;
+
+        assert!(!index_file_paths(&pool, false).await.unwrap());
+        assert_eq!(fts_conversion_record(&pool).await, None);
+        assert_eq!(indexed_rowids(&pool, "models").await, [1]);
+    }
+
+    #[tokio::test]
+    async fn every_trigger_writes_the_file_path() {
+        let pool = memory_library_pool().await;
+        let triggers: Vec<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'assets'
+             ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(triggers.len(), 3);
+        for sql in triggers {
+            assert!(sql.contains(".file_path"), "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_writes_to_indexed_columns_touch_the_full_text_index() {
+        let pool = memory_library_pool().await;
+        insert_asset(&pool, "crate").await;
+        let index = || async {
+            sqlx::query_as::<_, (i64, Vec<u8>)>("SELECT id, block FROM assets_fts_data ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+        };
+        let before = index().await;
+
+        sqlx::query(
+            "UPDATE assets SET rating = 5, color_label = 'red', is_favorite = 1, size_bytes = 9,
+                 modified_at = 1, indexed_at = 1, thumbnail_path = 'x', preview_status = 'done'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(index().await, before);
+
+        sqlx::query("UPDATE assets SET description = 'wooden'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_ne!(index().await, before);
+        assert_eq!(indexed_rowids(&pool, "wooden").await, [1]);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_conversion_runs_again_on_the_next_open_and_never_twice() {
+        let dir = std::env::temp_dir().join(format!("opendam-fts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("library.sqlite");
+        let old = connect_library_sqlite(&file).await.unwrap();
+        sqlx::query(OLD_ASSETS_FTS_SCHEMA)
+            .execute(&old)
+            .await
+            .unwrap();
+        insert_asset(&old, "crate").await;
+
+        assert!(!index_file_paths(&old, true).await.unwrap());
+        assert!(!has_file_path_column(&old).await);
+        assert_eq!(fts_conversion_record(&old).await, None);
+        assert_eq!(indexed_rowids(&old, "crate").await, [1]);
+        assert_eq!(indexed_rowids(&old, "models").await, Vec::<i64>::new());
+        old.close().await;
+
+        let reopened = connect_library_sqlite(&file).await.unwrap();
+        let converted = (
+            has_file_path_column(&reopened).await,
+            fts_conversion_record(&reopened).await,
+            indexed_rowids(&reopened, "models").await,
+            index_file_paths(&reopened, false).await.unwrap(),
+        );
+        reopened.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(converted, (true, Some("done".to_string()), vec![1], false));
     }
 
     #[tokio::test]
@@ -1126,7 +1343,7 @@ mod tests {
                 &old,
                 "CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
             ),
-            (&new, include_str!("../migrations/002_library_schema.sql")),
+            (&new, LIBRARY_SCHEMA),
         ] {
             let pool = SqlitePoolOptions::new()
                 .connect_with(

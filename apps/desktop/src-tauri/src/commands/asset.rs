@@ -1015,8 +1015,10 @@ pub async fn rename_asset(
 mod tests {
     use super::*;
     use crate::db::{
-        insert_asset, insert_collection, insert_tag, memory_database, memory_library,
-        memory_library_pool, memory_library_pool_enforcing_foreign_keys, LibraryHandle,
+        index_file_paths, indexed_rowids, insert_asset, insert_collection, insert_tag,
+        memory_database, memory_library, memory_library_pool,
+        memory_library_pool_enforcing_foreign_keys, memory_library_pool_with_old_fts,
+        LibraryHandle,
     };
     use sqlx::{Pool, Row, Sqlite};
     use std::cell::RefCell;
@@ -1095,6 +1097,164 @@ mod tests {
         assert_eq!(search_names(&pool, "\"").await, all);
         assert_eq!(search_names(&pool, "(").await, all);
         assert_eq!(search_names(&pool, "( tree").await, ["tree.glb"]);
+    }
+
+    /// Inserts an asset at `path` (relative to the library root), named for its file name.
+    async fn insert_at(pool: &Pool<Sqlite>, path: &str, description: &str) {
+        let name = path.rsplit('/').next().unwrap();
+        sqlx::query(
+            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, description)
+             VALUES (?, ?, ?, '', 'texture', 0, 0, 0, ?)",
+        )
+        .bind(name)
+        .bind(path)
+        .bind(name)
+        .bind(description)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Two platformer packs, one other pack and a file at the root.
+    async fn insert_packs(pool: &Pool<Sqlite>) {
+        for (path, description) in [
+            ("3D assets/Platformer Kit/Models/crate.glb", ""),
+            ("2D assets/Pixel Platformer/Tiles/tile.png", ""),
+            ("2D assets/Space Shooter/ship.png", "hull"),
+            ("platformer-notes.txt", ""),
+        ] {
+            insert_at(pool, path, description).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn search_finds_an_asset_by_the_folder_names_in_its_path() {
+        let pool = memory_library_pool().await;
+        insert_packs(&pool).await;
+
+        assert_eq!(
+            search_names(&pool, "platformer").await,
+            ["crate.glb", "platformer-notes.txt", "tile.png"]
+        );
+        assert_eq!(search_names(&pool, "3d models").await, ["crate.glb"]);
+        assert_eq!(search_names(&pool, "ship").await, ["ship.png"]);
+        assert_eq!(search_names(&pool, "hull").await, ["ship.png"]);
+    }
+
+    #[tokio::test]
+    async fn search_finds_assets_by_folder_names_once_an_old_library_is_converted() {
+        let pool = memory_library_pool_with_old_fts().await;
+        insert_packs(&pool).await;
+        assert_eq!(
+            search_names(&pool, "platformer").await,
+            ["platformer-notes.txt"]
+        );
+
+        assert!(index_file_paths(&pool, false).await.unwrap());
+
+        assert_eq!(
+            search_names(&pool, "platformer").await,
+            ["crate.glb", "platformer-notes.txt", "tile.png"]
+        );
+        assert_eq!(search_names(&pool, "ship").await, ["ship.png"]);
+        assert_eq!(search_names(&pool, "hull").await, ["ship.png"]);
+    }
+
+    #[tokio::test]
+    async fn after_a_rename_and_a_delete_the_index_matches_only_the_new_path() {
+        let pool = memory_library_pool().await;
+        insert_at(&pool, "Platformer Kit/crate.glb", "").await;
+        insert_at(&pool, "Space Kit/ship.png", "").await;
+
+        // What `rename_asset` writes.
+        sqlx::query(
+            "UPDATE assets SET file_name = 'barrel.glb', file_path = 'Platformer Kit/barrel.glb',
+                 extension = 'glb', modified_at = 1
+             WHERE id = 'crate.glb'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(indexed_rowids(&pool, "crate").await, Vec::<i64>::new());
+        assert_eq!(search_names(&pool, "barrel").await, ["barrel.glb"]);
+        assert_eq!(search_names(&pool, "platformer").await, ["barrel.glb"]);
+
+        // A move to another folder changes only the path.
+        sqlx::query("UPDATE assets SET file_path = 'Space Kit/barrel.glb' WHERE id = 'crate.glb'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(indexed_rowids(&pool, "platformer").await, Vec::<i64>::new());
+        assert_eq!(
+            search_names(&pool, "space").await,
+            ["barrel.glb", "ship.png"]
+        );
+
+        sqlx::query("DELETE FROM assets WHERE id = 'crate.glb'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(indexed_rowids(&pool, "barrel").await, Vec::<i64>::new());
+        assert_eq!(indexed_rowids(&pool, "space").await, [2]);
+        assert_eq!(search_names(&pool, "space").await, ["ship.png"]);
+    }
+
+    /// The acceptance check on a real library made before folder search, such as a copy of the
+    /// golden snapshot's DB (docs/agents/running-the-app.md#bench-data). Opening the copy
+    /// converts it, and every file in a folder whose name has a word starting "platformer" must
+    /// then match the search "platformer". Run it with
+    /// `OPENDAM_FTS_LIBRARY=<copy> cargo nextest run --run-ignored only real_library`.
+    #[tokio::test]
+    #[ignore = "needs OPENDAM_FTS_LIBRARY, a copy of a library DB it may convert"]
+    async fn a_converted_real_library_finds_every_platformer_pack_by_its_folder_name() {
+        let file = PathBuf::from(std::env::var("OPENDAM_FTS_LIBRARY").unwrap());
+        let started = std::time::Instant::now();
+        let pool = crate::db::connect_library_sqlite(&file).await.unwrap();
+        println!("opened and converted in {:?}", started.elapsed());
+
+        let in_platformer_folder = |path: &str| {
+            path.rsplit_once('/').is_some_and(|(folders, _)| {
+                folders
+                    .to_lowercase()
+                    .split(|c: char| !c.is_alphanumeric())
+                    .any(|word| word.starts_with("platformer"))
+            })
+        };
+        let pack = |path: &str| path.splitn(3, '/').take(2).collect::<Vec<_>>().join("/");
+        let paths: Vec<String> = sqlx::query_scalar("SELECT file_path FROM assets")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let expected: std::collections::BTreeSet<&String> =
+            paths.iter().filter(|p| in_platformer_folder(p)).collect();
+
+        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+            "query": { "text": "platformer", "filter": {}, "sort": { "field": "name", "order": "asc" } },
+            "page": 0,
+            "pageSize": paths.len(),
+        }))
+        .unwrap();
+        let result = search_libraries(&payload, &[(pool, None)]).await.unwrap();
+        let found: std::collections::BTreeSet<String> =
+            result.assets.into_iter().map(|a| a.file_path).collect();
+
+        let mut packs = std::collections::BTreeMap::<String, usize>::new();
+        for path in &expected {
+            *packs.entry(pack(path)).or_default() += 1;
+        }
+        for (pack, files) in &packs {
+            println!("{files:>5} files in a platformer folder of {pack}");
+        }
+        let missing: Vec<_> = expected.iter().filter(|p| !found.contains(**p)).collect();
+        println!(
+            "{} packs, {} files in platformer folders, {} matched the search, {} missing",
+            packs.len(),
+            expected.len(),
+            found.len(),
+            missing.len()
+        );
+        assert!(!packs.is_empty());
+        assert!(missing.is_empty(), "not found: {missing:?}");
     }
 
     /// A library with this collection tree, each asset (named for its id) in the collections

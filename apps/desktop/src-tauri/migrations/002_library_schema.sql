@@ -85,33 +85,8 @@ CREATE TABLE IF NOT EXISTS preview_jobs (
     created_at    INTEGER NOT NULL
 );
 
--- ── Full-text search (FTS5) ───────────────────────────────────────────────
-CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(
-    id UNINDEXED,
-    file_name,
-    description,
-    metadata,
-    content='assets',
-    content_rowid='rowid'
-);
-
--- Triggers to keep FTS in sync
-CREATE TRIGGER IF NOT EXISTS assets_ai AFTER INSERT ON assets BEGIN
-    INSERT INTO assets_fts(rowid, id, file_name, description, metadata)
-    VALUES (new.rowid, new.id, new.file_name, new.description, new.metadata);
-END;
-
-CREATE TRIGGER IF NOT EXISTS assets_ad AFTER DELETE ON assets BEGIN
-    INSERT INTO assets_fts(assets_fts, rowid, id, file_name, description, metadata)
-    VALUES ('delete', old.rowid, old.id, old.file_name, old.description, old.metadata);
-END;
-
-CREATE TRIGGER IF NOT EXISTS assets_au AFTER UPDATE ON assets BEGIN
-    INSERT INTO assets_fts(assets_fts, rowid, id, file_name, description, metadata)
-    VALUES ('delete', old.rowid, old.id, old.file_name, old.description, old.metadata);
-    INSERT INTO assets_fts(rowid, id, file_name, description, metadata)
-    VALUES (new.rowid, new.id, new.file_name, new.description, new.metadata);
-END;
+-- The full-text table and its triggers are in 003_assets_fts.sql, so a library made before
+-- `file_path` was indexed can recreate them inside a transaction (db::index_file_paths).
 
 -- ── Library meta: one-time maintenance passes record themselves here ──────
 CREATE TABLE IF NOT EXISTS library_meta (
