@@ -1,18 +1,18 @@
 # Fast browsing for big collections: final run results
 
-Status: **partly complete.** This is step 8 of the [plan](plan.md) ("Suggested build order").
+Status: **complete**, with T1 and T4 missed (see [Known gaps](#known-gaps)). This is step 8 of the [plan](plan.md) ("Suggested build order").
 
 | Acceptance criterion | State |
 |---|---|
 | T1-T4 at md in `gpu-shm` | Measured on a clean run: T2 and T3 PASS, T1 and T4 FAIL |
 | `explicit-sync` runs of the same scenarios | 8 of 9 scenarios measured, including every md scenario. lg end to end stalled at launch (below). |
 | `cpu` runs of the same scenarios | All 9 scenarios measured (2d130b7, the same code as 0e79743) |
-| U1-U8 in `checks` mode, with screenshots | **Not run** |
+| U1-U8 in `checks` mode, with screenshots | All pass. U1-U7 and M1 pass in one full run. U8 failed there on how it searches for images; this ticket fixed its search (9008525), and it then passed. |
 | The explicit-sync 15% test | Applied: 0% better, **fails** |
 | The default stays `gpu-shm` | Yes. No render-mode code changed. |
 
-The checks wait for the owner. A GPU-mode launch on this machine has twice stalled at startup, and
-once that froze the desktop ([The hang](#the-hang-on-2026-10-18)).
+A GPU-mode launch on this machine has twice stalled at startup, and once that froze the desktop
+([The hang](#the-hang-on-2026-10-18)).
 
 ## Setup
 
@@ -84,12 +84,35 @@ since the measurement already rules the switch out.
 
 ## UI checks U1-U8
 
-**Not run** on this final state. Earlier tickets ran them:
+Both runs used `gpu-shm` on a fresh run copy, with the cleanup pass finished first.
 
-- **#97:** U1-U5 and U8 passed in one run, peaking at 779 MB.
-- **#96:** U6, U7 and U8 passed in a run of their own.
+| Check | Result | Run |
+|---|---|---|
+| U1 Full-size scrollbar with only page 0 cached | PASS | full, 93d9a92 |
+| U2 Jump to 75%, placeholders, then filled within 300 ms | PASS | full, 93d9a92 |
+| U3 List view under 60 rows, footer range | PASS | full, 93d9a92 |
+| U4 Grid size change keeps the first visible asset | PASS | full, 93d9a92 |
+| U5 Right-click menu at offset 60,000, Escape closes it | PASS | full, 93d9a92 |
+| U6 Scrub label under name and date sort, hides after 0.6 s | PASS | full, 93d9a92 |
+| U7 Keyboard paging, all keys `defaultPrevented` | PASS | full, 93d9a92 |
+| U8 Scaling toggle flips enlarged images, shrunk stay `auto`, survives a reload | FAIL, then PASS | full, 93d9a92; alone, 9008525 |
+| M1 Held still 60% down, web process grows under 200 MB in 10 s | PASS | full, 93d9a92 |
 
-No full U1-U8 run on `main` with everything merged has been recorded.
+**Why U8 failed, and the fix.** In the full run U8 reported "no viewport showed both a whole card
+with an enlarged raster and a shrunk image".
+
+- **Cause:** it scans 41 positions in the default date order, which keeps each asset pack together.
+  Before this ticket's runs, the cleanup pass was still running, so packs mixed cleared originals
+  with old 512 px thumbnails, and U8 always found a view with both. Once the pass finishes, a view
+  holds either small textures shown at their own size or 512 px model thumbnails, rarely both.
+- **Confirmed by simulation:** reading the image headers from the golden snapshot and replaying
+  U8's 41 scan positions found none with both kinds in date order, and 8 in name order.
+- **The fix (9008525):** U8 runs in name order, which interleaves packs, and restores the previous
+  sort when it ends. That changes the check, not the app.
+- **Result:** run alone on 9008525, U8 passed with all four screenshots: the grid and the detail
+  panel in each state, and QuickLook in each state.
+
+Screenshots are in `.evidence/final-run/checks/` and `.evidence/final-run/checks-u8/` (gitignored).
 
 ## Launch stalls in GPU modes
 
@@ -131,7 +154,7 @@ Mission Control session.
 
 ## Known gaps
 
-- **T1 misses** (1.38 against 1.10, both GPU modes).
+- **T1 misses** (1.38 against 1.10, in all three modes).
   - The DOM stays between 549 and 759 nodes over all 83,095 assets, instead of growing with
     scroll depth.
   - The spread between top, middle and bottom is wider than the target allows.
@@ -142,7 +165,6 @@ Mission Control session.
     visited, which a 150 MB budget can't hold. The GPU modes add about 400 MB more, probably GPU
     tile or texture memory.
   - Not a small fix inside the plan's design.
-- **U1-U8 not run** on the final state, so there are no screenshots.
 - **`explicit-sync` lg end to end not measured,** because its launch stalled.
 - **GPU-mode launch stalls,** cause not established (above). They risk freezing the desktop.
 - **The bench build runs outside the memory cap,** and at 11:30:48 it coincided with a global OOM.
@@ -155,6 +177,8 @@ Raw reports are in `apps/desktop/src-tauri/target/scroll-bench/` (gitignored):
 |---|---|
 | `gpu-shm-1792355648.json` | Final `gpu-shm` run on 0e79743, all nine scenarios merged |
 | `cpu-1792362604.json` | Final `cpu` run on 2d130b7, all nine scenarios merged |
+| `gpu-shm-checks-1792364249.json` | Full checks run on 93d9a92: U1-U7 and M1 PASS, U8 FAIL |
+| `gpu-shm-checks-1792366404.json` | U8 alone on 9008525: PASS |
 | `explicit-sync-1792357296.json`, `-357339`, `-357356` | `explicit-sync` sm continuous scroll, end to end, random jumps |
 | `explicit-sync-1792357428.json`, `-357470`, `-357488` | `explicit-sync` md continuous scroll, end to end, random jumps |
 | `explicit-sync-1792357559.json`, `-359392` | `explicit-sync` lg continuous scroll, random jumps |
