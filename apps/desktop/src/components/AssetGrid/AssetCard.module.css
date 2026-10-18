@@ -1,3 +1,6 @@
+/* Nothing in a card uses backdrop-filter. Under GPU rendering each one is a compositing layer,
+   and once the grid scrolls, WebKitGTK 2.54 re-renders them without end, allocating about
+   500 MB/s in the web process (gridStyles.test.ts). Badges use near-opaque backgrounds instead. */
 .card {
   display: flex;
   flex-direction: column;
@@ -58,8 +61,7 @@
   position: absolute;
   bottom: var(--space-2);
   right: var(--space-2);
-  background: rgba(0, 0, 0, 0.65);
-  backdrop-filter: blur(4px);
+  background: rgba(0, 0, 0, 0.75);
   border-radius: var(--radius-sm);
   padding: 3px 6px;
   display: flex;
@@ -112,8 +114,7 @@
   height: 26px;
   border-radius: 50%;
   border: 1px solid rgba(255, 255, 255, 0.15);
-  background: rgba(15, 20, 28, 0.65);
-  backdrop-filter: blur(8px);
+  background: rgba(15, 20, 28, 0.85);
   color: var(--color-text-muted);
   display: flex;
   align-items: center;
@@ -172,8 +173,7 @@
   align-items: center;
   gap: 3px;
   padding: 2px 5px;
-  background: hsl(220 14% 9% / 0.75);
-  backdrop-filter: blur(4px);
+  background: hsl(220 14% 9% / 0.85);
   border-radius: var(--radius-sm);
   font-size: 9px;
   font-weight: 700;

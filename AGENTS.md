@@ -86,6 +86,11 @@ docs/plans                    Plans for this fork
   `useAssetStore`'s page cache: 200-asset pages by index, at most 25 kept, with selected and
   focused assets pinned. Nothing maps over all results. Change a cached asset through
   `patchCached`, and refetch after anything that shifts indices (`refresh`).
+- **No `backdrop-filter` in the grid or the list.** Under GPU rendering (`gpu-shm` on NVIDIA) each
+  one is a compositing layer, and once the grid scrolls WebKitGTK 2.54's compositor re-renders
+  them without end, growing the web process about 500 MB/s. `gridStyles.test.ts` keeps them out
+  of `components/AssetGrid/*.css`, and the scroll bench's M1 check measures the web process held
+  still deep in the grid.
 - **Master DB is the tag and collection catalog.** Tag and collection lists are read from master.
   Definition create, update and delete write to master, then mirror to every open library DB.
   `asset_tags` and `collection_assets` rows go only to the asset's own library
@@ -118,7 +123,8 @@ worker's stderr goes to the app log under the `preview_worker` target.
 
 Agent processes share Mission Control's cgroup, so one runaway process can get the whole session
 OOM-killed. That happened four times on 2026-10-17 (02:44, 10:41, 12:03 and 15:39), when the scroll
-bench's WebKit web process reached 15 to 20 GB in `checks` mode.
+bench's WebKit web process reached 15 to 20 GB in `checks` mode. The cause was the grid cards'
+`backdrop-filter` (see "No `backdrop-filter` in the grid or the list"), but keep the cap.
 
 - **Run them under `scripts/memory-cap.sh`.** It runs a command in its own systemd user scope
   with `MemoryMax` (`OPENDAM_MEMORY_MAX`, default `10G`) and no swap, keeps its exit status and
