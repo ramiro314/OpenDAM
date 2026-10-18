@@ -18,6 +18,7 @@ import type {
   RunSummary,
 } from '../types';
 import { api } from '../api';
+import type { ImageScaling } from '../utils/imageScaling';
 import {
   PAGE_SIZE,
   assetAt,
@@ -37,6 +38,8 @@ import {
 interface UIState {
   viewMode: 'grid' | 'list';
   gridSize: 'sm' | 'md' | 'lg';
+  /** How small images shown larger than their pixel size render */
+  imageScaling: ImageScaling;
   sidebarOpen: boolean;
   detailPanelOpen: boolean;
   selectedAssetIds: Set<string>;
@@ -48,6 +51,7 @@ interface UIState {
 
   setViewMode: (mode: 'grid' | 'list') => void;
   setGridSize: (size: 'sm' | 'md' | 'lg') => void;
+  setImageScaling: (scaling: ImageScaling) => void;
   toggleSidebar: () => void;
   toggleDetailPanel: () => void;
   selectAsset: (id: string, multi?: boolean) => void;
@@ -69,6 +73,7 @@ export const useUIStore = create<UIState>()(
     (set) => ({
       viewMode: 'grid',
       gridSize: 'md',
+      imageScaling: 'pixelated',
       sidebarOpen: true,
       detailPanelOpen: true,
       selectedAssetIds: new Set(),
@@ -80,6 +85,7 @@ export const useUIStore = create<UIState>()(
 
       setViewMode: (viewMode) => set({ viewMode }),
       setGridSize: (gridSize) => set({ gridSize }),
+      setImageScaling: (imageScaling) => set({ imageScaling }),
       toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
       toggleDetailPanel: () => set((s) => ({ detailPanelOpen: !s.detailPanelOpen })),
 
@@ -133,6 +139,7 @@ export const useUIStore = create<UIState>()(
       partialize: (s) => ({
         viewMode: s.viewMode,
         gridSize: s.gridSize,
+        imageScaling: s.imageScaling,
         sidebarOpen: s.sidebarOpen,
         detailPanelOpen: s.detailPanelOpen,
       }),

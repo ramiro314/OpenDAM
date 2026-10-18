@@ -4,6 +4,7 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import type { Asset } from '../../types';
 import { ThreeViewer } from '../DetailPanel/ThreeViewer';
 import { isWebviewDisplayable } from '../../utils/media';
+import { useImageScaling } from '../../hooks/useImageScaling';
 import { IconStar, IconModel3D, IconImage, IconVideo, IconFileText } from '../Icons';
 import styles from './QuickLookModal.module.css';
 
@@ -110,6 +111,7 @@ function VideoQuickLook({ filePath }: { filePath: string }) {
 }
 
 export const QuickLookModal = memo(function QuickLookModal({ asset, isOpen }: QuickLookModalProps) {
+  const scaling = useImageScaling('contain');
   if (!isOpen || !asset) return null;
 
   const modelPath =
@@ -177,6 +179,7 @@ export const QuickLookModal = memo(function QuickLookModal({ asset, isOpen }: Qu
                 src={convertFileSrc(imagePath)}
                 alt={asset.fileName}
                 className={styles.largeImg}
+                ref={scaling}
               />
             </div>
           ) : (

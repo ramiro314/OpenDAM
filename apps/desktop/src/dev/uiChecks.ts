@@ -10,6 +10,7 @@ import {
   rowOfIndex,
   rowTop,
 } from '../components/AssetGrid/gridGeometry';
+import { shouldPixelate, type ImageFit, type ImageScaling } from '../utils/imageScaling';
 
 export interface UiCheckContext {
   /** The grid's scroll container (`#asset-scroll`). */
@@ -78,6 +79,52 @@ function firstVisibleRow(el: HTMLElement): number[] {
     .filter((t) => Math.abs(t.getBoundingClientRect().top - top) < 1)
     .map(indexOf)
     .sort((a, b) => a - b);
+}
+
+/** The loaded images under `root`. */
+function loadedImages(root: ParentNode): HTMLImageElement[] {
+  return [...root.querySelectorAll('img')].filter((img) => img.complete && img.naturalWidth > 0);
+}
+
+/** Whether `img`, laid out with `fit`, is shown larger than its pixel size in device pixels. */
+function isEnlarged(img: HTMLImageElement, fit: ImageFit): boolean {
+  return shouldPixelate(
+    'pixelated',
+    { width: img.naturalWidth, height: img.naturalHeight },
+    { width: img.clientWidth, height: img.clientHeight },
+    fit,
+    window.devicePixelRatio
+  );
+}
+
+const rendering = (img: HTMLImageElement) => getComputedStyle(img).imageRendering;
+
+/**
+ * Asserts every loaded image under `root` renders `pixelated` when `pref` is pixelated and it is
+ * enlarged, `auto` otherwise. Images still finish loading during the check, and one can be
+ * complete a moment before its load handler applies the rule, so a mismatch gets up to 1 s to
+ * settle.
+ */
+async function assertScaling(
+  assert: UiCheckContext['assert'],
+  where: string,
+  root: ParentNode,
+  fit: ImageFit,
+  pref: ImageScaling
+) {
+  const mismatches = () =>
+    loadedImages(root).filter((img) => {
+      const want = isEnlarged(img, fit) && pref === 'pixelated' ? 'pixelated' : 'auto';
+      return rendering(img) !== want;
+    });
+  await untilFrame(() => mismatches().length === 0, 1_000, '').catch(() => {});
+  const img = mismatches()[0];
+  assert(
+    !img,
+    img &&
+      `${where}, ${pref}: a ${img.naturalWidth}x${img.naturalHeight} image in a ` +
+        `${img.clientWidth}x${img.clientHeight} box renders ${rendering(img)}`
+  );
 }
 
 const FOOTER = /^([\d,]+)-([\d,]+) of ([\d,]+) assets?$/;
@@ -267,7 +314,195 @@ export const UI_CHECKS: UiCheck[] = [
       await rightClick('list row', 'asset-row-', 'U5-list-menu');
     },
   },
+  {
+    id: 'U8',
+    title:
+      'The image scaling toggle flips enlarged small images between pixelated and smooth in the ' +
+      'grid, the list, the detail panel and QuickLook, and survives a reload',
+    run: async ({ scroll, assert, pause }) => {
+      const toggle = () => document.getElementById('image-scaling-toggle');
+      const ui = () => useUIStore.getState();
+      assert(toggle(), 'no #image-scaling-toggle in grid view');
+      assert(
+        ui().imageScaling === 'pixelated',
+        `a fresh profile starts ${ui().imageScaling}, not pixelated`
+      );
+      assert(
+        toggle()!.title === 'Image scaling: Pixelated',
+        `the toggle is titled "${toggle()!.title}"`
+      );
+      // The hook re-checks on a devicePixelRatio change through this media query, so the webview
+      // must evaluate it
+      const resolution = `(resolution: ${window.devicePixelRatio}dppx)`;
+      assert(window.matchMedia(resolution).matches, `${resolution} doesn't match`);
+
+      // Scroll through the results until the viewport shows an enlarged and a shrunk image
+      const el = scroll();
+      let small: HTMLImageElement | undefined;
+      let large: HTMLImageElement | undefined;
+      const steps = 40;
+      for (let step = 0; step <= steps && !(small && large); step++) {
+        el.scrollTop = (step / steps) * (el.scrollHeight - el.clientHeight);
+        // On a fresh run copy the thumbnail cleanup pass slows tile loads, so look at whatever
+        // has loaded rather than fail on how fast it loads
+        await untilFrame(() => allReady(el), 20_000, '').catch(() => {});
+        const shown = tilesInView(el).flatMap(loadedImages);
+        small = shown
+          .filter((img) => isEnlarged(img, 'cover'))
+          .sort((a, b) => a.naturalWidth - b.naturalWidth)[0];
+        large = shown.find((img) => !isEnlarged(img, 'cover'));
+      }
+      assert(small && large, 'no viewport showed both an enlarged and a shrunk image');
+      const tile = small!.closest<HTMLElement>('[data-tile]')!;
+      const id = tile.id.slice('asset-'.length);
+      const index = Number(tile.dataset.index);
+      const what = `asset ${index} (${small!.naturalWidth}x${small!.naturalHeight})`;
+
+      const quickLook = async (open: boolean) => {
+        const type = open ? 'keydown' : 'keyup';
+        window.dispatchEvent(new KeyboardEvent(type, { code: 'Space', key: ' ', bubbles: true }));
+        await frames(4);
+      };
+      const quickLookImage = () =>
+        document.querySelector<HTMLImageElement>('[role="dialog"][aria-modal="true"] img');
+
+      /** Checks the grid, the detail panel and QuickLook against `pref`, with screenshots. */
+      const everywhere = async (pref: ImageScaling) => {
+        assert(
+          rendering(small!) === (pref === 'pixelated' ? 'pixelated' : 'auto'),
+          `grid, ${pref}: ${what} renders ${rendering(small!)}`
+        );
+        assert(
+          rendering(large!) === 'auto',
+          `grid, ${pref}: a shrunk image renders ${rendering(large!)}`
+        );
+        await assertScaling(assert, 'grid', el, 'cover', pref);
+        const panel = document.getElementById('detail-panel');
+        assert(panel, 'no detail panel');
+        await untilFrame(() => loadedImages(panel!).length > 0, 5_000, 'the detail preview');
+        await assertScaling(assert, 'detail panel', panel!, 'contain', pref);
+        await pause(`U8-${pref}`);
+        await quickLook(true);
+        await untilFrame(
+          () => !!quickLookImage()?.complete && quickLookImage()!.naturalWidth > 0,
+          5_000,
+          'the QuickLook image'
+        );
+        const big = quickLookImage()!;
+        assert(isEnlarged(big, 'contain'), `QuickLook shows ${what} at ${big.clientWidth} px`);
+        await assertScaling(assert, 'QuickLook', big.parentElement!, 'contain', pref);
+        await pause(`U8-quicklook-${pref}`);
+        await quickLook(false);
+        assert(!quickLookImage(), 'releasing Space left QuickLook open');
+      };
+
+      // Select the small image, so the detail panel and QuickLook show it too
+      ui().selectAsset(id);
+      if (!ui().detailPanelOpen) ui().toggleDetailPanel();
+      await frames(3);
+      await everywhere('pixelated');
+
+      // A resize alone re-checks: shrink the loaded small image's box below its pixel size, then
+      // give it back. The src doesn't change, so no load event fires.
+      const box = small!.parentElement!;
+      const shrunkPx = Math.floor(
+        Math.min(small!.naturalWidth, small!.naturalHeight) / window.devicePixelRatio / 2
+      );
+      assert(shrunkPx >= 1, `${what} is too small to shrink`);
+      box.style.width = box.style.height = `${shrunkPx}px`;
+      await untilFrame(
+        () => rendering(small!) === 'auto',
+        1_000,
+        `${what} shrunk to ${small!.clientWidth}x${small!.clientHeight} to render auto, ` +
+          `it renders ${rendering(small!)}`
+      );
+      assert(!isEnlarged(small!, 'cover'), `${what} is still enlarged at ${shrunkPx} px`);
+      box.style.width = box.style.height = '';
+      await untilFrame(
+        () => rendering(small!) === 'pixelated',
+        1_000,
+        `${what} back at ${small!.clientWidth}x${small!.clientHeight} to render pixelated, ` +
+          `it renders ${rendering(small!)}`
+      );
+
+      toggle()!.click();
+      await frames(3);
+      assert(ui().imageScaling === 'smooth', 'the toggle did not switch to smooth');
+      assert(
+        toggle()!.title === 'Image scaling: Smooth',
+        `after a click the toggle is titled "${toggle()!.title}"`
+      );
+      await everywhere('smooth');
+
+      // The list shows the same small image, in both states
+      ui().setViewMode('list');
+      await frames(3);
+      assert(toggle(), 'no #image-scaling-toggle in list view');
+      const list = scroll();
+      const { columns, rowPitch } = layoutOf(list);
+      list.scrollTop = Math.max(
+        0,
+        rowTop(rowOfIndex(index, columns), rowPitch) - list.clientHeight / 2
+      );
+      const row = `[data-index="${index}"]:not([data-placeholder])`;
+      await untilFrame(
+        () => {
+          const r = list.querySelector(row);
+          return r !== null && loadedImages(r).length > 0;
+        },
+        20_000,
+        `list row ${index}'s image`
+      );
+      for (const pref of ['smooth', 'pixelated'] as const) {
+        if (ui().imageScaling !== pref) {
+          toggle()!.click();
+          await frames(3);
+        }
+        await assertScaling(assert, 'list', list, 'cover', pref);
+      }
+      ui().setViewMode('grid');
+      await frames(3);
+
+      // A reload reads the persisted preference back: save what smooth persists, clobber the
+      // store, put the saved value back and rehydrate, as a new page load would
+      toggle()!.click();
+      await frames(3);
+      const KEY = 'opendam-ui';
+      const saved = localStorage.getItem(KEY);
+      const persisted = saved ? JSON.parse(saved).state?.imageScaling : undefined;
+      assert(persisted === 'smooth', `localStorage holds imageScaling ${persisted}, not smooth`);
+      useUIStore.setState({ imageScaling: 'pixelated' });
+      localStorage.setItem(KEY, saved!);
+      await useUIStore.persist.rehydrate();
+      await frames(3);
+      assert(
+        ui().imageScaling === 'smooth',
+        `after a reload the preference is ${ui().imageScaling}`
+      );
+      assert(
+        toggle()!.title === 'Image scaling: Smooth',
+        `after a reload the toggle is titled "${toggle()!.title}"`
+      );
+
+      // Leave the default for whatever runs next
+      toggle()!.click();
+      await frames(3);
+      ui().clearSelection();
+    },
+  },
 ];
+
+/**
+ * The checks `only` names, as comma-separated ids (`U8` or `U3,U8`), in registry order, or every
+ * check when `only` is null. Throws on an id no check has.
+ */
+export function selectChecks(checks: UiCheck[], only: string | null): UiCheck[] {
+  if (!only) return checks;
+  const ids = only.split(',').map((id) => id.trim());
+  const unknown = ids.filter((id) => !checks.some((c) => c.id === id));
+  if (unknown.length > 0) throw new Error(`No UI check is named ${unknown.join(', ')}`);
+  return checks.filter((c) => ids.includes(c.id));
+}
 
 export interface UiCheckResult {
   id: string;

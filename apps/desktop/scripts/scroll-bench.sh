@@ -9,6 +9,7 @@
 #   OPENDAM_BENCH_GOLDEN  the golden snapshot (default ~/.cache/opendam-bench/kenney-golden)
 #   BENCH_SHOTS           where checks-mode screenshots go (default <repo>/.evidence/scroll-bench)
 #   BENCH_TIMEOUT         seconds before each app launch is stopped (default 1800)
+#   BENCH_CHECKS          checks mode only: the checks to run, as comma-separated ids (U8, U3,U8)
 #   OPENDAM_MEMORY_MAX    the app's memory cap (default 10G, see scripts/memory-cap.sh)
 #   WEBKIT_*, __NV_*      passed through to the app, to bench another rendering mode
 set -euo pipefail
@@ -47,7 +48,8 @@ mkdir -p "$shots" "$reports"
 # Timing runs start a fresh app process for each scenario, so no scenario's RSS includes memory an
 # earlier one left in the web process. Checks run in one process.
 if [[ $mode == checks ]]; then
-  scenarios=(all)
+  checks=${BENCH_CHECKS:-all}
+  scenarios=("${checks// /}")
 else
   scenarios=()
   for size in sm md lg; do
