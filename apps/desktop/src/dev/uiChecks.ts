@@ -100,6 +100,13 @@ function isEnlarged(img: HTMLImageElement, fit: ImageFit): boolean {
 const rendering = (img: HTMLImageElement) => getComputedStyle(img).imageRendering;
 
 /**
+ * Whether `img` is a raster. An SVG is drawn at the size it's shown, so pixelated and smooth look
+ * the same, and it can't show the toggle's effect.
+ */
+const isRaster = (img: HTMLImageElement) =>
+  !/\.svg$/i.test(decodeURIComponent(new URL(img.src).pathname));
+
+/**
  * Asserts every loaded image under `root` renders `pixelated` when `pref` is pixelated and it is
  * enlarged, `auto` otherwise. Images still finish loading during the check, and one can be
  * complete a moment before its load handler applies the rule, so a mismatch gets up to 1 s to
@@ -336,7 +343,7 @@ export const UI_CHECKS: UiCheck[] = [
       const resolution = `(resolution: ${window.devicePixelRatio}dppx)`;
       assert(window.matchMedia(resolution).matches, `${resolution} doesn't match`);
 
-      // Scroll through the results until the viewport shows an enlarged and a shrunk image
+      // Scroll through the results until the viewport shows an enlarged raster and a shrunk image
       const el = scroll();
       let small: HTMLImageElement | undefined;
       let large: HTMLImageElement | undefined;
@@ -348,11 +355,11 @@ export const UI_CHECKS: UiCheck[] = [
         await untilFrame(() => allReady(el), 20_000, '').catch(() => {});
         const shown = tilesInView(el).flatMap(loadedImages);
         small = shown
-          .filter((img) => isEnlarged(img, 'cover'))
+          .filter((img) => isRaster(img) && isEnlarged(img, 'cover'))
           .sort((a, b) => a.naturalWidth - b.naturalWidth)[0];
         large = shown.find((img) => !isEnlarged(img, 'cover'));
       }
-      assert(small && large, 'no viewport showed both an enlarged and a shrunk image');
+      assert(small && large, 'no viewport showed both an enlarged raster and a shrunk image');
       const tile = small!.closest<HTMLElement>('[data-tile]')!;
       const id = tile.id.slice('asset-'.length);
       const index = Number(tile.dataset.index);
