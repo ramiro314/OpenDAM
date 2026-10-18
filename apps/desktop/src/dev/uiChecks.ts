@@ -425,7 +425,7 @@ export const UI_CHECKS: UiCheck[] = [
     id: 'U7',
     title:
       'With the container focused, End, Home, Page Down and Page Up page through the results, ' +
-      'and they and Space are prevented',
+      'and they and Space are prevented, Space still opening QuickLook',
     run: async ({ scroll, assert }) => {
       const el = scroll();
       const { total } = useAssetStore.getState();
@@ -451,9 +451,29 @@ export const UI_CHECKS: UiCheck[] = [
       ]) {
         const event = press(el, key, code);
         assert(event.defaultPrevented, `${code} was not prevented`);
-        if (code === 'Space') el.dispatchEvent(new KeyboardEvent('keyup', { key, code }));
+        const up = new KeyboardEvent('keyup', { key, code, bubbles: true });
+        if (code === 'Space') el.dispatchEvent(up);
       }
       assert(!press(el, 'ArrowDown').defaultPrevented, 'ArrowDown was prevented');
+
+      // Space, though prevented, still reaches App's QuickLook handler: holding it opens
+      // QuickLook on the focused asset, releasing it closes it
+      const quickLook = () => document.querySelector('[role="dialog"][aria-modal="true"]');
+      const asset = assetAt(useAssetStore.getState(), 0);
+      assert(asset, 'asset 0 is not cached');
+      assert(!quickLook(), 'a dialog was open before Space');
+      useUIStore.getState().focusAsset(asset!.id);
+      try {
+        await frames(2);
+        assert(press(el, ' ', 'Space').defaultPrevented, 'Space was not prevented');
+        await frames(2);
+        assert(quickLook(), 'Space on the focused grid did not open QuickLook');
+        el.dispatchEvent(new KeyboardEvent('keyup', { key: ' ', code: 'Space', bubbles: true }));
+        await frames(2);
+        assert(!quickLook(), 'releasing Space left QuickLook open');
+      } finally {
+        useUIStore.getState().focusAsset(null);
+      }
 
       el.scrollTop = 0;
       await frames(2);
