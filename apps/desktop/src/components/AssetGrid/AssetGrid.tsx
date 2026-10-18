@@ -41,8 +41,8 @@ import styles from './AssetGrid.module.css';
 type AssetHandler = (asset: Asset, e: React.MouseEvent) => void;
 
 const PAGING_KEYS = new Set<string>(['Home', 'End', 'PageUp', 'PageDown'] satisfies PagingKey[]);
-/** What the browser focuses on a click by itself; `closest` finds the container at the latest. */
-const FOCUSABLE = 'a[href], button, input, select, textarea, [tabindex], [contenteditable]';
+/** Controls a click focuses for themselves; a click anywhere else in the results focuses the grid. */
+const CONTROLS = 'a[href], button, input, select, textarea, [contenteditable]';
 
 export function AssetGrid() {
   const viewMode = useUIStore((s) => s.viewMode);
@@ -175,6 +175,8 @@ function WindowedResults({
   const anchor = useAssetStore((s) => s.anchor);
   const selectedAssetIds = useUIStore((s) => s.selectedAssetIds);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Set from a pointerdown until its task ends, while the browser's own mousedown focus runs
+  const pointerFocus = useRef(false);
   const [width, setWidth] = useState(0);
 
   useLayoutEffect(() => {
@@ -217,6 +219,36 @@ function WindowedResults({
     []
   );
   useEffect(() => () => settler.dispose(), [settler]);
+
+  // A focused card or control unmounts once it scrolls out of the window, and focus would fall to
+  // the page, out of reach of the paging keys: hand it to the grid instead
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let inside: Element | null = null;
+    const onFocusIn = (e: FocusEvent) => {
+      inside = e.target === el ? null : (e.target as Element);
+    };
+    // A blur that unmounting causes leaves `inside` set; focus moving out of the grid clears it
+    const onFocusOut = (e: FocusEvent) => {
+      const to = e.relatedTarget as Node | null;
+      if ((e.target as Element).isConnected && !(to && el.contains(to))) inside = null;
+    };
+    const observer = new MutationObserver(() => {
+      if (!inside || inside.isConnected) return;
+      inside = null;
+      const active = document.activeElement;
+      if (!active || active === document.body) el.focus({ preventScroll: true });
+    });
+    el.addEventListener('focusin', onFocusIn);
+    el.addEventListener('focusout', onFocusOut);
+    observer.observe(el, { childList: true, subtree: true });
+    return () => {
+      el.removeEventListener('focusin', onFocusIn);
+      el.removeEventListener('focusout', onFocusOut);
+      observer.disconnect();
+    };
+  }, []);
 
   // A new grid size, window width or view mode: keep the first visible asset in the first
   // visible row
@@ -276,10 +308,19 @@ function WindowedResults({
   );
   const range = visible && rowsToIndexRange(visible.first, visible.last, columns, total);
 
-  // A click on the grid's background focuses it, so the paging keys work; a click on a card
-  // focuses the card, and its keys bubble up here
+  // A click in the results focuses the grid itself, not the card under it, so the paging keys
+  // keep working once that card scrolls out of the window and unmounts. Controls such as a card's
+  // favorite button keep their focus. Cards stay focusable with Tab.
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if ((e.target as Element).closest(FOCUSABLE) === e.currentTarget) {
+    if ((e.target as Element).closest(CONTROLS)) return;
+    pointerFocus.current = true;
+    setTimeout(() => (pointerFocus.current = false));
+    e.currentTarget.focus({ preventScroll: true });
+  };
+
+  // The browser's mousedown focuses the card after the pointerdown: hand focus back to the grid
+  const handleFocus = (e: React.FocusEvent<HTMLDivElement>) => {
+    if (pointerFocus.current && e.target !== e.currentTarget) {
       e.currentTarget.focus({ preventScroll: true });
     }
   };
@@ -312,6 +353,7 @@ function WindowedResults({
           className={styles.scrollArea}
           onClick={onBackdropClick}
           onPointerDown={handlePointerDown}
+          onFocus={handleFocus}
           onKeyDown={handleKeyDown}
           tabIndex={0}
           ref={scrollRef}

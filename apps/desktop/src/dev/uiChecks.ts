@@ -433,12 +433,28 @@ export const UI_CHECKS: UiCheck[] = [
       const atTop = () => el.scrollTop;
       const inView = (index: number) => tilesInView(el).some((t) => indexOf(t) === index);
 
-      // A pointerdown on a card leaves focus to the card; on the background it focuses the grid
+      // A pointerdown on a card focuses the grid, and keeps it there when the browser's own
+      // mousedown then focuses the card; a control in the card keeps its focus, and so does the
+      // background
       const down = (target: Element) =>
         target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
-      (document.activeElement as HTMLElement | null)?.blur();
-      down(el.querySelector('[data-index="0"]')!.firstElementChild!);
-      assert(document.activeElement !== el, 'a pointerdown on a card focused the container');
+      const blur = () => (document.activeElement as HTMLElement | null)?.blur();
+      const focused = () => document.activeElement?.id || document.activeElement?.tagName;
+      const card = el.querySelector<HTMLElement>('[data-index="0"]:not([data-placeholder])');
+      const favorite = card?.querySelector('button');
+      assert(card && favorite, 'card 0 or its favorite button is not rendered');
+      blur();
+      down(favorite!);
+      assert(
+        document.activeElement !== el,
+        'a pointerdown on the favorite button focused the grid'
+      );
+      blur();
+      down(card!.firstElementChild!);
+      card!.focus();
+      assert(document.activeElement === el, `a click on a card left focus on ${focused()}`);
+      blur();
+      await frames(2);
       down(el);
       assert(document.activeElement === el, 'a pointerdown on the background did not focus it');
 
@@ -500,6 +516,50 @@ export const UI_CHECKS: UiCheck[] = [
       press(el, 'PageUp');
       await frames(3);
       assert(Math.abs(atTop() - step) <= 2, `Page Up went back to ${atTop()}, not ${step}`);
+
+      // A card focused with Tab scrolls out of the window and unmounts on End, handing focus to the
+      // grid, and the keys still page from there
+      el.scrollTop = 0;
+      await frames(3);
+      const tabbed = el.querySelector<HTMLElement>('[data-index="0"]:not([data-placeholder])');
+      assert(tabbed, 'card 0 is not rendered');
+      tabbed!.focus();
+      assert(document.activeElement === tabbed, `Tab focus went to ${focused()}, not card 0`);
+      press(document.activeElement as HTMLElement, 'End');
+      await frames(3);
+      assert(
+        !tabbed!.isConnected,
+        `card 0 is still mounted after End: scrollTop ${atTop()} of ` +
+          `${el.scrollHeight - el.clientHeight}, focus on ${focused()}`
+      );
+      assert(document.activeElement === el, `card 0 unmounted, focus went to ${focused()}`);
+      press(document.activeElement as HTMLElement, 'Home');
+      await frames(3);
+      assert(
+        atTop() === 0,
+        `Home after End from a card left scrollTop at ${atTop()} (${focused()})`
+      );
+      press(document.activeElement as HTMLElement, 'PageDown');
+      await frames(3);
+      assert(Math.abs(atTop() - step) <= 1, `Page Down from ${focused()} moved ${atTop()} px`);
+
+      // A clicked favorite button keeps its focus; scrolled away with no key, as a wheel would, it
+      // hands focus to the grid too
+      el.scrollTop = 0;
+      await frames(3);
+      const button = el.querySelector<HTMLElement>(
+        '[data-index="0"]:not([data-placeholder]) button'
+      );
+      assert(button, "card 0's favorite button is not rendered");
+      button!.focus();
+      assert(document.activeElement === button, `the favorite button left focus on ${focused()}`);
+      el.scrollTop = el.scrollHeight - el.clientHeight;
+      await frames(3);
+      assert(!button!.isConnected, 'the favorite button is still mounted at the bottom');
+      assert(document.activeElement === el, `the button unmounted, focus went to ${focused()}`);
+      press(document.activeElement as HTMLElement, 'Home');
+      await frames(3);
+      assert(atTop() === 0, `Home after the button unmounted left scrollTop at ${atTop()}`);
 
       // The keys belong to a text field while one has focus
       const input = document.querySelector<HTMLInputElement>('#toolbar-search');
