@@ -23,14 +23,8 @@ import {
 import type { AutotagUpdate } from './types';
 import { api } from './api';
 import { startModelThumbnailer } from './preview/modelThumbnailer';
+import { isEditingText, isInControl } from './utils/keyboard';
 import styles from './App.module.css';
-
-function isEditingText(): boolean {
-  const active = document.activeElement;
-  if (!active) return false;
-  const tag = active.tagName.toLowerCase();
-  return tag === 'input' || tag === 'textarea' || (active as HTMLElement).isContentEditable;
-}
 
 export default function App() {
   const { sidebarOpen, detailPanelOpen, focusedAssetId } = useUIStore();
@@ -187,7 +181,8 @@ export default function App() {
       }
 
       // Hold Spacebar for Quick Look preview
-      if (e.code === 'Space' && !isEditingText()) {
+      // A focused control, such as a card's favorite button, keeps Space for its own activation
+      if (e.code === 'Space' && !isEditingText() && !isInControl(e.target)) {
         const focusedId = useUIStore.getState().focusedAssetId;
         if (focusedId) {
           e.preventDefault();

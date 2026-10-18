@@ -182,3 +182,40 @@ export function wantedPages(
   if (prefetch !== null && !pages.includes(prefetch)) pages.push(prefetch);
   return pages.sort((a, b) => a - b);
 }
+
+/** The keys the scroll container pages with (D17). */
+export type PagingKey = 'Home' | 'End' | 'PageUp' | 'PageDown';
+
+/**
+ * The `scrollTop` `key` scrolls to: the top, the bottom, or one viewport minus one row down or
+ * up, so the row cut by the viewport's edge stays in view. Clamped to the scroll range.
+ */
+export function pagingTarget(
+  key: PagingKey,
+  scrollTop: number,
+  viewportHeight: number,
+  scrollHeight: number,
+  rowPitch: number
+): number {
+  const max = Math.max(0, scrollHeight - viewportHeight);
+  const step = Math.max(1, viewportHeight - rowPitch);
+  const target =
+    key === 'Home' ? 0 : key === 'End' ? max : scrollTop + (key === 'PageDown' ? step : -step);
+  return Math.min(max, Math.max(0, target));
+}
+
+/**
+ * The scrub label's top within the viewport, at the scrollbar thumb's height: as far down the
+ * viewport as `scrollTop` is down the scroll range, so it is at the top at the top and touches the
+ * bottom at the bottom.
+ */
+export function scrubLabelTop(
+  scrollTop: number,
+  viewportHeight: number,
+  scrollHeight: number,
+  labelHeight: number
+): number {
+  const range = scrollHeight - viewportHeight;
+  const fraction = range > 0 ? Math.min(1, Math.max(0, scrollTop / range)) : 0;
+  return fraction * Math.max(0, viewportHeight - labelHeight);
+}

@@ -9,11 +9,13 @@ import {
   gridLayout,
   listLayout,
   pagesForIndexRange,
+  pagingTarget,
   prefetchPage,
   rowCount,
   rowOfIndex,
   rowTop,
   rowsToIndexRange,
+  scrubLabelTop,
   visibleRows,
   wantedPages,
 } from './gridGeometry';
@@ -165,5 +167,43 @@ describe('wantedPages', () => {
   test('never wants a page past the end', () => {
     expect(prefetchPage(190, 199, 1, 18, 200, 200)).toBeNull();
     expect(prefetchPage(0, 17, -1, 18, 200, 200)).toBeNull();
+  });
+});
+
+describe('pagingTarget', () => {
+  const [view, height, pitch] = [900, 100_000, 244];
+
+  test('Home and End go to the top and the bottom', () => {
+    expect(pagingTarget('Home', 5_000, view, height, pitch)).toBe(0);
+    expect(pagingTarget('End', 5_000, view, height, pitch)).toBe(height - view);
+  });
+
+  test('Page Down and Page Up move one viewport minus one row', () => {
+    expect(pagingTarget('PageDown', 5_000, view, height, pitch)).toBe(5_000 + view - pitch);
+    expect(pagingTarget('PageUp', 5_000, view, height, pitch)).toBe(5_000 - view + pitch);
+  });
+
+  test('stays inside the scroll range', () => {
+    expect(pagingTarget('PageUp', 100, view, height, pitch)).toBe(0);
+    expect(pagingTarget('PageDown', height - view - 10, view, height, pitch)).toBe(height - view);
+    expect(pagingTarget('End', 0, view, 500, pitch)).toBe(0);
+  });
+
+  test('still moves when a row is taller than the viewport', () => {
+    expect(pagingTarget('PageDown', 0, 300, height, 400)).toBe(1);
+  });
+});
+
+describe('scrubLabelTop', () => {
+  test('follows the scroll position down the viewport, label height included', () => {
+    expect(scrubLabelTop(0, 900, 10_900, 30)).toBe(0);
+    expect(scrubLabelTop(5_000, 900, 10_900, 30)).toBe(435);
+    expect(scrubLabelTop(10_000, 900, 10_900, 30)).toBe(870);
+  });
+
+  test('stays at the top when nothing scrolls, and inside the viewport past either end', () => {
+    expect(scrubLabelTop(0, 900, 900, 30)).toBe(0);
+    expect(scrubLabelTop(-50, 900, 10_900, 30)).toBe(0);
+    expect(scrubLabelTop(20_000, 900, 10_900, 30)).toBe(870);
   });
 });
