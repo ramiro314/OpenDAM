@@ -5,6 +5,7 @@ import type { Asset } from '../../types';
 import { useAssetStore } from '../../store';
 import { IconImage, IconVideo, IconStar, IconHeart, IconHeartFilled } from '../Icons';
 import { formatSize } from '../../utils/format';
+import { useImageScaling } from '../../hooks/useImageScaling';
 import { tileMedia, tileState, type TileMedia } from './tileState';
 import styles from './AssetListRow.module.css';
 
@@ -30,6 +31,7 @@ export const AssetListRow = memo(function AssetListRow({
   onContextMenu,
 }: AssetListRowProps) {
   const patchAsset = useAssetStore((s) => s.patchAsset);
+  const scaling = useImageScaling('cover');
   // The media that failed to load, so the row falls back to the next one
   const [failed, setFailed] = useState<TileMedia>();
   // The image has loaded; `data-tile-state` reads "ready" once it has, or all media failed
@@ -113,6 +115,7 @@ export const AssetListRow = memo(function AssetListRow({
             src={convertFileSrc(asset.thumbnailPath)}
             alt={asset.fileName}
             className={styles.thumbImg}
+            ref={scaling}
             decoding="async"
             onLoad={settle}
             onError={() => setFailed(media)}
@@ -122,6 +125,7 @@ export const AssetListRow = memo(function AssetListRow({
             src={convertFileSrc(asset.filePath)}
             alt={asset.fileName}
             className={styles.thumbImg}
+            ref={scaling}
             decoding="async"
             onLoad={settle}
             onError={() => setFailed(media)}

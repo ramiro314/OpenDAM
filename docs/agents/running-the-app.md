@@ -35,7 +35,7 @@ make dev
   it, run on 1430 from `apps/desktop`:
 
   ```sh
-  bun run tauri dev --config '{"build":{"devUrl":"http://localhost:1430","beforeDevCommand":"bun run vite:dev --port 1430"}}'
+  bun run dev --config '{"build":{"devUrl":"http://localhost:1430","beforeDevCommand":"bun run vite:dev --port 1430"}}'
   ```
 
 - Stop only the app you started. Other worktrees run their own `opendam-desktop`, so check a
@@ -107,8 +107,8 @@ frontend it embeds, so dev mode runs with no CSP. To see the policy in force wit
 available, build the embedded frontend in debug mode from `apps/desktop` and run the binary:
 
 ```sh
-bun run tauri build --debug --no-bundle
-./src-tauri/target/debug/opendam-desktop
+bun run build --debug --no-bundle
+../../scripts/memory-cap.sh ./src-tauri/target/debug/opendam-desktop
 ```
 
 ## Where the data lives
@@ -171,6 +171,7 @@ Run it with the script, from the repo root:
 ```sh
 apps/desktop/scripts/scroll-bench.sh          # timing scenarios, about 10 minutes plus the copy
 apps/desktop/scripts/scroll-bench.sh checks   # UI checks
+BENCH_CHECKS=U8 apps/desktop/scripts/scroll-bench.sh checks   # only U8, in a fresh app process
 ```
 
 The script:
@@ -189,6 +190,14 @@ The script:
 4. screenshots each `[scroll-bench] pause <name>` line the app prints, with `spectacle`, into
    `.evidence/scroll-bench/<name>.png`, and stops the app at `[scroll-bench] done`;
 5. deletes the run directory.
+
+The app runs under `scripts/memory-cap.sh`, in its own systemd scope capped at
+`OPENDAM_MEMORY_MAX` (default `10G`), so a web process that runs away is killed alone; the cargo
+build before it is not capped. In `checks` mode one web process reached about 20 GB before the
+cap existed. When the cap kills the app, the script says so, prints the last `[scroll-bench]`
+lines and exits 137: report that as a finding, don't rerun past it. Never start a run while
+another worktree's is going (`pgrep -f '^bash .*scroll-bench\.sh'`). See AGENTS.md,
+"Memory-heavy tools".
 
 It doesn't use the Vite dev server: under its `http://localhost` origin, every `<img>` loaded
 from the asset protocol fails in WebKitGTK 2.54 (libpng logs `Read Error`, while `fetch` of the

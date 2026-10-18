@@ -9,7 +9,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAssetStore, useUIStore } from '../store';
 import { frameStats, minMax, rssStats, seededRandom, timeStats } from './benchStats';
-import { UI_CHECKS, runUiChecks, type UiCheckContext } from './uiChecks';
+import { UI_CHECKS, runUiChecks, selectChecks, type UiCheckContext } from './uiChecks';
 
 type GridSize = 'sm' | 'md' | 'lg';
 const GRID_SIZES: GridSize[] = ['sm', 'md', 'lg'];
@@ -282,7 +282,9 @@ async function pause(name: string) {
   await sleep(PAUSE_MS);
 }
 
-async function runChecks() {
+/** Runs every UI check, or only those `only` names (`U8`, `U3,U8`). */
+async function runChecks(only: string | null) {
+  const checks = selectChecks(UI_CHECKS, only);
   const ctx: UiCheckContext = {
     scroll: scrollEl,
     assert: (condition, message) => {
@@ -295,8 +297,8 @@ async function runChecks() {
   await resetGrid('md');
   // Shows the runner's screenshot step works, and what the grid looked like when checks began
   await pause('checks-start');
-  if (UI_CHECKS.length === 0) await log('no UI checks registered yet');
-  return runUiChecks(UI_CHECKS, ctx, {
+  if (checks.length === 0) await log('no UI checks registered yet');
+  return runUiChecks(checks, ctx, {
     before: () => resetGrid('md'),
     after: (r) => log(`${r.id} ${r.result}: ${r.title}${r.detail ? ` (${r.detail})` : ''}`),
   });
@@ -316,7 +318,7 @@ export async function startScrollBench(mode: string): Promise<void> {
   let renderMode = 'unknown';
   try {
     renderMode = await invoke<string>('bench_render_mode');
-    const only = kind === 'timing' ? await invoke<string | null>('bench_only') : null;
+    const only = await invoke<string | null>('bench_only');
     const waitStart = performance.now();
     const indexingSettled = await waitFor(() => indexed, INDEXING_TIMEOUT_MS, 'library:updated')
       .then(() => true)
@@ -353,7 +355,7 @@ export async function startScrollBench(mode: string): Promise<void> {
       scenarioFilter: only,
     };
     await log(`${kind}: context ${JSON.stringify(report.context)}`);
-    if (kind === 'checks') report.checks = await runChecks();
+    if (kind === 'checks') report.checks = await runChecks(only);
     else report.scenarios = await runTiming(only);
   } catch (e) {
     report.error = String(e);

@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "tauri dev",
-    "build": "tauri build",
+    "dev": "../../scripts/memory-cap.sh tauri dev",
+    "build": "../../scripts/memory-cap.sh tauri build",
     "preview": "vite preview",
     "vite:dev": "vite",
     "vite:build": "tsc -b && vite build",

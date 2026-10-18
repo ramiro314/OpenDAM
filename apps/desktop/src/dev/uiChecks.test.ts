@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'bun:test';
-import { runUiChecks, type UiCheckContext, type UiCheckResult } from './uiChecks';
+import {
+  runUiChecks,
+  selectChecks,
+  type UiCheck,
+  type UiCheckContext,
+  type UiCheckResult,
+} from './uiChecks';
 
 const ctx: UiCheckContext = {
   scroll: () => {
@@ -66,5 +72,27 @@ describe('runUiChecks', () => {
 
   test('no checks gives an empty report', async () => {
     expect(await runUiChecks([], ctx)).toEqual({ passed: 0, failed: 0, results: [] });
+  });
+});
+
+describe('selectChecks', () => {
+  const checks: UiCheck[] = ['U1', 'U3', 'U8'].map((id) => ({
+    id,
+    title: id,
+    run: async () => {},
+  }));
+  const ids = (cs: UiCheck[]) => cs.map((c) => c.id);
+
+  test('null runs every check', () => {
+    expect(ids(selectChecks(checks, null))).toEqual(['U1', 'U3', 'U8']);
+  });
+
+  test('picks the named checks in registry order', () => {
+    expect(ids(selectChecks(checks, 'U8'))).toEqual(['U8']);
+    expect(ids(selectChecks(checks, 'U8, U1'))).toEqual(['U1', 'U8']);
+  });
+
+  test('an unknown id throws', () => {
+    expect(() => selectChecks(checks, 'U8,U9')).toThrow('No UI check is named U9');
   });
 });

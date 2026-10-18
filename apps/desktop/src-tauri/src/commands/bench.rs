@@ -112,8 +112,9 @@ pub fn bench_render_mode() -> &'static str {
 }
 
 /// The one timing scenario this app process runs, as `<size>/<scenario>` (for example
-/// `md/endToEnd`), from `OPENDAM_SCROLL_BENCH_ONLY`. The run script starts a fresh process per
-/// scenario, so no scenario's RSS includes memory an earlier one left behind. Unset runs them all.
+/// `md/endToEnd`), or in checks mode the UI checks it runs, as comma-separated ids (`U8`), from
+/// `OPENDAM_SCROLL_BENCH_ONLY`. The run script starts a fresh process per timing scenario, so no
+/// scenario's RSS includes memory an earlier one left behind. Unset runs them all.
 #[tauri::command]
 pub fn bench_only() -> Option<String> {
     std::env::var("OPENDAM_SCROLL_BENCH_ONLY")

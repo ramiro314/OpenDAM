@@ -10,6 +10,8 @@ import {
   IconPanel,
   IconRefresh,
   IconPlus,
+  IconPixelated,
+  IconSmooth,
   IconSettings,
   IconTag,
 } from '../Icons';
@@ -22,10 +24,12 @@ export function Toolbar() {
   const {
     viewMode,
     gridSize,
+    imageScaling,
     sidebarOpen,
     detailPanelOpen,
     setViewMode,
     setGridSize,
+    setImageScaling,
     toggleSidebar,
     toggleDetailPanel,
     selectedAssetIds,
@@ -182,6 +186,19 @@ export function Toolbar() {
             ))}
           </div>
         )}
+
+        {/* Image scaling, for small images shown larger than their pixel size */}
+        <div className={styles.buttonGroup}>
+          <button
+            id="image-scaling-toggle"
+            className={styles.iconBtn}
+            onClick={() => setImageScaling(imageScaling === 'pixelated' ? 'smooth' : 'pixelated')}
+            title={`Image scaling: ${imageScaling === 'pixelated' ? 'Pixelated' : 'Smooth'}`}
+            aria-pressed={imageScaling === 'pixelated'}
+          >
+            {imageScaling === 'pixelated' ? <IconPixelated /> : <IconSmooth />}
+          </button>
+        </div>
 
         {/* View mode */}
         <div className={styles.buttonGroup}>

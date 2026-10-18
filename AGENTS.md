@@ -16,7 +16,7 @@ uv and cargo-nextest; uv pins Python from `packages/preview-engine/.python-versi
 | Command | What it does |
 |---|---|
 | `make deps` | `bun install` and `uv sync`, rerun only when a manifest or lockfile changes |
-| `make dev` | Runs the app with hot reload (`tauri dev`) |
+| `make dev` | Runs the app with hot reload (`tauri dev`), under a memory cap (see [Memory-heavy tools](#memory-heavy-tools)) |
 | `make lint` | oxlint, oxfmt check, `cargo fmt --check`, clippy (`-D warnings`), ruff format check, ruff check |
 | `make check` | Tauri crate/npm version match, `tsc`, `cargo check` |
 | `make test` | `bun test` and `cargo nextest run`, both writing JUnit XML (see below) |
@@ -113,6 +113,23 @@ The engine's `.venv/bin/python` runs `worker.py`, or `python3` on `PATH` if it h
 After `make install`, `make dev` also runs the installed engine, so to test changes to `worker.py`,
 run `make uninstall` or set `OPENDAM_WORKER` and `OPENDAM_PYTHON` to the checkout's files. The
 worker's stderr goes to the app log under the `preview_worker` target.
+
+## Memory-heavy tools
+
+Agent processes share Mission Control's cgroup, so one runaway process can get the whole session
+OOM-killed. That happened four times on 2026-10-17 (02:44, 10:41, 12:03 and 15:39), when the scroll
+bench's WebKit web process reached 15 to 20 GB in `checks` mode.
+
+- **Run them under `scripts/memory-cap.sh`.** It runs a command in its own systemd user scope
+  with `MemoryMax` (`OPENDAM_MEMORY_MAX`, default `10G`) and no swap, keeps its exit status and
+  says when the cap killed it (status 137). Without `systemd-run --user` it warns and runs the
+  command uncapped. `bun run dev` and `bun run build` (so `make dev`, `make build` and
+  `make install`) and the app inside `scroll-bench.sh` already go through it. Wrap anything else
+  that starts the app or a webview, such as `./src-tauri/target/debug/opendam-desktop`, yourself.
+- **Never run two benchmarks at once.** Other worktrees run them too: check that
+  `pgrep -f '^bash .*scroll-bench\.sh'` finds nothing first.
+- **A capped run that gets OOM-killed is a finding, not a flake.** Report it, with the scenario
+  that was running. Don't rerun it in a loop or raise the cap to get past it.
 
 ## Working rules
 
