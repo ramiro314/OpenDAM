@@ -34,6 +34,14 @@ Revised again 2026-10-18 after Plan Validation repair round 2. Again, no decisio
 - **Step 1 builds only what it can.** The pack parts of C16 and C25 (pack icon, cover, hidden
   counts, the Packs view across libraries) move to step 2.
 
+Revised a third time 2026-10-18, after the first repair round of a second Plan Validation run. No
+decision changed:
+
+- **The rebuild after a single-file delete or rename lands in step 1.** Step 1 is the first step
+  with derived folder rows and counts. From step 1 on, the existing `delete_asset`,
+  `delete_assets` and `rename_asset` rerun the pass before they return, so no step ships with stale
+  counts or stale pack data. Step 3 extends the same commands to whole groups (C1).
+
 ## Problem
 
 Your one library, `~/Documents/Kenney/Assets` (the Kenney All-in-1 bundle), shows as one flat grid
@@ -154,7 +162,7 @@ them at review.
 
 | # | Choice | Why |
 |---|---|---|
-| C1 | **Structure is derived data, recomputed by one pass after every index run.** `structure::rebuild` runs at the end of `watcher::index_paths` (at startup, on add and on refresh), under the same index lock. It reads every asset row, derives folders, packs, groups and roles in memory, and writes only the rows that changed. <br>**Commands that change the pass's inputs also run it:** `set_pack_override`, plus `delete_assets` and `rename_asset`, for single files and groups. Each one writes its change, runs `structure::rebuild` for its library before it returns, then emits `library:updated`. If an index run holds the lock, the rebuild waits for it. | No second disk walk: the paths are already in the DB. Existing libraries get their structure on their next open with no backfill flag. A rerun on unchanged files writes nothing. Rerunning the pass after an edit keeps it the only writer of derived data, and costs no more than an unchanged rerun (A1). |
+| C1 | **Structure is derived data, recomputed by one pass after every index run.** `structure::rebuild` runs at the end of `watcher::index_paths` (at startup, on add and on refresh), under the same index lock. It reads every asset row, derives folders, packs, groups and roles in memory, and writes only the rows that changed. <br>**Commands that change the pass's inputs also run it:** `set_pack_override`, plus `delete_asset`, `delete_assets` and `rename_asset`, for single files and groups. Each one writes its change, runs `structure::rebuild` for its library before it returns, then emits `library:updated`. If an index run holds the lock, the rebuild waits for it. Single-file delete and rename get the rebuild in step 1, `set_pack_override` in step 2, and the group-wide delete and rename in step 3. | No second disk walk: the paths are already in the DB. Existing libraries get their structure on their next open with no backfill flag. A rerun on unchanged files writes nothing. Rerunning the pass after an edit keeps it the only writer of derived data, and costs no more than an unchanged rerun (A1). |
 | C2 | **The derivation is a pure function,** `structure::derive(rows, overrides, license_texts) -> Structure`. A thin `structure::apply` diffs the result against the DB and writes it in 200-row transactions. | The rules can be tested on plain path lists modeled on each source in D3, with no database. Writes follow the batched-writes invariant. |
 | C3 | **New tables.** `folders(path PK, parent_path, name, is_pack, item_count, hidden_count, pack_json)` is derived and rewritten by the pass. `pack_overrides(path PK, mark, name, license, source_url, cover_path, updated_at)` is your data, and the pass never deletes it. The library root is the row with `path = ''`, so a library that is itself one pack works. | Derived and user data stay apart. Because overrides are keyed by relative path, an in-place update (D4) that removes a folder and brings it back keeps its edits. |
 | C4 | **New asset columns.** `group_id` holds the main item's id on every member, the main item included, and is `NULL` for a file on its own. `support_role` is one of `doc`, `cover` or `model_preview`, or `NULL`. `bundled_preview` is the relative path of a matched render. They are added with idempotent `ALTER`s in `connect_library_sqlite`, following `add_tag_description_column`: they fail loudly unless the column is already there. `support_role` arrives in step 2, `group_id` and `bundled_preview` in step 3. Indexes are chosen with `EXPLAIN QUERY PLAN` in the step that adds each column. | Grouping and hiding live on the rows the windowed grid already pages through, so pages by index, sorting and the page cache work unchanged. |
@@ -264,10 +272,13 @@ Each step ships alone and leaves the app working. D5 fixed the order.
 
 ### Step 1: Folders, tree and folder search
 
-Covers D6, D7, D17, D21, C1-C3 (folders only), C7, C16 (tree, lazy loading, selection and item
-counts), C24 (folder path) and C25 (the per-library tree and folder filter).
+Covers D6, D7, D17, D21, C1 (the pass for folders only, and the rebuild after a single-file
+delete or rename), C2-C3 (folders only), C7, C16 (tree, lazy loading, selection and item counts),
+C24 (folder path) and C25 (the per-library tree and folder filter).
 
 - Add `structure.rs` with folders and counts only. Every file counts as one item in this step.
+- Make the existing `delete_asset`, `delete_assets` and `rename_asset` run `structure::rebuild`
+  before they return, then emit `library:updated` (C1).
 - Add the `folders` table and `get_folders`. The table's pack columns keep their defaults until
   step 2.
 - Build the tree under each library row, with the selected folder in the query and its path in the
@@ -281,6 +292,8 @@ counts), C24 (folder path) and C25 (the per-library tree and folder filter).
 - Selecting `3D assets/Platformer Kit` shows exactly the files whose path starts with it, checked
   against a SQL count.
 - A search for "platformer" returns files from every pack with "Platformer" in its folder name.
+- Deleting or renaming a file updates its folders' counts without a manual refresh, and a folder
+  it leaves empty drops out of the tree.
 - UI check U9 passes.
 
 ### Step 2: Packs and support files
@@ -313,7 +326,7 @@ C26.
 
 ### Step 3: Format groups and bundled previews
 
-Covers D12, D14, D18, D22, C1 (rebuild after delete and rename), C4 (`group_id`,
+Covers D12, D14, D18, D22, C1 (the rebuild after a group delete or rename), C4 (`group_id`,
 `bundled_preview`), C5 (the group half), C6, C11, C12, C14, C15 and C19-C21.
 
 - Add the `group_id` and `bundled_preview` columns and group derivation, and match bundled
@@ -321,7 +334,8 @@ Covers D12, D14, D18, D22, C1 (rebuild after delete and rename), C4 (`group_id`,
 - Apply the group half of the visibility rule and the any-member rules in `search_filter`.
 - Add the card badge and the detail panel's member list.
 - Make group writes expand to members, union metadata when groups form, and add group delete and
-  rename. `delete_assets` and `rename_asset` run `structure::rebuild` before they return (C1).
+  rename. These keep the rebuild that `delete_assets` and `rename_asset` have run since step 1
+  (C1).
 - Make the preview queue skip members and models with a bundled preview.
 
 **Done when:**
@@ -398,8 +412,8 @@ Run by file locally, as `AGENTS.md` says. CI runs the rest.
   - Overrides, including a nested "Mark as pack".
   - Retro Fantasy Kit's `GLTF format/` folder of `.glb` copies.
   - The `tile_0000.png` names that must not stack.
-  - An override, a group rename and a group delete each leave `folders` and the derived columns
-    exactly as a fresh pass would.
+  - A single-file delete and rename, an override, a group rename and a group delete each leave
+    `folders` and the derived columns exactly as a fresh pass would.
 - **`asset.rs` search tests** use `db::memory_library_pool()`. They cover:
   - the folder range;
   - any-member matching for extension and folder, with every file-level filter met by one file;
