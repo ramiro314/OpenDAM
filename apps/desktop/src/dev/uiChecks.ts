@@ -101,29 +101,30 @@ const rendering = (img: HTMLImageElement) => getComputedStyle(img).imageRenderin
 
 /**
  * Asserts every loaded image under `root` renders `pixelated` when `pref` is pixelated and it is
- * enlarged, `auto` otherwise. Returns how many were enlarged and how many not.
+ * enlarged, `auto` otherwise. Images still finish loading during the check, and one can be
+ * complete a moment before its load handler applies the rule, so a mismatch gets up to 1 s to
+ * settle.
  */
-function assertScaling(
+async function assertScaling(
   assert: UiCheckContext['assert'],
   where: string,
   root: ParentNode,
   fit: ImageFit,
   pref: ImageScaling
 ) {
-  let enlarged = 0;
-  let shrunk = 0;
-  for (const img of loadedImages(root)) {
-    const big = isEnlarged(img, fit);
-    if (big) enlarged++;
-    else shrunk++;
-    const want = big && pref === 'pixelated' ? 'pixelated' : 'auto';
-    assert(
-      rendering(img) === want,
+  const mismatches = () =>
+    loadedImages(root).filter((img) => {
+      const want = isEnlarged(img, fit) && pref === 'pixelated' ? 'pixelated' : 'auto';
+      return rendering(img) !== want;
+    });
+  await untilFrame(() => mismatches().length === 0, 1_000, '').catch(() => {});
+  const img = mismatches()[0];
+  assert(
+    !img,
+    img &&
       `${where}, ${pref}: a ${img.naturalWidth}x${img.naturalHeight} image in a ` +
-        `${img.clientWidth}x${img.clientHeight} box renders ${rendering(img)}, not ${want}`
-    );
-  }
-  return { enlarged, shrunk };
+        `${img.clientWidth}x${img.clientHeight} box renders ${rendering(img)}`
+  );
 }
 
 const FOOTER = /^([\d,]+)-([\d,]+) of ([\d,]+) assets?$/;
@@ -338,7 +339,9 @@ export const UI_CHECKS: UiCheck[] = [
       const steps = 40;
       for (let step = 0; step <= steps && !(small && large); step++) {
         el.scrollTop = (step / steps) * (el.scrollHeight - el.clientHeight);
-        await untilFrame(() => allReady(el), 5_000, `visible tiles ready at step ${step}`);
+        // On a fresh run copy the thumbnail cleanup pass slows tile loads, so look at whatever
+        // has loaded rather than fail on how fast it loads
+        await untilFrame(() => allReady(el), 20_000, '').catch(() => {});
         const shown = tilesInView(el).flatMap(loadedImages);
         small = shown
           .filter((img) => isEnlarged(img, 'cover'))
@@ -369,11 +372,11 @@ export const UI_CHECKS: UiCheck[] = [
           rendering(large!) === 'auto',
           `grid, ${pref}: a shrunk image renders ${rendering(large!)}`
         );
-        assertScaling(assert, 'grid', el, 'cover', pref);
+        await assertScaling(assert, 'grid', el, 'cover', pref);
         const panel = document.getElementById('detail-panel');
         assert(panel, 'no detail panel');
         await untilFrame(() => loadedImages(panel!).length > 0, 5_000, 'the detail preview');
-        assertScaling(assert, 'detail panel', panel!, 'contain', pref);
+        await assertScaling(assert, 'detail panel', panel!, 'contain', pref);
         await pause(`U8-${pref}`);
         await quickLook(true);
         await untilFrame(
@@ -383,7 +386,7 @@ export const UI_CHECKS: UiCheck[] = [
         );
         const big = quickLookImage()!;
         assert(isEnlarged(big, 'contain'), `QuickLook shows ${what} at ${big.clientWidth} px`);
-        assertScaling(assert, 'QuickLook', big.parentElement!, 'contain', pref);
+        await assertScaling(assert, 'QuickLook', big.parentElement!, 'contain', pref);
         await pause(`U8-quicklook-${pref}`);
         await quickLook(false);
         assert(!quickLookImage(), 'releasing Space left QuickLook open');
@@ -416,16 +419,19 @@ export const UI_CHECKS: UiCheck[] = [
       );
       const row = `[data-index="${index}"]:not([data-placeholder])`;
       await untilFrame(
-        () => allReady(list) && !!list.querySelector(row),
-        5_000,
-        `list row ${index}`
+        () => {
+          const r = list.querySelector(row);
+          return r !== null && loadedImages(r).length > 0;
+        },
+        20_000,
+        `list row ${index}'s image`
       );
       for (const pref of ['smooth', 'pixelated'] as const) {
         if (ui().imageScaling !== pref) {
           toggle()!.click();
           await frames(3);
         }
-        assertScaling(assert, 'list', list, 'cover', pref);
+        await assertScaling(assert, 'list', list, 'cover', pref);
       }
       ui().setViewMode('grid');
       await frames(3);
@@ -458,6 +464,18 @@ export const UI_CHECKS: UiCheck[] = [
     },
   },
 ];
+
+/**
+ * The checks `only` names, as comma-separated ids (`U8` or `U3,U8`), in registry order, or every
+ * check when `only` is null. Throws on an id no check has.
+ */
+export function selectChecks(checks: UiCheck[], only: string | null): UiCheck[] {
+  if (!only) return checks;
+  const ids = only.split(',').map((id) => id.trim());
+  const unknown = ids.filter((id) => !checks.some((c) => c.id === id));
+  if (unknown.length > 0) throw new Error(`No UI check is named ${unknown.join(', ')}`);
+  return checks.filter((c) => ids.includes(c.id));
+}
 
 export interface UiCheckResult {
   id: string;

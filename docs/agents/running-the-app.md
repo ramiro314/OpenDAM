@@ -171,6 +171,7 @@ Run it with the script, from the repo root:
 ```sh
 apps/desktop/scripts/scroll-bench.sh          # timing scenarios, about 10 minutes plus the copy
 apps/desktop/scripts/scroll-bench.sh checks   # UI checks
+BENCH_CHECKS=U8 apps/desktop/scripts/scroll-bench.sh checks   # only U8, in a fresh app process
 ```
 
 The script:
