@@ -63,6 +63,35 @@ cat >"$run/session.sh" <<EOF
 # the app at its report. The app runs under scripts/memory-cap.sh, in its own scope, so a web
 # process that runs away is killed at the cap instead of taking down the caller's session.
 cd "$desktop/src-tauri"
+
+# The one-time thumbnail cleanup pass runs when a fresh run copy opens, and starts over in every
+# app process until it finishes (about 25 minutes on Kenney). A warm-up process runs it to the
+# end first, so no scenario shares the machine with it or measures thumbnails it would clear.
+db="$run/library/.opendam/library.sqlite"
+cleaned() {
+  [[ \$(sqlite3 -readonly -cmd '.timeout 20000' "\$db" \\
+    "SELECT value FROM library_meta WHERE key = 'thumbs_no_upscale'" 2>/dev/null) == done ]]
+}
+if ! cleaned; then
+  echo "Warm-up: running the thumbnail cleanup pass to the end"
+  XDG_DATA_HOME="$run/xdg" OPENDAM_NO_KEYRING=1 OPENDAM_BENCH_LIBRARY="$run/library" \\
+    OPENDAM_SCROLL_BENCH_ONLY=warmup "$repo/scripts/memory-cap.sh" ./target/debug/opendam-desktop \\
+    >"$run/warmup.log" 2>&1 &
+  app=\$!
+  deadline=\$((SECONDS + $timeout))
+  until cleaned || ! kill -0 \$app 2>/dev/null || ((SECONDS > deadline)); do sleep 10; done
+  kill \$app 2>/dev/null
+  wait \$app 2>/dev/null
+  # The warm-up's own report, if it got that far, is not a result: no scenario or check is named
+  # warmup, so it holds an error or no checks
+  sed -n 's/^\[scroll-bench\] \(done\|failed\) \([^:]*\).*/\2/p' "$run/warmup.log" | xargs -r rm -f
+  if ! cleaned; then
+    echo "Warm-up: the thumbnail cleanup pass did not finish; see $run/warmup.log"
+    cat "$run/warmup.log" >>"$run/app.log"
+    exit 1
+  fi
+fi
+
 for only in ${scenarios[*]}; do
   log="$run/app-\${only//\//-}.log"
   [[ \$only == all ]] && only=

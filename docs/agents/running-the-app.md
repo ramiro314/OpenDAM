@@ -200,7 +200,11 @@ The script:
 2. builds a debug binary with the frontend embedded and built in Vite's development mode
    (`NODE_ENV=development vite build --mode development`), with `VITE_SCROLL_BENCH` set;
 3. runs the app in a nested headless KWin with a virtual 1400x900 output, its own D-Bus session
-   and `OPENDAM_NO_KEYRING=1`, never on your desktop session. A timing run starts a fresh app
+   and `OPENDAM_NO_KEYRING=1`, never on your desktop session. First a warm-up process runs the
+   one-time thumbnail cleanup pass to the end, until the copy's `library_meta` records
+   `thumbs_no_upscale = done` (about 25 minutes on Kenney), and its report is discarded. Each
+   process would otherwise start the pass over, so every scenario would share the machine with
+   it and measure thumbnails it is about to clear. A timing run starts a fresh app
    process for each size and scenario, naming it in `OPENDAM_SCROLL_BENCH_ONLY` (for example
    `md/endToEnd`), because memory one scenario takes stays with the web process and would count
    toward the next one's RSS. It then merges the nine reports into one. Checks run in one process;
@@ -224,10 +228,10 @@ them. This was seen in the nested KWin; `make dev` on your own session is unveri
 The app picks its usual rendering mode (`gpu-shm` on this machine). To bench another, export its
 variable for the script, for example `WEBKIT_DISABLE_DMABUF_RENDERER=1` for `cpu`; the app
 inherits it and `bench_render_mode` reports it.
-`BENCH_TIMEOUT` (seconds, default 1800) stops a stuck app launch. On a fresh run copy, the one-time
-thumbnail cleanup pass holds the library's connections for about 14 minutes on Kenney: the grid
-stays empty until the pass ends with `library:updated`, so the harness waits up to 20 minutes for
-the first page.
+`BENCH_TIMEOUT` (seconds, default 1800) stops a stuck app launch, and the warm-up. While the
+cleanup pass clears rows it holds the library's connections, for about 16 minutes on Kenney after
+about 7 minutes of reading image headers: an app started then shows an empty grid until the pass
+ends with `library:updated`, which is why the harness waits up to 20 minutes for the first page.
 
 **Reports** land in `apps/desktop/src-tauri/target/scroll-bench/` (gitignored), as
 `<render mode>-<unix ts>.json` for timing runs and `<render mode>-checks-<unix ts>.json` for
