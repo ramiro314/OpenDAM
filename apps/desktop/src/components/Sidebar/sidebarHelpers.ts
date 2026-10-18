@@ -1,4 +1,5 @@
 import type { Asset, FilterSpec } from '../../types';
+import { normalizeFolderPath } from '../../utils/folders';
 
 const DAY_MS = 86400000;
 
@@ -41,9 +42,10 @@ export function resolveDroppedAssetId(rawData: string, assets: Pick<Asset, 'id' 
   return assets.find((a) => norm(a.filePath) === norm(rawData))?.id ?? rawData;
 }
 
-/** Whether none of the filters the sidebar offers is set ("All assets" is active). */
+/** Whether none of the sidebar's filters or a smart filter's folder is set ("All assets" is active). */
 export function isFilterEmpty(filter: FilterSpec): boolean {
   return (
+    !normalizeFolderPath(filter.directory ?? '') &&
     !filter.isFavorite &&
     !filter.unorganized &&
     (!filter.kinds || filter.kinds.length === 0) &&

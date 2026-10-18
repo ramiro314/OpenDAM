@@ -190,6 +190,17 @@ pub struct SearchQuery {
     pub collection_id: Option<String>,
     #[serde(rename = "includeSubcollections")]
     pub include_subcollections: Option<bool>,
+    /// One folder of one library: the search covers only that library, and only the files below
+    /// the folder, recursively.
+    pub folder: Option<FolderRef>,
+}
+
+/// A folder of a library, by its path relative to the library root. The root is `""`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct FolderRef {
+    #[serde(rename = "libraryId")]
+    pub library_id: String,
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -209,6 +220,7 @@ pub struct FilterSpec {
     pub size_range: Option<SizeRange>,
     #[serde(rename = "previewStatus")]
     pub preview_status: Option<String>,
+    /// A folder path relative to the root of each library searched, as `SearchQuery::folder`.
     pub directory: Option<String>,
     #[serde(rename = "namePrefix")]
     pub name_prefix: Option<String>,

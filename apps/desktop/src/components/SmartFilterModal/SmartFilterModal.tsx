@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useTagStore, useCollectionStore } from '../../store';
+import { useTagStore, useCollectionStore, useLibraryStore } from '../../store';
+import { folderInLibraries, normalizeFolderPath } from '../../utils/folders';
 import type { FilterSpec, ColorLabel, Collection } from '../../types';
 import {
   IconFilter,
@@ -52,6 +53,7 @@ const COLOR_OPTIONS: { label: ColorLabel; hex: string }[] = [
 export function SmartFilterModal({ isOpen, onClose, onCreated }: SmartFilterModalProps) {
   const [name, setName] = useState('');
   const [directory, setDirectory] = useState('');
+  const [directoryError, setDirectoryError] = useState<string | null>(null);
   const [namePrefix, setNamePrefix] = useState('');
   const [nameSuffix, setNameSuffix] = useState('');
   const [selectedExtensions, setSelectedExtensions] = useState<string[]>([]);
@@ -126,7 +128,10 @@ export function SmartFilterModal({ isOpen, onClose, onCreated }: SmartFilterModa
     try {
       const selected = await open({ directory: true, multiple: false });
       if (typeof selected === 'string') {
-        setDirectory(selected);
+        // The field holds a path relative to the library root, so strip the root.
+        const folder = folderInLibraries(selected, useLibraryStore.getState().libraries);
+        setDirectory(folder?.path ?? '');
+        setDirectoryError(folder ? null : 'That folder is not inside a library.');
       }
     } catch (err) {
       console.error('Failed to pick folder', err);
@@ -153,8 +158,9 @@ export function SmartFilterModal({ isOpen, onClose, onCreated }: SmartFilterModa
     try {
       const filterSpec: FilterSpec = {};
 
-      if (directory.trim()) {
-        filterSpec.directory = directory.trim();
+      const folderPath = normalizeFolderPath(directory);
+      if (folderPath) {
+        filterSpec.directory = folderPath;
       }
       if (namePrefix.trim()) {
         filterSpec.namePrefix = namePrefix.trim();
@@ -197,6 +203,7 @@ export function SmartFilterModal({ isOpen, onClose, onCreated }: SmartFilterModa
 
       setName('');
       setDirectory('');
+      setDirectoryError(null);
       setNamePrefix('');
       setNameSuffix('');
       setSelectedExtensions([]);
@@ -253,16 +260,19 @@ export function SmartFilterModal({ isOpen, onClose, onCreated }: SmartFilterModa
             {/* Directory Filter */}
             <div className={styles.field}>
               <label className={styles.label}>
-                <span>Directory Path</span>
+                <span>Folder</span>
                 <span className={styles.optional}>Optional</span>
               </label>
               <div style={{ display: 'flex', gap: 6 }}>
                 <input
                   type="text"
                   className={styles.input}
-                  placeholder="e.g. C:/Assets/Textures or subfolder name"
+                  placeholder="e.g. 3D assets/Platformer Kit"
                   value={directory}
-                  onChange={(e) => setDirectory(e.target.value)}
+                  onChange={(e) => {
+                    setDirectory(e.target.value);
+                    setDirectoryError(null);
+                  }}
                 />
                 <button
                   type="button"
@@ -275,6 +285,7 @@ export function SmartFilterModal({ isOpen, onClose, onCreated }: SmartFilterModa
                   <span>Browse</span>
                 </button>
               </div>
+              {directoryError && <p className={styles.fieldError}>{directoryError}</p>}
             </div>
 
             {/* Name Prefix / Suffix */}

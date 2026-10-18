@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tauri::{Emitter, State};
 
-use crate::db::{make_relative_path, resolve_path, upsert_tag, Database};
+use crate::db::{make_relative_path, resolve_path, upsert_tag, Database, LibraryHandle};
 use crate::models::{Asset, AssetPatch, FilterSpec, SearchPayload, SearchQuery, SearchResult};
 use crate::AppState;
 
@@ -105,35 +105,48 @@ pub async fn search_assets(
     state: State<'_, Arc<AppState>>,
 ) -> Result<SearchResult> {
     let all_libs = state.db.get_all_libraries().await;
-    let target_libs: Vec<(sqlx::Pool<sqlx::Sqlite>, Option<std::path::PathBuf>)> = {
-        let mut list = Vec::new();
-        if let Some(ref lids) = payload.query.library_ids {
-            if !lids.is_empty() {
-                for lib in &all_libs {
-                    if lids.contains(&lib.id) {
-                        list.push((lib.pool.clone(), Some(lib.root_path.clone())));
-                    }
-                }
-            }
-        } else if let Some(ref lid) = payload.query.library_id {
-            if !lid.is_empty() {
-                for lib in &all_libs {
-                    if &lib.id == lid {
-                        list.push((lib.pool.clone(), Some(lib.root_path.clone())));
-                    }
-                }
-            }
-        }
-
-        if list.is_empty() {
-            for lib in &all_libs {
-                list.push((lib.pool.clone(), Some(lib.root_path.clone())));
-            }
-        }
-        list
-    };
-
+    let target_libs = target_libraries(&payload.query, &all_libs);
     search_libraries(&payload, &target_libs).await
+}
+
+/// The pools and roots of the libraries `query` searches, in `all_libs` order. A folder searches
+/// only its own library, and nothing when that library isn't open. Otherwise the query's
+/// libraries, or every library when it names none that is open.
+fn target_libraries(
+    query: &SearchQuery,
+    all_libs: &[LibraryHandle],
+) -> Vec<(sqlx::Pool<sqlx::Sqlite>, Option<std::path::PathBuf>)> {
+    let target = |lib: &LibraryHandle| (lib.pool.clone(), Some(lib.root_path.clone()));
+    if let Some(folder) = &query.folder {
+        return all_libs
+            .iter()
+            .filter(|lib| lib.id == folder.library_id)
+            .map(target)
+            .collect();
+    }
+    let mut list = Vec::new();
+    if let Some(ref lids) = query.library_ids {
+        if !lids.is_empty() {
+            for lib in all_libs {
+                if lids.contains(&lib.id) {
+                    list.push(target(lib));
+                }
+            }
+        }
+    } else if let Some(ref lid) = query.library_id {
+        if !lid.is_empty() {
+            for lib in all_libs {
+                if &lib.id == lid {
+                    list.push(target(lib));
+                }
+            }
+        }
+    }
+
+    if list.is_empty() {
+        list = all_libs.iter().map(target).collect();
+    }
+    list
 }
 
 async fn search_libraries(
@@ -455,6 +468,9 @@ fn search_filter(query: &SearchQuery) -> SqlFilter {
         Some(ps) => filter.push("a.preview_status = ?", [ps.to_string()]),
     }
     filter.push_in("a.extension", &f.extensions);
+    if let Some(folder) = &query.folder {
+        push_folder_range(&mut filter, &folder.path);
+    }
     push_tag_filter(&mut filter, f);
     push_collection_filter(&mut filter, query);
 
@@ -462,8 +478,8 @@ fn search_filter(query: &SearchQuery) -> SqlFilter {
     fn trimmed(s: &Option<String>) -> Option<&str> {
         s.as_deref().map(str::trim).filter(|s| !s.is_empty())
     }
-    if let Some(dir) = trimmed(&f.directory) {
-        filter.push("a.file_path LIKE ?", [format!("%{dir}%")]);
+    if let Some(dir) = &f.directory {
+        push_folder_range(&mut filter, dir);
     }
     if let Some(prefix) = trimmed(&f.name_prefix) {
         filter.push("a.file_name LIKE ?", [format!("{prefix}%")]);
@@ -472,6 +488,20 @@ fn search_filter(query: &SearchQuery) -> SqlFilter {
         filter.push("a.file_name LIKE ?", [format!("%{suffix}")]);
     }
     filter
+}
+
+/// Requires files below `folder`, a path relative to the library root, recursively. The range
+/// `p/ <= file_path < p0` (`0` follows `/`) holds exactly the paths starting with `p/`, uses the
+/// unique `file_path` index and needs no `LIKE` escaping. The root (`""`, or only slashes) adds
+/// no condition.
+fn push_folder_range(filter: &mut SqlFilter, folder: &str) {
+    let path = folder.trim().trim_matches('/');
+    if !path.is_empty() {
+        filter.push(
+            "a.file_path >= ? AND a.file_path < ?",
+            [format!("{path}/"), format!("{path}0")],
+        );
+    }
 }
 
 /// Tag filter: logic "and" (has all tags), "or" (has any tag), "and_or" (has the first tag
@@ -2347,5 +2377,285 @@ mod tests {
                 "failedIds": ["tree", "bush"],
             })
         );
+    }
+
+    /// A library holding `paths`, each an asset whose id is its path. Every file has the same
+    /// size, rating, kind and date, so every sort but by name breaks ties by rowid alone.
+    async fn library_of(id: &str, paths: &[&str]) -> LibraryHandle {
+        let pool = memory_library_pool().await;
+        for path in paths {
+            let name = path.rsplit('/').next().unwrap();
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+                 VALUES (?, ?, ?, 'glb', 'model', 4, 0, 0)",
+            )
+            .bind(path)
+            .bind(path)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        LibraryHandle {
+            id: id.to_string(),
+            name: id.to_string(),
+            root_path: PathBuf::from(format!("/libraries/{id}")),
+            pool,
+        }
+    }
+
+    /// The ids of the assets `query` (`text` and `filter` optional) finds in `libraries`, as
+    /// `search_assets` targets them, sorted by `field` in `order`.
+    async fn folder_search(
+        libraries: &[LibraryHandle],
+        query: serde_json::Value,
+        field: &str,
+        order: &str,
+    ) -> Vec<String> {
+        let mut query = query;
+        query["sort"] = serde_json::json!({ "field": field, "order": order });
+        query["text"] = query.get("text").cloned().unwrap_or("".into());
+        query["filter"] = query
+            .get("filter")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+            "query": query,
+            "page": 0,
+            "pageSize": 1000,
+        }))
+        .unwrap();
+        let targets = target_libraries(&payload.query, libraries);
+        let result = search_libraries(&payload, &targets)
+            .await
+            .unwrap_or_else(|e| panic!("search for {query} failed: {e}"));
+        assert_eq!(result.total, Some(result.assets.len() as i64));
+        result.assets.into_iter().map(|a| a.id).collect()
+    }
+
+    const KIT_FILES: [&str; 9] = [
+        "3D assets/Platformer Kit/License.txt",
+        "3D assets/Platformer Kit/Models/GLB format/block.glb",
+        "3D assets/Platformer Kit/Models/OBJ format/block.obj",
+        "3D assets/Platformer Kit 2/crate.glb",
+        "3D assets/Platformer Kit-Extra/coin.glb",
+        "3D assets/Platformer Kit.zip",
+        "3D assets/Platformer Kit0/flag.glb",
+        "3D assets/Platformer KitZ/tree.glb",
+        "2D assets/Platformer Kit/tile.png",
+    ];
+
+    #[tokio::test]
+    async fn a_folder_matches_the_files_below_it_and_no_sibling_sharing_its_name() {
+        let libs = [library_of("lib", &KIT_FILES).await];
+        let kit = [
+            "3D assets/Platformer Kit/License.txt",
+            "3D assets/Platformer Kit/Models/GLB format/block.glb",
+            "3D assets/Platformer Kit/Models/OBJ format/block.obj",
+        ];
+        for path in [
+            "3D assets/Platformer Kit",
+            "3D assets/Platformer Kit/",
+            " /3D assets/Platformer Kit/ ",
+        ] {
+            let mut found = folder_search(
+                &libs,
+                serde_json::json!({ "folder": { "libraryId": "lib", "path": path } }),
+                "date",
+                "asc",
+            )
+            .await;
+            found.sort();
+            assert_eq!(found, kit, "folder {path:?}");
+        }
+        assert_eq!(
+            folder_search(
+                &libs,
+                serde_json::json!({ "folder": { "libraryId": "lib", "path": "3D assets/Platformer Kit/Models/OBJ format" } }),
+                "name",
+                "asc",
+            )
+            .await,
+            ["3D assets/Platformer Kit/Models/OBJ format/block.obj"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_directory_filter_is_the_same_folder_range() {
+        let libs = [library_of("lib", &KIT_FILES).await];
+        let mut found = folder_search(
+            &libs,
+            serde_json::json!({ "filter": { "directory": "3D assets/Platformer Kit" } }),
+            "date",
+            "asc",
+        )
+        .await;
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "3D assets/Platformer Kit/License.txt",
+                "3D assets/Platformer Kit/Models/GLB format/block.glb",
+                "3D assets/Platformer Kit/Models/OBJ format/block.obj",
+            ]
+        );
+        // A name inside the path no longer matches as a substring.
+        assert!(folder_search(
+            &libs,
+            serde_json::json!({ "filter": { "directory": "Platformer Kit" } }),
+            "date",
+            "asc",
+        )
+        .await
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_folder_keeps_every_sort_order_and_its_rowid_tie_break() {
+        let libs = [library_of("lib", &KIT_FILES).await];
+        let folder = "3D assets/Platformer Kit/";
+        for field in ["name", "date", "size", "rating", "kind", "favorite"] {
+            for order in ["asc", "desc"] {
+                let all = folder_search(&libs, serde_json::json!({}), field, order).await;
+                let below: Vec<String> = all
+                    .into_iter()
+                    .filter(|id| id.starts_with(folder))
+                    .collect();
+                let found = folder_search(
+                    &libs,
+                    serde_json::json!({ "folder": { "libraryId": "lib", "path": folder } }),
+                    field,
+                    order,
+                )
+                .await;
+                assert_eq!(found, below, "sorted by {field} {order}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_library_root_matches_its_whole_library_and_no_other() {
+        let libs = [
+            library_of("a", &["3D assets/a.glb", "b.glb"]).await,
+            library_of("b", &["3D assets/c.glb", "d.glb"]).await,
+        ];
+        for root in ["", "/", " "] {
+            let mut found = folder_search(
+                &libs,
+                serde_json::json!({ "folder": { "libraryId": "b", "path": root }, "libraryIds": ["a", "b"] }),
+                "name",
+                "asc",
+            )
+            .await;
+            found.sort();
+            assert_eq!(found, ["3D assets/c.glb", "d.glb"], "root {root:?}");
+        }
+        assert!(folder_search(
+            &libs,
+            serde_json::json!({ "folder": { "libraryId": "gone", "path": "" } }),
+            "name",
+            "asc",
+        )
+        .await
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_directory_across_libraries_merges_their_matches() {
+        let libs = [
+            library_of("a", &["3D assets/b.glb", "3D assets/d.glb", "c.glb"]).await,
+            library_of("b", &["3D assets/a.glb", "3D assets/c.glb", "b.glb"]).await,
+        ];
+        assert_eq!(
+            folder_search(
+                &libs,
+                serde_json::json!({ "filter": { "directory": "3D assets" } }),
+                "name",
+                "asc",
+            )
+            .await,
+            [
+                "3D assets/a.glb",
+                "3D assets/b.glb",
+                "3D assets/c.glb",
+                "3D assets/d.glb"
+            ]
+        );
+    }
+
+    /// Checks the folder range on a copy of the golden snapshot's library DB, named by
+    /// `OPENDAM_GOLDEN_DB` (opening it runs the schema, so never point it at a live library):
+    /// `cargo nextest run --run-ignored only golden_snapshot`.
+    #[tokio::test]
+    #[ignore = "needs OPENDAM_GOLDEN_DB, a copy of the golden snapshot's library.sqlite"]
+    async fn a_folder_on_the_golden_snapshot_matches_a_sql_count() {
+        let db = std::env::var("OPENDAM_GOLDEN_DB").expect("OPENDAM_GOLDEN_DB is set");
+        let pool = crate::db::connect_library_sqlite(Path::new(&db))
+            .await
+            .unwrap();
+        let library = LibraryHandle {
+            id: "golden".to_string(),
+            name: "golden".to_string(),
+            root_path: PathBuf::from("/golden"),
+            pool: pool.clone(),
+        };
+        async fn count(pool: &Pool<Sqlite>, sql: &str, bind: &str) -> i64 {
+            sqlx::query_scalar(sql)
+                .bind(bind)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        let libs = [library];
+        let total = |path: &str| {
+            let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+                "query": {
+                    "text": "",
+                    "filter": {},
+                    "sort": { "field": "name", "order": "asc" },
+                    "folder": { "libraryId": "golden", "path": path },
+                },
+                "page": 0,
+                "pageSize": 100,
+            }))
+            .unwrap();
+            let libs = &libs;
+            async move {
+                let targets = target_libraries(&payload.query, libs);
+                search_libraries(&payload, &targets)
+                    .await
+                    .unwrap()
+                    .total
+                    .unwrap()
+            }
+        };
+
+        // `Nature Kit (Classic)` shares its name's start with `Nature Kit`.
+        for folder in ["3D assets/Platformer Kit", "3D assets/Nature Kit"] {
+            let expected = count(
+                &pool,
+                "SELECT COUNT(*) FROM assets WHERE substr(file_path, 1, length(?1) + 1) = ?1 || '/'",
+                folder,
+            )
+            .await;
+            let siblings = count(
+                &pool,
+                "SELECT COUNT(*) FROM assets
+                 WHERE substr(file_path, 1, length(?1)) = ?1
+                   AND substr(file_path, 1, length(?1) + 1) <> ?1 || '/'",
+                folder,
+            )
+            .await;
+            let found = total(folder).await;
+            println!(
+                "{folder}: search total {found}, SQL count {expected}, files in prefix-sharing siblings {siblings}"
+            );
+            assert!(expected > 0);
+            assert_eq!(found, expected);
+        }
+        let root = total("").await;
+        let all = count(&pool, "SELECT COUNT(*) FROM assets WHERE ?1 = ''", "").await;
+        println!("library root: search total {root}, SQL count {all}");
+        assert_eq!(root, all);
     }
 }
