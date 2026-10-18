@@ -42,6 +42,17 @@ decision changed:
   `delete_assets` and `rename_asset` rerun the pass before they return, so no step ships with stale
   counts or stale pack data. Step 3 extends the same commands to whole groups (C1).
 
+Revised a fourth time 2026-10-18, after GitHub Inspector's review of PR #98. No decision changed:
+
+- **The FTS change is a drop and recreate, not a rebuild.** FTS5 can't add a column, and
+  `CREATE ... IF NOT EXISTS` leaves an existing library's index as it is. So step 1 drops and
+  recreates `assets_fts` and all three of its triggers with `file_path`, then rebuilds the index.
+  All three triggers carry `file_path`, because an external-content `'delete'` must supply exactly
+  the indexed values.
+- **Search text matches through group members** like the other file-level filters (C6). A word
+  that appears only in a member's folder (`fbx`, `unity`) finds the group, so search and the
+  folder filter agree.
+
 ## Problem
 
 Your one library, `~/Documents/Kenney/Assets` (the Kenney All-in-1 bundle), shows as one flat grid
@@ -167,7 +178,7 @@ them at review.
 | C3 | **New tables.** `folders(path PK, parent_path, name, is_pack, item_count, hidden_count, pack_json)` is derived and rewritten by the pass. `pack_overrides(path PK, mark, name, license, source_url, cover_path, updated_at)` is your data, and the pass never deletes it. The library root is the row with `path = ''`, so a library that is itself one pack works. | Derived and user data stay apart. Because overrides are keyed by relative path, an in-place update (D4) that removes a folder and brings it back keeps its edits. |
 | C4 | **New asset columns.** `group_id` holds the main item's id on every member, the main item included, and is `NULL` for a file on its own. `support_role` is one of `doc`, `cover` or `model_preview`, or `NULL`. `bundled_preview` is the relative path of a matched render. They are added with idempotent `ALTER`s in `connect_library_sqlite`, following `add_tag_description_column`: they fail loudly unless the column is already there. `support_role` arrives in step 2, `group_id` and `bundled_preview` in step 3. Indexes are chosen with `EXPLAIN QUERY PLAN` in the step that adds each column. | Grouping and hiding live on the rows the windowed grid already pages through, so pages by index, sorting and the page cache work unchanged. |
 | C5 | **Grid visibility.** The grid shows a row when `(group_id IS NULL OR group_id = id)` and `support_role IS NULL` both hold. With "Show hidden files" on, the `support_role` condition is dropped. Members never appear in the grid, even with that filter on. Step 2 adds the `support_role` half, with `showHidden` in `search_filter`, and step 3 adds the group half. | One grid item per group. The filter (D11) reveals support files, not group members. |
-| C6 | **Matching a group.** File-level filters (kind, extension, folder, name prefix and suffix) match a group when at least one of its files, the main item included, satisfies all of them together. That is one `EXISTS (... m.group_id = a.id ...)` holding every file-level condition. Metadata filters read the main item, since D18 keeps members equal. Search text matches the main item's index row, because members share its name. Sort keys come from the main item. | This applies D12's "any member matches a format filter" to every file-level filter, so selecting `Models/FBX format/` still shows the kit's models. Requiring one file to satisfy all of them gives counts a single meaning (C23): `FBX format/` plus `.glb` matches nothing. |
+| C6 | **Matching a group.** File-level filters (search text, kind, extension, folder, name prefix and suffix) match a group when at least one of its files, the main item included, satisfies all of them together. That is one `EXISTS (... m.group_id = a.id ...)` holding every file-level condition. Search text is the condition `m.rowid IN (SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?)`, so it matches any member's own index row, folder path included (D17). Metadata filters read the main item, since D18 keeps members equal. Sort keys come from the main item. | This applies D12's "any member matches a format filter" to every file-level filter, so selecting `Models/FBX format/` still shows the kit's models. Search text is a file-level filter because, once folder paths are indexed, members differ in what they match: "fbx" matches only the FBX member's path. Requiring one file to satisfy all of them gives counts a single meaning (C23): `FBX format/` plus `.glb` matches nothing. |
 | C7 | **Folder filter.** `SearchQuery.folder = { libraryId, path }` becomes the range `file_path >= 'p/' AND file_path < 'p0'` on the unique `file_path` index. The Smart Filter's `directory` field becomes this prefix-anchored relative path. Its Browse button strips the library root, which fixes the absolute-path bug, and `isFilterEmpty` counts the field. | A range uses the index and needs no `LIKE` escaping. No smart filters exist on this machine, so changing the field's meaning breaks nothing. |
 | C8 | **The pack rule, in order:** <br>1. A folder is **marked** if a doc (`txt`, `md`, `pdf`) or an image directly inside it has a stem starting with `license`, `licence`, `preview` or `sample` (case-insensitive). <br>2. The outermost marked folder is the pack. <br>3. **Sibling rule:** a folder that isn't inside a pack is also a pack when its parent has at least 2 pack children and packs are more than half of its child folders. <br>4. Overrides apply last. "Mark as pack" always wins, and can nest a pack inside a pack. "Not a pack" removes a detection. | This is D9 with the refinement the simulation forced: Readme files don't mark a pack. It yields 254 packs on your library, with no false category packs. |
 | C9 | **Pack info is computed by the pass.** <br>- **Cover:** override > `Preview*` > `Sample*` > the pack's first image by path. <br>- **Gallery:** every `cover`-role image. <br>- **License:** the first `License*` file, which the pass reads only when its size or mtime changed. It recognizes CC0, CC-BY, CC-BY-SA, MIT, Apache-2.0 and OFL by URL or name, and anything else shows as "unknown". <br>- **Header:** the Kenney header gives the name and version from line 1 (`Car Kit (3.1)`) and the author from `Created/distributed by ...`. <br>- **Name shown:** override > header > folder name. <br>- **Counts:** by kind, plus total size, over every file in the pack. | This is D10. Reading only changed license files keeps reruns free of disk reads, which matters on network shares. |
@@ -184,7 +195,7 @@ them at review.
 | C20 | **Group writes.** Every command that writes metadata expands the asset id to its members in the same transaction, through one helper, `group_members(pool, id)`. That covers `update_asset` (rating, color label, favorite, description), tag and collection add and remove, and auto-tag apply. The bundled preview is a support file, not a member, so these writes don't reach it. Only delete and rename include it (C21). | This is D18, which gives metadata to every member file. |
 | C21 | **Delete and rename on a group.** <br>- **Delete:** one confirm dialog ("Move 4 files to the trash"), then every member and the bundled preview go to the trash. A trash failure stops there and reports which files remain, as `delete_asset_with` does for one file. <br>- **Rename:** every member and the bundled preview take the new stem, each keeping its extension and folder. A pre-check refuses if any target exists, and a failure midway reverts the renames already done. | This is D22. |
 | C22 | **Folder and pack actions.** The context menu of a tree node or pack card offers: <br>- **Auto-tag:** `AutotagScope` gains `{ kind: 'folder', libraryId, path, allAssets }`. The run covers the visible items below the folder (main items and single files, not support files), and only untagged ones unless `allAssets` is set, as the library scope does. <br>- **Add everything to a collection, Add a tag to everything:** new bulk commands that take `(libraryId, folderPath)` and write every file below, members included, in 200-row transactions. <br>- **Reveal in file manager:** the existing opener. | This is D16. |
-| C23 | **Live counts.** <br>- **When:** while search text or any filter is active. <br>- **Tree:** `get_folder_counts(query, libraryId, parentPaths)` returns, for the children of each expanded node, the number of matching visible items. It uses the same `SqlFilter` plus a `GROUP BY` on the child path segment. <br>- **Types and formats:** the sidebar's Types filter and the FilterBar's format filter get one `GROUP BY kind` and one `GROUP BY extension`. <br>- **The counting rule:** a group counts once toward each folder that holds at least one of its files matching every active file-level filter, and once toward each kind and each extension among those files. So sibling folders, or several extensions, can add up to more than their parent's total. A Kenney model counts under `GLB format/`, `FBX format/` and `OBJ format/`, but once under `Models/`. <br>- **Display:** folders with zero matches dim. Counts are computed once per query, like the total. | This is D15. Counts use the grid's visibility rule (C5) and its matching rule (C6), so each count equals the grid's total once you select that folder or add that filter value. |
+| C23 | **Live counts.** <br>- **When:** while search text or any filter is active. <br>- **Tree:** `get_folder_counts(query, libraryId, parentPaths)` returns, for the children of each expanded node, the number of matching visible items. It uses the same `SqlFilter` plus a `GROUP BY` on the child path segment. <br>- **Types and formats:** the sidebar's Types filter and the FilterBar's format filter get one `GROUP BY kind` and one `GROUP BY extension`. <br>- **The counting rule:** a group counts once toward each folder that holds at least one of its files matching every active file-level filter, search text included, and once toward each kind and each extension among those files. So sibling folders, or several extensions, can add up to more than their parent's total. A Kenney model counts under `GLB format/`, `FBX format/` and `OBJ format/`, but once under `Models/`. <br>- **Display:** folders with zero matches dim. Counts are computed once per query, like the total. | This is D15. Counts use the grid's visibility rule (C5) and its matching rule (C6), so each count equals the grid's total once you select that folder or add that filter value. |
 | C24 | **Status bar.** It shows items and files, `51,139 items (83,095 files)`, and the footer's visible range counts items. Step 1 adds the selected folder's path. Step 2 adds the items-and-files count and the footer change, and steps 3 and 4 lower the item count. | Once support files are hidden, the two numbers differ, and both are useful. |
 | C25 | **Several libraries.** The tree is per library. "All libraries" shows the Packs view across every library that has packs. A folder filter always names one library. Step 1 delivers the per-library tree and the folder filter, and step 2 the Packs view across libraries. | This keeps the existing rule that every caller names a library or iterates all of them. |
 | C26 | **"Show hidden files"** is a checkbox in the sidebar's Filters section (`FilterSpec.showHidden`). It counts as a filter, so it switches the Packs view to Assets. | You turn it on to see files, so Assets is the useful view. |
@@ -246,13 +257,22 @@ flowchart LR
 ### Search backend (`commands/asset.rs`, `migrations/002_library_schema.sql`)
 
 - **`search_filter`:** gains the visibility rule (C5), the folder range (C7) and any-member
-  matching for file-level filters (C6). Every `ORDER BY` keeps its `a.rowid` tie-break, and the
-  multi-library merge is unchanged.
-- **FTS** (D17):
-  - `assets_fts` gains `file_path`, so the tokenizer indexes folder names.
-  - The `AFTER UPDATE` trigger narrows to `UPDATE OF file_name, description, metadata, file_path`,
-    so the pass's column writes never touch the full-text index.
-  - Existing libraries rebuild the index once, recorded in `library_meta` as `fts_file_path`.
+  matching for file-level filters, search text included (C6). Every `ORDER BY` keeps its `a.rowid`
+  tie-break, and the multi-library merge is unchanged.
+- **FTS** (D17). `assets_fts` is an external-content FTS5 table, and FTS5 has no
+  `ALTER TABLE ADD COLUMN`. So step 1 does the following:
+  - **New libraries:** in `002_library_schema.sql`, `assets_fts` gets a `file_path` column, so the
+    tokenizer indexes folder names. All three triggers (`assets_ai`, `assets_ad`, `assets_au`)
+    write it. With external content, a `'delete'` row must supply exactly the values that were
+    indexed, or the index is silently corrupted.
+  - **The narrowed trigger:** `assets_au` fires only `AFTER UPDATE OF file_name, description,
+    metadata, file_path`, so the pass's column writes never touch the full-text index. A rename
+    changes `file_path`, so it still reindexes.
+  - **Existing libraries:** `connect_library_sqlite` checks `pragma_table_info('assets_fts')` for
+    `file_path`. When it's missing, one transaction drops `assets_fts` and its three triggers,
+    recreates them with the new definitions, and runs
+    `INSERT INTO assets_fts(assets_fts) VALUES('rebuild')`. It then records `fts_file_path` in
+    `library_meta`. A migration interrupted before its commit runs again on the next open.
 - **New commands:** `get_folders`, `get_packs`, `get_folder_counts`, `set_pack_override`, the
   group-aware `delete_assets` and `rename_asset`, and the bulk folder commands from C22.
 
@@ -284,7 +304,9 @@ C24 (folder path) and C25 (the per-library tree and folder filter).
 - Build the tree under each library row, with the selected folder in the query and its path in the
   status bar.
 - Add the folder range filter, and fix the Smart Filter's Directory field.
-- Index `file_path` in FTS, with the narrowed trigger and the one-time rebuild.
+- Index `file_path` in FTS: drop and recreate `assets_fts` and its three triggers with `file_path`,
+  in `002_library_schema.sql` for new libraries and in a one-time migration for existing ones,
+  then rebuild the index. `assets_au` fires only on the indexed columns.
 
 **Done when:** the steps below work on a copy of the golden snapshot.
 
@@ -292,6 +314,7 @@ C24 (folder path) and C25 (the per-library tree and folder filter).
 - Selecting `3D assets/Platformer Kit` shows exactly the files whose path starts with it, checked
   against a SQL count.
 - A search for "platformer" returns files from every pack with "Platformer" in its folder name.
+  This holds on a copy of your existing library, after the one-time FTS migration.
 - Deleting or renaming a file updates its folders' counts without a manual refresh, and a folder
   it leaves empty drops out of the tree.
 - UI check U9 passes.
@@ -420,7 +443,13 @@ Run by file locally, as `AGENTS.md` says. CI runs the rest.
   - folder, kind and extension counts that each equal the grid's total for that folder or value,
     including a group's format folders;
   - members never shown, and support files shown only with `showHidden`;
-  - FTS on folder names;
+  - FTS on folder names, in a fresh library and in one opened with the old schema (the old
+    `assets_fts` and triggers), which the migration converts so that a search finds a file by its
+    folder name;
+  - after a rename and a delete, the index still matches the new path and no longer matches the
+    old one, so the triggers' `'delete'` rows carry the indexed values;
+  - search text that matches only a member's folder (`fbx`) finds the group, and counts it only
+    under that member's folder;
   - sorting by the main item.
 - **Group write tests:**
   - `update_asset` and tag and collection writes reach every member, and not the bundled preview.
@@ -446,8 +475,8 @@ New `AGENTS.md` architecture invariants:
 - **One grid item per group.**
   - The grid shows main items and single files, never members, and support files only with "Show
     hidden files".
-  - File-level filters match a group when one of its files meets all of them. Counts use the same
-    rule.
+  - File-level filters, search text included, match a group when one of its files meets all of
+    them. Counts use the same rule.
   - Metadata is equal across members, so every metadata write goes through `group_members`.
 
 `docs/agents/running-the-app.md` lists U9-U13.
