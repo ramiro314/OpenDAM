@@ -15,6 +15,7 @@ interface FolderTreeStore {
   /**
    * Reloads every expanded node's children, for `library:updated`. Collapsed nodes' children are
    * dropped, so they load fresh when expanded, and expanded nodes whose folder is gone collapse.
+   * When refetches overlap, only the latest one's results are applied.
    */
   refetch: () => Promise<void>;
 }
@@ -45,6 +46,10 @@ async function load(libraryId: string, path: string): Promise<FolderNode[] | nul
   }
 }
 
+// Bumped by every refetch: only the latest one's results are applied, so an earlier one that
+// resolves last, with folders read before a later change, can't overwrite them.
+let refetchGeneration = 0;
+
 export const useFolderTreeStore = create<FolderTreeStore>()((set, get) => ({
   children: {},
   expanded: {},
@@ -67,12 +72,14 @@ export const useFolderTreeStore = create<FolderTreeStore>()((set, get) => ({
   },
 
   refetch: async () => {
+    const generation = ++refetchGeneration;
     const jobs = Object.entries(get().expanded).flatMap(([libraryId, paths]) =>
       paths.map((path) => ({ libraryId, path }))
     );
     const results = await Promise.all(
       jobs.map(async (job) => ({ ...job, nodes: await load(job.libraryId, job.path) }))
     );
+    if (generation !== refetchGeneration) return;
     set((s) => {
       const children: Record<string, LoadedNodes> = {};
       const expanded: Record<string, string[]> = {};

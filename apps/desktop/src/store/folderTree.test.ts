@@ -126,6 +126,33 @@ describe('useFolderTreeStore', () => {
     expect(childPaths('kenney', '')).toEqual(['2D assets', '3D assets']);
   });
 
+  test('when refetches overlap, an earlier one resolving last does not overwrite the latest', async () => {
+    serve(() => ({ kenney: KENNEY }));
+    await tree().toggle('kenney', '');
+
+    // The first refetch read the folders before a delete emptied `2D assets`, and answers last
+    let releaseStale = () => {};
+    api.getFolders = () =>
+      new Promise<FolderNode[]>((resolve) => {
+        releaseStale = () =>
+          resolve(
+            ['2D assets', '3D assets'].map((path) => ({
+              name: path,
+              path,
+              itemCount: 1,
+              hasChildren: true,
+            }))
+          );
+      });
+    const stale = tree().refetch();
+    serve(() => ({ kenney: { ...KENNEY, '': ['3D assets'] } }));
+    await tree().refetch();
+    releaseStale();
+    await stale;
+
+    expect(childPaths('kenney', '')).toEqual(['3D assets']);
+  });
+
   test('a node expanded during a refetch stays expanded with what it loaded', async () => {
     serve(() => ({ kenney: KENNEY }));
     await tree().toggle('kenney', '');

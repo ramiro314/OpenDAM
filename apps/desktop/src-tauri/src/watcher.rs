@@ -368,7 +368,11 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
         .await;
 
     // ── 5. Derive the folder tree, still under both locks ─────────────────
-    crate::structure::rebuild(&pool).await?;
+    // A failed pass is logged, not returned: the run's writes went through, so the caller still
+    // emits `library:updated`, and the next pass derives the folders again.
+    if let Err(e) = crate::structure::rebuild(&pool).await {
+        tracing::error!(target: "structure", "Structure pass failed for library {library_id}: {e}");
+    }
 
     tracing::info!(
         "NAS-efficient indexing complete for library {}: {} total assets",
@@ -569,6 +573,27 @@ mod tests {
             crate::structure::tests::folder_rows(&lib.pool).await,
             crate::structure::tests::fresh_pass(&["kits/readme.txt"]).await
         );
+    }
+
+    #[tokio::test]
+    async fn an_index_run_whose_structure_pass_fails_still_succeeds() {
+        let (dir, db, lib) = temp_library().await;
+        std::fs::write(dir.path().join("notes.txt"), "hi").unwrap();
+        // The pass reads `folders` first, so without it the pass fails after the run's writes.
+        sqlx::query("DROP TABLE folders")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+
+        let result =
+            index_paths(&db, &lib.id, &[lib.root_path.to_string_lossy().to_string()]).await;
+
+        let file_paths: Vec<String> = sqlx::query_scalar("SELECT file_path FROM assets")
+            .fetch_all(&lib.pool)
+            .await
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(file_paths, ["notes.txt"]);
     }
 
     /// Writes a `width` x `height` PNG to `path`. Large ones are short, so the decode stays cheap.
