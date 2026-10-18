@@ -17,6 +17,7 @@ const ctx: UiCheckContext = {
   waitFor: async () => {},
   pause: async () => {},
   sleep: async () => {},
+  rss: async () => 0,
 };
 
 describe('runUiChecks', () => {

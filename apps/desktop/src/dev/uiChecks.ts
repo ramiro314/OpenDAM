@@ -1,6 +1,6 @@
 // The UI checks `VITE_SCROLL_BENCH=checks` runs (U1-U8 in
-// docs/plans/fast-collection-browsing/plan.md). Each ticket that delivers a behavior adds its
-// check here.
+// docs/plans/fast-collection-browsing/plan.md, and M1 for the web process's memory). Each ticket
+// that delivers a behavior adds its check here.
 
 import { useAssetStore, useUIStore } from '../store';
 import {
@@ -22,6 +22,8 @@ export interface UiCheckContext {
   /** Logs a named pause and holds still long enough for the runner to take a screenshot. */
   pause: (name: string) => Promise<void>;
   sleep: (ms: number) => Promise<void>;
+  /** The web process's RSS in bytes (`bench_rss`). */
+  rss: () => Promise<number>;
 }
 
 export interface UiCheck {
@@ -507,6 +509,28 @@ export const UI_CHECKS: UiCheck[] = [
       toggle()!.click();
       await frames(3);
       ui().clearSelection();
+    },
+  },
+  {
+    id: 'M1',
+    title:
+      'Held still 60% down the grid, the tiles fill and the web process grows under 200 MB in 10 s',
+    // Each backdrop-filter in a card was a compositing layer that WebKitGTK's GPU compositor
+    // re-rendered without end once the grid scrolled, at about 500 MB/s (gridStyles.test.ts).
+    run: async ({ scroll, assert, waitFor, pause, sleep, rss }) => {
+      const el = scroll();
+      el.scrollTop = 0.6 * (el.scrollHeight - el.clientHeight);
+      await waitFor(() => allReady(el), 10_000, 'visible tiles ready 60% down');
+      await sleep(1000);
+      const start = await rss();
+      let most = start;
+      for (let s = 0; s < 10; s++) {
+        await sleep(1000);
+        most = Math.max(most, await rss());
+      }
+      const grewMb = Math.round((most - start) / 2 ** 20);
+      assert(grewMb < 200, `the web process grew ${grewMb} MB in 10 s of holding still`);
+      await pause('M1-held-still');
     },
   },
 ];

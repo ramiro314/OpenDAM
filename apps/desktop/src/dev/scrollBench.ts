@@ -293,6 +293,7 @@ async function runChecks(only: string | null) {
     waitFor,
     pause,
     sleep,
+    rss: readRss,
   };
   await resetGrid('md');
   // Shows the runner's screenshot step works, and what the grid looked like when checks began
