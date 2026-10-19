@@ -524,25 +524,16 @@ async fn apply_groups(
     Ok(changed.len())
 }
 
-/// The preview job states a job can still be claimed from.
-const WAITING_JOBS: &str = "('pending', 'queued', 'fallback')";
-
 /// Keeps the preview queue on grid items (plan C15). A group member other than its main item
-/// loses the jobs it is still waiting on and goes back to `none`, keeping any thumbnail it has.
-/// A grid item at `none` whose format takes a preview, such as a member that became a main item,
-/// gets a job. Returns how many assets it changed.
+/// comes off the queue, keeping any thumbnail it has. A grid item at `none` whose format takes a
+/// preview, such as a member that became a main item, goes on it. `preview::unqueue` and
+/// `preview::enqueue` own how. Returns how many assets it changed.
 async fn apply_previews(
     pool: &Pool<Sqlite>,
     files: &[FileRow],
     structure: &Structure,
 ) -> sqlx::Result<usize> {
-    let waiting: HashSet<String> = sqlx::query_scalar(&format!(
-        "SELECT DISTINCT asset_id FROM preview_jobs WHERE status IN {WAITING_JOBS}"
-    ))
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .collect();
+    let waiting = crate::preview::assets_waiting_for_jobs(pool).await?;
     let mut members = Vec::new();
     let mut items = Vec::new();
     for (i, file) in files.iter().enumerate() {
@@ -561,16 +552,7 @@ async fn apply_previews(
     for chunk in members.chunks(BATCH) {
         let mut tx = pool.begin().await?;
         for id in chunk {
-            sqlx::query(&format!(
-                "DELETE FROM preview_jobs WHERE asset_id = ? AND status IN {WAITING_JOBS}"
-            ))
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query("UPDATE assets SET preview_status = 'none' WHERE id = ? AND preview_status = 'pending'")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+            crate::preview::unqueue(&mut tx, id).await?;
         }
         tx.commit().await?;
     }
@@ -578,22 +560,7 @@ async fn apply_previews(
     for chunk in items.chunks(BATCH) {
         let mut tx = pool.begin().await?;
         for id in chunk {
-            sqlx::query("UPDATE assets SET preview_status = 'pending' WHERE id = ?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query(
-                "INSERT INTO preview_jobs (id, asset_id, status, created_at)
-                 SELECT ?, ?, 'pending', ? WHERE NOT EXISTS (
-                     SELECT 1 FROM preview_jobs WHERE asset_id = ?
-                     AND status IN ('pending', 'queued', 'processing', 'fallback'))",
-            )
-            .bind(uuid::Uuid::new_v4().to_string())
-            .bind(id)
-            .bind(now)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+            crate::preview::enqueue(&mut tx, id, now).await?;
         }
         tx.commit().await?;
     }

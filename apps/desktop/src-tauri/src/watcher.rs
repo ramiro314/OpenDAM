@@ -378,12 +378,13 @@ async fn commit_asset_batch(pool: &sqlx::Pool<sqlx::Sqlite>, batch: &[PendingAss
             .execute(&mut *tx)
             .await?;
 
-            sqlx::query(
+            sqlx::query(&format!(
                 "INSERT INTO preview_jobs (id, asset_id, status, created_at)
                  SELECT ?, ?, 'pending', ? WHERE NOT EXISTS (
                      SELECT 1 FROM preview_jobs WHERE asset_id = ?
-                     AND status IN ('pending', 'queued', 'fallback'))",
-            )
+                     AND status IN {})",
+                crate::preview::WAITING_JOBS
+            ))
             .bind(Uuid::new_v4().to_string())
             .bind(&item.id)
             .bind(item.now)

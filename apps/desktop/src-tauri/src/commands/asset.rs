@@ -414,8 +414,9 @@ struct SqlFilter {
 /// The group half of the grid's visibility rule (plan C5): a group shows as its main item, and
 /// its other members never show, even with "Show hidden files". With both halves, a search reads
 /// the grid items from `idx_assets_items`, whose `WHERE` repeats them term for term
-/// (`db::add_structure_columns`).
-const MAIN_OR_SINGLE: &str = "(a.group_id IS NULL OR a.group_id = a.id)";
+/// (`db::add_structure_columns`). The preview queue claims jobs by it too (`preview::claim_jobs`),
+/// on `assets a`.
+pub(crate) const MAIN_OR_SINGLE: &str = "(a.group_id IS NULL OR a.group_id = a.id)";
 
 /// The support-file half of the grid's visibility rule: a pack's support files show only with
 /// "Show hidden files".

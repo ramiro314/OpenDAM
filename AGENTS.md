@@ -120,7 +120,7 @@ docs/plans                    Plans for this fork
   - The grid shows main items and files on their own, never other members, even with
     `showHidden`, and support files only with it (`MAIN_OR_SINGLE` and `NOT_SUPPORT` in
     `commands/asset.rs`). The partial index `idx_assets_items` repeats those two terms in its
-    `WHERE`, so keep them term for term alike.
+    `WHERE`, so keep them term for term alike. `preview::claim_jobs` uses `MAIN_OR_SINGLE` itself.
   - File-level filters (search text, kind, extension, folder, name prefix and suffix) match a
     group when one of its files meets all of them together; metadata filters and sort keys read
     the main item. A folder whose `split_groups` is 0 holds every group it has a file of together
@@ -128,8 +128,9 @@ docs/plans                    Plans for this fork
     flat search.
   - A folder's `item_count` counts a group once under each folder holding one of its files, so
     it equals the grid's total for that folder.
-  - The preview queue skips members other than the main item: the pass drops their waiting jobs
-    and `claim_jobs` skips them, and their thumbnails stay on disk.
+  - The preview queue skips members other than the main item: the pass takes them off the queue
+    and `claim_jobs` skips them, and their thumbnails stay on disk. `preview.rs` owns the job
+    states and how an asset goes on or off the queue (`preview::enqueue`, `preview::unqueue`).
 
 ## Python preview worker
 

@@ -1,3 +1,4 @@
+use crate::commands::asset::MAIN_OR_SINGLE;
 use crate::db::{make_relative_path, resolve_path, LibraryHandle};
 use crate::AppState;
 use anyhow::{anyhow, Result};
@@ -297,14 +298,72 @@ pub(crate) const NATIVE_EXTS_SQL: &str =
 /// A claimed job: (job_id, asset_id, file_path)
 type Job = (String, String, String);
 
+/// The job states a worker can still claim a job from.
+pub(crate) const WAITING_JOBS: &str = "('pending', 'queued', 'fallback')";
+/// The job states of a job not yet finished: waiting, or running.
+const ACTIVE_JOBS: &str = "('pending', 'queued', 'processing', 'fallback')";
+
+/// The assets with a waiting job.
+pub(crate) async fn assets_waiting_for_jobs(
+    pool: &Pool<Sqlite>,
+) -> sqlx::Result<std::collections::HashSet<String>> {
+    let ids: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT DISTINCT asset_id FROM preview_jobs WHERE status IN {WAITING_JOBS}"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(ids.into_iter().collect())
+}
+
+/// Takes asset `id` off the queue: drops the jobs it is still waiting on and moves it from
+/// `pending` back to `none`. A running job finishes, and a thumbnail it has stays.
+pub(crate) async fn unqueue(conn: &mut sqlx::SqliteConnection, id: &str) -> sqlx::Result<()> {
+    sqlx::query(&format!(
+        "DELETE FROM preview_jobs WHERE asset_id = ? AND status IN {WAITING_JOBS}"
+    ))
+    .bind(id)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "UPDATE assets SET preview_status = 'none' WHERE id = ? AND preview_status = 'pending'",
+    )
+    .bind(id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Puts asset `id` on the queue: marks it `pending` and adds a job unless one is unfinished.
+pub(crate) async fn enqueue(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    now: i64,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE assets SET preview_status = 'pending' WHERE id = ?")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(&format!(
+        "INSERT INTO preview_jobs (id, asset_id, status, created_at)
+         SELECT ?, ?, 'pending', ? WHERE NOT EXISTS (
+             SELECT 1 FROM preview_jobs WHERE asset_id = ? AND status IN {ACTIVE_JOBS})"
+    ))
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(id)
+    .bind(now)
+    .bind(id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// Fetches up to `limit` jobs matching `filter` and marks them as 'processing'.
 async fn claim_jobs(pool: &Pool<Sqlite>, filter: &str, limit: usize) -> Vec<Job> {
     let jobs: Vec<Job> = sqlx::query_as(&format!(
         // A group member other than its main item never shows in the grid, so it gets no preview
         // (plan C15). The structure pass drops its waiting jobs; this skips any queued since.
         "SELECT p.id, p.asset_id, a.file_path FROM preview_jobs p JOIN assets a ON p.asset_id = a.id
-         WHERE ({}) AND (a.group_id IS NULL OR a.group_id = a.id) LIMIT {}",
-        filter, limit
+         WHERE ({filter}) AND {MAIN_OR_SINGLE} LIMIT {limit}"
     ))
     .fetch_all(pool)
     .await
