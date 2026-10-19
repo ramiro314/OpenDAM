@@ -171,7 +171,7 @@ export interface FolderNode {
 export interface FacetCounts {
   /** The total with each kind as the only one; kinds with none are absent */
   kinds: Record<string, number>;
-  /** The total with each extension added to the active ones; see `extensionBase` for the rest */
+  /** The total with each extension added to the active ones; read through `extensionCount` */
   extensions: Record<string, number>;
   /** The count of an extension `extensions` leaves out: the active extensions' total, or 0 */
   extensionBase: number;

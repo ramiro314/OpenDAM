@@ -5,6 +5,8 @@
 
 import { api } from '../api';
 import {
+  extensionCount,
+  kindCount,
   useAssetStore,
   useFolderTreeStore,
   useLibraryStore,
@@ -1521,7 +1523,7 @@ export const UI_CHECKS: UiCheck[] = [
       for (const option of kinds) {
         const kind = option.id.slice('sidebar-filter-type-'.length);
         const count = liveCount(option);
-        assert(count === (live().facets!.kinds[kind] ?? 0), `${kind}'s count isn't its live count`);
+        assert(count === kindCount(live().facets!, kind), `${kind}'s count isn't its live count`);
         const total = await totalWith({ filter: { ...query.filter, kinds: [kind] as never } });
         assert(total === count, `${kind} counts ${count}, its grid holds ${total}`);
       }
@@ -1550,7 +1552,7 @@ export const UI_CHECKS: UiCheck[] = [
         for (const pill of pills) {
           const ext = pill.id.slice('filter-ext-'.length);
           const count = liveCount(pill);
-          const expected = facets.extensions[ext] ?? facets.extensionBase;
+          const expected = extensionCount(facets, ext);
           assert(count === expected, `.${ext} reads ${count}, its live count is ${expected}`);
           assert((pill.dataset.noMatches !== undefined) === (count === 0), `.${ext}'s dimming`);
           const extensions = active.includes(ext) ? active : [...active, ext];

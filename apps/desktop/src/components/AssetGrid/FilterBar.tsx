@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useAssetStore, useLiveCountsStore } from '../../store';
+import { useAssetStore, useLiveCountsStore, extensionCount } from '../../store';
 import type { AssetKind, ColorLabel } from '../../types';
 import { IconFilter, IconX, IconLayers, IconFileText, IconInbox, IconHeartFilled } from '../Icons';
 import styles from './FilterBar.module.css';
@@ -411,7 +411,7 @@ export function FilterBar() {
             <div className={styles.pills}>
               {EXTENSION_OPTIONS.map(({ ext, label, softwareHint }) => {
                 const active = filter.extensions?.includes(ext);
-                const count = facets ? (facets.extensions[ext] ?? facets.extensionBase) : undefined;
+                const count = facets ? extensionCount(facets, ext) : undefined;
                 return (
                   <button
                     key={ext}

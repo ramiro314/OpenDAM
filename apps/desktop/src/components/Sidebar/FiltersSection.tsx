@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import clsx from 'clsx';
-import { useUIStore, useAssetStore, useLiveCountsStore } from '../../store';
+import { useUIStore, useAssetStore, useLiveCountsStore, kindCount } from '../../store';
 import type { ColorLabel, FilterSpec } from '../../types';
 import {
   IconChevronDown,
@@ -70,7 +70,7 @@ export function FiltersSection({ clearSmartFilter }: FiltersSectionProps) {
   const currentFilter = useAssetStore((s) => s.query.filter);
   const search = useAssetStore((s) => s.search);
   // While search text or a filter is on: each kind's grid total with it as the only kind
-  const kindCounts = useLiveCountsStore((s) => s.facets?.kinds);
+  const facets = useLiveCountsStore((s) => s.facets);
 
   const [expanded, setExpanded] = useState(true);
   const [subExpanded, setSubExpanded] = useState({
@@ -191,7 +191,7 @@ export function FiltersSection({ clearSmartFilter }: FiltersSectionProps) {
               label={label}
               icon={icon}
               active={isActive}
-              count={kindCounts && (kindCounts[kind] ?? 0)}
+              count={facets ? kindCount(facets, kind) : undefined}
               onClick={() => toggleFilter('kinds', isActive, { kinds: [kind] })}
             />
           );

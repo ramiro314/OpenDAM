@@ -22,6 +22,20 @@ interface LiveCountsStore {
   countFolders: (libraryId: string, parentPaths: string[]) => void;
 }
 
+/** The grid's total once `kind` is the only kind (the sidebar's Types replace the kind filter). */
+export function kindCount(facets: FacetCounts, kind: string): number {
+  return facets.kinds[kind] ?? 0;
+}
+
+/**
+ * The grid's total once `extension` joins the active ones (a format pill adds to them). Read
+ * every extension count through this: `facets.extensions` holds only those that differ from
+ * `extensionBase`, so a missing one counts the active extensions' total, not 0.
+ */
+export function extensionCount(facets: FacetCounts, extension: string): number {
+  return facets.extensions[extension] ?? facets.extensionBase;
+}
+
 // Bumped by every recount: only the latest one's results are applied.
 let generation = 0;
 let counted: SearchQuery | null = null;

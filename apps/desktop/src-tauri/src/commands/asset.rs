@@ -681,20 +681,25 @@ fn search_filter(query: &SearchQuery, split: bool) -> SqlFilter {
     filter
 }
 
-/// Requires files below `folder`, a path relative to the library root, recursively. The range
-/// `p/ <= file_path < p0` (`0` follows `/`) holds exactly the paths starting with `p/`, uses the
-/// unique `file_path` index and needs no `LIKE` escaping. The root (`""`, or only slashes) adds
-/// no condition. Spaces are kept: a folder name may start or end with one.
+/// The `file_path` range of the files below `folder`, a path relative to the library root,
+/// recursively: `p/ <= file_path < p0` (`0` follows `/`) holds exactly the paths starting with
+/// `p/`, uses the unique `file_path` index and needs no `LIKE` escaping. `None` for the root
+/// (`""`, or only slashes), which every file lies below. Spaces are kept: a folder name may start
+/// or end with one. The grid's folder filter and the tree's live counts both read folders by it.
+fn folder_range(folder: &str) -> Option<[String; 2]> {
+    let path = folder.trim_matches('/');
+    (!path.is_empty()).then(|| [format!("{path}/"), format!("{path}0")])
+}
+
+/// Requires files below `folder` (`folder_range`). The root adds no condition.
 ///
 /// It is a file-level condition. When the folder `split`s no group, every group with a file
 /// below it has its main item there too, so the item's own path decides, as fast as before
 /// groups: the range goes on the item as well, and adds no search through members.
 fn push_folder_range(filter: &mut SqlFilter, folder: &str, split: bool) {
-    let path = folder.trim_matches('/');
-    if path.is_empty() {
+    let Some(range) = folder_range(folder) else {
         return;
-    }
-    let range = [format!("{path}/"), format!("{path}0")];
+    };
     let condition = "{f}.file_path >= ? AND {f}.file_path < ?";
     if split {
         filter.push_file(condition, range);
@@ -844,11 +849,22 @@ pub struct FacetCounts {
     /// The grid's total with each kind as the only one, for the kinds that have one
     pub kinds: HashMap<String, i64>,
     /// The grid's total with each extension added to the active ones, for the extensions that
-    /// change it or have one
+    /// change it or have one. Read through `extension`, which covers the rest.
     pub extensions: HashMap<String, i64>,
     /// The count of an extension `extensions` leaves out: the grid's total with the active
     /// extensions, which adding one no file has keeps, or 0 when none is active
     pub extension_base: i64,
+}
+
+impl FacetCounts {
+    /// The grid's total once `extension` joins the active ones. Reads every extension count, as
+    /// `extensions` holds only those that differ from `extension_base`'s.
+    pub fn extension(&self, extension: &str) -> i64 {
+        self.extensions
+            .get(extension)
+            .copied()
+            .unwrap_or(self.extension_base)
+    }
 }
 
 /// The kind and extension counts for `query` (`FacetCounts`). Counted once per query, like the
@@ -957,24 +973,19 @@ async fn folder_counts(
     let filter = search_filter(&any_folder, false);
     let mut counts = HashMap::new();
     for parent in parent_paths {
-        // As `push_folder_range` reads a folder. SQLite's `substr` and `instr` count characters.
-        let path = parent.trim_matches('/');
-        let (prefix_len, range) = if path.is_empty() {
-            (0, vec![])
-        } else {
-            (
-                path.chars().count() + 1,
-                vec![format!("{path}/"), format!("{path}0")],
-            )
-        };
+        // The files below the parent start with its range's lower bound, `p/`, or are the whole
+        // library. SQLite's `substr` and `instr` count characters.
+        let range = folder_range(parent);
+        let prefix_len = range.as_ref().map_or(0, |[from, _]| from.chars().count());
         let rest = format!("substr(m.file_path, {})", prefix_len + 1);
         let child = format!("substr(m.file_path, 1, {prefix_len} + instr({rest}, '/') - 1)");
         let mut extra = vec![format!("instr({rest}, '/') > 0")];
-        if !range.is_empty() {
+        if range.is_some() {
             extra.push("m.file_path >= ? AND m.file_path < ?".to_string());
         }
+        let binds: Vec<String> = range.into_iter().flatten().collect();
         let mut children = HashMap::new();
-        add_grouped_counts(&mut children, pool, &filter, &child, &extra, &range).await?;
+        add_grouped_counts(&mut children, pool, &filter, &child, &extra, &binds).await?;
         counts.insert(parent.clone(), children);
     }
     Ok(counts)
@@ -3604,11 +3615,7 @@ mod tests {
                 .map(String::as_str)
                 .chain(["txt", "nothing"])
             {
-                let count = facets
-                    .extensions
-                    .get(ext)
-                    .copied()
-                    .unwrap_or(facets.extension_base);
+                let count = facets.extension(ext);
                 let mut picked = active.clone();
                 if !picked.iter().any(|e| e == ext) {
                     picked.push(ext.to_string());
@@ -4672,11 +4679,7 @@ mod tests {
             || serde_json::json!({ "text": "tree", "filter": { "extensions": ["fbx"] } });
         let union = live_facet_counts(&libs, with_fbx()).await;
         for ext in ["fbx", "glb", "gltf", "obj", "png", "svg", "jpg"] {
-            let count = union
-                .extensions
-                .get(ext)
-                .copied()
-                .unwrap_or(union.extension_base);
+            let count = union.extension(ext);
             let mut query = with_fbx();
             query["filter"]["extensions"] = serde_json::json!(["fbx", ext]);
             let expected = counted_search(&libs, query).await.1.unwrap();

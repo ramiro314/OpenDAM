@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { api } from '../api';
 import { useFolderTreeStore } from './folderTree';
-import { useLiveCountsStore } from './liveCounts';
+import { extensionCount, kindCount, useLiveCountsStore } from './liveCounts';
 import type { FacetCounts, FolderCounts, SearchQuery } from '../types';
 
 const realFacets = api.getFacetCounts;
@@ -50,6 +50,19 @@ afterEach(() => {
   api.getFolderCounts = realFolders;
   counts().recount(query(''));
   useFolderTreeStore.setState({ children: {}, expanded: {} });
+});
+
+describe('kindCount and extensionCount', () => {
+  test('a missing kind counts 0, a missing extension the active extensions total', () => {
+    const facets: FacetCounts = {
+      kinds: { '3d_model': 180 },
+      extensions: { png: 478 },
+      extensionBase: 180,
+    };
+    expect([kindCount(facets, '3d_model'), kindCount(facets, 'video')]).toEqual([180, 0]);
+    expect([extensionCount(facets, 'png'), extensionCount(facets, 'glb')]).toEqual([478, 180]);
+    expect(extensionCount({ ...facets, extensionBase: 0 }, 'glb')).toBe(0);
+  });
 });
 
 describe('useLiveCountsStore', () => {
