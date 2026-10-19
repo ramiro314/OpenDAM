@@ -907,6 +907,8 @@ function GroupFiles({ members, onShow }: { members: GroupMember[]; onShow: (id: 
               title={`Show ${m.fileName}`}
               onClick={() => onShow(m.id)}
               onKeyDown={(e) => {
+                // A key on the row's own file actions is theirs: Enter or Space runs that action
+                if (e.target !== e.currentTarget) return;
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
                   onShow(m.id);

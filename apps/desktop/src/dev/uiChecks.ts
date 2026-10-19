@@ -1478,6 +1478,32 @@ export const UI_CHECKS: UiCheck[] = [
         expectActed(fbx.filePath, "the FBX row's actions");
         assert(!document.querySelector('[data-group-member-view]'), 'an action opened a member');
 
+        // Enter or Space on a row's action is left to the button, which runs its action; on the
+        // row itself, Enter shows the member
+        for (const button of memberRows()[1].querySelectorAll<HTMLElement>('[data-file-action]')) {
+          for (const key of ['Enter', ' ']) {
+            const event = press(button, key, key === ' ' ? 'Space' : key);
+            assert(
+              !event.defaultPrevented,
+              `the row took ${key} from ${button.dataset.fileAction}`
+            );
+          }
+        }
+        await sleep(100);
+        assert(
+          !document.querySelector('[data-group-member-view]'),
+          "an action's key opened a member"
+        );
+        assert(acted.length === 0, `keydowns alone acted: ${acted.join(' | ')}`);
+        press(memberRows()[1], 'Enter');
+        await waitFor(
+          () => document.querySelector(`[data-group-member-view="${CSS.escape(fbx.id)}"]`) !== null,
+          5_000,
+          'Enter on the FBX row'
+        );
+        document.getElementById('detail-back-to-group')!.click();
+        await waitFor(() => memberRows().length === members.length, 5_000, 'back to the group');
+
         for (const m of [fbx, members[2]]) {
           memberRows()
             .find((r) => r.dataset.groupMember === m.id)!
