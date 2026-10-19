@@ -59,6 +59,11 @@ export function AssetGrid() {
   const [menu, setMenu] = useState<{ x: number; y: number; assetIds: string[] } | null>(null);
   const { view } = useBrowseView();
 
+  // The Packs view hides the assets, so none stays selected for Delete, Ctrl+C or QuickLook
+  useEffect(() => {
+    if (view === 'packs') clearSelection();
+  }, [view, clearSelection]);
+
   const handleBackdropClick = useCallback(
     (e: React.MouseEvent) => {
       if (e.target === e.currentTarget) clearSelection();

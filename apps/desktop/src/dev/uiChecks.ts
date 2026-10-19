@@ -2023,8 +2023,18 @@ async function checkPacksView({
   }
   document.getElementById('browse-assets')!.click();
   await mainShows('assets', 'the Assets toggle', waitFor);
+  // An asset selected there doesn't stay selected, out of sight, for Delete or Ctrl+C
+  const first = assetAt(useAssetStore.getState(), 0);
+  assert(first, 'no asset at index 0 to select');
+  useUIStore.getState().selectAsset(first!.id);
   document.getElementById('browse-packs')!.click();
   await mainShows('packs', 'the Packs toggle', waitFor);
+  await waitFor(
+    () => useUIStore.getState().selectedAssetIds.size === 0,
+    5_000,
+    'the Packs view to clear the asset selection'
+  );
+  assert(!useUIStore.getState().focusedAssetId, 'an asset stays focused in the Packs view');
 
   // A click selects a card. A double-click, or Enter, selects its pack in the tree, which
   // shows the pack's assets.
