@@ -937,7 +937,8 @@ function GroupFiles({ members, onShow }: { members: GroupMember[]; onShow: (id: 
                   <span className={styles.groupFileSize}>{formatSize(m.sizeBytes)}</span>
                 </span>
                 <span className={clsx(styles.groupFileFolder, 'truncate')} title={folder}>
-                  {folder}
+                  {/* Isolated, so the right-to-left box keeps the path's own order */}
+                  <bdi>{folder}</bdi>
                 </span>
               </span>
               <span className={styles.groupFileActions}>

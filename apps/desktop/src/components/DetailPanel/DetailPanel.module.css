@@ -720,7 +720,10 @@
   font-weight: 400;
   color: var(--color-text-secondary);
 }
+/* Cut from the start, so the end of a long folder, which tells copies apart, stays in view */
 .groupFileFolder {
+  direction: rtl;
+  text-align: left;
   font-family: var(--font-mono);
   font-size: 10px;
   color: var(--color-text-muted);
