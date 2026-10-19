@@ -100,6 +100,40 @@ describe('rows and pages', () => {
     expect(visibleRows(0, 800, 300, 0)).toBeNull();
     expect(rowTop(3, 300)).toBe(916);
   });
+
+  test('leaves out a row only a sub-pixel sliver or its gap shows of', () => {
+    // List rows: 36 px tall, 1 px gap, so row r spans 16 + 37r to 16 + 37r + 36
+    const list = (scrollTop: number, height: number) =>
+      visibleRows(scrollTop, height, 37, 100, 16, 36);
+    // Row 0 ends at 52: 0.4 px of it shows, then 0.6 px
+    expect(list(51.6, 370)?.first).toBe(1);
+    expect(list(51.4, 370)?.first).toBe(0);
+    // The top falls in the gap below row 0 (52-53)
+    expect(list(52.5, 370)?.first).toBe(1);
+    // Row 10 starts at 386: the bottom edge 0.4 px into it, then 0.6 px
+    expect(list(16.4, 370)?.last).toBe(9);
+    expect(list(16.6, 370)?.last).toBe(10);
+    // Exactly at a row's edges
+    expect(list(16, 370)).toEqual({ first: 0, last: 9 });
+  });
+
+  test('agrees with a check that counts a row once more than 0.5 px of it shows', () => {
+    const [pitch, height, offset, viewport] = [37, 36, 16, 793.4];
+    const shown = (scrollTop: number) => {
+      const rows: number[] = [];
+      for (let r = 0; r < 2_000; r++) {
+        const top = offset + r * pitch - scrollTop;
+        if (top + height > 0.5 && top < viewport - 0.5) rows.push(r);
+      }
+      return { first: rows[0], last: rows[rows.length - 1] };
+    };
+    for (let step = 0; step <= 400; step++) {
+      const scrollTop = step * 137.29;
+      expect(visibleRows(scrollTop, viewport, pitch, 2_000, offset, height)).toEqual(
+        shown(scrollTop)
+      );
+    }
+  });
 });
 
 describe('anchorRow', () => {

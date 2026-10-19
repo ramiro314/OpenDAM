@@ -103,15 +103,40 @@ docs/plans                    Plans for this fork
   collections.
 
 - **Structure is derived.** `folders` (each folder's path, parent, name, `is_pack`, and its
-  recursive `item_count` and `hidden_count`, the root being `path = ''`) and `assets.support_role`
-  are recomputed by `structure.rs` from the indexed paths: `structure::derive` is a pure
-  function, and the pass writes only the rows that changed, in 200-row transactions. Opening a
-  library DB (`connect_library_sqlite`) runs the pass once, and every `watcher::index_paths` run
-  ends with it, under the library's `Database::index_lock`. Only `structure.rs` writes `folders`
-  and `support_role`: a command that changes the indexed paths (`delete_asset`, `delete_assets`,
-  `rename_asset`) calls `structure::rebuild_library` before it returns, rather than patching rows,
-  and that waits for any index run holding the lock. Searches hide support files
-  (`support_role IS NOT NULL`) unless the filter's `showHidden` is set.
+  recursive `item_count`, `hidden_count` and `split_groups`, the root being `path = ''`) and
+  `assets.support_role` and `assets.group_id` are recomputed by `structure.rs` from the indexed
+  paths: `structure::derive` is a pure function, and the pass writes only the rows that changed,
+  in 200-row transactions. Opening a library DB (`connect_library_sqlite`) runs the pass once, and
+  every `watcher::index_paths` run ends with it, under the library's `Database::index_lock`. Only
+  `structure.rs` writes `folders`, `support_role` and `group_id`: a command that changes the
+  indexed paths (`delete_asset`, `delete_assets`, `rename_asset`) calls
+  `structure::rebuild_library` before it returns, rather than patching rows, and that waits for
+  any index run holding the lock. Searches hide support files (`support_role IS NOT NULL`) unless
+  the filter's `showHidden` is set.
+- **One grid item per group.** A format group (one model in several formats, or a file's copies
+  under format folders, plan C11) holds its main item's id in `group_id` on every member, the
+  main item included; a file on its own has `NULL`. The main item is chosen GLB > glTF > FBX >
+  Blend > OBJ > others, ties by path ignoring case.
+  - The grid shows main items and files on their own, never other members, even with
+    `showHidden`, and support files only with it (`MAIN_OR_SINGLE` and `NOT_SUPPORT` in
+    `commands/asset.rs`). The partial index `idx_assets_items` repeats those two terms in its
+    `WHERE`, so keep them term for term alike. `preview::claim_jobs` uses `MAIN_OR_SINGLE` itself.
+  - File-level filters (search text, kind, extension, folder, name prefix and suffix) match a
+    group when one of its files meets all of them together; metadata filters and sort keys read
+    the main item. A folder whose `split_groups` is 0 holds every group it has a file of together
+    with its main item, so a search for it reads the item's own path, which keeps it as fast as a
+    flat search.
+  - A folder's `item_count` counts a group once under each folder holding one of its files, so
+    it equals the grid's total for that folder.
+  - The preview queue skips members other than the main item, and their thumbnails stay on disk.
+    An index run queues no new file itself: the pass it ends with queues every file but those
+    members (support files' cover images included), so a member is never queued, even during a
+    library's first index. The pass also takes a file that has become a member off the queue,
+    and `claim_jobs` skips members. One exception: a group whose main item takes no preview,
+    such as a `.blend`, keeps its best previewable member queued as a stand-in
+    (`structure::preview_stand_ins`, `preview::claim_jobs`'s `STANDS_IN`), and its card shows
+    that member's thumbnail. `preview.rs` owns the job
+    states and how an asset goes on or off the queue (`preview::enqueue`, `preview::unqueue`).
 
 ## Python preview worker
 

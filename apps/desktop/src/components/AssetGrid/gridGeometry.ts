@@ -75,24 +75,31 @@ export function pagesForIndexRange(first: number, last: number, pageSize: number
   return pages;
 }
 
+/** How much of a row must show for it to count as visible: less is a sub-pixel sliver. */
+export const VISIBLE_SLIVER = 0.5;
+
 /**
  * The rows the viewport shows, partly or whole, when the content is scrolled to `scrollTop`.
- * Row 0 starts `offset` px down (the scroll area's padding).
+ * Row 0 starts `offset` px down (the scroll area's padding). A row counts when more than
+ * `VISIBLE_SLIVER` px of it shows, not counting the gap below it, which is `rowPitch - rowHeight`.
  */
 export function visibleRows(
   scrollTop: number,
   viewportHeight: number,
   rowPitch: number,
   rows: number,
-  offset = SCROLL_PADDING
+  offset = SCROLL_PADDING,
+  rowHeight = rowPitch
 ): { first: number; last: number } | null {
   if (rows === 0 || rowPitch <= 0) return null;
   const clamp = (r: number) => Math.min(rows - 1, Math.max(0, r));
-  const top = scrollTop - offset;
+  const top = scrollTop - offset + VISIBLE_SLIVER;
+  const bottom = scrollTop - offset + viewportHeight - VISIBLE_SLIVER;
   return {
-    first: clamp(Math.floor(top / rowPitch)),
-    // The row the bottom edge falls in, unless it falls in the gap below the row before
-    last: clamp(Math.ceil((top + viewportHeight) / rowPitch) - 1),
+    // The first row whose bottom edge lies below the top, and the last whose top lies above
+    // the bottom
+    first: clamp(Math.floor((top - rowHeight) / rowPitch) + 1),
+    last: clamp(Math.ceil(bottom / rowPitch) - 1),
   };
 }
 

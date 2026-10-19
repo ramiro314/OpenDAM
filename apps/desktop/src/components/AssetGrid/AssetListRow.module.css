@@ -105,9 +105,18 @@
   font-weight: 600;
   font-family: var(--font-mono);
   color: var(--color-text-muted);
-  width: 40px;
+  width: 52px;
   text-align: right;
   flex-shrink: 0;
+}
+
+/* A format group's badge: solid, so it reads as one */
+.groupBadge {
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-elevated);
+  color: var(--color-text-secondary);
+  text-align: center;
 }
 
 .stars {

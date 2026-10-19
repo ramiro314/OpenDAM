@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { formatItemsAndFiles, formatSize, formatVisibleRange } from './format';
+import { formatGroupBadge, formatItemsAndFiles, formatSize, formatVisibleRange } from './format';
 
 describe('formatSize', () => {
   test('shows bytes below 1 KB', () => {
@@ -38,5 +38,26 @@ describe('formatItemsAndFiles', () => {
     expect(formatItemsAndFiles(82_292, 83_095)).toBe('82,292 items (83,095 files)');
     expect(formatItemsAndFiles(1, 1)).toBe('1 item (1 file)');
     expect(formatItemsAndFiles(0, 3)).toBe('0 items (3 files)');
+  });
+});
+
+describe('formatGroupBadge', () => {
+  test("names the main item's format and counts the other files", () => {
+    expect(formatGroupBadge(['glb', 'fbx', 'obj'])).toEqual({
+      label: 'GLB +2',
+      title: '3 files: GLB, FBX, OBJ',
+    });
+  });
+
+  test('lists a format the copies share once', () => {
+    expect(formatGroupBadge(['png', 'png', 'png'])).toEqual({
+      label: 'PNG +2',
+      title: '3 files: PNG',
+    });
+  });
+
+  test('gives a file on its own no badge', () => {
+    expect(formatGroupBadge(undefined)).toBeNull();
+    expect(formatGroupBadge(['glb'])).toBeNull();
   });
 });
