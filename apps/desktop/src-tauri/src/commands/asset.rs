@@ -1039,6 +1039,8 @@ struct ItemFile {
     file_path: String,
     file_name: String,
     extension: String,
+    /// Whether this is the item's bundled preview rather than a member
+    is_render: bool,
 }
 
 /// The files a delete or rename of `id` reaches (plan C21): every member of its group, the main
@@ -1048,7 +1050,7 @@ struct ItemFile {
 async fn item_files(pool: &sqlx::Pool<sqlx::Sqlite>, id: &str) -> sqlx::Result<Vec<ItemFile>> {
     let mut files: Vec<ItemFile> = sqlx::query_as(
         "WITH item AS (SELECT COALESCE(group_id, id) AS main FROM assets WHERE id = ?1)
-         SELECT a.id, a.file_path, a.file_name, a.extension FROM assets a, item
+         SELECT a.id, a.file_path, a.file_name, a.extension, 0 AS is_render FROM assets a, item
          WHERE a.id = ?1 OR a.group_id = item.main
          ORDER BY a.id <> item.main, a.file_path",
     )
@@ -1056,7 +1058,7 @@ async fn item_files(pool: &sqlx::Pool<sqlx::Sqlite>, id: &str) -> sqlx::Result<V
     .fetch_all(pool)
     .await?;
     let render: Option<ItemFile> = sqlx::query_as(
-        "SELECT p.id, p.file_path, p.file_name, p.extension FROM assets m
+        "SELECT p.id, p.file_path, p.file_name, p.extension, 1 AS is_render FROM assets m
          JOIN assets p ON p.file_path = m.bundled_preview
          WHERE m.id = (SELECT COALESCE(group_id, id) FROM assets WHERE id = ?)
            AND NOT EXISTS (SELECT 1 FROM assets o
@@ -1240,9 +1242,10 @@ struct Move<'a> {
 
 /// Renames `id`'s files (`item_files`) in their folders, with `rename`, and their rows, then
 /// reruns the library's structure pass. A file on its own takes `new_name`, with its extension
-/// added when the name has none. A group's members and its bundled preview take `new_name` as
-/// their stem, less the main item's extension if it ends with it, and each keeps its own
-/// extension (plan C21). Nothing moves when a new name is taken, and a failed rename or row write
+/// added when the name has none, so a typed extension changes its format. A group's members take
+/// `new_name` as their stem, less the main item's extension if it ends with it, and each keeps
+/// its own extension (plan C21). Either way the bundled preview takes the new stem and keeps its
+/// extension. Nothing moves when a new name is taken, and a failed rename or row write
 /// puts the files already renamed back.
 async fn rename_asset_with(
     db: &Database,
@@ -1270,14 +1273,31 @@ async fn rename_asset_with(
     };
 
     // Each file's new name and extension
-    let names: Vec<(String, String)> = if files.len() == 1 {
+    let with_stem = |f: &ItemFile, stem: &str| match f.file_name.rsplit_once('.') {
+        Some((_, ext)) => (format!("{stem}.{ext}"), f.extension.clone()),
+        None => (stem.to_string(), f.extension.clone()),
+    };
+    let names: Vec<(String, String)> = if files.iter().filter(|f| !f.is_render).count() == 1 {
         let old_ext = &main.extension;
-        vec![match trimmed.rsplit_once('.') {
+        let (name, ext) = match trimmed.rsplit_once('.') {
             Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
                 (trimmed.to_string(), ext.to_lowercase())
             }
             _ => (format!("{}.{}", trimmed, old_ext), old_ext.clone()),
-        }]
+        };
+        let stem = name
+            .rsplit_once('.')
+            .map_or(name.as_str(), |(stem, _)| stem);
+        files
+            .iter()
+            .map(|f| {
+                if f.is_render {
+                    with_stem(f, stem)
+                } else {
+                    (name.clone(), ext.clone())
+                }
+            })
+            .collect()
     } else {
         let stem = match trimmed.rsplit_once('.') {
             Some((stem, ext)) if ext.eq_ignore_ascii_case(&main.extension) => stem,
@@ -1286,13 +1306,7 @@ async fn rename_asset_with(
         if stem.is_empty() {
             return Err("Asset file name cannot be empty, '.' or '..'".into());
         }
-        files
-            .iter()
-            .map(|f| match f.file_name.rsplit_once('.') {
-                Some((_, ext)) => (format!("{stem}.{ext}"), f.extension.clone()),
-                None => (stem.to_string(), f.extension.clone()),
-            })
-            .collect()
+        files.iter().map(|f| with_stem(f, stem)).collect()
     };
     let moves: Vec<Move> = files
         .iter()
@@ -3237,6 +3251,36 @@ mod tests {
         assert!(render_kept && render_renamed);
         let after = ["Kit/Previews/oak.png", "Kit/Models/oak.glb"];
         assert_eq!(derived, crate::structure::tests::fresh_pass(&after).await);
+    }
+
+    #[tokio::test]
+    async fn a_file_on_its_own_with_a_render_can_change_format_and_takes_its_render_along() {
+        let files = ["Kit/Models/rock.glb", "Kit/Previews/rock.png"];
+        let (root, db, pool) = library_in_folders(&files).await;
+
+        let result = rename_asset_with(&db, files[0], "boulder.fbx", fs_rename).await;
+
+        let derived = crate::structure::tests::derived_rows(&pool).await;
+        let extension: String = sqlx::query_scalar("SELECT extension FROM assets WHERE id = ?")
+            .bind(files[0])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let disk: Vec<bool> = ["Kit/Models/boulder.fbx", "Kit/Previews/boulder.png"]
+            .iter()
+            .chain(&files)
+            .map(|path| root.join(path).exists())
+            .collect();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(disk, [true, true, false, false]);
+        assert_eq!(extension, "fbx");
+        let after = ["Kit/Models/boulder.fbx", "Kit/Previews/boulder.png"];
+        assert_eq!(derived, crate::structure::tests::fresh_pass(&after).await);
+        assert_eq!(
+            derived.bundled_previews,
+            [(after[0].to_string(), after[1].to_string())]
+        );
     }
 
     #[tokio::test]
