@@ -401,12 +401,14 @@ fn resolve_source(root_path: &Path, file_path: &str) -> PathBuf {
 }
 
 /// A finished preview job, as `preview:done` reports it. Every path is absolute; a `None`
-/// `thumb_path` means the asset has no thumbnail. `file_path` is the asset's own file, so a
-/// card showing it as a model's bundled preview can switch to its thumbnail.
+/// `thumb_path` means the asset has no thumbnail. `file_path` is the asset's own file and
+/// `previous_thumb_path` the thumbnail it had before the job, so a card showing either as a
+/// model's bundled preview can switch to the new picture.
 #[derive(Debug)]
 pub(crate) struct PreviewDone {
     asset_id: String,
     file_path: Option<String>,
+    previous_thumb_path: Option<String>,
     thumb_path: Option<String>,
     model_path: Option<String>,
 }
@@ -417,6 +419,7 @@ fn emit_done(state: &AppState, done: &PreviewDone) {
         json!({
             "assetId": &done.asset_id,
             "filePath": &done.file_path,
+            "previousThumbnailPath": &done.previous_thumb_path,
             "thumbnailPath": &done.thumb_path,
             "previewModel": &done.model_path,
         }),
@@ -439,6 +442,16 @@ async fn complete_job(
         .execute(pool)
         .await;
 
+    let (file_path, previous_thumb): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT file_path, thumbnail_path FROM assets WHERE id = ?")
+            .bind(asset_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .map_or((None, None), |(file, thumb): (String, Option<String>)| {
+                (Some(file), thumb)
+            });
     delete_replaced_thumb(pool, root_path, asset_id, rel_thumb.as_deref()).await;
     if let Some(ref model_path) = model_path {
         let rel_model = make_relative_path(root_path, Path::new(model_path));
@@ -460,15 +473,10 @@ async fn complete_job(
         .await;
     }
 
-    let file_path: Option<String> = sqlx::query_scalar("SELECT file_path FROM assets WHERE id = ?")
-        .bind(asset_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
     PreviewDone {
         asset_id: asset_id.to_string(),
         file_path: file_path.map(|f| resolve_path(root_path, &f)),
+        previous_thumb_path: previous_thumb.map(|t| resolve_path(root_path, &t)),
         thumb_path: rel_thumb.as_ref().map(|r| resolve_path(root_path, r)),
         model_path,
     }
@@ -1109,6 +1117,11 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].asset_id, "a1");
         assert_eq!(done[0].thumb_path, None);
+        // The thumbnail it had, so a model card showing it as a render can drop it.
+        assert_eq!(
+            done[0].previous_thumb_path.as_deref(),
+            Some(old_thumb.to_string_lossy().as_ref())
+        );
         assert!(!old_thumb.exists());
         assert_eq!(
             job_outcome(&lib.pool).await,

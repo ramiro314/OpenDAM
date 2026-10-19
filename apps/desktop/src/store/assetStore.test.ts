@@ -730,16 +730,28 @@ describe('useAssetStore updateAssetPreview', () => {
     const thumb = '/lib/.opendam/thumbs/r_thumb.png';
 
     // The render itself isn't cached: it is a hidden support file.
-    useAssetStore.getState().updateAssetPreview('render', thumb, undefined, render);
+    useAssetStore.getState().updateAssetPreview('render', thumb, undefined, { filePath: render });
 
     const s = useAssetStore.getState();
     expect(s.assetAt(0)?.bundledPreview).toBe(thumb);
     expect(s.assetAt(1)?.bundledPreview).toBe('/lib/kit/Previews/tree.png');
-    // A render with no thumbnail stays the picture as it is.
-    useAssetStore
-      .getState()
-      .updateAssetPreview('render2', null, undefined, '/lib/kit/Previews/tree.png');
-    expect(useAssetStore.getState().assetAt(1)?.bundledPreview).toBe('/lib/kit/Previews/tree.png');
+  });
+
+  test("a render's regenerated thumbnail replaces the old one on the models it renders", async () => {
+    const render = '/lib/kit/Previews/rock.png';
+    const old = '/lib/.opendam/thumbs/r_thumb.jpg';
+    serve(() => [{ ...named('rock'), bundledPreview: old }]);
+    await useAssetStore.getState().search();
+    const update = useAssetStore.getState().updateAssetPreview;
+
+    // Renamed: the card takes the new thumbnail
+    const renamed = '/lib/.opendam/thumbs/r_thumb.png';
+    update('render', renamed, undefined, { filePath: render, previousThumbnailPath: old });
+    expect(useAssetStore.getState().assetAt(0)?.bundledPreview).toBe(renamed);
+
+    // Cleared, as for a render of 512 px or less: the card shows the render itself
+    update('render', null, undefined, { filePath: render, previousThumbnailPath: renamed });
+    expect(useAssetStore.getState().assetAt(0)?.bundledPreview).toBe(render);
   });
 });
 
