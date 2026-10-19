@@ -234,6 +234,7 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::asset::rename_asset,
             commands::folder::get_folders,
             commands::folder::get_packs,
+            commands::folder::get_pack_detail,
             commands::tag::list_tags,
             commands::tag::create_tag,
             commands::tag::update_tag,

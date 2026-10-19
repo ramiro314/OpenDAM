@@ -203,6 +203,37 @@ export interface PackCard {
   cover?: Cover | null;
 }
 
+/** The license a pack's license file names, or `unknown` for any other */
+export type LicenseKind = 'CC0' | 'CC-BY' | 'CC-BY-SA' | 'MIT' | 'Apache-2.0' | 'OFL' | 'unknown';
+
+/** A Kenney license header: `Car Kit (3.1)`, `Created/distributed by Kenney` */
+export interface PackHeader {
+  name: string;
+  version?: string | null;
+  author?: string | null;
+}
+
+/** What the detail panel shows for one pack (`get_pack_detail`) */
+export interface PackDetail {
+  libraryId: string;
+  /** Relative to the library root; `''` for a library that is itself one pack */
+  path: string;
+  name: string;
+  /** The folder holding the pack; `''` for the library root */
+  parentPath: string;
+  itemCount: number;
+  hiddenCount: number;
+  cover?: Cover | null;
+  /** The pack's `Preview*` and `Sample*` images, by path */
+  gallery: Cover[];
+  license?: { filePath: string; kind: LicenseKind } | null;
+  header?: PackHeader | null;
+  /** Files below the pack by kind, hidden files and every format of a model included */
+  kinds: Partial<Record<AssetKind, number>>;
+  /** Their total size in bytes */
+  sizeBytes: number;
+}
+
 /**
  * The live counts beside the Types and format filters (`get_facet_counts`), each the grid's total
  * once that value is picked: the sidebar's Types replace the kind filter, and a format pill adds

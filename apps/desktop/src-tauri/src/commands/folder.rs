@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::db::{resolve_path, LibraryHandle};
+use crate::structure::{LicenseKind, PackHeader};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -275,6 +276,143 @@ pub(crate) async fn packs_below(
             .then_with(|| a.path.cmp(&b.path))
     });
     Ok(cards)
+}
+
+/// What the detail panel shows for one pack (plan C18), as the structure pass derived it (C9).
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackDetail {
+    pub library_id: String,
+    /// Relative to the library root
+    pub path: String,
+    /// The license header's name, else the folder's, else the library's for a root pack
+    pub name: String,
+    /// The folder holding the pack; `''` for the library root
+    pub parent_path: String,
+    pub item_count: i64,
+    pub hidden_count: i64,
+    pub cover: Option<Cover>,
+    /// The pack's `Preview*` and `Sample*` images, by path
+    pub gallery: Vec<Cover>,
+    pub license: Option<PackLicense>,
+    /// The Kenney header of the license file, if it has one
+    pub header: Option<PackHeader>,
+    /// Files below the pack by kind, support files and group members included
+    pub kinds: std::collections::BTreeMap<String, i64>,
+    /// Their total size in bytes
+    pub size_bytes: i64,
+}
+
+/// A pack's license file, as "Open license" opens it.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackLicense {
+    /// Absolute
+    pub file_path: String,
+    pub kind: LicenseKind,
+}
+
+/// The pack that holds `path` in library `library_id`: the innermost pack at or above it, the
+/// folder itself included, or `None` when no pack holds it. A pack card asks with the pack's own
+/// path; the detail panel asks with the selected folder, `''` for a library's root.
+#[tauri::command]
+pub async fn get_pack_detail(
+    library_id: String,
+    path: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<PackDetail>> {
+    let library = state
+        .db
+        .get_library_handle(&library_id)
+        .await
+        .ok_or_else(|| format!("Library {library_id} is not open"))?;
+    pack_holding(&library, &path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(sqlx::FromRow)]
+struct PackDetailRow {
+    path: String,
+    parent_path: Option<String>,
+    name: String,
+    item_count: i64,
+    hidden_count: i64,
+    pack_json: Option<String>,
+}
+
+/// `get_pack_detail` on an open library. The pack is found among `path` and its ancestors on the
+/// primary key, and its cover and gallery images on the unique `file_path` index.
+pub(crate) async fn pack_holding(
+    library: &LibraryHandle,
+    path: &str,
+) -> sqlx::Result<Option<PackDetail>> {
+    let path = path.trim_matches('/');
+    let mut candidates = vec![String::new()];
+    candidates.extend(
+        path.match_indices('/')
+            .map(|(end, _)| path[..end].to_string()),
+    );
+    if !path.is_empty() {
+        candidates.push(path.to_string());
+    }
+    let row: Option<PackDetailRow> = sqlx::query_as(
+        "SELECT path, parent_path, name, item_count, hidden_count, pack_json FROM folders
+         WHERE is_pack AND path IN (SELECT value FROM json_each(?))
+         ORDER BY length(path) DESC LIMIT 1",
+    )
+    .bind(serde_json::to_string(&candidates).expect("paths serialize"))
+    .fetch_optional(&library.pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let info = crate::structure::parse_pack(row.pack_json.as_deref()).unwrap_or_default();
+
+    let images: Vec<&str> = info
+        .cover
+        .iter()
+        .chain(&info.gallery)
+        .map(String::as_str)
+        .collect();
+    let covers: Vec<(String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT file_path, thumbnail_path, extension, kind FROM assets
+         WHERE file_path IN (SELECT value FROM json_each(?))",
+    )
+    .bind(serde_json::to_string(&images).expect("paths serialize"))
+    .fetch_all(&library.pool)
+    .await?;
+    let root = &library.root_path;
+    let cover_of = |path: &str| {
+        covers
+            .iter()
+            .find(|(p, ..)| p == path)
+            .map(|(p, thumbnail, extension, kind)| Cover {
+                file_path: resolve_path(root, p),
+                thumbnail_path: thumbnail.as_deref().map(|t| resolve_path(root, t)),
+                extension: extension.clone(),
+                kind: kind.clone(),
+            })
+    };
+
+    Ok(Some(PackDetail {
+        library_id: library.id.clone(),
+        name: [info.name, row.name]
+            .into_iter()
+            .find(|n| !n.is_empty())
+            .unwrap_or_else(|| library.name.clone()),
+        path: row.path,
+        parent_path: row.parent_path.unwrap_or_default(),
+        item_count: row.item_count,
+        hidden_count: row.hidden_count,
+        cover: info.cover.as_deref().and_then(cover_of),
+        gallery: info.gallery.iter().filter_map(|p| cover_of(p)).collect(),
+        header: info.license.as_ref().and_then(|l| l.text.header.clone()),
+        license: info.license.map(|l| PackLicense {
+            file_path: resolve_path(root, &l.path),
+            kind: l.text.kind,
+        }),
+        kinds: info.kinds,
+        size_bytes: info.size_bytes,
+    }))
 }
 
 #[cfg(test)]
@@ -699,5 +837,106 @@ mod tests {
             (node.name.as_str(), node.cover.as_ref()),
             ("kit", Some(cover))
         );
+    }
+
+    #[tokio::test]
+    async fn a_packs_detail_is_found_from_the_pack_or_any_folder_inside_it() {
+        let library = library_handle(
+            "a",
+            &[
+                "3D assets/Car Kit/License.txt",
+                "3D assets/Car Kit/Preview.png",
+                "3D assets/Car Kit/Sample.png",
+                "3D assets/Car Kit/Models/sedan.png",
+                "Goodies/w.png",
+            ],
+        )
+        .await;
+        sqlx::query(
+            r#"UPDATE folders SET pack_json = json_set(pack_json,
+                 '$.name', 'Car Kit',
+                 '$.license.kind', 'CC0',
+                 '$.license.header', json('{"name":"Car Kit","version":"3.1","author":"Kenney"}'))
+             WHERE path = '3D assets/Car Kit'"#,
+        )
+        .execute(&library.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE assets SET thumbnail_path = '.opendam/thumbs/s_thumb.png'
+             WHERE file_path = '3D assets/Car Kit/Sample.png'",
+        )
+        .execute(&library.pool)
+        .await
+        .unwrap();
+
+        let image = |path: &str, thumbnail: Option<&str>| Cover {
+            file_path: format!("/libraries/a/{path}"),
+            thumbnail_path: thumbnail.map(|t| format!("/libraries/a/{t}")),
+            extension: "png".into(),
+            kind: "texture".into(),
+        };
+        let detail = pack_holding(&library, "3D assets/Car Kit").await.unwrap();
+        assert_eq!(
+            detail,
+            Some(PackDetail {
+                library_id: "a".into(),
+                path: "3D assets/Car Kit".into(),
+                name: "Car Kit".into(),
+                parent_path: "3D assets".into(),
+                item_count: 1,
+                hidden_count: 3,
+                cover: Some(image("3D assets/Car Kit/Preview.png", None)),
+                gallery: vec![
+                    image("3D assets/Car Kit/Preview.png", None),
+                    image(
+                        "3D assets/Car Kit/Sample.png",
+                        Some(".opendam/thumbs/s_thumb.png")
+                    ),
+                ],
+                license: Some(PackLicense {
+                    file_path: "/libraries/a/3D assets/Car Kit/License.txt".into(),
+                    kind: LicenseKind::Cc0,
+                }),
+                header: Some(PackHeader {
+                    name: "Car Kit".into(),
+                    version: Some("3.1".into()),
+                    author: Some("Kenney".into()),
+                }),
+                // Kinds by extension, as the indexer gives them; the test library's files are
+                // 1 byte each.
+                kinds: [("document".to_string(), 1), ("texture".to_string(), 3)].into(),
+                size_bytes: 4,
+            })
+        );
+        // From a folder inside the pack, or with edge slashes
+        assert_eq!(
+            pack_holding(&library, "/3D assets/Car Kit/Models/")
+                .await
+                .unwrap(),
+            detail
+        );
+        // No pack holds a folder outside every pack, or the library root.
+        for path in ["Goodies", "3D assets", "", "3D assets/Car"] {
+            assert_eq!(pack_holding(&library, path).await.unwrap(), None, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_library_that_is_one_pack_shows_it_at_its_root_named_after_the_library() {
+        let mut solo = library_handle("solo", &["License.txt", "rock.png", "Tiles/a.png"]).await;
+        solo.name = "Solo Download".into();
+        for path in ["", "Tiles"] {
+            let detail = pack_holding(&solo, path).await.unwrap().unwrap();
+            assert_eq!(
+                (detail.path.as_str(), detail.name.as_str()),
+                ("", "Solo Download")
+            );
+            // A license the pass couldn't read is unknown, with no header.
+            assert_eq!(
+                (detail.license.map(|l| l.kind), detail.header),
+                (Some(LicenseKind::Unknown), None)
+            );
+        }
     }
 }

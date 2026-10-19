@@ -6,11 +6,23 @@ import {
   useTagStore,
   useCollectionStore,
   useGroupDetailStore,
+  usePackDetailStore,
+  usePacksStore,
   lookupAsset,
+  packRef,
   shownMember,
 } from '../../store';
 import { convertFileSrc } from '@tauri-apps/api/core';
-import type { Asset, ColorLabel, Collection, GroupMember } from '../../types';
+import type {
+  Asset,
+  AssetKind,
+  ColorLabel,
+  Collection,
+  Cover,
+  GroupMember,
+  LicenseKind,
+  PackDetail,
+} from '../../types';
 import {
   IconStar,
   IconX,
@@ -25,12 +37,16 @@ import {
   IconHeart,
   IconHeartFilled,
   IconChevronRight,
+  IconPackage,
 } from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { api } from '../../api';
 import { imageOf } from '../../utils/media';
 import { formatSize, itemFileCount } from '../../utils/format';
 import { useImageScaling } from '../../hooks/useImageScaling';
+import { useBrowseView } from '../../hooks/useBrowseView';
+import { panelPackTarget } from '../../utils/packsView';
+import { KIND_LABEL } from '../../utils/scrubKey';
 import { ThreeViewer } from './ThreeViewer';
 import { SuggestTags } from './SuggestTags';
 import styles from './DetailPanel.module.css';
@@ -64,6 +80,19 @@ export function DetailPanel() {
   const [editingName, setEditingName] = useState('');
   const [panelError, setPanelError] = useState<string | null>(null);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
+
+  // With no asset shown, the panel shows a pack (plan C18): the Packs view's selected card, or
+  // the pack holding the selected folder
+  const { view } = useBrowseView();
+  const query = useAssetStore((s) => s.query);
+  const selectedCard = usePacksStore((s) => s.selected);
+  const pack = usePackDetailStore((s) => s.detail);
+  const loadPack = usePackDetailStore((s) => s.load);
+  const packTarget = panelPackTarget(view, selectedCard ? packRef(selectedCard) : null, query);
+  useEffect(() => {
+    void loadPack(packTarget);
+    // The target's library and path stand for it
+  }, [packTarget?.libraryId, packTarget?.path]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // A group card lists its files; the panel shows one of them in place of the group on a click,
   // while the grid keeps the card selected (plan C19)
@@ -159,12 +188,15 @@ export function DetailPanel() {
     }
   };
 
+  if (pack && (!asset || view === 'packs')) return <PackPanel pack={pack} />;
   if (!asset) {
     return (
       <aside className={styles.panel} id="detail-panel">
         <div className={styles.empty}>
           <IconInfo size={32} />
-          <p>Select an asset to see details</p>
+          <p>
+            {view === 'packs' ? 'Select a pack to see details' : 'Select an asset to see details'}
+          </p>
         </div>
       </aside>
     );
@@ -378,6 +410,178 @@ export function DetailPanel() {
         onConfirm={handleConfirmDelete}
         onCancel={() => setIsDeleteDialogOpen(false)}
       />
+    </aside>
+  );
+}
+
+// ── Pack ──────────────────────────────────────────────────────────────────
+const LICENSE_LABEL: Record<LicenseKind, string> = {
+  CC0: 'CC0',
+  'CC-BY': 'CC-BY',
+  'CC-BY-SA': 'CC-BY-SA',
+  MIT: 'MIT',
+  'Apache-2.0': 'Apache-2.0',
+  OFL: 'OFL',
+  unknown: 'Unknown',
+};
+
+/** The image that stands for a cover, as `imageOf` picks it for an asset. */
+const coverImage = (cover: Cover) =>
+  imageOf({ ...cover, thumbnailPath: cover.thumbnailPath ?? undefined });
+
+/**
+ * A pack's details (plan C18): its cover, or the gallery image clicked, its name, its gallery of
+ * `Preview*` and `Sample*` images, its Kenney header's version and author, its license with "Open
+ * license", and its files by kind with their total size.
+ */
+function PackPanel({ pack }: { pack: PackDetail }) {
+  const scaling = useImageScaling('contain');
+  const [shown, setShown] = useState<string | null>(null);
+  useEffect(() => setShown(null), [pack.libraryId, pack.path]);
+  const image = pack.gallery.find((g) => g.filePath === shown) ?? pack.cover;
+  const src = image ? coverImage(image) : undefined;
+  const kinds = (Object.entries(pack.kinds) as [AssetKind, number][]).sort(
+    ([a, m], [b, n]) => n - m || a.localeCompare(b)
+  );
+  const files = kinds.reduce((sum, [, n]) => sum + n, 0);
+  const { header, license } = pack;
+
+  return (
+    <aside
+      className={styles.panel}
+      id="detail-panel"
+      data-pack-detail={pack.path}
+      data-pack-library={pack.libraryId}
+    >
+      <div className={styles.thumbArea}>
+        {src ? (
+          <img
+            src={convertFileSrc(src)}
+            alt={pack.name}
+            className={styles.thumbImg}
+            ref={scaling}
+          />
+        ) : (
+          <div className={styles.thumbPlaceholder}>
+            <IconPackage size={40} className={styles.thumbPackIcon} />
+          </div>
+        )}
+      </div>
+
+      <div className={styles.header}>
+        <p className={clsx(styles.fileName, styles.packName)} title={pack.path || pack.name}>
+          <IconPackage size={14} className={styles.packIcon} />
+          <span id="detail-pack-name" className="truncate">
+            {pack.name}
+          </span>
+        </p>
+      </div>
+
+      {pack.gallery.length > 0 && (
+        <section className={styles.groupFiles} id="detail-pack-gallery">
+          <p className={styles.groupFilesTitle}>Gallery ({pack.gallery.length})</p>
+          <div className={styles.packGallery}>
+            {pack.gallery.map((g) => {
+              const thumb = coverImage(g);
+              const name = g.filePath.slice(g.filePath.lastIndexOf('/') + 1);
+              return (
+                <button
+                  key={g.filePath}
+                  data-gallery-image={g.filePath}
+                  className={clsx(
+                    styles.packGalleryItem,
+                    image?.filePath === g.filePath && styles.packGalleryShown
+                  )}
+                  title={name}
+                  onClick={() => setShown(g.filePath)}
+                >
+                  {thumb ? (
+                    <img src={convertFileSrc(thumb)} alt={name} loading="lazy" />
+                  ) : (
+                    <span className={styles.groupFileExt}>{g.extension.toUpperCase()}</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      <div className={styles.tabContent}>
+        <div className={styles.infoGrid}>
+          {header?.version && (
+            <>
+              <label className={styles.infoLabel}>Version</label>
+              <span id="detail-pack-version" className={styles.infoValue}>
+                {header.version}
+              </span>
+            </>
+          )}
+          {header?.author && (
+            <>
+              <label className={styles.infoLabel}>Author</label>
+              <span id="detail-pack-author" className={styles.infoValue}>
+                {header.author}
+              </span>
+            </>
+          )}
+
+          <label className={styles.infoLabel}>License</label>
+          {license ? (
+            <span className={styles.licenseRow}>
+              <span id="detail-pack-license" className={styles.infoValue}>
+                {LICENSE_LABEL[license.kind] ?? license.kind}
+              </span>
+              <button
+                id="detail-open-license"
+                className={styles.openLicenseBtn}
+                title={license.filePath}
+                onClick={async () => {
+                  try {
+                    await api.openWithDefault(license.filePath);
+                  } catch (err) {
+                    console.error('Failed to open the license:', err);
+                  }
+                }}
+              >
+                <IconExternal size={11} />
+                <span>Open license</span>
+              </button>
+            </span>
+          ) : (
+            <span id="detail-pack-license" className={styles.infoValue}>
+              No license file
+            </span>
+          )}
+
+          <label className={styles.infoLabel}>Items</label>
+          <span className={styles.infoValue}>{pack.itemCount.toLocaleString()}</span>
+
+          <label className={styles.infoLabel}>Files</label>
+          <ul id="detail-pack-kinds" className={clsx(styles.infoValue, styles.packKinds)}>
+            {kinds.map(([kind, n]) => (
+              <li key={kind} data-kind={kind}>
+                <span>{KIND_LABEL[kind] ?? kind}</span>
+                <span className={styles.mono}>{n.toLocaleString()}</span>
+              </li>
+            ))}
+            {kinds.length > 1 && (
+              <li>
+                <span>Total</span>
+                <span className={styles.mono}>{files.toLocaleString()}</span>
+              </li>
+            )}
+          </ul>
+
+          <label className={styles.infoLabel}>Size</label>
+          <span id="detail-pack-size" className={clsx(styles.infoValue, styles.mono)}>
+            {formatSize(pack.sizeBytes)}
+          </span>
+
+          <label className={styles.infoLabel}>Folder</label>
+          <span className={clsx(styles.infoValue, styles.mono)}>{pack.path || '/'}</span>
+        </div>
+      </div>
     </aside>
   );
 }

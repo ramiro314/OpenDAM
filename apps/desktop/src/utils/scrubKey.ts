@@ -4,7 +4,7 @@
 import type { Asset, AssetKind, SortField } from '../types';
 import { formatSize } from './format';
 
-const KIND_LABEL: Record<AssetKind, string> = {
+export const KIND_LABEL: Record<AssetKind, string> = {
   '3d_model': '3D Model',
   material: 'Material',
   texture: 'Texture',

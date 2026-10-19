@@ -20,6 +20,7 @@ import {
   useAutotagStore,
   useFolderTreeStore,
   usePacksStore,
+  usePackDetailStore,
   useLiveCountsStore,
   lookupAsset,
 } from './store';
@@ -101,6 +102,7 @@ export default function App() {
       useLibraryStore.getState().fetchLibraries();
       useFolderTreeStore.getState().refetch();
       usePacksStore.getState().refetch();
+      usePackDetailStore.getState().refetch();
     });
 
     // Keyboard shortcuts: F5, Space hold for QuickLook, Ctrl+C to copy path
