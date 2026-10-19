@@ -1994,6 +1994,47 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_blend_led_group_with_a_render_gets_no_stand_in_until_the_render_goes() {
+        let pool = memory_library_pool().await;
+        let (blend, obj, render) = (
+            "kit/ship.blend",
+            "kit/OBJ format/ship.obj",
+            "kit/Previews/ship.png",
+        );
+        for path in [blend, obj, render] {
+            insert_with_preview(&pool, path, "none").await;
+        }
+        rebuild(&pool).await.unwrap();
+        // The `.blend` leads and shows the render, so the OBJ stands in for nothing.
+        assert_eq!(
+            derived_rows(&pool).await.bundled_previews,
+            [(blend.to_string(), render.to_string())]
+        );
+        assert_eq!(
+            previews(&pool).await,
+            (
+                pairs(&[(obj, "none"), (render, "pending"), (blend, "none")]),
+                pairs(&[(render, "pending")]),
+            )
+        );
+        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+
+        // Without the render, the OBJ is queued as the group's stand-in.
+        sqlx::query("DELETE FROM assets WHERE id = ?")
+            .bind(render)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM preview_jobs WHERE asset_id = ?")
+            .bind(render)
+            .execute(&pool)
+            .await
+            .unwrap();
+        rebuild(&pool).await.unwrap();
+        assert_eq!(previews(&pool).await.1, pairs(&[(obj, "pending")]));
+    }
+
+    #[tokio::test]
     async fn a_file_on_its_own_needing_no_preview_gets_no_job() {
         let pool = memory_library_pool().await;
         for path in ["kit/rock.blend", "kit/notes.md", "kit/a/tree.glb"] {
