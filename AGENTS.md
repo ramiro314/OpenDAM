@@ -131,8 +131,11 @@ docs/plans                    Plans for this fork
   - The preview queue skips members other than the main item, and their thumbnails stay on disk.
     An index run queues no new file itself: the pass it ends with queues every file but those
     members (support files' cover images included), so a member is never queued, even during a
-    library's first index. The pass also takes a file
-    that has become a member off the queue, and `claim_jobs` skips members. `preview.rs` owns the job
+    library's first index. The pass also takes a file that has become a member off the queue,
+    and `claim_jobs` skips members. One exception: a group whose main item takes no preview,
+    such as a `.blend`, keeps its best previewable member queued as a stand-in
+    (`structure::preview_stand_ins`, `preview::claim_jobs`'s `STANDS_IN`), and its card shows
+    that member's thumbnail. `preview.rs` owns the job
     states and how an asset goes on or off the queue (`preview::enqueue`, `preview::unqueue`).
 
 ## Python preview worker

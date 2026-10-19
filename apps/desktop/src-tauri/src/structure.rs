@@ -525,9 +525,10 @@ async fn apply_groups(
 }
 
 /// Keeps group members off the preview queue (plan C15). A group member other than its main item
-/// comes off the queue, keeping any thumbnail it has. Any other file at `none` whose format takes
-/// a preview goes on it: a new file, a member that became a main item, or a pack's cover image,
-/// which "Show hidden files" shows and a pack card pictures. `preview::unqueue` and
+/// comes off the queue, keeping any thumbnail it has, unless it is its group's stand-in
+/// (`preview_stand_ins`). Any other file at `none` whose format takes a preview goes on it: a new
+/// file, a member that became a main item, a stand-in, or a pack's cover image, which "Show
+/// hidden files" shows and a pack card pictures. `preview::unqueue` and
 /// `preview::enqueue` own how. Returns how many assets it changed.
 async fn apply_previews(
     pool: &Pool<Sqlite>,
@@ -535,11 +536,12 @@ async fn apply_previews(
     structure: &Structure,
 ) -> sqlx::Result<usize> {
     let waiting = crate::preview::assets_waiting_for_jobs(pool).await?;
+    let stand_ins = preview_stand_ins(files, &structure.groups);
     let mut members = Vec::new();
     let mut items = Vec::new();
     for (i, file) in files.iter().enumerate() {
         let main = structure.groups[i];
-        if main.is_some_and(|m| m != i) {
+        if main.is_some_and(|m| m != i) && !stand_ins.contains(&i) {
             if file.preview_status == "pending" || waiting.contains(&file.id) {
                 members.push(file.id.as_str());
             }
@@ -563,6 +565,39 @@ async fn apply_previews(
         tx.commit().await?;
     }
     Ok(members.len() + items.len())
+}
+
+/// The member that is previewed for its group, by index into `files`, for each group whose main
+/// item's format takes no preview, such as a `.blend` beside an `.obj`: the previewable member
+/// that ranks first by format, then by path ignoring case. The card shows its thumbnail
+/// (`commands::asset`'s `ASSET_COLUMNS`), and `preview::claim_jobs` lets its job through.
+fn preview_stand_ins(files: &[FileRow], groups: &[Option<usize>]) -> HashSet<usize> {
+    let mut best: HashMap<usize, usize> = HashMap::new();
+    let key = |i: usize| {
+        let file = &files[i];
+        (
+            format_rank(&file.extension),
+            file.file_path.to_ascii_lowercase(),
+            file.file_path.clone(),
+        )
+    };
+    for (i, main) in groups.iter().enumerate() {
+        let Some(main) = *main else { continue };
+        if main == i
+            || crate::preview::needs_preview(&files[main].extension)
+            || !crate::preview::needs_preview(&files[i].extension)
+        {
+            continue;
+        }
+        best.entry(main)
+            .and_modify(|b| {
+                if key(i) < key(*b) {
+                    *b = i;
+                }
+            })
+            .or_insert(i);
+    }
+    best.into_values().collect()
 }
 
 /// Runs the pass on the library DB at `pool`: reads every indexed path, derives the structure and
@@ -1541,6 +1576,47 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(rebuild(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_group_led_by_a_blend_keeps_its_best_previewable_member_queued() {
+        // No glTF or FBX: the `.blend` leads (D12), and no preview reads it
+        let paths = [
+            "Ships/Bob/Blend/Bob.blend",
+            "Ships/Bob/OBJ/Bob.obj",
+            "Ships/Bob/DAE/Bob.dae",
+        ];
+        assert_eq!(groups_of(&paths), [paths.to_vec()]);
+        let pool = memory_library_pool().await;
+        insert_with_preview(&pool, paths[0], "none").await;
+        for path in &paths[1..] {
+            insert_with_preview(&pool, path, "pending").await;
+            add_job(&pool, path, "pending").await;
+        }
+        rebuild(&pool).await.unwrap();
+        // The OBJ ranks before the DAE, so it stands in, and the DAE comes off the queue
+        assert_eq!(
+            previews(&pool).await,
+            (
+                pairs(&[
+                    (paths[0], "none"),
+                    (paths[2], "none"),
+                    (paths[1], "pending")
+                ]),
+                pairs(&[(paths[1], "pending")]),
+            )
+        );
+        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_new_blend_and_obj_pair_queues_the_obj() {
+        let pool = memory_library_pool().await;
+        let (blend, obj) = ("kit/Blend/rock.blend", "kit/OBJ/rock.obj");
+        insert_with_preview(&pool, blend, "none").await;
+        insert_with_preview(&pool, obj, "none").await;
+        rebuild(&pool).await.unwrap();
+        assert_eq!(previews(&pool).await.1, pairs(&[(obj, "pending")]));
     }
 
     #[tokio::test]

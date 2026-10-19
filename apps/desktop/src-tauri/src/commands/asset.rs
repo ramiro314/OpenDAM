@@ -778,11 +778,17 @@ async fn count_assets(pool: &sqlx::Pool<sqlx::Sqlite>, filter: &SqlFilter) -> sq
     Ok(Counts { items, files })
 }
 
-/// The columns of a `RawAssetRow` selected from `assets a`.
+/// The columns of a `RawAssetRow` selected from `assets a`. A main item with no thumbnail
+/// of its own, such as a `.blend`, shows a member's (`structure::preview_stand_ins`).
 const ASSET_COLUMNS: &str = r#"
     a.id, a.file_path, a.file_name, a.extension, a.kind,
     a.size_bytes, a.modified_at, a.indexed_at, a.rating,
-    a.color_label, a.is_favorite, a.description, a.thumbnail_path,
+    a.color_label, a.is_favorite, a.description,
+    COALESCE(a.thumbnail_path, CASE WHEN a.group_id = a.id THEN
+        (SELECT m.thumbnail_path FROM assets m
+         WHERE m.group_id = a.id AND m.thumbnail_path IS NOT NULL
+         ORDER BY m.file_path LIMIT 1)
+    END) AS thumbnail_path,
     a.preview_status, a.metadata,
     (SELECT json_group_array(tag_id) FROM asset_tags WHERE asset_id = a.id) AS tags,
     (SELECT json_group_array(collection_id) FROM collection_assets WHERE asset_id = a.id) AS collections,
@@ -3323,6 +3329,58 @@ mod tests {
         assert_eq!(
             (ids, total, files),
             (strings(&[ROCK, ROCK, SEDAN, SEDAN]), Some(4), Some(4))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_main_item_with_no_thumbnail_shows_a_members() {
+        let pool = memory_library_pool().await;
+        for (path, thumb) in [
+            ("kit/Blend/rock.blend", None),
+            ("kit/OBJ/rock.obj", Some(".opendam/thumbs/rock_obj.png")),
+        ] {
+            let name = path.rsplit('/').next().unwrap();
+            let ext = name.rsplit_once('.').unwrap().1;
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, thumbnail_path)
+                 VALUES (?, ?, ?, ?, '3d_model', 1, 0, 0, ?)",
+            )
+            .bind(path)
+            .bind(path)
+            .bind(name)
+            .bind(ext)
+            .bind(thumb)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        structure::rebuild(&pool).await.unwrap();
+        let libs = [LibraryHandle {
+            id: "lib".to_string(),
+            name: "lib".to_string(),
+            root_path: PathBuf::from("/libraries/lib"),
+            pool,
+        }];
+        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+            "query": { "text": "", "filter": {}, "sort": { "field": "name", "order": "asc" } },
+            "page": 0,
+            "pageSize": 10,
+        }))
+        .unwrap();
+        let result = search_libraries(&payload, &target_libraries(&payload.query, &libs))
+            .await
+            .unwrap();
+        let shown: Vec<(String, Option<String>)> = result
+            .assets
+            .into_iter()
+            .map(|a| (a.file_name, a.thumbnail_path))
+            .collect();
+        assert_eq!(
+            shown,
+            [(
+                "rock.blend".to_string(),
+                Some("/libraries/lib/.opendam/thumbs/rock_obj.png".to_string())
+            )]
         );
     }
 

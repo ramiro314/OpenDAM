@@ -298,6 +298,12 @@ pub(crate) const NATIVE_EXTS_SQL: &str =
 /// A claimed job: (job_id, asset_id, file_path)
 type Job = (String, String, String);
 
+/// A group member whose main item has no preview of its own, as a `.blend` never does: the
+/// structure pass queues one such member as the group's stand-in (`structure::apply_previews`),
+/// and its job is claimed. Every other member's is skipped.
+const STANDS_IN: &str = "EXISTS (SELECT 1 FROM assets g
+    WHERE g.id = a.group_id AND g.preview_status = 'none' AND g.thumbnail_path IS NULL)";
+
 /// The job states a worker can still claim a job from.
 pub(crate) const WAITING_JOBS: &str = "('pending', 'queued', 'fallback')";
 /// The job states of a job not yet finished: waiting, or running.
@@ -363,7 +369,7 @@ async fn claim_jobs(pool: &Pool<Sqlite>, filter: &str, limit: usize) -> Vec<Job>
         // A group member other than its main item never shows in the grid, so it gets no preview
         // (plan C15). The structure pass drops its waiting jobs; this skips any queued since.
         "SELECT p.id, p.asset_id, a.file_path FROM preview_jobs p JOIN assets a ON p.asset_id = a.id
-         WHERE ({filter}) AND {MAIN_OR_SINGLE} LIMIT {limit}"
+         WHERE ({filter}) AND ({MAIN_OR_SINGLE} OR {STANDS_IN}) LIMIT {limit}"
     ))
     .fetch_all(pool)
     .await
@@ -961,10 +967,11 @@ mod tests {
     #[tokio::test]
     async fn claiming_skips_a_group_members_job() {
         let pool = crate::db::memory_library_pool().await;
+        // As the structure pass leaves them: the main item waits for its preview
         for (id, group) in [("glb", Some("glb")), ("fbx", Some("glb")), ("png", None)] {
             sqlx::query(
-                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, group_id)
-                 VALUES (?, ?, ?, ?, 'texture', 1, 0, 0, ?)",
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, group_id, preview_status)
+                 VALUES (?, ?, ?, ?, 'texture', 1, 0, 0, ?, 'pending')",
             )
             .bind(id)
             .bind(format!("{id}/a.{id}"))
@@ -988,6 +995,46 @@ mod tests {
             .collect();
         claimed.sort();
         assert_eq!(claimed, ["glb", "png"]);
+    }
+
+    #[tokio::test]
+    async fn claiming_takes_a_members_job_when_its_main_item_has_no_preview() {
+        let pool = crate::db::memory_library_pool().await;
+        for (id, ext, group) in [
+            ("blend", "blend", "blend"),
+            ("obj", "obj", "blend"),
+            ("glb", "glb", "glb"),
+            ("fbx", "fbx", "glb"),
+        ] {
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, group_id, preview_status)
+                 VALUES (?, ?, ?, ?, '3d_model', 1, 0, 0, ?, ?)",
+            )
+            .bind(id)
+            .bind(format!("{id}/a.{ext}"))
+            .bind(format!("a.{ext}"))
+            .bind(ext)
+            .bind(group)
+            .bind(if id == "glb" { "pending" } else { "none" })
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for id in ["obj", "glb", "fbx"] {
+            sqlx::query("INSERT INTO preview_jobs (id, asset_id, status, created_at) VALUES (?, ?, 'pending', 0)")
+                .bind(format!("job-{id}"))
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let mut claimed: Vec<String> = claim_jobs(&pool, "p.status = 'pending'", 10)
+            .await
+            .into_iter()
+            .map(|(_, asset, _)| asset)
+            .collect();
+        claimed.sort();
+        assert_eq!(claimed, ["glb", "obj"]);
     }
 
     #[tokio::test]
