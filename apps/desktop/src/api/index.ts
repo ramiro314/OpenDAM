@@ -3,11 +3,14 @@ import type {
   Asset,
   Library,
   Collection,
+  FacetCounts,
+  FolderCounts,
   FolderNode,
   Tag,
   TagPatch,
   AddLibraryPayload,
   SearchPayload,
+  SearchQuery,
   SearchResult,
   PreviewJob,
   PendingModelThumbnail,
@@ -53,6 +56,11 @@ export const api = {
   // Folder tree: the children of one node, `''` being the library root
   getFolders: (libraryId: string, parentPath: string) =>
     invoke<FolderNode[]>('get_folders', { libraryId, parentPath }),
+
+  // Live counts while search text or a filter is active, each the grid's total for its value
+  getFacetCounts: (query: SearchQuery) => invoke<FacetCounts>('get_facet_counts', { query }),
+  getFolderCounts: (query: SearchQuery, libraryId: string, parentPaths: string[]) =>
+    invoke<FolderCounts>('get_folder_counts', { query, libraryId, parentPaths }),
 
   // Tags
   listTags: () => invoke<Tag[]>('list_tags'),

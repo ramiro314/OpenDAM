@@ -224,6 +224,8 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::library::refresh_library,
             commands::library::refresh_all_libraries,
             commands::asset::search_assets,
+            commands::asset::get_facet_counts,
+            commands::asset::get_folder_counts,
             commands::asset::get_asset,
             commands::asset::update_asset,
             commands::asset::delete_asset,

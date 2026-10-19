@@ -199,6 +199,15 @@ The UI checks, each defined in its plan:
   finds `sedan.glb` through its FBX copy's folder.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 3. Screenshots:
   `U11-kit-models`, `U11-list-badge`, `U11-fbx-format`.
+- **U13** (live counts): with `3D assets/Platformer Kit/Models` expanded, a search for "tree"
+  gives every shown tree node a badge with its live count, the grid's total once that folder is
+  selected, and dims the nodes with none. The kit's `GLB format/`, `FBX format/` and `OBJ format/`
+  each count as many items as `Models/`, and selecting `Models/` gives that total. Each sidebar
+  Types option and each format pill (the filter bar's File Type mode) shows the grid's total with
+  that kind or extension as its only one, which picking 3D models and `.fbx` confirms. Each node's
+  `get_folder_counts` call takes under 300 ms.
+  [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 5. Screenshots:
+  `U13-tree-counts`, `U13-filter-counts`.
 
 Run it with the script, from the repo root:
 

@@ -1,11 +1,17 @@
 // The UI checks `VITE_SCROLL_BENCH=checks` runs (U1-U8 in
-// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U11 in
-// docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
+// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U11 and
+// U13 in docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
 // check here.
 
 import { api } from '../api';
-import { useAssetStore, useFolderTreeStore, useLibraryStore, useUIStore } from '../store';
-import type { FolderNode, SortField, SortOrder } from '../types';
+import {
+  useAssetStore,
+  useFolderTreeStore,
+  useLibraryStore,
+  useLiveCountsStore,
+  useUIStore,
+} from '../store';
+import type { FolderNode, SearchQuery, SortField, SortOrder } from '../types';
 import { isFolderShown } from '../components/Sidebar/sidebarHelpers';
 import { formatItemsAndFiles } from '../utils/format';
 import { assetAt } from '../store/pageCache';
@@ -1398,6 +1404,170 @@ export const UI_CHECKS: UiCheck[] = [
       );
 
       await searchWith({ text: '', folder: undefined }, waitFor);
+    },
+  },
+  {
+    id: 'U13',
+    title:
+      'A search for "tree" counts its items on the expanded tree nodes and the Types and format ' +
+      "filters, each count the grid's total for its folder or value, and dims folders with none",
+    run: async ({ assert, waitFor, pause, sleep }) => {
+      await expandBenchLibrary({ assert, sleep });
+      const kitPath = '3D assets/Platformer Kit';
+      const modelsPath = `${kitPath}/Models`;
+      const parents = ['', '3D assets', kitPath, modelsPath];
+      for (const path of parents.slice(1)) await expandFolder(path);
+      await searchWith({ text: 'tree', folder: undefined }, waitFor);
+      const live = () => useLiveCountsStore.getState();
+      const counted = (parent: string) => live().folders[BENCH_LIBRARY]?.[parent];
+      await waitFor(
+        () => live().facets !== null && parents.every((p) => counted(p) !== undefined),
+        30_000,
+        'the live counts'
+      );
+      const { query } = useAssetStore.getState();
+
+      // A node's folder counts take under 300 ms, through IPC
+      for (const parent of parents) {
+        const start = performance.now();
+        await api.getFolderCounts(query, BENCH_LIBRARY, [parent]);
+        const ms = performance.now() - start;
+        assert(
+          ms < 300,
+          `counting the folders in ${parent || 'the root'} took ${ms.toFixed(0)} ms`
+        );
+      }
+
+      /** The grid's total for the search with `patch` applied. */
+      const totalWith = async (patch: Partial<SearchQuery>) => {
+        const result = await api.searchAssets({
+          query: { ...query, ...patch },
+          page: 0,
+          pageSize: 1,
+          includeTotal: true,
+        });
+        return result.total ?? -1;
+      };
+
+      // Each shown node's badge is its live count, which is the grid's total once it's selected,
+      // and a node with none dims
+      let checked = 0;
+      let dimmed = 0;
+      for (const parent of parents) {
+        const children = useFolderTreeStore.getState().children[BENCH_LIBRARY]?.[parent] ?? [];
+        for (const node of children) {
+          const row = folderRow(node.path);
+          if (!row) continue;
+          const count = counted(parent)![node.path] ?? 0;
+          assert(
+            shownCount(row) === count,
+            `${node.path}'s badge reads ${shownCount(row)}, not ${count}`
+          );
+          assert(
+            (row.dataset.noMatches !== undefined) === (count === 0),
+            `${node.path}, with ${count} matches, is ${count === 0 ? 'not ' : ''}dimmed`
+          );
+          const total = await totalWith({ folder: { libraryId: BENCH_LIBRARY, path: node.path } });
+          assert(total === count, `${node.path} counts ${count}, its grid holds ${total}`);
+          checked += 1;
+          if (count === 0) dimmed += 1;
+        }
+      }
+      assert(checked > dimmed && dimmed > 0, `${checked} nodes checked, ${dimmed} dimmed`);
+
+      // The kit's format folders each count its tree models, and `Models/` counts them once
+      const inModels = counted(kitPath)![modelsPath] ?? 0;
+      assert(inModels > 0, `${modelsPath} counts no tree`);
+      for (const format of ['GLB format', 'FBX format', 'OBJ format']) {
+        const path = `${modelsPath}/${format}`;
+        const count = counted(modelsPath)![path] ?? 0;
+        assert(count === inModels, `${path} counts ${count}, ${modelsPath} ${inModels}`);
+      }
+      folderRow(modelsPath)!.scrollIntoView({ block: 'center' });
+      await pause('U13-tree-counts');
+
+      /** Clicks `el`, which changes the search, and waits for its results. */
+      const clickAndSearch = async (el: HTMLElement, what: string) => {
+        const generation = useAssetStore.getState().generation;
+        el.click();
+        await waitFor(
+          () => {
+            const st = useAssetStore.getState();
+            return st.generation > generation && !st.loading;
+          },
+          30_000,
+          what
+        );
+      };
+      /** The live count `el` shows. */
+      const liveCount = (el: HTMLElement) => {
+        const badge = el.querySelector('[data-live-count]');
+        assert(badge, `#${el.id} shows no live count`);
+        return parseCount(badge!.textContent ?? '');
+      };
+
+      // Selecting a folder gives the grid total its badge showed
+      await clickAndSearch(folderRow(modelsPath)!, `the search in ${modelsPath}`);
+      assert(
+        useAssetStore.getState().total === inModels,
+        `${modelsPath} holds ${useAssetStore.getState().total}, its badge read ${inModels}`
+      );
+      await searchWith({ folder: undefined }, waitFor);
+      await waitFor(() => live().facets !== null, 30_000, 'the kind and extension counts');
+
+      // The sidebar's Types: each kind's count, and picking the 3D models
+      const kinds = [...document.querySelectorAll<HTMLElement>('[id^="sidebar-filter-type-"]')];
+      assert(kinds.length > 0, 'no Types options in the sidebar');
+      for (const option of kinds) {
+        const kind = option.id.slice('sidebar-filter-type-'.length);
+        const count = liveCount(option);
+        assert(count === (live().facets!.kinds[kind] ?? 0), `${kind}'s count isn't its live count`);
+        const total = await totalWith({ filter: { ...query.filter, kinds: [kind] as never } });
+        assert(total === count, `${kind} counts ${count}, its grid holds ${total}`);
+      }
+      const models = document.getElementById('sidebar-filter-type-3d_model')!;
+      const modelCount = liveCount(models);
+      assert(modelCount > 0, 'the search counts no 3D model');
+      await clickAndSearch(models, 'the search for 3D models');
+      assert(
+        useAssetStore.getState().total === modelCount,
+        `3D models hold ${useAssetStore.getState().total}, the count read ${modelCount}`
+      );
+      await clickAndSearch(document.getElementById('sidebar-filter-type-3d_model')!, 'any kind');
+
+      // The format filter: each extension's count, and picking FBX
+      document.getElementById('filter-mode-extension')!.click();
+      await frames(3);
+      const pills = [...document.querySelectorAll<HTMLElement>('[id^="filter-ext-"]')].filter(
+        (el) => el.querySelector('[data-live-count]')
+      );
+      assert(pills.length > 0, 'no format pill shows a count');
+      let matching = 0;
+      for (const pill of pills) {
+        const ext = pill.id.slice('filter-ext-'.length);
+        const count = liveCount(pill);
+        assert(
+          count === (live().facets!.extensions[ext] ?? 0),
+          `.${ext}'s count isn't its live count`
+        );
+        assert((pill.dataset.noMatches !== undefined) === (count === 0), `.${ext}'s dimming`);
+        const total = await totalWith({ filter: { ...query.filter, extensions: [ext] } });
+        assert(total === count, `.${ext} counts ${count}, its grid holds ${total}`);
+        if (count > 0) matching += 1;
+      }
+      assert(matching >= 3, `only ${matching} formats match "tree"`);
+      await pause('U13-filter-counts');
+      const fbx = document.getElementById('filter-ext-fbx')!;
+      const fbxCount = liveCount(fbx);
+      await clickAndSearch(fbx, 'the search for FBX');
+      assert(
+        useAssetStore.getState().total === fbxCount,
+        `FBX holds ${useAssetStore.getState().total}, the count read ${fbxCount}`
+      );
+      await clickAndSearch(document.getElementById('filter-ext-fbx')!, 'any format');
+      document.getElementById('filter-mode-software')!.click();
+
+      await searchWith({ text: '' }, waitFor);
     },
   },
 ];

@@ -185,7 +185,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SearchQuery {
     pub text: String,
     pub filter: FilterSpec,
@@ -267,7 +267,7 @@ pub struct RatingRange {
     pub max: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SortSpec {
     pub field: String,
     pub order: String,

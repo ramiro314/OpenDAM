@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useAssetStore } from '../../store';
+import { useAssetStore, useLiveCountsStore } from '../../store';
 import type { AssetKind, ColorLabel } from '../../types';
 import { IconFilter, IconX, IconLayers, IconFileText, IconInbox, IconHeartFilled } from '../Icons';
 import styles from './FilterBar.module.css';
@@ -116,6 +116,8 @@ const EXTENSION_OPTIONS: ExtensionOption[] = [
   { ext: 'ai', label: '.ai', softwareHint: 'Illustrator' },
   { ext: 'exr', label: '.exr', softwareHint: 'OpenEXR' },
   { ext: 'hdr', label: '.hdr', softwareHint: 'Radiance HDR' },
+  { ext: 'glb', label: '.glb', softwareHint: 'glTF binary' },
+  { ext: 'gltf', label: '.gltf', softwareHint: 'glTF' },
   { ext: 'fbx', label: '.fbx', softwareHint: 'FBX' },
   { ext: 'obj', label: '.obj', softwareHint: 'OBJ' },
   { ext: '3ds', label: '.3ds', softwareHint: '3DS' },
@@ -128,6 +130,8 @@ export function FilterBar() {
   const { query, setFilter, setSort, search } = useAssetStore();
   const { filter, sort } = query;
   const [filterMode, setFilterMode] = useState<'software' | 'extension'>('software');
+  // While search text or a filter is on: each extension's grid total with it as the only one
+  const extensionCounts = useLiveCountsStore((s) => s.facets?.extensions);
 
   const hasActiveFilters =
     (filter.kinds?.length ?? 0) > 0 ||
@@ -406,16 +410,27 @@ export function FilterBar() {
             <div className={styles.pills}>
               {EXTENSION_OPTIONS.map(({ ext, label, softwareHint }) => {
                 const active = filter.extensions?.includes(ext);
+                const count = extensionCounts && (extensionCounts[ext] ?? 0);
                 return (
                   <button
                     key={ext}
                     id={`filter-ext-${ext}`}
-                    className={clsx(styles.extPill, active && styles.extActive)}
+                    className={clsx(
+                      styles.extPill,
+                      active && styles.extActive,
+                      count === 0 && styles.noMatches
+                    )}
+                    data-no-matches={count === 0 || undefined}
                     onClick={() => toggleExtension(ext)}
                     title={`${label} (${softwareHint})`}
                   >
                     <span>{label}</span>
                     <span className={styles.extSoftwareHint}>{softwareHint}</span>
+                    {count !== undefined && (
+                      <span className={styles.extCount} data-live-count>
+                        {count.toLocaleString()}
+                      </span>
+                    )}
                   </button>
                 );
               })}

@@ -807,3 +807,4 @@ export const useCollectionStore = create<CollectionStore>()((set) => ({
 }));
 
 export { useFolderTreeStore } from './folderTree';
+export { useLiveCountsStore } from './liveCounts';

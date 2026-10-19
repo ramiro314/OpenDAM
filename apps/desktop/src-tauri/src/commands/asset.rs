@@ -178,12 +178,9 @@ async fn search_libraries(
 ) -> Result<SearchResult> {
     let offset = payload.page * payload.page_size;
     let limit = payload.page_size;
-    let split = match (&payload.query.folder, target_libs.first()) {
-        (Some(folder), Some((pool, _))) => splits_groups(pool, &folder.path)
-            .await
-            .map_err(|e| e.to_string())?,
-        _ => false,
-    };
+    let split = folder_splits_groups(&payload.query, target_libs)
+        .await
+        .map_err(|e| e.to_string())?;
     let filter = search_filter(&payload.query, split);
     let sort_field = payload.query.sort.field.as_str();
     let is_asc = payload.query.sort.order == "asc";
@@ -501,7 +498,8 @@ impl SqlFilter {
         self.binds.iter().chain(file_binds)
     }
 
-    /// The values bound to `files_where_clause`'s placeholders, in order.
+    /// The values bound to `files_where_clause`'s placeholders, in order, and to `grouped_sql`'s
+    /// before its `extra` ones.
     fn files_binds(&self) -> impl Iterator<Item = &String> {
         self.binds.iter().chain(&self.file_binds)
     }
@@ -521,6 +519,31 @@ impl SqlFilter {
         } else {
             format!("WHERE {}", all.join(" AND "))
         }
+    }
+
+    /// Counts the grid items per value of `key`, an expression on a file `m` (plan C23): an item
+    /// counts once toward each value among its files that meet every file-level condition and
+    /// `extra` (on `m`) together. So each count is `where_clause`'s total with the condition
+    /// `key = value` added, and an item can count toward several values. Bound by `files_binds`,
+    /// then the values `extra` binds.
+    fn grouped_sql(&self, key: &str, extra: &[String]) -> String {
+        let mut all: Vec<String> = self.conditions.clone();
+        all.push(MAIN_OR_SINGLE.to_string());
+        if !self.show_hidden {
+            all.push(NOT_SUPPORT.to_string());
+        }
+        let file_conditions = self.file_conditions_on("m");
+        if !file_conditions.is_empty() {
+            all.push(file_conditions);
+        }
+        all.extend(extra.iter().cloned());
+        format!(
+            "SELECT {key} AS value, COUNT(DISTINCT a.id)
+             FROM assets m JOIN assets a ON a.id = COALESCE(m.group_id, m.id)
+             WHERE {}
+             GROUP BY value",
+            all.join(" AND ")
+        )
     }
 }
 
@@ -569,6 +592,18 @@ async fn splits_groups(pool: &sqlx::Pool<sqlx::Sqlite>, path: &str) -> sqlx::Res
         .fetch_optional(pool)
         .await?;
     Ok(split.unwrap_or(0) > 0)
+}
+
+/// Whether the folder `query` names splits format groups in its library, the first of `targets`
+/// (`target_libraries`). False when it names none.
+async fn folder_splits_groups(
+    query: &SearchQuery,
+    targets: &[(sqlx::Pool<sqlx::Sqlite>, Option<std::path::PathBuf>)],
+) -> sqlx::Result<bool> {
+    match (&query.folder, targets.first()) {
+        (Some(folder), Some((pool, _))) => splits_groups(pool, &folder.path).await,
+        _ => Ok(false),
+    }
 }
 
 /// The search for `query`. `split` tells whether its folder splits format groups
@@ -776,6 +811,138 @@ async fn count_assets(pool: &sqlx::Pool<sqlx::Sqlite>, filter: &SqlFilter) -> sq
     }
     let (items, files) = query.fetch_one(pool).await?;
     Ok(Counts { items, files })
+}
+
+/// The grid items per value of `key` that `filter` and `extra` match in the library at `pool`
+/// (`SqlFilter::grouped_sql`), added into `counts`.
+async fn add_grouped_counts(
+    counts: &mut HashMap<String, i64>,
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    filter: &SqlFilter,
+    key: &str,
+    extra: &[String],
+    extra_binds: &[String],
+) -> sqlx::Result<()> {
+    let sql = filter.grouped_sql(key, extra);
+    let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+    for b in filter.files_binds().chain(extra_binds) {
+        query = query.bind(b.clone());
+    }
+    for (value, n) in query.fetch_all(pool).await? {
+        *counts.entry(value).or_default() += n;
+    }
+    Ok(())
+}
+
+/// The live counts beside the sidebar's Types filter and the filter bar's format filter (plan
+/// C23), by kind and by extension.
+#[derive(Debug, Default, PartialEq, serde::Serialize)]
+pub struct FacetCounts {
+    pub kinds: HashMap<String, i64>,
+    pub extensions: HashMap<String, i64>,
+}
+
+/// For each kind and each extension, the grid's total for `query` with that kind, or that
+/// extension, as its only one. Counted once per query, like the total.
+#[tauri::command]
+pub async fn get_facet_counts(
+    query: SearchQuery,
+    state: State<'_, Arc<AppState>>,
+) -> Result<FacetCounts> {
+    let all_libs = state.db.get_all_libraries().await;
+    facet_counts(&query, &target_libraries(&query, &all_libs))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `get_facet_counts` over `targets`, the libraries `query` searches (`target_libraries`), each
+/// adding its items. A kind's count leaves out the query's kind filter, which picking the kind
+/// replaces, and an extension's its extension filter.
+async fn facet_counts(
+    query: &SearchQuery,
+    targets: &[(sqlx::Pool<sqlx::Sqlite>, Option<std::path::PathBuf>)],
+) -> sqlx::Result<FacetCounts> {
+    let split = folder_splits_groups(query, targets).await?;
+    let mut any_kind = query.clone();
+    any_kind.filter.kinds = None;
+    let mut any_extension = query.clone();
+    any_extension.filter.extensions = None;
+    let (by_kind, by_extension) = (
+        search_filter(&any_kind, split),
+        search_filter(&any_extension, split),
+    );
+    let mut counts = FacetCounts::default();
+    for (pool, _) in targets {
+        add_grouped_counts(&mut counts.kinds, pool, &by_kind, "m.kind", &[], &[]).await?;
+        add_grouped_counts(
+            &mut counts.extensions,
+            pool,
+            &by_extension,
+            "m.extension",
+            &[],
+            &[],
+        )
+        .await?;
+    }
+    Ok(counts)
+}
+
+/// For each of `parent_paths` (`""` for the root) in library `library_id`, the grid's total for
+/// `query` in each of its child folders, by child path. A child with no match is left out. Counted
+/// once per query, like the total.
+#[tauri::command]
+pub async fn get_folder_counts(
+    query: SearchQuery,
+    library_id: String,
+    parent_paths: Vec<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<HashMap<String, HashMap<String, i64>>> {
+    let library = state
+        .db
+        .get_library_handle(&library_id)
+        .await
+        .ok_or_else(|| format!("Library {library_id} is not open"))?;
+    folder_counts(&library.pool, &query, &parent_paths)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `get_folder_counts` on the library at `pool`. A folder's count leaves out the query's folder
+/// and collection, which selecting the folder replaces (`LibrariesSection`), and groups the files
+/// below each parent by the path segment that follows it: one query per parent. Files directly in
+/// a parent belong to no child.
+async fn folder_counts(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    query: &SearchQuery,
+    parent_paths: &[String],
+) -> sqlx::Result<HashMap<String, HashMap<String, i64>>> {
+    let mut any_folder = query.clone();
+    any_folder.folder = None;
+    any_folder.collection_id = None;
+    let filter = search_filter(&any_folder, false);
+    let mut counts = HashMap::new();
+    for parent in parent_paths {
+        // As `push_folder_range` reads a folder. SQLite's `substr` and `instr` count characters.
+        let path = parent.trim_matches('/');
+        let (prefix_len, range) = if path.is_empty() {
+            (0, vec![])
+        } else {
+            (
+                path.chars().count() + 1,
+                vec![format!("{path}/"), format!("{path}0")],
+            )
+        };
+        let rest = format!("substr(m.file_path, {})", prefix_len + 1);
+        let child = format!("substr(m.file_path, 1, {prefix_len} + instr({rest}, '/') - 1)");
+        let mut extra = vec![format!("instr({rest}, '/') > 0")];
+        if !range.is_empty() {
+            extra.push("m.file_path >= ? AND m.file_path < ?".to_string());
+        }
+        let mut children = HashMap::new();
+        add_grouped_counts(&mut children, pool, &filter, &child, &extra, &range).await?;
+        counts.insert(parent.clone(), children);
+    }
+    Ok(counts)
 }
 
 /// The columns of a `RawAssetRow` selected from `assets a`. A main item with no thumbnail
@@ -3289,6 +3456,195 @@ mod tests {
         }
     }
 
+    /// A search query from `query`, with an empty text and filter unless it sets them.
+    fn query_of(query: serde_json::Value) -> SearchQuery {
+        let mut query = query;
+        query["sort"] = serde_json::json!({ "field": "name", "order": "asc" });
+        query["text"] = query.get("text").cloned().unwrap_or("".into());
+        query["filter"] = query
+            .get("filter")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        serde_json::from_value(query).unwrap()
+    }
+
+    /// The live folder counts of `query` for the children of `parents` in library `lib`.
+    async fn live_folder_counts(
+        library: &LibraryHandle,
+        query: serde_json::Value,
+        parents: &[&str],
+    ) -> HashMap<String, HashMap<String, i64>> {
+        let parents: Vec<String> = parents.iter().map(|p| p.to_string()).collect();
+        folder_counts(&library.pool, &query_of(query), &parents)
+            .await
+            .unwrap()
+    }
+
+    /// The live kind and extension counts of `query` in `libraries`.
+    async fn live_facet_counts(
+        libraries: &[LibraryHandle],
+        query: serde_json::Value,
+    ) -> FacetCounts {
+        let query = query_of(query);
+        facet_counts(&query, &target_libraries(&query, libraries))
+            .await
+            .unwrap()
+    }
+
+    fn count_map(pairs: &[(&str, i64)]) -> HashMap<String, i64> {
+        pairs.iter().map(|(k, n)| (k.to_string(), *n)).collect()
+    }
+
+    #[tokio::test]
+    async fn every_live_count_is_the_grid_total_for_that_folder_kind_or_extension() {
+        let libs = [grouped_library().await];
+        let pool = &libs[0].pool;
+        let folders: Vec<String> = sqlx::query_scalar("SELECT path FROM folders")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        let parents: Vec<&str> = folders.iter().map(String::as_str).collect();
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT DISTINCT kind FROM assets")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        let extensions: Vec<String> = sqlx::query_scalar("SELECT DISTINCT extension FROM assets")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        let folder = |path: &str| serde_json::json!({ "libraryId": "lib", "path": path });
+        let queries = [
+            serde_json::json!({}),
+            serde_json::json!({ "text": "sedan" }),
+            serde_json::json!({ "text": "fbx" }),
+            serde_json::json!({ "text": "colormap", "filter": { "showHidden": true } }),
+            serde_json::json!({ "text": "license", "filter": { "showHidden": true } }),
+            serde_json::json!({ "filter": { "extensions": ["obj"] } }),
+            serde_json::json!({ "filter": { "kinds": ["texture"], "namePrefix": "c" } }),
+            serde_json::json!({ "filter": { "directory": "kit/Models/FBX format" } }),
+            serde_json::json!({ "folder": folder("kit/Models/FBX format") }),
+            serde_json::json!({ "folder": folder("kit"), "text": "sedan" }),
+        ];
+        let mut nonzero = 0;
+        for query in queries {
+            let total = |patch: serde_json::Value| {
+                let mut q = query.clone();
+                for (key, value) in patch.as_object().unwrap() {
+                    if key == "filter" {
+                        let mut filter = q.get("filter").cloned().unwrap_or(serde_json::json!({}));
+                        for (k, v) in value.as_object().unwrap() {
+                            filter[k] = v.clone();
+                        }
+                        q["filter"] = filter;
+                    } else {
+                        q[key] = value.clone();
+                    }
+                }
+                let libs = &libs;
+                async move { counted_search(libs, q).await.1.unwrap() }
+            };
+
+            let counts = live_folder_counts(&libs[0], query.clone(), &parents).await;
+            for child in folders.iter().filter(|p| !p.is_empty()) {
+                let parent = child.rsplit_once('/').map_or("", |(p, _)| p);
+                let count = counts[parent].get(child).copied().unwrap_or(0);
+                let expected = total(serde_json::json!({ "folder": folder(child) })).await;
+                assert_eq!(count, expected, "{query}: folder {child:?}");
+                nonzero += (count > 0) as usize;
+            }
+            let facets = live_facet_counts(&libs, query.clone()).await;
+            for kind in &kinds {
+                let count = facets.kinds.get(kind).copied().unwrap_or(0);
+                let expected = total(serde_json::json!({ "filter": { "kinds": [kind] } })).await;
+                assert_eq!(count, expected, "{query}: kind {kind}");
+            }
+            for ext in &extensions {
+                let count = facets.extensions.get(ext).copied().unwrap_or(0);
+                let expected =
+                    total(serde_json::json!({ "filter": { "extensions": [ext] } })).await;
+                assert_eq!(count, expected, "{query}: extension {ext}");
+            }
+        }
+        assert!(nonzero > 20, "only {nonzero} folder counts were above 0");
+    }
+
+    #[tokio::test]
+    async fn a_kits_format_folders_each_count_its_models_and_their_parent_counts_them_once() {
+        let library = grouped_library().await;
+        let counts = live_folder_counts(
+            &library,
+            serde_json::json!({ "filter": { "kinds": ["3d_model"] } }),
+            &["kit/Models", "kit", ""],
+        )
+        .await;
+        assert_eq!(
+            counts["kit/Models"],
+            count_map(&[
+                ("kit/Models/GLB format", 2),
+                ("kit/Models/FBX format", 1),
+                ("kit/Models/OBJ format", 2)
+            ])
+        );
+        // Sibling counts add up to more than their parent's: each model counts once in `Models/`.
+        assert_eq!(counts["kit"], count_map(&[("kit/Models", 2)]));
+        assert_eq!(counts[""], count_map(&[("kit", 2), ("other", 1)]));
+    }
+
+    #[tokio::test]
+    async fn search_text_only_a_members_folder_matches_counts_the_group_only_under_that_folder() {
+        let libs = [grouped_library().await];
+        let query = serde_json::json!({ "text": "fbx" });
+        let counts = live_folder_counts(&libs[0], query.clone(), &["kit/Models", ""]).await;
+        // The sedan and the colormap through their FBX copies, and no GLB or OBJ folder.
+        assert_eq!(
+            counts["kit/Models"],
+            count_map(&[("kit/Models/FBX format", 2)])
+        );
+        assert_eq!(counts[""], count_map(&[("kit", 2), ("other", 1)]));
+        let facets = live_facet_counts(&libs, query).await;
+        assert_eq!(
+            facets,
+            FacetCounts {
+                kinds: count_map(&[("3d_model", 2), ("texture", 1)]),
+                extensions: count_map(&[("fbx", 2), ("png", 1)]),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn folder_counts_leave_out_the_collection_selecting_a_folder_replaces() {
+        let libs = [grouped_library().await];
+        let pool = &libs[0].pool;
+        insert_collection(pool, "garage", "garage", None).await;
+        sqlx::query("INSERT INTO collection_assets (collection_id, asset_id) VALUES ('garage', ?)")
+            .bind(SEDAN)
+            .execute(pool)
+            .await
+            .unwrap();
+        let query = serde_json::json!({ "text": "fbx", "collectionId": "garage" });
+        let counts = live_folder_counts(&libs[0], query.clone(), &[""]).await;
+        assert_eq!(counts[""], count_map(&[("kit", 2), ("other", 1)]));
+        let facets = live_facet_counts(&libs, query).await;
+        assert_eq!(facets.extensions, count_map(&[("fbx", 1)]));
+    }
+
+    #[tokio::test]
+    async fn facet_counts_add_up_every_library_searched() {
+        let libs = [grouped_library().await, {
+            let mut other = grouped_library().await;
+            other.id = "other".to_string();
+            other
+        }];
+        let facets = live_facet_counts(&libs, serde_json::json!({ "text": "fbx" })).await;
+        assert_eq!(facets.extensions, count_map(&[("fbx", 4), ("png", 2)]));
+        let one = live_facet_counts(
+            &libs,
+            serde_json::json!({ "text": "fbx", "libraryId": "other" }),
+        )
+        .await;
+        assert_eq!(one.extensions, count_map(&[("fbx", 2), ("png", 1)]));
+    }
+
     #[tokio::test]
     async fn a_main_item_lists_its_groups_formats_and_a_file_on_its_own_none() {
         let libs = [grouped_library().await];
@@ -4136,5 +4492,109 @@ mod tests {
                 times[times.len() - 1]
             );
         }
+    }
+
+    /// Live counts (plan C23, A5) on a copy of the golden snapshot's library DB, named by
+    /// `OPENDAM_GOLDEN_DB` as above. For a search for "tree", every count beside the tree, the
+    /// Types filter and the format filter equals the grid's total, the Platformer Kit's format
+    /// folders each count its models while `Models/` counts them once, and each node's folder
+    /// counts take under 300 ms. Run it with
+    /// `cargo nextest run --run-ignored only golden_snapshot_live_counts --no-capture`.
+    #[tokio::test]
+    #[ignore = "needs OPENDAM_GOLDEN_DB, a copy of the golden snapshot's library.sqlite"]
+    async fn golden_snapshot_live_counts_equal_the_grid_totals_and_take_their_time() {
+        use std::time::{Duration, Instant};
+        let file = std::env::var("OPENDAM_GOLDEN_DB").expect("OPENDAM_GOLDEN_DB is set");
+        let pool = crate::db::connect_library_sqlite(Path::new(&file))
+            .await
+            .unwrap();
+        let libs = [LibraryHandle {
+            id: "golden".to_string(),
+            name: "golden".to_string(),
+            root_path: PathBuf::from("/golden"),
+            pool: pool.clone(),
+        }];
+        let search = || serde_json::json!({ "text": "tree" });
+        let kit = "3D assets/Platformer Kit";
+        let models = format!("{kit}/Models");
+        let parents = ["", "3D assets", kit, models.as_str()];
+
+        // Each node's counts as the tree asks for them when it expands: the median of 10 runs
+        // after 2 warm-ups.
+        let median = |mut times: Vec<Duration>| {
+            times.sort();
+            times[times.len() / 2]
+        };
+        for parent in parents {
+            let mut times = Vec::new();
+            for run in 0..12 {
+                let started = Instant::now();
+                live_folder_counts(&libs[0], search(), &[parent]).await;
+                if run >= 2 {
+                    times.push(started.elapsed());
+                }
+            }
+            let took = median(times);
+            println!("folder counts below {parent:?}: median {took:?} (target under 300 ms)");
+            assert!(
+                took < Duration::from_millis(300),
+                "{parent:?} took {took:?}"
+            );
+        }
+        let started = Instant::now();
+        let counts = live_folder_counts(&libs[0], search(), &parents).await;
+        println!(
+            "folder counts below all four at once: {:?}",
+            started.elapsed()
+        );
+        let started = Instant::now();
+        let facets = live_facet_counts(&libs, search()).await;
+        println!("kind and extension counts: {:?}", started.elapsed());
+
+        let total = |patch: serde_json::Value| {
+            let mut query = search();
+            for (key, value) in patch.as_object().unwrap() {
+                query[key] = value.clone();
+            }
+            let libs = &libs;
+            async move { counted_search(libs, query).await.1.unwrap() }
+        };
+        let mut checked = 0;
+        for parent in parents {
+            let children: Vec<String> =
+                sqlx::query_scalar("SELECT path FROM folders WHERE parent_path = ?")
+                    .bind(parent)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert!(!children.is_empty(), "{parent:?} has no children");
+            for child in children {
+                let count = counts[parent].get(&child).copied().unwrap_or(0);
+                let folder = serde_json::json!({ "libraryId": "golden", "path": child });
+                let expected = total(serde_json::json!({ "folder": folder })).await;
+                assert_eq!(count, expected, "folder {child:?}");
+                checked += 1;
+            }
+        }
+        for (kind, count) in &facets.kinds {
+            let expected = total(serde_json::json!({ "filter": { "kinds": [kind] } })).await;
+            assert_eq!(*count, expected, "kind {kind}");
+        }
+        for (ext, count) in &facets.extensions {
+            let expected = total(serde_json::json!({ "filter": { "extensions": [ext] } })).await;
+            assert_eq!(*count, expected, "extension {ext}");
+        }
+        println!(
+            "{checked} folder counts, {:?} by kind and {:?} by extension, each the grid's total",
+            facets.kinds, facets.extensions
+        );
+
+        let in_models = counts[kit][&models];
+        assert!(in_models > 0);
+        for format in ["GLB format", "FBX format", "OBJ format"] {
+            let path = format!("{models}/{format}");
+            assert_eq!(counts[models.as_str()][&path], in_models, "{path}");
+        }
+        println!("{models} counts {in_models}, and so does each of its format folders");
     }
 }

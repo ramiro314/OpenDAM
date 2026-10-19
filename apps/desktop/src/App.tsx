@@ -19,6 +19,7 @@ import {
   useAssetStore,
   useAutotagStore,
   useFolderTreeStore,
+  useLiveCountsStore,
   lookupAsset,
 } from './store';
 import type { AutotagUpdate } from './types';
@@ -80,6 +81,11 @@ export default function App() {
     useAutotagStore.getState().fetchLastUsed().catch(console.error);
     const unlistenAutotag = listen<AutotagUpdate>('autotag:updated', (event) => {
       useAutotagStore.getState().applyUpdate(event.payload);
+    });
+
+    // Live counts follow the results: once per search or refresh, like the total
+    const stopLiveCounts = useAssetStore.subscribe((s, prev) => {
+      if (s.epoch !== prev.epoch) useLiveCountsStore.getState().recount(s.query);
     });
 
     const unlistenLib = listen('library:updated', () => {
@@ -220,6 +226,7 @@ export default function App() {
       unlistenLib.then((fn) => fn());
       unlistenAutotag.then((fn) => fn());
       stopModelThumbnailer();
+      stopLiveCounts();
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', handleBlur);

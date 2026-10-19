@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import clsx from 'clsx';
-import { useUIStore, useAssetStore } from '../../store';
+import { useUIStore, useAssetStore, useLiveCountsStore } from '../../store';
 import type { ColorLabel, FilterSpec } from '../../types';
 import {
   IconChevronDown,
@@ -69,6 +69,8 @@ export function FiltersSection({ clearSmartFilter }: FiltersSectionProps) {
   const clearFilter = useAssetStore((s) => s.clearFilter);
   const currentFilter = useAssetStore((s) => s.query.filter);
   const search = useAssetStore((s) => s.search);
+  // While search text or a filter is on: each kind's grid total with it as the only kind
+  const kindCounts = useLiveCountsStore((s) => s.facets?.kinds);
 
   const [expanded, setExpanded] = useState(true);
   const [subExpanded, setSubExpanded] = useState({
@@ -189,6 +191,7 @@ export function FiltersSection({ clearSmartFilter }: FiltersSectionProps) {
               label={label}
               icon={icon}
               active={isActive}
+              count={kindCounts && (kindCounts[kind] ?? 0)}
               onClick={() => toggleFilter('kinds', isActive, { kinds: [kind] })}
             />
           );
@@ -356,6 +359,8 @@ interface FilterOptionProps {
   icon?: React.ReactNode;
   active: boolean;
   activeClassName?: string;
+  /** A live count, dimming the option at 0 */
+  count?: number;
   onClick: () => void;
 }
 
@@ -365,18 +370,25 @@ function FilterOption({
   icon,
   active,
   activeClassName = styles.active,
+  count,
   onClick,
 }: FilterOptionProps) {
   return (
     <button
       type="button"
       id={id}
-      className={clsx(styles.item, active && activeClassName)}
+      className={clsx(styles.item, active && activeClassName, count === 0 && styles.noMatches)}
+      data-no-matches={count === 0 || undefined}
       onClick={onClick}
     >
       {icon}
       <span className={clsx(styles.itemName, 'truncate')}>{label}</span>
       {active && <span className={styles.filterActiveChip}>●</span>}
+      {count !== undefined && (
+        <span className={styles.badge} data-live-count>
+          {count.toLocaleString()}
+        </span>
+      )}
     </button>
   );
 }
