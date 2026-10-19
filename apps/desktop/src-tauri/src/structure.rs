@@ -119,13 +119,41 @@ pub struct LicenseFile {
 
 /// What a license file says (`parse_license`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", from = "StoredLicenseText")]
 pub struct LicenseText {
-    #[serde(default)]
     pub kind: LicenseKind,
     /// Its Kenney header, if it has one
-    #[serde(default)]
     pub header: Option<PackHeader>,
+}
+
+/// A `LicenseText` as `pack_json` stores it, including the `headerName` that passes before
+/// `LicenseFile::parser` wrote instead of `header`. Such a license is read again, and if that
+/// read fails it keeps the name it gave, as any unreadable license keeps what it said.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredLicenseText {
+    #[serde(default)]
+    kind: LicenseKind,
+    #[serde(default)]
+    header: Option<PackHeader>,
+    #[serde(default)]
+    header_name: Option<String>,
+}
+
+impl From<StoredLicenseText> for LicenseText {
+    fn from(stored: StoredLicenseText) -> Self {
+        let header = stored.header.or_else(|| {
+            stored.header_name.map(|name| PackHeader {
+                name,
+                version: None,
+                author: None,
+            })
+        });
+        LicenseText {
+            kind: stored.kind,
+            header,
+        }
+    }
 }
 
 /// The license a license file names (`license_kind`).
@@ -3547,9 +3575,18 @@ pub(crate) mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // Its name reads as a header with no version or author.
+        let legacy = LicenseText {
+            kind: LicenseKind::Unknown,
+            header: Some(PackHeader {
+                name: "Car Kit".to_string(),
+                version: None,
+                author: None,
+            }),
+        };
         assert_eq!(
             stored_pack(&pool, "kit").await.license.unwrap().text,
-            LicenseText::default()
+            legacy
         );
 
         assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 1);
@@ -3559,6 +3596,34 @@ pub(crate) mod tests {
             (parse_license(KENNEY_LICENSE), LICENSE_PARSER)
         );
         assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_older_license_that_cant_be_read_again_keeps_its_name() {
+        let pool = memory_library_pool().await;
+        insert_path(&pool, "kit/License.txt").await;
+        rebuild(&pool, unmounted()).await.unwrap();
+        // The pack info a pass before `LicenseFile::parser` wrote
+        sqlx::query(
+            r#"UPDATE folders SET pack_json = '{"name":"Car Kit","cover":null,"license":{"path":"kit/License.txt","headerName":"Car Kit","sizeBytes":1,"modifiedAt":0}}' WHERE path = 'kit'"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The reread fails: the pack keeps its name, and records no read, so it is tried again.
+        rebuild(&pool, unmounted()).await.unwrap();
+        let pack = stored_pack(&pool, "kit").await;
+        assert_eq!(pack.name, "Car Kit");
+        let license = pack.license.unwrap();
+        assert_eq!(
+            (
+                license.text.header.map(|h| h.name),
+                license.parser,
+                license.size_bytes
+            ),
+            (Some("Car Kit".to_string()), 0, 0)
+        );
     }
 
     #[tokio::test]
