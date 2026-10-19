@@ -37,6 +37,21 @@ function isShown(nodes: LoadedNodes, expanded: Set<string>, path: string): boole
   );
 }
 
+/**
+ * The expanded nodes of `libraryId` whose children the tree shows: every ancestor up to the
+ * library row (`''`) is expanded too, and each node is listed under its parent. A collapse keeps
+ * the expanded nodes below it, which show again when it reopens.
+ */
+export function openNodes(
+  s: Pick<FolderTreeStore, 'children' | 'expanded'>,
+  libraryId: string
+): string[] {
+  const paths = s.expanded[libraryId] ?? [];
+  const open = new Set(paths);
+  const nodes = s.children[libraryId] ?? {};
+  return paths.filter((p) => isShown(nodes, open, p));
+}
+
 async function load(libraryId: string, path: string): Promise<FolderNode[] | null> {
   try {
     return await api.getFolders(libraryId, path);

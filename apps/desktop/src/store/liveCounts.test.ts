@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { api } from '../api';
 import { useFolderTreeStore } from './folderTree';
 import { extensionCount, kindCount, useLiveCountsStore } from './liveCounts';
-import type { FacetCounts, FolderCounts, SearchQuery } from '../types';
+import type { FacetCounts, FolderCounts, FolderNode, SearchQuery } from '../types';
 
 const realFacets = api.getFacetCounts;
 const realFolders = api.getFolderCounts;
@@ -42,6 +42,26 @@ function serve() {
   };
 }
 
+/** Sets the tree `children` (parent path to child paths) loaded and `expanded`, in `kenney`. */
+function showTree(children: Record<string, string[]>, expanded: string[]) {
+  const node = (path: string): FolderNode => ({
+    name: path.slice(path.lastIndexOf('/') + 1),
+    path,
+    isPack: false,
+    itemCount: 1,
+    hiddenCount: 0,
+    hasChildren: true,
+    shownWithoutHidden: true,
+    hasVisibleChildren: true,
+  });
+  useFolderTreeStore.setState({
+    children: {
+      kenney: Object.fromEntries(Object.entries(children).map(([p, cs]) => [p, cs.map(node)])),
+    },
+    expanded: { kenney: expanded },
+  });
+}
+
 const counts = () => useLiveCountsStore.getState();
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -66,9 +86,34 @@ describe('kindCount and extensionCount', () => {
 });
 
 describe('useLiveCountsStore', () => {
+  test('a recount asks only for the nodes the tree shows', async () => {
+    const { calls } = serve();
+    const tree = {
+      '': ['2D assets', '3D assets'],
+      '3D assets': ['3D assets/Platformer Kit'],
+      '3D assets/Platformer Kit': ['3D assets/Platformer Kit/Models'],
+    };
+    // `3D assets` is collapsed, so the kit and its models stay expanded but hidden
+    showTree(tree, [
+      '',
+      '3D assets/Platformer Kit',
+      '3D assets/Platformer Kit/Models',
+      '2D assets',
+    ]);
+    counts().recount(query('tree'));
+    await settle();
+    expect(calls).toEqual(['facets:tree', 'folders:tree:kenney:|2D assets']);
+
+    // With the library row collapsed, nothing below it is asked for
+    showTree(tree, ['3D assets', '3D assets/Platformer Kit']);
+    counts().recount(query('rock'));
+    await settle();
+    expect(calls.slice(2)).toEqual(['facets:rock']);
+  });
+
   test('counts the kinds, extensions and every expanded node while search text is on', async () => {
     const { calls } = serve();
-    useFolderTreeStore.setState({ expanded: { kenney: ['', '3D assets'] } });
+    showTree({ '': ['3D assets'] }, ['', '3D assets']);
 
     counts().recount(query('tree'));
     await settle();

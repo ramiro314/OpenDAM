@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { api } from '../api';
 import { showsLiveCounts } from '../components/Sidebar/sidebarHelpers';
 import type { FacetCounts, FolderCounts, SearchQuery } from '../types';
-import { useFolderTreeStore } from './folderTree';
+import { openNodes, useFolderTreeStore } from './folderTree';
 
 interface LiveCountsStore {
   /** Whether the current results show live counts (`showsLiveCounts`) */
@@ -12,8 +12,8 @@ interface LiveCountsStore {
   /** Child folder counts per library id, then per node path, for the nodes counted so far */
   folders: Record<string, FolderCounts>;
   /**
-   * Counts `query`, the one whose results the grid now shows, and every expanded node's
-   * children. Runs once per search or refresh, like the total. Counts that `query` can't change
+   * Counts `query`, the one whose results the grid now shows, and the children of every node
+   * the tree shows expanded (`openNodes`). Runs once per search or refresh, like the total. Counts that `query` can't change
    * stay on screen until the new ones arrive: all of them on a refresh, and the folder counts
    * when only the selected folder or collection changed, which they leave out.
    */
@@ -76,8 +76,11 @@ export const useLiveCountsStore = create<LiveCountsStore>()((set, get) => ({
         if (current === generation) set({ facets });
       })
       .catch((e) => console.error('Failed to count kinds and extensions:', e));
-    for (const [libraryId, paths] of Object.entries(useFolderTreeStore.getState().expanded)) {
-      get().countFolders(libraryId, paths);
+    // Only the nodes the tree shows: one under a collapsed ancestor asks for its own counts
+    // when its tree mounts again
+    const tree = useFolderTreeStore.getState();
+    for (const libraryId of Object.keys(tree.expanded)) {
+      get().countFolders(libraryId, openNodes(tree, libraryId));
     }
   },
 
