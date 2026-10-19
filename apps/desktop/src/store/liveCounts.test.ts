@@ -1,0 +1,184 @@
+import { afterEach, describe, expect, test } from 'bun:test';
+import { api } from '../api';
+import { useFolderTreeStore } from './folderTree';
+import { extensionCount, kindCount, useLiveCountsStore } from './liveCounts';
+import type { FacetCounts, FolderCounts, FolderNode, SearchQuery } from '../types';
+
+const realFacets = api.getFacetCounts;
+const realFolders = api.getFolderCounts;
+
+const query = (text: string, filter: SearchQuery['filter'] = {}): SearchQuery => ({
+  text,
+  filter,
+  sort: { field: 'date', order: 'desc' },
+});
+
+/** Serves counts that name the query's text, recording each call; `hold` keeps them pending. */
+function serve() {
+  const calls: string[] = [];
+  const pending: (() => void)[] = [];
+  let hold = false;
+  const answer = <T>(value: T) =>
+    new Promise<T>((resolve) => (hold ? pending.push(() => resolve(value)) : resolve(value)));
+  api.getFacetCounts = (q) => {
+    calls.push(`facets:${q.text}`);
+    return answer<FacetCounts>({
+      kinds: { texture: q.text.length },
+      extensions: {},
+      extensionBase: 0,
+    });
+  };
+  api.getFolderCounts = (q, libraryId, parentPaths) => {
+    calls.push(`folders:${q.text}:${libraryId}:${parentPaths.join('|')}`);
+    const counts: FolderCounts = Object.fromEntries(
+      parentPaths.map((p) => [p, { [`${p}/${q.text}`]: q.text.length }])
+    );
+    return answer(counts);
+  };
+  return {
+    calls,
+    hold: (on: boolean) => (hold = on),
+    release: () => pending.splice(0).forEach((resolve) => resolve()),
+  };
+}
+
+/** Sets the tree `children` (parent path to child paths) loaded and `expanded`, in `kenney`. */
+function showTree(children: Record<string, string[]>, expanded: string[]) {
+  const node = (path: string): FolderNode => ({
+    name: path.slice(path.lastIndexOf('/') + 1),
+    path,
+    isPack: false,
+    itemCount: 1,
+    hiddenCount: 0,
+    hasChildren: true,
+    shownWithoutHidden: true,
+    hasVisibleChildren: true,
+  });
+  useFolderTreeStore.setState({
+    children: {
+      kenney: Object.fromEntries(Object.entries(children).map(([p, cs]) => [p, cs.map(node)])),
+    },
+    expanded: { kenney: expanded },
+  });
+}
+
+const counts = () => useLiveCountsStore.getState();
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+afterEach(() => {
+  api.getFacetCounts = realFacets;
+  api.getFolderCounts = realFolders;
+  counts().recount(query(''));
+  useFolderTreeStore.setState({ children: {}, expanded: {} });
+});
+
+describe('kindCount and extensionCount', () => {
+  test('a missing kind counts 0, a missing extension the active extensions total', () => {
+    const facets: FacetCounts = {
+      kinds: { '3d_model': 180 },
+      extensions: { png: 478 },
+      extensionBase: 180,
+    };
+    expect([kindCount(facets, '3d_model'), kindCount(facets, 'video')]).toEqual([180, 0]);
+    expect([extensionCount(facets, 'png'), extensionCount(facets, 'glb')]).toEqual([478, 180]);
+    expect(extensionCount({ ...facets, extensionBase: 0 }, 'glb')).toBe(0);
+  });
+});
+
+describe('useLiveCountsStore', () => {
+  test('a recount asks only for the nodes the tree shows', async () => {
+    const { calls } = serve();
+    const tree = {
+      '': ['2D assets', '3D assets'],
+      '3D assets': ['3D assets/Platformer Kit'],
+      '3D assets/Platformer Kit': ['3D assets/Platformer Kit/Models'],
+    };
+    // `3D assets` is collapsed, so the kit and its models stay expanded but hidden
+    showTree(tree, [
+      '',
+      '3D assets/Platformer Kit',
+      '3D assets/Platformer Kit/Models',
+      '2D assets',
+    ]);
+    counts().recount(query('tree'));
+    await settle();
+    expect(calls).toEqual(['facets:tree', 'folders:tree:kenney:|2D assets']);
+
+    // With the library row collapsed, nothing below it is asked for
+    showTree(tree, ['3D assets', '3D assets/Platformer Kit']);
+    counts().recount(query('rock'));
+    await settle();
+    expect(calls.slice(2)).toEqual(['facets:rock']);
+  });
+
+  test('counts the kinds, extensions and every expanded node while search text is on', async () => {
+    const { calls } = serve();
+    showTree({ '': ['3D assets'] }, ['', '3D assets']);
+
+    counts().recount(query('tree'));
+    await settle();
+    expect(counts().live).toBe(true);
+    expect(counts().facets?.kinds).toEqual({ texture: 4 });
+    expect(counts().folders.kenney['3D assets']).toEqual({ '3D assets/tree': 4 });
+    expect(calls).toEqual(['facets:tree', 'folders:tree:kenney:|3D assets']);
+
+    // A node expanded later asks for its own; one already counted asks for nothing
+    counts().countFolders('kenney', ['3D assets/Platformer Kit', '3D assets']);
+    await settle();
+    expect(calls.at(-1)).toBe('folders:tree:kenney:3D assets/Platformer Kit');
+    expect(Object.keys(counts().folders.kenney)).toHaveLength(3);
+  });
+
+  test('asks for nothing and clears the counts with no search text or filter', async () => {
+    const { calls } = serve();
+    useFolderTreeStore.setState({ expanded: { kenney: [''] } });
+    counts().recount(query('', { kinds: ['texture'] }));
+    await settle();
+    expect(counts().facets).not.toBeNull();
+
+    counts().recount(query(''));
+    counts().countFolders('kenney', ['']);
+    await settle();
+    expect(counts()).toMatchObject({ live: false, facets: null, folders: {} });
+    expect(calls).toHaveLength(2);
+  });
+
+  test('a new query clears the counts it changes, and a refresh keeps them until it lands', async () => {
+    const server = serve();
+    useFolderTreeStore.setState({ expanded: { kenney: [''] } });
+    counts().recount(query('tree'));
+    await settle();
+
+    server.hold(true);
+    counts().recount({ ...query('tree'), sort: { field: 'name', order: 'asc' } });
+    expect(counts().folders.kenney['']).toEqual({ '/tree': 4 });
+    server.release();
+
+    // Selecting a folder changes the kind counts, not the folder counts
+    counts().recount({ ...query('tree'), folder: { libraryId: 'kenney', path: '3D assets' } });
+    expect(counts().facets).toBeNull();
+    expect(counts().folders.kenney['']).toEqual({ '/tree': 4 });
+    server.release();
+
+    counts().recount(query('rock'));
+    expect(counts()).toMatchObject({ facets: null, folders: {} });
+    server.release();
+    await settle();
+    expect(counts().facets?.kinds).toEqual({ texture: 4 });
+    expect(counts().folders.kenney['']).toEqual({ '/rock': 4 });
+  });
+
+  test('counts from an earlier query that land late are dropped', async () => {
+    const server = serve();
+    useFolderTreeStore.setState({ expanded: { kenney: [''] } });
+    server.hold(true);
+    counts().recount(query('tree'));
+    server.hold(false);
+    counts().recount(query('rocks'));
+    await settle();
+    server.release();
+    await settle();
+    expect(counts().facets?.kinds).toEqual({ texture: 5 });
+    expect(counts().folders.kenney['']).toEqual({ '/rocks': 5 });
+  });
+});

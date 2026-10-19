@@ -829,3 +829,4 @@ export const useCollectionStore = create<CollectionStore>()((set) => ({
 
 export { useFolderTreeStore } from './folderTree';
 export { useGroupDetailStore, shownMember } from './groupDetail';
+export { extensionCount, kindCount, useLiveCountsStore } from './liveCounts';

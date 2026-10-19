@@ -1,18 +1,21 @@
 // The UI checks `VITE_SCROLL_BENCH=checks` runs (U1-U8 in
-// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U12 and
-// U14 in docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds
-// its check here.
+// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U14 in
+// docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
+// check here.
 
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { api } from '../api';
 import {
   cachedAssets,
+  extensionCount,
+  kindCount,
   useAssetStore,
   useFolderTreeStore,
   useLibraryStore,
+  useLiveCountsStore,
   useUIStore,
 } from '../store';
-import type { FolderNode, SortField, SortOrder } from '../types';
+import type { FolderNode, SearchQuery, SortField, SortOrder } from '../types';
 import { isFolderShown } from '../components/Sidebar/sidebarHelpers';
 import { formatItemsAndFiles, formatSize } from '../utils/format';
 import { assetAt } from '../store/pageCache';
@@ -1597,6 +1600,197 @@ export const UI_CHECKS: UiCheck[] = [
 
       useUIStore.getState().clearSelection();
       await searchWith({ folder: undefined }, waitFor);
+    },
+  },
+  {
+    id: 'U13',
+    title:
+      'A search for "tree" counts its items on the expanded tree nodes and the Types and format ' +
+      "filters, each count the grid's total for its folder or value, and dims folders with none",
+    run: async ({ assert, waitFor, pause, sleep }) => {
+      await expandBenchLibrary({ assert, sleep });
+      const kitPath = '3D assets/Platformer Kit';
+      const modelsPath = `${kitPath}/Models`;
+      const parents = ['', '3D assets', kitPath, modelsPath];
+      for (const path of parents.slice(1)) await expandFolder(path);
+      await searchWith({ text: 'tree', folder: undefined }, waitFor);
+      const live = () => useLiveCountsStore.getState();
+      const counted = (parent: string) => live().folders[BENCH_LIBRARY]?.[parent];
+      await waitFor(
+        () => live().facets !== null && parents.every((p) => counted(p) !== undefined),
+        30_000,
+        'the live counts'
+      );
+      const { query } = useAssetStore.getState();
+
+      // A node's folder counts take under 300 ms, through IPC
+      for (const parent of parents) {
+        const start = performance.now();
+        await api.getFolderCounts(query, BENCH_LIBRARY, [parent]);
+        const ms = performance.now() - start;
+        assert(
+          ms < 300,
+          `counting the folders in ${parent || 'the root'} took ${ms.toFixed(0)} ms`
+        );
+      }
+
+      /** The grid's total for the search with `patch` applied. */
+      const totalWith = async (patch: Partial<SearchQuery>) => {
+        const result = await api.searchAssets({
+          query: { ...query, ...patch },
+          page: 0,
+          pageSize: 1,
+          includeTotal: true,
+        });
+        return result.total ?? -1;
+      };
+
+      // Each shown node's badge is its live count, which is the grid's total once it's selected,
+      // and a node with none dims
+      let checked = 0;
+      let dimmed = 0;
+      for (const parent of parents) {
+        const children = useFolderTreeStore.getState().children[BENCH_LIBRARY]?.[parent] ?? [];
+        for (const node of children) {
+          const row = folderRow(node.path);
+          if (!row) continue;
+          const count = counted(parent)![node.path] ?? 0;
+          assert(
+            shownCount(row) === count,
+            `${node.path}'s badge reads ${shownCount(row)}, not ${count}`
+          );
+          assert(
+            (row.dataset.noMatches !== undefined) === (count === 0),
+            `${node.path}, with ${count} matches, is ${count === 0 ? 'not ' : ''}dimmed`
+          );
+          const total = await totalWith({ folder: { libraryId: BENCH_LIBRARY, path: node.path } });
+          assert(total === count, `${node.path} counts ${count}, its grid holds ${total}`);
+          checked += 1;
+          if (count === 0) dimmed += 1;
+        }
+      }
+      assert(checked > dimmed && dimmed > 0, `${checked} nodes checked, ${dimmed} dimmed`);
+
+      // The kit's format folders each count its tree models, and `Models/` counts them once
+      const inModels = counted(kitPath)![modelsPath] ?? 0;
+      assert(inModels > 0, `${modelsPath} counts no tree`);
+      for (const format of ['GLB format', 'FBX format', 'OBJ format']) {
+        const path = `${modelsPath}/${format}`;
+        const count = counted(modelsPath)![path] ?? 0;
+        assert(count === inModels, `${path} counts ${count}, ${modelsPath} ${inModels}`);
+      }
+      folderRow(modelsPath)!.scrollIntoView({ block: 'center' });
+      await pause('U13-tree-counts');
+
+      /** Clicks `el`, which changes the search, and waits for its results. */
+      const clickAndSearch = async (el: HTMLElement, what: string) => {
+        const generation = useAssetStore.getState().generation;
+        el.click();
+        await waitFor(
+          () => {
+            const st = useAssetStore.getState();
+            return st.generation > generation && !st.loading;
+          },
+          30_000,
+          what
+        );
+      };
+      /** The live count `el` shows. */
+      const liveCount = (el: HTMLElement) => {
+        const badge = el.querySelector('[data-live-count]');
+        assert(badge, `#${el.id} shows no live count`);
+        return parseCount(badge!.textContent ?? '');
+      };
+
+      // Selecting a folder gives the grid total its badge showed
+      await clickAndSearch(folderRow(modelsPath)!, `the search in ${modelsPath}`);
+      assert(
+        useAssetStore.getState().total === inModels,
+        `${modelsPath} holds ${useAssetStore.getState().total}, its badge read ${inModels}`
+      );
+      await searchWith({ folder: undefined }, waitFor);
+      await waitFor(() => live().facets !== null, 30_000, 'the kind and extension counts');
+
+      // The sidebar's Types: each kind's count, and picking the 3D models
+      const kinds = [...document.querySelectorAll<HTMLElement>('[id^="sidebar-filter-type-"]')];
+      assert(kinds.length > 0, 'no Types options in the sidebar');
+      for (const option of kinds) {
+        const kind = option.id.slice('sidebar-filter-type-'.length);
+        const count = liveCount(option);
+        assert(count === kindCount(live().facets!, kind), `${kind}'s count isn't its live count`);
+        const total = await totalWith({ filter: { ...query.filter, kinds: [kind] as never } });
+        assert(total === count, `${kind} counts ${count}, its grid holds ${total}`);
+      }
+      const models = document.getElementById('sidebar-filter-type-3d_model')!;
+      const modelCount = liveCount(models);
+      assert(modelCount > 0, 'the search counts no 3D model');
+      await clickAndSearch(models, 'the search for 3D models');
+      assert(
+        useAssetStore.getState().total === modelCount,
+        `3D models hold ${useAssetStore.getState().total}, the count read ${modelCount}`
+      );
+      await clickAndSearch(document.getElementById('sidebar-filter-type-3d_model')!, 'any kind');
+
+      // The format filter: a pill adds its extension to the active ones, so each pill's count is
+      // the grid's total once it joins them, with none active and with FBX active
+      document.getElementById('filter-mode-extension')!.click();
+      await frames(3);
+      /** Checks every counted pill against the total with `active` plus its extension. */
+      const checkPills = async (active: string[]) => {
+        const pills = [...document.querySelectorAll<HTMLElement>('[id^="filter-ext-"]')].filter(
+          (el) => el.querySelector('[data-live-count]')
+        );
+        assert(pills.length > 0, 'no format pill shows a count');
+        const facets = live().facets!;
+        let matching = 0;
+        for (const pill of pills) {
+          const ext = pill.id.slice('filter-ext-'.length);
+          const count = liveCount(pill);
+          const expected = extensionCount(facets, ext);
+          assert(count === expected, `.${ext} reads ${count}, its live count is ${expected}`);
+          assert((pill.dataset.noMatches !== undefined) === (count === 0), `.${ext}'s dimming`);
+          const extensions = active.includes(ext) ? active : [...active, ext];
+          const total = await totalWith({ filter: { ...query.filter, extensions } });
+          assert(
+            total === count,
+            `.${ext} with ${active} counts ${count}, its grid holds ${total}`
+          );
+          if (count > 0) matching += 1;
+        }
+        return matching;
+      };
+      const matching = await checkPills([]);
+      assert(matching >= 3, `only ${matching} formats match "tree"`);
+      // The screenshot shows the matching formats and the Types counts, not the first pills
+      document
+        .getElementById('filter-ext-glb')!
+        .scrollIntoView({ inline: 'start', block: 'nearest' });
+      document.getElementById('sidebar-filter-type-3d_model')!.scrollIntoView({ block: 'center' });
+      await frames(3);
+      await pause('U13-filter-counts');
+
+      const pick = async (ext: string) => {
+        const count = liveCount(document.getElementById(`filter-ext-${ext}`)!);
+        await clickAndSearch(document.getElementById(`filter-ext-${ext}`)!, `adding .${ext}`);
+        const { total } = useAssetStore.getState();
+        assert(total === count, `adding .${ext} gives ${total}, its pill read ${count}`);
+        await waitFor(() => live().facets !== null, 30_000, 'the extension counts');
+        await frames(3);
+      };
+      await pick('fbx');
+      await checkPills(['fbx']);
+      const png = liveCount(document.getElementById('filter-ext-png')!);
+      assert(png > useAssetStore.getState().total, `.png adds nothing to .fbx: ${png}`);
+      document
+        .getElementById('filter-ext-glb')!
+        .scrollIntoView({ inline: 'start', block: 'nearest' });
+      await frames(3);
+      await pause('U13-format-union');
+      await pick('png');
+      await clickAndSearch(document.getElementById('filter-ext-all')!, 'any format');
+      document.getElementById('filter-mode-software')!.click();
+
+      await searchWith({ text: '' }, waitFor);
     },
   },
   {

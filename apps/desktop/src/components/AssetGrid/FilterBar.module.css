@@ -251,6 +251,19 @@
   opacity: 0.65;
 }
 
+/* A format's live count while search text or a filter is on */
+.extCount {
+  font-size: 9.5px;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  color: var(--color-text-muted);
+}
+
+/* A format with no match for the search text and filters */
+.noMatches {
+  opacity: 0.45;
+}
+
 /* Separator */
 .sep {
   width: 1px;

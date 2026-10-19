@@ -133,7 +133,12 @@ docs/plans                    Plans for this fork
     with its main item, so a search for it reads the item's own path, which keeps it as fast as a
     flat search.
   - A folder's `item_count` counts a group once under each folder holding one of its files, so
-    it equals the grid's total for that folder.
+    it equals the grid's total for that folder. The live counts shown while search text or a
+    filter is on (`get_folder_counts`, `get_facet_counts`) follow the same rule: a group counts
+    once toward each folder, kind and extension among its files that meet every file-level
+    filter, so each count equals the grid's total once you select that folder or value. A format
+    pill adds its extension to the active ones, so with extensions active, its count also holds
+    the items they match (`FacetCounts::extension_base`).
   - Metadata (rating, color label, favorite, description, tags, collections) is the same on
     every member. Each write expands its asset id through `structure::group_members` in its own
     transaction, which `no_metadata_write_bypasses_group_members` checks, and auto-tag sends

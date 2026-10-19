@@ -176,6 +176,26 @@ export interface FolderNode {
   hasVisibleChildren: boolean;
 }
 
+/**
+ * The live counts beside the Types and format filters (`get_facet_counts`), each the grid's total
+ * once that value is picked: the sidebar's Types replace the kind filter, and a format pill adds
+ * its extension to the active ones.
+ */
+export interface FacetCounts {
+  /** The total with each kind as the only one; kinds with none are absent */
+  kinds: Record<string, number>;
+  /** The total with each extension added to the active ones; read through `extensionCount` */
+  extensions: Record<string, number>;
+  /** The count of an extension `extensions` leaves out: the active extensions' total, or 0 */
+  extensionBase: number;
+}
+
+/**
+ * Live folder counts (`get_folder_counts`): for each parent path asked for, the grid's total in
+ * each of its child folders, by child path. Children with none are absent.
+ */
+export type FolderCounts = Record<string, Record<string, number>>;
+
 // ── Preview job ──────────────────────────────────────────────────────────
 export interface PreviewJob {
   id: string;
