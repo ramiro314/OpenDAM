@@ -176,6 +176,35 @@ export interface FolderNode {
   hasVisibleChildren: boolean;
   /** A pack's cover image */
   cover?: Cover | null;
+  /** What you said the folder is, if you did */
+  mark?: PackMark | null;
+  /** The name you gave the pack, shown in place of the folder's */
+  renamed?: string | null;
+}
+
+/** "Mark as pack" or "Not a pack", against what the pack rules detect */
+export type PackMark = 'pack' | 'not_pack';
+
+/** Your edits to one pack (`pack_overrides`); a null field keeps what was detected */
+export interface PackOverride {
+  mark?: PackMark | null;
+  name?: string | null;
+  /** The license as you name it, shown in place of the license file's */
+  license?: string | null;
+  sourceUrl?: string | null;
+  /** Relative to the library root */
+  coverPath?: string | null;
+}
+
+/** One edit `set_pack_override` saves. An empty text field keeps what was detected. */
+export type PackEdit =
+  | { kind: 'mark'; mark: PackMark | null }
+  | { kind: 'details'; name: string | null; license: string | null; sourceUrl: string | null }
+  | { kind: 'cover'; assetId: string | null };
+
+/** A pack by its library and path, with its name (`get_cover_pack`) */
+export interface PackRef extends FolderRef {
+  name: string;
 }
 
 /** A pack's cover image, shown as a grid tile shows an asset (`tileMedia`) */
@@ -193,7 +222,7 @@ export interface PackCard {
   libraryId: string;
   /** Relative to the library root */
   path: string;
-  /** The license header's name, else the folder's */
+  /** Your name, else the license header's, else the folder's */
   name: string;
   /** The folder holding the pack, the card's subtitle; `''` for the library root */
   parentPath: string;
@@ -201,6 +230,8 @@ export interface PackCard {
   itemCount: number;
   hiddenCount: number;
   cover?: Cover | null;
+  /** What you said the folder is, if you did */
+  mark?: PackMark | null;
 }
 
 /** The license a pack's license file names, or `unknown` for any other */
@@ -232,6 +263,8 @@ export interface PackDetail {
   kinds: Partial<Record<AssetKind, number>>;
   /** Their total size in bytes */
   sizeBytes: number;
+  /** Your edits, all null when you made none */
+  edits: PackOverride;
 }
 
 /**

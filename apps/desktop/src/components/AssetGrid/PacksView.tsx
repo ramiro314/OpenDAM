@@ -82,6 +82,7 @@ export function PacksView() {
         name: pack.name,
         isPack: true,
         itemCount: pack.itemCount,
+        mark: pack.mark,
       });
     },
     [select]

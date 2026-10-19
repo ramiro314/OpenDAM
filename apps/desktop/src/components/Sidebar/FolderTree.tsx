@@ -88,7 +88,7 @@ export function FolderTree({ libraryId, parentPath, onSelect, onMenu }: FolderTr
                 !node.isPack && <IconFolder size={13} />
               )}
               {node.isPack && <PackIcon cover={node.cover} />}
-              <span className={clsx(styles.itemName, 'truncate')}>{node.name}</span>
+              <span className={clsx(styles.itemName, 'truncate')}>{node.renamed ?? node.name}</span>
               {count !== undefined && (
                 <span className={styles.badge} data-live-count={live || undefined}>
                   {count.toLocaleString()}

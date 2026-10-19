@@ -5291,6 +5291,114 @@ mod tests {
         );
     }
 
+    /// The rebuild each pack edit runs (A1: under 2 s) on a copy of the golden snapshot's
+    /// library DB, named by `OPENDAM_GOLDEN_DB` as above, with the license files read from
+    /// `golden_root`. It writes edits to the copy and clears them again. Time it as the app ships,
+    /// optimized (a debug build takes about 1.3 s, and 2.1 s to restore a pack, whose license the
+    /// pass reads again), keeping the debug-only test helpers:
+    /// `CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true CARGO_PROFILE_RELEASE_LTO=false cargo nextest
+    /// run --cargo-profile release --run-ignored only golden_snapshot_pack_edits --no-capture`.
+    #[tokio::test]
+    #[ignore = "needs OPENDAM_GOLDEN_DB, a copy of the golden snapshot's library.sqlite"]
+    async fn golden_snapshot_pack_edits_each_rebuild_in_under_2_s() {
+        use crate::commands::folder::{packs_below, set_pack_override_in, PackEdit};
+        use crate::structure::PackMark;
+        use std::time::{Duration, Instant};
+        let file = std::env::var("OPENDAM_GOLDEN_DB").expect("OPENDAM_GOLDEN_DB is set");
+        let pool = crate::db::connect_library_sqlite(Path::new(&file))
+            .await
+            .unwrap();
+        let root = golden_root();
+        let library = LibraryHandle {
+            id: "golden".to_string(),
+            name: "golden".to_string(),
+            root_path: root.clone(),
+            pool: pool.clone(),
+        };
+        let db = memory_database(vec![library.clone()]).await;
+        crate::structure::rebuild(&pool, &root).await.unwrap();
+        let before = crate::structure::tests::derived_rows(&pool).await;
+        let cover: String = sqlx::query_scalar(
+            "SELECT id FROM assets WHERE file_path = '3D assets/Car Kit/Previews/sedan-sports.png'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mark = |mark| PackEdit::Mark { mark };
+        let details = |name: Option<&str>| PackEdit::Details {
+            name: name.map(str::to_string),
+            license: None,
+            source_url: None,
+        };
+        let edits = [
+            (
+                "Mark as pack",
+                "3D assets/Platformer Kit/Models",
+                mark(Some(PackMark::Pack)),
+            ),
+            (
+                "Not a pack",
+                "3D assets/Nature Kit",
+                mark(Some(PackMark::NotPack)),
+            ),
+            ("Name", "3D assets/Car Kit", details(Some("My cars"))),
+            (
+                "Use as pack cover",
+                "3D assets/Car Kit",
+                PackEdit::Cover {
+                    asset_id: Some(cover),
+                },
+            ),
+            (
+                "Clear the mark",
+                "3D assets/Platformer Kit/Models",
+                mark(None),
+            ),
+            ("Clear the mark", "3D assets/Nature Kit", mark(None)),
+            ("Clear the name", "3D assets/Car Kit", details(None)),
+            (
+                "Clear the cover",
+                "3D assets/Car Kit",
+                PackEdit::Cover { asset_id: None },
+            ),
+        ];
+        let mut slowest = Duration::ZERO;
+        for (i, (what, path, edit)) in edits.into_iter().enumerate() {
+            let started = Instant::now();
+            set_pack_override_in(&db, "golden", path, edit)
+                .await
+                .unwrap();
+            let took = started.elapsed();
+            println!("{what} on {path}: {took:?} (target under 2s)");
+            slowest = slowest.max(took);
+            if i == 3 {
+                let cards = packs_below(std::slice::from_ref(&library), "", false)
+                    .await
+                    .unwrap();
+                let paths: Vec<&str> = cards.iter().map(|c| c.path.as_str()).collect();
+                assert!(paths.contains(&"3D assets/Platformer Kit/Models"));
+                assert!(!paths.contains(&"3D assets/Nature Kit"));
+                let car = cards
+                    .iter()
+                    .find(|c| c.path == "3D assets/Car Kit")
+                    .unwrap();
+                assert_eq!(car.name, "My cars");
+                assert!(car
+                    .cover
+                    .as_ref()
+                    .unwrap()
+                    .file_path
+                    .ends_with("sedan-sports.png"));
+                println!("{} packs with the edits", cards.len());
+            }
+        }
+        assert!(
+            slowest < Duration::from_secs(2),
+            "slowest edit took {slowest:?}"
+        );
+        assert_eq!(crate::structure::tests::derived_rows(&pool).await, before);
+    }
+
     /// Format groups on a copy of the golden snapshot's library DB, named by `OPENDAM_GOLDEN_DB`
     /// as above: every Kenney kit model shows once, as GLB, and its other formats still find
     /// it. It writes to the copy: it clears the groups for a first pass. Run it with

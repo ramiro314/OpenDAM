@@ -118,6 +118,11 @@ docs/plans                    Plans for this fork
   `structure::rebuild_library` before it returns, rather than patching rows, and that waits for
   any index run holding the lock. Searches hide support files (`support_role IS NOT NULL`) unless
   the filter's `showHidden` is set.
+  - Your pack edits ("Mark as pack", "Not a pack", a pack's name, license, source URL and cover)
+    live only in `pack_overrides`, keyed by the folder's relative path, so they outlive the
+    folder going away and coming back. The pass reads them (`structure::read_overrides`) and
+    never writes or deletes them. `set_pack_override` writes one, then calls
+    `structure::rebuild_library` before it emits `library:updated`, like the commands above.
 - **One grid item per group.** A format group (one model in several formats, or a file's copies
   under format folders, plan C11) holds its main item's id in `group_id` on every member, the
   main item included; a file on its own has `NULL`. The main item is chosen GLB > glTF > FBX >

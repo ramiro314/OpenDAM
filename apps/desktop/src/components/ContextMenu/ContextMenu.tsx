@@ -25,7 +25,8 @@ interface ContextMenuProps {
 export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
 
-  // Opened at the cursor, then moved back inside the window once its size is known.
+  // Opened at the cursor, then moved back inside the window once its size is known, and again
+  // when an item arrives later.
   useLayoutEffect(() => {
     const el = menuRef.current;
     if (!el) return;
@@ -33,7 +34,7 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
     const { left, top } = fitInViewport(x, y, width, height, window.innerWidth, window.innerHeight);
     el.style.left = `${left}px`;
     el.style.top = `${top}px`;
-  }, [x, y]);
+  }, [x, y, items.length]);
 
   // On the window, not the menu: with every item disabled nothing in the menu can take focus.
   useEffect(() => {

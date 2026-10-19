@@ -1,8 +1,10 @@
 //! The structure pass: a library's folder tree, its packs, its support files, its format groups
 //! with their bundled previews, and its 2D stacks, derived from the paths it has indexed
 //! (docs/plans/smarter-big-collections/plan.md, "The structure pass"). `derive` is a pure function
-//! over the paths, their sizes and what the license files say, and the pass writes only the folder rows and `assets.support_role`,
-//! `assets.group_id` and `assets.bundled_preview` values that differ from it, and the metadata of
+//! over the paths, their sizes, what the license files say and your edits to packs
+//! (`pack_overrides`, which it never writes), and the pass writes only the folder rows and
+//! `assets.support_role`, `assets.group_id` and `assets.bundled_preview` values that differ from
+//! it, and the metadata of
 //! the groups that form or grow (`apply_unions`). Every index run ends with the pass
 //! (`watcher::index_paths`), and so does every command that changes the paths, through
 //! `rebuild_library`. Nothing else writes `folders`, `support_role`, `group_id` or
@@ -79,11 +81,11 @@ pub struct Folder {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackInfo {
-    /// The name shown: the license header's, else the folder's
+    /// The name shown: yours (`PackOverride::name`), else the license header's, else the folder's
     pub name: String,
-    /// The cover's path: the first `Preview*` cover image, else the first `Sample*` one, else the
-    /// pack's first image, else its first visible file (a model, whose thumbnail shows), each by
-    /// path
+    /// The cover's path: the image you chose, while it is an image in the pack, else the first
+    /// `Preview*` cover image, else the first `Sample*` one, else the pack's first image, else its
+    /// first visible file (a model, whose thumbnail shows), each by path
     pub cover: Option<String>,
     /// Every cover image of the pack (its `Preview*` and `Sample*` images), by path
     #[serde(default)]
@@ -190,6 +192,51 @@ pub struct PackHeader {
     pub author: Option<String>,
 }
 
+/// What you said a folder is, against what the pack rules detect (plan C8 rule 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
+pub enum PackMark {
+    /// "Mark as pack": a pack whatever the rules say, even inside another pack
+    Pack,
+    /// "Not a pack": neither a pack nor a marked folder to the pack rules, so the marked folders
+    /// inside it can be packs
+    NotPack,
+}
+
+/// Your edits to one folder's pack, a `pack_overrides` row. The pass reads them and never writes
+/// them. A `None` field keeps what the pass derives.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct PackOverride {
+    pub mark: Option<PackMark>,
+    pub name: Option<String>,
+    /// The license as you name it, shown in place of the one the license file names
+    pub license: Option<String>,
+    pub source_url: Option<String>,
+    /// The cover image, relative to the library root
+    pub cover_path: Option<String>,
+}
+
+/// Every folder's `PackOverride`, by the folder's path relative to the library root.
+pub type Overrides = BTreeMap<String, PackOverride>;
+
+/// The `pack_overrides` of the library DB at `pool`.
+pub async fn read_overrides(pool: &Pool<Sqlite>) -> sqlx::Result<Overrides> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        path: String,
+        #[sqlx(flatten)]
+        edit: PackOverride,
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT path, mark, name, license, source_url, cover_path FROM pack_overrides",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.path, r.edit)).collect())
+}
+
 /// Why a file is a pack's support file, hidden from the grid unless "Show hidden files" is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupportRole {
@@ -293,7 +340,9 @@ impl FileKind {
 ///    stem starting with `license`, `licence`, `preview` or `sample`, ignoring case. The
 ///    outermost marked folder is the pack. Then the sibling rule: a folder that isn't inside a
 ///    pack and holds no pack is also one when its parent has at least 2 pack children and packs
-///    are more than half of its child folders.
+///    are more than half of its child folders. Your overrides come last (rule 4): a folder
+///    you said is "Not a pack" is neither marked nor a pack to these rules, so the marked folders
+///    inside it can be packs, and one you marked as a pack is one, even inside another pack.
 /// 3. **Support roles** (C10): in a pack's own folder, or in a marked folder inside a pack, docs
 ///    are `Doc` and `Preview*`/`Sample*` images are `Cover`.
 /// 4. **Format groups** (C11, `format_groups`): one model shipped in several formats, and the
@@ -304,13 +353,16 @@ impl FileKind {
 ///    `Vector/`) form a group too, led by its PNG at the default scale.
 /// 7. **Counts:** each folder counts the grid items with a visible file below it, a group once,
 ///    and the support files below it.
-/// 8. **Pack info** (C9): each pack's cover, gallery and license file, which `read_license`
-///    reads, its name, which is the license's header name or else the folder's, and the files
-///    below it by kind with their total size.
+/// 8. **Pack info** (C9): each pack's cover, which is the image you chose when it is still in
+///    the pack, its gallery and license file, which `read_license` reads, its name, which is
+///    yours, else the license's header name, else the folder's, and the files below it by kind
+///    with their total size.
 ///
-/// Each file comes with its size in bytes.
+/// Each file comes with its size in bytes. An override of a folder that holds no file does
+/// nothing until files come back to it.
 pub fn derive<'a>(
     files: impl IntoIterator<Item = (&'a str, i64)>,
+    overrides: &Overrides,
     mut read_license: impl FnMut(&str) -> LicenseText,
 ) -> Structure {
     let (paths, sizes): (Vec<&str>, Vec<i64>) = files.into_iter().unzip();
@@ -336,11 +388,18 @@ pub fn derive<'a>(
         }
     }
 
-    // The outermost marked folders, then the sibling rule's packs.
-    let mut packs: BTreeSet<&str> = marked
+    // The outermost marked folders, then the sibling rule's packs, then your marks. A "Not a
+    // pack" folder still hides the support files it holds inside a pack (`marked`).
+    let mark = |dir: &str| overrides.get(dir).and_then(|o| o.mark);
+    let markers: HashSet<&str> = marked
         .iter()
         .copied()
-        .filter(|dir| !ancestors(dir).any(|a| marked.contains(a)))
+        .filter(|dir| mark(dir) != Some(PackMark::NotPack))
+        .collect();
+    let mut packs: BTreeSet<&str> = markers
+        .iter()
+        .copied()
+        .filter(|dir| !ancestors(dir).any(|a| markers.contains(a)))
         .collect();
     let mut by_siblings: Vec<&str> = Vec::new();
     for (parent, kids) in &children {
@@ -351,12 +410,17 @@ pub fn derive<'a>(
         if in_pack(&packs, parent) {
             continue;
         }
-        by_siblings.extend(
-            kids.iter()
-                .filter(|k| !packs.contains(*k) && !holds_pack(&packs, k)),
-        );
+        by_siblings.extend(kids.iter().filter(|k| {
+            !packs.contains(*k) && !holds_pack(&packs, k) && mark(k) != Some(PackMark::NotPack)
+        }));
     }
     packs.extend(by_siblings);
+    packs.extend(
+        overrides
+            .iter()
+            .filter(|(dir, o)| o.mark == Some(PackMark::Pack) && folders.contains_key(*dir))
+            .map(|(dir, _)| dir.as_str()),
+    );
 
     let mut roles: Vec<Option<SupportRole>> = paths
         .iter()
@@ -412,9 +476,27 @@ pub fn derive<'a>(
     }
     let mut info = pack_files(&packs, &paths, &kinds, &roles, &groups);
     let mut contents = pack_contents(&packs, &paths, &kinds, &sizes);
+    // The covers you chose that are still indexed images
+    let chosen: HashSet<&str> = overrides
+        .values()
+        .filter_map(|o| o.cover_path.as_deref())
+        .collect();
+    let images: HashSet<&str> = paths
+        .iter()
+        .zip(&kinds)
+        .filter(|(path, kind)| kind.is_image && chosen.contains(*path))
+        .map(|(path, _)| *path)
+        .collect();
     for pack in packs {
         let folder = folders.get_mut(pack).expect("a pack has a row");
         let files = info.remove(pack).unwrap_or_default();
+        let edit = overrides.get(pack);
+        let below = format!("{pack}/");
+        let cover = edit
+            .and_then(|o| o.cover_path.as_deref())
+            .filter(|c| images.contains(c) && (pack.is_empty() || c.starts_with(&below)))
+            .or_else(|| files.cover());
+        let name = edit.and_then(|o| o.name.clone()).filter(|n| !n.is_empty());
         let license = files.license.map(|path| LicenseFile {
             text: read_license(path),
             path: path.to_string(),
@@ -425,11 +507,10 @@ pub fn derive<'a>(
         let (kinds, size_bytes) = contents.remove(pack).unwrap_or_default();
         folder.is_pack = true;
         folder.pack = Some(PackInfo {
-            name: license
-                .as_ref()
-                .and_then(|l| Some(l.text.header.as_ref()?.name.clone()))
+            name: name
+                .or_else(|| Some(license.as_ref()?.text.header.as_ref()?.name.clone()))
                 .unwrap_or_else(|| folder.name.clone()),
-            cover: files.cover().map(str::to_string),
+            cover: cover.map(str::to_string),
             gallery: files.gallery.iter().map(|p| p.to_string()).collect(),
             license,
             kinds,
@@ -1467,13 +1548,14 @@ pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
     .fetch_all(pool)
     .await?;
     let known = known_licenses(pool).await?;
+    let overrides = read_overrides(pool).await?;
     let by_path: HashMap<&str, &FileRow> =
         files.iter().map(|f| (f.file_path.as_str(), f)).collect();
     let inputs = || files.iter().map(|f| (f.file_path.as_str(), f.size_bytes));
     // Derive with the licenses already read, noting each one that changed since. Only then read
     // those, off the runtime, and derive again with what they say.
     let mut changed = Vec::new();
-    let mut structure = derive(inputs(), |path| {
+    let mut structure = derive(inputs(), &overrides, |path| {
         known_text(by_path[path], &known).unwrap_or_else(|| {
             changed.push(path.to_string());
             LicenseText::default()
@@ -1483,7 +1565,7 @@ pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
     let reads = changed.len();
     if !changed.is_empty() {
         let read = read_license_files(root, changed).await;
-        structure = derive(inputs(), |path| match read.get(path) {
+        structure = derive(inputs(), &overrides, |path| match read.get(path) {
             None => known_text(by_path[path], &known).unwrap_or_default(),
             Some(Ok(text)) => text.clone(),
             // An unreadable license keeps what it said last time, and records no read, so the
@@ -1564,7 +1646,15 @@ pub(crate) mod tests {
 
     /// The structure of `paths` when every file is 1 byte and no license file says anything.
     fn derive<'a>(paths: impl IntoIterator<Item = &'a str>) -> Structure {
-        super::derive(paths.into_iter().map(|p| (p, 1)), |_| {
+        derive_with(paths, &Overrides::new())
+    }
+
+    /// `derive` with your `overrides`.
+    fn derive_with<'a>(
+        paths: impl IntoIterator<Item = &'a str>,
+        overrides: &Overrides,
+    ) -> Structure {
+        super::derive(paths.into_iter().map(|p| (p, 1)), overrides, |_| {
             LicenseText::default()
         })
     }
@@ -2040,6 +2130,164 @@ pub(crate) mod tests {
         ];
         assert_eq!(packs(&derive(paths)), [] as [&str; 0]);
         assert!(hidden(&paths).is_empty());
+    }
+
+    /// Overrides that give each folder of `marks` its mark.
+    fn marks(marks: &[(&str, PackMark)]) -> Overrides {
+        marks
+            .iter()
+            .map(|(path, mark)| {
+                let edit = PackOverride {
+                    mark: Some(*mark),
+                    ..PackOverride::default()
+                };
+                (path.to_string(), edit)
+            })
+            .collect()
+    }
+
+    /// The support files of `structure` over `paths`, with their roles.
+    fn roles_of<'a>(structure: &Structure, paths: &[&'a str]) -> Vec<(&'a str, &'static str)> {
+        paths
+            .iter()
+            .zip(&structure.roles)
+            .filter_map(|(path, role)| role.map(|r| (*path, r.as_str())))
+            .collect()
+    }
+
+    #[test]
+    fn mark_as_pack_makes_a_pack_of_any_folder_even_inside_a_pack() {
+        let paths = [
+            "kit/License.txt",
+            "kit/Extra/License.txt",
+            "kit/Extra/a.png",
+            "kit/Other/b.png",
+            "Synty/Props/crate.fbx",
+            "Synty/Props/Preview.png",
+        ];
+        assert_eq!(packs(&derive(paths)), ["Synty/Props", "kit"]);
+        let overrides = marks(&[
+            ("kit/Extra", PackMark::Pack),
+            ("Synty", PackMark::Pack),
+            // A folder holding no file does nothing.
+            ("gone", PackMark::Pack),
+        ]);
+        let structure = derive_with(paths, &overrides);
+        // `Synty/Props`, marked by its preview, stays a pack inside the one you marked.
+        assert_eq!(
+            packs(&structure),
+            ["Synty", "Synty/Props", "kit", "kit/Extra"]
+        );
+        assert!(!structure.folders.contains_key("gone"));
+        // The nested pack has its own info, and the outer one still counts its files.
+        assert_eq!(
+            info(&structure, "kit/Extra").cover.as_deref(),
+            Some("kit/Extra/a.png")
+        );
+        assert_eq!(
+            info(&structure, "kit").cover.as_deref(),
+            Some("kit/Other/b.png")
+        );
+        assert_eq!(info(&structure, "kit").kinds.values().sum::<i64>(), 4);
+        let hidden = [
+            ("kit/License.txt", "doc"),
+            ("kit/Extra/License.txt", "doc"),
+            ("Synty/Props/Preview.png", "cover"),
+        ];
+        assert_eq!(roles_of(&structure, &paths), hidden);
+        // "Not a pack" on the inner one leaves `Synty` alone, and its preview hidden inside it.
+        let synty = derive_with(
+            paths,
+            &marks(&[
+                ("Synty", PackMark::Pack),
+                ("Synty/Props", PackMark::NotPack),
+            ]),
+        );
+        assert_eq!(packs(&synty), ["Synty", "kit"]);
+        assert_eq!(roles_of(&synty, &paths), hidden);
+    }
+
+    #[test]
+    fn not_a_pack_removes_a_detection_and_frees_the_packs_inside_it() {
+        // A category with its own license swallows the packs inside it.
+        let paths = [
+            "Category/License.txt",
+            "Category/A/License.txt",
+            "Category/A/a.glb",
+            "Category/B/Preview.png",
+            "Category/B/b.glb",
+            "Category/C/c.glb",
+        ];
+        assert_eq!(packs(&derive(paths)), ["Category"]);
+        let structure = derive_with(paths, &marks(&[("Category", PackMark::NotPack)]));
+        // `A` and `B` are marked, and the sibling rule adds `C`.
+        assert_eq!(
+            packs(&structure),
+            ["Category/A", "Category/B", "Category/C"]
+        );
+        // The category's license is no pack's support file any more.
+        assert_eq!(
+            roles_of(&structure, &paths),
+            [
+                ("Category/A/License.txt", "doc"),
+                ("Category/B/Preview.png", "cover")
+            ]
+        );
+        assert_eq!(structure.folders["Category"].pack, None);
+        // A pack the sibling rule detects goes too, and so does a root pack.
+        let structure = derive_with(
+            paths,
+            &marks(&[
+                ("Category", PackMark::NotPack),
+                ("Category/C", PackMark::NotPack),
+            ]),
+        );
+        assert_eq!(packs(&structure), ["Category/A", "Category/B"]);
+        let root = ["License.txt", "rock.png"];
+        assert_eq!(packs(&derive(root)), [""]);
+        assert_eq!(
+            packs(&derive_with(root, &marks(&[("", PackMark::NotPack)]))),
+            [] as [&str; 0]
+        );
+    }
+
+    #[test]
+    fn your_name_and_cover_win_while_the_cover_is_an_image_in_the_pack() {
+        let edit = |name: &str, cover: &str| PackOverride {
+            name: Some(name.into()),
+            cover_path: Some(cover.into()),
+            ..PackOverride::default()
+        };
+        let car = "3D assets/Car Kit";
+        let derived = |edit: PackOverride| {
+            let overrides = Overrides::from([(car.to_string(), edit)]);
+            let structure = super::derive(KENNEY_3D_KIT.map(|p| (p, 1)), &overrides, |_| {
+                kenney("Car Kit Deluxe", LicenseKind::Cc0)
+            });
+            let info = info(&structure, car);
+            (info.name.clone(), info.cover.clone().unwrap())
+        };
+        let render = "3D assets/Car Kit/Previews/sedan.png";
+        assert_eq!(
+            derived(edit("My cars", render)),
+            ("My cars".into(), render.into())
+        );
+        // An empty name, a cover that is gone, outside the pack or no image: the pass's own.
+        let detected = ("Car Kit Deluxe".to_string(), format!("{car}/Preview.png"));
+        for cover in [
+            "3D assets/Car Kit/gone.png",
+            "3D assets/Holiday Kit/License.txt",
+            "3D assets/Car Kit/Models/GLB format/sedan.glb",
+        ] {
+            assert_eq!(derived(edit("", cover)), detected, "{cover}");
+        }
+        // The edit reaches no other pack.
+        let overrides = Overrides::from([(car.to_string(), edit("My cars", render))]);
+        let structure = derive_with(KENNEY_3D_KIT, &overrides);
+        assert_eq!(
+            info(&structure, "3D assets/Holiday Kit").name,
+            "Holiday Kit"
+        );
     }
 
     /// Each grouped file of `paths` with its main item, in input order.
@@ -2538,7 +2786,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_packs_name_is_its_license_header_name_else_its_folder_name() {
-        let structure = super::derive(KENNEY_3D_KIT.map(|p| (p, 1)), |path| {
+        let structure = super::derive(KENNEY_3D_KIT.map(|p| (p, 1)), &Overrides::new(), |path| {
             if path == "3D assets/Car Kit/License.txt" {
                 kenney("Car Kit Deluxe", LicenseKind::Cc0)
             } else {
@@ -2590,9 +2838,11 @@ pub(crate) mod tests {
     #[test]
     fn a_pack_counts_every_file_below_it_by_kind_with_their_total_size() {
         let sizes = [10, 200, 300, 4_000, 50, 6_000, 7_000, 80, 9];
-        let structure = super::derive(KENNEY_3D_KIT.into_iter().zip(sizes), |_| {
-            LicenseText::default()
-        });
+        let structure = super::derive(
+            KENNEY_3D_KIT.into_iter().zip(sizes),
+            &Overrides::new(),
+            |_| LicenseText::default(),
+        );
         let car = info(&structure, "3D assets/Car Kit");
         // Support files and every group member count, the render and the license included.
         assert_eq!(
@@ -2616,12 +2866,14 @@ pub(crate) mod tests {
                 ("kit/Extra/License.txt", 2),
                 ("kit/Extra/a/b.glb", 4),
             ],
+            &Overrides::new(),
             |_| LicenseText::default(),
         );
         assert_eq!(info(&structure, "kit").size_bytes, 7);
         // A library that is one pack counts each file once, those at its root included.
         let structure = super::derive(
             [("License.txt", 1), ("rock.png", 2), ("Tiles/a.png", 4)],
+            &Overrides::new(),
             |_| LicenseText::default(),
         );
         let root = info(&structure, "");
@@ -3155,6 +3407,105 @@ pub(crate) mod tests {
             derived_rows(&pool).await,
             fresh_pass(&["kit/Readme.txt", "kit/rock.glb"]).await
         );
+    }
+
+    /// A library over `KENNEY_3D_KIT` plus a category with two packs inside, for the override
+    /// tests.
+    const OVERRIDDEN: [&str; 13] = [
+        "3D assets/Car Kit/License.txt",
+        "3D assets/Car Kit/Preview.png",
+        "3D assets/Car Kit/Sample.png",
+        "3D assets/Car Kit/Models/GLB format/sedan.glb",
+        "3D assets/Car Kit/Models/GLB format/Textures/colormap.png",
+        "3D assets/Car Kit/Models/FBX format/sedan.fbx",
+        "3D assets/Car Kit/Models/OBJ format/sedan.obj",
+        "3D assets/Car Kit/Previews/sedan.png",
+        "3D assets/Holiday Kit/License.txt",
+        "Other/License.txt",
+        "Other/A/License.txt",
+        "Other/A/a.glb",
+        "Other/B/Preview.png",
+    ];
+
+    /// Your edits for the override tests: a nested pack, a detection removed, and a name and a
+    /// cover.
+    const EDITS: &str = "INSERT INTO pack_overrides (path, mark, name, cover_path, updated_at)
+        VALUES ('3D assets/Car Kit/Models', 'pack', NULL, NULL, 0),
+               ('Other', 'not_pack', NULL, NULL, 0),
+               ('3D assets/Car Kit', NULL, 'My cars', '3D assets/Car Kit/Previews/sedan.png', 0)";
+
+    /// The rows a fresh library holding `paths`, with your `edits` (SQL), gets from its first
+    /// pass.
+    async fn fresh_pass_with(paths: &[&str], edits: &str) -> DerivedRows {
+        let pool = memory_library_pool().await;
+        for path in paths {
+            insert_path(&pool, path).await;
+        }
+        run(&pool, edits).await;
+        rebuild(&pool, unmounted()).await.unwrap();
+        derived_rows(&pool).await
+    }
+
+    #[tokio::test]
+    async fn an_override_leaves_the_rows_exactly_as_a_fresh_pass_would() {
+        let pool = memory_library_pool().await;
+        for path in OVERRIDDEN {
+            insert_path(&pool, path).await;
+        }
+        rebuild(&pool, unmounted()).await.unwrap();
+        let before = derived_rows(&pool).await;
+        run(&pool, EDITS).await;
+        assert!(rebuild(&pool, unmounted()).await.unwrap() > 0);
+        let after = derived_rows(&pool).await;
+        assert_ne!(after, before);
+        assert_eq!(after, fresh_pass_with(&OVERRIDDEN, EDITS).await);
+        let packs: Vec<(String, String)> = rows(
+            &pool,
+            "SELECT path, json_extract(pack_json, '$.name') FROM folders WHERE is_pack ORDER BY path",
+        )
+        .await;
+        assert_eq!(
+            packs,
+            pairs(&[
+                ("3D assets/Car Kit", "My cars"),
+                ("3D assets/Car Kit/Models", "Models"),
+                ("3D assets/Holiday Kit", "Holiday Kit"),
+                ("Other/A", "A"),
+                ("Other/B", "B"),
+            ])
+        );
+        // A rerun writes nothing, and clearing every edit gives back the pass's own rows.
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+        run(&pool, "DELETE FROM pack_overrides").await;
+        rebuild(&pool, unmounted()).await.unwrap();
+        assert_eq!(derived_rows(&pool).await, before);
+    }
+
+    #[tokio::test]
+    async fn the_pass_never_deletes_an_override_so_a_folder_that_comes_back_keeps_it() {
+        let pool = memory_library_pool().await;
+        for path in OVERRIDDEN {
+            insert_path(&pool, path).await;
+        }
+        run(&pool, EDITS).await;
+        rebuild(&pool, unmounted()).await.unwrap();
+        let edited = derived_rows(&pool).await;
+        let overrides = read_overrides(&pool).await.unwrap();
+
+        // An update extracted over the library: every file goes, then comes back.
+        run(&pool, "DELETE FROM assets").await;
+        rebuild(&pool, unmounted()).await.unwrap();
+        assert_eq!(
+            rows(&pool, "SELECT path, name FROM folders").await,
+            pairs(&[("", "")])
+        );
+        assert_eq!(read_overrides(&pool).await.unwrap(), overrides);
+        for path in OVERRIDDEN {
+            insert_path(&pool, path).await;
+        }
+        rebuild(&pool, unmounted()).await.unwrap();
+        assert_eq!(derived_rows(&pool).await, edited);
+        assert_eq!(read_overrides(&pool).await.unwrap(), overrides);
     }
 
     /// Every asset's (path, preview status) and every preview job's (asset, status), by path.

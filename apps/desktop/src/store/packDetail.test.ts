@@ -15,6 +15,7 @@ const pack = (path: string, name = path): PackDetail => ({
   gallery: [],
   kinds: { texture: 3 },
   sizeBytes: 3,
+  edits: {},
 });
 
 const store = () => usePackDetailStore.getState();

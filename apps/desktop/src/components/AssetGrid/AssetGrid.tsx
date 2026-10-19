@@ -3,7 +3,13 @@ import clsx from 'clsx';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { api } from '../../api';
-import { useUIStore, useAssetStore, useLibraryStore, useAutotagStore } from '../../store';
+import {
+  useUIStore,
+  useAssetStore,
+  useLibraryStore,
+  useAutotagStore,
+  useFolderActionStore,
+} from '../../store';
 import { useBrowseView } from '../../hooks/useBrowseView';
 import { PAGE_SIZE, assetAt, createSettler } from '../../store/pageCache';
 import { autotagAvailability } from '../../utils/autotag';
@@ -12,7 +18,7 @@ import { formatVisibleRange } from '../../utils/format';
 import { isEditingText, isInControl } from '../../utils/keyboard';
 import { scrubKey, scrubLabelText } from '../../utils/scrubKey';
 import { ContextMenu } from '../ContextMenu/ContextMenu';
-import { IconEye, IconExternal, IconTag, IconTrash } from '../Icons';
+import { IconEye, IconExternal, IconImage, IconTag, IconTrash } from '../Icons';
 import { AssetCard } from './AssetCard';
 import { CARD_BODY_HEIGHT } from './cardMetrics';
 import { AssetListRow } from './AssetListRow';
@@ -37,7 +43,7 @@ import {
   wantedPages,
 } from './gridGeometry';
 import type { PagingKey } from './gridGeometry';
-import type { Asset } from '../../types';
+import type { Asset, PackRef } from '../../types';
 import styles from './AssetGrid.module.css';
 
 type AssetHandler = (asset: Asset, e: React.MouseEvent) => void;
@@ -626,7 +632,11 @@ interface AssetContextMenuProps {
   onClose: () => void;
 }
 
-/** The grid's right-click menu: Auto-tag..., Reveal in file manager, Open, Delete. */
+/**
+ * The grid's right-click menu: Auto-tag..., Reveal in file manager, Open, Delete, and on one
+ * image inside a pack, "Use as pack cover" (plan C18), which the backend saves before it reruns
+ * the structure pass and emits `library:updated`.
+ */
 function AssetContextMenu({
   x,
   y,
@@ -637,6 +647,20 @@ function AssetContextMenu({
   onClose,
 }: AssetContextMenuProps) {
   const tooMany = openLimitReason(assetIds.length);
+  // The pack the one asset can be the cover of, once the backend says; `null` for none
+  const [coverPack, setCoverPack] = useState<PackRef | null>(null);
+  const single = assetIds.length === 1 ? assetIds[0] : null;
+  useEffect(() => {
+    if (!single) return;
+    let current = true;
+    api
+      .getCoverPack(single)
+      .then((pack) => current && setCoverPack(pack))
+      .catch((err) => console.error('Failed to find the pack holding the image:', err));
+    return () => {
+      current = false;
+    };
+  }, [single]);
   const forEachPath = (action: (path: string) => Promise<void>, what: string) => {
     const getById = useAssetStore.getState().getById;
     for (const id of assetIds) {
@@ -672,6 +696,26 @@ function AssetContextMenu({
           disabledReason: tooMany,
           onSelect: () => forEachPath(api.openWithDefault, 'open with default app'),
         },
+        ...(coverPack && single
+          ? [
+              {
+                id: 'grid-menu-pack-cover',
+                label: 'Use as pack cover',
+                icon: <IconImage size={12} />,
+                onSelect: () =>
+                  api
+                    .setPackOverride(coverPack.libraryId, coverPack.path, {
+                      kind: 'cover',
+                      assetId: single,
+                    })
+                    .catch((err) =>
+                      useFolderActionStore
+                        .getState()
+                        .setFailure(`Setting the cover of ${coverPack.name} failed: ${String(err)}`)
+                    ),
+              },
+            ]
+          : []),
         {
           id: 'grid-menu-delete',
           label: 'Delete…',

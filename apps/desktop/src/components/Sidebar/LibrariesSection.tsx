@@ -111,6 +111,7 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
       name: node.name,
       isPack: node.isPack,
       itemCount: node.itemCount,
+      mark: node.mark,
     });
   };
 

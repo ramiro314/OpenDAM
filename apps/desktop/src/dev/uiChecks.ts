@@ -1,5 +1,5 @@
 // The UI checks `VITE_SCROLL_BENCH=checks` runs (U1-U8 in
-// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U15 in
+// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U16 in
 // docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
 // check here.
 
@@ -2026,6 +2026,199 @@ export const UI_CHECKS: UiCheck[] = [
       await waitFor(() => !panel()?.dataset.packDetail, 10_000, 'the panel to show no pack');
 
       usePacksStore.getState().setMode('packs');
+      useUIStore.getState().clearLibrarySelection();
+      await searchWith({ libraryIds: undefined, libraryId: undefined, folder: undefined }, waitFor);
+    },
+  },
+  {
+    id: 'U16',
+    title:
+      '"Mark as pack" and "Not a pack" from the tree, a name, license and source URL from the ' +
+      'pack panel\'s form, and "Use as pack cover" from the grid each show in the tree, the ' +
+      'Packs view and the panel without a refresh',
+    run: async ({ assert, waitFor, pause, sleep }) => {
+      await expandBenchLibrary({ assert, sleep });
+      const ui = () => useUIStore.getState();
+      if (!ui().detailPanelOpen) ui().toggleDetailPanel();
+      const kitPath = '3D assets/Car Kit';
+      const modelsPath = `${kitPath}/Models`;
+      const naturePath = '3D assets/Nature Kit';
+      const editTimeout = 30_000;
+      usePacksStore.getState().setMode('packs');
+      await benchLibraryRoot(waitFor);
+      await expandFolder('3D assets');
+      await expandFolder(kitPath);
+      await waitFor(
+        () => folderRow(modelsPath) !== null && folderRow(naturePath) !== null,
+        10_000,
+        'the kit folders in the tree'
+      );
+      const cards = () => usePacksStore.getState().packs ?? [];
+      const card = (path: string) =>
+        cards().find((c) => c.libraryId === BENCH_LIBRARY && c.path === path);
+      const isPackRow = (path: string) => folderRow(path)?.dataset.pack === 'true';
+      const menuChoice = async (el: HTMLElement, itemId: string) => {
+        const r = el.getBoundingClientRect();
+        el.dispatchEvent(
+          new MouseEvent('contextmenu', {
+            bubbles: true,
+            cancelable: true,
+            button: 2,
+            clientX: r.left + 10,
+            clientY: r.top + r.height / 2,
+          })
+        );
+        await waitFor(() => document.getElementById(itemId) !== null, 10_000, `#${itemId}`);
+        document.getElementById(itemId)!.click();
+      };
+
+      // "Mark as pack" nests a pack in the kit, and "Not a pack" removes a detected one
+      assert(!isPackRow(modelsPath) && isPackRow(naturePath), 'the packs before any edit');
+      await menuChoice(folderRow(modelsPath)!, 'folder-menu-mark-pack');
+      await waitFor(
+        () => isPackRow(modelsPath) && card(modelsPath) !== undefined,
+        editTimeout,
+        `${modelsPath} to show as a pack in the tree and the Packs view`
+      );
+      await menuChoice(folderRow(naturePath)!, 'folder-menu-not-pack');
+      await waitFor(
+        () => folderRow(naturePath) !== null && !isPackRow(naturePath) && !card(naturePath),
+        editTimeout,
+        `${naturePath} to show as a folder in the tree and leave the Packs view`
+      );
+      const models = card(modelsPath)!;
+      await scrollToCard(cards().indexOf(models), models, waitFor);
+      await pause('U16-marks');
+
+      // The kit's name, license and source URL, from the pack panel's form
+      const kit = card(kitPath)!;
+      (await scrollToCard(cards().indexOf(kit), kit, waitFor)).click();
+      const panel = () => document.getElementById('detail-panel');
+      await waitFor(
+        () => panel()?.dataset.packDetail === kitPath,
+        10_000,
+        `the panel to show ${kitPath}`
+      );
+      document.getElementById('detail-pack-edit')!.click();
+      await waitFor(
+        () => document.getElementById('detail-pack-form') !== null,
+        5_000,
+        'the edit form'
+      );
+      const typeInto = (id: string, value: string) => {
+        const input = document.getElementById(id) as HTMLInputElement;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(
+          input,
+          value
+        );
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      };
+      const [name, license, source] = [
+        'My cars',
+        'CC0, credit Kenney',
+        'https://kenney.nl/assets/car-kit',
+      ];
+      typeInto('detail-pack-form-name', name);
+      typeInto('detail-pack-form-license', license);
+      typeInto('detail-pack-form-source', source);
+      document.getElementById('detail-pack-form-save')!.click();
+      const text = (id: string) => document.getElementById(id)?.textContent ?? '';
+      await waitFor(
+        () =>
+          text('detail-pack-name') === name &&
+          text('detail-pack-license') === license &&
+          text('detail-pack-source') === source,
+        editTimeout,
+        'the panel to show the edits'
+      );
+      await waitFor(
+        () =>
+          folderRow(kitPath)?.textContent?.includes(name) === true &&
+          packCard(kit)?.title.startsWith(`${name} (`) === true,
+        editTimeout,
+        'the tree node and the card to show the new name'
+      );
+      // "Open" opens the source URL, recorded rather than run
+      const opened: string[] = [];
+      const realOpenUrl = api.openUrl;
+      api.openUrl = async (url) => void opened.push(url);
+      try {
+        document.getElementById('detail-open-source')!.click();
+        await waitFor(() => opened.length > 0, 5_000, '"Open" to open the source URL');
+      } finally {
+        api.openUrl = realOpenUrl;
+      }
+      assert(opened.join() === source, `"Open" opened ${opened.join(', ')}`);
+      await pause('U16-name');
+
+      // "Use as pack cover" on a render below the kit, which "Show hidden files" shows
+      const rendersPath = `${kitPath}/Previews`;
+      const filter = useAssetStore.getState().query.filter;
+      await searchWith(
+        {
+          folder: { libraryId: BENCH_LIBRARY, path: rendersPath },
+          filter: { ...filter, showHidden: true },
+        },
+        waitFor
+      );
+      await mainShows('assets', 'showing hidden files', waitFor);
+      const render = assetAt(useAssetStore.getState(), 0);
+      assert(render, `no file in ${rendersPath}`);
+      const tileSelector = '[data-index="0"]:not([data-placeholder])';
+      await untilFrame(() => assetScroll()?.querySelector(tileSelector) != null, 5_000, 'tile 0');
+      await menuChoice(
+        assetScroll()!.querySelector<HTMLElement>(tileSelector)!,
+        'grid-menu-pack-cover'
+      );
+      let cover = (await api.getPackDetail(BENCH_LIBRARY, kitPath))?.cover;
+      const deadline = performance.now() + editTimeout;
+      while (cover?.filePath !== render!.filePath) {
+        assert(performance.now() < deadline, `the cover is still ${cover?.filePath}`);
+        await sleep(250);
+        cover = (await api.getPackDetail(BENCH_LIBRARY, kitPath))?.cover;
+      }
+      const coverSrcs = [cover!.thumbnailPath, cover!.filePath]
+        .filter((p): p is string => Boolean(p))
+        .map((p) => convertFileSrc(p));
+      const showsCover = (img: Element | null | undefined) =>
+        coverSrcs.includes(img?.getAttribute('src') ?? '');
+      await waitFor(
+        () => showsCover(folderRow(kitPath)?.querySelector('[data-pack-cover]')),
+        editTimeout,
+        'the tree node to show the cover'
+      );
+      // Inside the pack with no asset selected, the panel shows the pack and its cover
+      ui().clearSelection();
+      await waitFor(
+        () => panel()?.dataset.packDetail === kitPath && showsCover(panel()?.querySelector('img')),
+        editTimeout,
+        'the panel to show the cover'
+      );
+      await searchWith({ folder: undefined, filter: { ...filter, showHidden: false } }, waitFor);
+      await benchLibraryRoot(waitFor);
+      const edited = card(kitPath)!;
+      const kitCard = await scrollToCard(cards().indexOf(edited), edited, waitFor);
+      await waitFor(
+        () => showsCover(kitCard.querySelector('img')),
+        editTimeout,
+        'the card to show the cover'
+      );
+      await pause('U16-cover');
+
+      // Back to what was detected, for the checks after this one
+      for (const [path, edit] of [
+        [modelsPath, { kind: 'mark', mark: null }],
+        [naturePath, { kind: 'mark', mark: null }],
+        [kitPath, { kind: 'details', name: null, license: null, sourceUrl: null }],
+        [kitPath, { kind: 'cover', assetId: null }],
+      ] as const) {
+        await api.setPackOverride(BENCH_LIBRARY, path, edit);
+      }
+      await waitFor(
+        () => !isPackRow(modelsPath) && isPackRow(naturePath) && card(kitPath)?.name === 'Car Kit',
+        editTimeout,
+        'the edits to go'
+      );
       useUIStore.getState().clearLibrarySelection();
       await searchWith({ libraryIds: undefined, libraryId: undefined, folder: undefined }, waitFor);
     },

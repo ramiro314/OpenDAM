@@ -46,6 +46,7 @@ import { formatSize, itemFileCount } from '../../utils/format';
 import { useImageScaling } from '../../hooks/useImageScaling';
 import { useBrowseView } from '../../hooks/useBrowseView';
 import { panelPackTarget } from '../../utils/packsView';
+import { detailsEdit, packForm, sourceUrlProblem, type PackForm } from '../../utils/packEdits';
 import { KIND_LABEL } from '../../utils/scrubKey';
 import { ThreeViewer } from './ThreeViewer';
 import { SuggestTags } from './SuggestTags';
@@ -432,19 +433,34 @@ const coverImage = (cover: Cover) =>
 /**
  * A pack's details (plan C18): its cover, or the gallery image clicked, its name, its gallery of
  * `Preview*` and `Sample*` images, its Kenney header's version and author, its license with "Open
- * license", and its files by kind with their total size.
+ * license", its source URL with "Open", and its files by kind with their total size. The edit
+ * button opens a form for its name, license and source URL. Each save reruns the structure pass,
+ * whose `library:updated` reloads the pack here.
  */
 function PackPanel({ pack }: { pack: PackDetail }) {
   const scaling = useImageScaling('contain');
   const [shown, setShown] = useState<string | null>(null);
-  useEffect(() => setShown(null), [pack.libraryId, pack.path]);
+  const [editing, setEditing] = useState(false);
+  useEffect(() => {
+    setShown(null);
+    setEditing(false);
+  }, [pack.libraryId, pack.path]);
   const image = pack.gallery.find((g) => g.filePath === shown) ?? pack.cover;
   const src = image ? coverImage(image) : undefined;
   const kinds = (Object.entries(pack.kinds) as [AssetKind, number][]).sort(
     ([a, m], [b, n]) => n - m || a.localeCompare(b)
   );
   const files = kinds.reduce((sum, [, n]) => sum + n, 0);
-  const { header, license } = pack;
+  const { header, license, edits } = pack;
+  const licenseName =
+    edits.license ?? (license ? (LICENSE_LABEL[license.kind] ?? license.kind) : null);
+  const resetCover = async () => {
+    try {
+      await api.setPackOverride(pack.libraryId, pack.path, { kind: 'cover', assetId: null });
+    } catch (err) {
+      console.error('Failed to reset the pack cover:', err);
+    }
+  };
 
   return (
     <aside
@@ -475,7 +491,30 @@ function PackPanel({ pack }: { pack: PackDetail }) {
             {pack.name}
           </span>
         </p>
+        <div className={styles.headerActions}>
+          {edits.coverPath && (
+            <button
+              id="detail-pack-reset-cover"
+              className={styles.actionBtn}
+              title="Use the detected cover"
+              onClick={resetCover}
+            >
+              <IconRefresh size={14} />
+            </button>
+          )}
+          <button
+            id="detail-pack-edit"
+            className={clsx(styles.actionBtn, editing && styles.actionBtnActive)}
+            title="Edit the pack's name, license and source URL"
+            aria-pressed={editing}
+            onClick={() => setEditing((e) => !e)}
+          >
+            <IconEdit size={14} />
+          </button>
+        </div>
       </div>
+
+      {editing && <PackEditForm pack={pack} onDone={() => setEditing(false)} />}
 
       {pack.gallery.length > 0 && (
         <section className={styles.groupFiles} id="detail-pack-gallery">
@@ -530,7 +569,7 @@ function PackPanel({ pack }: { pack: PackDetail }) {
           {license ? (
             <span className={styles.licenseRow}>
               <span id="detail-pack-license" className={styles.infoValue}>
-                {LICENSE_LABEL[license.kind] ?? license.kind}
+                {licenseName}
               </span>
               <button
                 id="detail-open-license"
@@ -550,8 +589,34 @@ function PackPanel({ pack }: { pack: PackDetail }) {
             </span>
           ) : (
             <span id="detail-pack-license" className={styles.infoValue}>
-              No license file
+              {licenseName ?? 'No license file'}
             </span>
+          )}
+
+          {edits.sourceUrl && (
+            <>
+              <label className={styles.infoLabel}>Source</label>
+              <span className={styles.licenseRow}>
+                <span id="detail-pack-source" className={clsx(styles.infoValue, styles.mono)}>
+                  {edits.sourceUrl}
+                </span>
+                <button
+                  id="detail-open-source"
+                  className={styles.openLicenseBtn}
+                  title={edits.sourceUrl}
+                  onClick={async () => {
+                    try {
+                      await api.openUrl(edits.sourceUrl!);
+                    } catch (err) {
+                      console.error('Failed to open the source URL:', err);
+                    }
+                  }}
+                >
+                  <IconExternal size={11} />
+                  <span>Open</span>
+                </button>
+              </span>
+            </>
           )}
 
           <label className={styles.infoLabel}>Items</label>
@@ -583,6 +648,95 @@ function PackPanel({ pack }: { pack: PackDetail }) {
         </div>
       </div>
     </aside>
+  );
+}
+
+/**
+ * The pack's edit form: its name, license and source URL. An empty field goes back to what the
+ * structure pass detected.
+ */
+function PackEditForm({ pack, onDone }: { pack: PackDetail; onDone: () => void }) {
+  const [form, setForm] = useState<PackForm>(() => packForm(pack));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const urlProblem = sourceUrlProblem(form.sourceUrl);
+  const field = (key: keyof PackForm) => ({
+    value: form[key],
+    onChange: (e: React.ChangeEvent<HTMLInputElement>) => {
+      setForm({ ...form, [key]: e.target.value });
+      setError(null);
+    },
+  });
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (urlProblem) return;
+    setSaving(true);
+    try {
+      await api.setPackOverride(pack.libraryId, pack.path, detailsEdit(form, pack));
+      onDone();
+    } catch (err) {
+      setError(String(err));
+      setSaving(false);
+    }
+  };
+
+  return (
+    <form
+      id="detail-pack-form"
+      className={styles.packForm}
+      onSubmit={handleSubmit}
+      onKeyDown={(e) => e.key === 'Escape' && onDone()}
+    >
+      <label className={styles.infoLabel} htmlFor="detail-pack-form-name">
+        Name
+      </label>
+      <input
+        id="detail-pack-form-name"
+        className={styles.packFormInput}
+        placeholder="The detected name"
+        autoFocus
+        {...field('name')}
+      />
+      <label className={styles.infoLabel} htmlFor="detail-pack-form-license">
+        License
+      </label>
+      <input
+        id="detail-pack-form-license"
+        className={styles.packFormInput}
+        placeholder={pack.license ? LICENSE_LABEL[pack.license.kind] : 'CC0, CC-BY 4.0...'}
+        {...field('license')}
+      />
+      <label className={styles.infoLabel} htmlFor="detail-pack-form-source">
+        Source URL
+      </label>
+      <input
+        id="detail-pack-form-source"
+        className={styles.packFormInput}
+        type="url"
+        placeholder="https://"
+        {...field('sourceUrl')}
+      />
+      {(urlProblem || error) && (
+        <p className={styles.packFormError} role="alert">
+          {urlProblem ?? error}
+        </p>
+      )}
+      <div className={styles.packFormActions}>
+        <span className={styles.packFormHint}>Leave a field empty to use what was detected.</span>
+        <button type="button" className={styles.openLicenseBtn} onClick={onDone}>
+          Cancel
+        </button>
+        <button
+          type="submit"
+          id="detail-pack-form-save"
+          className={clsx(styles.openLicenseBtn, styles.packFormSave)}
+          disabled={saving || Boolean(urlProblem)}
+        >
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+      </div>
+    </form>
   );
 }
 
