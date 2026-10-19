@@ -1388,11 +1388,13 @@ async function checkPacksView({
   await pause('U10-pack-opened');
 
   await benchLibraryRoot(waitFor);
-  const audio = hiddenOnly[0];
-  card = await scrollToCard(cards.indexOf(audio), audio, waitFor);
+  // A pack with visible items, whose assets fill the grid (one with none shows the empty state)
+  const next = cards[cards.indexOf(kit!) + 1];
+  assert(next.itemCount > 0, `${next.path}, after the Car Kit, has no visible item`);
+  card = await scrollToCard(cards.indexOf(next), next, waitFor);
   card.focus();
   press(card, 'Enter');
-  await opened(audio, 'Enter');
+  await opened(next, 'Enter');
 
   useUIStore.getState().clearLibrarySelection();
   await searchWith({ libraryIds: undefined, libraryId: undefined, folder: undefined }, waitFor);
