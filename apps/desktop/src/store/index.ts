@@ -219,7 +219,9 @@ interface AssetStore extends PageCache {
 
   setQuery: (q: Partial<SearchQuery>) => void;
   setFilter: (f: Partial<FilterSpec>) => void;
+  /** Replaces the filter, keeping "Show hidden files" unless `f` sets it */
   replaceFilter: (f: FilterSpec, collectionId?: string) => void;
+  /** Clears the collection and every filter but "Show hidden files" */
   resetFilter: () => void;
   clearFilter: (key: keyof FilterSpec) => void;
   setSort: (field: SortField, order?: SortOrder) => void;
@@ -266,6 +268,14 @@ const defaultQuery: SearchQuery = {
   sort: { field: 'date', order: 'desc' },
   includeSubcollections: true,
 };
+
+/**
+ * `next` with `prev`'s "Show hidden files", unless `next` sets it: a view setting that outlasts
+ * picking a collection, a tag or a smart filter, as it does turning it on while one is picked.
+ */
+function keepView(prev: FilterSpec, next: FilterSpec): FilterSpec {
+  return prev.showHidden && next.showHidden === undefined ? { ...next, showHidden: true } : next;
+}
 
 /** Clears the grid so a failed search can't leave results from an earlier query on screen */
 function failedSearch(e: unknown): Partial<AssetStore> {
@@ -349,9 +359,12 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
   setFilter: (f) => set((s) => ({ query: { ...s.query, filter: { ...s.query.filter, ...f } } })),
 
   replaceFilter: (f, collectionId) =>
-    set((s) => ({ query: { ...s.query, collectionId, filter: f } })),
+    set((s) => ({ query: { ...s.query, collectionId, filter: keepView(s.query.filter, f) } })),
 
-  resetFilter: () => set((s) => ({ query: { ...s.query, collectionId: undefined, filter: {} } })),
+  resetFilter: () =>
+    set((s) => ({
+      query: { ...s.query, collectionId: undefined, filter: keepView(s.query.filter, {}) },
+    })),
 
   clearFilter: (key) =>
     set((s) => {

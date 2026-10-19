@@ -147,6 +147,32 @@ describe('useAssetStore search errors', () => {
   });
 });
 
+describe('useAssetStore filters', () => {
+  test('picking a collection, a tag or a smart filter keeps "Show hidden files"', () => {
+    const store = useAssetStore.getState();
+    store.replaceFilter({ showHidden: true, isFavorite: true });
+
+    store.resetFilter();
+    expect(useAssetStore.getState().query.filter).toEqual({ showHidden: true });
+    store.replaceFilter({ tags: ['t1'] });
+    expect(useAssetStore.getState().query.filter).toEqual({ tags: ['t1'], showHidden: true });
+    // A smart filter that sets it wins
+    store.replaceFilter({ kinds: ['texture'], showHidden: false });
+    expect(useAssetStore.getState().query.filter).toEqual({
+      kinds: ['texture'],
+      showHidden: false,
+    });
+    store.replaceFilter({});
+  });
+
+  test('with hidden files off, a reset clears every filter', () => {
+    const store = useAssetStore.getState();
+    store.replaceFilter({ isFavorite: true });
+    store.resetFilter();
+    expect(useAssetStore.getState().query.filter).toEqual({});
+  });
+});
+
 describe('useAssetStore page cache', () => {
   test('search fetches page 0 with the total; later pages never count it again', async () => {
     const all = library(1000);

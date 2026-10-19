@@ -100,7 +100,8 @@ export function FiltersSection({ clearSmartFilter }: FiltersSectionProps) {
     search();
   };
 
-  // A view of hidden files, not a narrowing filter, so it keeps any collection or smart filter
+  // A view of hidden files, not a narrowing filter: it keeps any collection or smart filter, and
+  // picking one keeps it (`resetFilter`, `replaceFilter`). Only "All assets" turns it off.
   const toggleShowHidden = (show: boolean) => {
     if (show) {
       setFilter({ showHidden: true });
@@ -130,6 +131,7 @@ export function FiltersSection({ clearSmartFilter }: FiltersSectionProps) {
           clearSmartFilter();
           setActiveCollection(null);
           resetFilter();
+          clearFilter('showHidden');
           search();
         }}
       >
