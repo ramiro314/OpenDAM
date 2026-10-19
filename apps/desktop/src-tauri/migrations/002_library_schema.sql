@@ -39,8 +39,9 @@ CREATE TABLE IF NOT EXISTS assets (
     thumbnail_path   TEXT,                -- relative to library root (.opendam/thumbs/...)
     preview_status   TEXT NOT NULL DEFAULT 'none',
     metadata         TEXT NOT NULL DEFAULT '{}', -- JSON object
-    support_role     TEXT,                -- 'doc' or 'cover' for a pack's support file (structure.rs)
-    group_id         TEXT                 -- its format group's main item, itself included (structure.rs)
+    support_role     TEXT,                -- 'doc' or 'cover' or 'model_preview' for a support file (structure.rs)
+    group_id         TEXT,                -- its format group's main item (itself included) (structure.rs)
+    bundled_preview  TEXT                 -- the render a main item shows (relative to library root) (structure.rs)
 );
 
 CREATE INDEX IF NOT EXISTS idx_assets_kind         ON assets(kind);

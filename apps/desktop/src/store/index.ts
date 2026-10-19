@@ -248,8 +248,18 @@ interface AssetStore extends PageCache {
   deleteAsset: (id: string, deleteFile?: boolean) => Promise<void>;
   deleteAssets: (ids: string[], deleteFile?: boolean) => Promise<void>;
   renameAsset: (id: string, newName: string) => Promise<Asset>;
-  /** Applies a finished preview: `thumbnailPath` replaces the old one, and `null` clears it. */
-  updateAssetPreview: (id: string, thumbnailPath: string | null, previewModel?: string) => void;
+  /**
+   * Applies a finished preview: `thumbnailPath` replaces the old one, and `null` clears it. A
+   * cached model whose bundled preview is this asset, as its own file (`render.filePath`) or its
+   * thumbnail before the job (`render.previousThumbnailPath`), shows the new thumbnail instead,
+   * or the file itself when the thumbnail was cleared.
+   */
+  updateAssetPreview: (
+    id: string,
+    thumbnailPath: string | null,
+    previewModel?: string,
+    render?: { filePath: string; previousThumbnailPath?: string }
+  ) => void;
   setPreviewStatus: (id: string, status: Asset['previewStatus']) => void;
   /** Re-fetches the given assets that are cached or pinned; other ids are ignored */
   refreshAssets: (ids: string[]) => Promise<void>;
@@ -580,13 +590,24 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
     return updated;
   },
 
-  updateAssetPreview: (id, thumbnailPath, previewModel) => {
+  updateAssetPreview: (id, thumbnailPath, previewModel, render) => {
     get().patchCached(id, (asset) => ({
       ...asset,
       thumbnailPath: thumbnailPath ?? undefined,
       previewStatus: 'done',
       metadata: previewModel ? { ...asset.metadata, preview_model: previewModel } : asset.metadata,
     }));
+    if (!render) return;
+    const shown = new Set([render.filePath, render.previousThumbnailPath].filter(Boolean));
+    const picture = thumbnailPath ?? render.filePath;
+    const rendered = cachedAssets(get())
+      .filter(
+        (a) => a.bundledPreview && shown.has(a.bundledPreview) && a.bundledPreview !== picture
+      )
+      .map((a) => a.id);
+    if (rendered.length > 0) {
+      get().patchCached(rendered, (asset) => ({ ...asset, bundledPreview: picture }));
+    }
   },
 
   setPreviewStatus: (id, status) => {

@@ -6,7 +6,7 @@ import { useAssetStore } from '../../store';
 import { IconImage, IconVideo, IconStar, IconHeart, IconHeartFilled } from '../Icons';
 import { formatGroupBadge, formatSize } from '../../utils/format';
 import { useImageScaling } from '../../hooks/useImageScaling';
-import { tileMedia, tileState, type TileMedia } from './tileState';
+import { tileImage, tileMedia, tileState, type TileMedia } from './tileState';
 import styles from './AssetListRow.module.css';
 
 interface AssetListRowProps {
@@ -40,9 +40,10 @@ export const AssetListRow = memo(function AssetListRow({
   useEffect(() => {
     setFailed(undefined);
     setMediaSettled(false);
-  }, [asset.thumbnailPath, asset.filePath]);
+  }, [asset.bundledPreview, asset.thumbnailPath, asset.filePath]);
 
   const media = tileMedia(asset, { failed });
+  const image = tileImage(asset, media);
   const groupBadge = formatGroupBadge(asset.groupFormats);
   const settle = () => setMediaSettled(true);
 
@@ -111,19 +112,9 @@ export const AssetListRow = memo(function AssetListRow({
 
       {/* Thumbnail */}
       <div className={styles.thumb}>
-        {media === 'thumbnail' && asset.thumbnailPath ? (
+        {image ? (
           <img
-            src={convertFileSrc(asset.thumbnailPath)}
-            alt={asset.fileName}
-            className={styles.thumbImg}
-            ref={scaling}
-            decoding="async"
-            onLoad={settle}
-            onError={() => setFailed(media)}
-          />
-        ) : media === 'original' ? (
-          <img
-            src={convertFileSrc(asset.filePath)}
+            src={convertFileSrc(image)}
             alt={asset.fileName}
             className={styles.thumbImg}
             ref={scaling}
