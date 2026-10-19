@@ -279,8 +279,10 @@ async fn remove(
 /// Deletes the run's pairs from an open library's `asset_tags`, then their master rows, a batch
 /// at a time. Deleting a `pending` pair the library never got is a no-op. A pair another run
 /// still records, one not being undone, stays in the library: that run added it too (replay
-/// confirms a pair already there as its own), so only the master row of this run goes.
-/// Returns the assets whose tags changed.
+/// confirms a pair already there as its own), so only the master row of this run goes. The tag
+/// leaves every member of the asset's group (`structure::group_members`), so it stays when
+/// another run records it on any member, such as one from before group writes, which tagged
+/// each format file on its own. Returns the assets whose tags changed.
 async fn remove_pairs(
     db: &Database,
     lib: &LibraryHandle,
@@ -292,13 +294,15 @@ async fn remove_pairs(
     for chunk in pairs.chunks(BATCH) {
         let mut shared = HashSet::new();
         for (asset_id, tag_id) in chunk {
+            let members = crate::structure::group_members(&lib.pool, asset_id).await?;
             let owned_elsewhere: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM tag_run_applied a LEFT JOIN tag_runs r ON r.id = a.run_id
-                                WHERE a.asset_id = ? AND a.tag_id = ? AND a.run_id != ?
+                                WHERE a.asset_id IN (SELECT value FROM json_each(?))
+                                  AND a.tag_id = ? AND a.run_id != ?
                                   AND (r.status IS NULL
                                        OR r.status NOT IN ('undoing', 'undo_partial', 'undone')))",
             )
-            .bind(asset_id)
+            .bind(serde_json::to_string(&members).expect("ids serialize"))
             .bind(tag_id)
             .bind(run_id)
             .fetch_one(&db.master_pool)
@@ -309,7 +313,8 @@ async fn remove_pairs(
         }
         let mut tx = lib.pool.begin().await?;
         for (asset_id, tag_id) in chunk.iter().filter(|p| !shared.contains(&(&p.0, &p.1))) {
-            // The run tagged every member of the item's group (`store::write_batch`).
+            // The run tagged every member of the item's group (`store::write_batch`), and no
+            // other run holds the tag on any of them.
             let mut deleted = 0;
             for member in crate::structure::group_members(&mut *tx, asset_id).await? {
                 deleted += sqlx::query("DELETE FROM asset_tags WHERE asset_id = ? AND tag_id = ?")
@@ -1242,6 +1247,30 @@ mod tests {
         assert_eq!(asset_tags(a).await, tagged, "the cover is no member");
 
         assert_eq!(engine.undo_run(&run_id).await.unwrap(), "undone");
+        assert!(asset_tags(a).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn undo_leaves_a_groups_tag_that_another_run_holds_on_another_member() {
+        let (db, pools) = libraries(&["A"], &[&["rock-a1", "rock-a1-fbx"]]).await;
+        let a = &pools[0];
+        let engine = started_engine(&db).await;
+        // Before group writes, each format file was tagged on its own, by its own run.
+        let first = run(&engine, &db, &["rock-a1"], Mode::ExistingOnly, "done").await;
+        let second = run(&engine, &db, &["rock-a1-fbx"], Mode::ExistingOnly, "done").await;
+        sqlx::query("UPDATE assets SET group_id = 'rock-a1'")
+            .execute(a)
+            .await
+            .unwrap();
+        let both: Vec<(String, String)> = ["rock-a1", "rock-a1-fbx"]
+            .iter()
+            .map(|id| (id.to_string(), "t-rock".to_string()))
+            .collect();
+
+        assert_eq!(engine.undo_run(&second).await.unwrap(), "undone");
+        assert_eq!(asset_tags(a).await, both, "the first run still holds Rock");
+
+        assert_eq!(engine.undo_run(&first).await.unwrap(), "undone");
         assert!(asset_tags(a).await.is_empty());
     }
 }
