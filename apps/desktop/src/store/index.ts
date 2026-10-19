@@ -22,6 +22,7 @@ import type {
 import { api } from '../api';
 import { useFolderTreeStore } from './folderTree';
 import type { ImageScaling } from '../utils/imageScaling';
+import { PANEL_LIMITS, clampPanelWidth, type PanelSide } from '../utils/panelSize';
 import {
   PAGE_SIZE,
   assetAt,
@@ -45,6 +46,9 @@ interface UIState {
   imageScaling: ImageScaling;
   sidebarOpen: boolean;
   detailPanelOpen: boolean;
+  /** Panel widths in pixels, kept while a panel is collapsed */
+  sidebarWidth: number;
+  detailPanelWidth: number;
   selectedAssetIds: Set<string>;
   focusedAssetId: string | null;
   activeLibraryId: string | null;
@@ -57,6 +61,7 @@ interface UIState {
   setImageScaling: (scaling: ImageScaling) => void;
   toggleSidebar: () => void;
   toggleDetailPanel: () => void;
+  setPanelWidth: (side: PanelSide, width: number) => void;
   selectAsset: (id: string, multi?: boolean) => void;
   selectAll: (ids: string[]) => void;
   clearSelection: () => void;
@@ -79,6 +84,8 @@ export const useUIStore = create<UIState>()(
       imageScaling: 'pixelated',
       sidebarOpen: true,
       detailPanelOpen: true,
+      sidebarWidth: PANEL_LIMITS.sidebar.initial,
+      detailPanelWidth: PANEL_LIMITS.detail.initial,
       selectedAssetIds: new Set(),
       focusedAssetId: null,
       activeLibraryId: null,
@@ -91,6 +98,12 @@ export const useUIStore = create<UIState>()(
       setImageScaling: (imageScaling) => set({ imageScaling }),
       toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
       toggleDetailPanel: () => set((s) => ({ detailPanelOpen: !s.detailPanelOpen })),
+      setPanelWidth: (side, width) =>
+        set(
+          side === 'sidebar'
+            ? { sidebarWidth: clampPanelWidth(side, width) }
+            : { detailPanelWidth: clampPanelWidth(side, width) }
+        ),
 
       selectAsset: (id, multi = false) =>
         set((s) => {
@@ -145,6 +158,8 @@ export const useUIStore = create<UIState>()(
         imageScaling: s.imageScaling,
         sidebarOpen: s.sidebarOpen,
         detailPanelOpen: s.detailPanelOpen,
+        sidebarWidth: s.sidebarWidth,
+        detailPanelWidth: s.detailPanelWidth,
       }),
     }
   )

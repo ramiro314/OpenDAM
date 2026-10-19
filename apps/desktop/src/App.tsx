@@ -11,6 +11,7 @@ import { RunsPanel } from './components/Autotag/RunsPanel';
 import { AutotagDialog } from './components/Autotag/AutotagDialog';
 import { ReviewModal } from './components/Autotag/ReviewModal';
 import { IconCheck } from './components/Icons';
+import { PanelResizer } from './components/PanelResizer/PanelResizer';
 import { useUIStore } from './store';
 import {
   useLibraryStore,
@@ -28,10 +29,12 @@ import { api } from './api';
 import { startModelThumbnailer } from './preview/modelThumbnailer';
 import { isEditingText, isInControl } from './utils/keyboard';
 import { itemFileCount } from './utils/format';
+import { clampPanelWidth } from './utils/panelSize';
 import styles from './App.module.css';
 
 export default function App() {
-  const { sidebarOpen, detailPanelOpen, focusedAssetId } = useUIStore();
+  const { sidebarOpen, detailPanelOpen, sidebarWidth, detailPanelWidth, focusedAssetId } =
+    useUIStore();
   const focusedAsset = useAssetStore((s) =>
     focusedAssetId ? (lookupAsset(s, focusedAssetId) ?? null) : null
   );
@@ -270,11 +273,21 @@ export default function App() {
   return (
     <div className={styles.layout}>
       <Toolbar />
-      <div className={styles.body}>
+      <div
+        className={styles.body}
+        style={
+          {
+            '--sidebar-width': `${clampPanelWidth('sidebar', sidebarWidth)}px`,
+            '--detail-panel-width': `${clampPanelWidth('detail', detailPanelWidth)}px`,
+          } as React.CSSProperties
+        }
+      >
         {sidebarOpen && <Sidebar />}
+        {sidebarOpen && <PanelResizer side="sidebar" />}
         <main className={styles.main}>
           <AssetGrid />
         </main>
+        {detailPanelOpen && <PanelResizer side="detail" />}
         {detailPanelOpen && <DetailPanel />}
       </div>
       <StatusBar />

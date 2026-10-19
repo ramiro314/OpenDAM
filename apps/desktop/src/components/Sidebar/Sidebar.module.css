@@ -1,6 +1,7 @@
 .sidebar {
   width: var(--sidebar-width);
-  flex-shrink: 0;
+  /* PANEL_LIMITS.sidebar.min in utils/panelSize.ts */
+  min-width: 180px;
   display: flex;
   flex-direction: column;
   background: var(--color-bg-surface);

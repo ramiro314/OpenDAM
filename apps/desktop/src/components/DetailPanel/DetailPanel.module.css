@@ -1,6 +1,7 @@
 .panel {
   width: var(--detail-panel-width);
-  flex-shrink: 0;
+  /* PANEL_LIMITS.detail.min in utils/panelSize.ts */
+  min-width: 260px;
   display: flex;
   flex-direction: column;
   background: var(--color-bg-surface);

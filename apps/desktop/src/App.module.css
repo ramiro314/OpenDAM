@@ -14,8 +14,10 @@
   overflow: hidden;
 }
 
+/* Keep in step with MAIN_MIN_WIDTH in utils/panelSize.ts. In a narrow window the panels give way. */
 .main {
   flex: 1;
+  min-width: 320px;
   display: flex;
   flex-direction: column;
   overflow: hidden;
