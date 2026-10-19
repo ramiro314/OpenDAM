@@ -669,25 +669,47 @@ async fn read_licenses(pool: &Pool<Sqlite>) -> sqlx::Result<HashMap<String, Lice
         .collect())
 }
 
-/// The header name of license file `file` below `root`, from its last read when its size and
-/// mtime haven't changed since, else from its first `HEADER_BYTES` on disk. `Err` when it can't
-/// be read, so the pass records no read and tries again next time.
-fn license_header(
+/// The header name of license file `file` from its last read, when its size and mtime haven't
+/// changed since; `None` when it must be read again.
+fn known_header(file: &FileRow, known: &HashMap<String, LicenseFile>) -> Option<Option<String>> {
+    known
+        .get(&file.file_path)
+        .filter(|l| (l.size_bytes, l.modified_at) == (file.size_bytes, file.modified_at))
+        .map(|l| l.header_name.clone())
+}
+
+/// The header name of each license file of `paths` below `root`, from its first `HEADER_BYTES`,
+/// or why it couldn't be read. The reads run on the blocking pool, off the async runtime, since a
+/// library on a network share can take long to open each file.
+async fn read_headers(
     root: &Path,
-    file: &FileRow,
-    known: &HashMap<String, LicenseFile>,
-) -> std::io::Result<Option<String>> {
+    paths: Vec<String>,
+) -> HashMap<String, std::io::Result<Option<String>>> {
     use std::io::Read;
-    if let Some(l) = known.get(&file.file_path) {
-        if (l.size_bytes, l.modified_at) == (file.size_bytes, file.modified_at) {
-            return Ok(l.header_name.clone());
+    let read_all = {
+        let (root, paths) = (root.to_path_buf(), paths.clone());
+        move || {
+            paths
+                .into_iter()
+                .map(|path| {
+                    let mut head = Vec::new();
+                    let header = std::fs::File::open(root.join(&path))
+                        .and_then(|f| f.take(HEADER_BYTES).read_to_end(&mut head))
+                        .map(|_| kenney_header_name(&String::from_utf8_lossy(&head)));
+                    (path, header)
+                })
+                .collect()
         }
-    }
-    let mut head = Vec::new();
-    std::fs::File::open(root.join(&file.file_path))?
-        .take(HEADER_BYTES)
-        .read_to_end(&mut head)?;
-    Ok(kenney_header_name(&String::from_utf8_lossy(&head)))
+    };
+    tokio::task::spawn_blocking(read_all)
+        .await
+        .unwrap_or_else(|e| {
+            let error = format!("the license reads stopped: {e}");
+            paths
+                .into_iter()
+                .map(|path| (path, Err(std::io::Error::other(error.clone()))))
+                .collect()
+        })
 }
 
 /// Makes `folders` hold exactly `folders`, writing only the rows that differ, in transactions of
@@ -1084,16 +1106,31 @@ pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
     let known = read_licenses(pool).await?;
     let by_path: HashMap<&str, &FileRow> =
         files.iter().map(|f| (f.file_path.as_str(), f)).collect();
+    let paths = || files.iter().map(|f| f.file_path.as_str());
+    // Derive with the headers already read, noting each license that changed since. Only then
+    // read those, off the runtime, and derive again with what they say.
+    let mut changed = Vec::new();
+    let mut structure = derive(paths(), |path| {
+        known_header(by_path[path], &known).unwrap_or_else(|| {
+            changed.push(path.to_string());
+            None
+        })
+    });
     let mut unread = HashSet::new();
-    let mut structure = derive(files.iter().map(|f| f.file_path.as_str()), |path| {
-        license_header(root, by_path[path], &known)
-            .inspect_err(|e| {
+    if !changed.is_empty() {
+        let read = read_headers(root, changed).await;
+        structure = derive(paths(), |path| match read.get(path) {
+            None => known_header(by_path[path], &known).flatten(),
+            Some(Ok(header)) => header.clone(),
+            // An unreadable license keeps the name it gave last time, and records no read, so
+            // the next pass tries it again.
+            Some(Err(e)) => {
                 tracing::debug!(target: "structure", "Could not read {path}: {e}");
                 unread.insert(path.to_string());
-            })
-            .ok()
-            .flatten()
-    });
+                known.get(path).and_then(|l| l.header_name.clone())
+            }
+        });
+    }
     // A read license records the size and mtime it was read at; an unread one records none.
     for license in structure
         .folders
@@ -2657,6 +2694,31 @@ pub(crate) mod tests {
         assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 1);
         assert_eq!(stored_pack(&pool, "kit").await.name, "Space Kit");
         assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 0);
+
+        // Changed again but unreadable, as on a share that dropped: the pack keeps its name, and
+        // records no read, so the next pass reads the file once it can.
+        sqlx::query("UPDATE assets SET modified_at = 6 WHERE file_path = 'kit/License.txt'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
+        let dropped = stored_pack(&pool, "kit").await;
+        assert_eq!(dropped.name, "Space Kit");
+        let file = dropped.license.unwrap();
+        assert_eq!(
+            (
+                file.header_name.as_deref(),
+                file.size_bytes,
+                file.modified_at
+            ),
+            (Some("Space Kit"), 0, 0)
+        );
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+        std::fs::write(&license, "Car Kit (3.2)\nby Kenney Vleugels (Kenney.nl)\n").unwrap();
+        assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 1);
+        let back = stored_pack(&pool, "kit").await;
+        assert_eq!(back.name, "Car Kit");
+        assert_eq!(back.license.map(|l| l.modified_at), Some(6));
     }
 
     #[tokio::test]
