@@ -14,9 +14,28 @@ pub struct FolderNode {
     pub name: String,
     /// Relative to the library root
     pub path: String,
-    /// Files below the folder, at any depth
+    pub is_pack: bool,
+    /// Visible files below the folder, at any depth
     pub item_count: i64,
+    /// Support files below the folder, at any depth, hidden unless "Show hidden files" is on
+    pub hidden_count: i64,
     pub has_children: bool,
+    /// Whether the folder shows in the tree with hidden files off (`shown_without_hidden`)
+    pub shown_without_hidden: bool,
+    /// Whether a child shows with hidden files off, by the same rule
+    pub has_visible_children: bool,
+}
+
+/// The one rule for whether folder `f` shows in the tree with hidden files off: it has visible
+/// files, is a pack, or holds a pack, so every pack shows even when all its files are hidden. A
+/// pack below `f` lies in the primary key range `f.path/ <= p < f.path0` (`0` follows `/`).
+fn shown_without_hidden(f: &str) -> String {
+    format!(
+        "({f}.item_count > 0 OR {f}.is_pack OR EXISTS (
+            SELECT 1 FROM folders p
+            WHERE p.path >= {f}.path || '/' AND p.path < {f}.path || '0' AND p.is_pack
+        ))"
+    )
 }
 
 /// The child folders of `parent_path` (`""` for the root) in library `library_id`, sorted by
@@ -39,21 +58,29 @@ pub async fn get_folders(
 
 /// Reads one node's children from `idx_folders_parent_name`; `path` breaks ties between names
 /// that differ only in case. Only edge slashes are dropped from `parent_path`: folder names keep
-/// their spaces, as on disk.
+/// their spaces, as on disk. A node and its children show with hidden files off by the same
+/// `shown_without_hidden` rule.
 pub(crate) async fn child_folders(
     pool: &Pool<Sqlite>,
     parent_path: &str,
 ) -> sqlx::Result<Vec<FolderNode>> {
-    sqlx::query_as(
-        "SELECT f.name, f.path, f.item_count,
-                EXISTS (SELECT 1 FROM folders c WHERE c.parent_path = f.path) AS has_children
+    let sql = format!(
+        "SELECT f.name, f.path, f.is_pack, f.item_count, f.hidden_count,
+                EXISTS (SELECT 1 FROM folders c WHERE c.parent_path = f.path) AS has_children,
+                {} AS shown_without_hidden,
+                EXISTS (
+                    SELECT 1 FROM folders c WHERE c.parent_path = f.path AND {}
+                ) AS has_visible_children
          FROM folders f
          WHERE f.parent_path = ?
          ORDER BY f.name COLLATE NOCASE, f.path",
-    )
-    .bind(parent_path.trim_matches('/'))
-    .fetch_all(pool)
-    .await
+        shown_without_hidden("f"),
+        shown_without_hidden("c"),
+    );
+    sqlx::query_as(&sql)
+        .bind(parent_path.trim_matches('/'))
+        .fetch_all(pool)
+        .await
 }
 
 #[cfg(test)]
@@ -78,13 +105,135 @@ mod tests {
         pool
     }
 
+    /// A node with no pack in or below it and no hidden file.
     fn node(name: &str, path: &str, item_count: i64, has_children: bool) -> FolderNode {
         FolderNode {
             name: name.into(),
             path: path.into(),
+            is_pack: false,
             item_count,
+            hidden_count: 0,
             has_children,
+            shown_without_hidden: item_count > 0,
+            has_visible_children: has_children,
         }
+    }
+
+    #[tokio::test]
+    async fn nodes_carry_packs_hidden_counts_and_whether_they_show_with_hidden_files_off() {
+        let pool = library(&[
+            "3D assets/Car Kit/License.txt",
+            "3D assets/Car Kit/Models/sedan.png",
+            "Audio/Casino Audio/License.txt",
+            "Audio/Casino Audio/Preview.png",
+            "Docs/Readme.txt",
+            "Docs/Old/License.txt",
+        ])
+        .await;
+        let top = child_folders(&pool, "").await.unwrap();
+        let summary: Vec<(&str, bool, i64, i64, bool, bool)> = top
+            .iter()
+            .map(|n| {
+                (
+                    n.name.as_str(),
+                    n.is_pack,
+                    n.item_count,
+                    n.hidden_count,
+                    n.shown_without_hidden,
+                    n.has_visible_children,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("3D assets", false, 1, 1, true, true),
+                // Every file of the pack below is hidden, but the pack still shows.
+                ("Audio", false, 0, 2, true, true),
+                // `Docs/Old` is a pack too, by its license.
+                ("Docs", false, 1, 1, true, true),
+            ]
+        );
+        let kit = child_folders(&pool, "3D assets").await.unwrap();
+        assert_eq!(
+            (
+                kit[0].is_pack,
+                kit[0].has_children,
+                kit[0].has_visible_children
+            ),
+            (true, true, true)
+        );
+        let casino = child_folders(&pool, "Audio").await.unwrap();
+        assert_eq!(
+            (
+                casino[0].is_pack,
+                casino[0].item_count,
+                casino[0].hidden_count
+            ),
+            (true, 0, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_has_visible_children_exactly_when_a_child_shows_without_hidden_files() {
+        let pool = library(&[
+            "3D assets/Car Kit/License.txt",
+            "3D assets/Car Kit/Models/sedan.png",
+            "3D assets/Car Kit/Sources/Preview.png",
+            "3D assets/Car Kit/Sources/notes.txt",
+            "Audio/Casino Audio/License.txt",
+            "Archive/Readme.txt",
+            "Archive/Old/Kit/License.txt",
+            "Archive/Old/Kit/a.png",
+            "Goodies/Wallpapers/w.png",
+        ])
+        .await;
+        let mut queue = vec![String::new()];
+        let mut nodes = 0;
+        while let Some(parent) = queue.pop() {
+            for node in child_folders(&pool, &parent).await.unwrap() {
+                let children = child_folders(&pool, &node.path).await.unwrap();
+                assert_eq!(
+                    node.has_visible_children,
+                    children.iter().any(|c| c.shown_without_hidden),
+                    "{}",
+                    node.path
+                );
+                nodes += 1;
+                queue.push(node.path);
+            }
+        }
+        assert_eq!(nodes, 11);
+        // `Sources` holds only hidden files and is no pack, so it alone is left out.
+        let sources = child_folders(&pool, "3D assets/Car Kit").await.unwrap();
+        let shown: Vec<(&str, bool)> = sources
+            .iter()
+            .map(|n| (n.name.as_str(), n.shown_without_hidden))
+            .collect();
+        assert_eq!(shown, [("Models", true), ("Sources", false)]);
+    }
+
+    #[tokio::test]
+    async fn a_folder_holding_only_support_files_has_no_visible_children() {
+        let pool = library(&[
+            "kit/License.txt",
+            "kit/rock.png",
+            "kit/Sources/Preview.png",
+            "kit/Sources/game.txt",
+        ])
+        .await;
+        let kit = &child_folders(&pool, "").await.unwrap()[0];
+        assert_eq!(
+            (
+                kit.is_pack,
+                kit.item_count,
+                kit.hidden_count,
+                kit.has_children
+            ),
+            (true, 1, 3, true)
+        );
+        assert!(kit.shown_without_hidden);
+        assert!(!kit.has_visible_children);
     }
 
     #[tokio::test]

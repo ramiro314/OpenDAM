@@ -1,11 +1,13 @@
 // The UI checks `VITE_SCROLL_BENCH=checks` runs (U1-U8 in
-// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9 in
+// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U10 in
 // docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
 // check here.
 
 import { api } from '../api';
 import { useAssetStore, useFolderTreeStore, useLibraryStore, useUIStore } from '../store';
 import type { FolderNode, SortField, SortOrder } from '../types';
+import { isFolderShown } from '../components/Sidebar/sidebarHelpers';
+import { formatItemsAndFiles } from '../utils/format';
 import { assetAt } from '../store/pageCache';
 import { scrubKey } from '../utils/scrubKey';
 import {
@@ -151,7 +153,7 @@ async function assertScaling(
   );
 }
 
-const FOOTER = /^([\d,]+)-([\d,]+) of ([\d,]+) assets?$/;
+const FOOTER = /^([\d,]+)-([\d,]+) of ([\d,]+) items?$/;
 const SCRUB_LABEL = /^([\d,]+) of ([\d,]+)(?: - (.+))?$/;
 const parseCount = (s: string) => Number(s.replace(/,/g, ''));
 
@@ -177,8 +179,51 @@ const shownCount = (row: HTMLElement) => parseCount(row.lastElementChild?.textCo
 const parentFolder = (path: string) => path.slice(0, Math.max(0, path.lastIndexOf('/')));
 
 /**
- * The shallowest folder at least two levels deep that holds exactly one file, found breadth
- * first through `get_folders`, with the slowest node load on the way.
+ * Expands the bench library's row and returns its top-level folders. The checks can start before
+ * the startup index run, and the first structure pass it ends with, are done. The expanded row
+ * then fills on that run's `library:updated`.
+ */
+async function expandBenchLibrary({
+  assert,
+  sleep,
+}: Pick<UiCheckContext, 'assert' | 'sleep'>): Promise<FolderNode[]> {
+  const toggle = document.getElementById(`lib-toggle-${BENCH_LIBRARY}`);
+  assert(toggle, `no #lib-toggle-${BENCH_LIBRARY} on the library row`);
+  if (!useFolderTreeStore.getState().expanded[BENCH_LIBRARY]?.includes('')) toggle!.click();
+  const deadline = performance.now() + STRUCTURE_TIMEOUT_MS;
+  let top = await api.getFolders(BENCH_LIBRARY, '');
+  while (top.length === 0) {
+    assert(
+      performance.now() < deadline,
+      `the library has no top-level folders after ${STRUCTURE_TIMEOUT_MS / 1000} s`
+    );
+    await sleep(1_000);
+    top = await api.getFolders(BENCH_LIBRARY, '');
+  }
+  return top;
+}
+
+/** Expands the bench library's folder `path`, unless it is already expanded. */
+async function expandFolder(path: string) {
+  if (!useFolderTreeStore.getState().expanded[BENCH_LIBRARY]?.includes(path)) {
+    await useFolderTreeStore.getState().toggle(BENCH_LIBRARY, path);
+  }
+}
+
+/** Runs the store's query with `patch` applied, and waits for its first page and totals. */
+async function searchWith(
+  patch: Parameters<ReturnType<typeof useAssetStore.getState>['setQuery']>[0],
+  waitFor: UiCheckContext['waitFor']
+) {
+  const store = useAssetStore.getState();
+  store.setQuery(patch);
+  await store.search();
+  await waitFor(() => !useAssetStore.getState().loading, 30_000, 'the search');
+}
+
+/**
+ * The shallowest folder at least two levels deep that holds exactly one file, a visible one, and
+ * is no pack, found breadth first through `get_folders`, with the slowest node load on the way.
  */
 async function singleFileFolder(): Promise<{ folder: FolderNode; slowestMs: number }> {
   let slowestMs = 0;
@@ -189,7 +234,9 @@ async function singleFileFolder(): Promise<{ folder: FolderNode; slowestMs: numb
       const start = performance.now();
       const children = await api.getFolders(BENCH_LIBRARY, parent);
       slowestMs = Math.max(slowestMs, performance.now() - start);
-      const found = children.find((c) => c.itemCount === 1 && c.path.includes('/'));
+      const found = children.find(
+        (c) => c.itemCount === 1 && c.hiddenCount === 0 && !c.isPack && c.path.includes('/')
+      );
       if (found) return { folder: found, slowestMs };
       next.push(...children.filter((c) => c.hasChildren).map((c) => c.path));
     }
@@ -958,21 +1005,9 @@ export const UI_CHECKS: UiCheck[] = [
       'The library row expands into its folders with their counts, a folder shows exactly ' +
       'its files, and a delete updates the counts and drops a folder it empties',
     run: async ({ assert, waitFor, pause, sleep }) => {
-      const toggle = document.getElementById(`lib-toggle-${BENCH_LIBRARY}`);
-      assert(toggle, `no #lib-toggle-${BENCH_LIBRARY} on the library row`);
-      if (!useFolderTreeStore.getState().expanded[BENCH_LIBRARY]?.includes('')) toggle!.click();
-      // The checks can start before the startup index run, and the first structure pass it ends
-      // with, are done. The expanded row then fills on that run's `library:updated`.
-      const deadline = performance.now() + STRUCTURE_TIMEOUT_MS;
-      let top = await api.getFolders(BENCH_LIBRARY, '');
-      while (top.length === 0) {
-        assert(
-          performance.now() < deadline,
-          `the library has no top-level folders after ${STRUCTURE_TIMEOUT_MS / 1000} s`
-        );
-        await sleep(1_000);
-        top = await api.getFolders(BENCH_LIBRARY, '');
-      }
+      const top = (await expandBenchLibrary({ assert, sleep })).filter((f) =>
+        isFolderShown(f, false)
+      );
       await waitFor(() => top.every((f) => folderRow(f.path)), 10_000, 'the top-level folders');
       const rows = [
         ...document.querySelectorAll<HTMLElement>(`[data-library-id="${BENCH_LIBRARY}"]`),
@@ -1066,6 +1101,120 @@ export const UI_CHECKS: UiCheck[] = [
       );
       await pause('U9-after-delete');
 
+      useAssetStore.getState().setQuery({ folder: undefined });
+    },
+  },
+  {
+    id: 'U10',
+    title:
+      'Packs show a pack icon in the tree, their licenses and previews leave the grid, ' +
+      '"Show hidden files" brings them back, and the status bar counts items and files',
+    run: async ({ assert, waitFor, pause, sleep }) => {
+      await expandBenchLibrary({ assert, sleep });
+      const kitPath = '3D assets/Car Kit';
+      await expandFolder('3D assets');
+      await expandFolder('Audio');
+      await waitFor(() => folderRow(kitPath) !== null, 10_000, kitPath);
+      const kitRow = folderRow(kitPath)!;
+      assert(kitRow.dataset.pack === 'true', `${kitPath} is not marked as a pack`);
+      // A pack whose files are all hidden still shows, with no visible item
+      const audio = await api.getFolders(BENCH_LIBRARY, 'Audio');
+      const allHidden = audio.find((f) => f.isPack && f.itemCount === 0);
+      assert(allHidden, 'no pack in Audio/ has every file hidden');
+      await waitFor(() => folderRow(allHidden!.path) !== null, 5_000, allHidden!.path);
+      assert(shownCount(folderRow(allHidden!.path)!) === 0, `${allHidden!.path} counts items`);
+      const kit = (await api.getFolders(BENCH_LIBRARY, '3D assets')).find(
+        (f) => f.path === kitPath
+      )!;
+      assert(kit.hiddenCount >= 2, `${kitPath} has ${kit.hiddenCount} hidden files`);
+      assert(shownCount(kitRow) === kit.itemCount, `${kitPath}'s badge isn't its item count`);
+
+      // The kit's grid holds no support file, and the status bar counts them as files only
+      const support = ['License.txt', 'Preview.png'];
+      const status = () => document.getElementById('status-count')?.textContent ?? '';
+      const results = async () => {
+        const { query, total } = useAssetStore.getState();
+        const page = await api.searchAssets({ query, page: 0, pageSize: total + 1 });
+        return page.assets.map((a) => a.fileName);
+      };
+      kitRow.click();
+      await waitFor(
+        () => {
+          const s = useAssetStore.getState();
+          return s.query.folder?.path === kitPath && !s.loading && s.total > 0;
+        },
+        30_000,
+        `the search for ${kitPath}`
+      );
+      let s = useAssetStore.getState();
+      assert(
+        s.total === kit.itemCount,
+        `the grid holds ${s.total}, the node counts ${kit.itemCount}`
+      );
+      assert(
+        s.fileTotal === kit.itemCount + kit.hiddenCount,
+        `the search counts ${s.fileTotal} files, the node ${kit.itemCount} + ${kit.hiddenCount}`
+      );
+      const visible = await results();
+      assert(!support.some((n) => visible.includes(n)), `the grid shows ${support.join(' or ')}`);
+      const expected = formatItemsAndFiles(s.total, s.fileTotal);
+      assert(status() === expected, `the status bar reads "${status()}", not "${expected}"`);
+
+      // A search finding only the license shows no item, and one file
+      await searchWith({ text: 'license' }, waitFor);
+      s = useAssetStore.getState();
+      assert(s.total === 0 && s.fileTotal === 1, `"license" found ${s.total} (${s.fileTotal})`);
+      await waitFor(() => status() === '0 items (1 file)', 5_000, 'the status bar');
+      await pause('U10-license-hidden');
+
+      // "Show hidden files" brings it back, and the kit's badge counts its hidden files
+      const checkbox = document.querySelector<HTMLInputElement>(
+        '#sidebar-filter-show-hidden input'
+      );
+      assert(checkbox, 'no "Show hidden files" checkbox');
+      checkbox!.click();
+      await waitFor(
+        () => {
+          const st = useAssetStore.getState();
+          return st.query.filter.showHidden === true && !st.loading && st.total === 1;
+        },
+        30_000,
+        'the license to show'
+      );
+      await waitFor(
+        () =>
+          document
+            .querySelector('[data-tile][data-index="0"]')
+            ?.textContent?.includes('License.txt') ?? false,
+        10_000,
+        'the License.txt tile'
+      );
+      assert(status() === '1 item (1 file)', `the status bar reads "${status()}"`);
+      assert(
+        shownCount(folderRow(kitPath)!) === kit.itemCount + kit.hiddenCount,
+        `${kitPath}'s badge doesn't count its hidden files`
+      );
+      await pause('U10-license-shown');
+
+      await searchWith({ text: '' }, waitFor);
+      s = useAssetStore.getState();
+      assert(
+        s.total === s.fileTotal,
+        `with hidden files, ${s.total} items of ${s.fileTotal} files`
+      );
+      const all = await results();
+      assert(
+        support.every((n) => all.includes(n)),
+        `"Show hidden files" shows ${support.filter((n) => all.includes(n)).join(', ') || 'none'} of ${support.join(', ')}`
+      );
+
+      checkbox!.click();
+      await waitFor(
+        () => !useAssetStore.getState().query.filter.showHidden,
+        5_000,
+        'hidden files off'
+      );
+      await waitFor(() => !useAssetStore.getState().loading, 30_000, 'the search');
       useAssetStore.getState().setQuery({ folder: undefined });
     },
   },

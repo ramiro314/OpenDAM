@@ -100,6 +100,17 @@ export function FiltersSection({ clearSmartFilter }: FiltersSectionProps) {
     search();
   };
 
+  // A view of hidden files, not a narrowing filter: it keeps any collection or smart filter, and
+  // picking one keeps it (`resetFilter`, `replaceFilter`). Only "All assets" turns it off.
+  const toggleShowHidden = (show: boolean) => {
+    if (show) {
+      setFilter({ showHidden: true });
+    } else {
+      clearFilter('showHidden');
+    }
+    search();
+  };
+
   const isFavActive = Boolean(currentFilter.isFavorite);
   const isUnorgActive = Boolean(currentFilter.unorganized);
   const hasKinds = Boolean(currentFilter.kinds && currentFilter.kinds.length > 0);
@@ -120,6 +131,7 @@ export function FiltersSection({ clearSmartFilter }: FiltersSectionProps) {
           clearSmartFilter();
           setActiveCollection(null);
           resetFilter();
+          clearFilter('showHidden');
           search();
         }}
       >
@@ -146,6 +158,20 @@ export function FiltersSection({ clearSmartFilter }: FiltersSectionProps) {
         active={isUnorgActive}
         onClick={() => toggleFilter('unorganized', isUnorgActive, { unorganized: true })}
       />
+
+      <label
+        className={styles.item}
+        id="sidebar-filter-show-hidden"
+        title="Show packs' licenses, readmes, previews and samples"
+      >
+        <input
+          type="checkbox"
+          className={styles.filterCheckbox}
+          checked={Boolean(currentFilter.showHidden)}
+          onChange={(e) => toggleShowHidden(e.target.checked)}
+        />
+        <span className={clsx(styles.itemName, 'truncate')}>Show hidden files</span>
+      </label>
 
       <FilterSubGroup
         title="Types"

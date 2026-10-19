@@ -163,7 +163,7 @@ async fn search_libraries(
 
     if target_libs.len() == 1 {
         let (pool, root_opt) = &target_libs[0];
-        let total = if payload.include_total {
+        let counts = if payload.include_total {
             Some(
                 count_assets(pool, &filter)
                     .await
@@ -177,7 +177,8 @@ async fn search_libraries(
             .map_err(|e| e.to_string())?;
         return Ok(SearchResult {
             assets,
-            total,
+            total: counts.map(|c| c.items),
+            file_total: counts.map(|c| c.files),
             page: payload.page,
             page_size: payload.page_size,
         });
@@ -185,11 +186,12 @@ async fn search_libraries(
 
     // Multiple libraries: each returns only the rowid and sort key of its first `offset + limit`
     // matches, and only the merged page's rows are fetched in full.
-    let mut total: i64 = 0;
+    let mut total = Counts::default();
     if payload.include_total {
         for (pool, _) in target_libs {
             if let Ok(c) = count_assets(pool, &filter).await {
-                total += c;
+                total.items += c.items;
+                total.files += c.files;
             }
         }
     }
@@ -260,7 +262,8 @@ async fn search_libraries(
 
     Ok(SearchResult {
         assets,
-        total: payload.include_total.then_some(total),
+        total: payload.include_total.then_some(total.items),
+        file_total: payload.include_total.then_some(total.files),
         page: payload.page,
         page_size: payload.page_size,
     })
@@ -364,7 +367,14 @@ fn sort_column(field: &str) -> (&'static str, SortKind) {
 struct SqlFilter {
     conditions: Vec<String>,
     binds: Vec<String>,
+    /// Whether support files match too ("Show hidden files"). Otherwise the search adds
+    /// `VISIBLE`, which `count_assets` counts apart to give the files behind the items.
+    show_hidden: bool,
 }
+
+/// The grid's visibility rule (plan C5): a pack's support files show only with "Show hidden
+/// files".
+const VISIBLE: &str = "a.support_role IS NULL";
 
 impl SqlFilter {
     fn push(&mut self, condition: impl Into<String>, binds: impl IntoIterator<Item = String>) {
@@ -382,11 +392,28 @@ impl SqlFilter {
         }
     }
 
+    /// Every condition, the visibility rule included.
     fn where_clause(&self) -> String {
-        if self.conditions.is_empty() {
+        self.conditions_clause(!self.show_hidden)
+    }
+
+    /// Every condition but the visibility rule: the files behind the items.
+    fn files_where_clause(&self) -> String {
+        self.conditions_clause(false)
+    }
+
+    fn conditions_clause(&self, visible_only: bool) -> String {
+        let visible = visible_only.then_some(VISIBLE);
+        let all: Vec<&str> = self
+            .conditions
+            .iter()
+            .map(String::as_str)
+            .chain(visible)
+            .collect();
+        if all.is_empty() {
             String::new()
         } else {
-            format!("WHERE {}", self.conditions.join(" AND "))
+            format!("WHERE {}", all.join(" AND "))
         }
     }
 }
@@ -425,7 +452,10 @@ fn in_tags(count: usize) -> String {
 
 fn search_filter(query: &SearchQuery) -> SqlFilter {
     let f = &query.filter;
-    let mut filter = SqlFilter::default();
+    let mut filter = SqlFilter {
+        show_hidden: f.show_hidden == Some(true),
+        ..SqlFilter::default()
+    };
 
     if let Some(fts) = fts_match_expression(&query.text) {
         filter.push(
@@ -589,15 +619,33 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-async fn count_assets(pool: &sqlx::Pool<sqlx::Sqlite>, filter: &SqlFilter) -> sqlx::Result<i64> {
+/// A search's result count: the grid items, and the files they stand for, hidden support files
+/// included.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct Counts {
+    items: i64,
+    files: i64,
+}
+
+/// Counts the items and the files `filter` matches in one scan.
+async fn count_assets(pool: &sqlx::Pool<sqlx::Sqlite>, filter: &SqlFilter) -> sqlx::Result<Counts> {
     #[cfg(test)]
     COUNT_QUERIES.with(|c| c.set(c.get() + 1));
-    let sql = format!("SELECT COUNT(*) FROM assets a {}", filter.where_clause());
-    let mut query = sqlx::query_scalar::<_, i64>(&sql);
+    let items = if filter.show_hidden {
+        "COUNT(*)".to_string()
+    } else {
+        format!("COALESCE(SUM({VISIBLE}), 0)")
+    };
+    let sql = format!(
+        "SELECT {items}, COUNT(*) FROM assets a {}",
+        filter.files_where_clause()
+    );
+    let mut query = sqlx::query_as::<_, (i64, i64)>(&sql);
     for b in &filter.binds {
         query = query.bind(b.clone());
     }
-    query.fetch_one(pool).await
+    let (items, files) = query.fetch_one(pool).await?;
+    Ok(Counts { items, files })
 }
 
 /// The columns of a `RawAssetRow` selected from `assets a`.
@@ -2500,7 +2548,7 @@ mod tests {
     }
 
     /// A library in a temporary root holding a file at each of `paths`, indexed as an asset whose
-    /// id is its path, with its first structure pass run.
+    /// id is its path and whose extension is its path's, with its first structure pass run.
     async fn library_in_folders(paths: &[&str]) -> (PathBuf, Database, Pool<Sqlite>) {
         let (root, db, pool) = library_with(&[]).await;
         for path in paths {
@@ -2509,11 +2557,12 @@ mod tests {
             std::fs::write(&file, "glTF").unwrap();
             sqlx::query(
                 "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
-                 VALUES (?, ?, ?, 'glb', 'model', 4, 0, 0)",
+                 VALUES (?, ?, ?, ?, 'model', 4, 0, 0)",
             )
             .bind(path)
             .bind(path)
             .bind(path.rsplit('/').next().unwrap())
+            .bind(path.rsplit('.').next().unwrap())
             .execute(&pool)
             .await
             .unwrap();
@@ -2540,12 +2589,13 @@ mod tests {
         ]);
         let result = delete_assets_with(&db, &deleted, true, trash_failing_for(&[])).await;
 
-        let folders = crate::structure::tests::folder_rows(&pool).await;
+        let folders = crate::structure::tests::derived_rows(&pool).await;
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(result, Ok(()));
         let rest = [FOLDER_FILES[0], FOLDER_FILES[3]];
         assert_eq!(folders, crate::structure::tests::fresh_pass(&rest).await);
         assert!(!folders
+            .folders
             .iter()
             .any(|f| f.0.starts_with("3D assets/Nature Kit")));
     }
@@ -2556,7 +2606,7 @@ mod tests {
 
         let result = rename_asset_with(&db, FOLDER_FILES[2], "boulder").await;
 
-        let folders = crate::structure::tests::folder_rows(&pool).await;
+        let folders = crate::structure::tests::derived_rows(&pool).await;
         let renamed = root.join("3D assets/Nature Kit/Rocks/boulder.glb").exists();
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(result, Ok(()));
@@ -2568,6 +2618,39 @@ mod tests {
             FOLDER_FILES[3],
         ];
         assert_eq!(folders, crate::structure::tests::fresh_pass(&after).await);
+    }
+
+    #[tokio::test]
+    async fn renaming_or_deleting_a_packs_marker_leaves_the_packs_a_fresh_pass_would() {
+        let files = [
+            "kits/Car Kit/License.txt",
+            "kits/Car Kit/Readme.txt",
+            "kits/Car Kit/sedan.glb",
+        ];
+        let (root, db, pool) = library_in_folders(&files).await;
+        let before = crate::structure::tests::derived_rows(&pool).await;
+
+        let renamed = rename_asset_with(&db, files[0], "Notes").await;
+        let after_rename = crate::structure::tests::derived_rows(&pool).await;
+        let deleted =
+            delete_assets_with(&db, &ids(&[files[1]]), true, trash_failing_for(&[])).await;
+        let after_delete = crate::structure::tests::derived_rows(&pool).await;
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!((renamed, deleted), (Ok(()), Ok(())));
+        assert_eq!(before, crate::structure::tests::fresh_pass(&files).await);
+        assert!(before.folders.iter().any(|f| f.0 == "kits/Car Kit" && f.3));
+        // Without its license the kit is no pack, so its docs show again.
+        let renamed = ["kits/Car Kit/Notes.txt", files[1], files[2]];
+        assert_eq!(
+            after_rename,
+            crate::structure::tests::fresh_pass(&renamed).await
+        );
+        assert!(after_rename.roles.iter().all(|(_, role)| role.is_none()));
+        assert_eq!(
+            after_delete,
+            crate::structure::tests::fresh_pass(&[renamed[0], renamed[2]]).await
+        );
     }
 
     #[tokio::test]
@@ -2721,6 +2804,112 @@ mod tests {
             .unwrap_or_else(|e| panic!("search for {query} failed: {e}"));
         assert_eq!(result.total, Some(result.assets.len() as i64));
         result.assets.into_iter().map(|a| a.id).collect()
+    }
+
+    /// The ids `query` finds in `libraries` sorted by name, with the result's item and file totals.
+    async fn counted_search(
+        libraries: &[LibraryHandle],
+        query: serde_json::Value,
+    ) -> (Vec<String>, Option<i64>, Option<i64>) {
+        let mut query = query;
+        query["sort"] = serde_json::json!({ "field": "name", "order": "asc" });
+        query["text"] = query.get("text").cloned().unwrap_or("".into());
+        query["filter"] = query
+            .get("filter")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+            "query": query,
+            "page": 0,
+            "pageSize": 1000,
+        }))
+        .unwrap();
+        let result = search_libraries(&payload, &target_libraries(&payload.query, libraries))
+            .await
+            .unwrap();
+        let ids = result.assets.into_iter().map(|a| a.id).collect();
+        (ids, result.total, result.file_total)
+    }
+
+    /// A pack with a license, a preview and a model, and a file outside it.
+    const PACK_FILES: [&str; 4] = [
+        "3D assets/Car Kit/License.txt",
+        "3D assets/Car Kit/Preview.png",
+        "3D assets/Car Kit/Models/sedan.glb",
+        "Goodies/Thanks.txt",
+    ];
+
+    async fn library_with_packs(id: &str, paths: &[&str]) -> LibraryHandle {
+        let library = library_of(id, paths).await;
+        structure::rebuild(&library.pool).await.unwrap();
+        library
+    }
+
+    #[tokio::test]
+    async fn support_files_show_only_with_show_hidden_and_count_as_files() {
+        let libs = [library_with_packs("lib", &PACK_FILES).await];
+        let visible = vec![PACK_FILES[2].to_string(), PACK_FILES[3].to_string()];
+        let all: Vec<String> = PACK_FILES.map(String::from).into();
+
+        assert_eq!(
+            counted_search(&libs, serde_json::json!({})).await,
+            (visible.clone(), Some(2), Some(4))
+        );
+        assert_eq!(
+            counted_search(
+                &libs,
+                serde_json::json!({ "filter": { "showHidden": true } })
+            )
+            .await,
+            (all, Some(4), Some(4))
+        );
+        assert_eq!(
+            counted_search(
+                &libs,
+                serde_json::json!({ "filter": { "showHidden": false } })
+            )
+            .await,
+            (visible, Some(2), Some(4))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_files_total_follows_every_other_filter() {
+        let libs = [library_with_packs("lib", &PACK_FILES).await];
+        let folder = serde_json::json!({ "libraryId": "lib", "path": "3D assets/Car Kit" });
+        assert_eq!(
+            counted_search(&libs, serde_json::json!({ "folder": folder })).await,
+            (vec![PACK_FILES[2].to_string()], Some(1), Some(3))
+        );
+        // A search finding only support files shows no item, but counts its files.
+        assert_eq!(
+            counted_search(&libs, serde_json::json!({ "text": "license" })).await,
+            (vec![], Some(0), Some(1))
+        );
+        assert_eq!(
+            counted_search(
+                &libs,
+                serde_json::json!({ "text": "license", "filter": { "showHidden": true } })
+            )
+            .await,
+            (vec![PACK_FILES[0].to_string()], Some(1), Some(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn several_libraries_add_up_their_items_and_files() {
+        let libs = [
+            library_with_packs("a", &PACK_FILES).await,
+            library_with_packs("b", &PACK_FILES[..3]).await,
+        ];
+        let query = serde_json::json!({ "libraryIds": ["a", "b"] });
+        let (ids, total, files) = counted_search(&libs, query).await;
+        assert_eq!((ids.len(), total, files), (3, Some(3), Some(7)));
+        assert!(!ids.iter().any(|id| id.ends_with("License.txt")));
+        let query =
+            serde_json::json!({ "libraryIds": ["a", "b"], "filter": { "showHidden": true } });
+        let (ids, total, files) = counted_search(&libs, query).await;
+        assert_eq!((ids.len(), total, files), (7, Some(7), Some(7)));
     }
 
     const KIT_FILES: [&str; 9] = [
@@ -2931,6 +3120,7 @@ mod tests {
                 .unwrap()
         }
         let libs = [library];
+        // The files below the folder, hidden support files included, as the SQL counts them.
         let total = |path: &str| {
             let payload: SearchPayload = serde_json::from_value(serde_json::json!({
                 "query": {
@@ -2949,7 +3139,7 @@ mod tests {
                 search_libraries(&payload, &targets)
                     .await
                     .unwrap()
-                    .total
+                    .file_total
                     .unwrap()
             }
         };
@@ -2972,20 +3162,21 @@ mod tests {
             .await;
             let found = total(folder).await;
             println!(
-                "{folder}: search total {found}, SQL count {expected}, files in prefix-sharing siblings {siblings}"
+                "{folder}: search files total {found}, SQL count {expected}, files in prefix-sharing siblings {siblings}"
             );
             assert!(expected > 0);
             assert_eq!(found, expected);
         }
         let root = total("").await;
         let all = count(&pool, "SELECT COUNT(*) FROM assets WHERE ?1 = ''", "").await;
-        println!("library root: search total {root}, SQL count {all}");
+        println!("library root: search files total {root}, SQL count {all}");
         assert_eq!(root, all);
     }
 
     /// The structure pass's targets (A1) and the tree's node load time (A5) on a copy of the
     /// golden snapshot's library DB, named by `OPENDAM_GOLDEN_DB` as above. It writes to the copy:
-    /// it clears `folders` for a first pass, then deletes and renames one asset. Run it with
+    /// it clears `folders` and the support roles for a first pass, then deletes and renames one
+    /// asset. Run it with
     /// `cargo nextest run --run-ignored only golden_snapshot --no-capture`.
     #[tokio::test]
     #[ignore = "needs OPENDAM_GOLDEN_DB, a copy of the golden snapshot's library.sqlite"]
@@ -3009,7 +3200,7 @@ mod tests {
             assert!(took < limit, "{what} took {took:?}");
         };
 
-        sqlx::query("DELETE FROM folders")
+        sqlx::query("DELETE FROM folders; UPDATE assets SET support_role = NULL;")
             .execute(&pool)
             .await
             .unwrap();
@@ -3091,6 +3282,7 @@ mod tests {
         // A rename and a delete each rerun the pass before they return.
         let (id, path): (String, String) = sqlx::query_as(
             "SELECT id, file_path FROM assets WHERE file_path LIKE '3D assets/Platformer Kit/%'
+               AND support_role IS NULL
              ORDER BY file_path LIMIT 1",
         )
         .fetch_one(&pool)
@@ -3126,5 +3318,113 @@ mod tests {
         );
         assert_eq!(after.item_count, kit.item_count - 1);
         assert_eq!(crate::structure::rebuild(&pool).await.unwrap(), 0);
+    }
+
+    /// The packs (A2) and the hidden support files on a copy of the golden snapshot's library DB,
+    /// named by `OPENDAM_GOLDEN_DB` as above: `cargo nextest run --run-ignored only
+    /// golden_snapshot --no-capture`.
+    #[tokio::test]
+    #[ignore = "needs OPENDAM_GOLDEN_DB, a copy of the golden snapshot's library.sqlite"]
+    async fn the_packs_of_the_golden_snapshot_hide_their_support_files() {
+        let file = std::env::var("OPENDAM_GOLDEN_DB").expect("OPENDAM_GOLDEN_DB is set");
+        let pool = crate::db::connect_library_sqlite(Path::new(&file))
+            .await
+            .unwrap();
+        let packs: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT path, item_count, hidden_count FROM folders WHERE is_pack ORDER BY path",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let all_hidden: Vec<&str> = packs
+            .iter()
+            .filter(|(_, items, _)| *items == 0)
+            .map(|(path, _, _)| path.as_str())
+            .collect();
+        println!(
+            "{} packs, {} with every file hidden: {}",
+            packs.len(),
+            all_hidden.len(),
+            all_hidden.join(", ")
+        );
+        assert_eq!(packs.len(), 254);
+        assert_eq!(all_hidden.len(), 24);
+        // Every pack is `<category>/<pack>`, so no category folder is one.
+        let deeper: Vec<&str> = packs
+            .iter()
+            .map(|(path, _, _)| path.as_str())
+            .filter(|path| path.matches('/').count() != 1)
+            .collect();
+        assert_eq!(deeper, [] as [&str; 0]);
+        for not_pack in ["Goodies/Wallpapers", "Goodies", "Archive", "Early access"] {
+            assert!(
+                !packs.iter().any(|(path, _, _)| path == not_pack),
+                "{not_pack} is a pack"
+            );
+        }
+        let roles: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT support_role, COUNT(*) FROM assets WHERE support_role IS NOT NULL
+             GROUP BY support_role ORDER BY support_role",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        println!("support files: {roles:?}");
+
+        // The grid hides `License.txt` and `Preview.png`, and "Show hidden files" brings them back.
+        let library = LibraryHandle {
+            id: "golden".to_string(),
+            name: "golden".to_string(),
+            root_path: PathBuf::from("/golden"),
+            pool: pool.clone(),
+        };
+        let libs = [library];
+        let search = |text: &str, show_hidden: bool| {
+            let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+                "query": {
+                    "text": text,
+                    "filter": { "showHidden": show_hidden },
+                    "sort": { "field": "name", "order": "asc" },
+                    "folder": { "libraryId": "golden", "path": "3D assets/Car Kit" },
+                },
+                "page": 0,
+                "pageSize": 1000,
+            }))
+            .unwrap();
+            let libs = &libs;
+            async move {
+                let result = search_libraries(&payload, &target_libraries(&payload.query, libs))
+                    .await
+                    .unwrap();
+                let names: Vec<String> = result.assets.into_iter().map(|a| a.file_name).collect();
+                (names, result.total.unwrap(), result.file_total.unwrap())
+            }
+        };
+        let (names, items, files) = search("", false).await;
+        println!("3D assets/Car Kit: {items} items ({files} files)");
+        assert!(!names
+            .iter()
+            .any(|n| n == "License.txt" || n == "Preview.png"));
+        let (shown, all, all_files) = search("", true).await;
+        assert!(["License.txt", "Preview.png"]
+            .iter()
+            .all(|n| shown.iter().any(|s| s == n)));
+        assert_eq!((all, all_files), (files, files));
+        assert!(items < files);
+
+        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+            "query": { "text": "", "filter": {}, "sort": { "field": "name", "order": "asc" } },
+            "page": 0,
+            "pageSize": 1,
+        }))
+        .unwrap();
+        let root = search_libraries(&payload, &target_libraries(&payload.query, &libs))
+            .await
+            .unwrap();
+        println!(
+            "library root: {} items ({} files)",
+            root.total.unwrap(),
+            root.file_total.unwrap()
+        );
     }
 }

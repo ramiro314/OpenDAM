@@ -190,6 +190,8 @@ export const useLibraryStore = create<LibraryStore>()((set) => ({
 interface AssetStore extends PageCache {
   /** Result count for the current query, counted once per search or refresh */
   total: number;
+  /** The files the results stand for, hidden support files included, counted with `total` */
+  fileTotal: number;
   /** Copies of the selected and focused assets, kept when their pages are evicted (D3) */
   pinned: Map<string, Asset>;
   /**
@@ -217,7 +219,9 @@ interface AssetStore extends PageCache {
 
   setQuery: (q: Partial<SearchQuery>) => void;
   setFilter: (f: Partial<FilterSpec>) => void;
+  /** Replaces the filter, keeping "Show hidden files" unless `f` sets it */
   replaceFilter: (f: FilterSpec, collectionId?: string) => void;
+  /** Clears the collection and every filter but "Show hidden files" */
   resetFilter: () => void;
   clearFilter: (key: keyof FilterSpec) => void;
   setSort: (field: SortField, order?: SortOrder) => void;
@@ -265,9 +269,24 @@ const defaultQuery: SearchQuery = {
   includeSubcollections: true,
 };
 
+/**
+ * `next` with `prev`'s "Show hidden files", unless `next` sets it: a view setting that outlasts
+ * picking a collection, a tag or a smart filter, as it does turning it on while one is picked.
+ */
+function keepView(prev: FilterSpec, next: FilterSpec): FilterSpec {
+  return prev.showHidden && next.showHidden === undefined ? { ...next, showHidden: true } : next;
+}
+
 /** Clears the grid so a failed search can't leave results from an earlier query on screen */
 function failedSearch(e: unknown): Partial<AssetStore> {
-  return { ...emptyCache(), total: 0, wanted: [], deleted: new Set(), searchError: String(e) };
+  return {
+    ...emptyCache(),
+    total: 0,
+    fileTotal: 0,
+    wanted: [],
+    deleted: new Set(),
+    searchError: String(e),
+  };
 }
 
 /** The cached asset `id`, if its page is cached. */
@@ -323,6 +342,7 @@ function failuresOf(generation: number) {
 export const useAssetStore = create<AssetStore>()((set, get) => ({
   ...emptyCache(),
   total: 0,
+  fileTotal: 0,
   pinned: new Map(),
   deleted: new Set(),
   pending: new Set(),
@@ -339,9 +359,12 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
   setFilter: (f) => set((s) => ({ query: { ...s.query, filter: { ...s.query.filter, ...f } } })),
 
   replaceFilter: (f, collectionId) =>
-    set((s) => ({ query: { ...s.query, collectionId, filter: f } })),
+    set((s) => ({ query: { ...s.query, collectionId, filter: keepView(s.query.filter, f) } })),
 
-  resetFilter: () => set((s) => ({ query: { ...s.query, collectionId: undefined, filter: {} } })),
+  resetFilter: () =>
+    set((s) => ({
+      query: { ...s.query, collectionId: undefined, filter: keepView(s.query.filter, {}) },
+    })),
 
   clearFilter: (key) =>
     set((s) => {
@@ -384,6 +407,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       set((s) => ({
         ...cache,
         total: result.total ?? result.assets.length,
+        fileTotal: result.fileTotal ?? result.total ?? result.assets.length,
         wanted: [0],
         pinned: repin(s.pinned, result.assets),
         deleted: new Set(),
@@ -467,6 +491,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       );
       if (generation !== get().generation) return;
       const total = results[0].total ?? s.total;
+      const fileTotal = results[0].fileTotal ?? s.fileTotal;
       let cache = emptyCache();
       results.forEach((r, i) => {
         if (r.assets.length > 0) cache = insertPage(cache, pages[i], r.assets, pages);
@@ -477,6 +502,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       set((cur) => ({
         ...cache,
         total,
+        fileTotal,
         pinned: repin(
           cur.pinned,
           results.flatMap((r) => r.assets)

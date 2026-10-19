@@ -560,7 +560,7 @@ mod tests {
         std::fs::write(dir.path().join("kits/rocks/rock.glb"), "glTF").unwrap();
         std::fs::write(dir.path().join("kits/readme.txt"), "hi").unwrap();
         reindex(&db, &lib).await;
-        let first = crate::structure::tests::folder_rows(&lib.pool).await;
+        let first = crate::structure::tests::derived_rows(&lib.pool).await;
 
         std::fs::remove_dir_all(dir.path().join("kits/rocks")).unwrap();
         reindex(&db, &lib).await;
@@ -570,7 +570,7 @@ mod tests {
             crate::structure::tests::fresh_pass(&["kits/rocks/rock.glb", "kits/readme.txt"]).await
         );
         assert_eq!(
-            crate::structure::tests::folder_rows(&lib.pool).await,
+            crate::structure::tests::derived_rows(&lib.pool).await,
             crate::structure::tests::fresh_pass(&["kits/readme.txt"]).await
         );
     }

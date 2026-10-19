@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { formatSize, formatVisibleRange } from './format';
+import { formatItemsAndFiles, formatSize, formatVisibleRange } from './format';
 
 describe('formatSize', () => {
   test('shows bytes below 1 KB', () => {
@@ -22,13 +22,21 @@ describe('formatSize', () => {
 
 describe('formatVisibleRange', () => {
   test('shows the visible range of every result, 1-based', () => {
-    expect(formatVisibleRange({ first: 41_200, last: 41_235 }, 83_095)).toBe(
-      '41,201-41,236 of 83,095 assets'
+    expect(formatVisibleRange({ first: 41_200, last: 41_235 }, 82_292)).toBe(
+      '41,201-41,236 of 82,292 items'
     );
-    expect(formatVisibleRange({ first: 0, last: 0 }, 1)).toBe('1-1 of 1 asset');
+    expect(formatVisibleRange({ first: 0, last: 0 }, 1)).toBe('1-1 of 1 item');
   });
 
   test('shows only the total when no row is visible', () => {
-    expect(formatVisibleRange(null, 0)).toBe('0 assets');
+    expect(formatVisibleRange(null, 0)).toBe('0 items');
+  });
+});
+
+describe('formatItemsAndFiles', () => {
+  test('shows the items, then the files they stand for', () => {
+    expect(formatItemsAndFiles(82_292, 83_095)).toBe('82,292 items (83,095 files)');
+    expect(formatItemsAndFiles(1, 1)).toBe('1 item (1 file)');
+    expect(formatItemsAndFiles(0, 3)).toBe('0 items (3 files)');
   });
 });

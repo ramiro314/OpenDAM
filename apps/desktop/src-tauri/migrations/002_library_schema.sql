@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS assets (
     description      TEXT NOT NULL DEFAULT '',
     thumbnail_path   TEXT,                -- relative to library root (.opendam/thumbs/...)
     preview_status   TEXT NOT NULL DEFAULT 'none',
-    metadata         TEXT NOT NULL DEFAULT '{}'  -- JSON object
+    metadata         TEXT NOT NULL DEFAULT '{}', -- JSON object
+    support_role     TEXT                 -- 'doc' or 'cover' for a pack's support file (structure.rs)
 );
 
 CREATE INDEX IF NOT EXISTS idx_assets_kind         ON assets(kind);
@@ -87,8 +88,8 @@ CREATE TABLE IF NOT EXISTS preview_jobs (
 
 -- ── Folders: derived by the structure pass (structure.rs), never edited ──────
 -- Every folder with at least one indexed file below it, and the root (`path = ''`, no parent).
--- `item_count` counts the files below it, recursively. The pack columns keep their defaults
--- until packs are detected.
+-- `item_count` counts the visible files below it, recursively, and `hidden_count` the support
+-- files. `pack_json` stays NULL until pack info is parsed.
 CREATE TABLE IF NOT EXISTS folders (
     path          TEXT PRIMARY KEY,   -- relative to library root, no edge slashes
     parent_path   TEXT,               -- NULL for the root
