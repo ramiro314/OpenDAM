@@ -80,8 +80,6 @@
   --transition-slow: 320ms ease;
 
   /* Layout */
-  --sidebar-width: 240px;
-  --detail-panel-width: 320px;
   --toolbar-height: 48px;
   --statusbar-height: 28px;
 }

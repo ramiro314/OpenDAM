@@ -1,0 +1,28 @@
+/* Takes no room in the layout: its 8px hit area overlaps the panel's border and the grid */
+.handle {
+  position: relative;
+  z-index: 10;
+  flex: 0 0 8px;
+  margin: 0 -4px;
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+}
+
+.handle::after {
+  content: '';
+  position: absolute;
+  inset: 0 3px;
+  background: transparent;
+  transition: background var(--transition-fast);
+}
+
+.handle:hover::after,
+.handle:focus-visible::after,
+.handle[data-state='resize']::after {
+  background: var(--color-border-focus);
+}
+
+.handle[data-state='collapse']::after {
+  background: var(--color-text-muted);
+}

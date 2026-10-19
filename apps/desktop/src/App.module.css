@@ -14,8 +14,10 @@
   overflow: hidden;
 }
 
+/* In a narrow window the panels give way. The body sets the minimum (layoutVars). */
 .main {
   flex: 1;
+  min-width: var(--main-min-width);
   display: flex;
   flex-direction: column;
   overflow: hidden;
