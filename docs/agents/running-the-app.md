@@ -243,6 +243,15 @@ The UI checks, each defined in its plan:
   cleared; `3D assets` in the Assets view shows no pack.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), C9 and C18. Screenshots:
   `U15-pack-detail`, `U15-asset-in-pack`, `U15-pack-again`.
+- **U16** (pack edits): from the tree's context menu, "Mark as pack" on `3D assets/Car Kit/Models`
+  makes it a pack inside the kit, in the tree and as a card, and "Not a pack" on
+  `3D assets/Nature Kit` turns it back into a folder and takes its card away. The pack panel's
+  edit form gives the kit a name, a license and a source URL, which the panel shows, the tree
+  node and the card show the name, and "Open", recorded rather than run, opens the URL. "Use as
+  pack cover" on the first render in the kit's `Previews/`, with hidden files shown, puts it on
+  the tree node, the panel and the card. Every change shows without a refresh, and the check
+  clears the edits at the end. [smarter-big-collections](../plans/smarter-big-collections/plan.md),
+  C8 rule 4 and C18. Screenshots: `U16-marks`, `U16-name`, `U16-cover`.
 
 Run it with the script, from the repo root:
 

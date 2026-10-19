@@ -28,3 +28,13 @@ pub async fn reveal_in_file_manager(file_path: String) -> Result<()> {
 pub async fn open_with_default(file_path: String) -> Result<()> {
     tauri_plugin_opener::open_path(&file_path, None::<&str>).map_err(|e| e.to_string())
 }
+
+/// Opens a pack's source URL in the browser. Only a web address opens, so a stored URL can't
+/// start a program or open a local file.
+#[tauri::command]
+pub async fn open_url(url: String) -> Result<()> {
+    if !crate::commands::folder::is_web_url(&url) {
+        return Err("Only http:// and https:// addresses open".into());
+    }
+    tauri_plugin_opener::open_url(&url, None::<&str>).map_err(|e| e.to_string())
+}

@@ -9,6 +9,8 @@ import type {
   FolderNode,
   PackCard,
   PackDetail,
+  PackEdit,
+  PackRef,
   Tag,
   TagPatch,
   AddLibraryPayload,
@@ -67,6 +69,11 @@ export const api = {
   /** The pack holding `path`: the innermost pack at or above it, or null when none does */
   getPackDetail: (libraryId: string, path: string) =>
     invoke<PackDetail | null>('get_pack_detail', { libraryId, path }),
+  /** Saves an edit to the folder's pack, reruns the structure pass, then emits `library:updated` */
+  setPackOverride: (libraryId: string, path: string, edit: PackEdit) =>
+    invoke<void>('set_pack_override', { libraryId, path, edit }),
+  /** The pack "Use as pack cover" on the asset sets: the innermost one holding the image */
+  getCoverPack: (assetId: string) => invoke<PackRef | null>('get_cover_pack', { assetId }),
   /** Tags every file below the folder and their groups' members; returns how many */
   tagFolder: (libraryId: string, folderPath: string, tagId: string) =>
     invoke<number>('tag_folder', { libraryId, folderPath, tagId }),
@@ -120,6 +127,8 @@ export const api = {
   // Reveal in file manager / open with default app
   revealInFileManager: (filePath: string) => invoke<void>('reveal_in_file_manager', { filePath }),
   openWithDefault: (filePath: string) => invoke<void>('open_with_default', { filePath }),
+  /** Opens an http(s) address, such as a pack's source URL, in the browser */
+  openUrl: (url: string) => invoke<void>('open_url', { url }),
 
   // AI tagging settings. Keys are write-only: no command returns one.
   getAiSettings: () => invoke<AiSettings>('get_ai_settings'),

@@ -710,6 +710,50 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn a_pack_edit_survives_a_reindex_and_its_folder_going_and_coming_back() {
+        use crate::commands::folder::{set_pack_override_in, PackEdit};
+        let (dir, db, lib) = temp_library().await;
+        let kit = dir.path().join("kits/Rock Kit");
+        let extract = || {
+            std::fs::create_dir_all(&kit).unwrap();
+            let license = "Rock Kit (1.0)\n\nCreated/distributed by Kenney (www.kenney.nl)\n";
+            std::fs::write(kit.join("License.txt"), license).unwrap();
+            std::fs::write(kit.join("rock.glb"), "glTF").unwrap();
+        };
+        let name = || async {
+            let name: Option<String> = sqlx::query_scalar(
+                "SELECT json_extract(pack_json, '$.name') FROM folders WHERE path = 'kits/Rock Kit'",
+            )
+            .fetch_optional(&lib.pool)
+            .await
+            .unwrap();
+            name
+        };
+        extract();
+        reindex(&db, &lib).await;
+        assert_eq!(name().await.as_deref(), Some("Rock Kit"));
+        let edit = PackEdit::Details {
+            name: Some("My rocks".into()),
+            license: None,
+            source_url: None,
+        };
+        set_pack_override_in(&db, "lib", "kits/Rock Kit", edit)
+            .await
+            .unwrap();
+        assert_eq!(name().await.as_deref(), Some("My rocks"));
+
+        reindex(&db, &lib).await;
+        assert_eq!(name().await.as_deref(), Some("My rocks"));
+        // An update extracted over the library removes the folder, then brings it back.
+        std::fs::remove_dir_all(&kit).unwrap();
+        reindex(&db, &lib).await;
+        assert_eq!(name().await, None);
+        extract();
+        reindex(&db, &lib).await;
+        assert_eq!(name().await.as_deref(), Some("My rocks"));
+    }
+
     /// The asset's (thumbnail_path, preview_status) and its active preview job count.
     async fn preview_state(pool: &Pool<Sqlite>) -> (Option<String>, String, i64) {
         let (thumb, status): (Option<String>, String) =

@@ -107,6 +107,21 @@ CREATE TABLE IF NOT EXISTS folders (
 -- `get_folders` reads one node's children in name order from this index alone.
 CREATE INDEX IF NOT EXISTS idx_folders_parent_name ON folders(parent_path, name COLLATE NOCASE);
 
+-- ── Pack overrides: your edits to packs, which the structure pass reads and never writes ──────
+-- Keyed by the folder's relative path, so an edit outlives the folder going away and coming
+-- back, as an update extracted over the library does. `mark` is 'pack' ("Mark as pack") or
+-- 'not_pack' ("Not a pack"), and NULL leaves it to the rules. NULL fields keep what the pass
+-- derives. `cover_path` is relative to the library root.
+CREATE TABLE IF NOT EXISTS pack_overrides (
+    path        TEXT PRIMARY KEY,
+    mark        TEXT CHECK (mark IN ('pack', 'not_pack')),
+    name        TEXT,
+    license     TEXT,
+    source_url  TEXT,
+    cover_path  TEXT,
+    updated_at  INTEGER NOT NULL
+);
+
 -- The full-text table and its triggers are in 003_assets_fts.sql, so a library made before
 -- `file_path` was indexed can recreate them inside a transaction (db::index_file_paths).
 

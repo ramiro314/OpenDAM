@@ -1,12 +1,12 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::path::Path;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::commands::asset::folder_range;
 use crate::db::{resolve_path, upsert_collection, upsert_tag, Database, LibraryHandle};
-use crate::structure::{self, LicenseKind, PackHeader};
+use crate::structure::{self, LicenseKind, PackHeader, PackMark, PackOverride};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -28,6 +28,8 @@ pub struct Cover {
 const COVER_COLUMNS: &str = "c.file_path AS cover_path, c.thumbnail_path AS cover_thumbnail,
     c.extension AS cover_extension, c.kind AS cover_kind";
 const COVER_JOIN: &str = "LEFT JOIN assets c ON c.file_path = json_extract(f.pack_json, '$.cover')";
+/// Joins a `folders` row `f` to your override of it `o`, for its mark and name.
+const MARK_JOIN: &str = "LEFT JOIN pack_overrides o ON o.path = f.path";
 
 /// A cover's columns, as `COVER_COLUMNS` names them.
 #[derive(sqlx::FromRow)]
@@ -69,6 +71,10 @@ pub struct FolderNode {
     pub has_visible_children: bool,
     /// A pack's cover image
     pub cover: Option<Cover>,
+    /// What you said the folder is ("Mark as pack", "Not a pack"), if you did
+    pub mark: Option<PackMark>,
+    /// The name you gave the pack, which the tree shows in place of the folder's
+    pub renamed: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -83,6 +89,8 @@ struct NodeRow {
     has_visible_children: bool,
     #[sqlx(flatten)]
     cover: CoverRow,
+    mark: Option<PackMark>,
+    renamed: Option<String>,
 }
 
 /// The one rule for whether folder `f` shows in the tree with hidden files off: it has visible
@@ -131,8 +139,8 @@ pub(crate) async fn child_folders(
                 EXISTS (
                     SELECT 1 FROM folders k WHERE k.parent_path = f.path AND {}
                 ) AS has_visible_children,
-                {COVER_COLUMNS}
-         FROM folders f {COVER_JOIN}
+                {COVER_COLUMNS}, o.mark, CASE WHEN f.is_pack THEN o.name END AS renamed
+         FROM folders f {COVER_JOIN} {MARK_JOIN}
          WHERE f.parent_path = ?
          ORDER BY f.name COLLATE NOCASE, f.path",
         shown_without_hidden("f"),
@@ -154,6 +162,8 @@ pub(crate) async fn child_folders(
             shown_without_hidden: r.shown_without_hidden,
             has_visible_children: r.has_visible_children,
             cover: r.cover.into_cover(root),
+            mark: r.mark,
+            renamed: r.renamed,
         })
         .collect())
 }
@@ -165,7 +175,8 @@ pub struct PackCard {
     pub library_id: String,
     /// Relative to the library root
     pub path: String,
-    /// The name the structure pass gave the pack: its license header's, else its folder's
+    /// The name the structure pass gave the pack: yours, else its license header's, else its
+    /// folder's
     pub name: String,
     /// The folder holding the pack, the card's subtitle; `''` for the library root
     pub parent_path: String,
@@ -173,6 +184,8 @@ pub struct PackCard {
     pub item_count: i64,
     pub hidden_count: i64,
     pub cover: Option<Cover>,
+    /// What you said the folder is, if you did
+    pub mark: Option<PackMark>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -185,6 +198,7 @@ struct PackRow {
     hidden_count: i64,
     #[sqlx(flatten)]
     cover: CoverRow,
+    mark: Option<PackMark>,
 }
 
 /// Every pack below `under_path` (`""` for the root) in each library of `library_ids`, or in
@@ -243,8 +257,8 @@ pub(crate) async fn packs_below(
     let sql = format!(
         "SELECT f.path, f.parent_path, f.name AS folder_name,
                 json_extract(f.pack_json, '$.name') AS pack_name,
-                f.item_count, f.hidden_count, {COVER_COLUMNS}
-         FROM folders f {COVER_JOIN}
+                f.item_count, f.hidden_count, {COVER_COLUMNS}, o.mark
+         FROM folders f {COVER_JOIN} {MARK_JOIN}
          WHERE f.is_pack AND {below}"
     );
     let mut cards = Vec::new();
@@ -266,6 +280,7 @@ pub(crate) async fn packs_below(
                 item_count: r.item_count,
                 hidden_count: r.hidden_count,
                 cover: r.cover.into_cover(&library.root_path),
+                mark: r.mark,
             }
         }));
     }
@@ -286,7 +301,8 @@ pub struct PackDetail {
     pub library_id: String,
     /// Relative to the library root
     pub path: String,
-    /// The license header's name, else the folder's, else the library's for a root pack
+    /// Your name, else the license header's, else the folder's, else the library's for a root
+    /// pack
     pub name: String,
     /// The folder holding the pack; `''` for the library root
     pub parent_path: String,
@@ -302,6 +318,9 @@ pub struct PackDetail {
     pub kinds: std::collections::BTreeMap<String, i64>,
     /// Their total size in bytes
     pub size_bytes: i64,
+    /// Your edits to the pack, all `None` when you made none. The edit form starts from them,
+    /// and the panel shows your license and source URL.
+    pub edits: PackOverride,
 }
 
 /// A pack's license file, as "Open license" opens it.
@@ -367,6 +386,13 @@ pub(crate) async fn pack_holding(
     .await?;
     let Some(row) = row else { return Ok(None) };
     let info = crate::structure::parse_pack(row.pack_json.as_deref()).unwrap_or_default();
+    let edits: PackOverride = sqlx::query_as(
+        "SELECT mark, name, license, source_url, cover_path FROM pack_overrides WHERE path = ?",
+    )
+    .bind(&row.path)
+    .fetch_optional(&library.pool)
+    .await?
+    .unwrap_or_default();
 
     let images: Vec<&str> = info
         .cover
@@ -413,7 +439,199 @@ pub(crate) async fn pack_holding(
         }),
         kinds: info.kinds,
         size_bytes: info.size_bytes,
+        edits,
     }))
+}
+
+/// One edit to a folder's pack (plan C18), stored in `pack_overrides`.
+#[derive(Debug, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PackEdit {
+    /// "Mark as pack" or "Not a pack", or `None` to leave the folder to the pack rules
+    Mark { mark: Option<PackMark> },
+    /// The edit form's fields. An empty one keeps what the structure pass derives.
+    Details {
+        name: Option<String>,
+        license: Option<String>,
+        source_url: Option<String>,
+    },
+    /// "Use as pack cover" with an image below the pack, or `None` for the cover the pass picks
+    Cover { asset_id: Option<String> },
+}
+
+/// Saves `edit` to the folder at `path` (`""` for the root) in library `library_id`, reruns the
+/// structure pass so the tree, the Packs view and the panel show it, then emits
+/// `library:updated`.
+#[tauri::command]
+pub async fn set_pack_override(
+    library_id: String,
+    path: String,
+    edit: PackEdit,
+    state: State<'_, Arc<AppState>>,
+) -> Result<()> {
+    set_pack_override_in(&state.db, &library_id, &path, edit).await?;
+    let _ = state.app_handle.emit("library:updated", ());
+    Ok(())
+}
+
+/// A text field as stored: trimmed, and `None` when empty.
+fn field(value: Option<String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// `set_pack_override` without the event. The edit and the removal of a row it leaves empty
+/// commit together, then the pass runs once any index run on the library has finished
+/// (`structure::rebuild_library`). The pass never deletes a row.
+pub(crate) async fn set_pack_override_in(
+    db: &Database,
+    library_id: &str,
+    path: &str,
+    edit: PackEdit,
+) -> Result<()> {
+    let lib = open_library(db, library_id).await?;
+    let path = path.trim_matches('/');
+    let pool = &lib.pool;
+    let found: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM folders WHERE path = ?)")
+        .bind(path)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !found {
+        return Err(format!("There is no folder {path} in this library"));
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let write = match edit {
+        PackEdit::Mark { mark } => sqlx::query(
+            "INSERT INTO pack_overrides (path, mark, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(path) DO UPDATE SET mark = excluded.mark, updated_at = excluded.updated_at",
+        )
+        .bind(path)
+        .bind(mark),
+        PackEdit::Details {
+            name,
+            license,
+            source_url,
+        } => {
+            let source_url = field(source_url);
+            if source_url
+                .as_deref()
+                .is_some_and(|url| !is_web_url(url))
+            {
+                return Err("The source URL must start with http:// or https://".into());
+            }
+            sqlx::query(
+                "INSERT INTO pack_overrides (path, name, license, source_url, updated_at)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(path) DO UPDATE SET name = excluded.name,
+                     license = excluded.license, source_url = excluded.source_url,
+                     updated_at = excluded.updated_at",
+            )
+            .bind(path)
+            .bind(field(name))
+            .bind(field(license))
+            .bind(source_url)
+        }
+        PackEdit::Cover { asset_id } => {
+            let cover = match asset_id {
+                None => None,
+                Some(id) => Some(cover_below(pool, path, &id).await?),
+            };
+            sqlx::query(
+                "INSERT INTO pack_overrides (path, cover_path, updated_at) VALUES (?, ?, ?)
+                 ON CONFLICT(path) DO UPDATE SET cover_path = excluded.cover_path,
+                     updated_at = excluded.updated_at",
+            )
+            .bind(path)
+            .bind(cover)
+        }
+    };
+    let saved = async {
+        let mut tx = pool.begin().await?;
+        write.bind(now).execute(&mut *tx).await?;
+        sqlx::query(
+            "DELETE FROM pack_overrides WHERE path = ? AND mark IS NULL AND name IS NULL
+                 AND license IS NULL AND source_url IS NULL AND cover_path IS NULL",
+        )
+        .bind(path)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
+    };
+    saved.await.map_err(|e| e.to_string())?;
+    structure::rebuild_library(db, &lib).await;
+    Ok(())
+}
+
+/// Whether `url` is a web address, the only kind a source URL may be and "Open" opens.
+pub(crate) fn is_web_url(url: &str) -> bool {
+    let url = url.to_ascii_lowercase();
+    ["http://", "https://"]
+        .iter()
+        .any(|scheme| url.len() > scheme.len() && url.starts_with(scheme))
+}
+
+/// The path of asset `id` when it can be the cover of the folder `pack` (`""` for the root),
+/// for "Use as pack cover", by `structure::cover_allowed`.
+async fn cover_below(pool: &Pool<Sqlite>, pack: &str, id: &str) -> Result<String> {
+    let path: Option<String> = sqlx::query_scalar("SELECT file_path FROM assets WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(path) = path else {
+        return Err("That file is not in this library".into());
+    };
+    if !structure::cover_allowed(pack, &path) {
+        return Err("Only an image inside this pack can be its cover".into());
+    }
+    Ok(path)
+}
+
+/// A pack by its library and its path relative to the library root, with its name.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackRef {
+    pub library_id: String,
+    pub path: String,
+    pub name: String,
+}
+
+/// The pack "Use as pack cover" on asset `asset_id` sets the cover of: the innermost pack
+/// holding it, or `None` when no pack holds it or it can't be that pack's cover
+/// (`structure::cover_allowed`).
+#[tauri::command]
+pub async fn get_cover_pack(
+    asset_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<PackRef>> {
+    cover_pack(&state.db, &asset_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn cover_pack(db: &Database, asset_id: &str) -> sqlx::Result<Option<PackRef>> {
+    let Some(library) = db.library_of_asset(asset_id).await? else {
+        return Ok(None);
+    };
+    let path: String = sqlx::query_scalar("SELECT file_path FROM assets WHERE id = ?")
+        .bind(asset_id)
+        .fetch_one(&library.pool)
+        .await?;
+    let (dir, _) = path.rsplit_once('/').unwrap_or(("", &path));
+    Ok(pack_holding(&library, dir)
+        .await?
+        .filter(|pack| structure::cover_allowed(&pack.path, &path))
+        .map(|pack| PackRef {
+            library_id: pack.library_id,
+            path: pack.path,
+            name: pack.name,
+        }))
 }
 
 /// A file a bulk write reaches, and the grid item it belongs to: its group's main item, or itself
@@ -637,6 +855,8 @@ mod tests {
             shown_without_hidden: item_count > 0,
             has_visible_children: has_children,
             cover: None,
+            mark: None,
+            renamed: None,
         }
     }
 
@@ -1093,6 +1313,7 @@ mod tests {
                 // 1 byte each.
                 kinds: [("document".to_string(), 1), ("texture".to_string(), 3)].into(),
                 size_bytes: 4,
+                edits: PackOverride::default(),
             })
         );
         // From a folder inside the pack, or with edge slashes
@@ -1161,6 +1382,212 @@ mod tests {
             let detail = pack_holding(&library, path).await.unwrap();
             assert_eq!(detail.map(|d| d.path).as_deref(), Some(pack), "{path}");
         }
+    }
+
+    /// One open library `lib` over the Car Kit, below `/libraries/lib`.
+    async fn edited_car_kit() -> (Database, LibraryHandle) {
+        let mut lib = memory_library("lib", crate::structure::tests::car_kit().await);
+        lib.root_path = "/libraries/lib".into();
+        (memory_database(vec![lib.clone()]).await, lib)
+    }
+
+    /// The node at `path` in the tree, read as the sidebar reads its parent's children.
+    async fn tree_node(lib: &LibraryHandle, path: &str) -> FolderNode {
+        let parent = path.rsplit_once('/').map_or("", |(p, _)| p);
+        child_folders(&lib.pool, &lib.root_path, parent)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|n| n.path == path)
+            .expect("the node is in the tree")
+    }
+
+    #[tokio::test]
+    async fn pack_edits_show_in_the_tree_the_packs_view_and_the_panel() {
+        let (db, lib) = edited_car_kit().await;
+        let car = "3D assets/Car Kit";
+        let models = "3D assets/Car Kit/Models";
+        let holiday = "3D assets/Holiday Kit";
+        let edit = |path: &'static str, edit: PackEdit| {
+            let db = &db;
+            async move { set_pack_override_in(db, "lib", path, edit).await.unwrap() }
+        };
+        let mark = |mark| PackEdit::Mark { mark };
+        let cards = || async {
+            let cards = packs_below(std::slice::from_ref(&lib), "", false)
+                .await
+                .unwrap();
+            cards
+                .into_iter()
+                .map(|c| (c.path, c.name, c.mark))
+                .collect::<Vec<_>>()
+        };
+
+        edit(models, mark(Some(PackMark::Pack))).await;
+        edit(holiday, mark(Some(PackMark::NotPack))).await;
+        let node = tree_node(&lib, models).await;
+        assert_eq!((node.is_pack, node.mark), (true, Some(PackMark::Pack)));
+        let node = tree_node(&lib, holiday).await;
+        assert_eq!((node.is_pack, node.mark), (false, Some(PackMark::NotPack)));
+        assert_eq!(
+            cards().await,
+            [
+                (car.into(), "Car Kit".into(), None),
+                (models.into(), "Models".into(), Some(PackMark::Pack)),
+            ]
+        );
+
+        let details = PackEdit::Details {
+            name: Some("  My cars ".into()),
+            license: Some("CC0, credit Kenney".into()),
+            source_url: Some("https://kenney.nl/assets/car-kit".into()),
+        };
+        edit(car, details).await;
+        let cover = PackEdit::Cover {
+            asset_id: Some(SEDAN_RENDER.into()),
+        };
+        edit(car, cover).await;
+        let render = format!("/libraries/lib/{SEDAN_RENDER}");
+        let shown = |cover: Option<Cover>| cover.map(|c| c.file_path);
+        let node = tree_node(&lib, car).await;
+        assert_eq!(
+            (node.name.as_str(), node.renamed.as_deref()),
+            ("Car Kit", Some("My cars"))
+        );
+        assert_eq!(shown(node.cover), Some(render.clone()));
+        // A name for a folder that is no pack shows nowhere.
+        let named = PackEdit::Details {
+            name: Some("Hols".into()),
+            license: None,
+            source_url: None,
+        };
+        edit(holiday, named).await;
+        assert_eq!(tree_node(&lib, holiday).await.renamed, None);
+        let card = packs_below(std::slice::from_ref(&lib), "", false)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.path == car)
+            .unwrap();
+        assert_eq!(
+            (card.name.as_str(), shown(card.cover)),
+            ("My cars", Some(render.clone()))
+        );
+        let mut detail = pack_holding(&lib, car).await.unwrap().unwrap();
+        assert_eq!(
+            (detail.name.as_str(), shown(detail.cover.take())),
+            ("My cars", Some(render))
+        );
+        assert_eq!(
+            detail.edits,
+            PackOverride {
+                mark: None,
+                name: Some("My cars".into()),
+                license: Some("CC0, credit Kenney".into()),
+                source_url: Some("https://kenney.nl/assets/car-kit".into()),
+                cover_path: Some(SEDAN_RENDER.into()),
+            }
+        );
+
+        // A refresh keeps every edit.
+        structure::rebuild_library(&db, &lib).await;
+        let mut again = pack_holding(&lib, car).await.unwrap().unwrap();
+        assert!(again.cover.take().is_some());
+        assert_eq!(again, detail);
+
+        // Clearing every edit removes its rows and gives back the pass's own structure.
+        let clear = PackEdit::Details {
+            name: Some(" ".into()),
+            license: None,
+            source_url: Some(String::new()),
+        };
+        edit(car, clear).await;
+        edit(car, PackEdit::Cover { asset_id: None }).await;
+        edit(models, mark(None)).await;
+        edit(holiday, mark(None)).await;
+        edit(
+            holiday,
+            PackEdit::Details {
+                name: None,
+                license: None,
+                source_url: None,
+            },
+        )
+        .await;
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pack_overrides")
+            .fetch_one(&lib.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+        assert_eq!(
+            crate::structure::tests::derived_rows(&lib.pool).await,
+            crate::structure::tests::derived_rows(&crate::structure::tests::car_kit().await).await
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_edits_refuse_an_unknown_folder_a_bad_url_and_a_cover_outside_the_pack() {
+        let (db, lib) = edited_car_kit().await;
+        let car = "3D assets/Car Kit";
+        let details = |url: &str| PackEdit::Details {
+            name: Some("x".into()),
+            license: None,
+            source_url: Some(url.into()),
+        };
+        let cover = |id: &str| PackEdit::Cover {
+            asset_id: Some(id.into()),
+        };
+        let refusals = [
+            ("lib", "3D assets/Bus Kit", details("https://kenney.nl")),
+            ("lib", car, details("javascript:alert(1)")),
+            ("lib", car, details("file:///etc/passwd")),
+            ("lib", car, details("https://")),
+            ("lib", car, cover(SEDAN[1])),
+            ("lib", "3D assets/Holiday Kit", cover(SEDAN_RENDER)),
+            ("lib", car, cover("no-such-asset")),
+            ("closed", car, details("https://kenney.nl")),
+        ];
+        for (library, path, edit) in refusals {
+            let refused = format!("{library} {path} {edit:?}");
+            assert!(
+                set_pack_override_in(&db, library, path, edit)
+                    .await
+                    .is_err(),
+                "{refused}"
+            );
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pack_overrides")
+            .fetch_one(&lib.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn an_image_can_be_the_cover_of_the_innermost_pack_holding_it() {
+        let (db, _lib) = edited_car_kit().await;
+        let texture = "3D assets/Car Kit/Models/GLB format/Textures/colormap.png";
+        let pack = |id: &'static str| {
+            let db = &db;
+            async move { cover_pack(db, id).await.unwrap().map(|p| (p.path, p.name)) }
+        };
+        assert_eq!(
+            pack(texture).await,
+            Some(("3D assets/Car Kit".into(), "Car Kit".into()))
+        );
+        // No model is a cover, and an unknown asset has no pack.
+        assert_eq!(pack(SEDAN[1]).await, None);
+        assert_eq!(pack("no-such-asset").await, None);
+        let nest = PackEdit::Mark {
+            mark: Some(PackMark::Pack),
+        };
+        set_pack_override_in(&db, "lib", "3D assets/Car Kit/Models", nest)
+            .await
+            .unwrap();
+        assert_eq!(
+            pack(texture).await,
+            Some(("3D assets/Car Kit/Models".into(), "Models".into()))
+        );
     }
 
     /// One open library over the Car Kit (`structure::tests::car_kit`, each asset's id its path),
