@@ -1556,6 +1556,12 @@ export const UI_CHECKS: UiCheck[] = [
         if (count > 0) matching += 1;
       }
       assert(matching >= 3, `only ${matching} formats match "tree"`);
+      // The screenshot shows the matching formats and the Types counts, not the first pills
+      document
+        .getElementById('filter-ext-glb')!
+        .scrollIntoView({ inline: 'start', block: 'nearest' });
+      document.getElementById('sidebar-filter-type-3d_model')!.scrollIntoView({ block: 'center' });
+      await frames(3);
       await pause('U13-filter-counts');
       const fbx = document.getElementById('filter-ext-fbx')!;
       const fbxCount = liveCount(fbx);
