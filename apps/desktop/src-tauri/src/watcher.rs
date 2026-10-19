@@ -130,7 +130,6 @@ struct PendingAsset {
     now: i64,
     preview_status: &'static str,
     thumbnail_path: Option<String>,
-    needs_job: bool,
     is_update: bool,
 }
 
@@ -258,33 +257,9 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
 
             let mut preview_status = "none";
             let mut thumbnail_path = None;
-            let mut needs_job = false;
 
-            let needs_preview = matches!(
-                ext.as_str(),
-                "max"
-                    | "fbx"
-                    | "obj"
-                    | "gltf"
-                    | "glb"
-                    | "dae"
-                    | "stl"
-                    | "3ds"
-                    | "skp"
-                    | "rfa"
-                    | "rvt"
-                    | "dwg"
-                    | "3dm"
-                    | "vrmat"
-                    | "psd"
-                    | "psb"
-                    | "ai"
-                    | "exr"
-                    | "hdr"
-            ) || is_native_image(&ext);
-            if needs_preview {
+            if crate::preview::needs_preview(&ext) {
                 preview_status = "pending";
-                needs_job = true;
             }
 
             let (id, is_update) =
@@ -294,10 +269,14 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
                     if !is_native_image(&ext) && existing_thumb.is_some() {
                         thumbnail_path = existing_thumb.clone();
                         preview_status = "done";
-                        needs_job = false;
                     }
                     (existing_id.clone(), true)
                 } else {
+                    // A new file gets no job here: the structure pass this run ends with queues
+                    // it once it knows the file's format group, so a member that isn't its
+                    // group's main item is never queued, not even while this run goes on (plan
+                    // C15, `structure::apply_previews`).
+                    preview_status = "none";
                     (Uuid::new_v4().to_string(), false)
                 };
 
@@ -312,7 +291,6 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
                 now,
                 preview_status,
                 thumbnail_path,
-                needs_job,
                 is_update,
             });
 
@@ -400,12 +378,13 @@ async fn commit_asset_batch(pool: &sqlx::Pool<sqlx::Sqlite>, batch: &[PendingAss
             .execute(&mut *tx)
             .await?;
 
-            sqlx::query(
+            sqlx::query(&format!(
                 "INSERT INTO preview_jobs (id, asset_id, status, created_at)
                  SELECT ?, ?, 'pending', ? WHERE NOT EXISTS (
                      SELECT 1 FROM preview_jobs WHERE asset_id = ?
-                     AND status IN ('pending', 'queued', 'fallback'))",
-            )
+                     AND status IN {})",
+                crate::preview::WAITING_JOBS
+            ))
             .bind(Uuid::new_v4().to_string())
             .bind(&item.id)
             .bind(item.now)
@@ -448,18 +427,6 @@ async fn commit_asset_batch(pool: &sqlx::Pool<sqlx::Sqlite>, batch: &[PendingAss
             .bind(item.preview_status)
             .execute(&mut *tx)
             .await?;
-
-            if item.needs_job {
-                let job_id = Uuid::new_v4().to_string();
-                let _ = sqlx::query(
-                    "INSERT INTO preview_jobs (id, asset_id, status, created_at) VALUES (?, ?, 'pending', ?)"
-                )
-                .bind(&job_id)
-                .bind(&item.id)
-                .bind(item.now)
-                .execute(&mut *tx)
-                .await;
-            }
         }
     }
 
@@ -594,6 +561,124 @@ mod tests {
             .unwrap();
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(file_paths, ["notes.txt"]);
+    }
+
+    /// A kit's model in three format folders, and a model on its own.
+    fn write_grouped_kit(root: &Path) -> [&'static str; 4] {
+        let paths = [
+            "kit/Models/GLB format/rock.glb",
+            "kit/Models/FBX format/rock.fbx",
+            "kit/Models/OBJ format/rock.obj",
+            "kit/tree.glb",
+        ];
+        for path in paths {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "model").unwrap();
+        }
+        paths
+    }
+
+    /// Every asset's (path, preview status), and every preview job's (asset path, status) of any
+    /// status, by path.
+    async fn queued(pool: &Pool<Sqlite>) -> (Vec<(String, String)>, Vec<(String, String)>) {
+        let assets =
+            sqlx::query_as("SELECT file_path, preview_status FROM assets ORDER BY file_path")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        let jobs = sqlx::query_as(
+            "SELECT a.file_path, p.status FROM preview_jobs p JOIN assets a ON a.id = p.asset_id
+             ORDER BY a.file_path",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        (assets, jobs)
+    }
+
+    fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+        rows.iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_index_run_never_queues_a_group_member_other_than_its_main_item() {
+        let (dir, db, lib) = temp_library().await;
+        let [glb, fbx, obj, tree] = write_grouped_kit(dir.path());
+        reindex(&db, &lib).await;
+        assert_eq!(
+            queued(&lib.pool).await,
+            (
+                pairs(&[
+                    (fbx, "none"),
+                    (glb, "pending"),
+                    (obj, "none"),
+                    (tree, "pending")
+                ]),
+                pairs(&[(glb, "pending"), (tree, "pending")]),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_packs_cover_images_are_queued_like_any_other_image() {
+        let (dir, db, lib) = temp_library().await;
+        let [glb, ..] = write_grouped_kit(dir.path());
+        std::fs::write(dir.path().join("kit/License.txt"), "CC0").unwrap();
+        write_png(&dir.path().join("kit/Preview.png"), 1024, 32);
+        reindex(&db, &lib).await;
+        let roles: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT file_path, support_role FROM assets WHERE support_role IS NOT NULL
+             ORDER BY file_path",
+        )
+        .fetch_all(&lib.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            roles,
+            [
+                ("kit/License.txt".to_string(), Some("doc".to_string())),
+                ("kit/Preview.png".to_string(), Some("cover".to_string())),
+            ]
+        );
+        // The cover gets a job, the license takes no preview, and the members stay off
+        let jobs = queued(&lib.pool).await.1;
+        assert_eq!(
+            jobs,
+            pairs(&[
+                (glb, "pending"),
+                ("kit/Preview.png", "pending"),
+                ("kit/tree.glb", "pending")
+            ])
+        );
+        crate::preview::process_image_jobs(&lib, 2).await;
+        let thumb: Option<String> = sqlx::query_scalar(
+            "SELECT thumbnail_path FROM assets WHERE file_path = 'kit/Preview.png'",
+        )
+        .fetch_one(&lib.pool)
+        .await
+        .unwrap();
+        assert!(thumb.is_some(), "the 1024 px cover got no thumbnail");
+    }
+
+    #[tokio::test]
+    async fn new_files_wait_for_the_structure_pass_to_be_queued() {
+        let (dir, db, lib) = temp_library().await;
+        write_grouped_kit(dir.path());
+        // The pass fails before it queues anything, so what is queued is what the walk queued
+        sqlx::query("DROP TABLE folders")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+        reindex(&db, &lib).await;
+        let (assets, jobs) = queued(&lib.pool).await;
+        assert_eq!(jobs, []);
+        assert!(
+            assets.iter().all(|(_, status)| status == "none"),
+            "{assets:?}"
+        );
     }
 
     /// Writes a `width` x `height` PNG to `path`. Large ones are short, so the decode stays cheap.

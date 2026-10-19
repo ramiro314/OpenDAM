@@ -182,13 +182,20 @@ function WindowedResults({
   // Set from a pointerdown until its task ends, while the browser's own mousedown focus runs
   const pointerFocus = useRef(false);
   const [width, setWidth] = useState(0);
+  // The viewport's height as laid out, fractions included: the virtualizer rounds its own, which
+  // can count a row that lies just below the bottom edge as visible
+  const [viewportHeight, setViewportHeight] = useState(0);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const observer = new ResizeObserver(() => setWidth(el.clientWidth));
+    const measure = () => {
+      setWidth(el.clientWidth);
+      setViewportHeight(el.getBoundingClientRect().height);
+    };
+    const observer = new ResizeObserver(measure);
     observer.observe(el);
-    setWidth(el.clientWidth);
+    measure();
     return () => observer.disconnect();
   }, []);
 
@@ -291,7 +298,14 @@ function WindowedResults({
       direction.current = scrollTop > lastScrollTop.current ? 1 : -1;
       lastScrollTop.current = scrollTop;
     }
-    const visible = visibleRows(scrollTop, el.clientHeight, rowPitch, rows);
+    const visible = visibleRows(
+      scrollTop,
+      el.clientHeight,
+      rowPitch,
+      rows,
+      SCROLL_PADDING,
+      layout.rowHeight
+    );
     topIndex.current = visible ? visible.first * columns : 0;
     useAssetStore.getState().setViewTop(topIndex.current);
     settler.update(
@@ -306,9 +320,11 @@ function WindowedResults({
 
   const visible = visibleRows(
     virtualizer.scrollOffset ?? 0,
-    virtualizer.scrollRect?.height ?? 0,
+    viewportHeight,
     rowPitch,
-    rows
+    rows,
+    SCROLL_PADDING,
+    layout.rowHeight
   );
   const range = visible && rowsToIndexRange(visible.first, visible.last, columns, total);
 

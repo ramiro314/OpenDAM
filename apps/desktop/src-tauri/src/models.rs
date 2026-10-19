@@ -111,6 +111,14 @@ pub struct Asset {
     #[serde(rename = "previewStatus")]
     pub preview_status: String,
     pub metadata: HashMap<String, serde_json::Value>,
+    /// For the main item of a format group, every member's extension, its own first: the card's
+    /// badge (`GLB +2`). Absent for a file on its own.
+    #[serde(
+        rename = "groupFormats",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub group_formats: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

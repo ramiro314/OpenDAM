@@ -1,5 +1,5 @@
 // The UI checks `VITE_SCROLL_BENCH=checks` runs (U1-U8 in
-// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U10 in
+// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U11 in
 // docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
 // check here.
 
@@ -228,8 +228,9 @@ async function searchWith(
 }
 
 /**
- * The shallowest folder at least two levels deep that holds exactly one file, a visible one, and
- * is no pack, found breadth first through `get_folders`, with the slowest node load on the way.
+ * The shallowest folder at least two levels deep that holds exactly one file, a visible one that
+ * is no format group's, and is no pack, found breadth first through `get_folders`, with the
+ * slowest node load on the way.
  */
 async function singleFileFolder(): Promise<{ folder: FolderNode; slowestMs: number }> {
   let slowestMs = 0;
@@ -240,10 +241,22 @@ async function singleFileFolder(): Promise<{ folder: FolderNode; slowestMs: numb
       const start = performance.now();
       const children = await api.getFolders(BENCH_LIBRARY, parent);
       slowestMs = Math.max(slowestMs, performance.now() - start);
-      const found = children.find(
-        (c) => c.itemCount === 1 && c.hiddenCount === 0 && !c.isPack && c.path.includes('/')
-      );
-      if (found) return { folder: found, slowestMs };
+      for (const c of children) {
+        if (c.itemCount !== 1 || c.hiddenCount !== 0 || c.isPack || !c.path.includes('/')) {
+          continue;
+        }
+        // One item could be a group, with files elsewhere or several here
+        const { assets, fileTotal } = await api.searchAssets({
+          query: {
+            ...useAssetStore.getState().query,
+            folder: { libraryId: BENCH_LIBRARY, path: c.path },
+          },
+          page: 0,
+          pageSize: 2,
+          includeTotal: true,
+        });
+        if (fileTotal === 1 && !assets[0]?.groupFormats) return { folder: c, slowestMs };
+      }
       next.push(...children.filter((c) => c.hasChildren).map((c) => c.path));
     }
     level = next;
@@ -399,7 +412,8 @@ export const UI_CHECKS: UiCheck[] = [
         assert(
           first === Math.min(...shown) + 1 && last === Math.max(...shown) + 1,
           `step ${step}: the footer reads ${first}-${last}, rows ${Math.min(...shown) + 1}-` +
-            `${Math.max(...shown) + 1} are visible`
+            `${Math.max(...shown) + 1} are visible (scrollTop ${el.scrollTop}, viewport ` +
+            `${el.getBoundingClientRect().height} px)`
         );
         if (step === steps) assert(last === total, `at the bottom the footer ends at ${last}`);
         if (step === steps / 2) await pause('U3-list-middle');
@@ -1142,9 +1156,9 @@ export const UI_CHECKS: UiCheck[] = [
       const status = () => document.getElementById('status-count')?.textContent ?? '';
       const results = async () => {
         const { query, total } = useAssetStore.getState();
-        const page = await api.searchAssets({ query, page: 0, pageSize: total + 1 });
-        return page.assets.map((a) => a.fileName);
+        return (await api.searchAssets({ query, page: 0, pageSize: total + 1 })).assets;
       };
+      const names = async () => (await results()).map((a) => a.fileName);
       kitRow.click();
       await waitFor(
         () => {
@@ -1159,11 +1173,15 @@ export const UI_CHECKS: UiCheck[] = [
         s.total === kit.itemCount,
         `the grid holds ${s.total}, the node counts ${kit.itemCount}`
       );
+      // The files are the items, the hidden files and the format groups' other members
+      const shownItems = await results();
+      const members = shownItems.reduce((n, a) => n + (a.groupFormats?.length ?? 1) - 1, 0);
       assert(
-        s.fileTotal === kit.itemCount + kit.hiddenCount,
-        `the search counts ${s.fileTotal} files, the node ${kit.itemCount} + ${kit.hiddenCount}`
+        s.fileTotal === kit.itemCount + kit.hiddenCount + members,
+        `the search counts ${s.fileTotal} files, the node ${kit.itemCount} + ${kit.hiddenCount} ` +
+          `hidden, with ${members} other group members`
       );
-      const visible = await results();
+      const visible = shownItems.map((a) => a.fileName);
       assert(!support.some((n) => visible.includes(n)), `the grid shows ${support.join(' or ')}`);
       const expected = formatItemsAndFiles(s.total, s.fileTotal);
       assert(status() === expected, `the status bar reads "${status()}", not "${expected}"`);
@@ -1206,11 +1224,12 @@ export const UI_CHECKS: UiCheck[] = [
 
       await searchWith({ text: '' }, waitFor);
       s = useAssetStore.getState();
+      // The hidden files join the items, while group members stay out of the grid
       assert(
-        s.total === s.fileTotal,
-        `with hidden files, ${s.total} items of ${s.fileTotal} files`
+        s.total === kit.itemCount + kit.hiddenCount,
+        `with hidden files, ${s.total} items, the node ${kit.itemCount} + ${kit.hiddenCount}`
       );
-      const all = await results();
+      const all = await names();
       assert(
         support.every((n) => all.includes(n)),
         `"Show hidden files" shows ${support.filter((n) => all.includes(n)).join(', ') || 'none'} of ${support.join(', ')}`
@@ -1226,6 +1245,169 @@ export const UI_CHECKS: UiCheck[] = [
       useAssetStore.getState().setQuery({ folder: undefined });
 
       await checkPacksView({ assert, waitFor, pause });
+    },
+  },
+  {
+    id: 'U11',
+    title:
+      'A Kenney kit model shows once, as its GLB with a GLB +2 badge, its FBX format folder and ' +
+      'an FBX filter still list it, and each format folder counts every model',
+    run: async ({ assert, waitFor, pause, sleep }) => {
+      await expandBenchLibrary({ assert, sleep });
+      const kitPath = '3D assets/Car Kit';
+      const modelsPath = `${kitPath}/Models`;
+      await expandFolder('3D assets');
+      await expandFolder(kitPath);
+      await expandFolder(modelsPath);
+      const formatPaths = ['GLB format', 'FBX format', 'OBJ format'].map(
+        (f) => `${modelsPath}/${f}`
+      );
+      await waitFor(
+        () => formatPaths.every((p) => folderRow(p) !== null),
+        10_000,
+        "the kit's format folders"
+      );
+
+      // `Models/` counts each model once, and every format folder counts all of them
+      const models = (await api.getFolders(BENCH_LIBRARY, kitPath)).find(
+        (f) => f.path === modelsPath
+      )!;
+      const formats = await api.getFolders(BENCH_LIBRARY, modelsPath);
+      for (const path of formatPaths) {
+        const node = formats.find((f) => f.path === path);
+        assert(node, `no ${path} node`);
+        assert(
+          node!.itemCount === models.itemCount,
+          `${path} counts ${node!.itemCount}, ${modelsPath} ${models.itemCount}`
+        );
+        assert(shownCount(folderRow(path)!) === node!.itemCount, `${path}'s badge`);
+      }
+      assert(shownCount(folderRow(modelsPath)!) === models.itemCount, `${modelsPath}'s badge`);
+
+      /** The current search's every result, with its total. */
+      const results = async () => {
+        const { query, total } = useAssetStore.getState();
+        const page = await api.searchAssets({ query, page: 0, pageSize: total + 1 });
+        return { total, assets: page.assets };
+      };
+      const selectFolder = async (path: string) => {
+        folderRow(path)!.click();
+        await waitFor(
+          () => {
+            const st = useAssetStore.getState();
+            return st.query.folder?.path === path && !st.loading && st.total > 0;
+          },
+          30_000,
+          `the search for ${path}`
+        );
+      };
+
+      // The grid lists each model once, as its GLB with a solid `GLB +2` badge
+      await selectFolder(modelsPath);
+      let found = await results();
+      assert(
+        found.total === models.itemCount,
+        `the grid holds ${found.total}, the node counts ${models.itemCount}`
+      );
+      const modelItems = found.assets.filter((a) => a.kind === '3d_model');
+      const notGlb = modelItems.filter((a) => a.extension !== 'glb');
+      assert(notGlb.length === 0, `${notGlb[0]?.fileName} shows in the grid`);
+      const sedan = found.assets.find((a) => a.fileName === 'sedan.glb');
+      assert(sedan, 'no sedan.glb in the grid');
+      assert(
+        sedan!.groupFormats?.join(',') === 'glb,fbx,obj',
+        `sedan.glb's group is ${sedan!.groupFormats?.join(', ')}`
+      );
+      await waitFor(
+        () => document.querySelectorAll('[data-tile] [data-group-badge]').length > 0,
+        10_000,
+        'a group badge on a card'
+      );
+      const badges = [...document.querySelectorAll<HTMLElement>('[data-tile] [data-group-badge]')];
+      const modelBadge = badges.find((b) => b.dataset.groupBadge === 'GLB +2');
+      assert(modelBadge, `the badges read ${badges.map((b) => b.dataset.groupBadge).join(', ')}`);
+      assert(
+        modelBadge!.title === '3 files: GLB, FBX, OBJ',
+        `the badge's tooltip reads "${modelBadge!.title}"`
+      );
+      const background = getComputedStyle(modelBadge!).backgroundColor;
+      assert(background.startsWith('rgb('), `the badge's background is ${background}, not solid`);
+      await pause('U11-kit-models');
+
+      // A list row shows the same badge, solid and whole, in its extension column
+      useUIStore.getState().setViewMode('list');
+      const rowBadge = () =>
+        [...document.querySelectorAll<HTMLElement>('[data-tile] [data-group-badge]')].find(
+          (b) => b.dataset.groupBadge === 'GLB +2'
+        );
+      await waitFor(() => rowBadge() !== undefined, 10_000, "a list row's GLB +2 badge");
+      const listBadge = rowBadge()!;
+      assert(
+        listBadge.textContent === 'GLB +2',
+        `the row's badge reads "${listBadge.textContent}"`
+      );
+      assert(
+        listBadge.title === '3 files: GLB, FBX, OBJ',
+        `the row badge's tooltip reads "${listBadge.title}"`
+      );
+      const rowBackground = getComputedStyle(listBadge).backgroundColor;
+      assert(
+        rowBackground.startsWith('rgb('),
+        `the row badge's background is ${rowBackground}, not solid`
+      );
+      assert(
+        listBadge.scrollWidth <= listBadge.clientWidth,
+        `the row badge is clipped: ${listBadge.scrollWidth} px of text in ${listBadge.clientWidth} px`
+      );
+      await pause('U11-list-badge');
+      useUIStore.getState().setViewMode('grid');
+
+      // `FBX format/` still lists the models, as their GLBs, and holds no GLB itself
+      const fbxPath = `${modelsPath}/FBX format`;
+      await selectFolder(fbxPath);
+      found = await results();
+      assert(found.total === models.itemCount, `${fbxPath} lists ${found.total} items`);
+      const shown = new Set(found.assets.map((a) => a.extension));
+      assert(!shown.has('fbx'), `${fbxPath} shows FBX files: ${[...shown].join(', ')}`);
+      await pause('U11-fbx-format');
+      await searchWith(
+        { filter: { ...useAssetStore.getState().query.filter, extensions: ['glb'] } },
+        waitFor
+      );
+      assert(
+        useAssetStore.getState().total === 0,
+        `${fbxPath} with .glb matches ${useAssetStore.getState().total}`
+      );
+
+      // Filtering the kit by FBX, or searching it for "fbx", finds the models through their FBX
+      await searchWith(
+        {
+          folder: { libraryId: BENCH_LIBRARY, path: kitPath },
+          filter: { ...useAssetStore.getState().query.filter, extensions: ['fbx'] },
+        },
+        waitFor
+      );
+      found = await results();
+      const glbs = found.assets.filter((a) => a.extension === 'glb').length;
+      assert(found.total > 0 && glbs === found.total, `FBX finds ${found.total}, ${glbs} as GLB`);
+      assert(
+        found.total === modelItems.length,
+        `FBX finds ${found.total} of the kit's ${modelItems.length} models`
+      );
+      await searchWith(
+        {
+          text: 'fbx',
+          filter: { ...useAssetStore.getState().query.filter, extensions: undefined },
+        },
+        waitFor
+      );
+      found = await results();
+      assert(
+        found.assets.some((a) => a.fileName === 'sedan.glb'),
+        `"fbx" finds ${found.total} items, sedan.glb not among them`
+      );
+
+      await searchWith({ text: '', folder: undefined }, waitFor);
     },
   },
 ];

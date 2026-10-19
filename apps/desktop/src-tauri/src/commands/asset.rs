@@ -34,6 +34,8 @@ struct RawAssetRow {
     pub metadata: String,
     pub tags: Option<String>,
     pub collections: Option<String>,
+    /// A main item's members' extensions, as a JSON array, itself included
+    pub group_formats: Option<String>,
 }
 
 /// Build an Asset from a raw SQLite row, resolving relative paths to absolute paths
@@ -55,6 +57,10 @@ fn row_to_asset(root: Option<&Path>, row: RawAssetRow) -> Asset {
         .collections
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
+    let group_formats = row
+        .group_formats
+        .and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
+        .map(|formats| main_first(&row.extension, formats));
 
     let resolved_file_path = match root {
         Some(r) => resolve_path(r, &row.file_path),
@@ -83,7 +89,23 @@ fn row_to_asset(root: Option<&Path>, row: RawAssetRow) -> Asset {
         thumbnail_path: resolved_thumb_path,
         preview_status: row.preview_status,
         metadata,
+        group_formats,
     }
+}
+
+/// A group's member extensions with the main item's (`main`) first, then the rest in the order
+/// the group picks its main item by (`structure::format_rank`).
+fn main_first(main: &str, mut formats: Vec<String>) -> Vec<String> {
+    if let Some(i) = formats.iter().position(|f| f == main) {
+        formats.remove(i);
+    }
+    formats.sort_by(|a, b| {
+        structure::format_rank(a)
+            .cmp(&structure::format_rank(b))
+            .then_with(|| a.cmp(b))
+    });
+    formats.insert(0, main.to_string());
+    formats
 }
 
 /// Builds an FTS5 `MATCH` expression from free search text. Each whitespace-separated term
@@ -156,7 +178,13 @@ async fn search_libraries(
 ) -> Result<SearchResult> {
     let offset = payload.page * payload.page_size;
     let limit = payload.page_size;
-    let filter = search_filter(&payload.query);
+    let split = match (&payload.query.folder, target_libs.first()) {
+        (Some(folder), Some((pool, _))) => splits_groups(pool, &folder.path)
+            .await
+            .map_err(|e| e.to_string())?,
+        _ => false,
+    };
+    let filter = search_filter(&payload.query, split);
     let sort_field = payload.query.sort.field.as_str();
     let is_asc = payload.query.sort.order == "asc";
     let order_by = order_by(sort_field, is_asc);
@@ -295,7 +323,7 @@ where
     for (lib, tx) in txs.iter_mut().enumerate() {
         let Some(tx) = tx else { continue };
         let mut query = sqlx::query_as::<_, (i64, K)>(&sql);
-        for b in &filter.binds {
+        for b in filter.binds() {
             query = query.bind(b.clone());
         }
         match query.bind(offset + limit).fetch_all(&mut **tx).await {
@@ -363,18 +391,36 @@ fn sort_column(field: &str) -> (&'static str, SortKind) {
 
 /// The `WHERE` conditions of a search over `assets a`, and the values bound to their `?`
 /// placeholders in order.
+///
+/// A search lists grid items: main items of format groups and files on their own (plan C5). The
+/// item conditions read the item itself: its metadata, and the size and date that sort it. The
+/// file-level conditions (plan C6: search text, kind, extension, folder, name prefix and suffix)
+/// match an item when one of its files, the main item included, meets them all together.
 #[derive(Default)]
 struct SqlFilter {
     conditions: Vec<String>,
     binds: Vec<String>,
-    /// Whether support files match too ("Show hidden files"). Otherwise the search adds
-    /// `VISIBLE`, which `count_assets` counts apart to give the files behind the items.
+    /// Written on the file `{f}`, so they read any file of an item, or the file itself.
+    file_conditions: Vec<String>,
+    file_binds: Vec<String>,
+    /// Whether an item can match through a file other than its main item. Otherwise every
+    /// file-level condition is a folder range the item conditions hold too.
+    any_file: bool,
+    /// Whether support files match too ("Show hidden files"). Otherwise the items leave them out
+    /// with `NOT_SUPPORT`, while the files behind the items count them either way.
     show_hidden: bool,
 }
 
-/// The grid's visibility rule (plan C5): a pack's support files show only with "Show hidden
-/// files".
-const VISIBLE: &str = "a.support_role IS NULL";
+/// The group half of the grid's visibility rule (plan C5): a group shows as its main item, and
+/// its other members never show, even with "Show hidden files". With both halves, a search reads
+/// the grid items from `idx_assets_items`, whose `WHERE` repeats them term for term
+/// (`db::add_structure_columns`). The preview queue claims jobs by it too (`preview::claim_jobs`),
+/// on `assets a`.
+pub(crate) const MAIN_OR_SINGLE: &str = "(a.group_id IS NULL OR a.group_id = a.id)";
+
+/// The support-file half of the grid's visibility rule: a pack's support files show only with
+/// "Show hidden files".
+const NOT_SUPPORT: &str = "a.support_role IS NULL";
 
 impl SqlFilter {
     fn push(&mut self, condition: impl Into<String>, binds: impl IntoIterator<Item = String>) {
@@ -392,23 +438,83 @@ impl SqlFilter {
         }
     }
 
-    /// Every condition, the visibility rule included.
+    /// Adds a file-level condition, written on `{f}`.
+    fn push_file(&mut self, condition: impl Into<String>, binds: impl IntoIterator<Item = String>) {
+        self.any_file = true;
+        self.push_implied_file(condition, binds);
+    }
+
+    /// Adds a file-level condition the item conditions already hold for the main item.
+    fn push_implied_file(
+        &mut self,
+        condition: impl Into<String>,
+        binds: impl IntoIterator<Item = String>,
+    ) {
+        self.file_conditions.push(condition.into());
+        self.file_binds.extend(binds);
+    }
+
+    /// Requires a file's `column` (on `{f}`) to be one of `values`, unless there are none.
+    fn push_file_in(&mut self, column: &str, values: &Option<Vec<String>>) {
+        if let Some(values) = values.as_ref().filter(|v| !v.is_empty()) {
+            self.push_file(
+                format!("{} IN ({})", column, placeholders(values.len())),
+                values.iter().cloned(),
+            );
+        }
+    }
+
+    /// The file-level conditions on the file `alias`, joined by `AND`.
+    fn file_conditions_on(&self, alias: &str) -> String {
+        self.file_conditions
+            .iter()
+            .map(|c| c.replace("{f}", alias))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    }
+
+    /// The grid items: every condition, with the visibility rule. An item matches the file-level
+    /// conditions through any of its files `m`: `m.id = a.id` for a file on its own, and
+    /// `m.group_id = a.id` for each member of a group, its main item included.
     fn where_clause(&self) -> String {
-        self.conditions_clause(!self.show_hidden)
+        let mut all: Vec<String> = self.conditions.clone();
+        all.push(MAIN_OR_SINGLE.to_string());
+        if !self.show_hidden {
+            all.push(NOT_SUPPORT.to_string());
+        }
+        if self.any_file {
+            all.push(format!(
+                "a.id IN (SELECT COALESCE(m.group_id, m.id) FROM assets m WHERE {})",
+                self.file_conditions_on("m")
+            ));
+        }
+        format!("WHERE {}", all.join(" AND "))
     }
 
-    /// Every condition but the visibility rule: the files behind the items.
+    /// The values bound to `where_clause`'s placeholders, in order.
+    fn binds(&self) -> impl Iterator<Item = &String> {
+        let file_binds = if self.any_file {
+            &self.file_binds[..]
+        } else {
+            &[]
+        };
+        self.binds.iter().chain(file_binds)
+    }
+
+    /// The values bound to `files_where_clause`'s placeholders, in order.
+    fn files_binds(&self) -> impl Iterator<Item = &String> {
+        self.binds.iter().chain(&self.file_binds)
+    }
+
+    /// The files behind the items: every file that meets every condition itself, members and
+    /// support files included. Bound by `files_binds`.
     fn files_where_clause(&self) -> String {
-        self.conditions_clause(false)
-    }
-
-    fn conditions_clause(&self, visible_only: bool) -> String {
-        let visible = visible_only.then_some(VISIBLE);
+        let file_conditions = self.file_conditions_on("a");
         let all: Vec<&str> = self
             .conditions
             .iter()
             .map(String::as_str)
-            .chain(visible)
+            .chain((!file_conditions.is_empty()).then_some(file_conditions.as_str()))
             .collect();
         if all.is_empty() {
             String::new()
@@ -450,7 +556,24 @@ fn in_tags(count: usize) -> String {
     )
 }
 
-fn search_filter(query: &SearchQuery) -> SqlFilter {
+/// Whether folder `path` of the library at `pool` holds a member of a format group whose main
+/// item lies outside it (`structure::Folder::split_groups`). The root holds every main item, and
+/// a folder with no row holds no file.
+async fn splits_groups(pool: &sqlx::Pool<sqlx::Sqlite>, path: &str) -> sqlx::Result<bool> {
+    let path = path.trim_matches('/');
+    if path.is_empty() {
+        return Ok(false);
+    }
+    let split: Option<i64> = sqlx::query_scalar("SELECT split_groups FROM folders WHERE path = ?")
+        .bind(path)
+        .fetch_optional(pool)
+        .await?;
+    Ok(split.unwrap_or(0) > 0)
+}
+
+/// The search for `query`. `split` tells whether its folder splits format groups
+/// (`splits_groups`).
+fn search_filter(query: &SearchQuery, split: bool) -> SqlFilter {
     let f = &query.filter;
     let mut filter = SqlFilter {
         show_hidden: f.show_hidden == Some(true),
@@ -458,12 +581,12 @@ fn search_filter(query: &SearchQuery) -> SqlFilter {
     };
 
     if let Some(fts) = fts_match_expression(&query.text) {
-        filter.push(
-            "a.id IN (SELECT id FROM assets_fts WHERE assets_fts MATCH ?)",
+        filter.push_file(
+            "{f}.rowid IN (SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?)",
             [fts],
         );
     }
-    filter.push_in("a.kind", &f.kinds);
+    filter.push_file_in("{f}.kind", &f.kinds);
     filter.push_in("a.color_label", &f.color_labels);
     if let Some(rating) = &f.rating {
         filter.push(
@@ -498,9 +621,9 @@ fn search_filter(query: &SearchQuery) -> SqlFilter {
         Some("has_preview") => filter.push("a.preview_status = 'done'", []),
         Some(ps) => filter.push("a.preview_status = ?", [ps.to_string()]),
     }
-    filter.push_in("a.extension", &f.extensions);
+    filter.push_file_in("{f}.extension", &f.extensions);
     if let Some(folder) = &query.folder {
-        push_folder_range(&mut filter, &folder.path);
+        push_folder_range(&mut filter, &folder.path, split);
     }
     push_tag_filter(&mut filter, f);
     push_collection_filter(&mut filter, query);
@@ -509,15 +632,16 @@ fn search_filter(query: &SearchQuery) -> SqlFilter {
     fn trimmed(s: &Option<String>) -> Option<&str> {
         s.as_deref().map(str::trim).filter(|s| !s.is_empty())
     }
-    // Typed by hand, so padding is dropped; a tree folder's path is used exactly.
+    // Typed by hand, so padding is dropped; a tree folder's path is used exactly. It applies to
+    // every library searched, so it may split groups in any of them.
     if let Some(dir) = &f.directory {
-        push_folder_range(&mut filter, dir.trim());
+        push_folder_range(&mut filter, dir.trim(), true);
     }
     if let Some(prefix) = trimmed(&f.name_prefix) {
-        filter.push("a.file_name LIKE ?", [format!("{prefix}%")]);
+        filter.push_file("{f}.file_name LIKE ?", [format!("{prefix}%")]);
     }
     if let Some(suffix) = trimmed(&f.name_suffix) {
-        filter.push("a.file_name LIKE ?", [format!("%{suffix}")]);
+        filter.push_file("{f}.file_name LIKE ?", [format!("%{suffix}")]);
     }
     filter
 }
@@ -526,13 +650,22 @@ fn search_filter(query: &SearchQuery) -> SqlFilter {
 /// `p/ <= file_path < p0` (`0` follows `/`) holds exactly the paths starting with `p/`, uses the
 /// unique `file_path` index and needs no `LIKE` escaping. The root (`""`, or only slashes) adds
 /// no condition. Spaces are kept: a folder name may start or end with one.
-fn push_folder_range(filter: &mut SqlFilter, folder: &str) {
+///
+/// It is a file-level condition. When the folder `split`s no group, every group with a file
+/// below it has its main item there too, so the item's own path decides, as fast as before
+/// groups: the range goes on the item as well, and adds no search through members.
+fn push_folder_range(filter: &mut SqlFilter, folder: &str, split: bool) {
     let path = folder.trim_matches('/');
-    if !path.is_empty() {
-        filter.push(
-            "a.file_path >= ? AND a.file_path < ?",
-            [format!("{path}/"), format!("{path}0")],
-        );
+    if path.is_empty() {
+        return;
+    }
+    let range = [format!("{path}/"), format!("{path}0")];
+    let condition = "{f}.file_path >= ? AND {f}.file_path < ?";
+    if split {
+        filter.push_file(condition, range);
+    } else {
+        filter.push(condition.replace("{f}", "a"), range.clone());
+        filter.push_implied_file(condition, range);
     }
 }
 
@@ -627,35 +760,41 @@ struct Counts {
     files: i64,
 }
 
-/// Counts the items and the files `filter` matches in one scan.
+/// Counts the items and the files `filter` matches. With no condition but a folder, both come from
+/// an index alone: the items from `idx_assets_items`, the files from the `file_path` index.
 async fn count_assets(pool: &sqlx::Pool<sqlx::Sqlite>, filter: &SqlFilter) -> sqlx::Result<Counts> {
     #[cfg(test)]
     COUNT_QUERIES.with(|c| c.set(c.get() + 1));
-    let items = if filter.show_hidden {
-        "COUNT(*)".to_string()
-    } else {
-        format!("COALESCE(SUM({VISIBLE}), 0)")
-    };
     let sql = format!(
-        "SELECT {items}, COUNT(*) FROM assets a {}",
+        "SELECT (SELECT COUNT(*) FROM assets a {}), (SELECT COUNT(*) FROM assets a {})",
+        filter.where_clause(),
         filter.files_where_clause()
     );
     let mut query = sqlx::query_as::<_, (i64, i64)>(&sql);
-    for b in &filter.binds {
+    for b in filter.binds().chain(filter.files_binds()) {
         query = query.bind(b.clone());
     }
     let (items, files) = query.fetch_one(pool).await?;
     Ok(Counts { items, files })
 }
 
-/// The columns of a `RawAssetRow` selected from `assets a`.
+/// The columns of a `RawAssetRow` selected from `assets a`. A main item with no thumbnail
+/// of its own, such as a `.blend`, shows a member's (`structure::preview_stand_ins`).
 const ASSET_COLUMNS: &str = r#"
     a.id, a.file_path, a.file_name, a.extension, a.kind,
     a.size_bytes, a.modified_at, a.indexed_at, a.rating,
-    a.color_label, a.is_favorite, a.description, a.thumbnail_path,
+    a.color_label, a.is_favorite, a.description,
+    COALESCE(a.thumbnail_path, CASE WHEN a.group_id = a.id THEN
+        (SELECT m.thumbnail_path FROM assets m
+         WHERE m.group_id = a.id AND m.thumbnail_path IS NOT NULL
+         ORDER BY m.file_path LIMIT 1)
+    END) AS thumbnail_path,
     a.preview_status, a.metadata,
     (SELECT json_group_array(tag_id) FROM asset_tags WHERE asset_id = a.id) AS tags,
-    (SELECT json_group_array(collection_id) FROM collection_assets WHERE asset_id = a.id) AS collections"#;
+    (SELECT json_group_array(collection_id) FROM collection_assets WHERE asset_id = a.id) AS collections,
+    CASE WHEN a.group_id = a.id THEN
+        (SELECT json_group_array(m.extension) FROM assets m WHERE m.group_id = a.id)
+    END AS group_formats"#;
 
 #[derive(sqlx::FromRow)]
 struct RowidAssetRow {
@@ -705,7 +844,7 @@ async fn fetch_assets(
         if offset.is_some() { " OFFSET ?" } else { "" }
     );
     let mut query = sqlx::query_as::<_, RawAssetRow>(&sql);
-    for b in &filter.binds {
+    for b in filter.binds() {
         query = query.bind(b.clone());
     }
     query = query.bind(limit);
@@ -725,15 +864,9 @@ pub async fn get_asset(id: String, state: State<'_, Arc<AppState>>) -> Result<As
 
     // Search across open libraries
     for lib in libs {
-        let row = sqlx::query_as::<_, RawAssetRow>(
-            r#"SELECT a.id, a.file_path, a.file_name, a.extension, a.kind,
-               a.size_bytes, a.modified_at, a.indexed_at, a.rating,
-               a.color_label, a.is_favorite, a.description, a.thumbnail_path,
-               a.preview_status, a.metadata,
-               (SELECT json_group_array(tag_id) FROM asset_tags WHERE asset_id = a.id) AS tags,
-               (SELECT json_group_array(collection_id) FROM collection_assets WHERE asset_id = a.id) AS collections
-               FROM assets a WHERE a.id = ?"#,
-        )
+        let row = sqlx::query_as::<_, RawAssetRow>(&format!(
+            "SELECT {ASSET_COLUMNS} FROM assets a WHERE a.id = ?"
+        ))
         .bind(&id)
         .fetch_optional(&lib.pool)
         .await
@@ -757,7 +890,9 @@ pub async fn update_asset(
     get_asset(id, state).await
 }
 
-/// Writes the patch to the asset's own library only, memberships included.
+/// Writes the patch to the asset's own library only, memberships included. Its metadata (rating,
+/// color label, favorite, description and tags) goes to every member of the asset's group
+/// (`structure::group_members`), and its thumbnail and preview status to the asset alone.
 async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Result<()> {
     let lib = db
         .library_of_asset(id)
@@ -766,39 +901,50 @@ async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Resul
         .ok_or_else(|| format!("Asset not found: {}", id))?;
     // One transaction, so a patch whose tags fail saves none of its other fields either.
     let mut tx = lib.pool.begin().await.map_err(|e| e.to_string())?;
+    let members = structure::group_members(&mut *tx, id)
+        .await
+        .map_err(|e| e.to_string())?;
 
     if let Some(rating) = patch.rating {
-        sqlx::query("UPDATE assets SET rating = ? WHERE id = ?")
-            .bind(rating)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        for member in &members {
+            sqlx::query("UPDATE assets SET rating = ? WHERE id = ?")
+                .bind(rating)
+                .bind(member)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
     if let Some(ref color_label) = patch.color_label {
-        sqlx::query("UPDATE assets SET color_label = ? WHERE id = ?")
-            .bind(color_label)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        for member in &members {
+            sqlx::query("UPDATE assets SET color_label = ? WHERE id = ?")
+                .bind(color_label)
+                .bind(member)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
     if let Some(is_fav) = patch.is_favorite {
         let fav_int: i64 = if is_fav { 1 } else { 0 };
-        sqlx::query("UPDATE assets SET is_favorite = ? WHERE id = ?")
-            .bind(fav_int)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        for member in &members {
+            sqlx::query("UPDATE assets SET is_favorite = ? WHERE id = ?")
+                .bind(fav_int)
+                .bind(member)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
     if let Some(ref description) = patch.description {
-        sqlx::query("UPDATE assets SET description = ? WHERE id = ?")
-            .bind(description)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        for member in &members {
+            sqlx::query("UPDATE assets SET description = ? WHERE id = ?")
+                .bind(description)
+                .bind(member)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
     if let Some(ref thumbnail_path) = patch.thumbnail_path {
         let rel_thumb = make_relative_path(&lib.root_path, Path::new(thumbnail_path));
@@ -818,11 +964,13 @@ async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Resul
             .map_err(|e| e.to_string())?;
     }
     if let Some(ref tags) = patch.tags {
-        sqlx::query("DELETE FROM asset_tags WHERE asset_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        for member in &members {
+            sqlx::query("DELETE FROM asset_tags WHERE asset_id = ?")
+                .bind(member)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         for tag_id in tags {
             // Copy master's definition, and its ancestors root first, into the mirror: a
             // mirror can lack them after a skipped name collision or a failed mirror write, and
@@ -844,12 +992,14 @@ async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Resul
                     .await
                     .map_err(|e| format!("Could not tag the asset with '{}': {}", tag.1, e))?;
             }
-            sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
-                .bind(id)
-                .bind(tag_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
+            for member in &members {
+                sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
+                    .bind(member)
+                    .bind(tag_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
         }
     }
 
@@ -2914,6 +3064,358 @@ mod tests {
         assert_eq!((ids.len(), total, files), (7, Some(7), Some(7)));
     }
 
+    /// A Kenney-like kit: two models in format folders, texture copies, a render and a license,
+    /// next to a model on its own. Each file has its own size, so sorting by size tells them apart.
+    const GROUPED_FILES: [(&str, i64); 10] = [
+        ("kit/License.txt", 1),
+        ("kit/Models/GLB format/sedan.glb", 30),
+        ("kit/Models/FBX format/sedan.fbx", 10),
+        ("kit/Models/OBJ format/sedan.obj", 20),
+        ("kit/Models/GLB format/van.glb", 5),
+        ("kit/Models/OBJ format/van.obj", 50),
+        ("kit/Models/GLB format/Textures/colormap.png", 40),
+        ("kit/Models/FBX format/Textures/colormap.png", 2),
+        ("kit/Previews/sedan.png", 15),
+        ("other/rock.fbx", 25),
+    ];
+    const SEDAN: &str = "kit/Models/GLB format/sedan.glb";
+    const VAN: &str = "kit/Models/GLB format/van.glb";
+    const COLORMAP: &str = "kit/Models/GLB format/Textures/colormap.png";
+    const RENDER: &str = "kit/Previews/sedan.png";
+    const ROCK: &str = "other/rock.fbx";
+
+    /// A library holding `GROUPED_FILES`, each with its real extension and kind and its id the
+    /// path, after its structure pass.
+    async fn grouped_library() -> LibraryHandle {
+        let pool = memory_library_pool().await;
+        for (path, size) in GROUPED_FILES {
+            let name = path.rsplit('/').next().unwrap();
+            let ext = name.rsplit_once('.').unwrap().1;
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, preview_status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'done')",
+            )
+            .bind(path)
+            .bind(path)
+            .bind(name)
+            .bind(ext)
+            .bind(crate::models::AssetKind::from_extension(ext).as_str())
+            .bind(size)
+            .bind(size)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        structure::rebuild(&pool, crate::structure::tests::unmounted())
+            .await
+            .unwrap();
+        LibraryHandle {
+            id: "lib".to_string(),
+            name: "lib".to_string(),
+            root_path: PathBuf::from("/libraries/lib"),
+            pool,
+        }
+    }
+
+    fn strings(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    /// `counted_search` sorted by size, smallest first.
+    async fn by_size(
+        libs: &[LibraryHandle],
+        query: serde_json::Value,
+    ) -> (Vec<String>, Option<i64>, Option<i64>) {
+        let (mut ids, total, files) = counted_search(libs, query).await;
+        let size = |id: &String| GROUPED_FILES.iter().find(|(p, _)| p == id).unwrap().1;
+        ids.sort_by_key(size);
+        (ids, total, files)
+    }
+
+    #[tokio::test]
+    async fn a_group_shows_as_its_main_item_and_its_members_never_show() {
+        let libs = [grouped_library().await];
+        let items = strings(&[VAN, RENDER, ROCK, SEDAN, COLORMAP]);
+        assert_eq!(
+            by_size(&libs, serde_json::json!({})).await,
+            (items.clone(), Some(5), Some(10))
+        );
+        // "Show hidden files" brings back the license, but no member.
+        let mut with_license = items;
+        with_license.insert(0, "kit/License.txt".to_string());
+        assert_eq!(
+            by_size(
+                &libs,
+                serde_json::json!({ "filter": { "showHidden": true } })
+            )
+            .await,
+            (with_license, Some(6), Some(10))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_matches_a_kind_or_an_extension_through_any_of_its_files() {
+        let libs = [grouped_library().await];
+        let search = |filter: serde_json::Value| {
+            let libs = &libs;
+            async move { by_size(libs, serde_json::json!({ "filter": filter })).await }
+        };
+        // The sedan through its FBX, and the rock on its own. Two files are FBX.
+        assert_eq!(
+            search(serde_json::json!({ "extensions": ["fbx"] })).await,
+            (strings(&[ROCK, SEDAN]), Some(2), Some(2))
+        );
+        assert_eq!(
+            search(serde_json::json!({ "extensions": ["obj"] })).await,
+            (strings(&[VAN, SEDAN]), Some(2), Some(2))
+        );
+        assert_eq!(
+            search(serde_json::json!({ "kinds": ["texture"] })).await,
+            (strings(&[RENDER, COLORMAP]), Some(2), Some(3))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_format_folder_lists_its_groups_and_one_file_must_meet_every_filter() {
+        let libs = [grouped_library().await];
+        let search = |folder: &str, filter: serde_json::Value| {
+            let query = serde_json::json!({
+                "folder": { "libraryId": "lib", "path": folder },
+                "filter": filter,
+            });
+            let libs = &libs;
+            async move { by_size(libs, query).await }
+        };
+        let fbx = "kit/Models/FBX format";
+        assert_eq!(
+            search(fbx, serde_json::json!({})).await,
+            (strings(&[SEDAN, COLORMAP]), Some(2), Some(2))
+        );
+        assert_eq!(
+            search("kit/Models/OBJ format", serde_json::json!({})).await,
+            (strings(&[VAN, SEDAN]), Some(2), Some(2))
+        );
+        // The sedan has a GLB and a file in `FBX format/`, but no GLB there.
+        assert_eq!(
+            search(fbx, serde_json::json!({ "extensions": ["glb"] })).await,
+            (vec![], Some(0), Some(0))
+        );
+        assert_eq!(
+            search(fbx, serde_json::json!({ "extensions": ["fbx"] })).await,
+            (strings(&[SEDAN]), Some(1), Some(1))
+        );
+        assert_eq!(
+            search(fbx, serde_json::json!({ "namePrefix": "colormap" })).await,
+            (strings(&[COLORMAP]), Some(1), Some(1))
+        );
+        assert_eq!(
+            search(fbx, serde_json::json!({ "namePrefix": "van" })).await,
+            (vec![], Some(0), Some(0))
+        );
+        // A folder no group splits: its items are those below it, with every file it holds.
+        assert_eq!(
+            search("kit/Models", serde_json::json!({})).await,
+            (strings(&[VAN, SEDAN, COLORMAP]), Some(3), Some(7))
+        );
+        assert_eq!(
+            search("kit/Models", serde_json::json!({ "extensions": ["fbx"] })).await,
+            (strings(&[SEDAN]), Some(1), Some(1))
+        );
+        // The smart filter's directory reads members the same way.
+        assert_eq!(
+            by_size(&libs, serde_json::json!({ "filter": { "directory": fbx } })).await,
+            (strings(&[SEDAN, COLORMAP]), Some(2), Some(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn search_text_finds_a_group_through_a_word_only_a_members_folder_has() {
+        let libs = [grouped_library().await];
+        // "fbx" is in the sedan's and the colormap's FBX copies' paths, and the rock's name.
+        assert_eq!(
+            by_size(&libs, serde_json::json!({ "text": "fbx" })).await,
+            (strings(&[ROCK, SEDAN, COLORMAP]), Some(3), Some(3))
+        );
+        // No GLB has "fbx" in its path.
+        assert_eq!(
+            by_size(
+                &libs,
+                serde_json::json!({ "text": "fbx", "filter": { "extensions": ["glb"] } })
+            )
+            .await,
+            (vec![], Some(0), Some(0))
+        );
+        assert_eq!(
+            by_size(&libs, serde_json::json!({ "text": "sedan" })).await,
+            (strings(&[RENDER, SEDAN]), Some(2), Some(4))
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_filters_and_sort_keys_read_the_main_item() {
+        let libs = [grouped_library().await];
+        let pool = &libs[0].pool;
+        for (id, rating) in [(SEDAN, 4), ("kit/Models/OBJ format/van.obj", 5)] {
+            sqlx::query("UPDATE assets SET rating = ? WHERE id = ?")
+                .bind(rating)
+                .bind(id)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        let (rated, total, _) = counted_search(
+            &libs,
+            serde_json::json!({ "filter": { "rating": { "min": 4, "max": 5 } } }),
+        )
+        .await;
+        assert_eq!((rated, total), (strings(&[SEDAN]), Some(1)));
+
+        // By the main items' sizes: the van's GLB is the smallest file of all but the license
+        // and the colormap's FBX copy, and the sedan's GLB is larger than its FBX and OBJ.
+        for (field, order, expected) in [
+            ("size", "asc", [VAN, RENDER, ROCK, SEDAN, COLORMAP]),
+            ("size", "desc", [COLORMAP, SEDAN, ROCK, RENDER, VAN]),
+            ("name", "asc", [COLORMAP, ROCK, SEDAN, RENDER, VAN]),
+        ] {
+            assert_eq!(
+                folder_search(&libs, serde_json::json!({}), field, order).await,
+                strings(&expected),
+                "{field} {order}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_folders_item_count_is_the_grid_total_for_that_folder() {
+        let libs = [grouped_library().await];
+        let folders: Vec<(String, i64, i64)> =
+            sqlx::query_as("SELECT path, item_count, hidden_count FROM folders ORDER BY path")
+                .fetch_all(&libs[0].pool)
+                .await
+                .unwrap();
+        assert_eq!(folders.len(), 10);
+        for (path, items, hidden) in folders {
+            for (show_hidden, expected) in [(false, items), (true, items + hidden)] {
+                let query = serde_json::json!({
+                    "folder": { "libraryId": "lib", "path": path },
+                    "filter": { "showHidden": show_hidden },
+                });
+                let (_, total, _) = counted_search(&libs, query).await;
+                assert_eq!(
+                    total,
+                    Some(expected),
+                    "{path:?}, hidden files {show_hidden}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_main_item_lists_its_groups_formats_and_a_file_on_its_own_none() {
+        let libs = [grouped_library().await];
+        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+            "query": { "text": "", "filter": {}, "sort": { "field": "size", "order": "asc" } },
+            "page": 0,
+            "pageSize": 100,
+        }))
+        .unwrap();
+        let result = search_libraries(&payload, &target_libraries(&payload.query, &libs))
+            .await
+            .unwrap();
+        let formats: Vec<(String, Option<Vec<String>>)> = result
+            .assets
+            .into_iter()
+            .map(|a| (a.file_name, a.group_formats))
+            .collect();
+        let some = |f: &[&str]| Some(strings(f));
+        assert_eq!(
+            formats,
+            [
+                ("van.glb".to_string(), some(&["glb", "obj"])),
+                ("sedan.png".to_string(), None),
+                ("rock.fbx".to_string(), None),
+                ("sedan.glb".to_string(), some(&["glb", "fbx", "obj"])),
+                ("colormap.png".to_string(), some(&["png", "png"])),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_over_several_libraries_shows_each_groups_main_item_once() {
+        let mut second = grouped_library().await;
+        second.id = "second".to_string();
+        let libs = [grouped_library().await, second];
+        let query = serde_json::json!({ "filter": { "extensions": ["fbx"] } });
+        let (ids, total, files) = counted_search(&libs, query).await;
+        assert_eq!(
+            (ids, total, files),
+            (strings(&[ROCK, ROCK, SEDAN, SEDAN]), Some(4), Some(4))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_main_item_with_no_thumbnail_shows_a_members() {
+        let pool = memory_library_pool().await;
+        for (path, thumb) in [
+            ("kit/Blend/rock.blend", None),
+            ("kit/OBJ/rock.obj", Some(".opendam/thumbs/rock_obj.png")),
+        ] {
+            let name = path.rsplit('/').next().unwrap();
+            let ext = name.rsplit_once('.').unwrap().1;
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, thumbnail_path)
+                 VALUES (?, ?, ?, ?, '3d_model', 1, 0, 0, ?)",
+            )
+            .bind(path)
+            .bind(path)
+            .bind(name)
+            .bind(ext)
+            .bind(thumb)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        structure::rebuild(&pool, crate::structure::tests::unmounted())
+            .await
+            .unwrap();
+        let libs = [LibraryHandle {
+            id: "lib".to_string(),
+            name: "lib".to_string(),
+            root_path: PathBuf::from("/libraries/lib"),
+            pool,
+        }];
+        let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+            "query": { "text": "", "filter": {}, "sort": { "field": "name", "order": "asc" } },
+            "page": 0,
+            "pageSize": 10,
+        }))
+        .unwrap();
+        let result = search_libraries(&payload, &target_libraries(&payload.query, &libs))
+            .await
+            .unwrap();
+        let shown: Vec<(String, Option<String>)> = result
+            .assets
+            .into_iter()
+            .map(|a| (a.file_name, a.thumbnail_path))
+            .collect();
+        assert_eq!(
+            shown,
+            [(
+                "rock.blend".to_string(),
+                Some("/libraries/lib/.opendam/thumbs/rock_obj.png".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn a_groups_formats_list_the_main_items_first_then_by_rank() {
+        let formats = strings(&["obj", "fbx", "dae", "glb", "blend", "stl"]);
+        assert_eq!(
+            main_first("fbx", formats),
+            strings(&["fbx", "glb", "blend", "obj", "dae", "stl"])
+        );
+    }
+
     const KIT_FILES: [&str; 9] = [
         "3D assets/Platformer Kit/License.txt",
         "3D assets/Platformer Kit/Models/GLB format/block.glb",
@@ -3298,10 +3800,11 @@ mod tests {
             .iter()
             .all(|a| a.file_path.starts_with(&prefix)));
 
-        // A rename and a delete each rerun the pass before they return.
+        // A rename and a delete each rerun the pass before they return. The file is an item on
+        // its own, so the delete takes one from the kit's count.
         let (id, path): (String, String) = sqlx::query_as(
             "SELECT id, file_path FROM assets WHERE file_path LIKE '3D assets/Platformer Kit/%'
-               AND support_role IS NULL
+               AND support_role IS NULL AND group_id IS NULL
              ORDER BY file_path LIMIT 1",
         )
         .fetch_one(&pool)
@@ -3433,8 +3936,16 @@ mod tests {
         assert!(["License.txt", "Preview.png"]
             .iter()
             .all(|n| shown.iter().any(|s| s == n)));
-        assert_eq!((all, all_files), (files, files));
-        assert!(items < files);
+        // The support files join the items, and group members stay hidden.
+        let support: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM assets
+             WHERE file_path LIKE '3D assets/Car Kit/%' AND support_role IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((all, all_files), (items + support, files));
+        assert!(items + support < files);
 
         let payload: SearchPayload = serde_json::from_value(serde_json::json!({
             "query": { "text": "", "filter": {}, "sort": { "field": "name", "order": "asc" } },
@@ -3549,5 +4060,283 @@ mod tests {
             0,
             "a rerun rewrote pack info"
         );
+    }
+
+    /// Format groups on a copy of the golden snapshot's library DB, named by `OPENDAM_GOLDEN_DB`
+    /// as above: every Kenney kit model shows once, as GLB, and its other formats still find
+    /// it. It writes to the copy: it clears the groups for a first pass. Run it with
+    /// `cargo nextest run --run-ignored only golden_snapshot_groups --no-capture`.
+    #[tokio::test]
+    #[ignore = "needs OPENDAM_GOLDEN_DB, a copy of the golden snapshot's library.sqlite"]
+    async fn golden_snapshot_groups_show_each_kenney_model_once_as_glb() {
+        use crate::commands::folder::child_folders;
+        use std::collections::BTreeSet;
+        use std::time::{Duration, Instant};
+        let file = std::env::var("OPENDAM_GOLDEN_DB").expect("OPENDAM_GOLDEN_DB is set");
+        let pool = crate::db::connect_library_sqlite(Path::new(&file))
+            .await
+            .unwrap();
+        let count = |sql: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(sql)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // A first pass deriving every group, then a rerun writing nothing (A1).
+        sqlx::query("UPDATE assets SET group_id = NULL; UPDATE folders SET split_groups = 0;")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let written = crate::structure::rebuild(&pool, &golden_root())
+            .await
+            .unwrap();
+        let took = started.elapsed();
+        println!("first group pass: {written} rows written in {took:?}");
+        assert!(took < Duration::from_secs(10));
+        let started = Instant::now();
+        assert_eq!(
+            crate::structure::rebuild(&pool, &golden_root())
+                .await
+                .unwrap(),
+            0
+        );
+        let took = started.elapsed();
+        println!("rerun: 0 rows written in {took:?}");
+        assert!(took < Duration::from_secs(2));
+        let mains = count("SELECT COUNT(*) FROM assets WHERE group_id = id").await;
+        let grouped = count("SELECT COUNT(*) FROM assets WHERE group_id IS NOT NULL").await;
+        println!("{mains} groups of {grouped} files");
+
+        // In every kit with a `Models/GLB format/` folder, each model item is a GLB.
+        let kits: Vec<(String, i64, i64)> = sqlx::query_as(
+            "WITH kits AS (
+                 SELECT DISTINCT substr(file_path, 1, instr(file_path, '/Models/GLB format/') - 1)
+                     AS kit
+                 FROM assets WHERE file_path LIKE '3D assets/%/Models/GLB format/%'
+             )
+             SELECT kit,
+                 (SELECT COUNT(*) FROM assets a
+                  WHERE a.file_path >= kit || '/Models/' AND a.file_path < kit || '/Models0'
+                    AND a.kind = '3d_model' AND (a.group_id IS NULL OR a.group_id = a.id)),
+                 (SELECT COUNT(*) FROM assets a
+                  WHERE a.file_path >= kit || '/Models/' AND a.file_path < kit || '/Models0'
+                    AND a.kind = '3d_model' AND (a.group_id IS NULL OR a.group_id = a.id)
+                    AND a.extension <> 'glb')
+             FROM kits ORDER BY kit",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let models: i64 = kits.iter().map(|k| k.1).sum();
+        let not_glb: Vec<&(String, i64, i64)> = kits.iter().filter(|k| k.2 > 0).collect();
+        println!(
+            "{} kits with GLB format/: {models} model items, {} not GLB",
+            kits.len(),
+            not_glb.len()
+        );
+        assert!(kits.len() > 40);
+        assert_eq!(not_glb, [] as [&(String, i64, i64); 0]);
+
+        let libs = [LibraryHandle {
+            id: "golden".to_string(),
+            name: "golden".to_string(),
+            root_path: PathBuf::from("/golden"),
+            pool: pool.clone(),
+        }];
+        let search = |text: &str, folder: &str, filter: serde_json::Value| {
+            let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+                "query": {
+                    "text": text,
+                    "filter": filter,
+                    "sort": { "field": "name", "order": "asc" },
+                    "folder": { "libraryId": "golden", "path": folder },
+                },
+                "page": 0,
+                "pageSize": 10_000,
+            }))
+            .unwrap();
+            let libs = &libs;
+            async move {
+                let result = search_libraries(&payload, &target_libraries(&payload.query, libs))
+                    .await
+                    .unwrap();
+                let extensions: BTreeSet<String> =
+                    result.assets.iter().map(|a| a.extension.clone()).collect();
+                (result.total.unwrap(), extensions)
+            }
+        };
+        let kit = "3D assets/Car Kit";
+        let glbs = count(
+            "SELECT COUNT(*) FROM assets
+             WHERE file_path LIKE '3D assets/Car Kit/Models/GLB format/%' AND extension = 'glb'",
+        )
+        .await;
+        let glb_set = BTreeSet::from(["glb".to_string()]);
+
+        // Filtering by FBX still lists every model, each as its GLB.
+        let fbx = search("", kit, serde_json::json!({ "extensions": ["fbx"] })).await;
+        println!("{kit} filtered by FBX: {fbx:?}");
+        assert_eq!(fbx, (glbs, glb_set.clone()));
+
+        // `FBX format/` lists the models and their texture, and holds no GLB.
+        let fbx_folder = format!("{kit}/Models/FBX format");
+        let listed = search("", &fbx_folder, serde_json::json!({})).await;
+        println!("{fbx_folder}: {listed:?}");
+        assert_eq!(listed.0, glbs + 1);
+        assert_eq!(
+            search(
+                "",
+                &fbx_folder,
+                serde_json::json!({ "extensions": ["glb"] })
+            )
+            .await
+            .0,
+            0
+        );
+
+        // "fbx" finds the kit's groups through their FBX copies' paths.
+        let found = search("fbx", kit, serde_json::json!({})).await;
+        println!("{kit}, \"fbx\": {found:?}");
+        assert_eq!(found.0, glbs + 1);
+
+        // Each format folder counts every model, `Models` counts each once, and each count is
+        // the folder's grid total.
+        let nodes = child_folders(&pool, &golden_root(), &format!("{kit}/Models"))
+            .await
+            .unwrap();
+        let models_node = child_folders(&pool, &golden_root(), kit)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|f| f.name == "Models")
+            .unwrap();
+        println!(
+            "{}: {}; {}",
+            models_node.path,
+            models_node.item_count,
+            nodes
+                .iter()
+                .map(|f| format!("{} {}", f.name, f.item_count))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(models_node.item_count, glbs + 1);
+        for node in nodes.iter().chain([&models_node]) {
+            assert_eq!(node.item_count, glbs + 1, "{}", node.path);
+            let total = search("", &node.path, serde_json::json!({})).await.0;
+            assert_eq!(total, node.item_count, "{}", node.path);
+        }
+    }
+
+    /// The first page of the library root and of `3D assets`, as the grid asks for them (date
+    /// order, 200 assets, with the total), timed on a copy of the golden snapshot's library DB
+    /// named by `OPENDAM_GOLDEN_DB` (A5): `cargo nextest run --run-ignored only
+    /// golden_snapshot_first_pages --no-capture`. Prints the median of 20 runs after 5 warm-ups.
+    #[tokio::test]
+    #[ignore = "needs OPENDAM_GOLDEN_DB, a copy of the golden snapshot's library.sqlite"]
+    async fn golden_snapshot_first_pages_take_their_time() {
+        use std::time::{Duration, Instant};
+        let file = std::env::var("OPENDAM_GOLDEN_DB").expect("OPENDAM_GOLDEN_DB is set");
+        let pool = crate::db::connect_library_sqlite(Path::new(&file))
+            .await
+            .unwrap();
+        let libs = [LibraryHandle {
+            id: "golden".to_string(),
+            name: "golden".to_string(),
+            root_path: PathBuf::from("/golden"),
+            pool,
+        }];
+        for folder in [None, Some("3D assets")] {
+            let mut query = serde_json::json!({
+                "text": "",
+                "filter": {},
+                "sort": { "field": "date", "order": "desc" },
+            });
+            if let Some(path) = folder {
+                query["folder"] = serde_json::json!({ "libraryId": "golden", "path": path });
+            }
+            let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+                "query": query,
+                "page": 0,
+                "pageSize": 200,
+                "includeTotal": true,
+            }))
+            .unwrap();
+            let targets = target_libraries(&payload.query, &libs);
+            let mut times: Vec<Duration> = Vec::new();
+            let mut total = None;
+            for run in 0..25 {
+                let started = Instant::now();
+                let result = search_libraries(&payload, &targets).await.unwrap();
+                if run >= 5 {
+                    times.push(started.elapsed());
+                }
+                total = result.total;
+            }
+            times.sort();
+            println!(
+                "first page of {:?}: median {:?} (fastest {:?}, slowest {:?}), total {total:?}",
+                folder.unwrap_or("the library root"),
+                times[times.len() / 2],
+                times[0],
+                times[times.len() - 1]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_patch_on_a_group_reaches_its_three_formats_and_not_the_render() {
+        use crate::structure::tests::{car_kit, each, rows, SEDAN, SEDAN_RENDER};
+        let pool = car_kit().await;
+        let db = memory_database(vec![memory_library("a", pool.clone())]).await;
+        insert_tag(&db.master_pool, "car", "Car").await;
+        let patch: AssetPatch = serde_json::from_value(serde_json::json!({
+            "rating": 4, "colorLabel": "red", "isFavorite": true,
+            "description": "four doors", "tags": ["car"],
+            "previewStatus": "error",
+        }))
+        .unwrap();
+
+        apply_asset_patch(&db, SEDAN[1], &patch).await.unwrap();
+
+        let tags = "SELECT asset_id, tag_id FROM asset_tags";
+        assert_eq!(rows(&pool, tags).await, each(&SEDAN, "car"));
+        assert_eq!(
+            rows(
+                &pool,
+                "SELECT id, rating || ' ' || color_label || ' ' || is_favorite || ' ' || description
+                 FROM assets WHERE rating != 0 OR color_label != 'none' OR is_favorite
+                     OR description != ''"
+            )
+            .await,
+            each(&SEDAN, "4 red 1 four doors")
+        );
+        // The preview status is the item's own.
+        assert_eq!(
+            rows(
+                &pool,
+                "SELECT id, preview_status FROM assets WHERE preview_status = 'error'"
+            )
+            .await,
+            each(&SEDAN[1..2], "error")
+        );
+        let render: Vec<String> = sqlx::query_scalar(
+            "SELECT rating || ' ' || color_label || ' ' || is_favorite FROM assets WHERE id = ?",
+        )
+        .bind(SEDAN_RENDER)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(render, ["0 none 0"]);
+
+        // Clearing the tags from a member's id clears them from the whole group.
+        let clear: AssetPatch = serde_json::from_value(serde_json::json!({ "tags": [] })).unwrap();
+        apply_asset_patch(&db, SEDAN[0], &clear).await.unwrap();
+        assert!(rows(&pool, tags).await.is_empty());
     }
 }

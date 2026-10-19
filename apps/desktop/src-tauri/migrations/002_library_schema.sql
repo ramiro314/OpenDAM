@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS assets (
     thumbnail_path   TEXT,                -- relative to library root (.opendam/thumbs/...)
     preview_status   TEXT NOT NULL DEFAULT 'none',
     metadata         TEXT NOT NULL DEFAULT '{}', -- JSON object
-    support_role     TEXT                 -- 'doc' or 'cover' for a pack's support file (structure.rs)
+    support_role     TEXT,                -- 'doc' or 'cover' for a pack's support file (structure.rs)
+    group_id         TEXT                 -- its format group's main item, itself included (structure.rs)
 );
 
 CREATE INDEX IF NOT EXISTS idx_assets_kind         ON assets(kind);
@@ -88,8 +89,9 @@ CREATE TABLE IF NOT EXISTS preview_jobs (
 
 -- ── Folders: derived by the structure pass (structure.rs), never edited ──────
 -- Every folder with at least one indexed file below it, and the root (`path = ''`, no parent).
--- `item_count` counts the visible files below it, recursively, and `hidden_count` the support
--- files. `pack_json` stays NULL until pack info is parsed.
+-- `item_count` counts the grid items with a visible file below it, recursively (a format group
+-- once), and `hidden_count` the support files. `split_groups` counts the groups with a member
+-- below it whose main item lies outside it. `pack_json` stays NULL until pack info is parsed.
 CREATE TABLE IF NOT EXISTS folders (
     path          TEXT PRIMARY KEY,   -- relative to library root, no edge slashes
     parent_path   TEXT,               -- NULL for the root
@@ -97,7 +99,8 @@ CREATE TABLE IF NOT EXISTS folders (
     is_pack       INTEGER NOT NULL DEFAULT 0,
     item_count    INTEGER NOT NULL DEFAULT 0,
     hidden_count  INTEGER NOT NULL DEFAULT 0,
-    pack_json     TEXT
+    pack_json     TEXT,
+    split_groups  INTEGER NOT NULL DEFAULT 0
 );
 
 -- `get_folders` reads one node's children in name order from this index alone.
