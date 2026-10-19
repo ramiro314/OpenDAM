@@ -735,7 +735,7 @@ fn search_filter(query: &SearchQuery, split: bool) -> SqlFilter {
 /// `p/`, uses the unique `file_path` index and needs no `LIKE` escaping. `None` for the root
 /// (`""`, or only slashes), which every file lies below. Spaces are kept: a folder name may start
 /// or end with one. The grid's folder filter and the tree's live counts both read folders by it.
-fn folder_range(folder: &str) -> Option<[String; 2]> {
+pub(crate) fn folder_range(folder: &str) -> Option<[String; 2]> {
     let path = folder.trim_matches('/');
     (!path.is_empty()).then(|| [format!("{path}/"), format!("{path}0")])
 }

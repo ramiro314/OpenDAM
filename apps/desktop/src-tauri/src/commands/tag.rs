@@ -80,6 +80,7 @@ pub async fn update_tag(
 /// Writes the changed definition to master, then mirrors it, with its ancestors, to every open
 /// library in place, so its memberships stay.
 async fn update_tag_in(db: &Database, id: &str, patch: TagPatch) -> Result<Tag> {
+    let _catalog = db.catalog_lock.lock().await;
     let (_, mut name, mut color, mut parent_id, mut description) = sqlx::query_as::<_, TagRow>(
         "SELECT id, name, color, parent_id, description FROM tags WHERE id = ?",
     )
@@ -172,6 +173,7 @@ pub async fn delete_tag(id: String, state: State<'_, Arc<AppState>>) -> Result<(
 
 /// Deletes the definition from master and every open library, with its memberships.
 pub(crate) async fn delete_tag_in(db: &Database, id: &str) -> Result<()> {
+    let _catalog = db.catalog_lock.lock().await;
     // Mirrors first, each in one transaction, and master last: if a library can't take the
     // delete, master keeps the tag, so the next open doesn't bring a "deleted" tag back.
     for lib in db.get_all_libraries().await {

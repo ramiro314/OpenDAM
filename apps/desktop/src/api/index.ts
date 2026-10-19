@@ -63,6 +63,12 @@ export const api = {
   /** The packs below `underPath` in each of `libraryIds`, or in every library when null */
   getPacks: (libraryIds: string[] | null, underPath: string) =>
     invoke<PackCard[]>('get_packs', { libraryIds, underPath }),
+  /** Tags every file below the folder and their groups' members; returns how many */
+  tagFolder: (libraryId: string, folderPath: string, tagId: string) =>
+    invoke<number>('tag_folder', { libraryId, folderPath, tagId }),
+  /** Adds every file below the folder and their groups' members to a collection */
+  collectFolder: (libraryId: string, folderPath: string, collectionId: string) =>
+    invoke<number>('collect_folder', { libraryId, folderPath, collectionId }),
 
   // Live counts while search text or a filter is active, each the grid's total for its value
   getFacetCounts: (query: SearchQuery) => invoke<FacetCounts>('get_facet_counts', { query }),

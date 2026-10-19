@@ -1,5 +1,6 @@
 import { useAutotagStore } from '../../store';
 import { autotagAvailability } from '../../utils/autotag';
+import { folderMenuItems } from '../FolderActions';
 import { IconTag } from '../Icons';
 import { ContextMenu } from './ContextMenu';
 
@@ -16,7 +17,10 @@ export interface FolderMenuTarget {
   itemCount: number;
 }
 
-/** The right-click menu of a tree node or a pack card: auto-tag the items below it (plan C22). */
+/**
+ * The right-click menu of a tree node or a pack card (plan C22): auto-tag the items below it, add
+ * everything below it to a collection or a tag, or reveal it in the file manager.
+ */
 export function FolderContextMenu({
   target,
   onClose,
@@ -44,6 +48,7 @@ export function FolderContextMenu({
           ).reason,
           onSelect: () => openAutotagDialog({ kind: 'folder', libraryId, path, name }),
         },
+        ...folderMenuItems({ libraryId, path, name }),
       ]}
     />
   );
