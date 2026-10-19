@@ -3427,4 +3427,60 @@ mod tests {
             root.file_total.unwrap()
         );
     }
+
+    /// The first page of the library root and of `3D assets`, as the grid asks for them (date
+    /// order, 200 assets, with the total), timed on a copy of the golden snapshot's library DB
+    /// named by `OPENDAM_GOLDEN_DB` (A5): `cargo nextest run --run-ignored only
+    /// golden_snapshot_first_pages --no-capture`. Prints the median of 20 runs after 5 warm-ups.
+    #[tokio::test]
+    #[ignore = "needs OPENDAM_GOLDEN_DB, a copy of the golden snapshot's library.sqlite"]
+    async fn golden_snapshot_first_pages_take_their_time() {
+        use std::time::{Duration, Instant};
+        let file = std::env::var("OPENDAM_GOLDEN_DB").expect("OPENDAM_GOLDEN_DB is set");
+        let pool = crate::db::connect_library_sqlite(Path::new(&file))
+            .await
+            .unwrap();
+        let libs = [LibraryHandle {
+            id: "golden".to_string(),
+            name: "golden".to_string(),
+            root_path: PathBuf::from("/golden"),
+            pool,
+        }];
+        for folder in [None, Some("3D assets")] {
+            let mut query = serde_json::json!({
+                "text": "",
+                "filter": {},
+                "sort": { "field": "date", "order": "desc" },
+            });
+            if let Some(path) = folder {
+                query["folder"] = serde_json::json!({ "libraryId": "golden", "path": path });
+            }
+            let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+                "query": query,
+                "page": 0,
+                "pageSize": 200,
+                "includeTotal": true,
+            }))
+            .unwrap();
+            let targets = target_libraries(&payload.query, &libs);
+            let mut times: Vec<Duration> = Vec::new();
+            let mut total = None;
+            for run in 0..25 {
+                let started = Instant::now();
+                let result = search_libraries(&payload, &targets).await.unwrap();
+                if run >= 5 {
+                    times.push(started.elapsed());
+                }
+                total = result.total;
+            }
+            times.sort();
+            println!(
+                "first page of {:?}: median {:?} (fastest {:?}, slowest {:?}), total {total:?}",
+                folder.unwrap_or("the library root"),
+                times[times.len() / 2],
+                times[0],
+                times[times.len() - 1]
+            );
+        }
+    }
 }
