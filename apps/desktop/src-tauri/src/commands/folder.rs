@@ -345,9 +345,10 @@ pub async fn tag_folder(
 }
 
 /// Writes in transactions of about `structure::BATCH` files that never split a group
-/// (`group_batches`), each copying master's definition, with
-/// its ancestors root first, into the library's mirror before the memberships, since a mirror can
-/// lack it. It holds the library's index lock, so no structure pass regroups the files meanwhile.
+/// (`group_batches`), each copying master's definition, with its ancestors root first, into the
+/// library's mirror before the memberships, since a mirror can lack it. It holds the library's
+/// index lock, so no structure pass regroups the files meanwhile, and stops at the first batch
+/// that finds the tag deleted.
 async fn tag_folder_in(
     db: &Database,
     library_id: &str,
@@ -355,18 +356,20 @@ async fn tag_folder_in(
     tag_id: &str,
 ) -> Result<usize> {
     let lib = open_library(db, library_id).await?;
-    let chain = db
-        .tag_with_ancestors(tag_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    if chain.is_empty() {
-        return Err("The tag no longer exists".into());
-    }
     let lock = db.index_lock(&lib.id);
     let _guard = lock.lock().await;
+    // The definition is read once the lock is held, and again for each batch: one deleted while
+    // the write waited, or between batches, must not come back through the mirror.
     let write = async {
+        if db.tag_with_ancestors(tag_id).await?.is_empty() {
+            return Ok(None);
+        }
         let files = folder_members(&lib.pool, folder).await?;
         for batch in group_batches(&files) {
+            let chain = db.tag_with_ancestors(tag_id).await?;
+            if chain.is_empty() {
+                return Ok(None);
+            }
             let mut tx = lib.pool.begin().await?;
             for definition in &chain {
                 upsert_tag(&mut *tx, definition).await?;
@@ -380,9 +383,13 @@ async fn tag_folder_in(
             }
             tx.commit().await?;
         }
-        Ok::<_, sqlx::Error>(files.len())
+        Ok::<_, sqlx::Error>(Some(files.len()))
     };
-    write.await.map_err(|e| e.to_string())
+    match write.await {
+        Ok(Some(written)) => Ok(written),
+        Ok(None) => Err("The tag no longer exists".into()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// "Add everything to a collection": adds every file below `folder_path` in library
@@ -406,18 +413,24 @@ async fn collect_folder_in(
     collection_id: &str,
 ) -> Result<usize> {
     let lib = open_library(db, library_id).await?;
-    let chain = db
-        .collection_with_ancestors(collection_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    if chain.is_empty() {
-        return Err("The collection no longer exists".into());
-    }
     let lock = db.index_lock(&lib.id);
     let _guard = lock.lock().await;
+    // The definition is read once the lock is held, and again for each batch: one deleted while
+    // the write waited, or between batches, must not come back through the mirror.
     let write = async {
+        if db
+            .collection_with_ancestors(collection_id)
+            .await?
+            .is_empty()
+        {
+            return Ok(None);
+        }
         let files = folder_members(&lib.pool, folder).await?;
         for batch in group_batches(&files) {
+            let chain = db.collection_with_ancestors(collection_id).await?;
+            if chain.is_empty() {
+                return Ok(None);
+            }
             let mut tx = lib.pool.begin().await?;
             for definition in &chain {
                 upsert_collection(&mut *tx, definition).await?;
@@ -433,9 +446,13 @@ async fn collect_folder_in(
             }
             tx.commit().await?;
         }
-        Ok::<_, sqlx::Error>(files.len())
+        Ok::<_, sqlx::Error>(Some(files.len()))
     };
-    write.await.map_err(|e| e.to_string())
+    match write.await {
+        Ok(Some(written)) => Ok(written),
+        Ok(None) => Err("The collection no longer exists".into()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -1023,6 +1040,46 @@ mod tests {
                 .collect();
             sedan.sort();
             assert_eq!(sedan, SEDAN, "{folder:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tag_or_collection_deleted_while_a_bulk_write_waits_does_not_come_back() {
+        for collect in [false, true] {
+            let (db, pool) = car_kit_database().await;
+            let (id, read) = if collect {
+                ("c", "SELECT COUNT(*) FROM collections WHERE id = 'c'")
+            } else {
+                ("t", "SELECT COUNT(*) FROM tags WHERE id = 't'")
+            };
+            // An index run holds the lock while the write starts, and the definition goes meanwhile.
+            let lock = db.index_lock("lib");
+            let guard = lock.lock().await;
+            let write = async {
+                if collect {
+                    collect_folder_in(&db, "lib", "", id).await
+                } else {
+                    tag_folder_in(&db, "lib", "", id).await
+                }
+            };
+            let delete = async {
+                if collect {
+                    crate::commands::collection::delete_collection_in(&db, id).await
+                } else {
+                    crate::commands::tag::delete_tag_in(&db, id).await
+                }
+                .unwrap();
+                drop(guard);
+            };
+            let (written, ()) = tokio::join!(write, delete);
+
+            let noun = if collect { "collection" } else { "tag" };
+            assert_eq!(written, Err(format!("The {noun} no longer exists")));
+            for p in [&db.master_pool, &pool] {
+                let count: i64 = sqlx::query_scalar(read).fetch_one(p).await.unwrap();
+                assert_eq!(count, 0, "{noun}");
+            }
+            assert_eq!(tagged_and_collected(&pool).await, (vec![], vec![]));
         }
     }
 

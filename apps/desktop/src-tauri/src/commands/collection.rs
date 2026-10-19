@@ -226,7 +226,7 @@ pub async fn delete_collection(id: String, state: State<'_, Arc<AppState>>) -> R
 
 /// Deletes the collection and its descendants, walked in the master catalog, from master and
 /// every open library, with their memberships.
-async fn delete_collection_in(db: &Database, id: &str) -> Result<()> {
+pub(crate) async fn delete_collection_in(db: &Database, id: &str) -> Result<()> {
     // Recursively collect all descendant collection IDs from the catalog
     let mut to_delete = vec![id.to_string()];
     let mut idx = 0;

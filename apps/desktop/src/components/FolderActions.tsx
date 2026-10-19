@@ -145,6 +145,11 @@ function PickerDialog({ target, action }: { target: FolderTarget; action: 'tag' 
             </>
           )}
 
+          {saving && (
+            <p className={dialogStyles.subText} data-folder-action-running>
+              Adding can wait for indexing to finish. Closing this leaves it running.
+            </p>
+          )}
           {error && (
             <p className={styles.error} role="alert">
               {error}
@@ -157,7 +162,7 @@ function PickerDialog({ target, action }: { target: FolderTarget; action: 'tag' 
               className={clsx(dialogStyles.btn, dialogStyles.cancelBtn)}
               onClick={close}
             >
-              Cancel
+              {saving ? 'Close' : 'Cancel'}
             </button>
             <button
               type="submit"
