@@ -576,23 +576,19 @@ pub(crate) fn is_web_url(url: &str) -> bool {
         .any(|scheme| url.len() > scheme.len() && url.starts_with(scheme))
 }
 
-/// The path of asset `id` when it is an image below the folder `pack` (`""` for the root), for
-/// "Use as pack cover".
+/// The path of asset `id` when it can be the cover of the folder `pack` (`""` for the root),
+/// for "Use as pack cover", by `structure::cover_allowed`.
 async fn cover_below(pool: &Pool<Sqlite>, pack: &str, id: &str) -> Result<String> {
-    let row: Option<(String, String)> =
-        sqlx::query_as("SELECT file_path, kind FROM assets WHERE id = ?")
-            .bind(id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-    let Some((path, kind)) = row else {
+    let path: Option<String> = sqlx::query_scalar("SELECT file_path FROM assets WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(path) = path else {
         return Err("That file is not in this library".into());
     };
-    if !matches!(kind.as_str(), "texture" | "image") {
-        return Err("Only an image can be a pack's cover".into());
-    }
-    if !(pack.is_empty() || path.starts_with(&format!("{pack}/"))) {
-        return Err("That image is not in this pack".into());
+    if !structure::cover_allowed(pack, &path) {
+        return Err("Only an image inside this pack can be its cover".into());
     }
     Ok(path)
 }
@@ -607,7 +603,8 @@ pub struct PackRef {
 }
 
 /// The pack "Use as pack cover" on asset `asset_id` sets the cover of: the innermost pack
-/// holding it, or `None` when the asset is no image or no pack holds it.
+/// holding it, or `None` when no pack holds it or it can't be that pack's cover
+/// (`structure::cover_allowed`).
 #[tauri::command]
 pub async fn get_cover_pack(
     asset_id: String,
@@ -622,20 +619,19 @@ pub(crate) async fn cover_pack(db: &Database, asset_id: &str) -> sqlx::Result<Op
     let Some(library) = db.library_of_asset(asset_id).await? else {
         return Ok(None);
     };
-    let (path, kind): (String, String) =
-        sqlx::query_as("SELECT file_path, kind FROM assets WHERE id = ?")
-            .bind(asset_id)
-            .fetch_one(&library.pool)
-            .await?;
-    if !matches!(kind.as_str(), "texture" | "image") {
-        return Ok(None);
-    }
+    let path: String = sqlx::query_scalar("SELECT file_path FROM assets WHERE id = ?")
+        .bind(asset_id)
+        .fetch_one(&library.pool)
+        .await?;
     let (dir, _) = path.rsplit_once('/').unwrap_or(("", &path));
-    Ok(pack_holding(&library, dir).await?.map(|pack| PackRef {
-        library_id: pack.library_id,
-        path: pack.path,
-        name: pack.name,
-    }))
+    Ok(pack_holding(&library, dir)
+        .await?
+        .filter(|pack| structure::cover_allowed(&pack.path, &path))
+        .map(|pack| PackRef {
+            library_id: pack.library_id,
+            path: pack.path,
+            name: pack.name,
+        }))
 }
 
 /// A file a bulk write reaches, and the grid item it belongs to: its group's main item, or itself

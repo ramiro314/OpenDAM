@@ -476,25 +476,23 @@ pub fn derive<'a>(
     }
     let mut info = pack_files(&packs, &paths, &kinds, &roles, &groups);
     let mut contents = pack_contents(&packs, &paths, &kinds, &sizes);
-    // The covers you chose that are still indexed images
+    // The covers you chose that are still indexed
     let chosen: HashSet<&str> = overrides
         .values()
         .filter_map(|o| o.cover_path.as_deref())
         .collect();
-    let images: HashSet<&str> = paths
+    let indexed: HashSet<&str> = paths
         .iter()
-        .zip(&kinds)
-        .filter(|(path, kind)| kind.is_image && chosen.contains(*path))
-        .map(|(path, _)| *path)
+        .copied()
+        .filter(|path| chosen.contains(path))
         .collect();
     for pack in packs {
         let folder = folders.get_mut(pack).expect("a pack has a row");
         let files = info.remove(pack).unwrap_or_default();
         let edit = overrides.get(pack);
-        let below = format!("{pack}/");
         let cover = edit
             .and_then(|o| o.cover_path.as_deref())
-            .filter(|c| images.contains(c) && (pack.is_empty() || c.starts_with(&below)))
+            .filter(|c| indexed.contains(c) && cover_allowed(pack, c))
             .or_else(|| files.cover());
         let name = edit.and_then(|o| o.name.clone()).filter(|n| !n.is_empty());
         let license = files.license.map(|path| LicenseFile {
@@ -523,6 +521,14 @@ pub fn derive<'a>(
         groups,
         bundled_previews,
     }
+}
+
+/// Whether the file at `path` can be the cover of the pack at `pack` (`""` for the root), the
+/// one rule "Use as pack cover", `set_pack_override` and `derive` all follow: an image, by the
+/// pass's own reading of its extension, inside the pack.
+pub fn cover_allowed(pack: &str, path: &str) -> bool {
+    let inside = pack.is_empty() || path.starts_with(&format!("{pack}/"));
+    inside && FileKind::of(split_dir(path).1).is_image
 }
 
 /// The renders among `paths` (plan C12): an image in a folder named `Previews`, `Preview` or
@@ -2249,6 +2255,25 @@ pub(crate) mod tests {
             packs(&derive_with(root, &marks(&[("", PackMark::NotPack)]))),
             [] as [&str; 0]
         );
+    }
+
+    #[test]
+    fn a_cover_is_an_image_inside_its_pack() {
+        for (pack, path, allowed) in [
+            ("kit", "kit/Preview.png", true),
+            ("kit", "kit/Models/Textures/colormap.PNG", true),
+            ("kit", "kit/Renders/car.webp", true),
+            // The library root as one pack holds every file.
+            ("", "rock.png", true),
+            ("kit", "kit/License.txt", false),
+            ("kit", "kit/Models/car.glb", false),
+            ("kit", "other/Preview.png", false),
+            // A folder sharing the pack's name as a prefix is outside it.
+            ("kit", "kit 2/Preview.png", false),
+            ("kit", "kit2/Preview.png", false),
+        ] {
+            assert_eq!(cover_allowed(pack, path), allowed, "{pack}: {path}");
+        }
     }
 
     #[test]
