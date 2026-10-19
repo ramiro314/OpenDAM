@@ -71,8 +71,8 @@ pub struct ProviderOption {
     pub unavailable_reason: Option<String>,
 }
 
-/// What a run covers: chosen assets, or a library's untagged assets (every asset with
-/// `all_assets`).
+/// What a run covers: chosen assets, or the untagged items of a library or of a folder in one
+/// (every item with `all_assets`). A folder's `path` is relative to its library's root.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(
     tag = "kind",
@@ -85,6 +85,11 @@ pub enum RunScope {
     },
     Library {
         library_id: String,
+        all_assets: bool,
+    },
+    Folder {
+        library_id: String,
+        path: String,
         all_assets: bool,
     },
 }
@@ -566,37 +571,55 @@ impl Engine {
             RunScope::Library {
                 library_id,
                 all_assets,
-            } => {
-                let lib = self
-                    .db
-                    .get_library_handle(&library_id)
-                    .await
-                    .ok_or("This library is offline")?;
-                let asset_ids = store::library_assets(&lib.pool, all_assets)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if asset_ids.is_empty() {
-                    return Err(if all_assets {
-                        format!("{} has no assets", lib.name)
-                    } else {
-                        format!("Every asset in {} already has a tag", lib.name)
-                    });
-                }
-                let label = if all_assets {
-                    format!("{}: all assets", lib.name)
-                } else {
-                    format!("{}: untagged assets", lib.name)
-                };
-                Ok(ScopeItems {
-                    requested: asset_ids.len(),
-                    items: asset_ids
-                        .into_iter()
-                        .map(|id| (id, lib.id.clone()))
-                        .collect(),
-                    label,
-                })
-            }
+            } => self.folder_items(&library_id, "", all_assets).await,
+            RunScope::Folder {
+                library_id,
+                path,
+                all_assets,
+            } => self.folder_items(&library_id, &path, all_assets).await,
         }
+    }
+
+    /// The items below `path` of a library (`store::folder_assets`), named by the folder, or by
+    /// the library at its root.
+    async fn folder_items(
+        &self,
+        library_id: &str,
+        path: &str,
+        all_assets: bool,
+    ) -> Result<ScopeItems, String> {
+        let lib = self
+            .db
+            .get_library_handle(library_id)
+            .await
+            .ok_or("This library is offline")?;
+        let asset_ids = store::folder_assets(&lib.pool, path, all_assets)
+            .await
+            .map_err(|e| e.to_string())?;
+        let name = match path.trim_matches('/').rsplit('/').next() {
+            Some(folder) if !folder.is_empty() => folder,
+            _ => &lib.name,
+        };
+        if asset_ids.is_empty() {
+            return Err(if all_assets {
+                format!("{name} has no assets")
+            } else {
+                format!("Every asset in {name} already has a tag")
+            });
+        }
+        let label = if all_assets {
+            format!("{name}: all assets")
+        } else {
+            format!("{name}: untagged assets")
+        };
+        Ok(ScopeItems {
+            requested: asset_ids.len(),
+            items: asset_ids
+                .into_iter()
+                .map(|id| (id, lib.id.clone()))
+                .collect(),
+            label,
+        })
     }
 
     /// Leaves out the items another active run already has queued (D13), and returns how many
@@ -2225,6 +2248,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_folder_run_queues_one_item_per_group_and_no_support_file() {
+        use crate::structure::tests::{car_kit, SEDAN};
+        const COLORMAP: &str = "3D assets/Car Kit/Models/GLB format/Textures/colormap.png";
+        let pool = car_kit().await;
+        insert_tag(&pool, "t-car", "Car").await;
+        sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES (?, 't-car')")
+            .bind(SEDAN[1])
+            .execute(&pool)
+            .await
+            .unwrap();
+        let db = memory_database(vec![memory_library("lib", pool)]).await;
+        let engine = Engine::new(
+            Arc::new(db),
+            vec![Arc::new(Recording::default())],
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        );
+        let folder = |path: &str, all_assets| RunScope::Folder {
+            library_id: "lib".into(),
+            path: path.into(),
+            all_assets,
+        };
+        let pair = |id: &str| (id.to_string(), "lib".to_string());
+        let run = |scope| async {
+            let started = engine
+                .start_run(scope, "recording", Mode::ExistingOnly)
+                .await
+                .unwrap();
+            // Ended, so it no longer holds its assets
+            engine.cancel_run(&started.run.id).await.unwrap();
+            (
+                started.run.label.clone(),
+                items_of(&engine, &started.run.id).await,
+            )
+        };
+
+        assert_eq!(
+            run(folder("3D assets/Car Kit", false)).await,
+            ("Car Kit: untagged assets".to_string(), vec![pair(COLORMAP)])
+        );
+        assert_eq!(
+            run(folder("3D assets/Car Kit", true)).await,
+            (
+                "Car Kit: all assets".to_string(),
+                vec![pair(COLORMAP), pair(SEDAN[1])]
+            )
+        );
+        // The FBX's folder holds the sedan, which goes once, as its GLB
+        assert_eq!(
+            run(folder("3D assets/Car Kit/Models/FBX format/", true)).await,
+            ("FBX format: all assets".to_string(), vec![pair(SEDAN[1])])
+        );
+        assert_eq!(
+            run(folder("", true)).await,
+            (
+                "lib: all assets".to_string(),
+                vec![pair(COLORMAP), pair(SEDAN[1])]
+            )
+        );
+
+        let refused = |scope| async {
+            engine
+                .start_run(scope, "recording", Mode::ExistingOnly)
+                .await
+                .unwrap_err()
+        };
+        assert_eq!(
+            refused(folder("3D assets/Car Kit/Models/FBX format", false)).await,
+            "Every asset in FBX format already has a tag"
+        );
+        assert_eq!(
+            refused(folder("3D assets/Holiday Kit", true)).await,
+            "Holiday Kit has no assets"
+        );
+    }
+
+    #[tokio::test]
     async fn a_library_run_with_nothing_to_tag_is_refused() {
         let s = setup(Recording::default(), &["a1"]).await;
         insert_tag(&s.lib_pool, "t-rock", "Rock").await;
@@ -3230,7 +3330,16 @@ mod tests {
             serde_json::from_str(r#"{"kind":"library","libraryId":"lib","allAssets":true}"#)
                 .unwrap();
 
+        let folder: RunScope = serde_json::from_str(
+            r#"{"kind":"folder","libraryId":"lib","path":"3D assets/Car Kit","allAssets":false}"#,
+        )
+        .unwrap();
         assert!(matches!(assets, RunScope::Assets { asset_ids } if asset_ids == ["a1"]));
+        assert!(matches!(
+            folder,
+            RunScope::Folder { library_id, path, all_assets: false }
+                if library_id == "lib" && path == "3D assets/Car Kit"
+        ));
         assert!(matches!(
             library,
             RunScope::Library { library_id, all_assets: true } if library_id == "lib"

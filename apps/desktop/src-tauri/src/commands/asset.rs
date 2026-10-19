@@ -424,7 +424,7 @@ pub(crate) const MAIN_OR_SINGLE: &str = "(a.group_id IS NULL OR a.group_id = a.i
 
 /// The support-file half of the grid's visibility rule: a pack's support files show only with
 /// "Show hidden files".
-const NOT_SUPPORT: &str = "a.support_role IS NULL";
+pub(crate) const NOT_SUPPORT: &str = "a.support_role IS NULL";
 
 impl SqlFilter {
     fn push(&mut self, condition: impl Into<String>, binds: impl IntoIterator<Item = String>) {
@@ -693,7 +693,7 @@ fn search_filter(query: &SearchQuery, split: bool) -> SqlFilter {
 /// `p/`, uses the unique `file_path` index and needs no `LIKE` escaping. `None` for the root
 /// (`""`, or only slashes), which every file lies below. Spaces are kept: a folder name may start
 /// or end with one. The grid's folder filter and the tree's live counts both read folders by it.
-fn folder_range(folder: &str) -> Option<[String; 2]> {
+pub(crate) fn folder_range(folder: &str) -> Option<[String; 2]> {
     let path = folder.trim_matches('/');
     (!path.is_empty()).then(|| [format!("{path}/"), format!("{path}0")])
 }
