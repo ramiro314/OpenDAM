@@ -2,6 +2,8 @@ import { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { openPack, packKey, useLibraryStore, usePacksStore, useUIStore } from '../../store';
 import type { PackCard as Pack } from '../../types';
+import { ContextMenu } from '../ContextMenu/ContextMenu';
+import { folderMenuItems } from '../FolderActions';
 import { CARD_BODY_HEIGHT } from './cardMetrics';
 import { FilterBar } from './FilterBar';
 import {
@@ -39,6 +41,7 @@ export function PacksView() {
   const gridSize = useUIStore((s) => s.gridSize);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
+  const [menu, setMenu] = useState<{ x: number; y: number; pack: Pack } | null>(null);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -67,6 +70,14 @@ export function PacksView() {
   const handleOpen = useCallback(
     (pack: Pack) => void openPack(pack).then(() => revealNode(pack)),
     []
+  );
+  // Selects the card, so you see what the menu acts on
+  const handleContextMenu = useCallback(
+    (pack: Pack, e: React.MouseEvent) => {
+      select(packKey(pack));
+      setMenu({ x: e.clientX, y: e.clientY, pack });
+    },
+    [select]
   );
   const libraryName = (id: string) => libraries.find((l) => l.id === id)?.name ?? id;
 
@@ -114,6 +125,7 @@ export function PacksView() {
                       selected={selected === packKey(pack)}
                       onSelect={handleSelect}
                       onOpen={handleOpen}
+                      onContextMenu={handleContextMenu}
                     />
                   ))}
                 </div>
@@ -127,6 +139,18 @@ export function PacksView() {
           {packs.length.toLocaleString()} {packs.length === 1 ? 'pack' : 'packs'}
         </span>
       </div>
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          onClose={() => setMenu(null)}
+          items={folderMenuItems({
+            libraryId: menu.pack.libraryId,
+            path: menu.pack.path,
+            name: menu.pack.name,
+          })}
+        />
+      )}
     </div>
   );
 }

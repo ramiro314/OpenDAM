@@ -3,6 +3,8 @@ import clsx from 'clsx';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { useAssetStore, useFolderTreeStore, useLiveCountsStore } from '../../store';
 import type { Cover } from '../../types';
+import { ContextMenu } from '../ContextMenu/ContextMenu';
+import { folderMenuItems } from '../FolderActions';
 import { tileMedia } from '../AssetGrid/tileState';
 import { IconChevronDown, IconChevronRight, IconFolder, IconPackage } from '../Icons';
 import { folderCount, isFolderShown } from './sidebarHelpers';
@@ -30,6 +32,9 @@ export function FolderTree({ libraryId, parentPath, onSelect }: FolderTreeProps)
   const live = useLiveCountsStore((s) => s.live);
   const liveCounts = useLiveCountsStore((s) => s.folders[libraryId]?.[parentPath]);
   const countFolders = useLiveCountsStore((s) => s.countFolders);
+  const [menu, setMenu] = useState<{ x: number; y: number; path: string; name: string } | null>(
+    null
+  );
 
   // A node expanded while counts are live asks for its children's; a recount asks for them all
   useEffect(() => {
@@ -59,6 +64,10 @@ export function FolderTree({ libraryId, parentPath, onSelect }: FolderTreeProps)
                 liveCount === 0 && styles.noMatches
               )}
               onClick={() => onSelect(libraryId, node.path)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setMenu({ x: e.clientX, y: e.clientY, path: node.path, name: node.name });
+              }}
               data-library-id={libraryId}
               data-folder-path={node.path}
               data-pack={node.isPack || undefined}
@@ -98,6 +107,14 @@ export function FolderTree({ libraryId, parentPath, onSelect }: FolderTreeProps)
           </div>
         );
       })}
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          onClose={() => setMenu(null)}
+          items={folderMenuItems({ libraryId, path: menu.path, name: menu.name })}
+        />
+      )}
     </div>
   );
 }

@@ -10,6 +10,7 @@ import { ConfirmDeleteDialog } from './components/ConfirmDeleteDialog';
 import { RunsPanel } from './components/Autotag/RunsPanel';
 import { AutotagDialog } from './components/Autotag/AutotagDialog';
 import { ReviewModal } from './components/Autotag/ReviewModal';
+import { FolderActionDialog } from './components/FolderActions';
 import { IconCheck } from './components/Icons';
 import { useUIStore } from './store';
 import {
@@ -286,6 +287,7 @@ export default function App() {
       {autotagTarget && (
         <AutotagDialog target={autotagTarget} onClose={() => openAutotagDialog(null)} />
       )}
+      <FolderActionDialog />
 
       {/* Delete Confirmation Dialog */}
       <ConfirmDeleteDialog

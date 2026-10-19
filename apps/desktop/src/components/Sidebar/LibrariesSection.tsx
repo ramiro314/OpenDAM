@@ -14,6 +14,7 @@ import { autotagAvailability } from '../../utils/autotag';
 import { IconChevronDown, IconChevronRight, IconFolder, IconTag, IconTrash } from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { ContextMenu } from '../ContextMenu/ContextMenu';
+import { folderMenuItems } from '../FolderActions';
 import { FolderTree } from './FolderTree';
 import { SidebarSection } from './SidebarSection';
 import { libraryNameFromPath } from './sidebarHelpers';
@@ -242,6 +243,7 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
                   libraryName: menu.library.name,
                 }),
             },
+            ...folderMenuItems({ libraryId: menu.library.id, path: '', name: menu.library.name }),
           ]}
         />
       )}

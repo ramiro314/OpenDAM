@@ -4,7 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 use tauri::State;
 
-use crate::db::{resolve_path, LibraryHandle};
+use crate::commands::asset::folder_range;
+use crate::db::{resolve_path, upsert_collection, upsert_tag, Database, LibraryHandle};
+use crate::structure;
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -277,10 +279,149 @@ pub(crate) async fn packs_below(
     Ok(cards)
 }
 
+/// Every file below `folder` (`""` for the library root, which covers the whole library), with
+/// every member of the groups those files belong to, wherever it sits, so a bulk write keeps a
+/// group's members equal (plan C20). Support files are included: the write covers everything.
+async fn folder_members(pool: &Pool<Sqlite>, folder: &str) -> sqlx::Result<Vec<String>> {
+    let Some([from, to]) = folder_range(folder) else {
+        return sqlx::query_scalar("SELECT id FROM assets ORDER BY rowid")
+            .fetch_all(pool)
+            .await;
+    };
+    sqlx::query_scalar(
+        "SELECT id FROM assets WHERE file_path >= ?1 AND file_path < ?2
+         UNION
+         SELECT m.id FROM assets m WHERE m.group_id IN (
+             SELECT group_id FROM assets
+             WHERE file_path >= ?1 AND file_path < ?2 AND group_id IS NOT NULL
+         )",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+}
+
+/// The open library `library_id`.
+async fn open_library(db: &Database, library_id: &str) -> Result<LibraryHandle> {
+    db.get_library_handle(library_id)
+        .await
+        .ok_or_else(|| format!("Library {library_id} is not open"))
+}
+
+/// "Add a tag to everything": tags every file below `folder_path` in library `library_id`, and
+/// the members of their groups (`folder_members`). Returns how many files that is.
+#[tauri::command]
+pub async fn tag_folder(
+    library_id: String,
+    folder_path: String,
+    tag_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<usize> {
+    tag_folder_in(&state.db, &library_id, &folder_path, &tag_id).await
+}
+
+/// Writes in transactions of `structure::BATCH` files, each copying master's definition, with
+/// its ancestors root first, into the library's mirror before the memberships, since a mirror can
+/// lack it. It holds the library's index lock, so no structure pass regroups the files meanwhile.
+async fn tag_folder_in(
+    db: &Database,
+    library_id: &str,
+    folder: &str,
+    tag_id: &str,
+) -> Result<usize> {
+    let lib = open_library(db, library_id).await?;
+    let chain = db
+        .tag_with_ancestors(tag_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if chain.is_empty() {
+        return Err("The tag no longer exists".into());
+    }
+    let lock = db.index_lock(&lib.id);
+    let _guard = lock.lock().await;
+    let write = async {
+        let ids = folder_members(&lib.pool, folder).await?;
+        for batch in ids.chunks(structure::BATCH) {
+            let mut tx = lib.pool.begin().await?;
+            for definition in &chain {
+                upsert_tag(&mut *tx, definition).await?;
+            }
+            for id in batch {
+                sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
+                    .bind(id)
+                    .bind(tag_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+        }
+        Ok::<_, sqlx::Error>(ids.len())
+    };
+    write.await.map_err(|e| e.to_string())
+}
+
+/// "Add everything to a collection": adds every file below `folder_path` in library
+/// `library_id`, and the members of their groups (`folder_members`), to collection
+/// `collection_id`. Returns how many files that is.
+#[tauri::command]
+pub async fn collect_folder(
+    library_id: String,
+    folder_path: String,
+    collection_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<usize> {
+    collect_folder_in(&state.db, &library_id, &folder_path, &collection_id).await
+}
+
+/// Writes as `tag_folder_in` does, copying the collection's definition and its ancestors.
+async fn collect_folder_in(
+    db: &Database,
+    library_id: &str,
+    folder: &str,
+    collection_id: &str,
+) -> Result<usize> {
+    let lib = open_library(db, library_id).await?;
+    let chain = db
+        .collection_with_ancestors(collection_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if chain.is_empty() {
+        return Err("The collection no longer exists".into());
+    }
+    let lock = db.index_lock(&lib.id);
+    let _guard = lock.lock().await;
+    let write = async {
+        let ids = folder_members(&lib.pool, folder).await?;
+        for batch in ids.chunks(structure::BATCH) {
+            let mut tx = lib.pool.begin().await?;
+            for definition in &chain {
+                upsert_collection(&mut *tx, definition).await?;
+            }
+            for id in batch {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
+                )
+                .bind(collection_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+        }
+        Ok::<_, sqlx::Error>(ids.len())
+    };
+    write.await.map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::memory_library_pool;
+    use crate::db::{
+        insert_asset, insert_collection, insert_tag, memory_database, memory_library,
+        memory_library_pool, memory_library_pool_enforcing_foreign_keys,
+    };
+    use crate::structure::tests::{SEDAN, SEDAN_RENDER};
 
     async fn library(paths: &[&str]) -> Pool<Sqlite> {
         let pool = memory_library_pool().await;
@@ -699,5 +840,151 @@ mod tests {
             (node.name.as_str(), node.cover.as_ref()),
             ("kit", Some(cover))
         );
+    }
+
+    /// One open library over the Car Kit (`structure::tests::car_kit`, each asset's id its path),
+    /// with a tag `t` and a collection `c` in master alone.
+    async fn car_kit_database() -> (Database, Pool<Sqlite>) {
+        let pool = crate::structure::tests::car_kit().await;
+        let db = memory_database(vec![memory_library("lib", pool.clone())]).await;
+        insert_tag(&db.master_pool, "t", "vehicle").await;
+        insert_collection(&db.master_pool, "c", "cars", None).await;
+        (db, pool)
+    }
+
+    /// The assets holding tag `t` and those in collection `c`, each sorted.
+    async fn tagged_and_collected(pool: &Pool<Sqlite>) -> (Vec<String>, Vec<String>) {
+        let read = |sql: &'static str| async move {
+            sqlx::query_scalar::<_, String>(sql)
+                .fetch_all(pool)
+                .await
+                .unwrap()
+        };
+        (
+            read("SELECT asset_id FROM asset_tags WHERE tag_id = 't' ORDER BY 1").await,
+            read("SELECT asset_id FROM collection_assets WHERE collection_id = 'c' ORDER BY 1")
+                .await,
+        )
+    }
+
+    /// Runs both bulk actions on `folder` of library `lib`, checking each returns `expected`'s
+    /// length, and that they reached exactly `expected`.
+    async fn assert_both_reach(db: &Database, folder: &str, mut expected: Vec<String>) {
+        let pool = db.get_library_handle("lib").await.unwrap().pool;
+        assert_eq!(
+            tag_folder_in(db, "lib", folder, "t").await,
+            Ok(expected.len())
+        );
+        assert_eq!(
+            collect_folder_in(db, "lib", folder, "c").await,
+            Ok(expected.len())
+        );
+        expected.sort();
+        assert_eq!(
+            tagged_and_collected(&pool).await,
+            (expected.clone(), expected),
+            "{folder:?}"
+        );
+    }
+
+    async fn ids_where(pool: &Pool<Sqlite>, condition: &str) -> Vec<String> {
+        sqlx::query_scalar(&format!("SELECT id FROM assets WHERE {condition}"))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bulk_actions_on_a_format_folder_reach_its_groups_members_in_sibling_folders() {
+        let (db, _) = car_kit_database().await;
+        let mut expected: Vec<String> = SEDAN.map(String::from).to_vec();
+        expected.push("3D assets/Car Kit/Models/GLB format/Textures/colormap.png".into());
+
+        assert_both_reach(&db, "3D assets/Car Kit/Models/GLB format/", expected).await;
+    }
+
+    #[tokio::test]
+    async fn bulk_actions_on_a_pack_reach_every_file_in_it_support_files_included() {
+        let (db, pool) = car_kit_database().await;
+        let expected = ids_where(&pool, "file_path LIKE '3D assets/Car Kit/%'").await;
+        assert_eq!(expected.len(), 8);
+        assert!(expected.contains(&SEDAN_RENDER.to_string()));
+
+        assert_both_reach(&db, "3D assets/Car Kit", expected).await;
+    }
+
+    #[tokio::test]
+    async fn bulk_actions_on_the_library_root_reach_every_file_in_the_library() {
+        let (db, pool) = car_kit_database().await;
+        let expected = ids_where(&pool, "1").await;
+        assert_eq!(expected.len(), 9);
+
+        assert_both_reach(&db, "", expected).await;
+    }
+
+    #[tokio::test]
+    async fn bulk_actions_copy_the_definitions_into_the_mirror_with_their_ancestors() {
+        // Foreign keys on: a membership whose tag or collection the mirror lacks is refused.
+        let pool = memory_library_pool_enforcing_foreign_keys().await;
+        insert_asset(&pool, "rock").await;
+        let db = memory_database(vec![memory_library("lib", pool.clone())]).await;
+        insert_tag(&db.master_pool, "nature", "nature").await;
+        insert_tag(&db.master_pool, "t", "stone").await;
+        sqlx::query("UPDATE tags SET parent_id = 'nature' WHERE id = 't'")
+            .execute(&db.master_pool)
+            .await
+            .unwrap();
+        insert_collection(&db.master_pool, "props", "props", None).await;
+        insert_collection(&db.master_pool, "c", "rocks", Some("props")).await;
+
+        assert_eq!(tag_folder_in(&db, "lib", "", "t").await, Ok(1));
+        assert_eq!(collect_folder_in(&db, "lib", "", "c").await, Ok(1));
+
+        assert_eq!(
+            tagged_and_collected(&pool).await,
+            (vec!["rock".into()], vec!["rock".into()])
+        );
+        let mirrored: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM tags UNION ALL SELECT id FROM collections")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mirrored.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn bulk_actions_write_past_one_batch_and_leave_other_libraries_alone() {
+        let paths: Vec<String> = (0..450).map(|i| format!("big/{i}.png")).collect();
+        let big = library(&paths.iter().map(String::as_str).collect::<Vec<_>>()).await;
+        let other = library(&["big/0.png"]).await;
+        let db = memory_database(vec![
+            memory_library("lib", big.clone()),
+            memory_library("other", other.clone()),
+        ])
+        .await;
+        insert_tag(&db.master_pool, "t", "vehicle").await;
+        insert_collection(&db.master_pool, "c", "cars", None).await;
+
+        assert_both_reach(&db, "big", paths).await;
+        assert_eq!(tagged_and_collected(&other).await, (vec![], vec![]));
+    }
+
+    #[tokio::test]
+    async fn bulk_actions_refuse_an_unknown_tag_or_collection_and_a_closed_library() {
+        let (db, pool) = car_kit_database().await;
+
+        assert_eq!(
+            tag_folder_in(&db, "lib", "", "gone").await,
+            Err("The tag no longer exists".into())
+        );
+        assert_eq!(
+            collect_folder_in(&db, "lib", "", "gone").await,
+            Err("The collection no longer exists".into())
+        );
+        assert_eq!(
+            tag_folder_in(&db, "closed", "", "t").await,
+            Err("Library closed is not open".into())
+        );
+        assert_eq!(tagged_and_collected(&pool).await, (vec![], vec![]));
     }
 }
