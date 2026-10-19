@@ -2981,7 +2981,8 @@ pub(crate) mod tests {
 
     /// What the pass has written to `pool`, for comparing a library with a fresh pass. A license's
     /// parser, size and mtime are left out: they record when the pass last read the file, which
-    /// depends on the files on disk, not on the derived structure.
+    /// depends on the files on disk, not on the derived structure. So is a pack's total size,
+    /// which sums its files' sizes on disk.
     pub(crate) async fn derived_rows(pool: &Pool<Sqlite>) -> DerivedRows {
         let rows: Vec<FolderRow> = sqlx::query_as(
             "SELECT path, parent_path, name, is_pack, item_count, hidden_count, split_groups,
@@ -3000,6 +3001,7 @@ pub(crate) mod tests {
                         if let Some(license) = pack.license.as_mut() {
                             (license.parser, license.size_bytes, license.modified_at) = (0, 0, 0);
                         }
+                        pack.size_bytes = 0;
                         serde_json::to_string(&pack).unwrap()
                     });
                     (path, parent, name, is_pack, items, hidden, split, pack_json)
