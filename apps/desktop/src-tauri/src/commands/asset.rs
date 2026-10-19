@@ -3090,6 +3090,30 @@ mod tests {
         files
     }
 
+    /// Registers the test library and another one in master, each counting 99 assets.
+    async fn register_libraries(db: &Database) {
+        sqlx::query(
+            "INSERT INTO libraries (id, name, root_paths, created_at, asset_count)
+             VALUES ('lib', 'lib', '[]', 0, 99), ('other', 'other', '[]', 0, 99)",
+        )
+        .execute(&db.master_pool)
+        .await
+        .unwrap();
+    }
+
+    /// Each library's asset count in master, by id.
+    async fn asset_counts(db: &Database) -> Vec<(String, i64)> {
+        sqlx::query_as("SELECT id, asset_count FROM libraries ORDER BY id")
+            .fetch_all(&db.master_pool)
+            .await
+            .unwrap()
+    }
+
+    /// `(id, count)` for the test library and the other one, which keeps its 99.
+    fn counts(lib: i64) -> Vec<(String, i64)> {
+        vec![("lib".to_string(), lib), ("other".to_string(), 99)]
+    }
+
     #[tokio::test]
     async fn renaming_a_group_renames_every_member_and_its_render() {
         let files = sedan_kit();
@@ -3121,6 +3145,7 @@ mod tests {
     async fn deleting_a_group_trashes_every_member_and_its_render() {
         let files = sedan_kit();
         let (root, db, pool) = library_in_folders(&files).await;
+        register_libraries(&db).await;
         let trashed = RefCell::new(Vec::new());
 
         let result = delete_assets_with(&db, &ids(&[SEDAN_GLB]), true, |path| {
@@ -3132,6 +3157,8 @@ mod tests {
         let derived = crate::structure::tests::derived_rows(&pool).await;
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(result, Ok(()));
+        // Only the van is left, and only this library's count changes.
+        assert_eq!(asset_counts(&db).await, counts(1));
         // The main item first, the other members by path, then the render.
         assert_eq!(
             trashed.into_inner(),
@@ -3152,6 +3179,7 @@ mod tests {
     async fn a_failed_trash_in_a_group_keeps_the_files_after_it_and_names_them() {
         let files = sedan_kit();
         let (root, db, pool) = library_in_folders(&files).await;
+        register_libraries(&db).await;
 
         let result = delete_assets_with(&db, &ids(&[SEDAN_GLB]), true, |path| {
             if path.extension().is_some_and(|e| e == "obj") {
@@ -3178,6 +3206,7 @@ mod tests {
             })
         );
         // The GLB and FBX lost their rows, and the pass ran on what is left.
+        assert_eq!(asset_counts(&db).await, counts(3));
         let rest = [obj, render, files[4]];
         assert_eq!(derived, crate::structure::tests::fresh_pass(&rest).await);
     }
@@ -3264,6 +3293,86 @@ mod tests {
         assert_eq!(renamed.into_inner(), 4);
         assert_eq!(disk, sedan_files("sedan"));
         assert_eq!(derived, before);
+    }
+
+    #[tokio::test]
+    async fn a_group_rename_whose_undo_fails_names_the_files_left_renamed() {
+        let files = sedan_kit();
+        let (root, db, pool) = library_in_folders(&files).await;
+        let before = crate::structure::tests::derived_rows(&pool).await;
+
+        // The OBJ fails after the GLB and the FBX are renamed, and the FBX can't go back.
+        let result = rename_asset_with(&db, SEDAN_GLB, "coupe", |from, to| {
+            let ext = to.extension().unwrap();
+            let back = to.file_stem().unwrap() == "sedan";
+            if ext == "obj" || (back && ext == "fbx") {
+                return Err(std::io::Error::other("disk unavailable"));
+            }
+            std::fs::rename(from, to)
+        })
+        .await;
+
+        let derived = crate::structure::tests::derived_rows(&pool).await;
+        let disk = on_disk(&root, &["sedan", "coupe"]);
+        std::fs::remove_dir_all(&root).unwrap();
+        let fbx = root.join("3D assets/Car Kit/Models/FBX format/coupe.fbx");
+        assert_eq!(
+            result,
+            Err(format!(
+                "Failed to rename file on disk (disk unavailable), and could not undo the renames \
+                 of: {} (disk unavailable)",
+                fbx.display()
+            ))
+        );
+        assert_eq!(
+            disk,
+            [
+                "3D assets/Car Kit/Models/FBX format/coupe.fbx",
+                SEDAN_GLB,
+                "3D assets/Car Kit/Models/OBJ format/sedan.obj",
+                crate::structure::tests::SEDAN_RENDER,
+            ]
+        );
+        // No row was written, so they all keep their old paths.
+        assert_eq!(derived, before);
+    }
+
+    #[tokio::test]
+    async fn a_refused_row_write_whose_undo_fails_names_the_files_left_renamed() {
+        let files = sedan_kit();
+        let (root, db, pool) = library_in_folders(&files).await;
+        sqlx::query(
+            "CREATE TRIGGER refuse BEFORE UPDATE ON assets BEGIN SELECT RAISE(ABORT, 'busy'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Every file is renamed, then the render can't go back.
+        let result = rename_asset_with(&db, SEDAN_GLB, "coupe", |from, to| {
+            if to.extension().unwrap() == "png" && to.file_stem().unwrap() == "sedan" {
+                return Err(std::io::Error::other("disk unavailable"));
+            }
+            std::fs::rename(from, to)
+        })
+        .await;
+
+        let disk = on_disk(&root, &["sedan", "coupe"]);
+        std::fs::remove_dir_all(&root).unwrap();
+        let render = root.join("3D assets/Car Kit/Previews/coupe.png");
+        assert_eq!(
+            result,
+            Err(format!(
+                "Could not record the rename (error returned from database: (code: 1811) busy), \
+                 and could not undo it on disk: {} (disk unavailable)",
+                render.display()
+            ))
+        );
+        let mut expected = sedan_files("sedan");
+        expected.retain(|path| !path.ends_with(".png"));
+        expected.push("3D assets/Car Kit/Previews/coupe.png".to_string());
+        expected.sort();
+        assert_eq!(disk, expected);
     }
 
     #[tokio::test]
