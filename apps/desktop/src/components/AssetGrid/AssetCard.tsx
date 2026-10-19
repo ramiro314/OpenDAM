@@ -74,7 +74,7 @@ export const AssetCard = memo(function AssetCard({
 
   const KindIcon = KIND_ICON[asset.kind] ?? IconImage;
   const kindColor = KIND_COLOR[asset.kind];
-  const groupBadge = formatGroupBadge(asset.groupFormats);
+  const groupBadge = formatGroupBadge(asset);
 
   const handleClick = useCallback(
     (e: React.MouseEvent) => {

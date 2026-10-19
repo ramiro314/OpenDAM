@@ -44,7 +44,7 @@ export const AssetListRow = memo(function AssetListRow({
 
   const media = tileMedia(asset, { failed });
   const image = tileImage(asset, media);
-  const groupBadge = formatGroupBadge(asset.groupFormats);
+  const groupBadge = formatGroupBadge(asset);
   const settle = () => setMediaSettled(true);
 
   const handleClick = useCallback(

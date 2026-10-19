@@ -1,5 +1,5 @@
 // The UI checks `VITE_SCROLL_BENCH=checks` runs (U1-U8 in
-// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U11 in
+// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U12 in
 // docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
 // check here.
 
@@ -162,6 +162,12 @@ const scrubLabel = () => document.getElementById('scrub-label');
 
 /** The library the bench registers its run copy as (`OPENDAM_BENCH_LIBRARY`). */
 const BENCH_LIBRARY = 'bench';
+
+/**
+ * The grid items at the bench library's root once its format groups and 2D stacks are formed
+ * (docs/plans/smarter-big-collections/plan.md, A3), from the golden snapshot's 83,095 files.
+ */
+const ROOT_ITEMS = 51_139;
 
 /** How long U9 waits for the folder tree, and for a write to get through. */
 const STRUCTURE_TIMEOUT_MS = 900_000;
@@ -1425,6 +1431,110 @@ export const UI_CHECKS: UiCheck[] = [
       assert(
         found.assets.some((a) => a.fileName === 'sedan.glb'),
         `"fbx" finds ${found.total} items, sedan.glb not among them`
+      );
+
+      await searchWith({ text: '', folder: undefined }, waitFor);
+    },
+  },
+  {
+    id: 'U12',
+    title:
+      'UI Pack sprites show once each with a solid x3 badge, same-named tiles and color or ' +
+      'style variants stay apart, and the library root shows 51,139 items',
+    run: async ({ assert, waitFor, pause, sleep }) => {
+      await expandBenchLibrary({ assert, sleep });
+      const results = async () => {
+        const { query, total } = useAssetStore.getState();
+        return (await api.searchAssets({ query, page: 0, pageSize: total + 1 })).assets;
+      };
+      const inFolder = (path: string) =>
+        searchWith({ text: '', folder: { libraryId: BENCH_LIBRARY, path } }, waitFor);
+      const status = () => document.getElementById('status-count')?.textContent ?? '';
+
+      // The library root: plan A3's item count, for the golden snapshot's 83,095 files
+      await inFolder('');
+      let s = useAssetStore.getState();
+      assert(s.total === ROOT_ITEMS, `the library root shows ${s.total} items, not ${ROOT_ITEMS}`);
+      const rootStatus = formatItemsAndFiles(s.total, s.fileTotal);
+      await waitFor(() => status() === rootStatus, 5_000, `the status bar to read ${rootStatus}`);
+      await pause('U12-library-root');
+
+      // Each UI Pack sprite shows once, as its default-scale PNG, standing for its Double PNG
+      // and its vector
+      const packPath = 'UI assets/UI Pack';
+      await expandFolder('UI assets');
+      await waitFor(() => folderRow(packPath) !== null, 10_000, packPath);
+      const pack = (await api.getFolders(BENCH_LIBRARY, 'UI assets')).find(
+        (f) => f.path === packPath
+      )!;
+      folderRow(packPath)!.click();
+      await waitFor(
+        () => {
+          const st = useAssetStore.getState();
+          return st.query.folder?.path === packPath && !st.loading && st.total > 0;
+        },
+        30_000,
+        `the search for ${packPath}`
+      );
+      s = useAssetStore.getState();
+      assert(s.total === pack.itemCount, `the grid holds ${s.total}, the node ${pack.itemCount}`);
+      const sprites = (await results()).filter((a) => a.filePath.includes('/UI Pack/PNG/'));
+      assert(sprites.length > 0, `${packPath} shows no sprite`);
+      const copies = (await results()).filter((a) => /\/(Double|Vector)\//.test(a.filePath));
+      assert(copies.length === 0, `${packPath} shows ${copies[0]?.filePath}`);
+      const unstacked = sprites.filter(
+        (a) => !a.filePath.includes('/Default/') || a.groupFormats?.join(',') !== 'png,png,svg'
+      );
+      assert(
+        unstacked.length === 0,
+        `${unstacked[0]?.filePath} stacks ${unstacked[0]?.groupFormats?.join(', ') ?? 'nothing'}`
+      );
+      // Blue and Red sprites of one name stay two items
+      const button = sprites.filter((a) => a.fileName === 'button_rectangle_depth_flat.png');
+      const colors = button.map((a) => a.filePath.split('/PNG/')[1]?.split('/')[0]).sort();
+      assert(
+        colors.join(',') === 'Blue,Green,Grey,Red,Yellow',
+        `button_rectangle_depth_flat.png shows in ${colors.join(', ')}`
+      );
+
+      // The card's badge counts the stack's files, on a solid background
+      const stackBadge = () =>
+        [...document.querySelectorAll<HTMLElement>('[data-tile] [data-group-badge]')].find(
+          (b) => b.dataset.groupBadge === 'x3'
+        );
+      await waitFor(() => stackBadge() !== undefined, 10_000, 'an x3 badge on a card');
+      const badge = stackBadge()!;
+      assert(badge.textContent === 'x3', `the badge reads "${badge.textContent}"`);
+      assert(badge.title === '3 files: PNG, SVG', `the badge's tooltip reads "${badge.title}"`);
+      const background = getComputedStyle(badge).backgroundColor;
+      assert(background.startsWith('rgb('), `the badge's background is ${background}, not solid`);
+      await waitFor(
+        () => !document.querySelector('[data-tile-state="placeholder"]'),
+        10_000,
+        "the pack's pictures"
+      );
+      await pause('U12-ui-pack');
+
+      // Two tiles sharing a name in different folders are two pictures
+      await inFolder('2D assets/Pixel Platformer/Tiles');
+      const tiles = (await results()).filter((a) => a.fileName === 'tile_0000.png');
+      assert(
+        tiles.length === 2 && tiles.every((a) => !a.groupFormats),
+        `tile_0000.png shows ${tiles.length} times: ${tiles.map((a) => a.filePath).join(', ')}`
+      );
+
+      // A crosshair's Dark and Light styles stay apart, each with its 2x and vector copies
+      await inFolder('2D assets/Crosshair Pack/PNG');
+      const crosshairs = (await results()).filter((a) => a.fileName === 'crosshair-000.png');
+      const styles = crosshairs.map((a) => a.filePath.split('/PNG/')[1]?.split('/')[0]).sort();
+      assert(
+        styles.join(',') === 'Dark,Glow,Light,Outline',
+        `crosshair-000.png shows in ${styles.join(', ')}`
+      );
+      const dark = crosshairs.find((a) => a.filePath.includes('/PNG/Dark/'));
+      assert(
+        dark?.groupFormats?.join(',') === 'png,png,svg',
+        `the Dark crosshair stacks ${dark?.groupFormats?.join(', ')}`
       );
 
       await searchWith({ text: '', folder: undefined }, waitFor);
