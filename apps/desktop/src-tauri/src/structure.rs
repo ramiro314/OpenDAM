@@ -658,18 +658,11 @@ const LICENSE_NAMES: [(&str, Classify); 16] = [
     }),
     ("cc-by", cc_by),
     ("cc by", cc_by),
+    // `license_kind` turns it into another license when the text names NonCommercial or
+    // NoDerivatives anywhere.
     ("creative commons attribution", |rest| {
-        let rest = rest.trim_start_matches(['-', ' ']);
-        if ["sharealike", "share-alike", "share alike"]
-            .iter()
-            .any(|sa| rest.starts_with(sa))
-        {
+        if compact(rest).starts_with("sharealike") {
             Some(LicenseKind::CcBySa)
-        } else if ["noncommercial", "non-commercial", "noderiv"]
-            .iter()
-            .any(|other| rest.starts_with(other))
-        {
-            None
         } else {
             Some(LicenseKind::CcBy)
         }
@@ -707,18 +700,41 @@ fn cc_by(rest: &str) -> Option<LicenseKind> {
     }
 }
 
+/// `text` without spaces, hyphens, commas and parentheses, so a license's wordings compare alike:
+/// `Non-Commercial`, `Non Commercial` and `NonCommercial`, or `by-nc` and `BY NC`.
+fn compact(text: &str) -> String {
+    text.chars()
+        .filter(|c| !matches!(c, ' ' | '-' | ',' | '(' | ')'))
+        .collect()
+}
+
+/// What a Creative Commons license adds that makes it neither CC-BY nor CC-BY-SA, as `compact`
+/// spells it: NonCommercial (`noncommercial`, `by-nc`) or NoDerivatives (`noderiv`, `by-nd`).
+const CC_RESTRICTIONS: [&str; 4] = ["noncommercial", "noderiv", "bync", "bynd"];
+
 /// The license `text` names first, by its name or its URL, ignoring case: CC0, CC-BY, CC-BY-SA,
-/// MIT, Apache-2.0 or OFL. `Unknown` when it names none of them.
+/// MIT, Apache-2.0 or OFL. A name counts only as a word of its own, so `permit licensees` names
+/// no MIT license. A CC-BY or CC-BY-SA in text that also names NonCommercial or NoDerivatives is
+/// another license. `Unknown` when it names none of them.
 pub fn license_kind(text: &str) -> LicenseKind {
     let text = squash(text);
-    LICENSE_NAMES
+    let kind = LICENSE_NAMES
         .iter()
         .filter_map(|(name, classify)| {
             text.match_indices(name)
+                .filter(|(at, _)| !text[..*at].ends_with(|c: char| c.is_alphanumeric()))
                 .find_map(|(at, _)| Some((at, classify(&text[at + name.len()..])?)))
         })
         .min_by_key(|(at, _)| *at)
-        .map_or(LicenseKind::Unknown, |(_, kind)| kind)
+        .map_or(LicenseKind::Unknown, |(_, kind)| kind);
+    let restricted = || {
+        let text = compact(&text);
+        CC_RESTRICTIONS.iter().any(|r| text.contains(r))
+    };
+    match kind {
+        LicenseKind::CcBy | LicenseKind::CcBySa if restricted() => LicenseKind::Unknown,
+        kind => kind,
+    }
 }
 
 /// A format's place in `MAIN_FORMATS`, ignoring case: lower is better, and every format not
@@ -2575,6 +2591,13 @@ pub(crate) mod tests {
             |_| LicenseText::default(),
         );
         assert_eq!(info(&structure, "kit").size_bytes, 7);
+        // A library that is one pack counts each file once, those at its root included.
+        let structure = super::derive(
+            [("License.txt", 1), ("rock.png", 2), ("Tiles/a.png", 4)],
+            |_| LicenseText::default(),
+        );
+        let root = info(&structure, "");
+        assert_eq!((root.kinds.values().sum::<i64>(), root.size_bytes), (3, 7));
     }
 
     /// A Kenney `License.txt` as Kenney ships it, from the bench library's Car Kit.
@@ -2676,6 +2699,41 @@ pub(crate) mod tests {
             ),
             ("CC BY-NC-SA 4.0", LicenseKind::Unknown),
             ("Apache License 1.1", LicenseKind::Unknown),
+            (
+                "Creative Commons Attribution Non Commercial 4.0",
+                LicenseKind::Unknown,
+            ),
+            (
+                "Creative Commons Attribution, Non-Commercial (CC BY-NC 4.0)",
+                LicenseKind::Unknown,
+            ),
+            (
+                "Licensed under Creative Commons Attribution (CC BY-NC 4.0)",
+                LicenseKind::Unknown,
+            ),
+            (
+                "Creative Commons Attribution-NoDerivatives 4.0",
+                LicenseKind::Unknown,
+            ),
+            ("CC BY ND 4.0", LicenseKind::Unknown),
+            // A name inside another word is no name.
+            (
+                "You may not permit licensees to sell the assets.",
+                LicenseKind::Unknown,
+            ),
+            (
+                "Do not submit licensed assets to stores.",
+                LicenseKind::Unknown,
+            ),
+            (
+                "There is a limit license holders must respect.",
+                LicenseKind::Unknown,
+            ),
+            ("Use the arcc0 tool.", LicenseKind::Unknown),
+            (
+                "Creative Commons Attribution Share Alike 4.0",
+                LicenseKind::CcBySa,
+            ),
             (
                 "All rights reserved. Do not redistribute.",
                 LicenseKind::Unknown,

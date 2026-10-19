@@ -937,6 +937,14 @@ mod tests {
                 (detail.license.map(|l| l.kind), detail.header),
                 (Some(LicenseKind::Unknown), None)
             );
+            // Every file counts once, those at the root included.
+            assert_eq!(
+                (detail.kinds, detail.size_bytes),
+                (
+                    [("document".to_string(), 1), ("texture".to_string(), 2)].into(),
+                    3
+                )
+            );
         }
     }
 
