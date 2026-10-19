@@ -227,6 +227,7 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::asset::get_facet_counts,
             commands::asset::get_folder_counts,
             commands::asset::get_asset,
+            commands::asset::get_group_members,
             commands::asset::update_asset,
             commands::asset::delete_asset,
             commands::asset::delete_assets,

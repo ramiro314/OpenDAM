@@ -193,12 +193,21 @@ The UI checks, each defined in its plan:
 - **U11** (format groups): in `3D assets/Car Kit`, the `GLB format/`, `FBX format/` and `OBJ
   format/` nodes each count as many items as `Models/`, and selecting `Models/` lists each model
   once, as its GLB, with a solid `GLB +2` badge whose tooltip reads `3 files: GLB, FBX, OBJ`, on
-  its card and, in the list view, unclipped in its row's extension column.
+  its card and, in the list view, unclipped in its row's extension column. Each card of a model
+  with a Kenney render shows that render, and the kit lists no `Previews/` file.
   Selecting `FBX format/` lists the same items and no FBX file, and adding `.glb` to it matches
   nothing. Filtering the kit by FBX lists every model, each as its GLB, and a search for "fbx"
   finds `sedan.glb` through its FBX copy's folder.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 3. Screenshots:
   `U11-kit-models`, `U11-list-badge`, `U11-fbx-format`.
+- **U12** (group detail): selecting `sedan.glb` in `3D assets/Car Kit/Models` lists its GLB, FBX
+  and OBJ files in the detail panel, in that order, each with its format, folder and size. Each
+  file's Open, Reveal and Copy path, recorded rather than run, act on that file, in its row and in
+  its own details, which show on a click with "Back to group". Moving between the FBX and OBJ
+  files and back leaves the grid's selection and cached pages unchanged. Selecting the kit's
+  `colormap.png` then lists its copies, each row showing that copy's own image.
+  [smarter-big-collections](../plans/smarter-big-collections/plan.md), C19. Screenshots:
+  `U12-group-files`, `U12-member`, `U12-2d-members`.
 - **U13** (live counts): with `3D assets/Platformer Kit/Models` expanded, a search for "tree"
   gives every shown tree node a badge with its live count, the grid's total once that folder is
   selected, and dims the nodes with none. The kit's `GLB format/`, `FBX format/` and `OBJ format/`

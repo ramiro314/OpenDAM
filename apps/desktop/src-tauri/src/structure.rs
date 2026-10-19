@@ -1,10 +1,12 @@
-//! The structure pass: a library's folder tree, its packs, its support files and its format
-//! groups, derived from the paths it has indexed (docs/plans/smarter-big-collections/plan.md,
-//! "The structure pass"). `derive` is a pure function over the paths, and the pass writes only
-//! the folder rows and `assets.support_role` and `assets.group_id` values that differ from it.
-//! Every index run ends with the pass (`watcher::index_paths`), and so does every command that
-//! changes the paths, through `rebuild_library`. Nothing else writes `folders`, `support_role`
-//! or `group_id`.
+//! The structure pass: a library's folder tree, its packs, its support files, its format groups
+//! and their bundled previews, derived from the paths it has indexed
+//! (docs/plans/smarter-big-collections/plan.md, "The structure pass"). `derive` is a pure function
+//! over the paths, and the pass writes only the folder rows and `assets.support_role`,
+//! `assets.group_id` and `assets.bundled_preview` values that differ from it, and the metadata of
+//! the groups that form or grow (`apply_unions`). Every index run ends with the pass
+//! (`watcher::index_paths`), and so does every command that changes the paths, through
+//! `rebuild_library`. Nothing else writes `folders`, `support_role`, `group_id` or
+//! `bundled_preview`.
 
 use sqlx::{Pool, Sqlite};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -32,6 +34,8 @@ const MAIN_FORMATS: [&str; 5] = ["glb", "gltf", "fbx", "blend", "obj"];
 const FORMAT_FOLDERS: [&str; 11] = [
     "glb", "gltf", "fbx", "obj", "blend", "dae", "stl", "3ds", "usd", "usdz", "ply",
 ];
+/// The names (lowercase) of a folder of model renders, such as Kenney's `Previews/`.
+const RENDER_FOLDERS: [&str; 3] = ["previews", "preview", "renders"];
 
 /// One folder as the pass derives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +62,8 @@ pub enum SupportRole {
     Doc,
     /// A `Preview*` or `Sample*` image
     Cover,
+    /// A model's render, its group's bundled preview (`model_previews`)
+    ModelPreview,
 }
 
 impl SupportRole {
@@ -65,6 +71,7 @@ impl SupportRole {
         match self {
             SupportRole::Doc => "doc",
             SupportRole::Cover => "cover",
+            SupportRole::ModelPreview => "model_preview",
         }
     }
 }
@@ -79,6 +86,9 @@ pub struct Structure {
     /// The format group of each input path, in input order: the input index of its main item,
     /// itself for the main item, or `None` for a file on its own
     pub groups: Vec<Option<usize>>,
+    /// The bundled preview of each input path, in input order: the input index of its render,
+    /// for a main item or a file on its own whose model has one, and `None` for every other file
+    pub bundled_previews: Vec<Option<usize>>,
 }
 
 /// The folder holding `path` (`""` for the root) and the file's name.
@@ -149,7 +159,9 @@ impl FileKind {
 ///    are `Doc` and `Preview*`/`Sample*` images are `Cover`.
 /// 4. **Format groups** (C11, `format_groups`): one model shipped in several formats, and the
 ///    copies of a file under format folders, form one grid item led by its main item.
-/// 5. **Counts:** each folder counts the grid items with a visible file below it, a group once,
+/// 5. **Bundled previews** (C12, `model_previews`): a render of a model is a `ModelPreview`
+///    support file, and the model's main item records it.
+/// 6. **Counts:** each folder counts the grid items with a visible file below it, a group once,
 ///    and the support files below it.
 pub fn derive<'a>(paths: impl IntoIterator<Item = &'a str>) -> Structure {
     let paths: Vec<&str> = paths.into_iter().collect();
@@ -197,7 +209,7 @@ pub fn derive<'a>(paths: impl IntoIterator<Item = &'a str>) -> Structure {
     }
     packs.extend(by_siblings);
 
-    let roles: Vec<Option<SupportRole>> = paths
+    let mut roles: Vec<Option<SupportRole>> = paths
         .iter()
         .zip(&kinds)
         .map(|(path, kind)| {
@@ -207,7 +219,9 @@ pub fn derive<'a>(paths: impl IntoIterator<Item = &'a str>) -> Structure {
                 .flatten()
         })
         .collect();
+    let renders = model_previews(&paths, &kinds, &mut roles);
     let groups = format_groups(&paths, &kinds, &roles);
+    let bundled_previews = bundled_previews(&paths, &groups, &renders);
 
     // A file on its own counts toward the folders above it. A group counts once toward each
     // folder above any of its files, so every format folder of a kit counts all its models.
@@ -253,7 +267,77 @@ pub fn derive<'a>(paths: impl IntoIterator<Item = &'a str>) -> Structure {
         folders,
         roles,
         groups,
+        bundled_previews,
     }
+}
+
+/// The renders among `paths` (plan C12): an image in a folder named `Previews`, `Preview` or
+/// `Renders`, ignoring case, renders each model below that folder's parent whose lowercase stem
+/// equals its own. Each render becomes a `ModelPreview` support file in `roles`, and is returned
+/// with the models it renders, by input index. An image that already has a role, or renders no
+/// model, stays as it is. So does one the webview can't display itself (`.dds`, `.tga`): its
+/// card would show nothing whenever it has no thumbnail, while the model it renders lost its own
+/// place on the preview queue.
+fn model_previews(
+    paths: &[&str],
+    kinds: &[FileKind],
+    roles: &mut [Option<SupportRole>],
+) -> Vec<(usize, Vec<usize>)> {
+    let mut models: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, kind) in kinds.iter().enumerate() {
+        if kind.is_model {
+            models.entry(kind.stem.as_str()).or_default().push(i);
+        }
+    }
+    let mut renders = Vec::new();
+    for (i, (path, kind)) in paths.iter().zip(kinds).enumerate() {
+        if !kind.is_image
+            || roles[i].is_some()
+            || !crate::preview::is_webview_displayable(&kind.ext)
+        {
+            continue;
+        }
+        let (dir, _) = split_dir(path);
+        let (parent, folder) = split_dir(dir);
+        if dir.is_empty() || !RENDER_FOLDERS.contains(&folder.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        let below = format!("{parent}/");
+        let rendered: Vec<usize> = models
+            .get(kind.stem.as_str())
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&m| parent.is_empty() || paths[m].starts_with(&below))
+            .collect();
+        if !rendered.is_empty() {
+            roles[i] = Some(SupportRole::ModelPreview);
+            renders.push((i, rendered));
+        }
+    }
+    renders
+}
+
+/// `Structure::bundled_previews` for `renders` as `model_previews` returns them: each rendered
+/// model's main item, or the model itself when it is on its own, records its render. A render of
+/// models in several groups is each group's preview, and an item rendered more than once takes
+/// the render whose path sorts first ignoring case, as `format_groups` breaks ties.
+fn bundled_previews(
+    paths: &[&str],
+    groups: &[Option<usize>],
+    renders: &[(usize, Vec<usize>)],
+) -> Vec<Option<usize>> {
+    let key = |i: usize| (paths[i].to_ascii_lowercase(), paths[i]);
+    let mut bundled: Vec<Option<usize>> = vec![None; paths.len()];
+    for (render, models) in renders {
+        for &model in models {
+            let item = groups[model].unwrap_or(model);
+            if bundled[item].is_none_or(|b| key(*render) < key(b)) {
+                bundled[item] = Some(*render);
+            }
+        }
+    }
+    bundled
 }
 
 /// A format's place in `MAIN_FORMATS`, ignoring case: lower is better, and every format not
@@ -388,6 +472,7 @@ struct FileRow {
     extension: String,
     support_role: Option<String>,
     group_id: Option<String>,
+    bundled_preview: Option<String>,
     preview_status: String,
 }
 
@@ -524,24 +609,179 @@ async fn apply_groups(
     Ok(changed.len())
 }
 
-/// Keeps group members off the preview queue (plan C15). A group member other than its main item
-/// comes off the queue, keeping any thumbnail it has, unless it is its group's stand-in
-/// (`preview_stand_ins`). Any other file at `none` whose format takes a preview goes on it: a new
-/// file, a member that became a main item, a stand-in, or a pack's cover image, which "Show
-/// hidden files" shows and a pack card pictures. `preview::unqueue` and
-/// `preview::enqueue` own how. Returns how many assets it changed.
+/// The files a metadata write on `id` reaches (plan C20): every member of its group, the main
+/// item included, or `id` alone for a file on its own. Support files never group, so a model's
+/// bundled preview is never one. Rating, color label, favorite, description, tag and collection
+/// writes all go through it, in their own transaction.
+pub async fn group_members<'e, E>(executor: E, id: &str) -> sqlx::Result<Vec<String>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query_scalar(
+        "SELECT ?1 UNION SELECT id FROM assets WHERE group_id = (SELECT group_id FROM assets WHERE id = ?1)",
+    )
+    .bind(id)
+    .fetch_all(executor)
+    .await
+}
+
+/// The `library_meta` key recording that every group of a library had its metadata unioned
+/// once. Groups formed before group writes existed (plan step 3) never were.
+const GROUP_UNION_KEY: &str = "group_metadata_union";
+
+/// One file's metadata, as a group's union reads it. Each field's default means unset.
+#[derive(sqlx::FromRow)]
+struct Metadata {
+    rating: i64,
+    color_label: String,
+    is_favorite: bool,
+    description: String,
+}
+
+/// Unions the metadata of every group that forms or grows (plan C14), or of every group once per
+/// library (`GROUP_UNION_KEY`), in transactions of `BATCH` groups. Each member gets every tag and
+/// collection a member has, and the main item's rating, color label, favorite and description.
+/// A field the main item leaves unset takes the first member's that is set, by path, so a GLB
+/// that joins a rated FBX doesn't drop its rating. It runs before `apply_groups` and reads the
+/// groups from `groups`, so a pass interrupted between the two unions again. A dissolved group's
+/// files keep what they have. Returns how many groups it unioned.
+async fn apply_unions(
+    pool: &Pool<Sqlite>,
+    files: &[FileRow],
+    groups: &[Option<usize>],
+) -> sqlx::Result<usize> {
+    let all: bool =
+        sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM library_meta WHERE key = ?)")
+            .bind(GROUP_UNION_KEY)
+            .fetch_one(pool)
+            .await?;
+    let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, main) in groups.iter().enumerate() {
+        if let Some(main) = *main {
+            members.entry(main).or_default().push(i);
+        }
+    }
+    let changed: Vec<(usize, Vec<usize>)> = members
+        .into_iter()
+        .filter(|(main, group)| {
+            all || group
+                .iter()
+                .any(|&i| files[i].group_id.as_deref() != Some(files[*main].id.as_str()))
+        })
+        .collect();
+    for chunk in changed.chunks(BATCH) {
+        let mut tx = pool.begin().await?;
+        for (main, group) in chunk {
+            let mut group = group.clone();
+            group.sort_by_key(|&i| (i != *main, files[i].file_path.to_ascii_lowercase()));
+            let ids: Vec<&str> = group.iter().map(|&i| files[i].id.as_str()).collect();
+            let ids = serde_json::to_string(&ids).expect("ids serialize");
+            sqlx::query(
+                "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id)
+                 SELECT m.value, t.tag_id FROM json_each(?1) m
+                 JOIN asset_tags t ON t.asset_id IN (SELECT value FROM json_each(?1))",
+            )
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id)
+                 SELECT c.collection_id, m.value FROM json_each(?1) m
+                 JOIN collection_assets c ON c.asset_id IN (SELECT value FROM json_each(?1))",
+            )
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+
+            let rows: Vec<Metadata> = sqlx::query_as(
+                "SELECT a.rating, a.color_label, a.is_favorite, a.description
+                 FROM json_each(?) m JOIN assets a ON a.id = m.value ORDER BY m.key",
+            )
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            let first = |set: fn(&Metadata) -> bool| rows.iter().find(|r| set(r));
+            let rating = first(|r| r.rating != 0).map_or(0, |r| r.rating);
+            let color_label = first(|r| r.color_label != "none" && !r.color_label.is_empty())
+                .map_or("none", |r| r.color_label.as_str());
+            let is_favorite = rows.iter().any(|r| r.is_favorite);
+            let description =
+                first(|r| !r.description.is_empty()).map_or("", |r| r.description.as_str());
+            sqlx::query(
+                "UPDATE assets SET rating = ?, color_label = ?, is_favorite = ?, description = ?
+                 WHERE id IN (SELECT value FROM json_each(?))",
+            )
+            .bind(rating)
+            .bind(color_label)
+            .bind(is_favorite)
+            .bind(description)
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+    }
+    if all {
+        sqlx::query(
+            "INSERT INTO library_meta (key, value) VALUES (?, 'done')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(GROUP_UNION_KEY)
+        .execute(pool)
+        .await?;
+    }
+    Ok(changed.len())
+}
+
+/// Sets `bundled_preview` on each of `files` whose render differs from `bundled` (in the same
+/// order), to the render's path, in transactions of `BATCH` rows. Returns how many rows it
+/// updated.
+async fn apply_bundled_previews(
+    pool: &Pool<Sqlite>,
+    files: &[FileRow],
+    bundled: &[Option<usize>],
+) -> sqlx::Result<usize> {
+    let changed: Vec<(&str, Option<&str>)> = files
+        .iter()
+        .zip(bundled)
+        .map(|(file, render)| (file, render.map(|r| files[r].file_path.as_str())))
+        .filter(|(file, render)| file.bundled_preview.as_deref() != *render)
+        .map(|(file, render)| (file.id.as_str(), render))
+        .collect();
+    for chunk in changed.chunks(BATCH) {
+        let mut tx = pool.begin().await?;
+        for (id, render) in chunk {
+            sqlx::query("UPDATE assets SET bundled_preview = ? WHERE id = ?")
+                .bind(render)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+    }
+    Ok(changed.len())
+}
+
+/// Keeps group members and models with a bundled preview off the preview queue (plan C15). A
+/// group member other than its main item comes off the queue, keeping any thumbnail it has,
+/// unless it is its group's stand-in (`preview_stand_ins`), and so does an item whose card shows
+/// its bundled preview. Any other file at `none` whose format takes a preview goes on it: a new
+/// file, a member that became a main item with no picture, a stand-in, or a pack's cover image or
+/// a render, which "Show hidden files" shows and pack and model cards picture.
+/// `preview::unqueue` and `preview::enqueue` own how. Returns how many assets it changed.
 async fn apply_previews(
     pool: &Pool<Sqlite>,
     files: &[FileRow],
     structure: &Structure,
 ) -> sqlx::Result<usize> {
     let waiting = crate::preview::assets_waiting_for_jobs(pool).await?;
-    let stand_ins = preview_stand_ins(files, &structure.groups);
+    let stand_ins = preview_stand_ins(files, structure);
     let mut members = Vec::new();
     let mut items = Vec::new();
     for (i, file) in files.iter().enumerate() {
         let main = structure.groups[i];
-        if main.is_some_and(|m| m != i) && !stand_ins.contains(&i) {
+        let pictured = structure.bundled_previews[i].is_some();
+        if (main.is_some_and(|m| m != i) && !stand_ins.contains(&i)) || pictured {
             if file.preview_status == "pending" || waiting.contains(&file.id) {
                 members.push(file.id.as_str());
             }
@@ -568,10 +808,11 @@ async fn apply_previews(
 }
 
 /// The member that is previewed for its group, by index into `files`, for each group whose main
-/// item's format takes no preview, such as a `.blend` beside an `.obj`: the previewable member
-/// that ranks first by format, then by path ignoring case. The card shows its thumbnail
-/// (`commands::asset`'s `ASSET_COLUMNS`), and `preview::claim_jobs` lets its job through.
-fn preview_stand_ins(files: &[FileRow], groups: &[Option<usize>]) -> HashSet<usize> {
+/// item's format takes no preview, such as a `.blend` beside an `.obj`, and that has no bundled
+/// preview: the previewable member that ranks first by format, then by path ignoring case. The
+/// card shows its thumbnail (`commands::asset`'s `ASSET_COLUMNS`), and `preview::claim_jobs`
+/// lets its job through.
+fn preview_stand_ins(files: &[FileRow], structure: &Structure) -> HashSet<usize> {
     let mut best: HashMap<usize, usize> = HashMap::new();
     let key = |i: usize| {
         let file = &files[i];
@@ -581,9 +822,10 @@ fn preview_stand_ins(files: &[FileRow], groups: &[Option<usize>]) -> HashSet<usi
             file.file_path.clone(),
         )
     };
-    for (i, main) in groups.iter().enumerate() {
+    for (i, main) in structure.groups.iter().enumerate() {
         let Some(main) = *main else { continue };
         if main == i
+            || structure.bundled_previews[main].is_some()
             || crate::preview::needs_preview(&files[main].extension)
             || !crate::preview::needs_preview(&files[i].extension)
         {
@@ -605,14 +847,18 @@ fn preview_stand_ins(files: &[FileRow], groups: &[Option<usize>]) -> HashSet<usi
 pub async fn rebuild(pool: &Pool<Sqlite>) -> sqlx::Result<usize> {
     let started = Instant::now();
     let files: Vec<FileRow> = sqlx::query_as(
-        "SELECT id, file_path, extension, support_role, group_id, preview_status FROM assets",
+        "SELECT id, file_path, extension, support_role, group_id, bundled_preview, preview_status
+         FROM assets",
     )
     .fetch_all(pool)
     .await?;
     let structure = derive(files.iter().map(|f| f.file_path.as_str()));
-    let written = apply_folders(pool, &structure.folders).await?
-        + apply_roles(pool, &files, &structure.roles).await?
-        + apply_groups(pool, &files, &structure.groups).await?
+    let mut written = apply_folders(pool, &structure.folders).await?
+        + apply_roles(pool, &files, &structure.roles).await?;
+    // A union follows from the `group_id` writes counted next, so it isn't counted itself.
+    let unioned = apply_unions(pool, &files, &structure.groups).await?;
+    written += apply_groups(pool, &files, &structure.groups).await?
+        + apply_bundled_previews(pool, &files, &structure.bundled_previews).await?
         + apply_previews(pool, &files, &structure).await?;
     let grouped = structure.groups.iter().flatten().count();
     let mains = structure
@@ -623,13 +869,15 @@ pub async fn rebuild(pool: &Pool<Sqlite>) -> sqlx::Result<usize> {
         .count();
     tracing::info!(
         target: "structure",
-        "Structure pass: {} files, {} folders, {} packs, {} support files, {} groups of {} files, {} rows written in {:?}",
+        "Structure pass: {} files, {} folders, {} packs, {} support files, {} groups of {} files, {} groups unioned, {} bundled previews, {} rows written in {:?}",
         files.len(),
         structure.folders.len(),
         structure.folders.values().filter(|f| f.is_pack).count(),
         structure.roles.iter().flatten().count(),
         mains,
         grouped,
+        unioned,
+        structure.bundled_previews.iter().flatten().count(),
         written,
         started.elapsed()
     );
@@ -791,11 +1039,18 @@ pub(crate) mod tests {
             .map(|main| main.map(|m| last - m))
             .collect();
         groups.reverse();
+        let mut bundled_previews: Vec<Option<usize>> = derive(KENNEY)
+            .bundled_previews
+            .into_iter()
+            .map(|render| render.map(|r| last - r))
+            .collect();
+        bundled_previews.reverse();
         assert_eq!(
             derive(reversed),
             Structure {
                 roles,
                 groups,
+                bundled_previews,
                 ..derive(KENNEY)
             }
         );
@@ -815,7 +1070,7 @@ pub(crate) mod tests {
     ];
 
     #[test]
-    fn a_kenney_3d_kit_is_a_pack_whose_docs_and_covers_are_hidden() {
+    fn a_kenney_3d_kit_is_a_pack_whose_docs_covers_and_renders_are_hidden() {
         let structure = derive(KENNEY_3D_KIT);
         assert_eq!(
             packs(&structure),
@@ -827,12 +1082,13 @@ pub(crate) mod tests {
                 ("3D assets/Car Kit/License.txt", "doc"),
                 ("3D assets/Car Kit/Preview.png", "cover"),
                 ("3D assets/Car Kit/Sample.png", "cover"),
+                ("3D assets/Car Kit/Previews/sedan.png", "model_preview"),
                 ("3D assets/Holiday Kit/License.txt", "doc"),
             ]
         );
-        // The sedan in three formats is one item, next to the texture and the render.
+        // The sedan in three formats is one item, next to the texture.
         let kit = &structure.folders["3D assets/Car Kit"];
-        assert_eq!((kit.item_count, kit.hidden_count), (3, 3));
+        assert_eq!((kit.item_count, kit.hidden_count), (2, 4));
         // A pack whose only file is hidden keeps its row, with no visible item.
         let holiday = &structure.folders["3D assets/Holiday Kit"];
         assert_eq!((holiday.item_count, holiday.hidden_count), (0, 1));
@@ -1142,7 +1398,7 @@ pub(crate) mod tests {
         );
 
         // Every format folder counts every model it holds a copy of, and `Models` counts each
-        // model and the texture once. The render outside the format folders stays its own item.
+        // model and the texture once. The render is the sedan's hidden bundled preview.
         let structure = derive(paths);
         let count = |path: &str| structure.folders[path].item_count;
         assert_eq!(count("3D assets/Car Kit/Models/GLB format"), 3);
@@ -1150,8 +1406,8 @@ pub(crate) mod tests {
         assert_eq!(count("3D assets/Car Kit/Models/FBX format"), 2);
         assert_eq!(count("3D assets/Car Kit/Models/FBX format/Textures"), 1);
         assert_eq!(count("3D assets/Car Kit/Models"), 3);
-        assert_eq!(count("3D assets/Car Kit"), 4);
-        assert_eq!(count(""), 4);
+        assert_eq!(count("3D assets/Car Kit"), 3);
+        assert_eq!(count(""), 3);
         // Only the folders holding a member without its main item split groups.
         let split: Vec<(&str, i64)> = structure
             .folders
@@ -1355,13 +1611,149 @@ pub(crate) mod tests {
         );
     }
 
-    /// Every `folders` row, every asset's support role, and the main item's path of every
-    /// grouped asset, in path order.
+    /// Each item of `paths` that has a bundled preview, with its render, in input order.
+    fn bundled<'a>(paths: &[&'a str]) -> Vec<(&'a str, &'a str)> {
+        derive(paths.iter().copied())
+            .bundled_previews
+            .iter()
+            .enumerate()
+            .filter_map(|(i, render)| render.map(|r| (paths[i], paths[r])))
+            .collect()
+    }
+
+    #[test]
+    fn a_kenney_render_is_its_models_hidden_bundled_preview() {
+        let paths = [
+            "3D assets/Car Kit/License.txt",
+            "3D assets/Car Kit/Preview.png",
+            "3D assets/Car Kit/Models/GLB format/sedan.glb",
+            "3D assets/Car Kit/Models/FBX format/sedan.fbx",
+            "3D assets/Car Kit/Models/OBJ format/sedan.obj",
+            "3D assets/Car Kit/Models/GLB format/Textures/colormap.png",
+            "3D assets/Car Kit/Models/OBJ format/Textures/colormap.png",
+            "3D assets/Car Kit/Previews/sedan.png",
+            // A render with no matching model
+            "3D assets/Car Kit/Previews/truck.png",
+        ];
+        // The GLB leads the sedan and records the render, which no member does.
+        assert_eq!(
+            bundled(&paths),
+            [(
+                "3D assets/Car Kit/Models/GLB format/sedan.glb",
+                "3D assets/Car Kit/Previews/sedan.png"
+            )]
+        );
+        assert_eq!(
+            hidden(&paths),
+            [
+                ("3D assets/Car Kit/License.txt", "doc"),
+                ("3D assets/Car Kit/Preview.png", "cover"),
+                ("3D assets/Car Kit/Previews/sedan.png", "model_preview"),
+            ]
+        );
+        // The unmatched render stays an ordinary image on its own, and the matched one joins no
+        // group.
+        let structure = derive(paths);
+        assert_eq!(structure.groups[8], None);
+        assert_eq!(structure.groups[7], None);
+        let previews = &structure.folders["3D assets/Car Kit/Previews"];
+        assert_eq!((previews.item_count, previews.hidden_count), (1, 1));
+        assert_eq!(structure.folders["3D assets/Car Kit"].item_count, 3);
+    }
+
+    #[test]
+    fn a_render_matches_a_model_below_its_folders_parent_by_stem_ignoring_case() {
+        let paths = [
+            // `Preview/` and `renders/` hold renders too, and a model on its own records its own.
+            "kit/Preview/Rock.PNG",
+            "kit/deep/models/rock.glb",
+            "kit/renders/tree.jpg",
+            "kit/tree.fbx",
+            // A model beside the render's folder's parent, not below it
+            "a/Previews/barrel.png",
+            "b/barrel.glb",
+            // Not a render folder, and an image named like a model but no image
+            "kit/Images/rock.png",
+            "kit/Previews/notes.txt",
+            "kit/notes.obj",
+        ];
+        assert_eq!(
+            bundled(&paths),
+            [
+                ("kit/deep/models/rock.glb", "kit/Preview/Rock.PNG"),
+                ("kit/tree.fbx", "kit/renders/tree.jpg"),
+            ]
+        );
+        let roles: Vec<&str> = hidden(&paths).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(roles, ["kit/Preview/Rock.PNG", "kit/renders/tree.jpg"]);
+    }
+
+    #[test]
+    fn a_render_at_the_library_root_matches_every_model_and_one_item_takes_the_first() {
+        let paths = [
+            "Previews/rock.png",
+            "Renders/rock.png",
+            "kit/rock.glb",
+            "other/rock.glb",
+        ];
+        // Both models get a render, and each takes the one whose path sorts first.
+        assert_eq!(
+            bundled(&paths),
+            [
+                ("kit/rock.glb", "Previews/rock.png"),
+                ("other/rock.glb", "Previews/rock.png"),
+            ]
+        );
+        assert_eq!(hidden(&paths).len(), 2);
+    }
+
+    #[test]
+    fn an_image_the_webview_cant_display_is_no_render() {
+        // A render with no thumbnail shows as itself, so it must be one the webview decodes.
+        let paths = [
+            "kit/Renders/rock.dds",
+            "kit/Previews/tree.tga",
+            "kit/Previews/barrel.webp",
+            "kit/rock.glb",
+            "kit/tree.glb",
+            "kit/barrel.glb",
+        ];
+        assert_eq!(
+            bundled(&paths),
+            [("kit/barrel.glb", "kit/Previews/barrel.webp")]
+        );
+        assert_eq!(
+            hidden(&paths),
+            [("kit/Previews/barrel.webp", "model_preview")]
+        );
+    }
+
+    #[test]
+    fn an_image_that_is_already_a_support_file_is_no_render() {
+        // `Previews/` is marked by its `Preview.png`, which stays a cover.
+        let paths = [
+            "kit/License.txt",
+            "kit/Previews/Preview.png",
+            "kit/preview.glb",
+        ];
+        assert_eq!(bundled(&paths), []);
+        assert_eq!(
+            hidden(&paths),
+            [
+                ("kit/License.txt", "doc"),
+                ("kit/Previews/Preview.png", "cover"),
+            ]
+        );
+    }
+
+    /// Every `folders` row, every asset's support role, the main item's path of every grouped
+    /// asset, and every bundled preview, in path order.
     #[derive(Debug, PartialEq)]
     pub(crate) struct DerivedRows {
         pub folders: Vec<FolderRow>,
         pub roles: Vec<(String, Option<String>)>,
         pub groups: Vec<(String, Option<String>)>,
+        pub bundled_previews: Vec<(String, String)>,
     }
 
     /// What the pass has written to `pool`, for comparing a library with a fresh pass.
@@ -1384,10 +1776,18 @@ pub(crate) mod tests {
         .fetch_all(pool)
         .await
         .unwrap();
+        let bundled_previews = sqlx::query_as(
+            "SELECT file_path, bundled_preview FROM assets WHERE bundled_preview IS NOT NULL
+             ORDER BY file_path",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
         DerivedRows {
             folders,
             roles,
             groups,
+            bundled_previews,
         }
     }
 
@@ -1620,6 +2020,47 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_blend_led_group_with_a_render_gets_no_stand_in_until_the_render_goes() {
+        let pool = memory_library_pool().await;
+        let (blend, obj, render) = (
+            "kit/ship.blend",
+            "kit/OBJ format/ship.obj",
+            "kit/Previews/ship.png",
+        );
+        for path in [blend, obj, render] {
+            insert_with_preview(&pool, path, "none").await;
+        }
+        rebuild(&pool).await.unwrap();
+        // The `.blend` leads and shows the render, so the OBJ stands in for nothing.
+        assert_eq!(
+            derived_rows(&pool).await.bundled_previews,
+            [(blend.to_string(), render.to_string())]
+        );
+        assert_eq!(
+            previews(&pool).await,
+            (
+                pairs(&[(obj, "none"), (render, "pending"), (blend, "none")]),
+                pairs(&[(render, "pending")]),
+            )
+        );
+        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+
+        // Without the render, the OBJ is queued as the group's stand-in.
+        sqlx::query("DELETE FROM assets WHERE id = ?")
+            .bind(render)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM preview_jobs WHERE asset_id = ?")
+            .bind(render)
+            .execute(&pool)
+            .await
+            .unwrap();
+        rebuild(&pool).await.unwrap();
+        assert_eq!(previews(&pool).await.1, pairs(&[(obj, "pending")]));
+    }
+
+    #[tokio::test]
     async fn a_file_on_its_own_needing_no_preview_gets_no_job() {
         let pool = memory_library_pool().await;
         for path in ["kit/rock.blend", "kit/notes.md", "kit/a/tree.glb"] {
@@ -1630,6 +2071,105 @@ pub(crate) mod tests {
         assert_eq!(
             previews(&pool).await.1,
             pairs(&[("kit/a/tree.glb", "pending")])
+        );
+    }
+
+    #[tokio::test]
+    async fn the_preview_queue_skips_members_and_models_with_a_bundled_preview() {
+        let pool = memory_library_pool().await;
+        let (glb, fbx, render) = (
+            "kit/Models/GLB format/sedan.glb",
+            "kit/Models/FBX format/sedan.fbx",
+            "kit/Previews/sedan.png",
+        );
+        let (truck_glb, truck_fbx) = (
+            "kit/Models/GLB format/truck.glb",
+            "kit/Models/FBX format/truck.fbx",
+        );
+        // As a first index leaves them: nothing queued yet, except the sedan's GLB, which an
+        // older build queued.
+        for path in [glb, fbx, render, truck_glb, truck_fbx] {
+            insert_with_preview(&pool, path, "none").await;
+        }
+        sqlx::query("UPDATE assets SET preview_status = 'pending' WHERE id = ?")
+            .bind(glb)
+            .execute(&pool)
+            .await
+            .unwrap();
+        add_job(&pool, glb, "pending").await;
+        rebuild(&pool).await.unwrap();
+        // The sedan shows its render, so neither of its files is queued, and the render is, for
+        // its card. The truck has no render, so its GLB is queued and its FBX isn't.
+        assert_eq!(
+            previews(&pool).await,
+            (
+                pairs(&[
+                    (fbx, "none"),
+                    (truck_fbx, "none"),
+                    (glb, "none"),
+                    (truck_glb, "pending"),
+                    (render, "pending"),
+                ]),
+                pairs(&[(truck_glb, "pending"), (render, "pending")]),
+            )
+        );
+        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+
+        // Without its GLB, the truck's FBX leads with no picture and gets a job. Without its
+        // render, the sedan's GLB does.
+        for path in [truck_glb, render] {
+            sqlx::query("DELETE FROM assets WHERE id = ?")
+                .bind(path)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM preview_jobs WHERE asset_id = ?")
+                .bind(path)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        rebuild(&pool).await.unwrap();
+        assert_eq!(
+            previews(&pool).await,
+            (
+                pairs(&[(fbx, "none"), (truck_fbx, "pending"), (glb, "pending")]),
+                pairs(&[(truck_fbx, "pending"), (glb, "pending")]),
+            )
+        );
+        assert_eq!(derived_rows(&pool).await.bundled_previews, []);
+    }
+
+    #[tokio::test]
+    async fn a_model_whose_only_render_the_webview_cant_display_keeps_its_preview_job() {
+        let pool = memory_library_pool().await;
+        let (glb, render) = ("kit/rock.glb", "kit/Renders/rock.dds");
+        for path in [glb, render] {
+            insert_with_preview(&pool, path, "none").await;
+        }
+        rebuild(&pool).await.unwrap();
+        assert_eq!(derived_rows(&pool).await.bundled_previews, []);
+        // The DDS takes no preview, so only the model is queued.
+        assert_eq!(previews(&pool).await.1, pairs(&[(glb, "pending")]));
+    }
+
+    #[tokio::test]
+    async fn a_render_is_recorded_once_and_the_rerun_writes_nothing() {
+        let paths = [
+            "kit/Models/GLB format/sedan.glb",
+            "kit/Models/OBJ format/sedan.obj",
+            "kit/Previews/sedan.png",
+        ];
+        let pool = memory_library_pool().await;
+        for path in paths {
+            insert_path(&pool, path).await;
+        }
+        // 6 folders, the render's role, 2 group ids and the GLB's bundled preview
+        assert_eq!(rebuild(&pool).await.unwrap(), 10);
+        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+        assert_eq!(
+            derived_rows(&pool).await.bundled_previews,
+            [(paths[0].to_string(), paths[2].to_string())]
         );
     }
 
@@ -1713,5 +2253,306 @@ pub(crate) mod tests {
         // 111 kits go (1, 10-19, 100-199), and the root and `kits` change their count.
         assert_eq!(rebuild(&pool).await.unwrap(), 113);
         assert_eq!(derived_rows(&pool).await, fresh_pass(&rest).await);
+    }
+
+    /// The Car Kit's sedan in its three formats, by path. The GLB is the main item.
+    pub(crate) const SEDAN: [&str; 3] = [
+        "3D assets/Car Kit/Models/FBX format/sedan.fbx",
+        "3D assets/Car Kit/Models/GLB format/sedan.glb",
+        "3D assets/Car Kit/Models/OBJ format/sedan.obj",
+    ];
+    /// Kenney's render of the sedan, which is no member of its group.
+    pub(crate) const SEDAN_RENDER: &str = "3D assets/Car Kit/Previews/sedan.png";
+
+    /// A library holding `KENNEY_3D_KIT` after its first pass, each asset's id its path.
+    pub(crate) async fn car_kit() -> Pool<Sqlite> {
+        let pool = memory_library_pool().await;
+        for path in KENNEY_3D_KIT {
+            insert_path(&pool, path).await;
+        }
+        rebuild(&pool).await.unwrap();
+        pool
+    }
+
+    /// Every file holding a row of `sql` (`SELECT asset_id, <value> FROM ...`), by path, with
+    /// that row's value.
+    pub(crate) async fn rows(pool: &Pool<Sqlite>, sql: &str) -> Vec<(String, String)> {
+        sqlx::query_as(&format!("SELECT * FROM ({sql}) ORDER BY 1, 2"))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// `(id, value)` for each of `ids`, in order.
+    pub(crate) fn each(ids: &[&str], value: &str) -> Vec<(String, String)> {
+        ids.iter()
+            .map(|id| (id.to_string(), value.to_string()))
+            .collect()
+    }
+
+    async fn run(pool: &Pool<Sqlite>, sql: &str) {
+        sqlx::query(sql).execute(pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_members_are_a_files_whole_group_or_the_file_alone() {
+        let pool = car_kit().await;
+        for id in SEDAN {
+            let mut members = group_members(&pool, id).await.unwrap();
+            members.sort();
+            assert_eq!(members, SEDAN, "{id}");
+        }
+        for id in [SEDAN_RENDER, "3D assets/Car Kit/Preview.png", "not indexed"] {
+            assert_eq!(group_members(&pool, id).await.unwrap(), [id]);
+        }
+    }
+
+    /// The metadata columns of every model of the sedan and of its render.
+    async fn sedan_fields(pool: &Pool<Sqlite>) -> Vec<(String, String)> {
+        rows(
+            pool,
+            "SELECT id, rating || ' ' || color_label || ' ' || is_favorite || ' ' || description
+             FROM assets WHERE file_path LIKE '%/sedan.%'",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_group_that_forms_gives_every_member_the_union_of_its_files_metadata() {
+        let pool = memory_library_pool().await;
+        for path in [SEDAN[0], SEDAN_RENDER] {
+            insert_path(&pool, path).await;
+        }
+        rebuild(&pool).await.unwrap();
+        // The FBX on its own is tagged, collected, rated and described, and so is the render.
+        for sql in [
+            "INSERT INTO asset_tags (asset_id, tag_id) VALUES
+                 ('3D assets/Car Kit/Models/FBX format/sedan.fbx', 'car'),
+                 ('3D assets/Car Kit/Previews/sedan.png', 'render')",
+            "INSERT INTO collection_assets (collection_id, asset_id) VALUES
+                 ('vehicles', '3D assets/Car Kit/Models/FBX format/sedan.fbx'),
+                 ('pictures', '3D assets/Car Kit/Previews/sedan.png')",
+            "UPDATE assets SET rating = 4, color_label = 'blue', description = 'four doors'",
+        ] {
+            run(&pool, sql).await;
+        }
+        // The GLB and OBJ arrive, the GLB with a tag and a color label of its own.
+        for path in [SEDAN[1], SEDAN[2]] {
+            insert_path(&pool, path).await;
+        }
+        run(
+            &pool,
+            "INSERT INTO asset_tags (asset_id, tag_id) VALUES
+                 ('3D assets/Car Kit/Models/GLB format/sedan.glb', 'low-poly');
+             UPDATE assets SET color_label = 'red' WHERE extension = 'glb'",
+        )
+        .await;
+
+        rebuild(&pool).await.unwrap();
+
+        let mut tags = [each(&SEDAN, "car"), each(&SEDAN, "low-poly")].concat();
+        tags.push((SEDAN_RENDER.into(), "render".into()));
+        tags.sort();
+        assert_eq!(
+            rows(&pool, "SELECT asset_id, tag_id FROM asset_tags").await,
+            tags
+        );
+        let mut collections = each(&SEDAN, "vehicles");
+        collections.push((SEDAN_RENDER.into(), "pictures".into()));
+        assert_eq!(
+            rows(
+                &pool,
+                "SELECT asset_id, collection_id FROM collection_assets"
+            )
+            .await,
+            collections
+        );
+        // The GLB's color label wins. It has no rating or description, so the FBX's fill in.
+        let mut fields = each(&SEDAN, "4 red 0 four doors");
+        fields.push((SEDAN_RENDER.into(), "4 blue 0 four doors".into()));
+        assert_eq!(sedan_fields(&pool).await, fields);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_joins_a_group_gets_its_tags_and_its_main_items_fields() {
+        let pool = memory_library_pool().await;
+        for path in [SEDAN[0], SEDAN[1]] {
+            insert_path(&pool, path).await;
+        }
+        rebuild(&pool).await.unwrap();
+        run(
+            &pool,
+            "INSERT INTO asset_tags (asset_id, tag_id) VALUES
+                 ('3D assets/Car Kit/Models/FBX format/sedan.fbx', 'car'),
+                 ('3D assets/Car Kit/Models/GLB format/sedan.glb', 'car');
+             UPDATE assets SET rating = 2, is_favorite = 1, description = 'sedan'
+                 WHERE extension = 'glb';
+             UPDATE assets SET rating = 5, color_label = 'green', description = 'old'
+                 WHERE extension = 'fbx'",
+        )
+        .await;
+        insert_path(&pool, SEDAN[2]).await;
+        run(
+            &pool,
+            "INSERT INTO asset_tags (asset_id, tag_id) VALUES
+                 ('3D assets/Car Kit/Models/OBJ format/sedan.obj', 'wavefront');
+             UPDATE assets SET rating = 1 WHERE extension = 'obj'",
+        )
+        .await;
+
+        rebuild(&pool).await.unwrap();
+
+        assert_eq!(
+            rows(&pool, "SELECT asset_id, tag_id FROM asset_tags").await,
+            {
+                let mut tags = [each(&SEDAN, "car"), each(&SEDAN, "wavefront")].concat();
+                tags.sort();
+                tags
+            }
+        );
+        // The GLB's rating, favorite and description; the FBX's color label, the GLB having none.
+        assert_eq!(sedan_fields(&pool).await, each(&SEDAN, "2 green 1 sedan"));
+    }
+
+    #[tokio::test]
+    async fn a_dissolved_groups_files_keep_what_they_have() {
+        let pool = car_kit().await;
+        run(
+            &pool,
+            "INSERT INTO asset_tags (asset_id, tag_id) SELECT id, 'car' FROM assets
+                 WHERE file_path LIKE '%/sedan.%' AND extension != 'png';
+             UPDATE assets SET rating = 3;
+             DELETE FROM assets WHERE file_path LIKE '%/sedan.glb' OR file_path LIKE '%/sedan.obj'",
+        )
+        .await;
+
+        rebuild(&pool).await.unwrap();
+
+        // The FBX is on its own now, with the tag and the rating it had.
+        assert_eq!(
+            rows(
+                &pool,
+                "SELECT asset_id, tag_id FROM asset_tags WHERE asset_id IN (SELECT id FROM assets)"
+            )
+            .await,
+            each(&SEDAN[..1], "car")
+        );
+        assert_eq!(
+            sedan_fields(&pool).await,
+            [
+                (SEDAN[0].to_string(), "3 none 0 ".to_string()),
+                (SEDAN_RENDER.to_string(), "3 none 0 ".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn groups_formed_before_group_writes_union_once() {
+        let pool = car_kit().await;
+        run(
+            &pool,
+            "DELETE FROM library_meta;
+             INSERT INTO asset_tags (asset_id, tag_id) VALUES
+                 ('3D assets/Car Kit/Models/FBX format/sedan.fbx', 'car')",
+        )
+        .await;
+
+        rebuild(&pool).await.unwrap();
+        assert_eq!(
+            rows(&pool, "SELECT asset_id, tag_id FROM asset_tags").await,
+            each(&SEDAN, "car")
+        );
+
+        // Once recorded, a pass with no change to the group leaves the tags alone.
+        run(&pool, "DELETE FROM asset_tags WHERE asset_id LIKE '%.obj'").await;
+        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+        assert_eq!(
+            rows(&pool, "SELECT asset_id, tag_id FROM asset_tags").await,
+            each(&SEDAN[..2], "car")
+        );
+    }
+
+    /// Statements that write one asset's metadata.
+    const METADATA_WRITES: [&str; 8] = [
+        "UPDATE assets SET rating",
+        "UPDATE assets SET color_label",
+        "UPDATE assets SET is_favorite",
+        "UPDATE assets SET description",
+        "INTO asset_tags",
+        "INTO collection_assets",
+        "DELETE FROM asset_tags WHERE asset_id = ? AND",
+        "DELETE FROM collection_assets WHERE collection_id = ? AND asset_id",
+    ];
+
+    /// Every function outside tests that holds one of `METADATA_WRITES`, by file, and whether it
+    /// calls `group_members`.
+    fn metadata_writers() -> Vec<(String, String, bool)> {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        files.sort();
+        let mut writers = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let code = text.split("mod tests {").next().unwrap();
+            // Each top-level item, from one unindented line to the next.
+            let mut items: Vec<String> = Vec::new();
+            for line in code.lines() {
+                if items.is_empty() || !(line.is_empty() || line.starts_with([' ', '}', ')'])) {
+                    items.push(String::new());
+                }
+                let item = items.last_mut().unwrap();
+                item.push_str(line);
+                item.push('\n');
+            }
+            for item in items {
+                if !METADATA_WRITES.iter().any(|w| item.contains(w)) {
+                    continue;
+                }
+                let name = item
+                    .split_once("fn ")
+                    .map(|(_, rest)| rest.split(['(', '<']).next().unwrap().to_string())
+                    .unwrap_or_default();
+                let file = file.strip_prefix(&root).unwrap().display().to_string();
+                writers.push((file, name, item.contains("group_members(")));
+            }
+        }
+        writers
+    }
+
+    #[test]
+    fn no_metadata_write_bypasses_group_members() {
+        let writers = metadata_writers();
+        let names: Vec<(&str, &str, bool)> = writers
+            .iter()
+            .map(|(file, name, expands)| (file.as_str(), name.as_str(), *expands))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("autotag/store.rs", "write_batch", true),
+                ("autotag/undo.rs", "remove_pairs", true),
+                ("commands/asset.rs", "apply_asset_patch", true),
+                ("commands/collection.rs", "add_assets_to_collection", true),
+                (
+                    "commands/collection.rs",
+                    "remove_assets_from_collection",
+                    true
+                ),
+                // The union itself, which writes to a group's members by their ids.
+                ("structure.rs", "apply_unions", false),
+            ],
+            "a metadata write must expand its asset through `group_members` (plan C20)"
+        );
     }
 }

@@ -104,11 +104,13 @@ docs/plans                    Plans for this fork
 
 - **Structure is derived.** `folders` (each folder's path, parent, name, `is_pack`, and its
   recursive `item_count`, `hidden_count` and `split_groups`, the root being `path = ''`) and
-  `assets.support_role` and `assets.group_id` are recomputed by `structure.rs` from the indexed
+  `assets.support_role`, `assets.group_id` and `assets.bundled_preview` are recomputed by
+  `structure.rs` from the indexed
   paths: `structure::derive` is a pure function, and the pass writes only the rows that changed,
   in 200-row transactions. Opening a library DB (`connect_library_sqlite`) runs the pass once, and
   every `watcher::index_paths` run ends with it, under the library's `Database::index_lock`. Only
-  `structure.rs` writes `folders`, `support_role` and `group_id`: a command that changes the
+  `structure.rs` writes `folders`, `support_role`, `group_id` and `bundled_preview`: a command
+  that changes the
   indexed paths (`delete_asset`, `delete_assets`, `rename_asset`) calls
   `structure::rebuild_library` before it returns, rather than patching rows, and that waits for
   any index run holding the lock. Searches hide support files (`support_role IS NOT NULL`) unless
@@ -133,6 +135,14 @@ docs/plans                    Plans for this fork
     filter, so each count equals the grid's total once you select that folder or value. A format
     pill adds its extension to the active ones, so with extensions active, its count also holds
     the items they match (`FacetCounts::extension_base`).
+  - Metadata (rating, color label, favorite, description, tags, collections) is the same on
+    every member. Each write expands its asset id through `structure::group_members` in its own
+    transaction, which `no_metadata_write_bypasses_group_members` checks, and auto-tag sends
+    only main items. When a group forms or grows, the structure pass gives every member the
+    union of the group's tags and collections and the main item's fields (`apply_unions`).
+  - Delete and rename reach every member and the bundled preview, unless another item shows the
+    same render (`item_files` in `commands/asset.rs`). A rename gives them all the new stem,
+    refuses before anything moves when a name is taken, and puts files back if a step fails.
   - The preview queue skips members other than the main item, and their thumbnails stay on disk.
     An index run queues no new file itself: the pass it ends with queues every file but those
     members (support files' cover images included), so a member is never queued, even during a
@@ -142,6 +152,19 @@ docs/plans                    Plans for this fork
     (`structure::preview_stand_ins`, `preview::claim_jobs`'s `STANDS_IN`), and its card shows
     that member's thumbnail. `preview.rs` owns the job
     states and how an asset goes on or off the queue (`preview::enqueue`, `preview::unqueue`).
+- **Bundled previews.** An image in a folder named `Previews`, `Preview` or `Renders` (any case)
+  renders each model below that folder's parent with the same stem, ignoring case (plan C12).
+  The pass makes it a `model_preview` support file and stores its path in `bundled_preview` on
+  the model's main item, or on the model when it is on its own. An image that renders no model,
+  or that the webview can't display itself (`preview::is_webview_displayable`), stays an
+  ordinary image, so a render without a thumbnail still shows. Cards and list rows show the
+  bundled preview first, then the thumbnail, then the original (`tileMedia`), and
+  `ASSET_COLUMNS` sends the render's own thumbnail when it has one. `preview:done` carries the
+  finished file's `filePath` and its `previousThumbnailPath`, so cached models showing either as
+  their render switch to its new thumbnail, or to the render itself when the thumbnail was
+  cleared (`updateAssetPreview`). The pass keeps an item with a bundled preview off the preview queue
+  and gives its group no stand-in, `claim_jobs` skips its jobs, and an item that loses its render
+  goes back on the queue.
 
 ## Python preview worker
 
