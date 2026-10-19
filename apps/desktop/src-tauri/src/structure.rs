@@ -1,7 +1,7 @@
 //! The structure pass: a library's folder tree, its packs, its support files, its format groups
 //! with their bundled previews, and its 2D stacks, derived from the paths it has indexed
 //! (docs/plans/smarter-big-collections/plan.md, "The structure pass"). `derive` is a pure function
-//! over the paths and the license headers, and the pass writes only the folder rows and `assets.support_role`,
+//! over the paths, their sizes and what the license files say, and the pass writes only the folder rows and `assets.support_role`,
 //! `assets.group_id` and `assets.bundled_preview` values that differ from it, and the metadata of
 //! the groups that form or grow (`apply_unions`). Every index run ends with the pass
 //! (`watcher::index_paths`), and so does every command that changes the paths, through
@@ -29,8 +29,11 @@ const COVER_STEMS: [&str; 2] = ["preview", "sample"];
 /// Doc stems (lowercase) of a pack's license file, whose header names the pack.
 const LICENSE_STEMS: [&str; 2] = ["license", "licence"];
 const DOC_EXTENSIONS: [&str; 3] = ["txt", "md", "pdf"];
-/// How much of a license file the pass reads for its header.
+/// How much of a license file the pass reads for its header and license.
 const HEADER_BYTES: u64 = 4096;
+/// The version of `parse_license`. A license file read by an older one is read again once, so a
+/// library indexed before a field existed gains it.
+const LICENSE_PARSER: u32 = 1;
 /// The formats a group picks its main item by (plan D12), best first. Every other format ranks
 /// after them.
 const MAIN_FORMATS: [&str; 5] = ["glb", "gltf", "fbx", "blend", "obj"];
@@ -73,7 +76,7 @@ pub struct Folder {
 }
 
 /// What the pass derives for one pack (plan C9).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackInfo {
     /// The name shown: the license header's, else the folder's
@@ -82,7 +85,17 @@ pub struct PackInfo {
     /// pack's first image, else its first visible file (a model, whose thumbnail shows), each by
     /// path
     pub cover: Option<String>,
+    /// Every cover image of the pack (its `Preview*` and `Sample*` images), by path
+    #[serde(default)]
+    pub gallery: Vec<String>,
     pub license: Option<LicenseFile>,
+    /// How many files of each kind (`AssetKind::as_str`) lie below the pack, at any depth,
+    /// support files and group members included
+    #[serde(default)]
+    pub kinds: BTreeMap<String, i64>,
+    /// The total size in bytes of those files
+    #[serde(default)]
+    pub size_bytes: i64,
 }
 
 /// A pack's license file: its first `License*` doc by path, directly inside it.
@@ -90,14 +103,91 @@ pub struct PackInfo {
 #[serde(rename_all = "camelCase")]
 pub struct LicenseFile {
     pub path: String,
-    /// The pack's name from the file's Kenney header, if it has one (`kenney_header_name`)
-    pub header_name: Option<String>,
-    /// The file's size and mtime when the pass read its header, so a rerun reads only a changed
-    /// file. `derive` leaves them 0, and `rebuild` fills them from the file's row.
+    /// What the pass read from the file (`parse_license`)
+    #[serde(flatten)]
+    pub text: LicenseText,
+    /// The `LICENSE_PARSER` that read it, and the file's size and mtime then, so a rerun reads
+    /// only a changed file. `derive` leaves them 0, and `rebuild` fills them from the file's row
+    /// once it has read the file.
+    #[serde(default)]
+    pub parser: u32,
     #[serde(default)]
     pub size_bytes: i64,
     #[serde(default)]
     pub modified_at: i64,
+}
+
+/// What a license file says (`parse_license`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", from = "StoredLicenseText")]
+pub struct LicenseText {
+    pub kind: LicenseKind,
+    /// Its Kenney header, if it has one
+    pub header: Option<PackHeader>,
+}
+
+/// A `LicenseText` as `pack_json` stores it, including the `headerName` that passes before
+/// `LicenseFile::parser` wrote instead of `header`. Such a license is read again, and if that
+/// read fails it keeps the name it gave, as any unreadable license keeps what it said.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredLicenseText {
+    #[serde(default)]
+    kind: LicenseKind,
+    #[serde(default)]
+    header: Option<PackHeader>,
+    #[serde(default)]
+    header_name: Option<String>,
+}
+
+impl From<StoredLicenseText> for LicenseText {
+    fn from(stored: StoredLicenseText) -> Self {
+        let header = stored.header.or_else(|| {
+            stored.header_name.map(|name| PackHeader {
+                name,
+                version: None,
+                author: None,
+            })
+        });
+        LicenseText {
+            kind: stored.kind,
+            header,
+        }
+    }
+}
+
+/// The license a license file names (`license_kind`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LicenseKind {
+    #[serde(rename = "CC0")]
+    Cc0,
+    #[serde(rename = "CC-BY")]
+    CcBy,
+    #[serde(rename = "CC-BY-SA")]
+    CcBySa,
+    #[serde(rename = "MIT")]
+    Mit,
+    #[serde(rename = "Apache-2.0")]
+    Apache2,
+    #[serde(rename = "OFL")]
+    Ofl,
+    /// Any other license, or text that names none
+    #[default]
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+/// A Kenney license header (`kenney_header`): `Car Kit (3.1)`, then `Created/distributed by
+/// Kenney (www.kenney.nl)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackHeader {
+    /// The first line without its version: `Car Kit`
+    pub name: String,
+    /// The version from the first line's parentheses: `3.1`
+    pub version: Option<String>,
+    /// The byline's name without what follows it in parentheses: `Kenney`
+    pub author: Option<String>,
 }
 
 /// Why a file is a pack's support file, hidden from the grid unless "Show hidden files" is on.
@@ -214,13 +304,16 @@ impl FileKind {
 ///    `Vector/`) form a group too, led by its PNG at the default scale.
 /// 7. **Counts:** each folder counts the grid items with a visible file below it, a group once,
 ///    and the support files below it.
-/// 7. **Pack info** (C9): each pack's cover and license file, and its name, which is the license
-///    file's header name (`header_name` reads it) or else the folder's.
+/// 8. **Pack info** (C9): each pack's cover, gallery and license file, which `read_license`
+///    reads, its name, which is the license's header name or else the folder's, and the files
+///    below it by kind with their total size.
+///
+/// Each file comes with its size in bytes.
 pub fn derive<'a>(
-    paths: impl IntoIterator<Item = &'a str>,
-    mut header_name: impl FnMut(&str) -> Option<String>,
+    files: impl IntoIterator<Item = (&'a str, i64)>,
+    mut read_license: impl FnMut(&str) -> LicenseText,
 ) -> Structure {
-    let paths: Vec<&str> = paths.into_iter().collect();
+    let (paths, sizes): (Vec<&str>, Vec<i64>) = files.into_iter().unzip();
     let kinds: Vec<FileKind> = paths.iter().map(|p| FileKind::of(split_dir(p).1)).collect();
 
     let mut folders: BTreeMap<String, Folder> = BTreeMap::new();
@@ -318,23 +411,29 @@ pub fn derive<'a>(
         }
     }
     let mut info = pack_files(&packs, &paths, &kinds, &roles, &groups);
+    let mut contents = pack_contents(&packs, &paths, &kinds, &sizes);
     for pack in packs {
         let folder = folders.get_mut(pack).expect("a pack has a row");
         let files = info.remove(pack).unwrap_or_default();
         let license = files.license.map(|path| LicenseFile {
-            header_name: header_name(path),
+            text: read_license(path),
             path: path.to_string(),
+            parser: 0,
             size_bytes: 0,
             modified_at: 0,
         });
+        let (kinds, size_bytes) = contents.remove(pack).unwrap_or_default();
         folder.is_pack = true;
         folder.pack = Some(PackInfo {
             name: license
                 .as_ref()
-                .and_then(|l| l.header_name.clone())
+                .and_then(|l| Some(l.text.header.as_ref()?.name.clone()))
                 .unwrap_or_else(|| folder.name.clone()),
             cover: files.cover().map(str::to_string),
+            gallery: files.gallery.iter().map(|p| p.to_string()).collect(),
             license,
+            kinds,
+            size_bytes,
         });
     }
     Structure {
@@ -422,6 +521,8 @@ struct PackFiles<'a> {
     image: Option<&'a str>,
     visible: Option<&'a str>,
     license: Option<&'a str>,
+    /// Every cover image, by path
+    gallery: BTreeSet<&'a str>,
 }
 
 impl<'a> PackFiles<'a> {
@@ -462,6 +563,7 @@ fn pack_files<'a>(
         if kind.is_image {
             first(&mut entry.image, path);
             if *role == Some(SupportRole::Cover) {
+                entry.gallery.insert(path);
                 if kind.stem.starts_with("preview") {
                     first(&mut entry.preview, path);
                 } else {
@@ -476,41 +578,191 @@ fn pack_files<'a>(
     files
 }
 
-/// The pack name a Kenney license header gives: its first line (`Car Kit (3.1)`) without the
-/// version in parentheses, when the next line names Kenney as the author (`Created/distributed
-/// by Kenney` or `by Kenney Vleugels`). `None` for any other text, such as an MIT or CC license.
-pub fn kenney_header_name(text: &str) -> Option<String> {
+/// The files of each pack by kind, and their total size: every file below the pack, at any depth,
+/// so an outer pack counts the files of a pack nested in it too.
+fn pack_contents(
+    packs: &BTreeSet<&str>,
+    paths: &[&str],
+    kinds: &[FileKind],
+    sizes: &[i64],
+) -> HashMap<String, (BTreeMap<String, i64>, i64)> {
+    let mut contents: HashMap<String, (BTreeMap<String, i64>, i64)> = HashMap::new();
+    for ((path, kind), size) in paths.iter().zip(kinds).zip(sizes) {
+        let (dir, _) = split_dir(path);
+        for pack in ancestors(dir)
+            .chain(std::iter::once(dir))
+            .filter(|d| packs.contains(d))
+        {
+            let (by_kind, total) = contents.entry(pack.to_string()).or_default();
+            let name = AssetKind::from_extension(&kind.ext).as_str();
+            *by_kind.entry(name.to_string()).or_default() += 1;
+            *total += size;
+        }
+    }
+    contents
+}
+
+/// What a license file's text says: the license it names (`license_kind`) and its Kenney header
+/// (`kenney_header`).
+pub fn parse_license(text: &str) -> LicenseText {
+    LicenseText {
+        kind: license_kind(text),
+        header: kenney_header(text),
+    }
+}
+
+/// `text` in lowercase, with each run of whitespace as one space.
+fn squash(text: &str) -> String {
+    text.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A Kenney license header: its first line (`Car Kit (3.1)`) gives the name, without the version
+/// in parentheses, when the next line names Kenney as the author (`Created/distributed by Kenney
+/// (www.kenney.nl)` or `by Kenney Vleugels (Kenney.nl)`), which gives the author. `None` for any
+/// other text, such as an MIT or CC license.
+pub fn kenney_header(text: &str) -> Option<PackHeader> {
     let mut lines = text
         .trim_start_matches('\u{feff}')
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty());
     let title = lines.next()?;
-    let byline = lines.next()?.to_lowercase();
-    let names_kenney = ["created/distributed by kenney", "by kenney"]
+    let byline = lines
+        .next()?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = byline.to_lowercase();
+    let by = ["created/distributed by ", "by "]
         .iter()
-        .any(|by| {
-            byline
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .starts_with(by)
-        });
-    if !names_kenney {
+        .find(|by| lower.starts_with(*by))?;
+    let author = byline.get(by.len()..)?;
+    let author = author.split(" (").next().unwrap_or(author).trim();
+    if !author.to_lowercase().starts_with("kenney") {
         return None;
     }
     // Drops a version such as ` (3.1)` or ` (1.5A)`, wherever it sits.
     let mut name = title.to_string();
+    let mut version = None;
     if let Some(start) = name.find(" (") {
         let rest = &name[start + 2..];
         if rest.starts_with(|c: char| c.is_ascii_digit()) {
             if let Some(len) = rest.find(')') {
+                version = Some(rest[..len].trim().to_string());
                 name.replace_range(start..start + 2 + len + 1, "");
             }
         }
     }
     let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!name.is_empty()).then_some(name)
+    (!name.is_empty()).then_some(PackHeader {
+        name,
+        version,
+        author: Some(author.to_string()),
+    })
+}
+
+/// How each name or URL of a license is told apart from its neighbors: given the text after it,
+/// the license it names, or `None` when it names another (`CC BY-NC` after `cc by`).
+type Classify = fn(&str) -> Option<LicenseKind>;
+
+/// The names and URLs `license_kind` looks for, in lowercase with single spaces.
+const LICENSE_NAMES: [(&str, Classify); 16] = [
+    ("creativecommons.org/publicdomain/zero", |_| {
+        Some(LicenseKind::Cc0)
+    }),
+    ("cc0", |_| Some(LicenseKind::Cc0)),
+    ("creative commons zero", |_| Some(LicenseKind::Cc0)),
+    ("creativecommons.org/licenses/by", |rest| {
+        if rest.starts_with('/') {
+            Some(LicenseKind::CcBy)
+        } else if rest.starts_with("-sa/") {
+            Some(LicenseKind::CcBySa)
+        } else {
+            None
+        }
+    }),
+    ("cc-by", cc_by),
+    ("cc by", cc_by),
+    // `license_kind` turns it into another license when the text names NonCommercial or
+    // NoDerivatives anywhere.
+    ("creative commons attribution", |rest| {
+        if compact(rest).starts_with("sharealike") {
+            Some(LicenseKind::CcBySa)
+        } else {
+            Some(LicenseKind::CcBy)
+        }
+    }),
+    ("opensource.org/licenses/mit", |_| Some(LicenseKind::Mit)),
+    ("mit license", |_| Some(LicenseKind::Mit)),
+    // The MIT text itself, which many license files hold without its title
+    ("permission is hereby granted, free of charge", |_| {
+        Some(LicenseKind::Mit)
+    }),
+    ("apache.org/licenses/license-2.0", |_| {
+        Some(LicenseKind::Apache2)
+    }),
+    ("apache-2.0", |_| Some(LicenseKind::Apache2)),
+    ("apache license", |rest| {
+        let rest = rest.trim_start_matches([',', ' ', '-']);
+        let rest = rest.strip_prefix("version ").unwrap_or(rest);
+        rest.starts_with('2').then_some(LicenseKind::Apache2)
+    }),
+    ("open font license", |_| Some(LicenseKind::Ofl)),
+    ("scripts.sil.org/ofl", |_| Some(LicenseKind::Ofl)),
+    ("openfontlicense.org", |_| Some(LicenseKind::Ofl)),
+];
+
+/// `cc-by` or `cc by`, given the text after it: `-sa` makes it CC-BY-SA, and `-nc` or `-nd`, or
+/// a letter (`cc bypass`), some other text.
+fn cc_by(rest: &str) -> Option<LicenseKind> {
+    let rest = rest.trim_start_matches(['-', ' ']);
+    if rest.starts_with("sa") && !rest[2..].starts_with(|c: char| c.is_ascii_alphabetic()) {
+        Some(LicenseKind::CcBySa)
+    } else if rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        None
+    } else {
+        Some(LicenseKind::CcBy)
+    }
+}
+
+/// `text` without spaces, hyphens, commas and parentheses, so a license's wordings compare alike:
+/// `Non-Commercial`, `Non Commercial` and `NonCommercial`, or `by-nc` and `BY NC`.
+fn compact(text: &str) -> String {
+    text.chars()
+        .filter(|c| !matches!(c, ' ' | '-' | ',' | '(' | ')'))
+        .collect()
+}
+
+/// What a Creative Commons license adds that makes it neither CC-BY nor CC-BY-SA, as `compact`
+/// spells it: NonCommercial (`noncommercial`, `by-nc`) or NoDerivatives (`noderiv`, `by-nd`).
+const CC_RESTRICTIONS: [&str; 4] = ["noncommercial", "noderiv", "bync", "bynd"];
+
+/// The license `text` names first, by its name or its URL, ignoring case: CC0, CC-BY, CC-BY-SA,
+/// MIT, Apache-2.0 or OFL. A name counts only as a word of its own, so `permit licensees` names
+/// no MIT license. A CC-BY or CC-BY-SA in text that also names NonCommercial or NoDerivatives is
+/// another license. `Unknown` when it names none of them.
+pub fn license_kind(text: &str) -> LicenseKind {
+    let text = squash(text);
+    let kind = LICENSE_NAMES
+        .iter()
+        .filter_map(|(name, classify)| {
+            text.match_indices(name)
+                .filter(|(at, _)| !text[..*at].ends_with(|c: char| c.is_alphanumeric()))
+                .find_map(|(at, _)| Some((at, classify(&text[at + name.len()..])?)))
+        })
+        .min_by_key(|(at, _)| *at)
+        .map_or(LicenseKind::Unknown, |(_, kind)| kind);
+    let restricted = || {
+        let text = compact(&text);
+        CC_RESTRICTIONS.iter().any(|r| text.contains(r))
+    };
+    match kind {
+        LicenseKind::CcBy | LicenseKind::CcBySa if restricted() => LicenseKind::Unknown,
+        kind => kind,
+    }
 }
 
 /// A format's place in `MAIN_FORMATS`, ignoring case: lower is better, and every format not
@@ -760,12 +1012,12 @@ pub(crate) type FolderRow = (
 );
 
 /// A `pack_json` value as `PackInfo`; one that doesn't parse is rewritten by the pass.
-fn parse_pack(json: Option<&str>) -> Option<PackInfo> {
+pub(crate) fn parse_pack(json: Option<&str>) -> Option<PackInfo> {
     serde_json::from_str(json?).ok()
 }
 
-/// The license files whose header the pass read before, by path, from the current `pack_json`s.
-async fn read_licenses(pool: &Pool<Sqlite>) -> sqlx::Result<HashMap<String, LicenseFile>> {
+/// The license files the pass read before, by path, from the current `pack_json`s.
+async fn known_licenses(pool: &Pool<Sqlite>) -> sqlx::Result<HashMap<String, LicenseFile>> {
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT pack_json FROM folders WHERE pack_json IS NOT NULL")
             .fetch_all(pool)
@@ -777,22 +1029,25 @@ async fn read_licenses(pool: &Pool<Sqlite>) -> sqlx::Result<HashMap<String, Lice
         .collect())
 }
 
-/// The header name of license file `file` from its last read, when its size and mtime haven't
-/// changed since; `None` when it must be read again.
-fn known_header(file: &FileRow, known: &HashMap<String, LicenseFile>) -> Option<Option<String>> {
+/// What license file `file` said when the pass last read it, when its size and mtime haven't
+/// changed since and the same `LICENSE_PARSER` read it; `None` when it must be read again.
+fn known_text(file: &FileRow, known: &HashMap<String, LicenseFile>) -> Option<LicenseText> {
     known
         .get(&file.file_path)
-        .filter(|l| (l.size_bytes, l.modified_at) == (file.size_bytes, file.modified_at))
-        .map(|l| l.header_name.clone())
+        .filter(|l| {
+            (l.parser, l.size_bytes, l.modified_at)
+                == (LICENSE_PARSER, file.size_bytes, file.modified_at)
+        })
+        .map(|l| l.text.clone())
 }
 
-/// The header name of each license file of `paths` below `root`, from its first `HEADER_BYTES`,
-/// or why it couldn't be read. The reads run on the blocking pool, off the async runtime, since a
+/// What each license file of `paths` below `root` says, from its first `HEADER_BYTES`, or why
+/// it couldn't be read. The reads run on the blocking pool, off the async runtime, since a
 /// library on a network share can take long to open each file.
-async fn read_headers(
+async fn read_license_files(
     root: &Path,
     paths: Vec<String>,
-) -> HashMap<String, std::io::Result<Option<String>>> {
+) -> HashMap<String, std::io::Result<LicenseText>> {
     use std::io::Read;
     let read_all = {
         let (root, paths) = (root.to_path_buf(), paths.clone());
@@ -801,10 +1056,10 @@ async fn read_headers(
                 .into_iter()
                 .map(|path| {
                     let mut head = Vec::new();
-                    let header = std::fs::File::open(root.join(&path))
+                    let text = std::fs::File::open(root.join(&path))
                         .and_then(|f| f.take(HEADER_BYTES).read_to_end(&mut head))
-                        .map(|_| kenney_header_name(&String::from_utf8_lossy(&head)));
-                    (path, header)
+                        .map(|_| parse_license(&String::from_utf8_lossy(&head)));
+                    (path, text)
                 })
                 .collect()
         }
@@ -1211,35 +1466,37 @@ pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
     )
     .fetch_all(pool)
     .await?;
-    let known = read_licenses(pool).await?;
+    let known = known_licenses(pool).await?;
     let by_path: HashMap<&str, &FileRow> =
         files.iter().map(|f| (f.file_path.as_str(), f)).collect();
-    let paths = || files.iter().map(|f| f.file_path.as_str());
-    // Derive with the headers already read, noting each license that changed since. Only then
-    // read those, off the runtime, and derive again with what they say.
+    let inputs = || files.iter().map(|f| (f.file_path.as_str(), f.size_bytes));
+    // Derive with the licenses already read, noting each one that changed since. Only then read
+    // those, off the runtime, and derive again with what they say.
     let mut changed = Vec::new();
-    let mut structure = derive(paths(), |path| {
-        known_header(by_path[path], &known).unwrap_or_else(|| {
+    let mut structure = derive(inputs(), |path| {
+        known_text(by_path[path], &known).unwrap_or_else(|| {
             changed.push(path.to_string());
-            None
+            LicenseText::default()
         })
     });
     let mut unread = HashSet::new();
+    let reads = changed.len();
     if !changed.is_empty() {
-        let read = read_headers(root, changed).await;
-        structure = derive(paths(), |path| match read.get(path) {
-            None => known_header(by_path[path], &known).flatten(),
-            Some(Ok(header)) => header.clone(),
-            // An unreadable license keeps the name it gave last time, and records no read, so
-            // the next pass tries it again.
+        let read = read_license_files(root, changed).await;
+        structure = derive(inputs(), |path| match read.get(path) {
+            None => known_text(by_path[path], &known).unwrap_or_default(),
+            Some(Ok(text)) => text.clone(),
+            // An unreadable license keeps what it said last time, and records no read, so the
+            // next pass tries it again.
             Some(Err(e)) => {
                 tracing::debug!(target: "structure", "Could not read {path}: {e}");
                 unread.insert(path.to_string());
-                known.get(path).and_then(|l| l.header_name.clone())
+                known.get(path).map(|l| l.text.clone()).unwrap_or_default()
             }
         });
     }
-    // A read license records the size and mtime it was read at; an unread one records none.
+    // A read license records the parser, size and mtime it was read with; an unread one records
+    // none.
     for license in structure
         .folders
         .values_mut()
@@ -1247,7 +1504,8 @@ pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
         .filter(|l| !unread.contains(&l.path))
     {
         let file = by_path[license.path.as_str()];
-        (license.size_bytes, license.modified_at) = (file.size_bytes, file.modified_at);
+        (license.parser, license.size_bytes, license.modified_at) =
+            (LICENSE_PARSER, file.size_bytes, file.modified_at);
     }
     let structure = structure;
 
@@ -1267,10 +1525,11 @@ pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
         .count();
     tracing::info!(
         target: "structure",
-        "Structure pass: {} files, {} folders, {} packs, {} support files, {} groups of {} files, {} groups unioned, {} bundled previews, {} rows written in {:?}",
+        "Structure pass: {} files, {} folders, {} packs, {} license files read, {} support files, {} groups of {} files, {} groups unioned, {} bundled previews, {} rows written in {:?}",
         files.len(),
         structure.folders.len(),
         structure.folders.values().filter(|f| f.is_pack).count(),
+        reads,
         structure.roles.iter().flatten().count(),
         mains,
         grouped,
@@ -1303,9 +1562,11 @@ pub(crate) mod tests {
         Path::new("/opendam-test-library-not-mounted")
     }
 
-    /// The structure of `paths` when no license file has a header.
+    /// The structure of `paths` when every file is 1 byte and no license file says anything.
     fn derive<'a>(paths: impl IntoIterator<Item = &'a str>) -> Structure {
-        super::derive(paths, |_| None)
+        super::derive(paths.into_iter().map(|p| (p, 1)), |_| {
+            LicenseText::default()
+        })
     }
 
     fn folder(parent_path: Option<&str>, name: &str, item_count: i64, hidden_count: i64) -> Folder {
@@ -1327,19 +1588,29 @@ pub(crate) mod tests {
         }
     }
 
-    /// `folder` as a pack named after its folder, with `cover` and `license`.
-    fn pack(folder: Folder, cover: Option<&str>, license: Option<&str>) -> Folder {
+    /// `folder` as a pack named after its folder, with `cover`, `license` and the files of
+    /// `kinds`, 1 byte each, and no gallery.
+    fn pack(
+        folder: Folder,
+        cover: Option<&str>,
+        license: Option<&str>,
+        kinds: &[(&str, i64)],
+    ) -> Folder {
         Folder {
             is_pack: true,
             pack: Some(PackInfo {
                 name: folder.name.clone(),
                 cover: cover.map(str::to_string),
+                gallery: Vec::new(),
                 license: license.map(|path| LicenseFile {
                     path: path.to_string(),
-                    header_name: None,
+                    text: LicenseText::default(),
+                    parser: 0,
                     size_bytes: 0,
                     modified_at: 0,
                 }),
+                kinds: kinds.iter().map(|(k, n)| (k.to_string(), *n)).collect(),
+                size_bytes: kinds.iter().map(|(_, n)| n).sum(),
             }),
             ..folder
         }
@@ -1406,6 +1677,7 @@ pub(crate) mod tests {
                         folder(Some("3D assets"), "Platformer Kit", 1, 1),
                         Some("3D assets/Platformer Kit/Models/GLB format/block.glb"),
                         Some("3D assets/Platformer Kit/License.txt"),
+                        &[("3d_model", 2), ("document", 1)],
                     ),
                 ),
                 (
@@ -2252,12 +2524,33 @@ pub(crate) mod tests {
         assert_eq!(info(&inner, "kit").license, None);
     }
 
+    /// A license that says `kind` and has a Kenney header naming `name`, at version 1.0.
+    fn kenney(name: &str, kind: LicenseKind) -> LicenseText {
+        LicenseText {
+            kind,
+            header: Some(PackHeader {
+                name: name.to_string(),
+                version: Some("1.0".to_string()),
+                author: Some("Kenney".to_string()),
+            }),
+        }
+    }
+
     #[test]
     fn a_packs_name_is_its_license_header_name_else_its_folder_name() {
-        let structure = super::derive(KENNEY_3D_KIT, |path| {
-            (path == "3D assets/Car Kit/License.txt").then(|| "Car Kit Deluxe".to_string())
+        let structure = super::derive(KENNEY_3D_KIT.map(|p| (p, 1)), |path| {
+            if path == "3D assets/Car Kit/License.txt" {
+                kenney("Car Kit Deluxe", LicenseKind::Cc0)
+            } else {
+                LicenseText::default()
+            }
         });
-        assert_eq!(info(&structure, "3D assets/Car Kit").name, "Car Kit Deluxe");
+        let car = info(&structure, "3D assets/Car Kit");
+        assert_eq!(car.name, "Car Kit Deluxe");
+        assert_eq!(
+            car.license.as_ref().map(|l| &l.text),
+            Some(&kenney("Car Kit Deluxe", LicenseKind::Cc0))
+        );
         assert_eq!(
             info(&structure, "3D assets/Holiday Kit").name,
             "Holiday Kit"
@@ -2267,28 +2560,253 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_packs_gallery_is_every_cover_image_by_path() {
+        let structure = derive(KENNEY_3D_KIT);
+        assert_eq!(
+            info(&structure, "3D assets/Car Kit").gallery,
+            [
+                "3D assets/Car Kit/Preview.png",
+                "3D assets/Car Kit/Sample.png"
+            ]
+        );
+        assert!(info(&structure, "3D assets/Holiday Kit").gallery.is_empty());
+        // Cover images in a marked folder inside the pack join it; a render, a doc named
+        // `Preview` and an image under another name don't.
+        let structure = derive([
+            "kit/License.txt",
+            "kit/Sample2.png",
+            "kit/Sources/Preview.jpg",
+            "kit/Models/rock.glb",
+            "kit/Previews/rock.png",
+            "kit/Preview.pdf",
+            "kit/Tiles/tile.png",
+        ]);
+        assert_eq!(
+            info(&structure, "kit").gallery,
+            ["kit/Sample2.png", "kit/Sources/Preview.jpg"]
+        );
+    }
+
+    #[test]
+    fn a_pack_counts_every_file_below_it_by_kind_with_their_total_size() {
+        let sizes = [10, 200, 300, 4_000, 50, 6_000, 7_000, 80, 9];
+        let structure = super::derive(KENNEY_3D_KIT.into_iter().zip(sizes), |_| {
+            LicenseText::default()
+        });
+        let car = info(&structure, "3D assets/Car Kit");
+        // Support files and every group member count, the render and the license included.
+        assert_eq!(
+            car.kinds,
+            BTreeMap::from([
+                ("3d_model".to_string(), 3),
+                ("document".to_string(), 1),
+                ("texture".to_string(), 4),
+            ])
+        );
+        assert_eq!(
+            car.size_bytes,
+            10 + 200 + 300 + 4_000 + 50 + 6_000 + 7_000 + 80
+        );
+        let holiday = info(&structure, "3D assets/Holiday Kit");
+        assert_eq!((holiday.kinds.len(), holiday.size_bytes), (1, 9));
+        // Files at any depth count, those in a marked folder inside the pack included.
+        let structure = super::derive(
+            [
+                ("kit/License.txt", 1),
+                ("kit/Extra/License.txt", 2),
+                ("kit/Extra/a/b.glb", 4),
+            ],
+            |_| LicenseText::default(),
+        );
+        assert_eq!(info(&structure, "kit").size_bytes, 7);
+        // A library that is one pack counts each file once, those at its root included.
+        let structure = super::derive(
+            [("License.txt", 1), ("rock.png", 2), ("Tiles/a.png", 4)],
+            |_| LicenseText::default(),
+        );
+        let root = info(&structure, "");
+        assert_eq!((root.kinds.values().sum::<i64>(), root.size_bytes), (3, 7));
+    }
+
+    /// A Kenney `License.txt` as Kenney ships it, from the bench library's Car Kit.
+    const KENNEY_LICENSE: &str = "\u{feff}\t\r\n\r\n\tCar Kit (3.1)\r\n\r\n\tCreated/distributed by Kenney (www.kenney.nl)\r\n\tCreation date: 02-04-2026 14:03\r\n\t\r\n\t\t\t------------------------------\r\n\r\n\tLicense: (Creative Commons Zero, CC0)\r\n\thttp://creativecommons.org/publicdomain/zero/1.0/\r\n\r\n\tYou can use this content for personal, educational, and commercial purposes.\r\n\r\n\tSupport by crediting 'Kenney' or 'www.kenney.nl' (this is not a requirement)\r\n";
+    /// A KayKit `LICENSE.txt`: CC0, with a header naming its own author.
+    const KAYKIT_LICENSE: &str = "KayKit : Adventurers (1.0)\n\nCreated and distributed by Kay Lousberg (www.kaylousberg.com)\n\n------------------------------\n\nLicense: (Creative Commons Zero, CC0)\nhttp://creativecommons.org/publicdomain/zero/1.0/\n\nThis content is free to use in personal, educational and commercial projects.\n";
+    const MIT_LICENSE: &str = "MIT License\n\nCopyright (c) 2024 Some Author\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND.\n";
+
+    #[test]
+    fn a_kenney_license_gives_the_name_version_author_and_cc0() {
+        assert_eq!(
+            parse_license(KENNEY_LICENSE),
+            LicenseText {
+                kind: LicenseKind::Cc0,
+                header: Some(PackHeader {
+                    name: "Car Kit".to_string(),
+                    version: Some("3.1".to_string()),
+                    author: Some("Kenney".to_string()),
+                }),
+            }
+        );
+        // The older byline, with no version
+        assert_eq!(
+            kenney_header("Top-down Tanks Remastered\n\tby  Kenney Vleugels (Kenney.nl)\n"),
+            Some(PackHeader {
+                name: "Top-down Tanks Remastered".to_string(),
+                version: None,
+                author: Some("Kenney Vleugels".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_kaykit_or_mit_license_has_its_kind_and_no_kenney_header() {
+        assert_eq!(
+            parse_license(KAYKIT_LICENSE),
+            LicenseText {
+                kind: LicenseKind::Cc0,
+                header: None,
+            }
+        );
+        assert_eq!(
+            parse_license(MIT_LICENSE),
+            LicenseText {
+                kind: LicenseKind::Mit,
+                header: None,
+            }
+        );
+        // The MIT text without its title
+        assert_eq!(
+            license_kind(&MIT_LICENSE.replace("MIT License\n", "")),
+            LicenseKind::Mit
+        );
+    }
+
+    #[test]
+    fn a_license_is_recognized_by_its_name_or_url_else_unknown() {
+        for (text, kind) in [
+            ("Licensed under CC0 1.0 Universal", LicenseKind::Cc0),
+            (
+                "https://creativecommons.org/licenses/by/4.0/",
+                LicenseKind::CcBy,
+            ),
+            ("License: CC-BY 4.0. Credit the author.", LicenseKind::CcBy),
+            (
+                "Creative Commons Attribution 4.0 International",
+                LicenseKind::CcBy,
+            ),
+            (
+                "https://creativecommons.org/licenses/by-sa/4.0/",
+                LicenseKind::CcBySa,
+            ),
+            ("Released as CC BY-SA 3.0", LicenseKind::CcBySa),
+            (
+                "Creative Commons Attribution-ShareAlike 4.0",
+                LicenseKind::CcBySa,
+            ),
+            (
+                "Apache License\nVersion 2.0, January 2004",
+                LicenseKind::Apache2,
+            ),
+            ("SPDX-License-Identifier: Apache-2.0", LicenseKind::Apache2),
+            (
+                "http://www.apache.org/licenses/LICENSE-2.0",
+                LicenseKind::Apache2,
+            ),
+            ("SIL OPEN FONT LICENSE Version 1.1", LicenseKind::Ofl),
+            ("https://openfontlicense.org", LicenseKind::Ofl),
+            // The license named first wins.
+            ("CC-BY 4.0, or else MIT license", LicenseKind::CcBy),
+            // Others it doesn't recognize
+            (
+                "Creative Commons Attribution-NonCommercial 4.0",
+                LicenseKind::Unknown,
+            ),
+            (
+                "https://creativecommons.org/licenses/by-nc/4.0/",
+                LicenseKind::Unknown,
+            ),
+            ("CC BY-NC-SA 4.0", LicenseKind::Unknown),
+            ("Apache License 1.1", LicenseKind::Unknown),
+            (
+                "Creative Commons Attribution Non Commercial 4.0",
+                LicenseKind::Unknown,
+            ),
+            (
+                "Creative Commons Attribution, Non-Commercial (CC BY-NC 4.0)",
+                LicenseKind::Unknown,
+            ),
+            (
+                "Licensed under Creative Commons Attribution (CC BY-NC 4.0)",
+                LicenseKind::Unknown,
+            ),
+            (
+                "Creative Commons Attribution-NoDerivatives 4.0",
+                LicenseKind::Unknown,
+            ),
+            ("CC BY ND 4.0", LicenseKind::Unknown),
+            // A name inside another word is no name.
+            (
+                "You may not permit licensees to sell the assets.",
+                LicenseKind::Unknown,
+            ),
+            (
+                "Do not submit licensed assets to stores.",
+                LicenseKind::Unknown,
+            ),
+            (
+                "There is a limit license holders must respect.",
+                LicenseKind::Unknown,
+            ),
+            ("Use the arcc0 tool.", LicenseKind::Unknown),
+            (
+                "Creative Commons Attribution Share Alike 4.0",
+                LicenseKind::CcBySa,
+            ),
+            (
+                "All rights reserved. Do not redistribute.",
+                LicenseKind::Unknown,
+            ),
+            ("", LicenseKind::Unknown),
+        ] {
+            assert_eq!(license_kind(text), kind, "{text:?}");
+        }
+    }
+
+    #[test]
     fn the_kenney_header_names_the_pack_without_its_version() {
-        let header = |text: &str| kenney_header_name(text);
+        let header = |text: &str| kenney_header(text).map(|h| (h.name, h.version));
         let kenney = "\u{feff}\r\n\tCar Kit (3.1)\r\n\r\n\tCreated/distributed by Kenney (www.kenney.nl)\r\n\tCreation date: 02-04-2026\r\n";
-        assert_eq!(header(kenney).as_deref(), Some("Car Kit"));
-        for (title, name) in [
-            ("Input Prompts (1.5A)", "Input Prompts"),
-            ("Space Kit (1.2) Exclusive", "Space Kit Exclusive"),
-            ("Sketch Desert 1.0", "Sketch Desert 1.0"),
-            ("Generic Items #1", "Generic Items #1"),
-            ("Platformer Pack (Redux)", "Platformer Pack (Redux)"),
+        assert_eq!(
+            header(kenney),
+            Some(("Car Kit".to_string(), Some("3.1".to_string())))
+        );
+        for (title, name, version) in [
+            ("Input Prompts (1.5A)", "Input Prompts", Some("1.5A")),
+            (
+                "Space Kit (1.2) Exclusive",
+                "Space Kit Exclusive",
+                Some("1.2"),
+            ),
+            ("Sketch Desert 1.0", "Sketch Desert 1.0", None),
+            ("Generic Items #1", "Generic Items #1", None),
+            ("Platformer Pack (Redux)", "Platformer Pack (Redux)", None),
         ] {
             let text = format!("{title}\n\nCreated/distributed by Kenney (www.kenney.nl)\n");
-            assert_eq!(header(&text).as_deref(), Some(name), "{title}");
+            assert_eq!(
+                header(&text),
+                Some((name.to_string(), version.map(str::to_string))),
+                "{title}"
+            );
         }
         // The older byline
         assert_eq!(
-            header("Roguelike Indoor pack\nby Kenney Vleugels (Kenney.nl)\n---").as_deref(),
-            Some("Roguelike Indoor pack")
+            header("Roguelike Indoor pack\nby Kenney Vleugels (Kenney.nl)\n---"),
+            Some(("Roguelike Indoor pack".to_string(), None))
         );
         // Another license's first line names no pack.
         for text in [
-            "MIT License\n\nCopyright (c) 2024 KayKit\n",
+            MIT_LICENSE,
+            KAYKIT_LICENSE,
             "Creative Commons Zero v1.0 Universal\n\nCC0 1.0 Universal\n",
             "Car Kit (3.1)",
             "",
@@ -2490,8 +3008,9 @@ pub(crate) mod tests {
     }
 
     /// What the pass has written to `pool`, for comparing a library with a fresh pass. A license's
-    /// size and mtime are left out: they record when the pass last read the file, which depends
-    /// on the files on disk, not on the derived structure.
+    /// parser, size and mtime are left out: they record when the pass last read the file, which
+    /// depends on the files on disk, not on the derived structure. So is a pack's total size,
+    /// which sums its files' sizes on disk.
     pub(crate) async fn derived_rows(pool: &Pool<Sqlite>) -> DerivedRows {
         let rows: Vec<FolderRow> = sqlx::query_as(
             "SELECT path, parent_path, name, is_pack, item_count, hidden_count, split_groups,
@@ -2508,8 +3027,9 @@ pub(crate) mod tests {
                     let pack_json = pack_json.map(|json| {
                         let mut pack = parse_pack(Some(&json)).expect("pack_json holds pack info");
                         if let Some(license) = pack.license.as_mut() {
-                            (license.size_bytes, license.modified_at) = (0, 0);
+                            (license.parser, license.size_bytes, license.modified_at) = (0, 0, 0);
                         }
+                        pack.size_bytes = 0;
                         serde_json::to_string(&pack).unwrap()
                     });
                     (path, parent, name, is_pack, items, hidden, split, pack_json)
@@ -2966,15 +3486,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn the_pass_names_a_pack_from_its_license_and_rereads_it_only_once_it_changes() {
+    async fn the_pass_reads_a_packs_license_and_rereads_it_only_once_it_changes() {
         let root = tempfile::tempdir().unwrap();
         let license = root.path().join("kit/License.txt");
         std::fs::create_dir_all(license.parent().unwrap()).unwrap();
-        std::fs::write(
-            &license,
-            "\tCar Kit (3.1)\r\n\r\n\tCreated/distributed by Kenney\r\n",
-        )
-        .unwrap();
+        std::fs::write(&license, KENNEY_LICENSE).unwrap();
         let pool = memory_library_pool().await;
         for path in ["kit/License.txt", "kit/Preview.png", "kit/Models/sedan.glb"] {
             insert_path(&pool, path).await;
@@ -2991,12 +3507,16 @@ pub(crate) mod tests {
         let read = stored_pack(&pool, "kit").await;
         assert_eq!(read.name, "Car Kit");
         let file = read.license.unwrap();
-        assert_eq!(
-            (file.header_name.as_deref(), file.size_bytes),
-            (Some("Car Kit"), 1)
-        );
+        assert_eq!(file.text, parse_license(KENNEY_LICENSE));
+        assert_eq!((file.parser, file.size_bytes), (LICENSE_PARSER, 1));
 
-        // An unchanged row means an unchanged file: the pass doesn't read it again.
+        // An unchanged row means an unchanged file: the pass doesn't read it again, even when
+        // the file can't be read at all.
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+        assert_eq!(
+            stored_pack(&pool, "kit").await.license.unwrap().text,
+            file.text
+        );
         std::fs::write(
             &license,
             "Space Kit (1.2)\nby Kenney Vleugels (Kenney.nl)\n",
@@ -3024,11 +3544,12 @@ pub(crate) mod tests {
         let file = dropped.license.unwrap();
         assert_eq!(
             (
-                file.header_name.as_deref(),
+                file.text.header.map(|h| h.name),
+                file.parser,
                 file.size_bytes,
                 file.modified_at
             ),
-            (Some("Space Kit"), 0, 0)
+            (Some("Space Kit".to_string()), 0, 0, 0)
         );
         assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
         std::fs::write(&license, "Car Kit (3.2)\nby Kenney Vleugels (Kenney.nl)\n").unwrap();
@@ -3039,18 +3560,87 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_license_read_by_an_older_parser_is_read_again_once() {
+        let root = tempfile::tempdir().unwrap();
+        let license = root.path().join("kit/License.txt");
+        std::fs::create_dir_all(license.parent().unwrap()).unwrap();
+        std::fs::write(&license, KENNEY_LICENSE).unwrap();
+        let pool = memory_library_pool().await;
+        insert_path(&pool, "kit/License.txt").await;
+        rebuild(&pool, root.path()).await.unwrap();
+        // The pack info a pass before `LicenseFile::parser` wrote, from the same file
+        sqlx::query(
+            r#"UPDATE folders SET pack_json = '{"name":"Car Kit","cover":null,"license":{"path":"kit/License.txt","headerName":"Car Kit","sizeBytes":1,"modifiedAt":0}}' WHERE path = 'kit'"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Its name reads as a header with no version or author.
+        let legacy = LicenseText {
+            kind: LicenseKind::Unknown,
+            header: Some(PackHeader {
+                name: "Car Kit".to_string(),
+                version: None,
+                author: None,
+            }),
+        };
+        assert_eq!(
+            stored_pack(&pool, "kit").await.license.unwrap().text,
+            legacy
+        );
+
+        assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 1);
+        let file = stored_pack(&pool, "kit").await.license.unwrap();
+        assert_eq!(
+            (file.text, file.parser),
+            (parse_license(KENNEY_LICENSE), LICENSE_PARSER)
+        );
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_older_license_that_cant_be_read_again_keeps_its_name() {
+        let pool = memory_library_pool().await;
+        insert_path(&pool, "kit/License.txt").await;
+        rebuild(&pool, unmounted()).await.unwrap();
+        // The pack info a pass before `LicenseFile::parser` wrote
+        sqlx::query(
+            r#"UPDATE folders SET pack_json = '{"name":"Car Kit","cover":null,"license":{"path":"kit/License.txt","headerName":"Car Kit","sizeBytes":1,"modifiedAt":0}}' WHERE path = 'kit'"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The reread fails: the pack keeps its name, and records no read, so it is tried again.
+        rebuild(&pool, unmounted()).await.unwrap();
+        let pack = stored_pack(&pool, "kit").await;
+        assert_eq!(pack.name, "Car Kit");
+        let license = pack.license.unwrap();
+        assert_eq!(
+            (
+                license.text.header.map(|h| h.name),
+                license.parser,
+                license.size_bytes
+            ),
+            (Some("Car Kit".to_string()), 0, 0)
+        );
+    }
+
+    #[tokio::test]
     async fn a_count_change_keeps_the_pack_info_and_writes_only_the_counts() {
         let pool = memory_library_pool().await;
         for path in KENNEY {
             insert_path(&pool, path).await;
         }
         rebuild(&pool, unmounted()).await.unwrap();
-        insert_path(&pool, "3D assets/Platformer Kit/Models/crate.glb").await;
+        let crate_glb = "3D assets/Platformer Kit/Models/crate.glb";
+        insert_path(&pool, crate_glb).await;
         // The kit, `Models`, `3D assets` and the root
         assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 4);
+        let paths = [&KENNEY[..], &[crate_glb]].concat();
         assert_eq!(
             stored_pack(&pool, "3D assets/Platformer Kit").await,
-            info(&derive(KENNEY), "3D assets/Platformer Kit").clone()
+            info(&derive(paths), "3D assets/Platformer Kit").clone()
         );
     }
 

@@ -834,7 +834,8 @@ export { useFolderTreeStore } from './folderTree';
 export { useGroupDetailStore, shownMember } from './groupDetail';
 export { extensionCount, kindCount, useLiveCountsStore } from './liveCounts';
 
-export { usePacksStore, packKey } from './packs';
+export { usePacksStore, packKey, packRef } from './packs';
+export { usePackDetailStore } from './packDetail';
 export {
   useFolderActionStore,
   applyFolderAction,

@@ -1,5 +1,5 @@
 // The UI checks `VITE_SCROLL_BENCH=checks` runs (U1-U8 in
-// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U14 in
+// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U15 in
 // docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
 // check here.
 
@@ -1902,6 +1902,132 @@ export const UI_CHECKS: UiCheck[] = [
       );
 
       await searchWith({ text: '', folder: undefined }, waitFor);
+    },
+  },
+  {
+    id: 'U15',
+    title:
+      "A Kenney kit's pack card shows its header's name, version and author, its license with " +
+      '"Open license", its gallery and its files by kind with their size, and browsing inside ' +
+      'the pack shows it whenever no asset is selected',
+    run: async ({ assert, waitFor, pause, sleep }) => {
+      await expandBenchLibrary({ assert, sleep });
+      const ui = () => useUIStore.getState();
+      if (!ui().detailPanelOpen) ui().toggleDetailPanel();
+      const kitPath = '3D assets/Car Kit';
+      // The first structure pass reads the kit's license once, then keeps what it said
+      const deadline = performance.now() + STRUCTURE_TIMEOUT_MS;
+      let detail = await api.getPackDetail(BENCH_LIBRARY, kitPath);
+      while (!detail?.header) {
+        assert(performance.now() < deadline, `${kitPath}'s license was never read`);
+        await sleep(1_000);
+        detail = await api.getPackDetail(BENCH_LIBRARY, kitPath);
+      }
+
+      // A click on the kit's card shows the pack in the panel
+      usePacksStore.getState().setMode('packs');
+      await benchLibraryRoot(waitFor);
+      const cards = usePacksStore.getState().packs ?? [];
+      const kit = cards.find((c) => c.path === kitPath);
+      assert(kit, `no card for ${kitPath}`);
+      const card = await scrollToCard(cards.indexOf(kit!), kit!, waitFor);
+      card.click();
+      const panel = () => document.getElementById('detail-panel');
+      const showsKit = () => panel()?.dataset.packDetail === kitPath;
+      await waitFor(showsKit, 10_000, `the panel to show ${kitPath}`);
+      const text = (id: string) => document.getElementById(id)?.textContent ?? '';
+      for (const [id, expected] of [
+        ['detail-pack-name', 'Car Kit'],
+        ['detail-pack-version', '3.1'],
+        ['detail-pack-author', 'Kenney'],
+        ['detail-pack-license', 'CC0'],
+        ['detail-pack-size', formatSize(detail!.sizeBytes)],
+      ]) {
+        assert(text(id) === expected, `#${id} reads "${text(id)}", not "${expected}"`);
+      }
+
+      // The gallery holds the kit's preview, each image loaded
+      const gallery = () => [...document.querySelectorAll<HTMLElement>('[data-gallery-image]')];
+      assert(
+        gallery().some((g) => g.dataset.galleryImage?.endsWith(`${kitPath}/Preview.png`)),
+        `the gallery holds ${gallery()
+          .map((g) => g.dataset.galleryImage)
+          .join(', ')}`
+      );
+      await waitFor(
+        () =>
+          loadedImages(document.getElementById('detail-pack-gallery')!).length === gallery().length,
+        10_000,
+        'the gallery images to load'
+      );
+
+      // The counts by kind add up to every file in the kit, hidden files and members included
+      const files = Object.values(detail!.kinds).reduce((sum, n) => sum + (n ?? 0), 0);
+      const all = await api.searchAssets({
+        query: {
+          ...useAssetStore.getState().query,
+          text: '',
+          filter: { showHidden: true },
+          folder: { libraryId: BENCH_LIBRARY, path: kitPath },
+        },
+        page: 0,
+        pageSize: 1,
+      });
+      assert(
+        files === all.fileTotal,
+        `the kinds count ${files} files, the kit holds ${all.fileTotal}`
+      );
+      for (const [kind, n] of Object.entries(detail!.kinds)) {
+        const row = document.querySelector(`#detail-pack-kinds [data-kind="${kind}"]`);
+        assert(
+          row?.textContent?.includes(n!.toLocaleString()),
+          `the ${kind} row reads "${row?.textContent}"`
+        );
+      }
+
+      // "Open license" opens the license file, recorded rather than run
+      const opened: string[] = [];
+      const realOpen = api.openWithDefault;
+      api.openWithDefault = async (path) => void opened.push(path);
+      try {
+        document.getElementById('detail-open-license')!.click();
+        await waitFor(() => opened.length > 0, 5_000, '"Open license" to open a file');
+      } finally {
+        api.openWithDefault = realOpen;
+      }
+      assert(
+        opened.length === 1 && opened[0].endsWith(`${kitPath}/License.txt`),
+        `"Open license" opened ${opened.join(', ')}`
+      );
+      await pause('U15-pack-detail');
+
+      // Inside the pack, the panel shows the pack until an asset is selected, and again after
+      const modelsPath = `${kitPath}/Models`;
+      await searchWith({ folder: { libraryId: BENCH_LIBRARY, path: modelsPath } }, waitFor);
+      await mainShows('assets', `opening ${modelsPath}`, waitFor);
+      await waitFor(showsKit, 10_000, `the panel to show ${kitPath} inside it`);
+      const sedan = cachedAssets(useAssetStore.getState()).find((a) => a.fileName === 'sedan.glb');
+      assert(sedan, `no sedan.glb in the first pages of ${modelsPath}`);
+      ui().selectAsset(sedan!.id);
+      await waitFor(
+        () => !panel()?.dataset.packDetail && document.getElementById('detail-rename') !== null,
+        10_000,
+        'the panel to show the selected asset'
+      );
+      await pause('U15-asset-in-pack');
+      ui().clearSelection();
+      await waitFor(showsKit, 10_000, `the panel to show ${kitPath} again`);
+      await pause('U15-pack-again');
+
+      // Outside every pack the panel shows none
+      await searchWith({ folder: { libraryId: BENCH_LIBRARY, path: '3D assets' } }, waitFor);
+      usePacksStore.getState().setMode('assets');
+      await mainShows('assets', 'the Assets toggle', waitFor);
+      await waitFor(() => !panel()?.dataset.packDetail, 10_000, 'the panel to show no pack');
+
+      usePacksStore.getState().setMode('packs');
+      useUIStore.getState().clearLibrarySelection();
+      await searchWith({ libraryIds: undefined, libraryId: undefined, folder: undefined }, waitFor);
     },
   },
 ];
