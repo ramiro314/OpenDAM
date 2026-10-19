@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::provider::ProposedTag;
 use super::vocabulary::normalize_name;
-use crate::commands::asset::MAIN_OR_SINGLE;
 use crate::db::{create_master_tag, upsert_tag, Database, LibraryHandle};
 
 /// Rows per transaction, the repository's batch size.
@@ -188,21 +187,6 @@ pub async fn inline_runs_of(
     )
     .bind(asset_id)
     .fetch_all(master)
-    .await
-}
-
-/// A library's assets with no tag, or all of them with `all_assets`, in file path order. A group
-/// sends only its main item, whose tags reach its members (plan D18).
-pub async fn library_assets(lib: &Pool<Sqlite>, all_assets: bool) -> sqlx::Result<Vec<String>> {
-    let untagged = if all_assets {
-        ""
-    } else {
-        "AND NOT EXISTS (SELECT 1 FROM asset_tags t WHERE t.asset_id = a.id)"
-    };
-    sqlx::query_scalar(&format!(
-        "SELECT id FROM assets a WHERE {MAIN_OR_SINGLE} {untagged} ORDER BY file_path"
-    ))
-    .fetch_all(lib)
     .await
 }
 
@@ -1932,19 +1916,5 @@ mod tests {
             .unwrap();
 
         assert_eq!(count_rows(master, "tag_run_applied").await, 0);
-    }
-
-    #[tokio::test]
-    async fn a_library_run_sends_a_group_as_its_main_item_alone() {
-        use crate::structure::tests::{car_kit, SEDAN, SEDAN_RENDER};
-        let pool = car_kit().await;
-        for all_assets in [true, false] {
-            let sent = library_assets(&pool, all_assets).await.unwrap();
-            assert!(sent.contains(&SEDAN[1].to_string()), "{all_assets}");
-            assert!(sent.contains(&SEDAN_RENDER.to_string()), "{all_assets}");
-            for member in [SEDAN[0], SEDAN[2]] {
-                assert!(!sent.contains(&member.to_string()), "{all_assets} {member}");
-            }
-        }
     }
 }

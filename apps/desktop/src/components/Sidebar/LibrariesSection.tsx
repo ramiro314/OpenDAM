@@ -9,11 +9,12 @@ import {
   useFolderTreeStore,
   selectFolder,
 } from '../../store';
-import type { Library } from '../../types';
+import type { FolderNode, Library } from '../../types';
 import { autotagAvailability } from '../../utils/autotag';
 import { IconChevronDown, IconChevronRight, IconFolder, IconTag, IconTrash } from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { ContextMenu } from '../ContextMenu/ContextMenu';
+import { FolderContextMenu, type FolderMenuTarget } from '../ContextMenu/FolderContextMenu';
 import { folderMenuItems } from '../FolderActions';
 import { FolderTree } from './FolderTree';
 import { SidebarSection } from './SidebarSection';
@@ -45,6 +46,7 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
   const [expanded, setExpanded] = useState(true);
   const [removeTarget, setRemoveTarget] = useState<{ id: string; name: string } | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; library: Library } | null>(null);
+  const [folderMenu, setFolderMenu] = useState<FolderMenuTarget | null>(null);
   const providers = useAutotagStore((s) => s.providers);
   const openAutotagDialog = useAutotagStore((s) => s.openAutotagDialog);
 
@@ -97,6 +99,19 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
   const handleFolderClick = (libraryId: string, path: string) => {
     clearSmartFilter();
     selectFolder({ libraryId, path });
+  };
+
+  const handleFolderMenu = (e: React.MouseEvent, libraryId: string, node: FolderNode) => {
+    e.preventDefault();
+    setFolderMenu({
+      x: e.clientX,
+      y: e.clientY,
+      libraryId,
+      path: node.path,
+      name: node.name,
+      isPack: node.isPack,
+      itemCount: node.itemCount,
+    });
   };
 
   const executeRemove = async () => {
@@ -214,7 +229,12 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
                 </span>
               </div>
               {isExpanded && (
-                <FolderTree libraryId={lib.id} parentPath="" onSelect={handleFolderClick} />
+                <FolderTree
+                  libraryId={lib.id}
+                  parentPath=""
+                  onSelect={handleFolderClick}
+                  onMenu={handleFolderMenu}
+                />
               )}
             </div>
           );
@@ -247,6 +267,8 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
           ]}
         />
       )}
+
+      {folderMenu && <FolderContextMenu target={folderMenu} onClose={() => setFolderMenu(null)} />}
 
       <ConfirmDeleteDialog
         isOpen={Boolean(removeTarget)}

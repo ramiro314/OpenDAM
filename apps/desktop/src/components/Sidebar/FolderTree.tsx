@@ -2,9 +2,7 @@ import { useEffect, useState } from 'react';
 import clsx from 'clsx';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { useAssetStore, useFolderTreeStore, useLiveCountsStore } from '../../store';
-import type { Cover } from '../../types';
-import { ContextMenu } from '../ContextMenu/ContextMenu';
-import { folderMenuItems } from '../FolderActions';
+import type { Cover, FolderNode } from '../../types';
 import { tileMedia } from '../AssetGrid/tileState';
 import { IconChevronDown, IconChevronRight, IconFolder, IconPackage } from '../Icons';
 import { folderCount, isFolderShown } from './sidebarHelpers';
@@ -15,6 +13,8 @@ interface FolderTreeProps {
   /** The node whose children this lists; `''` is the library root */
   parentPath: string;
   onSelect: (libraryId: string, path: string) => void;
+  /** A right-click on a node */
+  onMenu: (e: React.MouseEvent, libraryId: string, node: FolderNode) => void;
 }
 
 /**
@@ -23,7 +23,7 @@ interface FolderTreeProps {
  * files are left out. While search text or a filter is on, each badge counts the matching items
  * below its folder, once they are counted, and a folder with none dims.
  */
-export function FolderTree({ libraryId, parentPath, onSelect }: FolderTreeProps) {
+export function FolderTree({ libraryId, parentPath, onSelect, onMenu }: FolderTreeProps) {
   const nodes = useFolderTreeStore((s) => s.children[libraryId]?.[parentPath]);
   const expanded = useFolderTreeStore((s) => s.expanded[libraryId]);
   const toggle = useFolderTreeStore((s) => s.toggle);
@@ -32,9 +32,6 @@ export function FolderTree({ libraryId, parentPath, onSelect }: FolderTreeProps)
   const live = useLiveCountsStore((s) => s.live);
   const liveCounts = useLiveCountsStore((s) => s.folders[libraryId]?.[parentPath]);
   const countFolders = useLiveCountsStore((s) => s.countFolders);
-  const [menu, setMenu] = useState<{ x: number; y: number; path: string; name: string } | null>(
-    null
-  );
 
   // A node expanded while counts are live asks for its children's; a recount asks for them all
   useEffect(() => {
@@ -64,10 +61,7 @@ export function FolderTree({ libraryId, parentPath, onSelect }: FolderTreeProps)
                 liveCount === 0 && styles.noMatches
               )}
               onClick={() => onSelect(libraryId, node.path)}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                setMenu({ x: e.clientX, y: e.clientY, path: node.path, name: node.name });
-              }}
+              onContextMenu={(e) => onMenu(e, libraryId, node)}
               data-library-id={libraryId}
               data-folder-path={node.path}
               data-pack={node.isPack || undefined}
@@ -102,19 +96,16 @@ export function FolderTree({ libraryId, parentPath, onSelect }: FolderTreeProps)
               )}
             </div>
             {isOpen && hasChildren && (
-              <FolderTree libraryId={libraryId} parentPath={node.path} onSelect={onSelect} />
+              <FolderTree
+                libraryId={libraryId}
+                parentPath={node.path}
+                onSelect={onSelect}
+                onMenu={onMenu}
+              />
             )}
           </div>
         );
       })}
-      {menu && (
-        <ContextMenu
-          x={menu.x}
-          y={menu.y}
-          onClose={() => setMenu(null)}
-          items={folderMenuItems({ libraryId, path: menu.path, name: menu.name })}
-        />
-      )}
     </div>
   );
 }

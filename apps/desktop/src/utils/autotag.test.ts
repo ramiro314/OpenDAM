@@ -132,6 +132,23 @@ describe('scopeFor', () => {
       allAssets: true,
     });
   });
+
+  test('a folder target sends its library, its path and the All assets choice', () => {
+    const pack = {
+      kind: 'folder',
+      libraryId: 'lib-1',
+      path: '3D/Car Kit',
+      name: 'Car Kit',
+    } as const;
+
+    expect(scopeFor(pack, false)).toEqual({
+      kind: 'folder',
+      libraryId: 'lib-1',
+      path: '3D/Car Kit',
+      allAssets: false,
+    });
+    expect(scopeFor(pack, true)).toMatchObject({ kind: 'folder', allAssets: true });
+  });
 });
 
 describe('modeOptions', () => {
