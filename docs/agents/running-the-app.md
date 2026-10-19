@@ -346,9 +346,9 @@ the script then skips its warm-up. Check `PRAGMA integrity_check` and the asset 
 `~/.cache/opendam-bench/golden.json` records the source, the time, the asset count (83,095), the
 size, the commit, and the commit and time it was warmed at. The current snapshot was taken on
 2026-10-17 at `a23b513` and warmed on 2026-10-19 at `3063d46`, which cleared 56,698 upscaled
-thumbnails and took it from 5.3 GB to 2.1 GB. The unwarmed one is kept as
-`kenney-golden-2026-10-17`, with its manifest beside it. The timing baseline on the warmed one
-(gpu-shm) is kept as `~/.cache/opendam-bench/kenney-golden-baseline-gpu-shm.json`.
+thumbnails and took it from 5.3 GB to 2.1 GB. The unwarmed one was deleted, so results from
+before 2026-10-19 are history, not baselines. The timing baseline on the warmed one (gpu-shm) is
+kept as `~/.cache/opendam-bench/kenney-golden-baseline-gpu-shm.json`.
 Every comparison uses this same snapshot, so a baseline can be rerun on identical data at any
 later step; your live library only gets new indexes or cleanup passes when you run a build that
 has them. Each run copy takes as much disk again until the script deletes it. Don't refresh the
