@@ -175,4 +175,19 @@ describe('useFolderTreeStore', () => {
       '3D assets/Platformer Kit',
     ]);
   });
+
+  test('revealing a pack expands the library row and every folder above it, not the pack', async () => {
+    const calls = serve(() => ({ kenney: KENNEY }));
+    await tree().toggle('kenney', '');
+
+    await tree().reveal('kenney', '3D assets/Platformer Kit/Models');
+    expect(tree().expanded.kenney).toEqual(['', '3D assets', '3D assets/Platformer Kit']);
+    expect(calls).toEqual(['kenney:', 'kenney:3D assets', 'kenney:3D assets/Platformer Kit']);
+
+    // Revealing a shown node expands nothing more
+    await tree().reveal('kenney', '3D assets/Nature Kit');
+    expect(tree().expanded.kenney).toEqual(['', '3D assets', '3D assets/Platformer Kit']);
+    await tree().reveal('other', '');
+    expect(tree().expanded.other).toBeUndefined();
+  });
 });

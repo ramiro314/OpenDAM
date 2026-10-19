@@ -9,6 +9,7 @@ import type {
   TagPatch,
   SearchQuery,
   FilterSpec,
+  FolderRef,
   SortField,
   SortOrder,
   AutotagLastUsed,
@@ -807,3 +808,22 @@ export const useCollectionStore = create<CollectionStore>()((set) => ({
 }));
 
 export { useFolderTreeStore } from './folderTree';
+export { usePacksStore, packKey } from './packs';
+
+/**
+ * Selects tree node `folder` and searches it. A folder names its own library, so it replaces the
+ * library and collection selection. The sidebar also clears its smart filter.
+ */
+export function selectFolder(folder: FolderRef) {
+  const ui = useUIStore.getState();
+  ui.setActiveCollection(null);
+  ui.clearLibrarySelection();
+  const assets = useAssetStore.getState();
+  assets.setQuery({
+    libraryIds: undefined,
+    libraryId: undefined,
+    collectionId: undefined,
+    folder,
+  });
+  void assets.search();
+}

@@ -4,6 +4,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { api } from '../../api';
 import { useUIStore, useAssetStore, useLibraryStore, useAutotagStore } from '../../store';
+import { useBrowseView } from '../../hooks/useBrowseView';
 import { PAGE_SIZE, assetAt, createSettler } from '../../store/pageCache';
 import { autotagAvailability } from '../../utils/autotag';
 import { menuTargets, openLimitReason } from '../../utils/contextMenu';
@@ -16,6 +17,7 @@ import { AssetCard } from './AssetCard';
 import { CARD_BODY_HEIGHT } from './cardMetrics';
 import { AssetListRow } from './AssetListRow';
 import { FilterBar } from './FilterBar';
+import { PacksView } from './PacksView';
 import {
   GRID_GAP,
   LIST_ROW_HEIGHT,
@@ -55,6 +57,7 @@ export function AssetGrid() {
   const openAutotagDialog = useAutotagStore((s) => s.openAutotagDialog);
   const requestDelete = useUIStore((s) => s.requestDelete);
   const [menu, setMenu] = useState<{ x: number; y: number; assetIds: string[] } | null>(null);
+  const { view } = useBrowseView();
 
   const handleBackdropClick = useCallback(
     (e: React.MouseEvent) => {
@@ -81,6 +84,8 @@ export function AssetGrid() {
     [selectAsset]
   );
 
+  if (view === 'packs') return <PacksView />;
+
   if (searchError && !loading) {
     return (
       <div className={styles.container}>
@@ -93,7 +98,8 @@ export function AssetGrid() {
     );
   }
 
-  if (loading && cachedPages === 0) {
+  // Also while the selected node's packs load, which may show the Packs view
+  if (view === 'loading' || (loading && cachedPages === 0)) {
     return (
       <div className={styles.container}>
         <FilterBar />

@@ -102,10 +102,12 @@ docs/plans                    Plans for this fork
   `db::upsert_collection`), never `REPLACE`, which cascade-deletes memberships and child
   collections.
 
-- **Structure is derived.** `folders` (each folder's path, parent, name, `is_pack`, and its
-  recursive `item_count` and `hidden_count`, the root being `path = ''`) and `assets.support_role`
-  are recomputed by `structure.rs` from the indexed paths: `structure::derive` is a pure
-  function, and the pass writes only the rows that changed, in 200-row transactions. Opening a
+- **Structure is derived.** `folders` (each folder's path, parent, name, `is_pack`, its
+  recursive `item_count` and `hidden_count`, the root being `path = ''`, and a pack's cover and
+  name in `pack_json`) and `assets.support_role` are recomputed by `structure.rs` from the indexed
+  paths: `structure::derive` is a pure function, and the pass writes only the rows that changed,
+  in 200-row transactions. The pass reads a pack's license file for its name only when the file's
+  size or mtime changed since it last read it. Opening a
   library DB (`connect_library_sqlite`) runs the pass once, and every `watcher::index_paths` run
   ends with it, under the library's `Database::index_lock`. Only `structure.rs` writes `folders`
   and `support_role`: a command that changes the indexed paths (`delete_asset`, `delete_assets`,

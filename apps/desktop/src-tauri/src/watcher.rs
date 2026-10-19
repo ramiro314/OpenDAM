@@ -370,7 +370,7 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
     // ── 5. Derive the folder tree, still under both locks ─────────────────
     // A failed pass is logged, not returned: the run's writes went through, so the caller still
     // emits `library:updated`, and the next pass derives the folders again.
-    if let Err(e) = crate::structure::rebuild(&pool).await {
+    if let Err(e) = crate::structure::rebuild(&pool, &root_path).await {
         tracing::error!(target: "structure", "Structure pass failed for library {library_id}: {e}");
     }
 

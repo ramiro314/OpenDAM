@@ -1,5 +1,12 @@
 import { useCallback, useState } from 'react';
-import { useUIStore, useAssetStore, useLibraryStore, useAutotagStore } from '../../store';
+import {
+  useUIStore,
+  useAssetStore,
+  useLibraryStore,
+  useAutotagStore,
+  usePacksStore,
+} from '../../store';
+import { useBrowseView } from '../../hooks/useBrowseView';
 import { api } from '../../api';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
@@ -14,9 +21,12 @@ import {
   IconSmooth,
   IconSettings,
   IconTag,
+  IconPackage,
+  IconImage,
 } from '../Icons';
 import { SettingsDialog } from '../Settings/SettingsDialog';
 import { autotagAvailability } from '../../utils/autotag';
+import { isSearching } from '../../utils/packsView';
 import styles from './Toolbar.module.css';
 import clsx from 'clsx';
 
@@ -42,7 +52,10 @@ export function Toolbar() {
   const fetchProviders = useAutotagStore((s) => s.fetchProviders);
   const openAutotagDialog = useAutotagStore((s) => s.openAutotagDialog);
   const [autotagReasonShown, setAutotagReasonShown] = useState(false);
+  const { view, hasPacks } = useBrowseView();
+  const setBrowseMode = usePacksStore((s) => s.setMode);
   const autotag = autotagAvailability(providers, selectedAssetIds.size);
+  const searching = isSearching(query);
 
   // A disabled button shows no tooltip in every webview, so a click shows the reason instead.
   const handleAutotag = () => {
@@ -165,6 +178,45 @@ export function Toolbar() {
 
       {/* Right controls */}
       <div className={styles.controls}>
+        {/* Packs or assets, when the selected node has packs below it */}
+        {hasPacks && (
+          <div className={styles.buttonGroup} role="group" aria-label="Show packs or assets">
+            <button
+              id="browse-packs"
+              className={clsx(
+                styles.iconBtn,
+                styles.segmentBtn,
+                view === 'packs' && styles.active,
+                searching && styles.dimmed
+              )}
+              onClick={() => setBrowseMode('packs')}
+              aria-pressed={view === 'packs'}
+              title={
+                searching
+                  ? 'A search or filter shows assets: clear it to see the packs'
+                  : 'Show the packs below this folder'
+              }
+            >
+              <IconPackage size={14} />
+              <span>Packs</span>
+            </button>
+            <button
+              id="browse-assets"
+              className={clsx(
+                styles.iconBtn,
+                styles.segmentBtn,
+                view === 'assets' && styles.active
+              )}
+              onClick={() => setBrowseMode('assets')}
+              aria-pressed={view === 'assets'}
+              title="Show the assets below this folder"
+            >
+              <IconImage size={14} />
+              <span>Assets</span>
+            </button>
+          </div>
+        )}
+
         {/* Grid size */}
         {viewMode === 'grid' && (
           <div className={styles.buttonGroup}>

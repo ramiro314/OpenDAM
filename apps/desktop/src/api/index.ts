@@ -4,6 +4,7 @@ import type {
   Library,
   Collection,
   FolderNode,
+  PackCard,
   Tag,
   TagPatch,
   AddLibraryPayload,
@@ -53,6 +54,9 @@ export const api = {
   // Folder tree: the children of one node, `''` being the library root
   getFolders: (libraryId: string, parentPath: string) =>
     invoke<FolderNode[]>('get_folders', { libraryId, parentPath }),
+  /** The packs below `underPath` in each of `libraryIds`, or in every library when null */
+  getPacks: (libraryIds: string[] | null, underPath: string) =>
+    invoke<PackCard[]>('get_packs', { libraryIds, underPath }),
 
   // Tags
   listTags: () => invoke<Tag[]>('list_tags'),

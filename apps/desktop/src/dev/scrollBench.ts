@@ -7,7 +7,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { useAssetStore, useUIStore } from '../store';
+import { useAssetStore, usePacksStore, useUIStore } from '../store';
 import { frameStats, minMax, rssStats, seededRandom, timeStats } from './benchStats';
 import { UI_CHECKS, runUiChecks, selectChecks, type UiCheckContext } from './uiChecks';
 
@@ -96,10 +96,12 @@ function recordFrames() {
   };
 }
 
-/** Grid view at `size`, a fresh search, scrolled to the top, visible tiles ready. */
+/** The assets' grid view at `size`, a fresh search, scrolled to the top, visible tiles ready. */
 async function resetGrid(size: GridSize): Promise<void> {
   const ui = useUIStore.getState();
   ui.clearSelection();
+  // On the assets, which the toggle may have left (U10)
+  usePacksStore.getState().setMode('assets');
   ui.setViewMode('grid');
   ui.setGridSize(size);
   await useAssetStore.getState().search();
@@ -317,6 +319,8 @@ export async function startScrollBench(mode: string): Promise<void> {
 
   const report: Record<string, unknown> = { kind };
   let renderMode = 'unknown';
+  // The scenarios and checks start on the assets' grid: the library root has packs below it
+  usePacksStore.getState().setMode('assets');
   try {
     renderMode = await invoke<string>('bench_render_mode');
     const only = await invoke<string | null>('bench_only');

@@ -429,3 +429,11 @@
   flex-shrink: 0;
   color: var(--color-brand-400);
 }
+/* A pack node's cover, in the pack icon's place */
+.packCover {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  object-fit: cover;
+}

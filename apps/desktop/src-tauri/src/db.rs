@@ -337,8 +337,13 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     }
 
     // The folder tree, so a library has it from its first open even when the index run that
-    // follows fails. Nothing else holds this new pool yet, so the pass needs no index lock.
-    if let Err(e) = crate::structure::rebuild(&pool).await {
+    // follows fails. Nothing else holds this new pool yet, so the pass needs no index lock. The
+    // DB is `<root>/.opendam/library.sqlite`.
+    let root = db_path
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(Path::new(""));
+    if let Err(e) = crate::structure::rebuild(&pool, root).await {
         tracing::warn!("Could not derive the folder tree of {db_path:?}: {e}");
     }
 

@@ -7,6 +7,7 @@ import {
   useAssetStore,
   useAutotagStore,
   useFolderTreeStore,
+  selectFolder,
 } from '../../store';
 import type { Library } from '../../types';
 import { autotagAvailability } from '../../utils/autotag';
@@ -94,15 +95,7 @@ export function LibrariesSection({ clearSmartFilter }: LibrariesSectionProps) {
   // A folder names its own library, so it replaces the library selection
   const handleFolderClick = (libraryId: string, path: string) => {
     clearSmartFilter();
-    setActiveCollection(null);
-    clearLibrarySelection();
-    setQuery({
-      libraryIds: undefined,
-      libraryId: undefined,
-      collectionId: undefined,
-      folder: { libraryId, path },
-    });
-    search();
+    selectFolder({ libraryId, path });
   };
 
   const executeRemove = async () => {

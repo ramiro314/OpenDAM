@@ -2567,7 +2567,7 @@ mod tests {
             .await
             .unwrap();
         }
-        crate::structure::rebuild(&pool).await.unwrap();
+        crate::structure::rebuild(&pool, &root).await.unwrap();
         (root, db, pool)
     }
 
@@ -2841,7 +2841,9 @@ mod tests {
 
     async fn library_with_packs(id: &str, paths: &[&str]) -> LibraryHandle {
         let library = library_of(id, paths).await;
-        structure::rebuild(&library.pool).await.unwrap();
+        structure::rebuild(&library.pool, &library.root_path)
+            .await
+            .unwrap();
         library
     }
 
@@ -3096,6 +3098,17 @@ mod tests {
         );
     }
 
+    /// The golden snapshot's files, for the license headers the structure pass reads:
+    /// `OPENDAM_GOLDEN_ROOT`, or the snapshot's usual place.
+    pub(crate) fn golden_root() -> PathBuf {
+        std::env::var_os("OPENDAM_GOLDEN_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("HOME").expect("HOME is set"))
+                    .join(".cache/opendam-bench/kenney-golden")
+            })
+    }
+
     /// Checks the folder range on a copy of the golden snapshot's library DB, named by
     /// `OPENDAM_GOLDEN_DB` (opening it runs the schema, so never point it at a live library):
     /// `cargo nextest run --run-ignored only golden_snapshot`.
@@ -3205,14 +3218,18 @@ mod tests {
             .await
             .unwrap();
         let started = Instant::now();
-        let written = crate::structure::rebuild(&pool).await.unwrap();
+        let written = crate::structure::rebuild(&pool, &golden_root())
+            .await
+            .unwrap();
         timed(
             &format!("first pass, {written} rows written"),
             started.elapsed(),
             Duration::from_secs(10),
         );
         let started = Instant::now();
-        let written = crate::structure::rebuild(&pool).await.unwrap();
+        let written = crate::structure::rebuild(&pool, &golden_root())
+            .await
+            .unwrap();
         timed(
             &format!("rerun with no changes, {written} rows written"),
             started.elapsed(),
@@ -3226,7 +3243,9 @@ mod tests {
         let mut queue = vec![String::new()];
         while let Some(parent) = queue.pop() {
             let started = Instant::now();
-            let children = child_folders(&pool, &parent).await.unwrap();
+            let children = child_folders(&pool, &library.root_path, &parent)
+                .await
+                .unwrap();
             let took = started.elapsed();
             if took > slowest.0 {
                 slowest = (took, parent);
@@ -3239,7 +3258,7 @@ mod tests {
             slowest.0,
             Duration::from_millis(50),
         );
-        let top = child_folders(&pool, "").await.unwrap();
+        let top = child_folders(&pool, &library.root_path, "").await.unwrap();
         println!(
             "top-level folders: {}",
             top.iter()
@@ -3247,7 +3266,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let kit = child_folders(&pool, "3D assets")
+        let kit = child_folders(&pool, &library.root_path, "3D assets")
             .await
             .unwrap()
             .into_iter()
@@ -3306,7 +3325,7 @@ mod tests {
             started.elapsed(),
             Duration::from_secs(2),
         );
-        let after = child_folders(&pool, "3D assets")
+        let after = child_folders(&pool, &library.root_path, "3D assets")
             .await
             .unwrap()
             .into_iter()
@@ -3317,7 +3336,12 @@ mod tests {
             after.path, after.item_count
         );
         assert_eq!(after.item_count, kit.item_count - 1);
-        assert_eq!(crate::structure::rebuild(&pool).await.unwrap(), 0);
+        assert_eq!(
+            crate::structure::rebuild(&pool, &golden_root())
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     /// The packs (A2) and the hidden support files on a copy of the golden snapshot's library DB,
@@ -3425,6 +3449,105 @@ mod tests {
             "library root: {} items ({} files)",
             root.total.unwrap(),
             root.file_total.unwrap()
+        );
+    }
+
+    /// The library root's Packs view on a copy of the golden snapshot's library DB, named by
+    /// `OPENDAM_GOLDEN_DB` as above, with the snapshot's license files read from `golden_root`:
+    /// `cargo nextest run --run-ignored only golden_snapshot --no-capture`.
+    #[tokio::test]
+    #[ignore = "needs OPENDAM_GOLDEN_DB, a copy of the golden snapshot's library.sqlite"]
+    async fn the_packs_view_of_the_golden_snapshot_shows_every_pack_with_a_cover() {
+        use crate::commands::folder::packs_below;
+        let file = std::env::var("OPENDAM_GOLDEN_DB").expect("OPENDAM_GOLDEN_DB is set");
+        let pool = crate::db::connect_library_sqlite(Path::new(&file))
+            .await
+            .unwrap();
+        let root = golden_root();
+        crate::structure::rebuild(&pool, &root).await.unwrap();
+        let library = LibraryHandle {
+            id: "golden".to_string(),
+            name: "golden".to_string(),
+            root_path: root.clone(),
+            pool: pool.clone(),
+        };
+        let started = std::time::Instant::now();
+        let cards = packs_below(std::slice::from_ref(&library), "")
+            .await
+            .unwrap();
+        println!("{} cards in {:?}", cards.len(), started.elapsed());
+        let no_cover: Vec<&str> = cards
+            .iter()
+            .filter(|c| c.cover.is_none())
+            .map(|c| c.path.as_str())
+            .collect();
+        let no_items: Vec<&str> = cards
+            .iter()
+            .filter(|c| c.item_count == 0)
+            .map(|c| c.path.as_str())
+            .collect();
+        let named = cards
+            .iter()
+            .filter(|c| Some(c.name.as_str()) != c.path.rsplit('/').next())
+            .count();
+        println!("without a cover: {no_cover:?}");
+        println!("{} with no visible items: {no_items:?}", no_items.len());
+        println!("{named} named by their license header, unlike their folder");
+        for card in cards.iter().take(5) {
+            println!(
+                "{} ({}): {:?}",
+                card.name,
+                card.parent_path,
+                card.cover.as_ref().map(|c| &c.file_path)
+            );
+        }
+        assert_eq!(cards.len(), 254);
+        assert_eq!(no_cover, [] as [&str; 0]);
+        assert_eq!(no_items.len(), 24);
+        // The 11 zip-only folders in `Archive/` hold no indexed file, so they have no row.
+        let archive: Vec<&str> = cards
+            .iter()
+            .map(|c| c.path.as_str())
+            .filter(|p| p.starts_with("Archive/"))
+            .collect();
+        assert_eq!(
+            archive,
+            [
+                "Archive/Mini Car Kit",
+                "Archive/Onscreen Controls",
+                "Archive/Pre-rendered Models",
+                "Archive/Space Kit (Legacy)"
+            ]
+        );
+        let names: Vec<String> = cards.iter().map(|c| c.name.to_ascii_lowercase()).collect();
+        assert!(
+            names.windows(2).all(|w| w[0] <= w[1]),
+            "the cards are not in name order"
+        );
+        let car = cards
+            .iter()
+            .find(|c| c.path == "3D assets/Car Kit")
+            .unwrap();
+        assert_eq!(
+            (car.name.as_str(), car.parent_path.as_str()),
+            ("Car Kit", "3D assets")
+        );
+        // Every cover is an indexed image of its own pack.
+        for card in &cards {
+            let cover = card.cover.as_ref().unwrap();
+            assert!(
+                cover
+                    .file_path
+                    .starts_with(&format!("{}/{}/", root.display(), card.path)),
+                "{} has cover {}",
+                card.path,
+                cover.file_path
+            );
+        }
+        assert_eq!(
+            crate::structure::rebuild(&pool, &root).await.unwrap(),
+            0,
+            "a rerun rewrote pack info"
         );
     }
 }

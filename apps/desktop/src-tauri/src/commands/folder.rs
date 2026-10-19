@@ -1,14 +1,55 @@
 use serde::Serialize;
 use sqlx::{Pool, Sqlite};
+use std::path::Path;
 use std::sync::Arc;
 use tauri::State;
 
+use crate::db::{resolve_path, LibraryHandle};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
 
+/// A pack's cover image, with what a card needs to show it as a grid tile shows an asset.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Cover {
+    /// Absolute
+    pub file_path: String,
+    /// Absolute, when the image has a thumbnail
+    pub thumbnail_path: Option<String>,
+    pub extension: String,
+    pub kind: String,
+}
+
+/// The columns a cover is read from: its `folders` row `f` joined to the cover's asset row `c`
+/// (`COVER_JOIN`), on the unique `file_path` index.
+const COVER_COLUMNS: &str = "c.file_path AS cover_path, c.thumbnail_path AS cover_thumbnail,
+    c.extension AS cover_extension, c.kind AS cover_kind";
+const COVER_JOIN: &str = "LEFT JOIN assets c ON c.file_path = json_extract(f.pack_json, '$.cover')";
+
+/// A cover's columns, as `COVER_COLUMNS` names them.
+#[derive(sqlx::FromRow)]
+struct CoverRow {
+    cover_path: Option<String>,
+    cover_thumbnail: Option<String>,
+    cover_extension: Option<String>,
+    cover_kind: Option<String>,
+}
+
+impl CoverRow {
+    /// The cover with its paths made absolute below `root`, if the pack has one.
+    fn into_cover(self, root: &Path) -> Option<Cover> {
+        Some(Cover {
+            file_path: resolve_path(root, &self.cover_path?),
+            thumbnail_path: self.cover_thumbnail.map(|t| resolve_path(root, &t)),
+            extension: self.cover_extension.unwrap_or_default(),
+            kind: self.cover_kind.unwrap_or_default(),
+        })
+    }
+}
+
 /// One node of a library's folder tree, as the structure pass derived it.
-#[derive(Debug, PartialEq, Serialize, sqlx::FromRow)]
+#[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderNode {
     pub name: String,
@@ -24,6 +65,22 @@ pub struct FolderNode {
     pub shown_without_hidden: bool,
     /// Whether a child shows with hidden files off, by the same rule
     pub has_visible_children: bool,
+    /// A pack's cover image
+    pub cover: Option<Cover>,
+}
+
+#[derive(sqlx::FromRow)]
+struct NodeRow {
+    name: String,
+    path: String,
+    is_pack: bool,
+    item_count: i64,
+    hidden_count: i64,
+    has_children: bool,
+    shown_without_hidden: bool,
+    has_visible_children: bool,
+    #[sqlx(flatten)]
+    cover: CoverRow,
 }
 
 /// The one rule for whether folder `f` shows in the tree with hidden files off: it has visible
@@ -51,7 +108,7 @@ pub async fn get_folders(
         .get_library_handle(&library_id)
         .await
         .ok_or_else(|| format!("Library {library_id} is not open"))?;
-    child_folders(&library.pool, &parent_path)
+    child_folders(&library.pool, &library.root_path, &parent_path)
         .await
         .map_err(|e| e.to_string())
 }
@@ -59,28 +116,149 @@ pub async fn get_folders(
 /// Reads one node's children from `idx_folders_parent_name`; `path` breaks ties between names
 /// that differ only in case. Only edge slashes are dropped from `parent_path`: folder names keep
 /// their spaces, as on disk. A node and its children show with hidden files off by the same
-/// `shown_without_hidden` rule.
+/// `shown_without_hidden` rule. Cover paths are made absolute below `root`.
 pub(crate) async fn child_folders(
     pool: &Pool<Sqlite>,
+    root: &Path,
     parent_path: &str,
 ) -> sqlx::Result<Vec<FolderNode>> {
     let sql = format!(
         "SELECT f.name, f.path, f.is_pack, f.item_count, f.hidden_count,
-                EXISTS (SELECT 1 FROM folders c WHERE c.parent_path = f.path) AS has_children,
+                EXISTS (SELECT 1 FROM folders k WHERE k.parent_path = f.path) AS has_children,
                 {} AS shown_without_hidden,
                 EXISTS (
-                    SELECT 1 FROM folders c WHERE c.parent_path = f.path AND {}
-                ) AS has_visible_children
-         FROM folders f
+                    SELECT 1 FROM folders k WHERE k.parent_path = f.path AND {}
+                ) AS has_visible_children,
+                {COVER_COLUMNS}
+         FROM folders f {COVER_JOIN}
          WHERE f.parent_path = ?
          ORDER BY f.name COLLATE NOCASE, f.path",
         shown_without_hidden("f"),
-        shown_without_hidden("c"),
+        shown_without_hidden("k"),
     );
-    sqlx::query_as(&sql)
+    let rows: Vec<NodeRow> = sqlx::query_as(&sql)
         .bind(parent_path.trim_matches('/'))
         .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| FolderNode {
+            name: r.name,
+            path: r.path,
+            is_pack: r.is_pack,
+            item_count: r.item_count,
+            hidden_count: r.hidden_count,
+            has_children: r.has_children,
+            shown_without_hidden: r.shown_without_hidden,
+            has_visible_children: r.has_visible_children,
+            cover: r.cover.into_cover(root),
+        })
+        .collect())
+}
+
+/// One card of the Packs view.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackCard {
+    pub library_id: String,
+    /// Relative to the library root
+    pub path: String,
+    /// The name the structure pass gave the pack: its license header's, else its folder's
+    pub name: String,
+    /// The folder holding the pack, the card's subtitle; `''` for the library root
+    pub parent_path: String,
+    /// Visible files below the pack; 0 shows as "No visible items"
+    pub item_count: i64,
+    pub hidden_count: i64,
+    pub cover: Option<Cover>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PackRow {
+    path: String,
+    parent_path: Option<String>,
+    folder_name: String,
+    pack_name: Option<String>,
+    item_count: i64,
+    hidden_count: i64,
+    #[sqlx(flatten)]
+    cover: CoverRow,
+}
+
+/// Every pack below `under_path` (`""` for the root) in each library of `library_ids`, or in
+/// every open library when it is `None`, in one list sorted by name ignoring case (D20).
+#[tauri::command]
+pub async fn get_packs(
+    library_ids: Option<Vec<String>>,
+    under_path: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<PackCard>> {
+    let libraries = match library_ids {
+        None => state.db.get_all_libraries().await,
+        Some(ids) => {
+            let mut open = Vec::new();
+            for id in ids {
+                open.push(
+                    state
+                        .db
+                        .get_library_handle(&id)
+                        .await
+                        .ok_or_else(|| format!("Library {id} is not open"))?,
+                );
+            }
+            open
+        }
+    };
+    packs_below(&libraries, &under_path)
         .await
+        .map_err(|e| e.to_string())
+}
+
+/// The packs strictly below `under_path` in each of `libraries`, sorted by name, folding ASCII
+/// case only as `NOCASE` does, then by path, then by the library's place in `libraries`.
+pub(crate) async fn packs_below(
+    libraries: &[LibraryHandle],
+    under_path: &str,
+) -> sqlx::Result<Vec<PackCard>> {
+    let under = under_path.trim_matches('/');
+    // Below the root is every folder but the root; below `p`, the key range `p/ <= path < p0`.
+    let below = if under.is_empty() {
+        "f.path <> ''"
+    } else {
+        "f.path >= ?1 || '/' AND f.path < ?1 || '0'"
+    };
+    let sql = format!(
+        "SELECT f.path, f.parent_path, f.name AS folder_name,
+                json_extract(f.pack_json, '$.name') AS pack_name,
+                f.item_count, f.hidden_count, {COVER_COLUMNS}
+         FROM folders f {COVER_JOIN}
+         WHERE f.is_pack AND {below}"
+    );
+    let mut cards = Vec::new();
+    for library in libraries {
+        let mut query = sqlx::query_as::<_, PackRow>(&sql);
+        if !under.is_empty() {
+            query = query.bind(under);
+        }
+        let rows = query.fetch_all(&library.pool).await?;
+        cards.extend(rows.into_iter().map(|r| PackCard {
+            library_id: library.id.clone(),
+            path: r.path,
+            name: r.pack_name.unwrap_or(r.folder_name),
+            parent_path: r.parent_path.unwrap_or_default(),
+            item_count: r.item_count,
+            hidden_count: r.hidden_count,
+            cover: r.cover.into_cover(&library.root_path),
+        }));
+    }
+    // Stable, so packs that tie on name and path keep their libraries' order.
+    cards.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(cards)
 }
 
 #[cfg(test)]
@@ -101,7 +279,9 @@ mod tests {
             .await
             .unwrap();
         }
-        crate::structure::rebuild(&pool).await.unwrap();
+        crate::structure::rebuild(&pool, crate::structure::tests::unmounted())
+            .await
+            .unwrap();
         pool
     }
 
@@ -116,6 +296,7 @@ mod tests {
             has_children,
             shown_without_hidden: item_count > 0,
             has_visible_children: has_children,
+            cover: None,
         }
     }
 
@@ -130,7 +311,7 @@ mod tests {
             "Docs/Old/License.txt",
         ])
         .await;
-        let top = child_folders(&pool, "").await.unwrap();
+        let top = child_folders(&pool, Path::new("/lib"), "").await.unwrap();
         let summary: Vec<(&str, bool, i64, i64, bool, bool)> = top
             .iter()
             .map(|n| {
@@ -154,7 +335,9 @@ mod tests {
                 ("Docs", false, 1, 1, true, true),
             ]
         );
-        let kit = child_folders(&pool, "3D assets").await.unwrap();
+        let kit = child_folders(&pool, Path::new("/lib"), "3D assets")
+            .await
+            .unwrap();
         assert_eq!(
             (
                 kit[0].is_pack,
@@ -163,7 +346,9 @@ mod tests {
             ),
             (true, true, true)
         );
-        let casino = child_folders(&pool, "Audio").await.unwrap();
+        let casino = child_folders(&pool, Path::new("/lib"), "Audio")
+            .await
+            .unwrap();
         assert_eq!(
             (
                 casino[0].is_pack,
@@ -191,8 +376,13 @@ mod tests {
         let mut queue = vec![String::new()];
         let mut nodes = 0;
         while let Some(parent) = queue.pop() {
-            for node in child_folders(&pool, &parent).await.unwrap() {
-                let children = child_folders(&pool, &node.path).await.unwrap();
+            for node in child_folders(&pool, Path::new("/lib"), &parent)
+                .await
+                .unwrap()
+            {
+                let children = child_folders(&pool, Path::new("/lib"), &node.path)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     node.has_visible_children,
                     children.iter().any(|c| c.shown_without_hidden),
@@ -205,7 +395,9 @@ mod tests {
         }
         assert_eq!(nodes, 11);
         // `Sources` holds only hidden files and is no pack, so it alone is left out.
-        let sources = child_folders(&pool, "3D assets/Car Kit").await.unwrap();
+        let sources = child_folders(&pool, Path::new("/lib"), "3D assets/Car Kit")
+            .await
+            .unwrap();
         let shown: Vec<(&str, bool)> = sources
             .iter()
             .map(|n| (n.name.as_str(), n.shown_without_hidden))
@@ -222,7 +414,7 @@ mod tests {
             "kit/Sources/game.txt",
         ])
         .await;
-        let kit = &child_folders(&pool, "").await.unwrap()[0];
+        let kit = &child_folders(&pool, Path::new("/lib"), "").await.unwrap()[0];
         assert_eq!(
             (
                 kit.is_pack,
@@ -252,7 +444,10 @@ mod tests {
             node("textures", "textures", 1, false),
         ];
         for root in ["", "/"] {
-            assert_eq!(child_folders(&pool, root).await.unwrap(), expected);
+            assert_eq!(
+                child_folders(&pool, Path::new("/lib"), root).await.unwrap(),
+                expected
+            );
         }
     }
 
@@ -265,12 +460,17 @@ mod tests {
         ])
         .await;
         assert_eq!(
-            child_folders(&pool, "3D assets/Platformer Kit/")
+            child_folders(&pool, Path::new("/lib"), "3D assets/Platformer Kit/")
                 .await
                 .unwrap(),
             [node("Models", "3D assets/Platformer Kit/Models", 1, false)]
         );
-        assert_eq!(child_folders(&pool, "nowhere").await.unwrap(), []);
+        assert_eq!(
+            child_folders(&pool, Path::new("/lib"), "nowhere")
+                .await
+                .unwrap(),
+            []
+        );
     }
 
     #[tokio::test]
@@ -282,15 +482,24 @@ mod tests {
         ])
         .await;
         assert_eq!(
-            child_folders(&pool, "Textures ").await.unwrap(),
+            child_folders(&pool, Path::new("/lib"), "Textures ")
+                .await
+                .unwrap(),
             [node("Rock", "Textures /Rock", 1, false)]
         );
         assert_eq!(
-            child_folders(&pool, "Textures").await.unwrap(),
+            child_folders(&pool, Path::new("/lib"), "Textures")
+                .await
+                .unwrap(),
             [node("Wood", "Textures/Wood", 1, false)]
         );
-        assert_eq!(child_folders(&pool, " Models").await.unwrap(), []);
-        let top: Vec<String> = child_folders(&pool, "")
+        assert_eq!(
+            child_folders(&pool, Path::new("/lib"), " Models")
+                .await
+                .unwrap(),
+            []
+        );
+        let top: Vec<String> = child_folders(&pool, Path::new("/lib"), "")
             .await
             .unwrap()
             .into_iter()
@@ -302,12 +511,138 @@ mod tests {
     #[tokio::test]
     async fn names_differing_only_in_case_keep_a_stable_order() {
         let pool = library(&["b/x.png", "B/y.png", "a/z.png"]).await;
-        let names: Vec<String> = child_folders(&pool, "")
+        let names: Vec<String> = child_folders(&pool, Path::new("/lib"), "")
             .await
             .unwrap()
             .into_iter()
             .map(|n| n.path)
             .collect();
         assert_eq!(names, ["a", "B", "b"]);
+    }
+
+    /// A library `id` at `/libraries/<id>` holding `paths`, with its pass run.
+    async fn library_handle(id: &str, paths: &[&str]) -> LibraryHandle {
+        let mut library = crate::db::memory_library(id, library(paths).await);
+        library.root_path = format!("/libraries/{id}").into();
+        library
+    }
+
+    /// Each card as `(library, path, name, parent, items)`.
+    fn summary(cards: &[PackCard]) -> Vec<(&str, &str, &str, &str, i64)> {
+        cards
+            .iter()
+            .map(|c| {
+                (
+                    c.library_id.as_str(),
+                    c.path.as_str(),
+                    c.name.as_str(),
+                    c.parent_path.as_str(),
+                    c.item_count,
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_packs_below_a_node_come_flat_and_by_name_across_libraries() {
+        let a = library_handle(
+            "a",
+            &[
+                "3D assets/space kit/License.txt",
+                "3D assets/space kit/rocket.png",
+                "3D assets/Car Kit/License.txt",
+                "3D assets/Car Kit/Preview.png",
+                "3D assets/Car Kit/Models/sedan.png",
+                "Audio/Casino Audio/License.txt",
+                "Audio/Casino Audio/Preview.png",
+                "Goodies/w.png",
+            ],
+        )
+        .await;
+        let b = library_handle(
+            "b",
+            &["Kits/Car Kit/License.txt", "Kits/Boat Kit/Sample.png"],
+        )
+        .await;
+        let libraries = [a, b];
+
+        let all = packs_below(&libraries, "").await.unwrap();
+        assert_eq!(
+            summary(&all),
+            [
+                ("b", "Kits/Boat Kit", "Boat Kit", "Kits", 0),
+                ("a", "3D assets/Car Kit", "Car Kit", "3D assets", 1),
+                ("b", "Kits/Car Kit", "Car Kit", "Kits", 0),
+                // Every file hidden: the card shows "No visible items".
+                ("a", "Audio/Casino Audio", "Casino Audio", "Audio", 0),
+                ("a", "3D assets/space kit", "space kit", "3D assets", 1),
+            ]
+        );
+        let car = &all[1];
+        assert_eq!(
+            car.cover,
+            Some(Cover {
+                file_path: "/libraries/a/3D assets/Car Kit/Preview.png".into(),
+                thumbnail_path: None,
+                extension: "png".into(),
+                kind: "texture".into(),
+            })
+        );
+        // The first image stands in when the pack has no preview or sample.
+        assert_eq!(
+            all[4].cover.as_ref().map(|c| c.file_path.as_str()),
+            Some("/libraries/a/3D assets/space kit/rocket.png")
+        );
+        // A pack whose only file is its license has no cover.
+        assert_eq!(all[2].cover, None);
+
+        let below = packs_below(&libraries, "3D assets/").await.unwrap();
+        assert_eq!(
+            below.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+            ["3D assets/Car Kit", "3D assets/space kit"]
+        );
+        // A pack itself has no packs below it, nor does a folder holding none.
+        assert_eq!(
+            packs_below(&libraries, "3D assets/Car Kit").await.unwrap(),
+            []
+        );
+        assert_eq!(packs_below(&libraries, "Goodies").await.unwrap(), []);
+        assert_eq!(packs_below(&libraries[1..], "3D assets").await.unwrap(), []);
+    }
+
+    #[tokio::test]
+    async fn a_card_shows_the_pass_name_and_the_covers_thumbnail() {
+        let library = library_handle("a", &["kits/kit/License.txt", "kits/kit/Preview.tga"]).await;
+        sqlx::query(
+            "UPDATE folders SET pack_json = json_set(pack_json, '$.name', 'Kit Deluxe')
+             WHERE path = 'kits/kit'",
+        )
+        .execute(&library.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE assets SET thumbnail_path = '.opendam/thumbs/p_thumb.png', extension = 'tga'
+             WHERE file_path = 'kits/kit/Preview.tga'",
+        )
+        .execute(&library.pool)
+        .await
+        .unwrap();
+        let cards = packs_below(std::slice::from_ref(&library), "")
+            .await
+            .unwrap();
+        assert_eq!(cards[0].name, "Kit Deluxe");
+        let cover = cards[0].cover.as_ref().unwrap();
+        assert_eq!(
+            (cover.thumbnail_path.as_deref(), cover.extension.as_str()),
+            (Some("/libraries/a/.opendam/thumbs/p_thumb.png"), "tga")
+        );
+        // The tree's pack node carries the same cover, and keeps its folder's name.
+        let node = &child_folders(&library.pool, &library.root_path, "kits")
+            .await
+            .unwrap()[0];
+        assert_eq!(
+            (node.name.as_str(), node.cover.as_ref()),
+            ("kit", Some(cover))
+        );
     }
 }

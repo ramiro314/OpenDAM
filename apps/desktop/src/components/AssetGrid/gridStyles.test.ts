@@ -12,12 +12,13 @@ function backdropFilters(css: string): string[] {
 }
 
 describe('grid and list styles', () => {
-  test('cover the card, the list row and the grid', () => {
+  test('cover the card, the list row, the grid and the pack card', () => {
     expect(stylesheets).toEqual(
       expect.arrayContaining([
         'AssetCard.module.css',
         'AssetGrid.module.css',
         'AssetListRow.module.css',
+        'PackCard.module.css',
       ])
     );
   });
