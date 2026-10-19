@@ -1,7 +1,7 @@
 .sidebar {
   width: var(--sidebar-width);
-  /* PANEL_LIMITS.sidebar.min in utils/panelSize.ts */
-  min-width: 180px;
+  /* The layout body sets both from utils/panelSize.ts (layoutVars) */
+  min-width: var(--sidebar-min-width);
   display: flex;
   flex-direction: column;
   background: var(--color-bg-surface);

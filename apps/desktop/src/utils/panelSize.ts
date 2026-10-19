@@ -15,6 +15,28 @@ export const COLLAPSE_SLACK = 60;
 /** How far an arrow key on a panel's handle resizes it */
 export const KEY_STEP = 16;
 
+/** The CSS custom properties on the layout body that size each panel */
+export const PANEL_VARS: Record<PanelSide, { width: string; min: string }> = {
+  sidebar: { width: '--sidebar-width', min: '--sidebar-min-width' },
+  detail: { width: '--detail-panel-width', min: '--detail-panel-min-width' },
+};
+
+/** The CSS custom property on the layout body that holds the grid's minimum width */
+export const MAIN_MIN_WIDTH_VAR = '--main-min-width';
+
+/**
+ * The layout body's custom properties, so the CSS reads each panel's width and minimum, and the
+ * grid's minimum, from here rather than keeping copies that could drift from these limits.
+ */
+export function layoutVars(widths: Record<PanelSide, number>): Record<string, string> {
+  const vars: Record<string, string> = { [MAIN_MIN_WIDTH_VAR]: `${MAIN_MIN_WIDTH}px` };
+  for (const side of ['sidebar', 'detail'] as const) {
+    vars[PANEL_VARS[side].width] = `${clampPanelWidth(side, widths[side])}px`;
+    vars[PANEL_VARS[side].min] = `${PANEL_LIMITS[side].min}px`;
+  }
+  return vars;
+}
+
 /** `width` within the panel's limits and the `room` the grid leaves it, in whole pixels. */
 export function clampPanelWidth(side: PanelSide, width: number, room = Infinity): number {
   const { min, max } = PANEL_LIMITS[side];

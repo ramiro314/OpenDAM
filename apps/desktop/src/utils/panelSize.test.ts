@@ -2,10 +2,14 @@ import { describe, expect, test } from 'bun:test';
 import {
   COLLAPSE_SLACK,
   KEY_STEP,
+  MAIN_MIN_WIDTH,
+  MAIN_MIN_WIDTH_VAR,
   PANEL_LIMITS,
+  PANEL_VARS,
   clampPanelWidth,
   dragPanelWidth,
   keyPanelWidth,
+  layoutVars,
   settledPanelWidth,
 } from './panelSize';
 
@@ -92,5 +96,17 @@ describe('settledPanelWidth', () => {
   test('never below the minimum, and a stored width out of limits counts as clamped', () => {
     expect(settledPanelWidth('sidebar', sidebar.min - 0.5, 300)).toBe(sidebar.min);
     expect(settledPanelWidth('detail', detail.max, 5000)).toBeNull();
+  });
+});
+
+describe('layoutVars', () => {
+  test("gives the CSS each panel's clamped width and minimum, and the grid's minimum", () => {
+    expect(layoutVars({ sidebar: 300, detail: 5000 })).toEqual({
+      [PANEL_VARS.sidebar.width]: '300px',
+      [PANEL_VARS.sidebar.min]: `${sidebar.min}px`,
+      [PANEL_VARS.detail.width]: `${detail.max}px`,
+      [PANEL_VARS.detail.min]: `${detail.min}px`,
+      [MAIN_MIN_WIDTH_VAR]: `${MAIN_MIN_WIDTH}px`,
+    });
   });
 });

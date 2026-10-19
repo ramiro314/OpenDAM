@@ -29,7 +29,7 @@ import { api } from './api';
 import { startModelThumbnailer } from './preview/modelThumbnailer';
 import { isEditingText, isInControl } from './utils/keyboard';
 import { itemFileCount } from './utils/format';
-import { clampPanelWidth } from './utils/panelSize';
+import { layoutVars } from './utils/panelSize';
 import styles from './App.module.css';
 
 export default function App() {
@@ -276,10 +276,7 @@ export default function App() {
       <div
         className={styles.body}
         style={
-          {
-            '--sidebar-width': `${clampPanelWidth('sidebar', sidebarWidth)}px`,
-            '--detail-panel-width': `${clampPanelWidth('detail', detailPanelWidth)}px`,
-          } as React.CSSProperties
+          layoutVars({ sidebar: sidebarWidth, detail: detailPanelWidth }) as React.CSSProperties
         }
       >
         {sidebarOpen && <Sidebar />}

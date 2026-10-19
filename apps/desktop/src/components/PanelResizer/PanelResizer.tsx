@@ -3,6 +3,7 @@ import { useUIStore } from '../../store';
 import {
   MAIN_MIN_WIDTH,
   PANEL_LIMITS,
+  PANEL_VARS,
   clampPanelWidth,
   dragPanelWidth,
   keyPanelWidth,
@@ -10,11 +11,6 @@ import {
   type PanelSide,
 } from '../../utils/panelSize';
 import styles from './PanelResizer.module.css';
-
-const WIDTH_VAR: Record<PanelSide, string> = {
-  sidebar: '--sidebar-width',
-  detail: '--detail-panel-width',
-};
 
 const PANEL_ID: Record<PanelSide, string> = { sidebar: 'sidebar', detail: 'detail-panel' };
 
@@ -49,7 +45,7 @@ export function PanelResizer({ side }: { side: PanelSide }) {
   const label = side === 'sidebar' ? 'sidebar' : 'detail panel';
 
   const showWidth = (handle: HTMLElement, px: number) =>
-    handle.parentElement?.style.setProperty(WIDTH_VAR[side], `${px}px`);
+    handle.parentElement?.style.setProperty(PANEL_VARS[side].width, `${px}px`);
 
   const panelOf = (handle: HTMLElement, s = side) =>
     handle.parentElement?.querySelector<HTMLElement>(`:scope > #${PANEL_ID[s]}`) ?? null;
@@ -69,7 +65,7 @@ export function PanelResizer({ side }: { side: PanelSide }) {
       const stored = s === 'sidebar' ? ui.sidebarWidth : ui.detailPanelWidth;
       const settled = width === undefined ? null : settledPanelWidth(s, width, stored);
       if (settled === null) continue;
-      handle.parentElement?.style.setProperty(WIDTH_VAR[s], `${settled}px`);
+      handle.parentElement?.style.setProperty(PANEL_VARS[s].width, `${settled}px`);
       ui.setPanelWidth(s, settled);
     }
     const current = useUIStore.getState();
