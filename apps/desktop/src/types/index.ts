@@ -69,6 +69,11 @@ export interface Asset {
   /** Whether a preview job is pending/running */
   previewStatus: 'none' | 'pending' | 'generating' | 'done' | 'error';
   metadata: AssetMeta;
+  /**
+   * For the main item of a format group (one model in several formats, or a file's copies under
+   * format folders), every member's extension, its own first. Absent for a file on its own.
+   */
+  groupFormats?: string[];
 }
 
 export interface Library {

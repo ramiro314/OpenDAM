@@ -260,29 +260,7 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
             let mut thumbnail_path = None;
             let mut needs_job = false;
 
-            let needs_preview = matches!(
-                ext.as_str(),
-                "max"
-                    | "fbx"
-                    | "obj"
-                    | "gltf"
-                    | "glb"
-                    | "dae"
-                    | "stl"
-                    | "3ds"
-                    | "skp"
-                    | "rfa"
-                    | "rvt"
-                    | "dwg"
-                    | "3dm"
-                    | "vrmat"
-                    | "psd"
-                    | "psb"
-                    | "ai"
-                    | "exr"
-                    | "hdr"
-            ) || is_native_image(&ext);
-            if needs_preview {
+            if crate::preview::needs_preview(&ext) {
                 preview_status = "pending";
                 needs_job = true;
             }

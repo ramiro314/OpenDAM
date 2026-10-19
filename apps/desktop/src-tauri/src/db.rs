@@ -183,20 +183,41 @@ async fn add_tag_description_column(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// Backward compatibility: assets gained `support_role`, which the structure pass derives. As with
-/// tag descriptions, any failure other than the column already being there is an error, since
-/// every search reads it.
-async fn add_support_role_column(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
-    let present: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('assets') WHERE name = 'support_role')",
-    )
-    .fetch_one(pool)
-    .await?;
-    if !present {
-        sqlx::query("ALTER TABLE assets ADD COLUMN support_role TEXT")
+/// Backward compatibility: assets gained `support_role` and `group_id`, and folders
+/// `split_groups`, which the structure pass derives. As with tag descriptions, any failure other
+/// than a column already being there is an error, since every search reads them. Their indexes are
+/// made here rather than in the schema, which runs before an old library has the columns.
+async fn add_structure_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
+    for (table, column, definition) in [
+        ("assets", "support_role", "TEXT"),
+        ("assets", "group_id", "TEXT"),
+        ("folders", "split_groups", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let present: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)")
+                .bind(table)
+                .bind(column)
+                .fetch_one(pool)
+                .await?;
+        if !present {
+            sqlx::query(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))
             .execute(pool)
             .await?;
+        }
     }
+    // The grid items by path: a search of the library or of a folder counts them from this
+    // index alone, and finds a folder's items without reading its members and support files.
+    // Its `WHERE` must stay term for term the visibility rule's (`commands::asset`'s
+    // `NOT_SUPPORT` and `MAIN_OR_SINGLE`), or SQLite won't use it.
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_assets_group_id ON assets(group_id);
+         CREATE INDEX IF NOT EXISTS idx_assets_items ON assets(file_path)
+             WHERE support_role IS NULL AND (group_id IS NULL OR group_id = id);",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -304,9 +325,9 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     add_tag_description_column(&pool)
         .await
         .context("Could not add the tag description column")?;
-    add_support_role_column(&pool)
+    add_structure_columns(&pool)
         .await
-        .context("Could not add the support role column")?;
+        .context("Could not add the support role and group columns")?;
     // Search still works on the old index, so a failed conversion only waits for the next open.
     if let Err(e) = index_file_paths(&pool, false).await {
         tracing::warn!("Could not index folder names for search in {db_path:?}: {e}");
@@ -698,6 +719,7 @@ async fn memory_pool(foreign_keys: bool) -> Pool<Sqlite> {
         .await
         .unwrap();
     create_library_schema(&pool).await.unwrap();
+    add_structure_columns(&pool).await.unwrap();
     // The schema script sets the pragma itself, so pin it again afterwards.
     sqlx::query(&format!(
         "PRAGMA foreign_keys = {}",
@@ -1036,11 +1058,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_a_library_made_before_support_roles_adds_them_and_derives_its_packs() {
+    async fn opening_a_library_made_before_support_roles_and_groups_adds_them_and_derives_them() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("library.sqlite");
         let pool = connect_library_sqlite(&file).await.unwrap();
-        let paths = ["kits/rocks/License.txt", "kits/rocks/rock.glb"];
+        let paths = [
+            "kits/rocks/License.txt",
+            "kits/rocks/GLB format/rock.glb",
+            "kits/rocks/OBJ format/rock.obj",
+        ];
         for path in paths {
             sqlx::query(
                 "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
@@ -1052,19 +1078,31 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::query("ALTER TABLE assets DROP COLUMN support_role; DELETE FROM folders;")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "DROP INDEX idx_assets_items; DROP INDEX idx_assets_group_id;
+             ALTER TABLE assets DROP COLUMN group_id;
+             ALTER TABLE assets DROP COLUMN support_role; DELETE FROM folders;
+             ALTER TABLE folders DROP COLUMN split_groups;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         pool.close().await;
 
         let reopened = connect_library_sqlite(&file).await.unwrap();
 
         let derived = crate::structure::tests::derived_rows(&reopened).await;
         assert_eq!(derived, crate::structure::tests::fresh_pass(&paths).await);
+        assert!(derived
+            .roles
+            .contains(&(paths[0].to_string(), Some("doc".to_string()))));
+        let glb = Some(paths[1].to_string());
         assert_eq!(
-            derived.roles[0],
-            (paths[0].to_string(), Some("doc".to_string()))
+            derived.groups,
+            [
+                (paths[1].to_string(), glb.clone()),
+                (paths[2].to_string(), glb)
+            ]
         );
     }
 

@@ -12,7 +12,7 @@ import {
   IconHeart,
   IconHeartFilled,
 } from '../Icons';
-import { formatSize } from '../../utils/format';
+import { formatGroupBadge, formatSize } from '../../utils/format';
 import { useImageScaling } from '../../hooks/useImageScaling';
 import { tileMedia, tileState, type TileMedia } from './tileState';
 import styles from './AssetCard.module.css';
@@ -73,6 +73,7 @@ export const AssetCard = memo(function AssetCard({
 
   const KindIcon = KIND_ICON[asset.kind] ?? IconImage;
   const kindColor = KIND_COLOR[asset.kind];
+  const groupBadge = formatGroupBadge(asset.groupFormats);
 
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
@@ -232,10 +233,15 @@ export const AssetCard = memo(function AssetCard({
           />
         )}
 
-        {/* Kind chip */}
-        <div className={styles.kindChip} style={{ color: kindColor }}>
+        {/* Kind chip, or a format group's badge: `GLB +2` */}
+        <div
+          className={clsx(styles.kindChip, groupBadge && styles.groupBadge)}
+          style={{ color: kindColor }}
+          title={groupBadge?.title}
+          data-group-badge={groupBadge?.label}
+        >
           <KindIcon size={10} />
-          <span>{asset.extension.toUpperCase()}</span>
+          <span>{groupBadge?.label ?? asset.extension.toUpperCase()}</span>
         </div>
       </div>
 

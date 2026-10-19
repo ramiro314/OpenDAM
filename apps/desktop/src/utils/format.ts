@@ -24,3 +24,19 @@ export function formatItemsAndFiles(items: number, files: number): string {
   const n = (x: number) => x.toLocaleString('en-US');
   return `${n(items)} ${items === 1 ? 'item' : 'items'} (${n(files)} ${files === 1 ? 'file' : 'files'})`;
 }
+
+/**
+ * A format group's badge on its card and list row (plan C19): the main item's format and how many
+ * other files the group holds, `GLB +2`, with every format in its tooltip, `3 files: GLB, FBX,
+ * OBJ`. `null` for a file on its own.
+ */
+export function formatGroupBadge(
+  groupFormats: string[] | undefined
+): { label: string; title: string } | null {
+  if (!groupFormats || groupFormats.length < 2) return null;
+  const formats = groupFormats.map((f) => f.toUpperCase());
+  return {
+    label: `${formats[0]} +${formats.length - 1}`,
+    title: `${formats.length} files: ${[...new Set(formats)].join(', ')}`,
+  };
+}

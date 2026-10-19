@@ -181,6 +181,11 @@
   letter-spacing: 0.04em;
 }
 
+/* A format group's badge reads on any picture, so it gets a solid background */
+.groupBadge {
+  background: hsl(220 14% 9%);
+}
+
 /* Card body: a fixed height (CARD_BODY_HEIGHT in cardMetrics.ts), with or without chips */
 .body {
   height: var(--card-body-height);

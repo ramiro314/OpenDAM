@@ -190,6 +190,14 @@ The UI checks, each defined in its plan:
   kit's badge count its hidden files.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 2. Screenshots:
   `U10-license-hidden`, `U10-license-shown`.
+- **U11** (format groups): in `3D assets/Car Kit`, the `GLB format/`, `FBX format/` and `OBJ
+  format/` nodes each count as many items as `Models/`, and selecting `Models/` lists each model
+  once, as its GLB, with a solid `GLB +2` badge whose tooltip reads `3 files: GLB, FBX, OBJ`.
+  Selecting `FBX format/` lists the same items and no FBX file, and adding `.glb` to it matches
+  nothing. Filtering the kit by FBX lists every model, each as its GLB, and a search for "fbx"
+  finds `sedan.glb` through its FBX copy's folder.
+  [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 3. Screenshots:
+  `U11-kit-models`, `U11-fbx-format`.
 
 Run it with the script, from the repo root:
 

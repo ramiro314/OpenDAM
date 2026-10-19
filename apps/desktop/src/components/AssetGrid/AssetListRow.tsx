@@ -4,7 +4,7 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import type { Asset } from '../../types';
 import { useAssetStore } from '../../store';
 import { IconImage, IconVideo, IconStar, IconHeart, IconHeartFilled } from '../Icons';
-import { formatSize } from '../../utils/format';
+import { formatGroupBadge, formatSize } from '../../utils/format';
 import { useImageScaling } from '../../hooks/useImageScaling';
 import { tileMedia, tileState, type TileMedia } from './tileState';
 import styles from './AssetListRow.module.css';
@@ -43,6 +43,7 @@ export const AssetListRow = memo(function AssetListRow({
   }, [asset.thumbnailPath, asset.filePath]);
 
   const media = tileMedia(asset, { failed });
+  const groupBadge = formatGroupBadge(asset.groupFormats);
   const settle = () => setMediaSettled(true);
 
   const handleClick = useCallback(
@@ -151,8 +152,14 @@ export const AssetListRow = memo(function AssetListRow({
         <span className={clsx(styles.path, 'truncate')}>{asset.filePath}</span>
       </div>
 
-      {/* Extension */}
-      <span className={styles.ext}>{asset.extension.toUpperCase()}</span>
+      {/* Extension, or a format group's badge: `GLB +2` */}
+      <span
+        className={clsx(styles.ext, groupBadge && styles.groupBadge)}
+        title={groupBadge?.title}
+        data-group-badge={groupBadge?.label}
+      >
+        {groupBadge?.label ?? asset.extension.toUpperCase()}
+      </span>
 
       {/* Rating */}
       <div className={styles.stars}>

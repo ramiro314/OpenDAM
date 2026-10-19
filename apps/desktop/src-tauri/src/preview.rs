@@ -21,6 +21,33 @@ pub fn is_native_image(ext: &str) -> bool {
     )
 }
 
+/// Whether a file with extension `ext` gets a preview job: models, layered and HDR images, and
+/// every raster `is_native_image` accepts.
+pub fn needs_preview(ext: &str) -> bool {
+    matches!(
+        ext.to_lowercase().as_str(),
+        "max"
+            | "fbx"
+            | "obj"
+            | "gltf"
+            | "glb"
+            | "dae"
+            | "stl"
+            | "3ds"
+            | "skp"
+            | "rfa"
+            | "rvt"
+            | "dwg"
+            | "3dm"
+            | "vrmat"
+            | "psd"
+            | "psb"
+            | "ai"
+            | "exr"
+            | "hdr"
+    ) || is_native_image(ext)
+}
+
 /// Checks if an extension is a raster image the webview displays itself, so a small one needs
 /// no thumbnail.
 pub fn is_webview_displayable(ext: &str) -> bool {
@@ -273,7 +300,10 @@ type Job = (String, String, String);
 /// Fetches up to `limit` jobs matching `filter` and marks them as 'processing'.
 async fn claim_jobs(pool: &Pool<Sqlite>, filter: &str, limit: usize) -> Vec<Job> {
     let jobs: Vec<Job> = sqlx::query_as(&format!(
-        "SELECT p.id, p.asset_id, a.file_path FROM preview_jobs p JOIN assets a ON p.asset_id = a.id WHERE ({}) LIMIT {}",
+        // A group member other than its main item never shows in the grid, so it gets no preview
+        // (plan C15). The structure pass drops its waiting jobs; this skips any queued since.
+        "SELECT p.id, p.asset_id, a.file_path FROM preview_jobs p JOIN assets a ON p.asset_id = a.id
+         WHERE ({}) AND (a.group_id IS NULL OR a.group_id = a.id) LIMIT {}",
         filter, limit
     ))
     .fetch_all(pool)
@@ -867,6 +897,38 @@ mod tests {
             .await
             .unwrap();
         (thumb, status, job)
+    }
+
+    #[tokio::test]
+    async fn claiming_skips_a_group_members_job() {
+        let pool = crate::db::memory_library_pool().await;
+        for (id, group) in [("glb", Some("glb")), ("fbx", Some("glb")), ("png", None)] {
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, group_id)
+                 VALUES (?, ?, ?, ?, 'texture', 1, 0, 0, ?)",
+            )
+            .bind(id)
+            .bind(format!("{id}/a.{id}"))
+            .bind(format!("a.{id}"))
+            .bind(id)
+            .bind(group)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO preview_jobs (id, asset_id, status, created_at) VALUES (?, ?, 'pending', 0)")
+                .bind(format!("job-{id}"))
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let mut claimed: Vec<String> = claim_jobs(&pool, "p.status = 'pending'", 10)
+            .await
+            .into_iter()
+            .map(|(_, asset, _)| asset)
+            .collect();
+        claimed.sort();
+        assert_eq!(claimed, ["glb", "png"]);
     }
 
     #[tokio::test]
