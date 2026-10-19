@@ -55,16 +55,22 @@ export default function App() {
     // Real-time preview updates from background engine
     const unlistenDone = listen<{
       assetId: string;
+      filePath?: string | null;
+      previousThumbnailPath?: string | null;
       thumbnailPath: string | null;
       previewModel?: string;
     }>('preview:done', (event) => {
-      useAssetStore
-        .getState()
-        .updateAssetPreview(
-          event.payload.assetId,
-          event.payload.thumbnailPath,
-          event.payload.previewModel
-        );
+      useAssetStore.getState().updateAssetPreview(
+        event.payload.assetId,
+        event.payload.thumbnailPath,
+        event.payload.previewModel,
+        event.payload.filePath
+          ? {
+              filePath: event.payload.filePath,
+              previousThumbnailPath: event.payload.previousThumbnailPath ?? undefined,
+            }
+          : undefined
+      );
     });
 
     const unlistenError = listen<{ assetId: string }>('preview:error', (event) => {

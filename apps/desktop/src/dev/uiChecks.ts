@@ -3,6 +3,7 @@
 // docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
 // check here.
 
+import { convertFileSrc } from '@tauri-apps/api/core';
 import { api } from '../api';
 import { useAssetStore, useFolderTreeStore, useLibraryStore, useUIStore } from '../store';
 import type { FolderNode, SortField, SortOrder } from '../types';
@@ -1322,6 +1323,35 @@ export const UI_CHECKS: UiCheck[] = [
       );
       const background = getComputedStyle(modelBadge!).backgroundColor;
       assert(background.startsWith('rgb('), `the badge's background is ${background}, not solid`);
+
+      // Each model's card shows Kenney's render, from `Previews/`, which lists no item of its own
+      assert(sedan!.bundledPreview, 'sedan.glb has no bundled preview');
+      const byId = new Map(found.assets.map((a) => [a.id, a]));
+      const renderedCards = () =>
+        [...document.querySelectorAll<HTMLElement>('[data-tile]')].flatMap((tile) => {
+          const asset = byId.get(tile.id.replace(/^asset-/, ''));
+          return asset?.bundledPreview ? [{ tile, asset }] : [];
+        });
+      await waitFor(() => renderedCards().length > 0, 10_000, 'a card with a bundled preview');
+      for (const { tile, asset } of renderedCards()) {
+        const src = tile.querySelector('img')?.getAttribute('src');
+        assert(
+          src === convertFileSrc(asset.bundledPreview!),
+          `${asset.fileName}'s card shows ${src}, not ${asset.bundledPreview}`
+        );
+      }
+      await searchWith({ folder: { libraryId: BENCH_LIBRARY, path: kitPath } }, waitFor);
+      const kitItems = await results();
+      const renders = kitItems.assets.filter((a) => a.filePath.includes('/Previews/'));
+      assert(renders.length === 0, `${kitPath} lists ${renders[0]?.fileName} from Previews/`);
+      await selectFolder(modelsPath);
+      found = await results();
+      await waitFor(
+        () =>
+          renderedCards().length > 0 && !document.querySelector('[data-tile-state="placeholder"]'),
+        10_000,
+        "the kit's pictures"
+      );
       await pause('U11-kit-models');
 
       // A list row shows the same badge, solid and whole, in its extension column

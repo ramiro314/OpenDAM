@@ -191,6 +191,7 @@ async fn add_structure_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
     for (table, column, definition) in [
         ("assets", "support_role", "TEXT"),
         ("assets", "group_id", "TEXT"),
+        ("assets", "bundled_preview", "TEXT"),
         ("folders", "split_groups", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         let present: bool =
@@ -1066,6 +1067,7 @@ mod tests {
             "kits/rocks/License.txt",
             "kits/rocks/GLB format/rock.glb",
             "kits/rocks/OBJ format/rock.obj",
+            "kits/rocks/Previews/rock.png",
         ];
         for path in paths {
             sqlx::query(
@@ -1080,7 +1082,7 @@ mod tests {
         }
         sqlx::query(
             "DROP INDEX idx_assets_items; DROP INDEX idx_assets_group_id;
-             ALTER TABLE assets DROP COLUMN group_id;
+             ALTER TABLE assets DROP COLUMN bundled_preview; ALTER TABLE assets DROP COLUMN group_id;
              ALTER TABLE assets DROP COLUMN support_role; DELETE FROM folders;
              ALTER TABLE folders DROP COLUMN split_groups;",
         )
@@ -1103,6 +1105,10 @@ mod tests {
                 (paths[1].to_string(), glb.clone()),
                 (paths[2].to_string(), glb)
             ]
+        );
+        assert_eq!(
+            derived.bundled_previews,
+            [(paths[1].to_string(), paths[3].to_string())]
         );
     }
 

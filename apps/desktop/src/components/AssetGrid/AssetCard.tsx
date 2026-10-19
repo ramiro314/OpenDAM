@@ -14,7 +14,7 @@ import {
 } from '../Icons';
 import { formatGroupBadge, formatSize } from '../../utils/format';
 import { useImageScaling } from '../../hooks/useImageScaling';
-import { tileMedia, tileState, type TileMedia } from './tileState';
+import { tileImage, tileMedia, tileState, type TileMedia } from './tileState';
 import styles from './AssetCard.module.css';
 
 export interface AssetCardProps {
@@ -67,9 +67,10 @@ export const AssetCard = memo(function AssetCard({
   useEffect(() => {
     setFailed(undefined);
     setMediaLoaded(false);
-  }, [asset.thumbnailPath, asset.filePath]);
+  }, [asset.bundledPreview, asset.thumbnailPath, asset.filePath]);
 
   const media = tileMedia(asset, { failed, withVideo: true });
+  const image = tileImage(asset, media);
 
   const KindIcon = KIND_ICON[asset.kind] ?? IconImage;
   const kindColor = KIND_COLOR[asset.kind];
@@ -153,19 +154,9 @@ export const AssetCard = memo(function AssetCard({
     >
       {/* Thumbnail / preview area */}
       <div className={styles.thumb}>
-        {media === 'thumbnail' && asset.thumbnailPath ? (
+        {image ? (
           <img
-            src={convertFileSrc(asset.thumbnailPath)}
-            alt={asset.fileName}
-            className={styles.thumbImg}
-            ref={scaling}
-            decoding="async"
-            onLoad={() => setMediaLoaded(true)}
-            onError={() => setFailed(media)}
-          />
-        ) : media === 'original' ? (
-          <img
-            src={convertFileSrc(asset.filePath)}
+            src={convertFileSrc(image)}
             alt={asset.fileName}
             className={styles.thumbImg}
             ref={scaling}
