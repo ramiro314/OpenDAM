@@ -835,15 +835,24 @@ async fn add_grouped_counts(
 }
 
 /// The live counts beside the sidebar's Types filter and the filter bar's format filter (plan
-/// C23), by kind and by extension.
+/// C23), by kind and by extension. Each is the grid's total once that value is picked: the
+/// sidebar's Types replace the kind filter, and a format pill adds its extension to the active
+/// ones.
 #[derive(Debug, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FacetCounts {
+    /// The grid's total with each kind as the only one, for the kinds that have one
     pub kinds: HashMap<String, i64>,
+    /// The grid's total with each extension added to the active ones, for the extensions that
+    /// change it or have one
     pub extensions: HashMap<String, i64>,
+    /// The count of an extension `extensions` leaves out: the grid's total with the active
+    /// extensions, which adding one no file has keeps, or 0 when none is active
+    pub extension_base: i64,
 }
 
-/// For each kind and each extension, the grid's total for `query` with that kind, or that
-/// extension, as its only one. Counted once per query, like the total.
+/// The kind and extension counts for `query` (`FacetCounts`). Counted once per query, like the
+/// total.
 #[tauri::command]
 pub async fn get_facet_counts(
     query: SearchQuery,
@@ -857,7 +866,10 @@ pub async fn get_facet_counts(
 
 /// `get_facet_counts` over `targets`, the libraries `query` searches (`target_libraries`), each
 /// adding its items. A kind's count leaves out the query's kind filter, which picking the kind
-/// replaces, and an extension's its extension filter.
+/// replaces. An extension's count leaves out the extension filter too, and with extensions
+/// active, it is the items those match plus the items only that extension adds: the ones with a
+/// file of that extension meeting every other file-level filter, and no file of an active
+/// extension doing so.
 async fn facet_counts(
     query: &SearchQuery,
     targets: &[(sqlx::Pool<sqlx::Sqlite>, Option<std::path::PathBuf>)],
@@ -871,6 +883,23 @@ async fn facet_counts(
         search_filter(&any_kind, split),
         search_filter(&any_extension, split),
     );
+    let active = query
+        .filter
+        .extensions
+        .as_ref()
+        .is_some_and(|e| !e.is_empty())
+        .then(|| search_filter(query, split));
+    // The items the active extensions already match, which an added extension's count leaves out
+    let (extra, extra_binds) = match &active {
+        Some(with_active) => (
+            vec![format!(
+                "a.id NOT IN (SELECT COALESCE(s.group_id, s.id) FROM assets s WHERE {})",
+                with_active.file_conditions_on("s")
+            )],
+            with_active.file_binds.clone(),
+        ),
+        None => (vec![], vec![]),
+    };
     let mut counts = FacetCounts::default();
     for (pool, _) in targets {
         add_grouped_counts(&mut counts.kinds, pool, &by_kind, "m.kind", &[], &[]).await?;
@@ -879,10 +908,16 @@ async fn facet_counts(
             pool,
             &by_extension,
             "m.extension",
-            &[],
-            &[],
+            &extra,
+            &extra_binds,
         )
         .await?;
+        if let Some(with_active) = &active {
+            counts.extension_base += count_assets(pool, with_active).await?.items;
+        }
+    }
+    for n in counts.extensions.values_mut() {
+        *n += counts.extension_base;
     }
     Ok(counts)
 }
@@ -3524,6 +3559,9 @@ mod tests {
             serde_json::json!({ "filter": { "directory": "kit/Models/FBX format" } }),
             serde_json::json!({ "folder": folder("kit/Models/FBX format") }),
             serde_json::json!({ "folder": folder("kit"), "text": "sedan" }),
+            serde_json::json!({ "filter": { "extensions": ["png", "obj"] } }),
+            serde_json::json!({ "text": "fbx", "filter": { "extensions": ["glb"] } }),
+            serde_json::json!({ "folder": folder("kit/Models"), "filter": { "extensions": ["fbx"] } }),
         ];
         let mut nonzero = 0;
         for query in queries {
@@ -3558,10 +3596,25 @@ mod tests {
                 let expected = total(serde_json::json!({ "filter": { "kinds": [kind] } })).await;
                 assert_eq!(count, expected, "{query}: kind {kind}");
             }
-            for ext in &extensions {
-                let count = facets.extensions.get(ext).copied().unwrap_or(0);
+            // A format pill adds its extension to the active ones; `txt` only the license has.
+            let active: Vec<String> =
+                serde_json::from_value(query["filter"]["extensions"].clone()).unwrap_or_default();
+            for ext in extensions
+                .iter()
+                .map(String::as_str)
+                .chain(["txt", "nothing"])
+            {
+                let count = facets
+                    .extensions
+                    .get(ext)
+                    .copied()
+                    .unwrap_or(facets.extension_base);
+                let mut picked = active.clone();
+                if !picked.iter().any(|e| e == ext) {
+                    picked.push(ext.to_string());
+                }
                 let expected =
-                    total(serde_json::json!({ "filter": { "extensions": [ext] } })).await;
+                    total(serde_json::json!({ "filter": { "extensions": picked } })).await;
                 assert_eq!(count, expected, "{query}: extension {ext}");
             }
         }
@@ -3607,8 +3660,28 @@ mod tests {
             FacetCounts {
                 kinds: count_map(&[("3d_model", 2), ("texture", 1)]),
                 extensions: count_map(&[("fbx", 2), ("png", 1)]),
+                extension_base: 0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn a_format_count_adds_its_extension_to_the_active_ones() {
+        let libs = [grouped_library().await];
+        // The PNGs are the render and the colormap; each model adds its own formats to them.
+        let query = serde_json::json!({ "filter": { "extensions": ["png"] } });
+        let facets = live_facet_counts(&libs, query).await;
+        assert_eq!(facets.extension_base, 2);
+        assert_eq!(
+            facets.extensions,
+            count_map(&[("fbx", 4), ("glb", 4), ("obj", 4)])
+        );
+        let (_, total, _) = counted_search(
+            &libs,
+            serde_json::json!({ "filter": { "extensions": ["png", "fbx"] } }),
+        )
+        .await;
+        assert_eq!(total, Some(4));
     }
 
     #[tokio::test]
@@ -3643,6 +3716,16 @@ mod tests {
         )
         .await;
         assert_eq!(one.extensions, count_map(&[("fbx", 2), ("png", 1)]));
+        // With FBX active, the colormap's PNG copy adds one item in each library.
+        let fbx = live_facet_counts(
+            &libs,
+            serde_json::json!({ "text": "fbx", "filter": { "extensions": ["fbx"] } }),
+        )
+        .await;
+        assert_eq!(
+            (fbx.extension_base, fbx.extensions),
+            (4, count_map(&[("png", 6)]))
+        );
     }
 
     #[tokio::test]
@@ -4584,6 +4667,25 @@ mod tests {
             let expected = total(serde_json::json!({ "filter": { "extensions": [ext] } })).await;
             assert_eq!(*count, expected, "extension {ext}");
         }
+        // With FBX active, a format pill's count is the total once it joins FBX.
+        let with_fbx =
+            || serde_json::json!({ "text": "tree", "filter": { "extensions": ["fbx"] } });
+        let union = live_facet_counts(&libs, with_fbx()).await;
+        for ext in ["fbx", "glb", "gltf", "obj", "png", "svg", "jpg"] {
+            let count = union
+                .extensions
+                .get(ext)
+                .copied()
+                .unwrap_or(union.extension_base);
+            let mut query = with_fbx();
+            query["filter"]["extensions"] = serde_json::json!(["fbx", ext]);
+            let expected = counted_search(&libs, query).await.1.unwrap();
+            assert_eq!(count, expected, "fbx plus {ext}");
+        }
+        println!(
+            "with .fbx active: {:?}, {} for any other extension, each the total once it joins .fbx",
+            union.extensions, union.extension_base
+        );
         println!(
             "{checked} folder counts, {:?} by kind and {:?} by extension, each the grid's total",
             facets.kinds, facets.extensions

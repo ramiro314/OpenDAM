@@ -164,12 +164,17 @@ export interface FolderNode {
 }
 
 /**
- * The live counts beside the Types and format filters (`get_facet_counts`): for each kind and
- * extension, the grid's total with it as the only kind or extension. Values with none are absent.
+ * The live counts beside the Types and format filters (`get_facet_counts`), each the grid's total
+ * once that value is picked: the sidebar's Types replace the kind filter, and a format pill adds
+ * its extension to the active ones.
  */
 export interface FacetCounts {
+  /** The total with each kind as the only one; kinds with none are absent */
   kinds: Record<string, number>;
+  /** The total with each extension added to the active ones; see `extensionBase` for the rest */
   extensions: Record<string, number>;
+  /** The count of an extension `extensions` leaves out: the active extensions' total, or 0 */
+  extensionBase: number;
 }
 
 /**

@@ -22,7 +22,11 @@ function serve() {
     new Promise<T>((resolve) => (hold ? pending.push(() => resolve(value)) : resolve(value)));
   api.getFacetCounts = (q) => {
     calls.push(`facets:${q.text}`);
-    return answer<FacetCounts>({ kinds: { texture: q.text.length }, extensions: {} });
+    return answer<FacetCounts>({
+      kinds: { texture: q.text.length },
+      extensions: {},
+      extensionBase: 0,
+    });
   };
   api.getFolderCounts = (q, libraryId, parentPaths) => {
     calls.push(`folders:${q.text}:${libraryId}:${parentPaths.join('|')}`);

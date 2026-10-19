@@ -130,8 +130,9 @@ export function FilterBar() {
   const { query, setFilter, setSort, search } = useAssetStore();
   const { filter, sort } = query;
   const [filterMode, setFilterMode] = useState<'software' | 'extension'>('software');
-  // While search text or a filter is on: each extension's grid total with it as the only one
-  const extensionCounts = useLiveCountsStore((s) => s.facets?.extensions);
+  // While search text or a filter is on: each extension's grid total once its pill is picked,
+  // which adds it to the active extensions
+  const facets = useLiveCountsStore((s) => s.facets);
 
   const hasActiveFilters =
     (filter.kinds?.length ?? 0) > 0 ||
@@ -410,7 +411,7 @@ export function FilterBar() {
             <div className={styles.pills}>
               {EXTENSION_OPTIONS.map(({ ext, label, softwareHint }) => {
                 const active = filter.extensions?.includes(ext);
-                const count = extensionCounts && (extensionCounts[ext] ?? 0);
+                const count = facets ? (facets.extensions[ext] ?? facets.extensionBase) : undefined;
                 return (
                   <button
                     key={ext}

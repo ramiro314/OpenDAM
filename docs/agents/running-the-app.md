@@ -203,11 +203,12 @@ The UI checks, each defined in its plan:
   gives every shown tree node a badge with its live count, the grid's total once that folder is
   selected, and dims the nodes with none. The kit's `GLB format/`, `FBX format/` and `OBJ format/`
   each count as many items as `Models/`, and selecting `Models/` gives that total. Each sidebar
-  Types option and each format pill (the filter bar's File Type mode) shows the grid's total with
-  that kind or extension as its only one, which picking 3D models and `.fbx` confirms. Each node's
-  `get_folder_counts` call takes under 300 ms.
+  Types option shows the grid's total with that kind as its only one, which picking 3D models
+  confirms. Each format pill (the filter bar's File Type mode) shows the grid's total once its
+  extension joins the active ones: with none active, and again with `.fbx` active, which adding
+  `.fbx` and then `.png` confirms. Each node's `get_folder_counts` call takes under 300 ms.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 5. Screenshots:
-  `U13-tree-counts`, `U13-filter-counts`.
+  `U13-tree-counts`, `U13-filter-counts`, `U13-format-union`.
 
 Run it with the script, from the repo root:
 

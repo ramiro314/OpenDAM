@@ -130,7 +130,9 @@ docs/plans                    Plans for this fork
     it equals the grid's total for that folder. The live counts shown while search text or a
     filter is on (`get_folder_counts`, `get_facet_counts`) follow the same rule: a group counts
     once toward each folder, kind and extension among its files that meet every file-level
-    filter, so each count equals the grid's total once you select that folder or value.
+    filter, so each count equals the grid's total once you select that folder or value. A format
+    pill adds its extension to the active ones, so with extensions active, its count also holds
+    the items they match (`FacetCounts::extension_base`).
   - The preview queue skips members other than the main item, and their thumbnails stay on disk.
     An index run queues no new file itself: the pass it ends with queues every file but those
     members (support files' cover images included), so a member is never queued, even during a

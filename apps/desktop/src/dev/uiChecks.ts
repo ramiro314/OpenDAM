@@ -1535,26 +1535,35 @@ export const UI_CHECKS: UiCheck[] = [
       );
       await clickAndSearch(document.getElementById('sidebar-filter-type-3d_model')!, 'any kind');
 
-      // The format filter: each extension's count, and picking FBX
+      // The format filter: a pill adds its extension to the active ones, so each pill's count is
+      // the grid's total once it joins them, with none active and with FBX active
       document.getElementById('filter-mode-extension')!.click();
       await frames(3);
-      const pills = [...document.querySelectorAll<HTMLElement>('[id^="filter-ext-"]')].filter(
-        (el) => el.querySelector('[data-live-count]')
-      );
-      assert(pills.length > 0, 'no format pill shows a count');
-      let matching = 0;
-      for (const pill of pills) {
-        const ext = pill.id.slice('filter-ext-'.length);
-        const count = liveCount(pill);
-        assert(
-          count === (live().facets!.extensions[ext] ?? 0),
-          `.${ext}'s count isn't its live count`
+      /** Checks every counted pill against the total with `active` plus its extension. */
+      const checkPills = async (active: string[]) => {
+        const pills = [...document.querySelectorAll<HTMLElement>('[id^="filter-ext-"]')].filter(
+          (el) => el.querySelector('[data-live-count]')
         );
-        assert((pill.dataset.noMatches !== undefined) === (count === 0), `.${ext}'s dimming`);
-        const total = await totalWith({ filter: { ...query.filter, extensions: [ext] } });
-        assert(total === count, `.${ext} counts ${count}, its grid holds ${total}`);
-        if (count > 0) matching += 1;
-      }
+        assert(pills.length > 0, 'no format pill shows a count');
+        const facets = live().facets!;
+        let matching = 0;
+        for (const pill of pills) {
+          const ext = pill.id.slice('filter-ext-'.length);
+          const count = liveCount(pill);
+          const expected = facets.extensions[ext] ?? facets.extensionBase;
+          assert(count === expected, `.${ext} reads ${count}, its live count is ${expected}`);
+          assert((pill.dataset.noMatches !== undefined) === (count === 0), `.${ext}'s dimming`);
+          const extensions = active.includes(ext) ? active : [...active, ext];
+          const total = await totalWith({ filter: { ...query.filter, extensions } });
+          assert(
+            total === count,
+            `.${ext} with ${active} counts ${count}, its grid holds ${total}`
+          );
+          if (count > 0) matching += 1;
+        }
+        return matching;
+      };
+      const matching = await checkPills([]);
       assert(matching >= 3, `only ${matching} formats match "tree"`);
       // The screenshot shows the matching formats and the Types counts, not the first pills
       document
@@ -1563,14 +1572,26 @@ export const UI_CHECKS: UiCheck[] = [
       document.getElementById('sidebar-filter-type-3d_model')!.scrollIntoView({ block: 'center' });
       await frames(3);
       await pause('U13-filter-counts');
-      const fbx = document.getElementById('filter-ext-fbx')!;
-      const fbxCount = liveCount(fbx);
-      await clickAndSearch(fbx, 'the search for FBX');
-      assert(
-        useAssetStore.getState().total === fbxCount,
-        `FBX holds ${useAssetStore.getState().total}, the count read ${fbxCount}`
-      );
-      await clickAndSearch(document.getElementById('filter-ext-fbx')!, 'any format');
+
+      const pick = async (ext: string) => {
+        const count = liveCount(document.getElementById(`filter-ext-${ext}`)!);
+        await clickAndSearch(document.getElementById(`filter-ext-${ext}`)!, `adding .${ext}`);
+        const { total } = useAssetStore.getState();
+        assert(total === count, `adding .${ext} gives ${total}, its pill read ${count}`);
+        await waitFor(() => live().facets !== null, 30_000, 'the extension counts');
+        await frames(3);
+      };
+      await pick('fbx');
+      await checkPills(['fbx']);
+      const png = liveCount(document.getElementById('filter-ext-png')!);
+      assert(png > useAssetStore.getState().total, `.png adds nothing to .fbx: ${png}`);
+      document
+        .getElementById('filter-ext-glb')!
+        .scrollIntoView({ inline: 'start', block: 'nearest' });
+      await frames(3);
+      await pause('U13-format-union');
+      await pick('png');
+      await clickAndSearch(document.getElementById('filter-ext-all')!, 'any format');
       document.getElementById('filter-mode-software')!.click();
 
       await searchWith({ text: '' }, waitFor);
