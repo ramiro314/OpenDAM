@@ -7,7 +7,8 @@ use tauri::{Emitter, State};
 
 use crate::db::{make_relative_path, resolve_path, upsert_tag, Database, LibraryHandle};
 use crate::models::{
-    Asset, AssetPatch, FilterSpec, GroupMember, SearchPayload, SearchQuery, SearchResult,
+    Asset, AssetPatch, FilterSpec, FolderRef, GroupMember, SearchPayload, SearchQuery,
+    SearchResult, SortSpec,
 };
 use crate::structure;
 use crate::AppState;
@@ -613,6 +614,47 @@ async fn folder_splits_groups(
     }
 }
 
+/// The grid's items below `folder` of the library at `pool`, in file path order: the search the
+/// grid runs with that folder selected and hidden files off, so main items and files on their
+/// own, never support files (plan C22). With `untagged_only`, the grid's untagged filter keeps
+/// the items with no tag. The root (`""`) covers the whole library. Auto-tag's folder and
+/// library runs send these, so they stay what the grid and the folder's badge show.
+pub(crate) async fn folder_item_ids(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    folder: &str,
+    untagged_only: bool,
+) -> sqlx::Result<Vec<String>> {
+    let query = SearchQuery {
+        text: String::new(),
+        filter: FilterSpec {
+            tag_logic: untagged_only.then(|| "none".to_string()),
+            ..FilterSpec::default()
+        },
+        sort: SortSpec {
+            field: "name".into(),
+            order: "asc".into(),
+        },
+        library_id: None,
+        library_ids: None,
+        collection_id: None,
+        include_subcollections: None,
+        folder: Some(FolderRef {
+            library_id: String::new(),
+            path: folder.to_string(),
+        }),
+    };
+    let filter = search_filter(&query, splits_groups(pool, folder).await?);
+    let sql = format!(
+        "SELECT a.id FROM assets a {} ORDER BY a.file_path",
+        filter.where_clause()
+    );
+    let mut ids = sqlx::query_scalar(&sql);
+    for bound in filter.binds() {
+        ids = ids.bind(bound);
+    }
+    ids.fetch_all(pool).await
+}
+
 /// The search for `query`. `split` tells whether its folder splits format groups
 /// (`splits_groups`).
 fn search_filter(query: &SearchQuery, split: bool) -> SqlFilter {
@@ -693,7 +735,7 @@ fn search_filter(query: &SearchQuery, split: bool) -> SqlFilter {
 /// `p/`, uses the unique `file_path` index and needs no `LIKE` escaping. `None` for the root
 /// (`""`, or only slashes), which every file lies below. Spaces are kept: a folder name may start
 /// or end with one. The grid's folder filter and the tree's live counts both read folders by it.
-fn folder_range(folder: &str) -> Option<[String; 2]> {
+pub(crate) fn folder_range(folder: &str) -> Option<[String; 2]> {
     let path = folder.trim_matches('/');
     (!path.is_empty()).then(|| [format!("{path}/"), format!("{path}0")])
 }
@@ -5801,6 +5843,58 @@ mod tests {
             assert_eq!(counts[models.as_str()][&path], in_models, "{path}");
         }
         println!("{models} counts {in_models}, and so does each of its format folders");
+    }
+
+    #[tokio::test]
+    async fn folder_items_are_the_grid_items_one_per_group_and_no_support_file() {
+        use crate::structure::tests::{car_kit, SEDAN};
+        const COLORMAP: &str = "3D assets/Car Kit/Models/GLB format/Textures/colormap.png";
+        let pool = car_kit().await;
+        let items = |folder: &'static str, untagged_only| {
+            let pool = pool.clone();
+            async move { folder_item_ids(&pool, folder, untagged_only).await.unwrap() }
+        };
+
+        // The root is the whole library: the sedan as its GLB, and the texture. The FBX and OBJ,
+        // the render, the covers and the licenses never count.
+        assert_eq!(items("", false).await, [COLORMAP, SEDAN[1]]);
+        assert_eq!(
+            items("3D assets/Car Kit", false).await,
+            [COLORMAP, SEDAN[1]]
+        );
+        // The FBX's folder shows the sedan, as its main item that lies outside it.
+        assert_eq!(
+            items("3D assets/Car Kit/Models/FBX format/", false).await,
+            [SEDAN[1]]
+        );
+        assert!(items("3D assets/Car Kit/Previews", false).await.is_empty());
+        assert!(items("3D assets/Holiday Kit", false).await.is_empty());
+        assert!(items("3D assets/Car", false).await.is_empty());
+        // Every folder's badge, which the structure pass counts on its own, holds as many.
+        let badges: Vec<(String, i64)> = sqlx::query_as("SELECT path, item_count FROM folders")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(badges.len() > 5);
+        for (path, item_count) in badges {
+            let n = folder_item_ids(&pool, &path, false).await.unwrap().len();
+            assert_eq!(n as i64, item_count, "{path}");
+        }
+
+        insert_tag(&pool, "t-car", "Car").await;
+        sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES (?, 't-car')")
+            .bind(SEDAN[1])
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(items("3D assets/Car Kit", true).await, [COLORMAP]);
+        assert_eq!(
+            items("3D assets/Car Kit", false).await,
+            [COLORMAP, SEDAN[1]]
+        );
+        assert!(items("3D assets/Car Kit/Models/FBX format", true)
+            .await
+            .is_empty());
     }
 
     #[tokio::test]

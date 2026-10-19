@@ -444,15 +444,20 @@ export interface RunSummary {
   finishedAt: number | null;
 }
 
-/** What a run covers: chosen assets, or a library's untagged assets (every asset with `allAssets`) */
+/**
+ * What a run covers: chosen assets, or the untagged items of a library or of a folder in one
+ * (every item with `allAssets`). A folder's `path` is relative to its library's root.
+ */
 export type AutotagScope =
   | { kind: 'assets'; assetIds: string[] }
-  | { kind: 'library'; libraryId: string; allAssets: boolean };
+  | { kind: 'library'; libraryId: string; allAssets: boolean }
+  | { kind: 'folder'; libraryId: string; path: string; allAssets: boolean };
 
-/** What the run dialog was opened for: chosen assets, or a sidebar library */
+/** What the run dialog was opened for: chosen assets, a sidebar library, or a folder or pack */
 export type AutotagTarget =
   | { kind: 'assets'; assetIds: string[] }
-  | { kind: 'library'; libraryId: string; libraryName: string };
+  | { kind: 'library'; libraryId: string; libraryName: string }
+  | { kind: 'folder'; libraryId: string; path: string; name: string };
 
 export interface StartedRun {
   run: RunSummary;

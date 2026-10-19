@@ -19,7 +19,7 @@ use crate::db::{Database, LibraryHandle};
 use crate::models::AssetKind;
 
 /// Rows per write transaction, as in `watcher.rs`.
-const BATCH: usize = 200;
+pub(crate) const BATCH: usize = 200;
 
 /// File stems (lowercase) that mark the folder holding them as a pack, on a doc or an image.
 /// A Readme marks nothing: `Archive/` and `Early access/` each hold one above several packs.
@@ -3867,7 +3867,7 @@ pub(crate) mod tests {
     ];
 
     /// Every function outside tests that holds one of `METADATA_WRITES`, by file, and whether it
-    /// calls `group_members`.
+    /// expands its assets: through `group_members`, or `folder_members` for a folder's files.
     fn metadata_writers() -> Vec<(String, String, bool)> {
         fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap() {
@@ -3906,7 +3906,8 @@ pub(crate) mod tests {
                     .map(|(_, rest)| rest.split(['(', '<']).next().unwrap().to_string())
                     .unwrap_or_default();
                 let file = file.strip_prefix(&root).unwrap().display().to_string();
-                writers.push((file, name, item.contains("group_members(")));
+                let expands = item.contains("group_members(") || item.contains("folder_members(");
+                writers.push((file, name, expands));
             }
         }
         writers
@@ -3931,6 +3932,8 @@ pub(crate) mod tests {
                     "remove_assets_from_collection",
                     true
                 ),
+                ("commands/folder.rs", "tag_folder_in", true),
+                ("commands/folder.rs", "collect_folder_in", true),
                 // The union itself, which writes to a group's members by their ids.
                 ("structure.rs", "apply_unions", false),
             ],

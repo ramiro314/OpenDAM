@@ -21,6 +21,10 @@ pub struct Database {
     pub libraries: Arc<RwLock<HashMap<String, LibraryHandle>>>,
     /// One lock per library id, held by an index run and by each structure pass (`index_lock`).
     index_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Held by every tag or collection definition update and delete, and by each batch of a bulk
+    /// folder write (`commands/folder.rs`) from reading the definition until its commit, so a
+    /// batch never copies a definition into a mirror while it is changed or removed.
+    pub catalog_lock: tokio::sync::Mutex<()>,
 }
 
 /// A collection definition as stored: id, name, description, parent_id, is_smart, filter_spec,
@@ -479,6 +483,7 @@ impl Database {
             master_pool,
             libraries: Arc::new(RwLock::new(open_libraries)),
             index_locks: Default::default(),
+            catalog_lock: Default::default(),
         };
 
         db.sync_open_libraries().await;
@@ -802,6 +807,7 @@ pub(crate) async fn memory_database(libraries: Vec<LibraryHandle>) -> Database {
             libraries.into_iter().map(|h| (h.id.clone(), h)).collect(),
         )),
         index_locks: Default::default(),
+        catalog_lock: Default::default(),
     }
 }
 
