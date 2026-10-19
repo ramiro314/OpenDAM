@@ -206,6 +206,32 @@ The UI checks, each defined in its plan:
   finds `sedan.glb` through its FBX copy's folder.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 3. Screenshots:
   `U11-kit-models`, `U11-list-badge`, `U11-fbx-format`.
+- **U12** (group detail): selecting `sedan.glb` in `3D assets/Car Kit/Models` lists its GLB, FBX
+  and OBJ files in the detail panel, in that order, each with its format, folder and size. Each
+  file's Open, Reveal and Copy path, recorded rather than run, act on that file, in its row and in
+  its own details, which show on a click with "Back to group". Moving between the FBX and OBJ
+  files and back leaves the grid's selection and cached pages unchanged. Selecting the kit's
+  `colormap.png` then lists its copies, each row showing that copy's own image.
+  [smarter-big-collections](../plans/smarter-big-collections/plan.md), C19. Screenshots:
+  `U12-group-files`, `U12-member`, `U12-2d-members`.
+- **U13** (live counts): with `3D assets/Platformer Kit/Models` expanded, a search for "tree"
+  gives every shown tree node a badge with its live count, the grid's total once that folder is
+  selected, and dims the nodes with none. The kit's `GLB format/`, `FBX format/` and `OBJ format/`
+  each count as many items as `Models/`, and selecting `Models/` gives that total. Each sidebar
+  Types option shows the grid's total with that kind as its only one, which picking 3D models
+  confirms. Each format pill (the filter bar's File Type mode) shows the grid's total once its
+  extension joins the active ones: with none active, and again with `.fbx` active, which adding
+  `.fbx` and then `.png` confirms. Each node's `get_folder_counts` call takes under 300 ms.
+  [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 5. Screenshots:
+  `U13-tree-counts`, `U13-filter-counts`, `U13-format-union`.
+- **U14** (2D stacks): the library root shows 51,139 items (plan A3) and the status bar counts
+  them. `UI assets/UI Pack` lists each sprite once, as its `Default/` PNG standing for its
+  `Double/` PNG and its vector, with a solid `x3` badge whose tooltip reads `3 files: PNG, SVG`,
+  and its five colors stay five items. `2D assets/Pixel Platformer/Tiles` still lists both
+  `tile_0000.png` files, and the Crosshair Pack's Dark, Glow, Light and Outline styles stay
+  apart, the Dark one stacking its `(2×)` and vector copies.
+  [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 4. Screenshots:
+  `U14-library-root`, `U14-ui-pack`.
 
 Run it with the script, from the repo root:
 

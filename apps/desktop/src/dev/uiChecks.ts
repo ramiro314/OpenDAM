@@ -1,20 +1,24 @@
 // The UI checks `VITE_SCROLL_BENCH=checks` runs (U1-U8 in
-// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U11 in
+// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U14 in
 // docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
 // check here.
 
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { api } from '../api';
 import {
+  cachedAssets,
+  extensionCount,
+  kindCount,
   useAssetStore,
   useFolderTreeStore,
   useLibraryStore,
+  useLiveCountsStore,
   usePacksStore,
   useUIStore,
 } from '../store';
 import type { FolderNode, PackCard, SearchQuery, SortField, SortOrder } from '../types';
 import { isFolderShown } from '../components/Sidebar/sidebarHelpers';
-import { formatItemsAndFiles } from '../utils/format';
+import { formatItemsAndFiles, formatSize } from '../utils/format';
 import { assetAt } from '../store/pageCache';
 import { scrubKey } from '../utils/scrubKey';
 import {
@@ -168,6 +172,12 @@ const scrubLabel = () => document.getElementById('scrub-label');
 
 /** The library the bench registers its run copy as (`OPENDAM_BENCH_LIBRARY`). */
 const BENCH_LIBRARY = 'bench';
+
+/**
+ * The grid items at the bench library's root once its format groups and 2D stacks are formed
+ * (docs/plans/smarter-big-collections/plan.md, A3), from the golden snapshot's 83,095 files.
+ */
+const ROOT_ITEMS = 51_139;
 
 /** How long U9 waits for the folder tree, and for a write to get through. */
 const STRUCTURE_TIMEOUT_MS = 900_000;
@@ -1435,6 +1445,460 @@ export const UI_CHECKS: UiCheck[] = [
       assert(
         found.assets.some((a) => a.fileName === 'sedan.glb'),
         `"fbx" finds ${found.total} items, sedan.glb not among them`
+      );
+
+      await searchWith({ text: '', folder: undefined }, waitFor);
+    },
+  },
+  {
+    id: 'U12',
+    title:
+      "A Kenney kit model's detail panel lists its GLB, FBX and OBJ files with folder and size, " +
+      'a member shows its own details and file actions, and Back to group returns, while the ' +
+      "grid's selection and cached pages stay as they were",
+    run: async ({ assert, waitFor, pause, sleep }) => {
+      // Waits out the first structure pass, which forms the groups
+      await expandBenchLibrary({ assert, sleep });
+      const modelsPath = '3D assets/Car Kit/Models';
+      await searchWith({ folder: { libraryId: BENCH_LIBRARY, path: modelsPath } }, waitFor);
+      const sedan = cachedAssets(useAssetStore.getState()).find((a) => a.fileName === 'sedan.glb');
+      assert(sedan, `no sedan.glb in the first pages of ${modelsPath}`);
+      useUIStore.getState().selectAsset(sedan!.id);
+
+      // The panel lists the model's files, main item first, each with its format, folder and size
+      const members = await api.getGroupMembers(sedan!.id);
+      const formats = members.map((m) => m.extension).join(',');
+      assert(formats === 'glb,fbx,obj', `sedan.glb's members are ${formats}`);
+      const memberRows = () => [...document.querySelectorAll<HTMLElement>('[data-group-member]')];
+      await waitFor(() => memberRows().length === members.length, 10_000, 'the group files');
+      memberRows().forEach((row, i) => {
+        const m = members[i];
+        assert(row.dataset.groupMember === m.id, `row ${i} is ${row.dataset.groupMember}`);
+        const folder = `${modelsPath}/${m.extension.toUpperCase()} format`;
+        assert(m.folder === folder, `${m.fileName}'s folder is ${m.folder}`);
+        for (const text of [m.extension.toUpperCase(), folder, formatSize(m.sizeBytes)]) {
+          assert(row.textContent?.includes(text), `${m.fileName}'s row lacks "${text}"`);
+        }
+      });
+      await pause('U12-group-files');
+
+      // What the grid holds while moving between members
+      const grid = () => {
+        const ui = useUIStore.getState();
+        const st = useAssetStore.getState();
+        return JSON.stringify({
+          selected: [...ui.selectedAssetIds],
+          focused: ui.focusedAssetId,
+          generation: st.generation,
+          epoch: st.epoch,
+          pages: [...st.pages].map(([page, assets]) => [page, assets.map((a) => a.id)]),
+        });
+      };
+      const before = grid();
+
+      // File actions act on the file they sit beside, recorded rather than run
+      const acted: string[] = [];
+      const realOpen = api.openWithDefault;
+      const realReveal = api.revealInFileManager;
+      const clipboard = navigator.clipboard;
+      assert(clipboard, 'no navigator.clipboard');
+      const realWrite = clipboard.writeText;
+      api.openWithDefault = async (path) => void acted.push(`open ${path}`);
+      api.revealInFileManager = async (path) => void acted.push(`reveal ${path}`);
+      clipboard.writeText = async (text) => void acted.push(`copy ${text}`);
+      const actOn = (scope: ParentNode) =>
+        (['open', 'reveal', 'copy-path'] as const).forEach((action) =>
+          scope.querySelector<HTMLElement>(`[data-file-action="${action}"]`)!.click()
+        );
+      const expectActed = (path: string, where: string) => {
+        const expected = [`open ${path}`, `reveal ${path}`, `copy ${path}`].join(' | ');
+        assert(acted.join(' | ') === expected, `${where} acted: ${acted.join(' | ')}`);
+        acted.length = 0;
+      };
+      try {
+        const fbx = members[1];
+        actOn(memberRows()[1]);
+        expectActed(fbx.filePath, "the FBX row's actions");
+        assert(!document.querySelector('[data-group-member-view]'), 'an action opened a member');
+
+        // Enter or Space on a row's action is left to the button, which runs its action; on the
+        // row itself, Enter shows the member
+        for (const button of memberRows()[1].querySelectorAll<HTMLElement>('[data-file-action]')) {
+          for (const key of ['Enter', ' ']) {
+            const event = press(button, key, key === ' ' ? 'Space' : key);
+            assert(
+              !event.defaultPrevented,
+              `the row took ${key} from ${button.dataset.fileAction}`
+            );
+          }
+        }
+        await sleep(100);
+        assert(
+          !document.querySelector('[data-group-member-view]'),
+          "an action's key opened a member"
+        );
+        assert(acted.length === 0, `keydowns alone acted: ${acted.join(' | ')}`);
+        press(memberRows()[1], 'Enter');
+        await waitFor(
+          () => document.querySelector(`[data-group-member-view="${CSS.escape(fbx.id)}"]`) !== null,
+          5_000,
+          'Enter on the FBX row'
+        );
+        document.getElementById('detail-back-to-group')!.click();
+        await waitFor(() => memberRows().length === members.length, 5_000, 'back to the group');
+
+        for (const m of [fbx, members[2]]) {
+          memberRows()
+            .find((r) => r.dataset.groupMember === m.id)!
+            .click();
+          const view = () =>
+            document.querySelector<HTMLElement>(`[data-group-member-view="${CSS.escape(m.id)}"]`);
+          await waitFor(() => view() !== null, 5_000, `${m.fileName}'s details`);
+          const text = view()!.textContent ?? '';
+          assert(text.includes(m.fileName), `the details lack ${m.fileName}`);
+          assert(text.includes(m.filePath), `the details lack ${m.filePath}`);
+          assert(!text.includes(sedan!.filePath), "the details show the GLB's path");
+          actOn(view()!);
+          expectActed(m.filePath, `${m.fileName}'s actions`);
+          if (m === fbx) await pause('U12-member');
+
+          document.getElementById('detail-back-to-group')!.click();
+          await waitFor(
+            () => !view() && memberRows().length === members.length,
+            5_000,
+            'back to the group'
+          );
+          assert(grid() === before, `the grid changed: ${before} became ${grid()}`);
+        }
+      } finally {
+        api.openWithDefault = realOpen;
+        api.revealInFileManager = realReveal;
+        clipboard.writeText = realWrite;
+      }
+      assert(useUIStore.getState().focusedAssetId === sedan!.id, 'the card lost the selection');
+
+      // 2D members show their own image: the kit's colormap.png copies, one per format folder
+      const colormap = cachedAssets(useAssetStore.getState()).find(
+        (a) => a.fileName === 'colormap.png' && a.groupFormats
+      );
+      assert(colormap, `no grouped colormap.png in the first pages of ${modelsPath}`);
+      useUIStore.getState().selectAsset(colormap!.id);
+      const copies = await api.getGroupMembers(colormap!.id);
+      assert(
+        copies.length > 1 && copies.every((c) => c.kind !== '3d_model'),
+        `colormap.png's members are ${copies.map((c) => c.filePath).join(', ')}`
+      );
+      const rowImage = (i: number) => memberRows()[i]?.querySelector('img') ?? null;
+      await waitFor(
+        () =>
+          memberRows().length === copies.length &&
+          memberRows()[0].dataset.groupMember === copies[0].id &&
+          copies.every((_, i) => rowImage(i)?.complete && rowImage(i)!.naturalWidth > 0),
+        10_000,
+        "the colormap copies' images"
+      );
+      copies.forEach((c, i) => {
+        const src = rowImage(i)!.getAttribute('src');
+        assert(src === convertFileSrc(c.filePath), `${c.filePath}'s row shows ${src}`);
+      });
+      await pause('U12-2d-members');
+
+      useUIStore.getState().clearSelection();
+      await searchWith({ folder: undefined }, waitFor);
+    },
+  },
+  {
+    id: 'U13',
+    title:
+      'A search for "tree" counts its items on the expanded tree nodes and the Types and format ' +
+      "filters, each count the grid's total for its folder or value, and dims folders with none",
+    run: async ({ assert, waitFor, pause, sleep }) => {
+      await expandBenchLibrary({ assert, sleep });
+      const kitPath = '3D assets/Platformer Kit';
+      const modelsPath = `${kitPath}/Models`;
+      const parents = ['', '3D assets', kitPath, modelsPath];
+      for (const path of parents.slice(1)) await expandFolder(path);
+      await searchWith({ text: 'tree', folder: undefined }, waitFor);
+      const live = () => useLiveCountsStore.getState();
+      const counted = (parent: string) => live().folders[BENCH_LIBRARY]?.[parent];
+      await waitFor(
+        () => live().facets !== null && parents.every((p) => counted(p) !== undefined),
+        30_000,
+        'the live counts'
+      );
+      const { query } = useAssetStore.getState();
+
+      // A node's folder counts take under 300 ms, through IPC
+      for (const parent of parents) {
+        const start = performance.now();
+        await api.getFolderCounts(query, BENCH_LIBRARY, [parent]);
+        const ms = performance.now() - start;
+        assert(
+          ms < 300,
+          `counting the folders in ${parent || 'the root'} took ${ms.toFixed(0)} ms`
+        );
+      }
+
+      /** The grid's total for the search with `patch` applied. */
+      const totalWith = async (patch: Partial<SearchQuery>) => {
+        const result = await api.searchAssets({
+          query: { ...query, ...patch },
+          page: 0,
+          pageSize: 1,
+          includeTotal: true,
+        });
+        return result.total ?? -1;
+      };
+
+      // Each shown node's badge is its live count, which is the grid's total once it's selected,
+      // and a node with none dims
+      let checked = 0;
+      let dimmed = 0;
+      for (const parent of parents) {
+        const children = useFolderTreeStore.getState().children[BENCH_LIBRARY]?.[parent] ?? [];
+        for (const node of children) {
+          const row = folderRow(node.path);
+          if (!row) continue;
+          const count = counted(parent)![node.path] ?? 0;
+          assert(
+            shownCount(row) === count,
+            `${node.path}'s badge reads ${shownCount(row)}, not ${count}`
+          );
+          assert(
+            (row.dataset.noMatches !== undefined) === (count === 0),
+            `${node.path}, with ${count} matches, is ${count === 0 ? 'not ' : ''}dimmed`
+          );
+          const total = await totalWith({ folder: { libraryId: BENCH_LIBRARY, path: node.path } });
+          assert(total === count, `${node.path} counts ${count}, its grid holds ${total}`);
+          checked += 1;
+          if (count === 0) dimmed += 1;
+        }
+      }
+      assert(checked > dimmed && dimmed > 0, `${checked} nodes checked, ${dimmed} dimmed`);
+
+      // The kit's format folders each count its tree models, and `Models/` counts them once
+      const inModels = counted(kitPath)![modelsPath] ?? 0;
+      assert(inModels > 0, `${modelsPath} counts no tree`);
+      for (const format of ['GLB format', 'FBX format', 'OBJ format']) {
+        const path = `${modelsPath}/${format}`;
+        const count = counted(modelsPath)![path] ?? 0;
+        assert(count === inModels, `${path} counts ${count}, ${modelsPath} ${inModels}`);
+      }
+      folderRow(modelsPath)!.scrollIntoView({ block: 'center' });
+      await pause('U13-tree-counts');
+
+      /** Clicks `el`, which changes the search, and waits for its results. */
+      const clickAndSearch = async (el: HTMLElement, what: string) => {
+        const generation = useAssetStore.getState().generation;
+        el.click();
+        await waitFor(
+          () => {
+            const st = useAssetStore.getState();
+            return st.generation > generation && !st.loading;
+          },
+          30_000,
+          what
+        );
+      };
+      /** The live count `el` shows. */
+      const liveCount = (el: HTMLElement) => {
+        const badge = el.querySelector('[data-live-count]');
+        assert(badge, `#${el.id} shows no live count`);
+        return parseCount(badge!.textContent ?? '');
+      };
+
+      // Selecting a folder gives the grid total its badge showed
+      await clickAndSearch(folderRow(modelsPath)!, `the search in ${modelsPath}`);
+      assert(
+        useAssetStore.getState().total === inModels,
+        `${modelsPath} holds ${useAssetStore.getState().total}, its badge read ${inModels}`
+      );
+      await searchWith({ folder: undefined }, waitFor);
+      await waitFor(() => live().facets !== null, 30_000, 'the kind and extension counts');
+
+      // The sidebar's Types: each kind's count, and picking the 3D models
+      const kinds = [...document.querySelectorAll<HTMLElement>('[id^="sidebar-filter-type-"]')];
+      assert(kinds.length > 0, 'no Types options in the sidebar');
+      for (const option of kinds) {
+        const kind = option.id.slice('sidebar-filter-type-'.length);
+        const count = liveCount(option);
+        assert(count === kindCount(live().facets!, kind), `${kind}'s count isn't its live count`);
+        const total = await totalWith({ filter: { ...query.filter, kinds: [kind] as never } });
+        assert(total === count, `${kind} counts ${count}, its grid holds ${total}`);
+      }
+      const models = document.getElementById('sidebar-filter-type-3d_model')!;
+      const modelCount = liveCount(models);
+      assert(modelCount > 0, 'the search counts no 3D model');
+      await clickAndSearch(models, 'the search for 3D models');
+      assert(
+        useAssetStore.getState().total === modelCount,
+        `3D models hold ${useAssetStore.getState().total}, the count read ${modelCount}`
+      );
+      await clickAndSearch(document.getElementById('sidebar-filter-type-3d_model')!, 'any kind');
+
+      // The format filter: a pill adds its extension to the active ones, so each pill's count is
+      // the grid's total once it joins them, with none active and with FBX active
+      document.getElementById('filter-mode-extension')!.click();
+      await frames(3);
+      /** Checks every counted pill against the total with `active` plus its extension. */
+      const checkPills = async (active: string[]) => {
+        const pills = [...document.querySelectorAll<HTMLElement>('[id^="filter-ext-"]')].filter(
+          (el) => el.querySelector('[data-live-count]')
+        );
+        assert(pills.length > 0, 'no format pill shows a count');
+        const facets = live().facets!;
+        let matching = 0;
+        for (const pill of pills) {
+          const ext = pill.id.slice('filter-ext-'.length);
+          const count = liveCount(pill);
+          const expected = extensionCount(facets, ext);
+          assert(count === expected, `.${ext} reads ${count}, its live count is ${expected}`);
+          assert((pill.dataset.noMatches !== undefined) === (count === 0), `.${ext}'s dimming`);
+          const extensions = active.includes(ext) ? active : [...active, ext];
+          const total = await totalWith({ filter: { ...query.filter, extensions } });
+          assert(
+            total === count,
+            `.${ext} with ${active} counts ${count}, its grid holds ${total}`
+          );
+          if (count > 0) matching += 1;
+        }
+        return matching;
+      };
+      const matching = await checkPills([]);
+      assert(matching >= 3, `only ${matching} formats match "tree"`);
+      // The screenshot shows the matching formats and the Types counts, not the first pills
+      document
+        .getElementById('filter-ext-glb')!
+        .scrollIntoView({ inline: 'start', block: 'nearest' });
+      document.getElementById('sidebar-filter-type-3d_model')!.scrollIntoView({ block: 'center' });
+      await frames(3);
+      await pause('U13-filter-counts');
+
+      const pick = async (ext: string) => {
+        const count = liveCount(document.getElementById(`filter-ext-${ext}`)!);
+        await clickAndSearch(document.getElementById(`filter-ext-${ext}`)!, `adding .${ext}`);
+        const { total } = useAssetStore.getState();
+        assert(total === count, `adding .${ext} gives ${total}, its pill read ${count}`);
+        await waitFor(() => live().facets !== null, 30_000, 'the extension counts');
+        await frames(3);
+      };
+      await pick('fbx');
+      await checkPills(['fbx']);
+      const png = liveCount(document.getElementById('filter-ext-png')!);
+      assert(png > useAssetStore.getState().total, `.png adds nothing to .fbx: ${png}`);
+      document
+        .getElementById('filter-ext-glb')!
+        .scrollIntoView({ inline: 'start', block: 'nearest' });
+      await frames(3);
+      await pause('U13-format-union');
+      await pick('png');
+      await clickAndSearch(document.getElementById('filter-ext-all')!, 'any format');
+      document.getElementById('filter-mode-software')!.click();
+
+      await searchWith({ text: '' }, waitFor);
+    },
+  },
+  {
+    id: 'U14',
+    title:
+      'UI Pack sprites show once each with a solid x3 badge, same-named tiles and color or ' +
+      'style variants stay apart, and the library root shows 51,139 items',
+    run: async ({ assert, waitFor, pause, sleep }) => {
+      await expandBenchLibrary({ assert, sleep });
+      const results = async () => {
+        const { query, total } = useAssetStore.getState();
+        return (await api.searchAssets({ query, page: 0, pageSize: total + 1 })).assets;
+      };
+      const inFolder = (path: string) =>
+        searchWith({ text: '', folder: { libraryId: BENCH_LIBRARY, path } }, waitFor);
+      const status = () => document.getElementById('status-count')?.textContent ?? '';
+
+      // The library root: plan A3's item count, for the golden snapshot's 83,095 files
+      await inFolder('');
+      let s = useAssetStore.getState();
+      assert(s.total === ROOT_ITEMS, `the library root shows ${s.total} items, not ${ROOT_ITEMS}`);
+      const rootStatus = formatItemsAndFiles(s.total, s.fileTotal);
+      await waitFor(() => status() === rootStatus, 5_000, `the status bar to read ${rootStatus}`);
+      await pause('U14-library-root');
+
+      // Each UI Pack sprite shows once, as its default-scale PNG, standing for its Double PNG
+      // and its vector
+      const packPath = 'UI assets/UI Pack';
+      await expandFolder('UI assets');
+      await waitFor(() => folderRow(packPath) !== null, 10_000, packPath);
+      const pack = (await api.getFolders(BENCH_LIBRARY, 'UI assets')).find(
+        (f) => f.path === packPath
+      )!;
+      folderRow(packPath)!.click();
+      await waitFor(
+        () => {
+          const st = useAssetStore.getState();
+          return st.query.folder?.path === packPath && !st.loading && st.total > 0;
+        },
+        30_000,
+        `the search for ${packPath}`
+      );
+      s = useAssetStore.getState();
+      assert(s.total === pack.itemCount, `the grid holds ${s.total}, the node ${pack.itemCount}`);
+      const sprites = (await results()).filter((a) => a.filePath.includes('/UI Pack/PNG/'));
+      assert(sprites.length > 0, `${packPath} shows no sprite`);
+      const copies = (await results()).filter((a) => /\/(Double|Vector)\//.test(a.filePath));
+      assert(copies.length === 0, `${packPath} shows ${copies[0]?.filePath}`);
+      const unstacked = sprites.filter(
+        (a) => !a.filePath.includes('/Default/') || a.groupFormats?.join(',') !== 'png,png,svg'
+      );
+      assert(
+        unstacked.length === 0,
+        `${unstacked[0]?.filePath} stacks ${unstacked[0]?.groupFormats?.join(', ') ?? 'nothing'}`
+      );
+      // Blue and Red sprites of one name stay two items
+      const button = sprites.filter((a) => a.fileName === 'button_rectangle_depth_flat.png');
+      const colors = button.map((a) => a.filePath.split('/PNG/')[1]?.split('/')[0]).sort();
+      assert(
+        colors.join(',') === 'Blue,Green,Grey,Red,Yellow',
+        `button_rectangle_depth_flat.png shows in ${colors.join(', ')}`
+      );
+
+      // The card's badge counts the stack's files, on a solid background
+      const stackBadge = () =>
+        [...document.querySelectorAll<HTMLElement>('[data-tile] [data-group-badge]')].find(
+          (b) => b.dataset.groupBadge === 'x3'
+        );
+      await waitFor(() => stackBadge() !== undefined, 10_000, 'an x3 badge on a card');
+      const badge = stackBadge()!;
+      assert(badge.textContent === 'x3', `the badge reads "${badge.textContent}"`);
+      assert(badge.title === '3 files: PNG, SVG', `the badge's tooltip reads "${badge.title}"`);
+      const background = getComputedStyle(badge).backgroundColor;
+      assert(background.startsWith('rgb('), `the badge's background is ${background}, not solid`);
+      await waitFor(
+        () => !document.querySelector('[data-tile-state="placeholder"]'),
+        10_000,
+        "the pack's pictures"
+      );
+      await pause('U14-ui-pack');
+
+      // Tiles sharing a name in different folders are different pictures, each its own item
+      await inFolder('2D assets/Pixel Platformer/Tiles');
+      const tiles = (await results()).filter((a) => a.fileName === 'tile_0000.png');
+      const tileFolders = tiles.map((a) => a.filePath.split('/Pixel Platformer/Tiles/')[1]);
+      assert(
+        ['tile_0000.png', 'Characters/tile_0000.png'].every((t) => tileFolders.includes(t)) &&
+          tiles.every((a) => !a.groupFormats),
+        `tile_0000.png shows as ${tileFolders.join(', ')}, grouped: ${tiles.some((a) => a.groupFormats)}`
+      );
+
+      // A crosshair's Dark and Light styles stay apart, each with its 2x and vector copies
+      await inFolder('2D assets/Crosshair Pack/PNG');
+      const crosshairs = (await results()).filter((a) => a.fileName === 'crosshair-000.png');
+      const styles = crosshairs.map((a) => a.filePath.split('/PNG/')[1]?.split('/')[0]).sort();
+      assert(
+        styles.join(',') === 'Dark,Glow,Light,Outline',
+        `crosshair-000.png shows in ${styles.join(', ')}`
+      );
+      const dark = crosshairs.find((a) => a.filePath.includes('/PNG/Dark/'));
+      assert(
+        dark?.groupFormats?.join(',') === 'png,png,svg',
+        `the Dark crosshair stacks ${dark?.groupFormats?.join(', ')}`
       );
 
       await searchWith({ text: '', folder: undefined }, waitFor);

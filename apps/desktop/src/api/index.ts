@@ -1,14 +1,18 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
   Asset,
+  GroupMember,
   Library,
   Collection,
+  FacetCounts,
+  FolderCounts,
   FolderNode,
   PackCard,
   Tag,
   TagPatch,
   AddLibraryPayload,
   SearchPayload,
+  SearchQuery,
   SearchResult,
   PreviewJob,
   PendingModelThumbnail,
@@ -44,6 +48,8 @@ export const api = {
   // Assets
   searchAssets: (payload: SearchPayload) => invoke<SearchResult>('search_assets', { payload }),
   getAsset: (id: string) => invoke<Asset>('get_asset', { id }),
+  /** The files of the group `id` belongs to, main item first; a file on its own alone */
+  getGroupMembers: (id: string) => invoke<GroupMember[]>('get_group_members', { id }),
   updateAsset: (id: string, patch: Partial<Asset>) => invoke<Asset>('update_asset', { id, patch }),
   deleteAsset: (id: string, deleteFile?: boolean) =>
     invoke<void>('delete_asset', { id, deleteFile: deleteFile ?? true }),
@@ -57,6 +63,11 @@ export const api = {
   /** The packs below `underPath` in each of `libraryIds`, or in every library when null */
   getPacks: (libraryIds: string[] | null, underPath: string) =>
     invoke<PackCard[]>('get_packs', { libraryIds, underPath }),
+
+  // Live counts while search text or a filter is active, each the grid's total for its value
+  getFacetCounts: (query: SearchQuery) => invoke<FacetCounts>('get_facet_counts', { query }),
+  getFolderCounts: (query: SearchQuery, libraryId: string, parentPaths: string[]) =>
+    invoke<FolderCounts>('get_folder_counts', { query, libraryId, parentPaths }),
 
   // Tags
   listTags: () => invoke<Tag[]>('list_tags'),

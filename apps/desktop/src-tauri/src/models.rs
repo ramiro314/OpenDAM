@@ -130,6 +130,15 @@ pub struct Asset {
     pub bundled_preview: Option<String>,
 }
 
+/// One file of a format group, as the detail panel lists it (plan C19).
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupMember {
+    #[serde(flatten)]
+    pub asset: Asset,
+    /// The folder holding the file, relative to its library root; `""` is the root
+    pub folder: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tag {
     pub id: String,
@@ -194,7 +203,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SearchQuery {
     pub text: String,
     pub filter: FilterSpec,
@@ -276,7 +285,7 @@ pub struct RatingRange {
     pub max: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SortSpec {
     pub field: String,
     pub order: String,

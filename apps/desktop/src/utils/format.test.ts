@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { formatGroupBadge, formatItemsAndFiles, formatSize, formatVisibleRange } from './format';
+import {
+  formatGroupBadge,
+  formatItemsAndFiles,
+  formatSize,
+  formatTrashAction,
+  formatVisibleRange,
+  itemFileCount,
+} from './format';
 
 describe('formatSize', () => {
   test('shows bytes below 1 KB', () => {
@@ -42,22 +49,48 @@ describe('formatItemsAndFiles', () => {
 });
 
 describe('formatGroupBadge', () => {
-  test("names the main item's format and counts the other files", () => {
-    expect(formatGroupBadge(['glb', 'fbx', 'obj'])).toEqual({
+  test("names a model group's main format and counts the other files", () => {
+    expect(formatGroupBadge({ kind: '3d_model', groupFormats: ['glb', 'fbx', 'obj'] })).toEqual({
       label: 'GLB +2',
       title: '3 files: GLB, FBX, OBJ',
     });
   });
 
-  test('lists a format the copies share once', () => {
-    expect(formatGroupBadge(['png', 'png', 'png'])).toEqual({
-      label: 'PNG +2',
-      title: '3 files: PNG',
+  test("counts a 2D stack's files, listing a format the copies share once", () => {
+    expect(formatGroupBadge({ kind: 'texture', groupFormats: ['png', 'png', 'svg'] })).toEqual({
+      label: 'x3',
+      title: '3 files: PNG, SVG',
+    });
+    expect(formatGroupBadge({ kind: 'image', groupFormats: ['svg', 'svg'] })).toEqual({
+      label: 'x2',
+      title: '2 files: SVG',
     });
   });
 
   test('gives a file on its own no badge', () => {
-    expect(formatGroupBadge(undefined)).toBeNull();
-    expect(formatGroupBadge(['glb'])).toBeNull();
+    expect(formatGroupBadge({ kind: '3d_model', groupFormats: undefined })).toBeNull();
+    expect(formatGroupBadge({ kind: 'texture', groupFormats: ['png'] })).toBeNull();
+  });
+});
+
+describe('itemFileCount', () => {
+  test('counts a file on its own as one', () => {
+    expect(itemFileCount({})).toBe(1);
+  });
+
+  test("counts a group's members and its bundled preview", () => {
+    expect(
+      itemFileCount({ groupFormats: ['glb', 'fbx', 'obj'], bundledPreview: '/kit/Previews/a.png' })
+    ).toBe(4);
+    expect(itemFileCount({ groupFormats: ['glb', 'fbx'] })).toBe(2);
+    expect(itemFileCount({ bundledPreview: '/kit/Previews/a.png' })).toBe(2);
+  });
+});
+
+describe('formatTrashAction', () => {
+  test('says how many files go to the trash', () => {
+    expect(formatTrashAction(1)).toBe('Move 1 file to the trash');
+    expect(formatTrashAction(4)).toBe('Move 4 files to the trash');
+    expect(formatTrashAction(1200)).toBe('Move 1,200 files to the trash');
   });
 });

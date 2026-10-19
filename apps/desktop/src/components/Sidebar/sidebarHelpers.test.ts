@@ -8,6 +8,7 @@ import {
   libraryNameFromPath,
   parentCandidates,
   resolveDroppedAssetId,
+  showsLiveCounts,
 } from './sidebarHelpers';
 import type { FolderNode } from '../../types';
 
@@ -106,6 +107,26 @@ describe('isFilterEmpty', () => {
   test('is false while hidden files show', () => {
     expect(isFilterEmpty({ showHidden: true })).toBe(false);
     expect(isFilterEmpty({ showHidden: false })).toBe(true);
+  });
+});
+
+describe('showsLiveCounts', () => {
+  test('is on with search text or any filter, and off with neither', () => {
+    expect(showsLiveCounts({ text: '', filter: {} })).toBe(false);
+    expect(showsLiveCounts({ text: '  ', filter: { namePrefix: ' ' } })).toBe(false);
+    expect(showsLiveCounts({ text: 'tree', filter: {} })).toBe(true);
+    for (const filter of [
+      { kinds: ['texture' as const] },
+      { extensions: ['glb'] },
+      { showHidden: true },
+      { directory: 'Models' },
+      { nameSuffix: '_1k' },
+      { collectionIds: ['props'] },
+      { tagLogic: 'none' as const },
+    ]) {
+      expect(showsLiveCounts({ text: '', filter })).toBe(true);
+    }
+    expect(showsLiveCounts({ text: '', filter: { extensions: [], kinds: [] } })).toBe(false);
   });
 });
 

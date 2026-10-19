@@ -70,8 +70,9 @@ export interface Asset {
   previewStatus: 'none' | 'pending' | 'generating' | 'done' | 'error';
   metadata: AssetMeta;
   /**
-   * For the main item of a format group (one model in several formats, or a file's copies under
-   * format folders), every member's extension, its own first. Absent for a file on its own.
+   * For the main item of a group (one model in several formats, a file's copies under format
+   * folders, or a sprite's scale and format copies in a 2D stack), every member's extension, its
+   * own first. Absent for a file on its own.
    */
   groupFormats?: string[];
   /**
@@ -80,6 +81,12 @@ export interface Asset {
    * Cards show it before `thumbnailPath`.
    */
   bundledPreview?: string;
+}
+
+/** One file of a format group, as the detail panel lists it (`get_group_members`) */
+export interface GroupMember extends Asset {
+  /** The folder holding the file, relative to its library root; `''` is the root */
+  folder: string;
 }
 
 export interface Library {
@@ -195,6 +202,26 @@ export interface PackCard {
   hiddenCount: number;
   cover?: Cover | null;
 }
+
+/**
+ * The live counts beside the Types and format filters (`get_facet_counts`), each the grid's total
+ * once that value is picked: the sidebar's Types replace the kind filter, and a format pill adds
+ * its extension to the active ones.
+ */
+export interface FacetCounts {
+  /** The total with each kind as the only one; kinds with none are absent */
+  kinds: Record<string, number>;
+  /** The total with each extension added to the active ones; read through `extensionCount` */
+  extensions: Record<string, number>;
+  /** The count of an extension `extensions` leaves out: the active extensions' total, or 0 */
+  extensionBase: number;
+}
+
+/**
+ * Live folder counts (`get_folder_counts`): for each parent path asked for, the grid's total in
+ * each of its child folders, by child path. Children with none are absent.
+ */
+export type FolderCounts = Record<string, Record<string, number>>;
 
 // ── Preview job ──────────────────────────────────────────────────────────
 export interface PreviewJob {

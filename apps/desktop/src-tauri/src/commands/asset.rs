@@ -1,12 +1,14 @@
 use serde_json;
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use crate::db::{make_relative_path, resolve_path, upsert_tag, Database, LibraryHandle};
-use crate::models::{Asset, AssetPatch, FilterSpec, SearchPayload, SearchQuery, SearchResult};
+use crate::models::{
+    Asset, AssetPatch, FilterSpec, GroupMember, SearchPayload, SearchQuery, SearchResult,
+};
 use crate::structure;
 use crate::AppState;
 
@@ -183,12 +185,9 @@ async fn search_libraries(
 ) -> Result<SearchResult> {
     let offset = payload.page * payload.page_size;
     let limit = payload.page_size;
-    let split = match (&payload.query.folder, target_libs.first()) {
-        (Some(folder), Some((pool, _))) => splits_groups(pool, &folder.path)
-            .await
-            .map_err(|e| e.to_string())?,
-        _ => false,
-    };
+    let split = folder_splits_groups(&payload.query, target_libs)
+        .await
+        .map_err(|e| e.to_string())?;
     let filter = search_filter(&payload.query, split);
     let sort_field = payload.query.sort.field.as_str();
     let is_asc = payload.query.sort.order == "asc";
@@ -506,7 +505,8 @@ impl SqlFilter {
         self.binds.iter().chain(file_binds)
     }
 
-    /// The values bound to `files_where_clause`'s placeholders, in order.
+    /// The values bound to `files_where_clause`'s placeholders, in order, and to `grouped_sql`'s
+    /// before its `extra` ones.
     fn files_binds(&self) -> impl Iterator<Item = &String> {
         self.binds.iter().chain(&self.file_binds)
     }
@@ -526,6 +526,31 @@ impl SqlFilter {
         } else {
             format!("WHERE {}", all.join(" AND "))
         }
+    }
+
+    /// Counts the grid items per value of `key`, an expression on a file `m` (plan C23): an item
+    /// counts once toward each value among its files that meet every file-level condition and
+    /// `extra` (on `m`) together. So each count is `where_clause`'s total with the condition
+    /// `key = value` added, and an item can count toward several values. Bound by `files_binds`,
+    /// then the values `extra` binds.
+    fn grouped_sql(&self, key: &str, extra: &[String]) -> String {
+        let mut all: Vec<String> = self.conditions.clone();
+        all.push(MAIN_OR_SINGLE.to_string());
+        if !self.show_hidden {
+            all.push(NOT_SUPPORT.to_string());
+        }
+        let file_conditions = self.file_conditions_on("m");
+        if !file_conditions.is_empty() {
+            all.push(file_conditions);
+        }
+        all.extend(extra.iter().cloned());
+        format!(
+            "SELECT {key} AS value, COUNT(DISTINCT a.id)
+             FROM assets m JOIN assets a ON a.id = COALESCE(m.group_id, m.id)
+             WHERE {}
+             GROUP BY value",
+            all.join(" AND ")
+        )
     }
 }
 
@@ -574,6 +599,18 @@ async fn splits_groups(pool: &sqlx::Pool<sqlx::Sqlite>, path: &str) -> sqlx::Res
         .fetch_optional(pool)
         .await?;
     Ok(split.unwrap_or(0) > 0)
+}
+
+/// Whether the folder `query` names splits format groups in its library, the first of `targets`
+/// (`target_libraries`). False when it names none.
+async fn folder_splits_groups(
+    query: &SearchQuery,
+    targets: &[(sqlx::Pool<sqlx::Sqlite>, Option<std::path::PathBuf>)],
+) -> sqlx::Result<bool> {
+    match (&query.folder, targets.first()) {
+        (Some(folder), Some((pool, _))) => splits_groups(pool, &folder.path).await,
+        _ => Ok(false),
+    }
 }
 
 /// The search for `query`. `split` tells whether its folder splits format groups
@@ -651,20 +688,25 @@ fn search_filter(query: &SearchQuery, split: bool) -> SqlFilter {
     filter
 }
 
-/// Requires files below `folder`, a path relative to the library root, recursively. The range
-/// `p/ <= file_path < p0` (`0` follows `/`) holds exactly the paths starting with `p/`, uses the
-/// unique `file_path` index and needs no `LIKE` escaping. The root (`""`, or only slashes) adds
-/// no condition. Spaces are kept: a folder name may start or end with one.
+/// The `file_path` range of the files below `folder`, a path relative to the library root,
+/// recursively: `p/ <= file_path < p0` (`0` follows `/`) holds exactly the paths starting with
+/// `p/`, uses the unique `file_path` index and needs no `LIKE` escaping. `None` for the root
+/// (`""`, or only slashes), which every file lies below. Spaces are kept: a folder name may start
+/// or end with one. The grid's folder filter and the tree's live counts both read folders by it.
+fn folder_range(folder: &str) -> Option<[String; 2]> {
+    let path = folder.trim_matches('/');
+    (!path.is_empty()).then(|| [format!("{path}/"), format!("{path}0")])
+}
+
+/// Requires files below `folder` (`folder_range`). The root adds no condition.
 ///
 /// It is a file-level condition. When the folder `split`s no group, every group with a file
 /// below it has its main item there too, so the item's own path decides, as fast as before
 /// groups: the range goes on the item as well, and adds no search through members.
 fn push_folder_range(filter: &mut SqlFilter, folder: &str, split: bool) {
-    let path = folder.trim_matches('/');
-    if path.is_empty() {
+    let Some(range) = folder_range(folder) else {
         return;
-    }
-    let range = [format!("{path}/"), format!("{path}0")];
+    };
     let condition = "{f}.file_path >= ? AND {f}.file_path < ?";
     if split {
         filter.push_file(condition, range);
@@ -783,6 +825,179 @@ async fn count_assets(pool: &sqlx::Pool<sqlx::Sqlite>, filter: &SqlFilter) -> sq
     Ok(Counts { items, files })
 }
 
+/// The grid items per value of `key` that `filter` and `extra` match in the library at `pool`
+/// (`SqlFilter::grouped_sql`), added into `counts`.
+async fn add_grouped_counts(
+    counts: &mut HashMap<String, i64>,
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    filter: &SqlFilter,
+    key: &str,
+    extra: &[String],
+    extra_binds: &[String],
+) -> sqlx::Result<()> {
+    let sql = filter.grouped_sql(key, extra);
+    let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+    for b in filter.files_binds().chain(extra_binds) {
+        query = query.bind(b.clone());
+    }
+    for (value, n) in query.fetch_all(pool).await? {
+        *counts.entry(value).or_default() += n;
+    }
+    Ok(())
+}
+
+/// The live counts beside the sidebar's Types filter and the filter bar's format filter (plan
+/// C23), by kind and by extension. Each is the grid's total once that value is picked: the
+/// sidebar's Types replace the kind filter, and a format pill adds its extension to the active
+/// ones.
+#[derive(Debug, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FacetCounts {
+    /// The grid's total with each kind as the only one, for the kinds that have one
+    pub kinds: HashMap<String, i64>,
+    /// The grid's total with each extension added to the active ones, for the extensions that
+    /// change it or have one. Read through `extension`, which covers the rest.
+    pub extensions: HashMap<String, i64>,
+    /// The count of an extension `extensions` leaves out: the grid's total with the active
+    /// extensions, which adding one no file has keeps, or 0 when none is active
+    pub extension_base: i64,
+}
+
+impl FacetCounts {
+    /// The grid's total once `extension` joins the active ones. Reads every extension count, as
+    /// `extensions` holds only those that differ from `extension_base`'s.
+    pub fn extension(&self, extension: &str) -> i64 {
+        self.extensions
+            .get(extension)
+            .copied()
+            .unwrap_or(self.extension_base)
+    }
+}
+
+/// The kind and extension counts for `query` (`FacetCounts`). Counted once per query, like the
+/// total.
+#[tauri::command]
+pub async fn get_facet_counts(
+    query: SearchQuery,
+    state: State<'_, Arc<AppState>>,
+) -> Result<FacetCounts> {
+    let all_libs = state.db.get_all_libraries().await;
+    facet_counts(&query, &target_libraries(&query, &all_libs))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `get_facet_counts` over `targets`, the libraries `query` searches (`target_libraries`), each
+/// adding its items. A kind's count leaves out the query's kind filter, which picking the kind
+/// replaces. An extension's count leaves out the extension filter too, and with extensions
+/// active, it is the items those match plus the items only that extension adds: the ones with a
+/// file of that extension meeting every other file-level filter, and no file of an active
+/// extension doing so.
+async fn facet_counts(
+    query: &SearchQuery,
+    targets: &[(sqlx::Pool<sqlx::Sqlite>, Option<std::path::PathBuf>)],
+) -> sqlx::Result<FacetCounts> {
+    let split = folder_splits_groups(query, targets).await?;
+    let mut any_kind = query.clone();
+    any_kind.filter.kinds = None;
+    let mut any_extension = query.clone();
+    any_extension.filter.extensions = None;
+    let (by_kind, by_extension) = (
+        search_filter(&any_kind, split),
+        search_filter(&any_extension, split),
+    );
+    let active = query
+        .filter
+        .extensions
+        .as_ref()
+        .is_some_and(|e| !e.is_empty())
+        .then(|| search_filter(query, split));
+    // The items the active extensions already match, which an added extension's count leaves out
+    let (extra, extra_binds) = match &active {
+        Some(with_active) => (
+            vec![format!(
+                "a.id NOT IN (SELECT COALESCE(s.group_id, s.id) FROM assets s WHERE {})",
+                with_active.file_conditions_on("s")
+            )],
+            with_active.file_binds.clone(),
+        ),
+        None => (vec![], vec![]),
+    };
+    let mut counts = FacetCounts::default();
+    for (pool, _) in targets {
+        add_grouped_counts(&mut counts.kinds, pool, &by_kind, "m.kind", &[], &[]).await?;
+        add_grouped_counts(
+            &mut counts.extensions,
+            pool,
+            &by_extension,
+            "m.extension",
+            &extra,
+            &extra_binds,
+        )
+        .await?;
+        if let Some(with_active) = &active {
+            counts.extension_base += count_assets(pool, with_active).await?.items;
+        }
+    }
+    for n in counts.extensions.values_mut() {
+        *n += counts.extension_base;
+    }
+    Ok(counts)
+}
+
+/// For each of `parent_paths` (`""` for the root) in library `library_id`, the grid's total for
+/// `query` in each of its child folders, by child path. A child with no match is left out. Counted
+/// once per query, like the total.
+#[tauri::command]
+pub async fn get_folder_counts(
+    query: SearchQuery,
+    library_id: String,
+    parent_paths: Vec<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<HashMap<String, HashMap<String, i64>>> {
+    let library = state
+        .db
+        .get_library_handle(&library_id)
+        .await
+        .ok_or_else(|| format!("Library {library_id} is not open"))?;
+    folder_counts(&library.pool, &query, &parent_paths)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `get_folder_counts` on the library at `pool`. A folder's count leaves out the query's folder
+/// and collection, which selecting the folder replaces (`LibrariesSection`), and groups the files
+/// below each parent by the path segment that follows it: one query per parent. Files directly in
+/// a parent belong to no child.
+async fn folder_counts(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    query: &SearchQuery,
+    parent_paths: &[String],
+) -> sqlx::Result<HashMap<String, HashMap<String, i64>>> {
+    let mut any_folder = query.clone();
+    any_folder.folder = None;
+    any_folder.collection_id = None;
+    let filter = search_filter(&any_folder, false);
+    let mut counts = HashMap::new();
+    for parent in parent_paths {
+        // The files below the parent start with its range's lower bound, `p/`, or are the whole
+        // library. SQLite's `substr` and `instr` count characters.
+        let range = folder_range(parent);
+        let prefix_len = range.as_ref().map_or(0, |[from, _]| from.chars().count());
+        let rest = format!("substr(m.file_path, {})", prefix_len + 1);
+        let child = format!("substr(m.file_path, 1, {prefix_len} + instr({rest}, '/') - 1)");
+        let mut extra = vec![format!("instr({rest}, '/') > 0")];
+        if range.is_some() {
+            extra.push("m.file_path >= ? AND m.file_path < ?".to_string());
+        }
+        let binds: Vec<String> = range.into_iter().flatten().collect();
+        let mut children = HashMap::new();
+        add_grouped_counts(&mut children, pool, &filter, &child, &extra, &binds).await?;
+        counts.insert(parent.clone(), children);
+    }
+    Ok(counts)
+}
+
 /// The columns of a `RawAssetRow` selected from `assets a`. A main item with no thumbnail
 /// of its own, such as a `.blend`, shows a member's (`structure::preview_stand_ins`). An item's
 /// bundled preview is shown by its render's thumbnail when the render has one (plan C12).
@@ -886,6 +1101,61 @@ pub async fn get_asset(id: String, state: State<'_, Arc<AppState>>) -> Result<As
     }
 
     Err(format!("Asset not found: {}", id))
+}
+
+/// The files of the group asset `id` belongs to, for the detail panel: the main item first, then
+/// the others in the order the group picks its main item by (`structure::format_rank`), ties by
+/// path ignoring case. A file on its own is listed alone.
+#[tauri::command]
+pub async fn get_group_members(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<GroupMember>> {
+    let lib = state
+        .db
+        .library_of_asset(&id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Asset not found: {}", id))?;
+    group_members(&lib, &id).await.map_err(|e| e.to_string())
+}
+
+#[derive(sqlx::FromRow)]
+struct MemberRow {
+    is_main: bool,
+    #[sqlx(flatten)]
+    row: RawAssetRow,
+}
+
+async fn group_members(lib: &LibraryHandle, id: &str) -> sqlx::Result<Vec<GroupMember>> {
+    let sql = format!(
+        "SELECT a.group_id IS a.id AS is_main, {ASSET_COLUMNS} FROM assets a
+         WHERE a.id = ?1 OR a.group_id = (SELECT group_id FROM assets WHERE id = ?1)"
+    );
+    let mut rows = sqlx::query_as::<_, MemberRow>(&sql)
+        .bind(id)
+        .fetch_all(&lib.pool)
+        .await?;
+    rows.sort_by_cached_key(|m| {
+        (
+            !m.is_main,
+            structure::format_rank(&m.row.extension),
+            m.row.file_path.to_ascii_lowercase(),
+            m.row.file_path.clone(),
+        )
+    });
+    Ok(rows
+        .into_iter()
+        .map(|m| GroupMember {
+            folder: m
+                .row
+                .file_path
+                .rsplit_once('/')
+                .map_or("", |(dir, _)| dir)
+                .to_string(),
+            asset: row_to_asset(Some(&lib.root_path), m.row),
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -1020,92 +1290,131 @@ pub async fn delete_asset(
     delete_file: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
-    delete_assets_with(
+    let result = delete_assets_with(
         &state.db,
         std::slice::from_ref(&id),
         delete_file.unwrap_or(true),
         |path| trash::delete(path),
     )
-    .await
-    .map_err(|e| e.message)?;
+    .await;
+    // Emit even on failure: the files of a group that were trashed are gone.
     let _ = state.app_handle.emit("library:updated", ());
-    Ok(())
+    result.map_err(|e| e.message)
 }
 
-/// Deletes an asset's rows and, when `delete_file` is set, moves its file to the trash with
-/// `trash`. If the trash fails, it returns the error and leaves the file and the rows alone.
-/// Returns the library that held the asset, whose structure pass the caller reruns.
+/// One file that a delete or rename of an item reaches (`item_files`).
+#[derive(sqlx::FromRow)]
+struct ItemFile {
+    id: String,
+    file_path: String,
+    file_name: String,
+    extension: String,
+    /// Whether this is the item's bundled preview rather than a member
+    is_render: bool,
+}
+
+/// The files a delete or rename of `id` reaches (plan C21): every member of its group, the main
+/// item first and the rest by path, then the group's bundled preview, unless another item shows
+/// the same render. A file on its own comes with its bundled preview, if it has one. Empty when
+/// `pool` holds no asset `id`.
+async fn item_files(pool: &sqlx::Pool<sqlx::Sqlite>, id: &str) -> sqlx::Result<Vec<ItemFile>> {
+    let mut files: Vec<ItemFile> = sqlx::query_as(
+        "WITH item AS (SELECT COALESCE(group_id, id) AS main FROM assets WHERE id = ?1)
+         SELECT a.id, a.file_path, a.file_name, a.extension, 0 AS is_render FROM assets a, item
+         WHERE a.id = ?1 OR a.group_id = item.main
+         ORDER BY a.id <> item.main, a.file_path",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    let render: Option<ItemFile> = sqlx::query_as(
+        "SELECT p.id, p.file_path, p.file_name, p.extension, 1 AS is_render FROM assets m
+         JOIN assets p ON p.file_path = m.bundled_preview
+         WHERE m.id = (SELECT COALESCE(group_id, id) FROM assets WHERE id = ?)
+           AND NOT EXISTS (SELECT 1 FROM assets o
+                           WHERE o.bundled_preview = m.bundled_preview AND o.id <> m.id)",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    files.extend(render);
+    Ok(files)
+}
+
+/// Deletes the rows of `id`'s files (`item_files`) from `lib` and, when `delete_file` is set,
+/// first moves each file to the trash with `trash`, never falling back to a permanent delete. A
+/// failed trash stops there: the files trashed before it lose their rows, and the error names
+/// the files left in place, which keep theirs.
 async fn delete_asset_with<E: std::fmt::Display>(
     db: &Database,
+    lib: &LibraryHandle,
     id: &str,
     delete_file: bool,
     trash: impl Fn(&Path) -> std::result::Result<(), E>,
-) -> Result<Option<LibraryHandle>> {
-    let libs = db.get_all_libraries().await;
-    let mut target_pools = Vec::new();
-    let mut file_to_delete: Option<std::path::PathBuf> = None;
-    let mut holder = None;
-
-    for lib in &libs {
-        let row: Option<(String,)> = sqlx::query_as("SELECT file_path FROM assets WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&lib.pool)
-            .await
-            .unwrap_or(None);
-
-        if let Some((fp,)) = row {
-            let abs_path = if Path::new(&fp).is_absolute() {
-                std::path::PathBuf::from(fp)
-            } else {
-                lib.root_path.join(fp)
-            };
-            file_to_delete = Some(abs_path);
-            target_pools.push(lib.pool.clone());
-            holder = Some(lib.clone());
-        }
-    }
-
-    target_pools.push(db.master_pool.clone());
-
-    // Move the file to the trash. Never fall back to a permanent delete.
-    if delete_file {
-        if let Some(ref path) = file_to_delete {
-            if path.exists() {
-                trash(path).map_err(|e| {
-                    format!(
-                        "Could not move {} to the trash, so it was not deleted: {}",
-                        path.display(),
-                        e
-                    )
-                })?;
+) -> Result<()> {
+    let files = item_files(&lib.pool, id).await.map_err(|e| e.to_string())?;
+    let mut failure = None;
+    let mut trashed = 0;
+    for file in &files {
+        let path = PathBuf::from(resolve_path(&lib.root_path, &file.file_path));
+        if delete_file && path.exists() {
+            if let Err(e) = trash(&path) {
+                failure = Some(format!(
+                    "Could not move {} to the trash, so it was not deleted: {}",
+                    path.display(),
+                    e
+                ));
+                break;
             }
         }
+        trashed += 1;
     }
 
-    // Delete records from databases
-    for pool in target_pools {
-        let _ = sqlx::query("DELETE FROM asset_tags WHERE asset_id = ?")
-            .bind(id)
-            .execute(&pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM collection_assets WHERE asset_id = ?")
-            .bind(id)
-            .execute(&pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM preview_jobs WHERE asset_id = ?")
-            .bind(id)
-            .execute(&pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM assets WHERE id = ?")
-            .bind(id)
-            .execute(&pool)
-            .await;
-        let _ = sqlx::query("UPDATE libraries SET asset_count = (SELECT COUNT(*) FROM assets)")
-            .execute(&pool)
+    let gone: Vec<&str> = files[..trashed].iter().map(|f| f.id.as_str()).collect();
+    if let Err(e) = delete_rows(&lib.pool, &gone).await {
+        tracing::warn!(
+            "Could not delete the rows of {gone:?} from library {}: {e}",
+            lib.id
+        );
+    }
+    let _ = delete_rows(&db.master_pool, &gone).await;
+    let count: sqlx::Result<i64> = sqlx::query_scalar("SELECT COUNT(*) FROM assets")
+        .fetch_one(&lib.pool)
+        .await;
+    if let Ok(count) = count {
+        let _ = sqlx::query("UPDATE libraries SET asset_count = ? WHERE id = ?")
+            .bind(count)
+            .bind(&lib.id)
+            .execute(&db.master_pool)
             .await;
     }
 
-    Ok(holder)
+    let Some(mut message) = failure else {
+        return Ok(());
+    };
+    let left = &files[trashed..];
+    if left.len() > 1 {
+        let paths: Vec<&str> = left.iter().map(|f| f.file_path.as_str()).collect();
+        message.push_str(&format!(". Still in place: {}", paths.join(", ")));
+    }
+    Err(message)
+}
+
+/// Deletes the assets `ids` and their tag, collection and preview job rows from `pool`, in one
+/// transaction.
+async fn delete_rows(pool: &sqlx::Pool<sqlx::Sqlite>, ids: &[&str]) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    for id in ids {
+        for sql in [
+            "DELETE FROM asset_tags WHERE asset_id = ?",
+            "DELETE FROM collection_assets WHERE asset_id = ?",
+            "DELETE FROM preview_jobs WHERE asset_id = ?",
+            "DELETE FROM assets WHERE id = ?",
+        ] {
+            sqlx::query(sql).bind(id).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await
 }
 
 #[tauri::command]
@@ -1133,8 +1442,9 @@ pub struct DeleteAssetsError {
     failed_ids: Vec<String>,
 }
 
-/// Deletes each asset with `delete_asset_with`, carrying on past failures, and reports them.
-/// Before it returns, it reruns the structure pass once for each library it deleted from.
+/// Deletes each asset with its group and bundled preview (`delete_asset_with`), carrying on past
+/// failures, and reports them. Before it returns, it reruns the structure pass once for each
+/// library that held one of them, failed or not, since a group can lose some of its files.
 async fn delete_assets_with<E: std::fmt::Display>(
     db: &Database,
     ids: &[String],
@@ -1144,10 +1454,23 @@ async fn delete_assets_with<E: std::fmt::Display>(
     let mut failures = Vec::new();
     let mut changed: Vec<LibraryHandle> = Vec::new();
     for id in ids {
-        match delete_asset_with(db, id, delete_file, &trash).await {
-            Ok(Some(lib)) if !changed.iter().any(|l| l.id == lib.id) => changed.push(lib),
-            Ok(_) => {}
-            Err(e) => failures.push((id.clone(), e)),
+        let lib = match db.library_of_asset(id).await {
+            Ok(Some(lib)) => lib,
+            Ok(None) => {
+                // A row only master holds, from before libraries had their own DBs.
+                let _ = delete_rows(&db.master_pool, &[id.as_str()]).await;
+                continue;
+            }
+            Err(e) => {
+                failures.push((id.clone(), e.to_string()));
+                continue;
+            }
+        };
+        if let Err(e) = delete_asset_with(db, &lib, id, delete_file, &trash).await {
+            failures.push((id.clone(), e));
+        }
+        if !changed.iter().any(|l| l.id == lib.id) {
+            changed.push(lib);
         }
     }
     for lib in &changed {
@@ -1170,13 +1493,36 @@ pub async fn rename_asset(
     new_name: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Asset> {
-    rename_asset_with(&state.db, &id, &new_name).await?;
+    rename_asset_with(&state.db, &id, &new_name, |from, to| {
+        std::fs::rename(from, to)
+    })
+    .await?;
     let _ = state.app_handle.emit("library:updated", ());
     get_asset(id, state).await
 }
 
-/// Renames an asset's file in its folder and its rows, then reruns its library's structure pass.
-async fn rename_asset_with(db: &Database, id: &str, new_name: &str) -> Result<()> {
+/// One file's rename: its row, where it is and where it goes.
+struct Move<'a> {
+    file: &'a ItemFile,
+    from: PathBuf,
+    to: PathBuf,
+    name: String,
+    extension: String,
+}
+
+/// Renames `id`'s files (`item_files`) in their folders, with `rename`, and their rows, then
+/// reruns the library's structure pass. A file on its own takes `new_name`, with its extension
+/// added when the name has none, so a typed extension changes its format. A group's members take
+/// `new_name` as their stem, less the main item's extension if it ends with it, and each keeps
+/// its own extension (plan C21). Either way the bundled preview takes the new stem and keeps its
+/// extension. Nothing moves when a new name is taken, and a failed rename or row write
+/// puts the files already renamed back.
+async fn rename_asset_with(
+    db: &Database,
+    id: &str,
+    new_name: &str,
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
     let trimmed = new_name.trim();
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
         return Err("Asset file name cannot be empty, '.' or '..'".into());
@@ -1186,105 +1532,180 @@ async fn rename_asset_with(db: &Database, id: &str, new_name: &str) -> Result<()
         return Err("File name cannot contain '/' or NUL".into());
     }
 
-    let libs = db.get_all_libraries().await;
-    let mut found_lib = None;
-    let mut current_fp = None;
-    let mut current_ext = None;
-
-    for lib in &libs {
-        let row: Option<(String, String)> =
-            sqlx::query_as("SELECT file_path, extension FROM assets WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&lib.pool)
-                .await
-                .unwrap_or(None);
-
-        if let Some((fp, ext)) = row {
-            found_lib = Some(lib.clone());
-            current_fp = Some(fp);
-            current_ext = Some(ext);
-            break;
-        }
-    }
-
-    let (lib, old_rel_fp, old_ext) = match (found_lib, current_fp, current_ext) {
-        (Some(l), Some(fp), Some(ext)) => (l, fp, ext),
-        _ => return Err(format!("Asset not found: {}", id)),
+    let lib = db
+        .library_of_asset(id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Asset not found: {}", id))?;
+    let files = item_files(&lib.pool, id).await.map_err(|e| e.to_string())?;
+    let Some(main) = files.first() else {
+        return Err(format!("Asset not found: {}", id));
     };
 
-    let old_abs_path = if Path::new(&old_rel_fp).is_absolute() {
-        std::path::PathBuf::from(&old_rel_fp)
-    } else {
-        lib.root_path.join(&old_rel_fp)
+    // Each file's new name and extension
+    let with_stem = |f: &ItemFile, stem: &str| match f.file_name.rsplit_once('.') {
+        Some((_, ext)) => (format!("{stem}.{ext}"), f.extension.clone()),
+        None => (stem.to_string(), f.extension.clone()),
     };
-
-    let parent_dir = old_abs_path
-        .parent()
-        .ok_or_else(|| "Could not determine parent directory".to_string())?;
-
-    // Determine new filename and extension
-    let (final_name, new_ext) = if let Some((stem, ext)) = trimmed.rsplit_once('.') {
-        if !stem.is_empty() && !ext.is_empty() {
-            (trimmed.to_string(), ext.to_lowercase())
-        } else {
-            (format!("{}.{}", trimmed, old_ext), old_ext.clone())
-        }
-    } else {
-        (format!("{}.{}", trimmed, old_ext), old_ext.clone())
-    };
-
-    let new_abs_path = parent_dir.join(&final_name);
-
-    if new_abs_path.exists() && new_abs_path != old_abs_path {
-        return Err(format!(
-            "A file named '{}' already exists in this folder",
-            final_name
-        ));
-    }
-
-    // Rename file on disk
-    let renamed_on_disk = old_abs_path.exists();
-    if renamed_on_disk {
-        std::fs::rename(&old_abs_path, &new_abs_path)
-            .map_err(|e| format!("Failed to rename file on disk: {}", e))?;
-    }
-
-    let new_rel_fp = make_relative_path(&lib.root_path, &new_abs_path);
-    let now = chrono::Utc::now().timestamp_millis();
-
-    // Update in all relevant databases. The library's row must follow the file: if it can't
-    // (a busy NAS), the file takes its old name back, so the index never sees a new file.
-    let update = |pool: sqlx::Pool<sqlx::Sqlite>| {
-        let (name, path, ext) = (final_name.clone(), new_rel_fp.clone(), new_ext.clone());
-        async move {
-            sqlx::query(
-                "UPDATE assets SET file_name = ?, file_path = ?, extension = ?, modified_at = ? WHERE id = ?",
-            )
-            .bind(name)
-            .bind(path)
-            .bind(ext)
-            .bind(now)
-            .bind(id)
-            .execute(&pool)
-            .await
-        }
-    };
-    if let Err(e) = update(lib.pool.clone()).await {
-        if renamed_on_disk {
-            if let Err(undo) = std::fs::rename(&new_abs_path, &old_abs_path) {
-                return Err(format!(
-                    "Could not record the rename ({e}), and could not undo it on disk: {undo}"
-                ));
+    let names: Vec<(String, String)> = if files.iter().filter(|f| !f.is_render).count() == 1 {
+        let old_ext = &main.extension;
+        let (name, ext) = match trimmed.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
+                (trimmed.to_string(), ext.to_lowercase())
             }
+            _ => (format!("{}.{}", trimmed, old_ext), old_ext.clone()),
+        };
+        let stem = name
+            .rsplit_once('.')
+            .map_or(name.as_str(), |(stem, _)| stem);
+        files
+            .iter()
+            .map(|f| {
+                if f.is_render {
+                    with_stem(f, stem)
+                } else {
+                    (name.clone(), ext.clone())
+                }
+            })
+            .collect()
+    } else {
+        let stem = match trimmed.rsplit_once('.') {
+            Some((stem, ext)) if ext.eq_ignore_ascii_case(&main.extension) => stem,
+            _ => trimmed,
+        };
+        if stem.is_empty() {
+            return Err("Asset file name cannot be empty, '.' or '..'".into());
         }
-        return Err(format!(
-            "Could not record the rename, so it was undone: {e}"
-        ));
+        files.iter().map(|f| with_stem(f, stem)).collect()
+    };
+    let moves: Vec<Move> = files
+        .iter()
+        .zip(names)
+        .map(|(file, (name, extension))| {
+            let from = PathBuf::from(resolve_path(&lib.root_path, &file.file_path));
+            Move {
+                file,
+                to: from.with_file_name(&name),
+                from,
+                name,
+                extension,
+            }
+        })
+        .collect();
+
+    // Refuse before anything moves if a new name is taken, or two files would take one name
+    let mut targets = HashSet::new();
+    let taken: Vec<&Move> = moves
+        .iter()
+        .filter(|m| {
+            let repeated = !targets.insert(&m.to);
+            repeated || (m.to != m.from && m.to.exists())
+        })
+        .collect();
+    match taken.as_slice() {
+        [] => {}
+        [m] if files.len() == 1 => {
+            return Err(format!(
+                "A file named '{}' already exists in this folder",
+                m.name
+            ));
+        }
+        taken => {
+            let paths: Vec<String> = taken
+                .iter()
+                .map(|m| make_relative_path(&lib.root_path, &m.to))
+                .collect();
+            return Err(format!(
+                "Nothing was renamed, because these names are taken: {}",
+                paths.join(", ")
+            ));
+        }
     }
-    let _ = update(db.master_pool.clone()).await;
+
+    let mut done: Vec<&Move> = Vec::new();
+    for m in &moves {
+        if m.to == m.from || !m.from.exists() {
+            continue;
+        }
+        if let Err(e) = rename(&m.from, &m.to) {
+            return Err(match undo_renames(&done, &rename) {
+                Ok(()) => format!("Failed to rename file on disk: {e}"),
+                Err(left) => format!(
+                    "Failed to rename file on disk ({e}), and could not undo the renames of: {left}"
+                ),
+            });
+        }
+        done.push(m);
+    }
+
+    // The library's rows must follow the files: if they can't (a busy NAS), the files take their
+    // old names back, so the index never sees new files.
+    let now = chrono::Utc::now().timestamp_millis();
+    let rows: Vec<(&str, String, &str, &str)> = moves
+        .iter()
+        .map(|m| {
+            let path = make_relative_path(&lib.root_path, &m.to);
+            (
+                m.name.as_str(),
+                path,
+                m.extension.as_str(),
+                m.file.id.as_str(),
+            )
+        })
+        .collect();
+    let write = |pool: sqlx::Pool<sqlx::Sqlite>| {
+        let rows = &rows;
+        async move {
+            let mut tx = pool.begin().await?;
+            for (name, path, ext, id) in rows {
+                sqlx::query(
+                    "UPDATE assets SET file_name = ?, file_path = ?, extension = ?, modified_at = ? WHERE id = ?",
+                )
+                .bind(name)
+                .bind(path)
+                .bind(ext)
+                .bind(now)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await
+        }
+    };
+    if let Err(e) = write(lib.pool.clone()).await {
+        return Err(match undo_renames(&done, &rename) {
+            Ok(()) => format!("Could not record the rename, so it was undone: {e}"),
+            Err(left) => {
+                format!("Could not record the rename ({e}), and could not undo it on disk: {left}")
+            }
+        });
+    }
+    let _ = write(db.master_pool.clone()).await;
 
     structure::rebuild_library(db, &lib).await;
     Ok(())
+}
+
+/// Puts the files of `done` back at their old names, last first. On failure, names the files
+/// left at their new names.
+fn undo_renames(
+    done: &[&Move],
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::result::Result<(), String> {
+    let left: Vec<String> = done
+        .iter()
+        .rev()
+        .filter_map(|m| {
+            rename(&m.to, &m.from)
+                .err()
+                .map(|e| format!("{} ({e})", m.to.display()))
+        })
+        .collect();
+    if left.is_empty() {
+        Ok(())
+    } else {
+        Err(left.join(", "))
+    }
 }
 
 #[cfg(test)]
@@ -2639,6 +3060,10 @@ mod tests {
         (root, db, pool)
     }
 
+    fn fs_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
     async fn has_row(pool: &Pool<Sqlite>, id: &str) -> bool {
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets WHERE id = ?")
             .bind(id)
@@ -2677,12 +3102,18 @@ mod tests {
     async fn a_failed_trash_keeps_the_file_and_the_asset_row() {
         let (root, db, pool) = library_with(&["tree"]).await;
 
-        let result = delete_asset_with(&db, "tree", true, |_| Err("trash unavailable")).await;
+        let result = delete_assets_with(&db, &ids(&["tree"]), true, |_| {
+            Err::<(), _>("trash unavailable")
+        })
+        .await;
 
         let file_exists = root.join("tree.glb").exists();
         let row_kept = has_row(&pool, "tree").await;
         std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(result.map(|_| ()), Err(trash_error(&root, "tree")));
+        assert_eq!(
+            result.map_err(|e| e.message),
+            Err(trash_error(&root, "tree"))
+        );
         assert!(file_exists);
         assert!(row_kept);
     }
@@ -2692,7 +3123,7 @@ mod tests {
         let (root, db, pool) = library_with(&["tree"]).await;
         let trashed = RefCell::new(Vec::new());
 
-        let result = delete_asset_with(&db, "tree", true, |path| {
+        let result = delete_assets_with(&db, &ids(&["tree"]), true, |path| {
             trashed.borrow_mut().push(path.to_path_buf());
             Ok::<(), &str>(())
         })
@@ -2700,7 +3131,7 @@ mod tests {
 
         let row_kept = has_row(&pool, "tree").await;
         std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(result.map(|lib| lib.map(|l| l.id)), Ok(Some("lib".into())));
+        assert_eq!(result, Ok(()));
         assert_eq!(trashed.into_inner(), vec![root.join("tree.glb")]);
         assert!(!row_kept);
     }
@@ -2762,7 +3193,7 @@ mod tests {
     async fn renaming_an_asset_leaves_the_folders_a_fresh_pass_would() {
         let (root, db, pool) = library_in_folders(&FOLDER_FILES).await;
 
-        let result = rename_asset_with(&db, FOLDER_FILES[2], "boulder").await;
+        let result = rename_asset_with(&db, FOLDER_FILES[2], "boulder", fs_rename).await;
 
         let folders = crate::structure::tests::derived_rows(&pool).await;
         let renamed = root.join("3D assets/Nature Kit/Rocks/boulder.glb").exists();
@@ -2788,7 +3219,7 @@ mod tests {
         let (root, db, pool) = library_in_folders(&files).await;
         let before = crate::structure::tests::derived_rows(&pool).await;
 
-        let renamed = rename_asset_with(&db, files[0], "Notes").await;
+        let renamed = rename_asset_with(&db, files[0], "Notes", fs_rename).await;
         let after_rename = crate::structure::tests::derived_rows(&pool).await;
         let deleted =
             delete_assets_with(&db, &ids(&[files[1]]), true, trash_failing_for(&[])).await;
@@ -2821,7 +3252,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = rename_asset_with(&db, FOLDER_FILES[3], "oak").await;
+        let result = rename_asset_with(&db, FOLDER_FILES[3], "oak", fs_rename).await;
 
         let kept = root.join("tree.glb").exists();
         let renamed = root.join("oak.glb").exists();
@@ -2908,6 +3339,381 @@ mod tests {
                 "failedIds": ["tree", "bush"],
             })
         );
+    }
+
+    /// The Car Kit with the sedan in three formats, Kenney's render of it, and a van on its own.
+    fn sedan_kit() -> Vec<&'static str> {
+        let mut files = crate::structure::tests::SEDAN.to_vec();
+        files.push(crate::structure::tests::SEDAN_RENDER);
+        files.push("3D assets/Car Kit/Models/GLB format/van.glb");
+        files
+    }
+
+    /// The sedan's main item, the GLB, which is the card a delete or rename starts from.
+    const SEDAN_GLB: &str = "3D assets/Car Kit/Models/GLB format/sedan.glb";
+
+    /// The sedan's four files, its render included, renamed to `stem`.
+    fn sedan_files(stem: &str) -> Vec<String> {
+        let mut files: Vec<String> = crate::structure::tests::SEDAN
+            .iter()
+            .chain([&crate::structure::tests::SEDAN_RENDER])
+            .map(|path| path.replace("/sedan.", &format!("/{stem}.")))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// The sedan's files that are on disk under `root` for each of `stems`, sorted by path.
+    fn on_disk(root: &Path, stems: &[&str]) -> Vec<String> {
+        let mut files: Vec<String> = stems
+            .iter()
+            .flat_map(|stem| sedan_files(stem))
+            .filter(|path| root.join(path).exists())
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Registers the test library and another one in master, each counting 99 assets.
+    async fn register_libraries(db: &Database) {
+        sqlx::query(
+            "INSERT INTO libraries (id, name, root_paths, created_at, asset_count)
+             VALUES ('lib', 'lib', '[]', 0, 99), ('other', 'other', '[]', 0, 99)",
+        )
+        .execute(&db.master_pool)
+        .await
+        .unwrap();
+    }
+
+    /// Each library's asset count in master, by id.
+    async fn asset_counts(db: &Database) -> Vec<(String, i64)> {
+        sqlx::query_as("SELECT id, asset_count FROM libraries ORDER BY id")
+            .fetch_all(&db.master_pool)
+            .await
+            .unwrap()
+    }
+
+    /// `(id, count)` for the test library and the other one, which keeps its 99.
+    fn counts(lib: i64) -> Vec<(String, i64)> {
+        vec![("lib".to_string(), lib), ("other".to_string(), 99)]
+    }
+
+    #[tokio::test]
+    async fn renaming_a_group_renames_every_member_and_its_render() {
+        let files = sedan_kit();
+        let (root, db, pool) = library_in_folders(&files).await;
+
+        let result = rename_asset_with(&db, SEDAN_GLB, "coupe.glb", fs_rename).await;
+
+        let derived = crate::structure::tests::derived_rows(&pool).await;
+        let disk = on_disk(&root, &["sedan", "coupe"]);
+        let van_kept = root.join(files[4]).exists();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(disk, sedan_files("coupe"));
+        assert!(van_kept);
+        let mut after = sedan_files("coupe");
+        after.push(files[4].to_string());
+        let after: Vec<&str> = after.iter().map(String::as_str).collect();
+        assert_eq!(derived, crate::structure::tests::fresh_pass(&after).await);
+        assert_eq!(
+            derived.bundled_previews,
+            [(
+                "3D assets/Car Kit/Models/GLB format/coupe.glb".to_string(),
+                "3D assets/Car Kit/Previews/coupe.png".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_group_trashes_every_member_and_its_render() {
+        let files = sedan_kit();
+        let (root, db, pool) = library_in_folders(&files).await;
+        register_libraries(&db).await;
+        let trashed = RefCell::new(Vec::new());
+
+        let result = delete_assets_with(&db, &ids(&[SEDAN_GLB]), true, |path| {
+            trashed.borrow_mut().push(make_relative_path(&root, path));
+            Ok::<(), &str>(())
+        })
+        .await;
+
+        let derived = crate::structure::tests::derived_rows(&pool).await;
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Ok(()));
+        // Only the van is left, and only this library's count changes.
+        assert_eq!(asset_counts(&db).await, counts(1));
+        // The main item first, the other members by path, then the render.
+        assert_eq!(
+            trashed.into_inner(),
+            [
+                SEDAN_GLB,
+                "3D assets/Car Kit/Models/FBX format/sedan.fbx",
+                "3D assets/Car Kit/Models/OBJ format/sedan.obj",
+                "3D assets/Car Kit/Previews/sedan.png",
+            ]
+        );
+        assert_eq!(
+            derived,
+            crate::structure::tests::fresh_pass(&[files[4]]).await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_trash_in_a_group_keeps_the_files_after_it_and_names_them() {
+        let files = sedan_kit();
+        let (root, db, pool) = library_in_folders(&files).await;
+        register_libraries(&db).await;
+
+        let result = delete_assets_with(&db, &ids(&[SEDAN_GLB]), true, |path| {
+            if path.extension().is_some_and(|e| e == "obj") {
+                Err("trash unavailable")
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+
+        let derived = crate::structure::tests::derived_rows(&pool).await;
+        std::fs::remove_dir_all(&root).unwrap();
+        let obj = "3D assets/Car Kit/Models/OBJ format/sedan.obj";
+        let render = crate::structure::tests::SEDAN_RENDER;
+        assert_eq!(
+            result,
+            Err(DeleteAssetsError {
+                message: format!(
+                    "Could not move {} to the trash, so it was not deleted: trash unavailable. \
+                     Still in place: {obj}, {render}",
+                    root.join(obj).display()
+                ),
+                failed_ids: ids(&[SEDAN_GLB]),
+            })
+        );
+        // The GLB and FBX lost their rows, and the pass ran on what is left.
+        assert_eq!(asset_counts(&db).await, counts(3));
+        let rest = [obj, render, files[4]];
+        assert_eq!(derived, crate::structure::tests::fresh_pass(&rest).await);
+    }
+
+    #[tokio::test]
+    async fn a_render_two_items_show_goes_only_with_the_last_of_them() {
+        let files = [
+            "Kit/Previews/tree.png",
+            "Kit/Models/tree.glb",
+            "Kit/Props/tree.glb",
+        ];
+        let (root, db, pool) = library_in_folders(&files).await;
+        let before = crate::structure::tests::derived_rows(&pool).await;
+
+        // The render is the models' both, so it stays when one goes, and goes with the other.
+        let deleted = delete_assets_with(&db, &ids(&[files[2]]), true, |path| {
+            std::fs::remove_file(path)
+        })
+        .await;
+        let render_kept = root.join(files[0]).exists();
+        let renamed = rename_asset_with(&db, files[1], "oak", fs_rename).await;
+
+        let derived = crate::structure::tests::derived_rows(&pool).await;
+        let render_renamed = root.join("Kit/Previews/oak.png").exists();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(before.bundled_previews.len(), 2);
+        assert_eq!((deleted, renamed), (Ok(()), Ok(())));
+        assert!(render_kept && render_renamed);
+        let after = ["Kit/Previews/oak.png", "Kit/Models/oak.glb"];
+        assert_eq!(derived, crate::structure::tests::fresh_pass(&after).await);
+    }
+
+    #[tokio::test]
+    async fn a_file_on_its_own_with_a_render_can_change_format_and_takes_its_render_along() {
+        let files = ["Kit/Models/rock.glb", "Kit/Previews/rock.png"];
+        let (root, db, pool) = library_in_folders(&files).await;
+
+        let result = rename_asset_with(&db, files[0], "boulder.fbx", fs_rename).await;
+
+        let derived = crate::structure::tests::derived_rows(&pool).await;
+        let extension: String = sqlx::query_scalar("SELECT extension FROM assets WHERE id = ?")
+            .bind(files[0])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let disk: Vec<bool> = ["Kit/Models/boulder.fbx", "Kit/Previews/boulder.png"]
+            .iter()
+            .chain(&files)
+            .map(|path| root.join(path).exists())
+            .collect();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(disk, [true, true, false, false]);
+        assert_eq!(extension, "fbx");
+        let after = ["Kit/Models/boulder.fbx", "Kit/Previews/boulder.png"];
+        assert_eq!(derived, crate::structure::tests::fresh_pass(&after).await);
+        assert_eq!(
+            derived.bundled_previews,
+            [(after[0].to_string(), after[1].to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_rename_onto_a_taken_name_moves_nothing() {
+        let files = sedan_kit();
+        let (root, db, pool) = library_in_folders(&files).await;
+        let before = crate::structure::tests::derived_rows(&pool).await;
+        let taken = "3D assets/Car Kit/Models/OBJ format/coupe.obj";
+        std::fs::write(root.join(taken), "").unwrap();
+
+        let result = rename_asset_with(&db, SEDAN_GLB, "coupe", fs_rename).await;
+
+        let derived = crate::structure::tests::derived_rows(&pool).await;
+        let disk = on_disk(&root, &["sedan", "coupe"]);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            result,
+            Err(format!(
+                "Nothing was renamed, because these names are taken: {taken}"
+            ))
+        );
+        let mut expected = sedan_files("sedan");
+        expected.push(taken.to_string());
+        expected.sort();
+        assert_eq!(disk, expected);
+        assert_eq!(derived, before);
+    }
+
+    #[tokio::test]
+    async fn a_group_rename_that_fails_midway_puts_every_file_back() {
+        let files = sedan_kit();
+        let (root, db, pool) = library_in_folders(&files).await;
+        let before = crate::structure::tests::derived_rows(&pool).await;
+        let renamed = RefCell::new(0);
+
+        // The GLB and the FBX are renamed before the OBJ fails.
+        let result = rename_asset_with(&db, SEDAN_GLB, "coupe", |from, to| {
+            if to.extension().is_some_and(|e| e == "obj") {
+                return Err(std::io::Error::other("disk unavailable"));
+            }
+            *renamed.borrow_mut() += 1;
+            std::fs::rename(from, to)
+        })
+        .await;
+
+        let derived = crate::structure::tests::derived_rows(&pool).await;
+        let disk = on_disk(&root, &["sedan", "coupe"]);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            result,
+            Err("Failed to rename file on disk: disk unavailable".to_string())
+        );
+        // Two renames there and two back
+        assert_eq!(renamed.into_inner(), 4);
+        assert_eq!(disk, sedan_files("sedan"));
+        assert_eq!(derived, before);
+    }
+
+    #[tokio::test]
+    async fn a_group_rename_whose_undo_fails_names_the_files_left_renamed() {
+        let files = sedan_kit();
+        let (root, db, pool) = library_in_folders(&files).await;
+        let before = crate::structure::tests::derived_rows(&pool).await;
+
+        // The OBJ fails after the GLB and the FBX are renamed, and the FBX can't go back.
+        let result = rename_asset_with(&db, SEDAN_GLB, "coupe", |from, to| {
+            let ext = to.extension().unwrap();
+            let back = to.file_stem().unwrap() == "sedan";
+            if ext == "obj" || (back && ext == "fbx") {
+                return Err(std::io::Error::other("disk unavailable"));
+            }
+            std::fs::rename(from, to)
+        })
+        .await;
+
+        let derived = crate::structure::tests::derived_rows(&pool).await;
+        let disk = on_disk(&root, &["sedan", "coupe"]);
+        std::fs::remove_dir_all(&root).unwrap();
+        let fbx = root.join("3D assets/Car Kit/Models/FBX format/coupe.fbx");
+        assert_eq!(
+            result,
+            Err(format!(
+                "Failed to rename file on disk (disk unavailable), and could not undo the renames \
+                 of: {} (disk unavailable)",
+                fbx.display()
+            ))
+        );
+        assert_eq!(
+            disk,
+            [
+                "3D assets/Car Kit/Models/FBX format/coupe.fbx",
+                SEDAN_GLB,
+                "3D assets/Car Kit/Models/OBJ format/sedan.obj",
+                crate::structure::tests::SEDAN_RENDER,
+            ]
+        );
+        // No row was written, so they all keep their old paths.
+        assert_eq!(derived, before);
+    }
+
+    #[tokio::test]
+    async fn a_refused_row_write_whose_undo_fails_names_the_files_left_renamed() {
+        let files = sedan_kit();
+        let (root, db, pool) = library_in_folders(&files).await;
+        sqlx::query(
+            "CREATE TRIGGER refuse BEFORE UPDATE ON assets BEGIN SELECT RAISE(ABORT, 'busy'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Every file is renamed, then the render can't go back.
+        let result = rename_asset_with(&db, SEDAN_GLB, "coupe", |from, to| {
+            if to.extension().unwrap() == "png" && to.file_stem().unwrap() == "sedan" {
+                return Err(std::io::Error::other("disk unavailable"));
+            }
+            std::fs::rename(from, to)
+        })
+        .await;
+
+        let disk = on_disk(&root, &["sedan", "coupe"]);
+        std::fs::remove_dir_all(&root).unwrap();
+        let render = root.join("3D assets/Car Kit/Previews/coupe.png");
+        assert_eq!(
+            result,
+            Err(format!(
+                "Could not record the rename (error returned from database: (code: 1811) busy), \
+                 and could not undo it on disk: {} (disk unavailable)",
+                render.display()
+            ))
+        );
+        let mut expected = sedan_files("sedan");
+        expected.retain(|path| !path.ends_with(".png"));
+        expected.push("3D assets/Car Kit/Previews/coupe.png".to_string());
+        expected.sort();
+        assert_eq!(disk, expected);
+    }
+
+    #[tokio::test]
+    async fn a_group_rename_the_library_db_refuses_puts_every_file_back() {
+        let files = sedan_kit();
+        let (root, db, pool) = library_in_folders(&files).await;
+        sqlx::query(
+            "CREATE TRIGGER refuse BEFORE UPDATE OF file_path ON assets
+             WHEN NEW.file_path LIKE '%.obj' BEGIN SELECT RAISE(ABORT, 'busy'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = rename_asset_with(&db, SEDAN_GLB, "coupe", fs_rename).await;
+
+        let paths: Vec<String> =
+            sqlx::query_scalar("SELECT file_path FROM assets WHERE file_path LIKE '%sedan.%'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let disk = on_disk(&root, &["sedan", "coupe"]);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(result.unwrap_err().contains("so it was undone"));
+        assert_eq!(disk, sedan_files("sedan"));
+        // The rows written before the refusal were rolled back with it.
+        assert_eq!(paths.len(), 4);
     }
 
     /// A library holding `paths`, each an asset whose id is its path. Every file has the same
@@ -3095,8 +3901,13 @@ mod tests {
     /// A library holding `GROUPED_FILES`, each with its real extension and kind and its id the
     /// path, after its structure pass.
     async fn grouped_library() -> LibraryHandle {
+        sized_library(&GROUPED_FILES).await
+    }
+
+    /// A library holding `files`, as `grouped_library` holds `GROUPED_FILES`.
+    async fn sized_library(files: &[(&str, i64)]) -> LibraryHandle {
         let pool = memory_library_pool().await;
-        for (path, size) in GROUPED_FILES {
+        for &(path, size) in files {
             let name = path.rsplit('/').next().unwrap();
             let ext = name.rsplit_once('.').unwrap().1;
             sqlx::query(
@@ -3138,6 +3949,98 @@ mod tests {
         let size = |id: &String| GROUPED_FILES.iter().find(|(p, _)| p == id).unwrap().1;
         ids.sort_by_key(size);
         (ids, total, files)
+    }
+
+    #[tokio::test]
+    async fn a_groups_members_list_in_main_item_order_from_any_member() {
+        let lib = grouped_library().await;
+        let members = |id: &'static str| {
+            let lib = &lib;
+            async move {
+                group_members(lib, id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|m| (m.asset.id, m.folder, m.asset.size_bytes))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let sedan = vec![
+            (SEDAN.to_string(), "kit/Models/GLB format".to_string(), 30),
+            (
+                "kit/Models/FBX format/sedan.fbx".to_string(),
+                "kit/Models/FBX format".to_string(),
+                10,
+            ),
+            (
+                "kit/Models/OBJ format/sedan.obj".to_string(),
+                "kit/Models/OBJ format".to_string(),
+                20,
+            ),
+        ];
+        assert_eq!(members(SEDAN).await, sedan);
+        assert_eq!(members("kit/Models/OBJ format/sedan.obj").await, sedan);
+        // Copies of one format: the main item first, the rest by path.
+        let colormaps: Vec<String> = members(COLORMAP)
+            .await
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(
+            colormaps,
+            strings(&[COLORMAP, "kit/Models/FBX format/Textures/colormap.png"])
+        );
+        // A file on its own is listed alone.
+        assert_eq!(
+            members(ROCK).await,
+            vec![(ROCK.to_string(), "other".to_string(), 25)]
+        );
+        let paths: Vec<String> = group_members(&lib, SEDAN)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.asset.file_path)
+            .collect();
+        assert_eq!(paths[0], format!("/libraries/lib/{SEDAN}"));
+    }
+
+    #[tokio::test]
+    async fn a_groups_members_order_by_format_then_by_path_ignoring_case() {
+        let ids = |lib: LibraryHandle, id: &'static str| async move {
+            group_members(&lib, id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.asset.id)
+                .collect::<Vec<_>>()
+        };
+        // The OBJ's path sorts before the FBX's, but FBX ranks first as a format.
+        let ship = sized_library(&[
+            ("ship/ship.glb", 1),
+            ("ship/ship.fbx", 1),
+            ("ship/obj/ship.obj", 1),
+        ])
+        .await;
+        assert_eq!(
+            ids(ship, "ship/ship.glb").await,
+            strings(&["ship/ship.glb", "ship/ship.fbx", "ship/obj/ship.obj"])
+        );
+        // Copies of one format follow their path ignoring case: `fbx/` before `OBJ/`, which
+        // byte order would put first.
+        let kit = sized_library(&[
+            ("kit/GLB format/tex.png", 1),
+            ("kit/OBJ/tex.png", 1),
+            ("kit/fbx/tex.png", 1),
+        ])
+        .await;
+        assert_eq!(
+            ids(kit, "kit/OBJ/tex.png").await,
+            strings(&[
+                "kit/GLB format/tex.png",
+                "kit/fbx/tex.png",
+                "kit/OBJ/tex.png"
+            ])
+        );
     }
 
     #[tokio::test]
@@ -3317,6 +4220,240 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A search query from `query`, with an empty text and filter unless it sets them.
+    fn query_of(query: serde_json::Value) -> SearchQuery {
+        let mut query = query;
+        query["sort"] = serde_json::json!({ "field": "name", "order": "asc" });
+        query["text"] = query.get("text").cloned().unwrap_or("".into());
+        query["filter"] = query
+            .get("filter")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        serde_json::from_value(query).unwrap()
+    }
+
+    /// The live folder counts of `query` for the children of `parents` in library `lib`.
+    async fn live_folder_counts(
+        library: &LibraryHandle,
+        query: serde_json::Value,
+        parents: &[&str],
+    ) -> HashMap<String, HashMap<String, i64>> {
+        let parents: Vec<String> = parents.iter().map(|p| p.to_string()).collect();
+        folder_counts(&library.pool, &query_of(query), &parents)
+            .await
+            .unwrap()
+    }
+
+    /// The live kind and extension counts of `query` in `libraries`.
+    async fn live_facet_counts(
+        libraries: &[LibraryHandle],
+        query: serde_json::Value,
+    ) -> FacetCounts {
+        let query = query_of(query);
+        facet_counts(&query, &target_libraries(&query, libraries))
+            .await
+            .unwrap()
+    }
+
+    fn count_map(pairs: &[(&str, i64)]) -> HashMap<String, i64> {
+        pairs.iter().map(|(k, n)| (k.to_string(), *n)).collect()
+    }
+
+    #[tokio::test]
+    async fn every_live_count_is_the_grid_total_for_that_folder_kind_or_extension() {
+        let libs = [grouped_library().await];
+        let pool = &libs[0].pool;
+        let folders: Vec<String> = sqlx::query_scalar("SELECT path FROM folders")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        let parents: Vec<&str> = folders.iter().map(String::as_str).collect();
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT DISTINCT kind FROM assets")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        let extensions: Vec<String> = sqlx::query_scalar("SELECT DISTINCT extension FROM assets")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        let folder = |path: &str| serde_json::json!({ "libraryId": "lib", "path": path });
+        let queries = [
+            serde_json::json!({}),
+            serde_json::json!({ "text": "sedan" }),
+            serde_json::json!({ "text": "fbx" }),
+            serde_json::json!({ "text": "colormap", "filter": { "showHidden": true } }),
+            serde_json::json!({ "text": "license", "filter": { "showHidden": true } }),
+            serde_json::json!({ "filter": { "extensions": ["obj"] } }),
+            serde_json::json!({ "filter": { "kinds": ["texture"], "namePrefix": "c" } }),
+            serde_json::json!({ "filter": { "directory": "kit/Models/FBX format" } }),
+            serde_json::json!({ "folder": folder("kit/Models/FBX format") }),
+            serde_json::json!({ "folder": folder("kit"), "text": "sedan" }),
+            serde_json::json!({ "filter": { "extensions": ["png", "obj"] } }),
+            serde_json::json!({ "text": "fbx", "filter": { "extensions": ["glb"] } }),
+            serde_json::json!({ "folder": folder("kit/Models"), "filter": { "extensions": ["fbx"] } }),
+        ];
+        let mut nonzero = 0;
+        for query in queries {
+            let total = |patch: serde_json::Value| {
+                let mut q = query.clone();
+                for (key, value) in patch.as_object().unwrap() {
+                    if key == "filter" {
+                        let mut filter = q.get("filter").cloned().unwrap_or(serde_json::json!({}));
+                        for (k, v) in value.as_object().unwrap() {
+                            filter[k] = v.clone();
+                        }
+                        q["filter"] = filter;
+                    } else {
+                        q[key] = value.clone();
+                    }
+                }
+                let libs = &libs;
+                async move { counted_search(libs, q).await.1.unwrap() }
+            };
+
+            let counts = live_folder_counts(&libs[0], query.clone(), &parents).await;
+            for child in folders.iter().filter(|p| !p.is_empty()) {
+                let parent = child.rsplit_once('/').map_or("", |(p, _)| p);
+                let count = counts[parent].get(child).copied().unwrap_or(0);
+                let expected = total(serde_json::json!({ "folder": folder(child) })).await;
+                assert_eq!(count, expected, "{query}: folder {child:?}");
+                nonzero += (count > 0) as usize;
+            }
+            let facets = live_facet_counts(&libs, query.clone()).await;
+            for kind in &kinds {
+                let count = facets.kinds.get(kind).copied().unwrap_or(0);
+                let expected = total(serde_json::json!({ "filter": { "kinds": [kind] } })).await;
+                assert_eq!(count, expected, "{query}: kind {kind}");
+            }
+            // A format pill adds its extension to the active ones; `txt` only the license has.
+            let active: Vec<String> =
+                serde_json::from_value(query["filter"]["extensions"].clone()).unwrap_or_default();
+            for ext in extensions
+                .iter()
+                .map(String::as_str)
+                .chain(["txt", "nothing"])
+            {
+                let count = facets.extension(ext);
+                let mut picked = active.clone();
+                if !picked.iter().any(|e| e == ext) {
+                    picked.push(ext.to_string());
+                }
+                let expected =
+                    total(serde_json::json!({ "filter": { "extensions": picked } })).await;
+                assert_eq!(count, expected, "{query}: extension {ext}");
+            }
+        }
+        assert!(nonzero > 20, "only {nonzero} folder counts were above 0");
+    }
+
+    #[tokio::test]
+    async fn a_kits_format_folders_each_count_its_models_and_their_parent_counts_them_once() {
+        let library = grouped_library().await;
+        let counts = live_folder_counts(
+            &library,
+            serde_json::json!({ "filter": { "kinds": ["3d_model"] } }),
+            &["kit/Models", "kit", ""],
+        )
+        .await;
+        assert_eq!(
+            counts["kit/Models"],
+            count_map(&[
+                ("kit/Models/GLB format", 2),
+                ("kit/Models/FBX format", 1),
+                ("kit/Models/OBJ format", 2)
+            ])
+        );
+        // Sibling counts add up to more than their parent's: each model counts once in `Models/`.
+        assert_eq!(counts["kit"], count_map(&[("kit/Models", 2)]));
+        assert_eq!(counts[""], count_map(&[("kit", 2), ("other", 1)]));
+    }
+
+    #[tokio::test]
+    async fn search_text_only_a_members_folder_matches_counts_the_group_only_under_that_folder() {
+        let libs = [grouped_library().await];
+        let query = serde_json::json!({ "text": "fbx" });
+        let counts = live_folder_counts(&libs[0], query.clone(), &["kit/Models", ""]).await;
+        // The sedan and the colormap through their FBX copies, and no GLB or OBJ folder.
+        assert_eq!(
+            counts["kit/Models"],
+            count_map(&[("kit/Models/FBX format", 2)])
+        );
+        assert_eq!(counts[""], count_map(&[("kit", 2), ("other", 1)]));
+        let facets = live_facet_counts(&libs, query).await;
+        assert_eq!(
+            facets,
+            FacetCounts {
+                kinds: count_map(&[("3d_model", 2), ("texture", 1)]),
+                extensions: count_map(&[("fbx", 2), ("png", 1)]),
+                extension_base: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_format_count_adds_its_extension_to_the_active_ones() {
+        let libs = [grouped_library().await];
+        // The only PNG item is the colormap, the sedan's render being hidden; each model adds its
+        // own formats to it.
+        let query = serde_json::json!({ "filter": { "extensions": ["png"] } });
+        let facets = live_facet_counts(&libs, query).await;
+        assert_eq!(facets.extension_base, 1);
+        assert_eq!(
+            facets.extensions,
+            count_map(&[("fbx", 3), ("glb", 3), ("obj", 3)])
+        );
+        let (_, total, _) = counted_search(
+            &libs,
+            serde_json::json!({ "filter": { "extensions": ["png", "fbx"] } }),
+        )
+        .await;
+        assert_eq!(total, Some(3));
+    }
+
+    #[tokio::test]
+    async fn folder_counts_leave_out_the_collection_selecting_a_folder_replaces() {
+        let libs = [grouped_library().await];
+        let pool = &libs[0].pool;
+        insert_collection(pool, "garage", "garage", None).await;
+        sqlx::query("INSERT INTO collection_assets (collection_id, asset_id) VALUES ('garage', ?)")
+            .bind(SEDAN)
+            .execute(pool)
+            .await
+            .unwrap();
+        let query = serde_json::json!({ "text": "fbx", "collectionId": "garage" });
+        let counts = live_folder_counts(&libs[0], query.clone(), &[""]).await;
+        assert_eq!(counts[""], count_map(&[("kit", 2), ("other", 1)]));
+        let facets = live_facet_counts(&libs, query).await;
+        assert_eq!(facets.extensions, count_map(&[("fbx", 1)]));
+    }
+
+    #[tokio::test]
+    async fn facet_counts_add_up_every_library_searched() {
+        let libs = [grouped_library().await, {
+            let mut other = grouped_library().await;
+            other.id = "other".to_string();
+            other
+        }];
+        let facets = live_facet_counts(&libs, serde_json::json!({ "text": "fbx" })).await;
+        assert_eq!(facets.extensions, count_map(&[("fbx", 4), ("png", 2)]));
+        let one = live_facet_counts(
+            &libs,
+            serde_json::json!({ "text": "fbx", "libraryId": "other" }),
+        )
+        .await;
+        assert_eq!(one.extensions, count_map(&[("fbx", 2), ("png", 1)]));
+        // With FBX active, the colormap's PNG copy adds one item in each library.
+        let fbx = live_facet_counts(
+            &libs,
+            serde_json::json!({ "text": "fbx", "filter": { "extensions": ["fbx"] } }),
+        )
+        .await;
+        assert_eq!(
+            (fbx.extension_base, fbx.extensions),
+            (4, count_map(&[("png", 6)]))
+        );
     }
 
     #[tokio::test]
@@ -3861,7 +4998,7 @@ mod tests {
         .await
         .unwrap();
         let started = Instant::now();
-        rename_asset_with(&db, &id, "renamed-by-golden-test")
+        rename_asset_with(&db, &id, "renamed-by-golden-test", fs_rename)
             .await
             .unwrap();
         timed(
@@ -4545,6 +5682,125 @@ mod tests {
                 times[times.len() - 1]
             );
         }
+    }
+
+    /// Live counts (plan C23, A5) on a copy of the golden snapshot's library DB, named by
+    /// `OPENDAM_GOLDEN_DB` as above. For a search for "tree", every count beside the tree, the
+    /// Types filter and the format filter equals the grid's total, the Platformer Kit's format
+    /// folders each count its models while `Models/` counts them once, and each node's folder
+    /// counts take under 300 ms. Run it with
+    /// `cargo nextest run --run-ignored only golden_snapshot_live_counts --no-capture`.
+    #[tokio::test]
+    #[ignore = "needs OPENDAM_GOLDEN_DB, a copy of the golden snapshot's library.sqlite"]
+    async fn golden_snapshot_live_counts_equal_the_grid_totals_and_take_their_time() {
+        use std::time::{Duration, Instant};
+        let file = std::env::var("OPENDAM_GOLDEN_DB").expect("OPENDAM_GOLDEN_DB is set");
+        let pool = crate::db::connect_library_sqlite(Path::new(&file))
+            .await
+            .unwrap();
+        let libs = [LibraryHandle {
+            id: "golden".to_string(),
+            name: "golden".to_string(),
+            root_path: PathBuf::from("/golden"),
+            pool: pool.clone(),
+        }];
+        let search = || serde_json::json!({ "text": "tree" });
+        let kit = "3D assets/Platformer Kit";
+        let models = format!("{kit}/Models");
+        let parents = ["", "3D assets", kit, models.as_str()];
+
+        // Each node's counts as the tree asks for them when it expands: the median of 10 runs
+        // after 2 warm-ups.
+        let median = |mut times: Vec<Duration>| {
+            times.sort();
+            times[times.len() / 2]
+        };
+        for parent in parents {
+            let mut times = Vec::new();
+            for run in 0..12 {
+                let started = Instant::now();
+                live_folder_counts(&libs[0], search(), &[parent]).await;
+                if run >= 2 {
+                    times.push(started.elapsed());
+                }
+            }
+            let took = median(times);
+            println!("folder counts below {parent:?}: median {took:?} (target under 300 ms)");
+            assert!(
+                took < Duration::from_millis(300),
+                "{parent:?} took {took:?}"
+            );
+        }
+        let started = Instant::now();
+        let counts = live_folder_counts(&libs[0], search(), &parents).await;
+        println!(
+            "folder counts below all four at once: {:?}",
+            started.elapsed()
+        );
+        let started = Instant::now();
+        let facets = live_facet_counts(&libs, search()).await;
+        println!("kind and extension counts: {:?}", started.elapsed());
+
+        let total = |patch: serde_json::Value| {
+            let mut query = search();
+            for (key, value) in patch.as_object().unwrap() {
+                query[key] = value.clone();
+            }
+            let libs = &libs;
+            async move { counted_search(libs, query).await.1.unwrap() }
+        };
+        let mut checked = 0;
+        for parent in parents {
+            let children: Vec<String> =
+                sqlx::query_scalar("SELECT path FROM folders WHERE parent_path = ?")
+                    .bind(parent)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert!(!children.is_empty(), "{parent:?} has no children");
+            for child in children {
+                let count = counts[parent].get(&child).copied().unwrap_or(0);
+                let folder = serde_json::json!({ "libraryId": "golden", "path": child });
+                let expected = total(serde_json::json!({ "folder": folder })).await;
+                assert_eq!(count, expected, "folder {child:?}");
+                checked += 1;
+            }
+        }
+        for (kind, count) in &facets.kinds {
+            let expected = total(serde_json::json!({ "filter": { "kinds": [kind] } })).await;
+            assert_eq!(*count, expected, "kind {kind}");
+        }
+        for (ext, count) in &facets.extensions {
+            let expected = total(serde_json::json!({ "filter": { "extensions": [ext] } })).await;
+            assert_eq!(*count, expected, "extension {ext}");
+        }
+        // With FBX active, a format pill's count is the total once it joins FBX.
+        let with_fbx =
+            || serde_json::json!({ "text": "tree", "filter": { "extensions": ["fbx"] } });
+        let union = live_facet_counts(&libs, with_fbx()).await;
+        for ext in ["fbx", "glb", "gltf", "obj", "png", "svg", "jpg"] {
+            let count = union.extension(ext);
+            let mut query = with_fbx();
+            query["filter"]["extensions"] = serde_json::json!(["fbx", ext]);
+            let expected = counted_search(&libs, query).await.1.unwrap();
+            assert_eq!(count, expected, "fbx plus {ext}");
+        }
+        println!(
+            "with .fbx active: {:?}, {} for any other extension, each the total once it joins .fbx",
+            union.extensions, union.extension_base
+        );
+        println!(
+            "{checked} folder counts, {:?} by kind and {:?} by extension, each the grid's total",
+            facets.kinds, facets.extensions
+        );
+
+        let in_models = counts[kit][&models];
+        assert!(in_models > 0);
+        for format in ["GLB format", "FBX format", "OBJ format"] {
+            let path = format!("{models}/{format}");
+            assert_eq!(counts[models.as_str()][&path], in_models, "{path}");
+        }
+        println!("{models} counts {in_models}, and so does each of its format folders");
     }
 
     #[tokio::test]
