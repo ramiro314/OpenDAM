@@ -623,6 +623,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_packs_cover_images_are_queued_like_any_other_image() {
+        let (dir, db, lib) = temp_library().await;
+        let [glb, ..] = write_grouped_kit(dir.path());
+        std::fs::write(dir.path().join("kit/License.txt"), "CC0").unwrap();
+        write_png(&dir.path().join("kit/Preview.png"), 1024, 32);
+        reindex(&db, &lib).await;
+        let roles: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT file_path, support_role FROM assets WHERE support_role IS NOT NULL
+             ORDER BY file_path",
+        )
+        .fetch_all(&lib.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            roles,
+            [
+                ("kit/License.txt".to_string(), Some("doc".to_string())),
+                ("kit/Preview.png".to_string(), Some("cover".to_string())),
+            ]
+        );
+        // The cover gets a job, the license takes no preview, and the members stay off
+        let jobs = queued(&lib.pool).await.1;
+        assert_eq!(
+            jobs,
+            pairs(&[
+                (glb, "pending"),
+                ("kit/Preview.png", "pending"),
+                ("kit/tree.glb", "pending")
+            ])
+        );
+        crate::preview::process_image_jobs(&lib, 2).await;
+        let thumb: Option<String> = sqlx::query_scalar(
+            "SELECT thumbnail_path FROM assets WHERE file_path = 'kit/Preview.png'",
+        )
+        .fetch_one(&lib.pool)
+        .await
+        .unwrap();
+        assert!(thumb.is_some(), "the 1024 px cover got no thumbnail");
+    }
+
+    #[tokio::test]
     async fn new_files_wait_for_the_structure_pass_to_be_queued() {
         let (dir, db, lib) = temp_library().await;
         write_grouped_kit(dir.path());

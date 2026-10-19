@@ -524,9 +524,10 @@ async fn apply_groups(
     Ok(changed.len())
 }
 
-/// Keeps the preview queue on grid items (plan C15). A group member other than its main item
-/// comes off the queue, keeping any thumbnail it has. A grid item at `none` whose format takes a
-/// preview, such as a member that became a main item, goes on it. `preview::unqueue` and
+/// Keeps group members off the preview queue (plan C15). A group member other than its main item
+/// comes off the queue, keeping any thumbnail it has. Any other file at `none` whose format takes
+/// a preview goes on it: a new file, a member that became a main item, or a pack's cover image,
+/// which "Show hidden files" shows and a pack card pictures. `preview::unqueue` and
 /// `preview::enqueue` own how. Returns how many assets it changed.
 async fn apply_previews(
     pool: &Pool<Sqlite>,
@@ -542,10 +543,7 @@ async fn apply_previews(
             if file.preview_status == "pending" || waiting.contains(&file.id) {
                 members.push(file.id.as_str());
             }
-        } else if structure.roles[i].is_none()
-            && file.preview_status == "none"
-            && crate::preview::needs_preview(&file.extension)
-        {
+        } else if file.preview_status == "none" && crate::preview::needs_preview(&file.extension) {
             items.push(file.id.as_str());
         }
     }
