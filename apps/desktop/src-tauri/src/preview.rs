@@ -400,11 +400,13 @@ fn resolve_source(root_path: &Path, file_path: &str) -> PathBuf {
     }
 }
 
-/// A finished preview job, as `preview:done` reports it. Both paths are absolute; a `None`
-/// `thumb_path` means the asset has no thumbnail.
+/// A finished preview job, as `preview:done` reports it. Every path is absolute; a `None`
+/// `thumb_path` means the asset has no thumbnail. `file_path` is the asset's own file, so a
+/// card showing it as a model's bundled preview can switch to its thumbnail.
 #[derive(Debug)]
 pub(crate) struct PreviewDone {
     asset_id: String,
+    file_path: Option<String>,
     thumb_path: Option<String>,
     model_path: Option<String>,
 }
@@ -414,6 +416,7 @@ fn emit_done(state: &AppState, done: &PreviewDone) {
         "preview:done",
         json!({
             "assetId": &done.asset_id,
+            "filePath": &done.file_path,
             "thumbnailPath": &done.thumb_path,
             "previewModel": &done.model_path,
         }),
@@ -457,8 +460,15 @@ async fn complete_job(
         .await;
     }
 
+    let file_path: Option<String> = sqlx::query_scalar("SELECT file_path FROM assets WHERE id = ?")
+        .bind(asset_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
     PreviewDone {
         asset_id: asset_id.to_string(),
+        file_path: file_path.map(|f| resolve_path(root_path, &f)),
         thumb_path: rel_thumb.as_ref().map(|r| resolve_path(root_path, r)),
         model_path,
     }
@@ -1123,6 +1133,11 @@ mod tests {
         assert_eq!(
             done[0].thumb_path.as_deref(),
             Some(thumb.to_string_lossy().as_ref())
+        );
+        // The source's own path, so a model card showing it as a render takes its thumbnail.
+        assert_eq!(
+            done[0].file_path.as_deref(),
+            Some(root.join("textures/rock.png").to_string_lossy().as_ref())
         );
         assert_eq!(image::image_dimensions(&thumb).unwrap(), (512, 16));
         assert_eq!(

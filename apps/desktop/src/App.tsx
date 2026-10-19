@@ -55,6 +55,7 @@ export default function App() {
     // Real-time preview updates from background engine
     const unlistenDone = listen<{
       assetId: string;
+      filePath?: string | null;
       thumbnailPath: string | null;
       previewModel?: string;
     }>('preview:done', (event) => {
@@ -63,7 +64,8 @@ export default function App() {
         .updateAssetPreview(
           event.payload.assetId,
           event.payload.thumbnailPath,
-          event.payload.previewModel
+          event.payload.previewModel,
+          event.payload.filePath ?? undefined
         );
     });
 

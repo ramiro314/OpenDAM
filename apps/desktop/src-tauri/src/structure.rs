@@ -275,7 +275,9 @@ pub fn derive<'a>(paths: impl IntoIterator<Item = &'a str>) -> Structure {
 /// `Renders`, ignoring case, renders each model below that folder's parent whose lowercase stem
 /// equals its own. Each render becomes a `ModelPreview` support file in `roles`, and is returned
 /// with the models it renders, by input index. An image that already has a role, or renders no
-/// model, stays as it is.
+/// model, stays as it is. So does one the webview can't display itself (`.dds`, `.tga`): its
+/// card would show nothing whenever it has no thumbnail, while the model it renders lost its own
+/// place on the preview queue.
 fn model_previews(
     paths: &[&str],
     kinds: &[FileKind],
@@ -289,7 +291,10 @@ fn model_previews(
     }
     let mut renders = Vec::new();
     for (i, (path, kind)) in paths.iter().zip(kinds).enumerate() {
-        if !kind.is_image || roles[i].is_some() {
+        if !kind.is_image
+            || roles[i].is_some()
+            || !crate::preview::is_webview_displayable(&kind.ext)
+        {
             continue;
         }
         let (dir, _) = split_dir(path);
@@ -1703,6 +1708,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_image_the_webview_cant_display_is_no_render() {
+        // A render with no thumbnail shows as itself, so it must be one the webview decodes.
+        let paths = [
+            "kit/Renders/rock.dds",
+            "kit/Previews/tree.tga",
+            "kit/Previews/barrel.webp",
+            "kit/rock.glb",
+            "kit/tree.glb",
+            "kit/barrel.glb",
+        ];
+        assert_eq!(
+            bundled(&paths),
+            [("kit/barrel.glb", "kit/Previews/barrel.webp")]
+        );
+        assert_eq!(
+            hidden(&paths),
+            [("kit/Previews/barrel.webp", "model_preview")]
+        );
+    }
+
+    #[test]
     fn an_image_that_is_already_a_support_file_is_no_render() {
         // `Previews/` is marked by its `Preview.png`, which stays a cover.
         let paths = [
@@ -2112,6 +2138,19 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(derived_rows(&pool).await.bundled_previews, []);
+    }
+
+    #[tokio::test]
+    async fn a_model_whose_only_render_the_webview_cant_display_keeps_its_preview_job() {
+        let pool = memory_library_pool().await;
+        let (glb, render) = ("kit/rock.glb", "kit/Renders/rock.dds");
+        for path in [glb, render] {
+            insert_with_preview(&pool, path, "none").await;
+        }
+        rebuild(&pool).await.unwrap();
+        assert_eq!(derived_rows(&pool).await.bundled_previews, []);
+        // The DDS takes no preview, so only the model is queued.
+        assert_eq!(previews(&pool).await.1, pairs(&[(glb, "pending")]));
     }
 
     #[tokio::test]

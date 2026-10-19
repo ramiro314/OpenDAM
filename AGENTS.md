@@ -147,10 +147,13 @@ docs/plans                    Plans for this fork
 - **Bundled previews.** An image in a folder named `Previews`, `Preview` or `Renders` (any case)
   renders each model below that folder's parent with the same stem, ignoring case (plan C12).
   The pass makes it a `model_preview` support file and stores its path in `bundled_preview` on
-  the model's main item, or on the model when it is on its own. An image that renders no model
-  stays an ordinary image. Cards and list rows show the bundled preview first, then the
-  thumbnail, then the original (`tileMedia`), and `ASSET_COLUMNS` sends the render's own
-  thumbnail when it has one. The pass keeps an item with a bundled preview off the preview queue
+  the model's main item, or on the model when it is on its own. An image that renders no model,
+  or that the webview can't display itself (`preview::is_webview_displayable`), stays an
+  ordinary image, so a render without a thumbnail still shows. Cards and list rows show the
+  bundled preview first, then the thumbnail, then the original (`tileMedia`), and
+  `ASSET_COLUMNS` sends the render's own thumbnail when it has one. `preview:done` carries the
+  finished file's `filePath`, so cached models that show it as their render switch to its new
+  thumbnail (`updateAssetPreview`). The pass keeps an item with a bundled preview off the preview queue
   and gives its group no stand-in, `claim_jobs` skips its jobs, and an item that loses its render
   goes back on the queue.
 

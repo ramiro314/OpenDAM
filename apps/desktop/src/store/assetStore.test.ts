@@ -718,6 +718,29 @@ describe('useAssetStore updateAssetPreview', () => {
       '/lib/.opendam/thumbs/a1_thumb.jpg'
     );
   });
+
+  test("a render's new thumbnail becomes the picture of the models it renders", async () => {
+    const render = '/lib/kit/Previews/rock.png';
+    const models = [
+      { ...named('rock'), bundledPreview: render },
+      { ...named('tree'), bundledPreview: '/lib/kit/Previews/tree.png' },
+    ];
+    serve(() => models);
+    await useAssetStore.getState().search();
+    const thumb = '/lib/.opendam/thumbs/r_thumb.png';
+
+    // The render itself isn't cached: it is a hidden support file.
+    useAssetStore.getState().updateAssetPreview('render', thumb, undefined, render);
+
+    const s = useAssetStore.getState();
+    expect(s.assetAt(0)?.bundledPreview).toBe(thumb);
+    expect(s.assetAt(1)?.bundledPreview).toBe('/lib/kit/Previews/tree.png');
+    // A render with no thumbnail stays the picture as it is.
+    useAssetStore
+      .getState()
+      .updateAssetPreview('render2', null, undefined, '/lib/kit/Previews/tree.png');
+    expect(useAssetStore.getState().assetAt(1)?.bundledPreview).toBe('/lib/kit/Previews/tree.png');
+  });
 });
 
 describe('useAutotagStore applyUpdate', () => {

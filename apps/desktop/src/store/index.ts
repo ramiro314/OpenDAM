@@ -245,8 +245,17 @@ interface AssetStore extends PageCache {
   deleteAsset: (id: string, deleteFile?: boolean) => Promise<void>;
   deleteAssets: (ids: string[], deleteFile?: boolean) => Promise<void>;
   renameAsset: (id: string, newName: string) => Promise<Asset>;
-  /** Applies a finished preview: `thumbnailPath` replaces the old one, and `null` clears it. */
-  updateAssetPreview: (id: string, thumbnailPath: string | null, previewModel?: string) => void;
+  /**
+   * Applies a finished preview: `thumbnailPath` replaces the old one, and `null` clears it. When
+   * `filePath`, the asset's own file, is a cached model's bundled preview, that model shows the
+   * new thumbnail instead of the full-size render.
+   */
+  updateAssetPreview: (
+    id: string,
+    thumbnailPath: string | null,
+    previewModel?: string,
+    filePath?: string
+  ) => void;
   setPreviewStatus: (id: string, status: Asset['previewStatus']) => void;
   /** Re-fetches the given assets that are cached or pinned; other ids are ignored */
   refreshAssets: (ids: string[]) => Promise<void>;
@@ -577,13 +586,20 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
     return updated;
   },
 
-  updateAssetPreview: (id, thumbnailPath, previewModel) => {
+  updateAssetPreview: (id, thumbnailPath, previewModel, filePath) => {
     get().patchCached(id, (asset) => ({
       ...asset,
       thumbnailPath: thumbnailPath ?? undefined,
       previewStatus: 'done',
       metadata: previewModel ? { ...asset.metadata, preview_model: previewModel } : asset.metadata,
     }));
+    if (!filePath || !thumbnailPath) return;
+    const rendered = cachedAssets(get())
+      .filter((a) => a.bundledPreview === filePath)
+      .map((a) => a.id);
+    if (rendered.length > 0) {
+      get().patchCached(rendered, (asset) => ({ ...asset, bundledPreview: thumbnailPath }));
+    }
   },
 
   setPreviewStatus: (id, status) => {
