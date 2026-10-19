@@ -270,9 +270,10 @@ The script:
 2. builds a debug binary with the frontend embedded and built in Vite's development mode
    (`NODE_ENV=development vite build --mode development`), with `VITE_SCROLL_BENCH` set;
 3. runs the app in a nested headless KWin with a virtual 1400x900 output, its own D-Bus session
-   and `OPENDAM_NO_KEYRING=1`, never on your desktop session. First a warm-up process runs the
-   one-time thumbnail cleanup pass to the end, until the copy's `library_meta` records
-   `thumbs_no_upscale = done` (about 25 minutes on Kenney), and its report is discarded. Each
+   and `OPENDAM_NO_KEYRING=1`, never on your desktop session. Unless the copy's `library_meta`
+   already records `thumbs_no_upscale = done`, as a warmed golden snapshot's does (see "Bench
+   data"), a warm-up process first runs the one-time thumbnail cleanup pass to the end (about 25
+   minutes on Kenney), and its report is discarded. Each
    process would otherwise start the pass over, so every scenario would share the machine with
    it and measure thumbnails it is about to clear. A timing run starts a fresh app
    process for each size and scenario, naming it in `OPENDAM_SCROLL_BENCH_ONLY` (for example
@@ -333,8 +334,21 @@ rsync -a --exclude='/.opendam/library.sqlite*' --exclude='/.opendam/index.lock' 
 sqlite3 -readonly "$L/.opendam/library.sqlite" ".backup '$G/.opendam/library.sqlite'"
 ```
 
-`.backup` stays consistent even while your app holds the DB. `~/.cache/opendam-bench/golden.json`
-records the source, the time, the asset count (83,095), the size (about 5.3 GB) and the commit.
+`.backup` stays consistent even while your app holds the DB.
+
+Then warm the snapshot, so no run repeats the one-time passes: open it once with a debug build,
+exactly as the script's warm-up opens a run copy (headless KWin, fresh `XDG_DATA_HOME`,
+`OPENDAM_NO_KEYRING=1`, under `scripts/memory-cap.sh`), but with `OPENDAM_BENCH_LIBRARY` set to
+`$G` itself, and stop the app once `library_meta` records `thumbs_no_upscale = done`. That runs
+the migrations, the structure pass and the thumbnail cleanup (about 25 minutes on Kenney), and
+the script then skips its warm-up. Check `PRAGMA integrity_check` and the asset count afterwards.
+
+`~/.cache/opendam-bench/golden.json` records the source, the time, the asset count (83,095), the
+size, the commit, and the commit and time it was warmed at. The current snapshot was taken on
+2026-10-17 at `a23b513` and warmed on 2026-10-19 at `3063d46`, which cleared 56,698 upscaled
+thumbnails and took it from 5.3 GB to 2.1 GB. The unwarmed one is kept as
+`kenney-golden-2026-10-17`, with its manifest beside it. The timing baseline on the warmed one
+(gpu-shm) is kept as `~/.cache/opendam-bench/kenney-golden-baseline-gpu-shm.json`.
 Every comparison uses this same snapshot, so a baseline can be rerun on identical data at any
 later step; your live library only gets new indexes or cleanup passes when you run a build that
 has them. Each run copy takes as much disk again until the script deletes it. Don't refresh the
