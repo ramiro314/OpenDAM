@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
   Asset,
+  GroupMember,
   Library,
   Collection,
   FolderNode,
@@ -43,6 +44,8 @@ export const api = {
   // Assets
   searchAssets: (payload: SearchPayload) => invoke<SearchResult>('search_assets', { payload }),
   getAsset: (id: string) => invoke<Asset>('get_asset', { id }),
+  /** The files of the group `id` belongs to, main item first; a file on its own alone */
+  getGroupMembers: (id: string) => invoke<GroupMember[]>('get_group_members', { id }),
   updateAsset: (id: string, patch: Partial<Asset>) => invoke<Asset>('update_asset', { id, patch }),
   deleteAsset: (id: string, deleteFile?: boolean) =>
     invoke<void>('delete_asset', { id, deleteFile: deleteFile ?? true }),

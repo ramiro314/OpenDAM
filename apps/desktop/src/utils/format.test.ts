@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { formatGroupBadge, formatItemsAndFiles, formatSize, formatVisibleRange } from './format';
+import {
+  formatGroupBadge,
+  formatItemsAndFiles,
+  formatSize,
+  formatTrashAction,
+  formatVisibleRange,
+  itemFileCount,
+} from './format';
 
 describe('formatSize', () => {
   test('shows bytes below 1 KB', () => {
@@ -63,5 +70,27 @@ describe('formatGroupBadge', () => {
   test('gives a file on its own no badge', () => {
     expect(formatGroupBadge({ kind: '3d_model', groupFormats: undefined })).toBeNull();
     expect(formatGroupBadge({ kind: 'texture', groupFormats: ['png'] })).toBeNull();
+  });
+});
+
+describe('itemFileCount', () => {
+  test('counts a file on its own as one', () => {
+    expect(itemFileCount({})).toBe(1);
+  });
+
+  test("counts a group's members and its bundled preview", () => {
+    expect(
+      itemFileCount({ groupFormats: ['glb', 'fbx', 'obj'], bundledPreview: '/kit/Previews/a.png' })
+    ).toBe(4);
+    expect(itemFileCount({ groupFormats: ['glb', 'fbx'] })).toBe(2);
+    expect(itemFileCount({ bundledPreview: '/kit/Previews/a.png' })).toBe(2);
+  });
+});
+
+describe('formatTrashAction', () => {
+  test('says how many files go to the trash', () => {
+    expect(formatTrashAction(1)).toBe('Move 1 file to the trash');
+    expect(formatTrashAction(4)).toBe('Move 4 files to the trash');
+    expect(formatTrashAction(1200)).toBe('Move 1,200 files to the trash');
   });
 });

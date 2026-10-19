@@ -45,3 +45,16 @@ export function formatGroupBadge(
     title: `${formats.length} files: ${[...new Set(formats)].join(', ')}`,
   };
 }
+
+/**
+ * How many files deleting or renaming an item reaches (plan C21): each member of its format
+ * group, or the file alone, plus its bundled preview.
+ */
+export function itemFileCount(asset: Pick<Asset, 'groupFormats' | 'bundledPreview'>): number {
+  return (asset.groupFormats?.length ?? 1) + (asset.bundledPreview ? 1 : 0);
+}
+
+/** A delete dialog's action for `files` files, `Move 4 files to the trash`. */
+export function formatTrashAction(files: number): string {
+  return `Move ${files === 1 ? '1 file' : `${files.toLocaleString('en-US')} files`} to the trash`;
+}
