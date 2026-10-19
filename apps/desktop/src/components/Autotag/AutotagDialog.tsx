@@ -15,8 +15,9 @@ interface AutotagDialogProps {
 
 /**
  * Picks a provider and a mode, then starts a background run over the target's assets: chosen
- * assets, or a library's untagged assets unless "All assets" is ticked. Before Start it shows
- * the run's asset count, its estimated cost or Claude-plan requests, and the assets it skips.
+ * assets, or a library's or folder's untagged assets unless "All assets" is ticked. Before Start
+ * it shows the run's asset count, its estimated cost or Claude-plan requests, and the assets it
+ * skips.
  */
 export function AutotagDialog({ target, onClose }: AutotagDialogProps) {
   const providers = useAutotagStore((s) => s.providers);
@@ -90,6 +91,8 @@ export function AutotagDialog({ target, onClose }: AutotagDialogProps) {
   let title: string;
   if (target.kind === 'library') {
     title = `Auto-tag library ${target.libraryName}`;
+  } else if (target.kind === 'folder') {
+    title = `Auto-tag ${target.name}`;
   } else {
     const count = target.assetIds.length;
     title = `Auto-tag ${count.toLocaleString()} asset${count === 1 ? '' : 's'}`;
@@ -117,7 +120,7 @@ export function AutotagDialog({ target, onClose }: AutotagDialogProps) {
         </div>
 
         <div className={dialog.content}>
-          {target.kind === 'library' && (
+          {target.kind !== 'assets' && (
             <>
               <h4 className={dialog.sectionTitle}>Assets</h4>
               <fieldset className={styles.fieldset}>
@@ -132,7 +135,7 @@ export function AutotagDialog({ target, onClose }: AutotagDialogProps) {
                     <span className={styles.choiceLabel}>All assets</span>
                     <span className={styles.choiceNote}>
                       {allAssets
-                        ? 'Every asset in the library, tagged or not. Existing tags are kept.'
+                        ? `Every asset in the ${target.kind}, tagged or not. Existing tags are kept.`
                         : 'Off: only assets with no tag yet.'}
                     </span>
                   </span>

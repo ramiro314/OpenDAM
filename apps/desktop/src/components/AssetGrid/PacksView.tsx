@@ -2,6 +2,7 @@ import { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { openPack, packKey, useLibraryStore, usePacksStore, useUIStore } from '../../store';
 import type { PackCard as Pack } from '../../types';
+import { FolderContextMenu, type FolderMenuTarget } from '../ContextMenu/FolderContextMenu';
 import { CARD_BODY_HEIGHT } from './cardMetrics';
 import { FilterBar } from './FilterBar';
 import {
@@ -39,6 +40,7 @@ export function PacksView() {
   const gridSize = useUIStore((s) => s.gridSize);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
+  const [menu, setMenu] = useState<FolderMenuTarget | null>(null);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -67,6 +69,22 @@ export function PacksView() {
   const handleOpen = useCallback(
     (pack: Pack) => void openPack(pack).then(() => revealNode(pack)),
     []
+  );
+  const handleMenu = useCallback(
+    (e: React.MouseEvent, pack: Pack) => {
+      e.preventDefault();
+      select(packKey(pack));
+      setMenu({
+        x: e.clientX,
+        y: e.clientY,
+        libraryId: pack.libraryId,
+        path: pack.path,
+        name: pack.name,
+        isPack: true,
+        itemCount: pack.itemCount,
+      });
+    },
+    [select]
   );
   const libraryName = (id: string) => libraries.find((l) => l.id === id)?.name ?? id;
 
@@ -114,6 +132,7 @@ export function PacksView() {
                       selected={selected === packKey(pack)}
                       onSelect={handleSelect}
                       onOpen={handleOpen}
+                      onMenu={handleMenu}
                     />
                   ))}
                 </div>
@@ -122,6 +141,7 @@ export function PacksView() {
           </div>
         </div>
       </div>
+      {menu && <FolderContextMenu target={menu} onClose={() => setMenu(null)} />}
       <div className={styles.footer}>
         <span id="pack-count" className={styles.footerCount}>
           {packs.length.toLocaleString()} {packs.length === 1 ? 'pack' : 'packs'}

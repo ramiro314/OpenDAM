@@ -128,11 +128,19 @@ export function suggestionChips(suggestions: AutotagSuggestion[]): SuggestionChi
   return [...chips.values()];
 }
 
-/** What the run dialog asks the backend to tag: the chosen assets, or the library with its "All assets" choice. */
+/**
+ * What the run dialog asks the backend to tag: the chosen assets, or the library or folder with
+ * its "All assets" choice.
+ */
 export function scopeFor(target: AutotagTarget, allAssets: boolean): AutotagScope {
-  return target.kind === 'assets'
-    ? { kind: 'assets', assetIds: target.assetIds }
-    : { kind: 'library', libraryId: target.libraryId, allAssets };
+  switch (target.kind) {
+    case 'assets':
+      return { kind: 'assets', assetIds: target.assetIds };
+    case 'library':
+      return { kind: 'library', libraryId: target.libraryId, allAssets };
+    case 'folder':
+      return { kind: 'folder', libraryId: target.libraryId, path: target.path, allAssets };
+  }
 }
 
 export interface ModeOption {

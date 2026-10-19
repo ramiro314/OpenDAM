@@ -16,6 +16,7 @@ export interface PackCardProps {
   selected: boolean;
   onSelect: (pack: Pack) => void;
   onOpen: (pack: Pack) => void;
+  onMenu: (e: React.MouseEvent, pack: Pack) => void;
 }
 
 /** A cover as the asset it is, for `tileMedia`. */
@@ -35,6 +36,7 @@ export const PackCard = memo(function PackCard({
   selected,
   onSelect,
   onOpen,
+  onMenu,
 }: PackCardProps) {
   const [failed, setFailed] = useState<TileMedia>();
   const [loaded, setLoaded] = useState(false);
@@ -59,6 +61,7 @@ export const PackCard = memo(function PackCard({
         onSelect(pack);
       }}
       onDoubleClick={() => onOpen(pack)}
+      onContextMenu={(e) => onMenu(e, pack)}
       onKeyDown={(e) => {
         if (e.key === 'Enter') {
           e.preventDefault();
