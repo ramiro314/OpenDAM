@@ -186,13 +186,16 @@ struct PackRow {
 }
 
 /// Every pack below `under_path` (`""` for the root) in each library of `library_ids`, or in
-/// every open library when it is `None`, in one list sorted by name ignoring case (D20).
+/// every open library when it is `None`, in one list sorted by name ignoring case (D20). Below
+/// "All libraries" (`None` and `""`) lies each library's root, so a library that is itself one
+/// pack has a card there.
 #[tauri::command]
 pub async fn get_packs(
     library_ids: Option<Vec<String>>,
     under_path: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<PackCard>> {
+    let library_ids_none = library_ids.is_none();
     let libraries = match library_ids {
         None => state.db.get_all_libraries().await,
         Some(ids) => {
@@ -209,21 +212,29 @@ pub async fn get_packs(
             open
         }
     };
-    packs_below(&libraries, &under_path)
+    let all_libraries = library_ids_none && under_path.trim_matches('/').is_empty();
+    packs_below(&libraries, &under_path, all_libraries)
         .await
         .map_err(|e| e.to_string())
 }
 
-/// The packs strictly below `under_path` in each of `libraries`, sorted by name, folding ASCII
-/// case only as `NOCASE` does, then by path, then by the library's place in `libraries`.
+/// The packs strictly below `under_path` in each of `libraries`, plus each library's root when
+/// `with_roots` (below "All libraries"), sorted by name, folding ASCII case only as `NOCASE`
+/// does, then by path, then by the library's place in `libraries`. A root pack the pass gave no
+/// name (no license header) takes its library's.
 pub(crate) async fn packs_below(
     libraries: &[LibraryHandle],
     under_path: &str,
+    with_roots: bool,
 ) -> sqlx::Result<Vec<PackCard>> {
     let under = under_path.trim_matches('/');
     // Below the root is every folder but the root; below `p`, the key range `p/ <= path < p0`.
     let below = if under.is_empty() {
-        "f.path <> ''"
+        if with_roots {
+            "1"
+        } else {
+            "f.path <> ''"
+        }
     } else {
         "f.path >= ?1 || '/' AND f.path < ?1 || '0'"
     };
@@ -241,14 +252,19 @@ pub(crate) async fn packs_below(
             query = query.bind(under);
         }
         let rows = query.fetch_all(&library.pool).await?;
-        cards.extend(rows.into_iter().map(|r| PackCard {
-            library_id: library.id.clone(),
-            path: r.path,
-            name: r.pack_name.unwrap_or(r.folder_name),
-            parent_path: r.parent_path.unwrap_or_default(),
-            item_count: r.item_count,
-            hidden_count: r.hidden_count,
-            cover: r.cover.into_cover(&library.root_path),
+        cards.extend(rows.into_iter().map(|r| {
+            PackCard {
+                library_id: library.id.clone(),
+                path: r.path,
+                name: [r.pack_name.unwrap_or_default(), r.folder_name]
+                    .into_iter()
+                    .find(|n| !n.is_empty())
+                    .unwrap_or_else(|| library.name.clone()),
+                parent_path: r.parent_path.unwrap_or_default(),
+                item_count: r.item_count,
+                hidden_count: r.hidden_count,
+                cover: r.cover.into_cover(&library.root_path),
+            }
         }));
     }
     // Stable, so packs that tie on name and path keep their libraries' order.
@@ -566,7 +582,7 @@ mod tests {
         .await;
         let libraries = [a, b];
 
-        let all = packs_below(&libraries, "").await.unwrap();
+        let all = packs_below(&libraries, "", false).await.unwrap();
         assert_eq!(
             summary(&all),
             [
@@ -596,18 +612,57 @@ mod tests {
         // A pack whose only file is its license has no cover.
         assert_eq!(all[2].cover, None);
 
-        let below = packs_below(&libraries, "3D assets/").await.unwrap();
+        let below = packs_below(&libraries, "3D assets/", false).await.unwrap();
         assert_eq!(
             below.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
             ["3D assets/Car Kit", "3D assets/space kit"]
         );
         // A pack itself has no packs below it, nor does a folder holding none.
         assert_eq!(
-            packs_below(&libraries, "3D assets/Car Kit").await.unwrap(),
+            packs_below(&libraries, "3D assets/Car Kit", false)
+                .await
+                .unwrap(),
             []
         );
-        assert_eq!(packs_below(&libraries, "Goodies").await.unwrap(), []);
-        assert_eq!(packs_below(&libraries[1..], "3D assets").await.unwrap(), []);
+        assert_eq!(packs_below(&libraries, "Goodies", false).await.unwrap(), []);
+        assert_eq!(
+            packs_below(&libraries[1..], "3D assets", false)
+                .await
+                .unwrap(),
+            []
+        );
+    }
+
+    #[tokio::test]
+    async fn a_library_that_is_one_pack_has_a_card_only_below_all_libraries() {
+        let mut solo = library_handle("solo", &["License.txt", "Preview.png", "rock.png"]).await;
+        solo.name = "Solo Download".into();
+        let kits = library_handle("kits", &["3D assets/Car Kit/License.txt"]).await;
+        let libraries = [kits, solo];
+
+        // Below "All libraries", the root pack, named after its library
+        let all = packs_below(&libraries, "", true).await.unwrap();
+        assert_eq!(
+            summary(&all),
+            [
+                ("kits", "3D assets/Car Kit", "Car Kit", "3D assets", 0),
+                ("solo", "", "Solo Download", "", 1),
+            ]
+        );
+        assert_eq!(
+            all[1].cover.as_ref().map(|c| c.file_path.as_str()),
+            Some("/libraries/solo/Preview.png")
+        );
+        // The library row itself is that pack, so it has no pack below it.
+        assert_eq!(packs_below(&libraries[1..], "", false).await.unwrap(), []);
+
+        // A license header's name wins over the library's.
+        sqlx::query("UPDATE folders SET pack_json = json_set(pack_json, '$.name', 'Rock Kit') WHERE path = ''")
+            .execute(&libraries[1].pool)
+            .await
+            .unwrap();
+        let named = packs_below(&libraries, "", true).await.unwrap();
+        assert_eq!(named[1].name, "Rock Kit");
     }
 
     #[tokio::test]
@@ -627,7 +682,7 @@ mod tests {
         .execute(&library.pool)
         .await
         .unwrap();
-        let cards = packs_below(std::slice::from_ref(&library), "")
+        let cards = packs_below(std::slice::from_ref(&library), "", false)
             .await
             .unwrap();
         assert_eq!(cards[0].name, "Kit Deluxe");

@@ -10,6 +10,7 @@ import type {
   SearchQuery,
   FilterSpec,
   FolderRef,
+  PackCard,
   SortField,
   SortOrder,
   AutotagLastUsed,
@@ -19,6 +20,7 @@ import type {
   RunSummary,
 } from '../types';
 import { api } from '../api';
+import { useFolderTreeStore } from './folderTree';
 import type { ImageScaling } from '../utils/imageScaling';
 import {
   PAGE_SIZE,
@@ -826,4 +828,30 @@ export function selectFolder(folder: FolderRef) {
     folder,
   });
   void assets.search();
+}
+
+/** Selects library `libraryId`'s row alone and searches it. */
+export function selectLibrary(libraryId: string) {
+  useUIStore.getState().setActiveLibrary(libraryId);
+  const assets = useAssetStore.getState();
+  assets.setQuery({
+    libraryIds: [libraryId],
+    libraryId,
+    collectionId: undefined,
+    folder: undefined,
+  });
+  void assets.search();
+}
+
+/**
+ * Opens a pack card (D19): selects the pack's node in the tree, expanding the folders above it,
+ * so the main area shows the pack's assets. A library that is itself one pack is its row.
+ */
+export async function openPack(pack: Pick<PackCard, 'libraryId' | 'path'>) {
+  if (pack.path === '') {
+    selectLibrary(pack.libraryId);
+    return;
+  }
+  selectFolder({ libraryId: pack.libraryId, path: pack.path });
+  await useFolderTreeStore.getState().reveal(pack.libraryId, pack.path);
 }

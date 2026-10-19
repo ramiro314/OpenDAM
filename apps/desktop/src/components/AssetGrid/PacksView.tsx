@@ -1,13 +1,6 @@
 import { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import {
-  packKey,
-  selectFolder,
-  useFolderTreeStore,
-  useLibraryStore,
-  usePacksStore,
-  useUIStore,
-} from '../../store';
+import { openPack, packKey, useLibraryStore, usePacksStore, useUIStore } from '../../store';
 import type { PackCard as Pack } from '../../types';
 import { CARD_BODY_HEIGHT } from './cardMetrics';
 import { FilterBar } from './FilterBar';
@@ -22,19 +15,15 @@ import {
 import { PackCard } from './PackCard';
 import styles from './AssetGrid.module.css';
 
-/**
- * Selects `pack`'s node in the tree, expanding the folders above it, and scrolls the node into
- * view; the main area then shows the pack's assets.
- */
-export async function openPack(pack: Pick<Pack, 'libraryId' | 'path'>) {
-  selectFolder({ libraryId: pack.libraryId, path: pack.path });
-  await useFolderTreeStore.getState().reveal(pack.libraryId, pack.path);
+/** Scrolls `pack`'s tree node, or its library's row for a root pack, into view. */
+function revealNode(pack: Pick<Pack, 'libraryId' | 'path'>) {
+  const id = CSS.escape(pack.libraryId);
+  const selector =
+    pack.path === ''
+      ? `#lib-${id}`
+      : `[data-library-id="${id}"][data-folder-path="${CSS.escape(pack.path)}"]`;
   requestAnimationFrame(() =>
-    document
-      .querySelector(
-        `[data-library-id="${CSS.escape(pack.libraryId)}"][data-folder-path="${CSS.escape(pack.path)}"]`
-      )
-      ?.scrollIntoView({ block: 'nearest' })
+    document.querySelector(selector)?.scrollIntoView({ block: 'nearest' })
   );
 }
 
@@ -75,7 +64,10 @@ export function PacksView() {
   useLayoutEffect(() => virtualizer.measure(), [rowPitch, virtualizer]);
 
   const handleSelect = useCallback((pack: Pack) => select(packKey(pack)), [select]);
-  const handleOpen = useCallback((pack: Pack) => void openPack(pack), []);
+  const handleOpen = useCallback(
+    (pack: Pack) => void openPack(pack).then(() => revealNode(pack)),
+    []
+  );
   const libraryName = (id: string) => libraries.find((l) => l.id === id)?.name ?? id;
 
   return (

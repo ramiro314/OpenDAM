@@ -3472,7 +3472,7 @@ mod tests {
             pool: pool.clone(),
         };
         let started = std::time::Instant::now();
-        let cards = packs_below(std::slice::from_ref(&library), "")
+        let cards = packs_below(std::slice::from_ref(&library), "", false)
             .await
             .unwrap();
         println!("{} cards in {:?}", cards.len(), started.elapsed());
