@@ -6,6 +6,7 @@ import {
   clampPanelWidth,
   dragPanelWidth,
   keyPanelWidth,
+  settledPanelWidth,
 } from './panelSize';
 
 const { sidebar, detail } = PANEL_LIMITS;
@@ -74,5 +75,22 @@ describe('keyPanelWidth', () => {
   test('ignores other keys', () => {
     expect(keyPanelWidth('sidebar', 240, 'ArrowUp')).toBeNull();
     expect(keyPanelWidth('sidebar', 240, 'Enter')).toBeNull();
+  });
+});
+
+describe('settledPanelWidth', () => {
+  test('a panel showing its stored width keeps it', () => {
+    expect(settledPanelWidth('sidebar', 360, 360)).toBeNull();
+    expect(settledPanelWidth('sidebar', 359.7, 360)).toBeNull();
+  });
+
+  test('a panel a narrow window shrank stores what it shows, rounded down', () => {
+    expect(settledPanelWidth('sidebar', 295.4, 360)).toBe(295);
+    expect(settledPanelWidth('detail', 345.9, 420)).toBe(345);
+  });
+
+  test('never below the minimum, and a stored width out of limits counts as clamped', () => {
+    expect(settledPanelWidth('sidebar', sidebar.min - 0.5, 300)).toBe(sidebar.min);
+    expect(settledPanelWidth('detail', detail.max, 5000)).toBeNull();
   });
 });

@@ -52,3 +52,14 @@ export function keyPanelWidth(
   const dx = key === 'ArrowRight' ? KEY_STEP : -KEY_STEP;
   return clampPanelWidth(side, side === 'sidebar' ? current + dx : current - dx, room);
 }
+
+/**
+ * The width to store for a panel that shows `shown` pixels of its `stored` width before a
+ * resize starts from it, or null when it shows its stored width. A window too narrow for both
+ * stored widths shrinks the panels, and a resize that started from the stored widths would
+ * jump away from the pointer and move the other panel. Rounds down, so the widths still fit.
+ */
+export function settledPanelWidth(side: PanelSide, shown: number, stored: number): number | null {
+  if (shown > clampPanelWidth(side, stored) - 0.5) return null;
+  return clampPanelWidth(side, Math.floor(shown));
+}

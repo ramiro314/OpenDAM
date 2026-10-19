@@ -6,6 +6,7 @@ import {
   clampPanelWidth,
   dragPanelWidth,
   keyPanelWidth,
+  settledPanelWidth,
   type PanelSide,
 } from '../../utils/panelSize';
 import styles from './PanelResizer.module.css';
@@ -15,21 +16,28 @@ const WIDTH_VAR: Record<PanelSide, string> = {
   detail: '--detail-panel-width',
 };
 
+const PANEL_ID: Record<PanelSide, string> = { sidebar: 'sidebar', detail: 'detail-panel' };
+
+/** Where a resize starts: the panel's width and the widest the grid lets it be */
+interface Start {
+  width: number;
+  room: number;
+}
+
 interface Drag {
   startX: number;
-  startWidth: number;
-  room: number;
   panel: HTMLElement;
+  /** Set on the first move, so a click that doesn't move stores nothing */
+  start: Start | null;
   /** The width the drag gives the panel, null when it collapses it */
   width: number | null;
 }
 
 /**
  * The drag handle on a side panel's inner edge, between the panel and the grid in the layout
- * body: right after the sidebar, right before the detail panel. While it drags it sets the
- * width variable on the body directly and stores the width only on release, so the app doesn't
- * render on every pointer move. Dragging well past the minimum collapses the panel, and a
- * double click gives it its initial width.
+ * body. While it drags it sets the width variable on the body directly and stores the width
+ * only on release, so the app doesn't render on every pointer move. Dragging well past the
+ * minimum collapses the panel, and a double click gives it its initial width.
  */
 export function PanelResizer({ side }: { side: PanelSide }) {
   const width = useUIStore((s) => (side === 'sidebar' ? s.sidebarWidth : s.detailPanelWidth));
@@ -43,13 +51,34 @@ export function PanelResizer({ side }: { side: PanelSide }) {
   const showWidth = (handle: HTMLElement, px: number) =>
     handle.parentElement?.style.setProperty(WIDTH_VAR[side], `${px}px`);
 
-  const panelOf = (handle: HTMLElement) =>
-    (side === 'sidebar' ? handle.previousElementSibling : handle.nextElementSibling) as HTMLElement;
+  const panelOf = (handle: HTMLElement, s = side) =>
+    handle.parentElement?.querySelector<HTMLElement>(`:scope > #${PANEL_ID[s]}`) ?? null;
 
-  /** The widest the panel can be while the grid keeps its minimum */
-  const roomFor = (handle: HTMLElement, panelWidth: number) => {
+  /**
+   * Starts a resize from what the panels show. A window too narrow for both stored widths
+   * shrinks the panels, so each shrunk panel first stores the width it shows: the resize then
+   * follows the pointer and leaves the other panel where it is. Both are measured before
+   * either changes, since settling one lets the other grow back.
+   */
+  const beginResize = (handle: HTMLElement): Start => {
+    const ui = useUIStore.getState();
+    const shown = (['sidebar', 'detail'] as const).map(
+      (s) => [s, panelOf(handle, s)?.getBoundingClientRect().width] as const
+    );
+    for (const [s, width] of shown) {
+      const stored = s === 'sidebar' ? ui.sidebarWidth : ui.detailPanelWidth;
+      const settled = width === undefined ? null : settledPanelWidth(s, width, stored);
+      if (settled === null) continue;
+      handle.parentElement?.style.setProperty(WIDTH_VAR[s], `${settled}px`);
+      ui.setPanelWidth(s, settled);
+    }
+    const current = useUIStore.getState();
+    const width = clampPanelWidth(
+      side,
+      side === 'sidebar' ? current.sidebarWidth : current.detailPanelWidth
+    );
     const main = handle.parentElement?.querySelector<HTMLElement>(':scope > main');
-    return main ? panelWidth + main.clientWidth - MAIN_MIN_WIDTH : Infinity;
+    return { width, room: main ? width + main.clientWidth - MAIN_MIN_WIDTH : Infinity };
   };
 
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -59,22 +88,16 @@ export function PanelResizer({ side }: { side: PanelSide }) {
     if (!panel) return;
     e.preventDefault();
     handle.setPointerCapture(e.pointerId);
-    const startWidth = panel.getBoundingClientRect().width;
-    drag.current = {
-      startX: e.clientX,
-      startWidth,
-      room: roomFor(handle, startWidth),
-      panel,
-      width: startWidth,
-    };
+    drag.current = { startX: e.clientX, panel, start: null, width: null };
     document.body.style.cursor = 'col-resize';
     setState('resize');
   };
 
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     const d = drag.current;
-    if (!d) return;
-    d.width = dragPanelWidth(side, d.startWidth, e.clientX - d.startX, d.room);
+    if (!d || (!d.start && e.clientX === d.startX)) return;
+    d.start ??= beginResize(e.currentTarget);
+    d.width = dragPanelWidth(side, d.start.width, e.clientX - d.startX, d.start.room);
     if (d.width !== null) showWidth(e.currentTarget, d.width);
     d.panel.style.opacity = d.width === null ? '0.4' : '';
     setState(d.width === null ? 'collapse' : 'resize');
@@ -87,17 +110,18 @@ export function PanelResizer({ side }: { side: PanelSide }) {
     d.panel.style.opacity = '';
     document.body.style.cursor = '';
     setState(null);
-    // A collapse puts back the width the app last rendered, which the panel has when it reopens
-    showWidth(e.currentTarget, d.width ?? clampPanelWidth(side, width));
+    if (!d.start) return;
+    // A collapse puts back the stored width, which the panel has when it reopens
+    showWidth(e.currentTarget, d.width ?? d.start.width);
     finishPanelDrag(side, d.width);
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    const current = panelOf(e.currentTarget)?.getBoundingClientRect().width ?? width;
-    const next = keyPanelWidth(side, current, e.key, roomFor(e.currentTarget, current));
-    if (next === null) return;
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
     e.preventDefault();
-    setPanelWidth(side, next);
+    const start = beginResize(e.currentTarget);
+    const next = keyPanelWidth(side, start.width, e.key, start.room);
+    if (next !== null) setPanelWidth(side, next);
   };
 
   return (
