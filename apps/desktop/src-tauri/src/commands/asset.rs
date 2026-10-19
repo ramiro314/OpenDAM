@@ -36,6 +36,8 @@ struct RawAssetRow {
     pub collections: Option<String>,
     /// A main item's members' extensions, as a JSON array, itself included
     pub group_formats: Option<String>,
+    /// The picture of an item's bundled preview: its render's thumbnail, or the render itself
+    pub bundled_preview: Option<String>,
 }
 
 /// Build an Asset from a raw SQLite row, resolving relative paths to absolute paths
@@ -66,10 +68,12 @@ fn row_to_asset(root: Option<&Path>, row: RawAssetRow) -> Asset {
         Some(r) => resolve_path(r, &row.file_path),
         None => row.file_path,
     };
-    let resolved_thumb_path = match (root, row.thumbnail_path) {
-        (Some(r), Some(t)) => Some(resolve_path(r, &t)),
-        (_, t) => t,
+    let resolve = |path: Option<String>| match (root, path) {
+        (Some(r), Some(p)) => Some(resolve_path(r, &p)),
+        (_, p) => p,
     };
+    let resolved_thumb_path = resolve(row.thumbnail_path);
+    let bundled_preview = resolve(row.bundled_preview);
 
     Asset {
         id: row.id,
@@ -90,6 +94,7 @@ fn row_to_asset(root: Option<&Path>, row: RawAssetRow) -> Asset {
         preview_status: row.preview_status,
         metadata,
         group_formats,
+        bundled_preview,
     }
 }
 
@@ -779,7 +784,8 @@ async fn count_assets(pool: &sqlx::Pool<sqlx::Sqlite>, filter: &SqlFilter) -> sq
 }
 
 /// The columns of a `RawAssetRow` selected from `assets a`. A main item with no thumbnail
-/// of its own, such as a `.blend`, shows a member's (`structure::preview_stand_ins`).
+/// of its own, such as a `.blend`, shows a member's (`structure::preview_stand_ins`). An item's
+/// bundled preview is shown by its render's thumbnail when the render has one (plan C12).
 const ASSET_COLUMNS: &str = r#"
     a.id, a.file_path, a.file_name, a.extension, a.kind,
     a.size_bytes, a.modified_at, a.indexed_at, a.rating,
@@ -794,7 +800,9 @@ const ASSET_COLUMNS: &str = r#"
     (SELECT json_group_array(collection_id) FROM collection_assets WHERE asset_id = a.id) AS collections,
     CASE WHEN a.group_id = a.id THEN
         (SELECT json_group_array(m.extension) FROM assets m WHERE m.group_id = a.id)
-    END AS group_formats"#;
+    END AS group_formats,
+    (SELECT COALESCE(p.thumbnail_path, p.file_path) FROM assets p
+     WHERE p.file_path = a.bundled_preview) AS bundled_preview"#;
 
 #[derive(sqlx::FromRow)]
 struct RowidAssetRow {
@@ -3131,14 +3139,15 @@ mod tests {
     #[tokio::test]
     async fn a_group_shows_as_its_main_item_and_its_members_never_show() {
         let libs = [grouped_library().await];
-        let items = strings(&[VAN, RENDER, ROCK, SEDAN, COLORMAP]);
+        let items = strings(&[VAN, ROCK, SEDAN, COLORMAP]);
         assert_eq!(
             by_size(&libs, serde_json::json!({})).await,
-            (items.clone(), Some(5), Some(10))
+            (items.clone(), Some(4), Some(10))
         );
-        // "Show hidden files" brings back the license, but no member.
+        // "Show hidden files" brings back the license and the sedan's render, but no member.
         let mut with_license = items;
         with_license.insert(0, "kit/License.txt".to_string());
+        with_license.insert(2, RENDER.to_string());
         assert_eq!(
             by_size(
                 &libs,
@@ -3167,7 +3176,7 @@ mod tests {
         );
         assert_eq!(
             search(serde_json::json!({ "kinds": ["texture"] })).await,
-            (strings(&[RENDER, COLORMAP]), Some(2), Some(3))
+            (strings(&[COLORMAP]), Some(1), Some(3))
         );
     }
 
@@ -3243,7 +3252,7 @@ mod tests {
         );
         assert_eq!(
             by_size(&libs, serde_json::json!({ "text": "sedan" })).await,
-            (strings(&[RENDER, SEDAN]), Some(2), Some(4))
+            (strings(&[SEDAN]), Some(1), Some(4))
         );
     }
 
@@ -3269,9 +3278,9 @@ mod tests {
         // By the main items' sizes: the van's GLB is the smallest file of all but the license
         // and the colormap's FBX copy, and the sedan's GLB is larger than its FBX and OBJ.
         for (field, order, expected) in [
-            ("size", "asc", [VAN, RENDER, ROCK, SEDAN, COLORMAP]),
-            ("size", "desc", [COLORMAP, SEDAN, ROCK, RENDER, VAN]),
-            ("name", "asc", [COLORMAP, ROCK, SEDAN, RENDER, VAN]),
+            ("size", "asc", [VAN, ROCK, SEDAN, COLORMAP]),
+            ("size", "desc", [COLORMAP, SEDAN, ROCK, VAN]),
+            ("name", "asc", [COLORMAP, ROCK, SEDAN, VAN]),
         ] {
             assert_eq!(
                 folder_search(&libs, serde_json::json!({}), field, order).await,
@@ -3328,11 +3337,52 @@ mod tests {
             formats,
             [
                 ("van.glb".to_string(), some(&["glb", "obj"])),
-                ("sedan.png".to_string(), None),
                 ("rock.fbx".to_string(), None),
                 ("sedan.glb".to_string(), some(&["glb", "fbx", "obj"])),
                 ("colormap.png".to_string(), some(&["png", "png"])),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_item_with_a_render_shows_the_renders_thumbnail_or_else_the_render() {
+        let libs = [grouped_library().await];
+        let pictures = || async {
+            let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+                "query": { "text": "", "filter": {}, "sort": { "field": "size", "order": "asc" } },
+                "page": 0,
+                "pageSize": 100,
+            }))
+            .unwrap();
+            search_libraries(&payload, &target_libraries(&payload.query, &libs))
+                .await
+                .unwrap()
+                .assets
+                .into_iter()
+                .filter_map(|a| a.bundled_preview.map(|p| (a.id, p)))
+                .collect::<Vec<_>>()
+        };
+        // The render has no thumbnail, as one of 512 px or less never does.
+        assert_eq!(
+            pictures().await,
+            [(
+                SEDAN.to_string(),
+                "/libraries/lib/kit/Previews/sedan.png".to_string()
+            )]
+        );
+        sqlx::query(
+            "UPDATE assets SET thumbnail_path = '.opendam/thumbs/r_thumb.png' WHERE id = ?",
+        )
+        .bind(RENDER)
+        .execute(&libs[0].pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pictures().await,
+            [(
+                SEDAN.to_string(),
+                "/libraries/lib/.opendam/thumbs/r_thumb.png".to_string()
+            )]
         );
     }
 
@@ -4097,6 +4147,207 @@ mod tests {
             let total = search("", &node.path, serde_json::json!({})).await.0;
             assert_eq!(total, node.item_count, "{}", node.path);
         }
+    }
+
+    /// Kenney's renders on a copy of the golden snapshot's library DB, named by
+    /// `OPENDAM_GOLDEN_DB` as above (A4): every render is a hidden bundled preview, each kit
+    /// model's GLB records one, and no model with one waits for a preview job. It writes to the
+    /// copy: it clears the renders for a first pass. Run it with
+    /// `cargo nextest run --run-ignored only golden_snapshot_renders --no-capture`.
+    #[tokio::test]
+    #[ignore = "needs OPENDAM_GOLDEN_DB, a copy of the golden snapshot's library.sqlite"]
+    async fn golden_snapshot_renders_are_the_bundled_previews_of_their_models() {
+        use std::time::{Duration, Instant};
+        let file = std::env::var("OPENDAM_GOLDEN_DB").expect("OPENDAM_GOLDEN_DB is set");
+        let pool = crate::db::connect_library_sqlite(Path::new(&file))
+            .await
+            .unwrap();
+        let count = |sql: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(&sql)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // A first pass deriving every render, then a rerun writing nothing (A1).
+        sqlx::query(
+            "UPDATE assets SET bundled_preview = NULL;
+             UPDATE assets SET support_role = NULL WHERE support_role = 'model_preview';",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let started = Instant::now();
+        let written = crate::structure::rebuild(&pool).await.unwrap();
+        let took = started.elapsed();
+        println!("first render pass: {written} rows written in {took:?}");
+        assert!(took < Duration::from_secs(10));
+        let started = Instant::now();
+        assert_eq!(crate::structure::rebuild(&pool).await.unwrap(), 0);
+        let took = started.elapsed();
+        println!("rerun: 0 rows written in {took:?}");
+        assert!(took < Duration::from_secs(2));
+
+        // Every `Previews/` image is a hidden render that an item records, and only main items
+        // and files on their own record one.
+        let renders =
+            count("SELECT COUNT(*) FROM assets WHERE file_path LIKE '%/Previews/%'".into()).await;
+        let hidden = count(
+            "SELECT COUNT(*) FROM assets
+             WHERE file_path LIKE '%/Previews/%' AND support_role = 'model_preview'"
+                .into(),
+        )
+        .await;
+        let recorded = count(
+            "SELECT COUNT(DISTINCT bundled_preview) FROM assets WHERE bundled_preview IS NOT NULL"
+                .into(),
+        )
+        .await;
+        let items =
+            count("SELECT COUNT(*) FROM assets WHERE bundled_preview IS NOT NULL".into()).await;
+        println!(
+            "{renders} Previews/ images, {hidden} of them hidden renders, {recorded} recorded by {items} items"
+        );
+        assert_eq!((renders, hidden, recorded), (3741, 3741, 3741));
+        assert_eq!(
+            count(format!(
+                "SELECT COUNT(*) FROM assets a WHERE a.bundled_preview IS NOT NULL
+                 AND NOT {MAIN_OR_SINGLE}"
+            ))
+            .await,
+            0
+        );
+        assert_eq!(
+            count(format!(
+                "SELECT COUNT(*) FROM assets a WHERE {NOT_SUPPORT} AND {MAIN_OR_SINGLE}
+                 AND a.file_path LIKE '%/Previews/%'"
+            ))
+            .await,
+            0
+        );
+        // An image in a render folder that renders no model stays an ordinary image.
+        let unmatched: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT file_path, support_role FROM assets
+             WHERE file_path LIKE '3D assets/Animated Characters Bundle/Preview/%'
+             ORDER BY file_path",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        println!("unmatched: {unmatched:?}");
+        assert_eq!(unmatched.len(), 4);
+        assert!(unmatched.iter().all(|(_, role)| role.is_none()));
+
+        // No model with a render waits for a preview.
+        let queued = count(format!(
+            "SELECT COUNT(*) FROM assets a WHERE a.bundled_preview IS NOT NULL
+             AND (a.preview_status = 'pending' OR EXISTS (SELECT 1 FROM preview_jobs p
+                  WHERE p.asset_id = a.id AND p.status IN {}))",
+            crate::preview::WAITING_JOBS
+        ))
+        .await;
+        println!("models with a render waiting for a preview: {queued}");
+        assert_eq!(queued, 0);
+
+        // In every kit with a `Models/GLB format/` folder, each model item is a GLB, and each one
+        // Kenney ships a render of shows it. Some kits also ship older models under other names
+        // (`GLTF format/tower_edge.glb` beside `GLB format/tower-edge.glb`), with no render.
+        let kits: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+            "WITH kits AS (
+                 SELECT DISTINCT substr(file_path, 1, instr(file_path, '/Models/GLB format/') - 1)
+                     AS kit
+                 FROM assets WHERE file_path LIKE '3D assets/%/Models/GLB format/%'
+             ),
+             models AS (
+                 SELECT kit, a.extension, a.bundled_preview,
+                     EXISTS (SELECT 1 FROM assets r
+                         WHERE r.file_path >= kit || '/Previews/' AND r.file_path < kit || '/Previews0'
+                           AND lower(substr(r.file_name, 1, length(r.file_name) - length(r.extension) - 1))
+                             = lower(substr(a.file_name, 1, length(a.file_name) - length(a.extension) - 1)))
+                         AS rendered
+                 FROM kits JOIN assets a
+                     ON a.file_path >= kit || '/Models/' AND a.file_path < kit || '/Models0'
+                 WHERE a.kind = '3d_model' AND (a.group_id IS NULL OR a.group_id = a.id)
+             )
+             SELECT kit, COUNT(*),
+                 SUM(extension <> 'glb' OR (rendered AND bundled_preview IS NULL)),
+                 SUM(NOT rendered)
+             FROM models GROUP BY kit ORDER BY kit",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let models: i64 = kits.iter().map(|k| k.1).sum();
+        let unrendered: i64 = kits.iter().map(|k| k.3).sum();
+        let wrong: Vec<&(String, i64, i64, i64)> = kits.iter().filter(|k| k.2 > 0).collect();
+        println!(
+            "{} kits with GLB format/: {models} model items, {unrendered} with no render, kits with one not a GLB or missing its render: {wrong:?}",
+            kits.len()
+        );
+        assert!(kits.len() > 40);
+        assert_eq!(wrong, [] as [&(String, i64, i64, i64); 0]);
+
+        let libs = [LibraryHandle {
+            id: "golden".to_string(),
+            name: "golden".to_string(),
+            root_path: PathBuf::from("/golden"),
+            pool: pool.clone(),
+        }];
+        let search = |folder: &str, show_hidden: bool| {
+            let payload: SearchPayload = serde_json::from_value(serde_json::json!({
+                "query": {
+                    "text": "",
+                    "filter": { "showHidden": show_hidden },
+                    "sort": { "field": "name", "order": "asc" },
+                    "folder": { "libraryId": "golden", "path": folder },
+                },
+                "page": 0,
+                "pageSize": 10_000,
+            }))
+            .unwrap();
+            let libs = &libs;
+            async move {
+                search_libraries(&payload, &target_libraries(&payload.query, libs))
+                    .await
+                    .unwrap()
+            }
+        };
+        let kit = "3D assets/Car Kit";
+        let found = search(kit, false).await;
+        assert!(!found
+            .assets
+            .iter()
+            .any(|a| a.file_path.contains("/Previews/")));
+        let sedan = found
+            .assets
+            .iter()
+            .find(|a| a.file_name == "sedan.glb")
+            .expect("sedan.glb in the grid");
+        let (render_thumb,): (Option<String>,) = sqlx::query_as(
+            "SELECT thumbnail_path FROM assets WHERE file_path = '3D assets/Car Kit/Previews/sedan.png'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let picture = format!(
+            "/golden/{}",
+            render_thumb
+                .as_deref()
+                .unwrap_or("3D assets/Car Kit/Previews/sedan.png")
+        );
+        println!("sedan.glb shows {:?}", sedan.bundled_preview);
+        assert_eq!(sedan.bundled_preview.as_deref(), Some(picture.as_str()));
+        let previews = format!("{kit}/Previews");
+        let (hidden_total, shown_total) = (
+            search(&previews, false).await.total,
+            search(&previews, true).await.total,
+        );
+        println!("{previews}: {hidden_total:?} items, {shown_total:?} with hidden files");
+        assert_eq!(hidden_total, Some(0));
+        assert!(shown_total.unwrap() > 0);
     }
 
     /// The first page of the library root and of `3D assets`, as the grid asks for them (date

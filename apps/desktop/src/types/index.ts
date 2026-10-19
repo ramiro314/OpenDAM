@@ -74,6 +74,12 @@ export interface Asset {
    * format folders), every member's extension, its own first. Absent for a file on its own.
    */
   groupFormats?: string[];
+  /**
+   * For a model with a bundled preview (a render shipped beside it, such as Kenney's
+   * `Previews/<name>.png`), the picture to show: the render's thumbnail, or the render itself.
+   * Cards show it before `thumbnailPath`.
+   */
+  bundledPreview?: string;
 }
 
 export interface Library {

@@ -298,11 +298,12 @@ pub(crate) const NATIVE_EXTS_SQL: &str =
 /// A claimed job: (job_id, asset_id, file_path)
 type Job = (String, String, String);
 
-/// A group member whose main item has no preview of its own, as a `.blend` never does: the
-/// structure pass queues one such member as the group's stand-in (`structure::apply_previews`),
-/// and its job is claimed. Every other member's is skipped.
+/// A group member whose main item has no preview of its own, as a `.blend` never does, nor a
+/// bundled one: the structure pass queues one such member as the group's stand-in
+/// (`structure::apply_previews`), and its job is claimed. Every other member's is skipped.
 const STANDS_IN: &str = "EXISTS (SELECT 1 FROM assets g
-    WHERE g.id = a.group_id AND g.preview_status = 'none' AND g.thumbnail_path IS NULL)";
+    WHERE g.id = a.group_id AND g.preview_status = 'none' AND g.thumbnail_path IS NULL
+      AND g.bundled_preview IS NULL)";
 
 /// The job states a worker can still claim a job from.
 pub(crate) const WAITING_JOBS: &str = "('pending', 'queued', 'fallback')";
@@ -366,10 +367,12 @@ pub(crate) async fn enqueue(
 /// Fetches up to `limit` jobs matching `filter` and marks them as 'processing'.
 async fn claim_jobs(pool: &Pool<Sqlite>, filter: &str, limit: usize) -> Vec<Job> {
     let jobs: Vec<Job> = sqlx::query_as(&format!(
-        // A group member other than its main item never shows in the grid, so it gets no preview
-        // (plan C15). The structure pass drops its waiting jobs; this skips any queued since.
+        // A group member other than its main item never shows in the grid, and an item with a
+        // bundled preview shows that, so neither gets a preview (plan C15). The structure pass
+        // drops their waiting jobs; this skips any queued since.
         "SELECT p.id, p.asset_id, a.file_path FROM preview_jobs p JOIN assets a ON p.asset_id = a.id
-         WHERE ({filter}) AND ({MAIN_OR_SINGLE} OR {STANDS_IN}) LIMIT {limit}"
+         WHERE ({filter})
+           AND (({MAIN_OR_SINGLE} AND a.bundled_preview IS NULL) OR {STANDS_IN}) LIMIT {limit}"
     ))
     .fetch_all(pool)
     .await
@@ -1035,6 +1038,47 @@ mod tests {
             .collect();
         claimed.sort();
         assert_eq!(claimed, ["glb", "obj"]);
+    }
+
+    #[tokio::test]
+    async fn claiming_skips_a_job_for_an_item_with_a_bundled_preview() {
+        let pool = crate::db::memory_library_pool().await;
+        // `rock` shows its render, and `blend` leads a group whose OBJ would stand in, but the
+        // group has a render too. Only `tree` has no picture.
+        for (id, ext, group, render) in [
+            ("rock", "glb", None, Some("Previews/rock.png")),
+            ("blend", "blend", Some("blend"), Some("Previews/ship.png")),
+            ("obj", "obj", Some("blend"), None),
+            ("tree", "glb", None, None),
+        ] {
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, group_id, bundled_preview, preview_status)
+                 VALUES (?, ?, ?, ?, '3d_model', 1, 0, 0, ?, ?, 'none')",
+            )
+            .bind(id)
+            .bind(format!("{id}/a.{ext}"))
+            .bind(format!("a.{ext}"))
+            .bind(ext)
+            .bind(group)
+            .bind(render)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for id in ["rock", "obj", "tree"] {
+            sqlx::query("INSERT INTO preview_jobs (id, asset_id, status, created_at) VALUES (?, ?, 'pending', 0)")
+                .bind(format!("job-{id}"))
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let claimed: Vec<String> = claim_jobs(&pool, "p.status = 'pending'", 10)
+            .await
+            .into_iter()
+            .map(|(_, asset, _)| asset)
+            .collect();
+        assert_eq!(claimed, ["tree"]);
     }
 
     #[tokio::test]
