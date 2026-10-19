@@ -1181,15 +1181,30 @@ pub(crate) mod tests {
         pub roles: Vec<(String, Option<String>)>,
     }
 
-    /// What the pass has written to `pool`, for comparing a library with a fresh pass.
+    /// What the pass has written to `pool`, for comparing a library with a fresh pass. A license's
+    /// size and mtime are left out: they record when the pass last read the file, which depends
+    /// on the files on disk, not on the derived structure.
     pub(crate) async fn derived_rows(pool: &Pool<Sqlite>) -> DerivedRows {
-        let folders = sqlx::query_as(
+        let rows: Vec<FolderRow> = sqlx::query_as(
             "SELECT path, parent_path, name, is_pack, item_count, hidden_count, pack_json
              FROM folders ORDER BY path",
         )
         .fetch_all(pool)
         .await
         .unwrap();
+        let folders = rows
+            .into_iter()
+            .map(|(path, parent, name, is_pack, items, hidden, pack_json)| {
+                let pack_json = pack_json.map(|json| {
+                    let mut pack = parse_pack(Some(&json)).expect("pack_json holds pack info");
+                    if let Some(license) = pack.license.as_mut() {
+                        (license.size_bytes, license.modified_at) = (0, 0);
+                    }
+                    serde_json::to_string(&pack).unwrap()
+                });
+                (path, parent, name, is_pack, items, hidden, pack_json)
+            })
+            .collect();
         let roles = sqlx::query_as("SELECT file_path, support_role FROM assets ORDER BY file_path")
             .fetch_all(pool)
             .await
