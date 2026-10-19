@@ -28,17 +28,20 @@ export function formatItemsAndFiles(items: number, files: number): string {
 }
 
 /**
- * A format group's badge on its card and list row (plan C19): the main item's format and how many
- * other files the group holds, `GLB +2`, with every format in its tooltip, `3 files: GLB, FBX,
- * OBJ`. `null` for a file on its own.
+ * A group's badge on its card and list row (plan C19). A model's format group names the main
+ * item's format and how many other files the group holds, `GLB +2`, with every format in its
+ * tooltip, `3 files: GLB, FBX, OBJ`. Any other group, such as a sprite's 2D stack, counts its
+ * files, `x3`, with the same tooltip. `null` for a file on its own.
  */
 export function formatGroupBadge(
-  groupFormats: string[] | undefined
+  asset: Pick<Asset, 'kind' | 'groupFormats'>
 ): { label: string; title: string } | null {
+  const { groupFormats } = asset;
   if (!groupFormats || groupFormats.length < 2) return null;
   const formats = groupFormats.map((f) => f.toUpperCase());
   return {
-    label: `${formats[0]} +${formats.length - 1}`,
+    label:
+      asset.kind === '3d_model' ? `${formats[0]} +${formats.length - 1}` : `x${formats.length}`,
     title: `${formats.length} files: ${[...new Set(formats)].join(', ')}`,
   };
 }

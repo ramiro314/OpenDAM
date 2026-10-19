@@ -218,6 +218,14 @@ The UI checks, each defined in its plan:
   `.fbx` and then `.png` confirms. Each node's `get_folder_counts` call takes under 300 ms.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 5. Screenshots:
   `U13-tree-counts`, `U13-filter-counts`, `U13-format-union`.
+- **U14** (2D stacks): the library root shows 51,139 items (plan A3) and the status bar counts
+  them. `UI assets/UI Pack` lists each sprite once, as its `Default/` PNG standing for its
+  `Double/` PNG and its vector, with a solid `x3` badge whose tooltip reads `3 files: PNG, SVG`,
+  and its five colors stay five items. `2D assets/Pixel Platformer/Tiles` still lists both
+  `tile_0000.png` files, and the Crosshair Pack's Dark, Glow, Light and Outline styles stay
+  apart, the Dark one stacking its `(2×)` and vector copies.
+  [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 4. Screenshots:
+  `U14-library-root`, `U14-ui-pack`.
 
 Run it with the script, from the repo root:
 

@@ -119,6 +119,10 @@ docs/plans                    Plans for this fork
   under format folders, plan C11) holds its main item's id in `group_id` on every member, the
   main item included; a file on its own has `NULL`. The main item is chosen GLB > glTF > FBX >
   Blend > OBJ > others, ties by path ignoring case.
+  - A 2D stack (plan C13) is a group too: a sprite's scale and format copies (`Default/`,
+    `Double/`, `Vector/`, the table in `structure.rs`), among images in no format group and no
+    support files. Style and color folders (`Dark`, `Blue`) aren't in the table, so their
+    sprites stay apart. Its main item is a PNG first, then the default scale, then by path.
   - The grid shows main items and files on their own, never other members, even with
     `showHidden`, and support files only with it (`MAIN_OR_SINGLE` and `NOT_SUPPORT` in
     `commands/asset.rs`). The partial index `idx_assets_items` repeats those two terms in its

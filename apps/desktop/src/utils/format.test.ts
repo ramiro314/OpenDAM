@@ -49,23 +49,27 @@ describe('formatItemsAndFiles', () => {
 });
 
 describe('formatGroupBadge', () => {
-  test("names the main item's format and counts the other files", () => {
-    expect(formatGroupBadge(['glb', 'fbx', 'obj'])).toEqual({
+  test("names a model group's main format and counts the other files", () => {
+    expect(formatGroupBadge({ kind: '3d_model', groupFormats: ['glb', 'fbx', 'obj'] })).toEqual({
       label: 'GLB +2',
       title: '3 files: GLB, FBX, OBJ',
     });
   });
 
-  test('lists a format the copies share once', () => {
-    expect(formatGroupBadge(['png', 'png', 'png'])).toEqual({
-      label: 'PNG +2',
-      title: '3 files: PNG',
+  test("counts a 2D stack's files, listing a format the copies share once", () => {
+    expect(formatGroupBadge({ kind: 'texture', groupFormats: ['png', 'png', 'svg'] })).toEqual({
+      label: 'x3',
+      title: '3 files: PNG, SVG',
+    });
+    expect(formatGroupBadge({ kind: 'image', groupFormats: ['svg', 'svg'] })).toEqual({
+      label: 'x2',
+      title: '2 files: SVG',
     });
   });
 
   test('gives a file on its own no badge', () => {
-    expect(formatGroupBadge(undefined)).toBeNull();
-    expect(formatGroupBadge(['glb'])).toBeNull();
+    expect(formatGroupBadge({ kind: '3d_model', groupFormats: undefined })).toBeNull();
+    expect(formatGroupBadge({ kind: 'texture', groupFormats: ['png'] })).toBeNull();
   });
 });
 

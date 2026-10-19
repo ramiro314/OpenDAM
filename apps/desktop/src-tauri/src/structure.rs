@@ -1,5 +1,5 @@
 //! The structure pass: a library's folder tree, its packs, its support files, its format groups
-//! and their bundled previews, derived from the paths it has indexed
+//! with their bundled previews, and its 2D stacks, derived from the paths it has indexed
 //! (docs/plans/smarter-big-collections/plan.md, "The structure pass"). `derive` is a pure function
 //! over the paths, and the pass writes only the folder rows and `assets.support_role`,
 //! `assets.group_id` and `assets.bundled_preview` values that differ from it, and the metadata of
@@ -36,6 +36,15 @@ const FORMAT_FOLDERS: [&str; 11] = [
 ];
 /// The names (lowercase) of a folder of model renders, such as Kenney's `Previews/`.
 const RENDER_FOLDERS: [&str; 3] = ["previews", "preview", "renders"];
+/// The names (lowercase) of a folder of a sprite's copies at its default scale (plan C13).
+const DEFAULT_SCALE_FOLDERS: [&str; 3] = ["default", "default size", "1x"];
+/// The names (lowercase) of a folder of a sprite's copies at a larger scale.
+const LARGER_SCALE_FOLDERS: [&str; 8] = ["double", "large", "retina", "hd", "2x", "3x", "4x", "x2"];
+/// The names (lowercase) of a folder of a sprite's copies in one format.
+const IMAGE_FORMAT_FOLDERS: [&str; 4] = ["png", "svg", "vector", "vectors"];
+/// The endings (lowercase) of a folder name that make it a larger scale of the folder named
+/// without them, such as `Sprites X2` beside `Sprites`.
+const LARGER_SCALE_SUFFIXES: [&str; 4] = [" x2", " hd", " (2×)", " (2x)"];
 
 /// One folder as the pass derives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,7 +170,9 @@ impl FileKind {
 ///    copies of a file under format folders, form one grid item led by its main item.
 /// 5. **Bundled previews** (C12, `model_previews`): a render of a model is a `ModelPreview`
 ///    support file, and the model's main item records it.
-/// 6. **Counts:** each folder counts the grid items with a visible file below it, a group once,
+/// 6. **2D stacks** (C13, `stacks`): a sprite's scale and format copies (`Default/`, `Double/`,
+///    `Vector/`) form a group too, led by its PNG at the default scale.
+/// 7. **Counts:** each folder counts the grid items with a visible file below it, a group once,
 ///    and the support files below it.
 pub fn derive<'a>(paths: impl IntoIterator<Item = &'a str>) -> Structure {
     let paths: Vec<&str> = paths.into_iter().collect();
@@ -220,7 +231,8 @@ pub fn derive<'a>(paths: impl IntoIterator<Item = &'a str>) -> Structure {
         })
         .collect();
     let renders = model_previews(&paths, &kinds, &mut roles);
-    let groups = format_groups(&paths, &kinds, &roles);
+    let mut groups = format_groups(&paths, &kinds, &roles);
+    stacks(&paths, &kinds, &roles, &mut groups);
     let bundled_previews = bundled_previews(&paths, &groups, &renders);
 
     // A file on its own counts toward the folders above it. A group counts once toward each
@@ -416,8 +428,20 @@ fn format_groups(
     }
 
     let mut groups = vec![None; paths.len()];
-    for files in candidates.into_values().filter(|f| f.len() > 1) {
-        let (_, main) = *files
+    form_groups(paths, candidates.into_values(), &mut groups);
+    groups
+}
+
+/// Records in `groups` each of `candidates` that holds more than one file, as (rank, input
+/// index) pairs: the file with the lowest rank leads it, ties broken by path, ignoring ASCII case
+/// as SQLite's `NOCASE` does.
+fn form_groups<R: Ord>(
+    paths: &[&str],
+    candidates: impl IntoIterator<Item = Vec<(R, usize)>>,
+    groups: &mut [Option<usize>],
+) {
+    for files in candidates.into_iter().filter(|f| f.len() > 1) {
+        let (_, main) = files
             .iter()
             .min_by(|(rank_a, a), (rank_b, b)| {
                 let (a, b) = (paths[*a], paths[*b]);
@@ -431,11 +455,95 @@ fn format_groups(
                     .then_with(|| a.cmp(b))
             })
             .expect("a group has files");
+        let main = *main;
         for (_, i) in files {
             groups[i] = Some(main);
         }
     }
-    groups
+}
+
+/// What a folder named `name` says about the sprite copies inside it (plan C13).
+#[derive(Debug, PartialEq, Eq)]
+enum StackFolder {
+    /// A scale or format folder, which a stack's folder leaves out: `Default`, `Double (128px)`,
+    /// `Vector`. `larger` is true for a scale above the default.
+    Copies { larger: bool },
+    /// A folder named after another with a larger scale's ending, which a stack's folder names
+    /// as that other: `Sprites X2`, `Poses HD`, `Dark (2×)`.
+    LargerOf(String),
+}
+
+/// The folder `name` is in a 2D stack's terms, if it is a scale or format folder, ignoring case
+/// and a parenthesized note (`Default (64px)`).
+fn stack_folder(name: &str) -> Option<StackFolder> {
+    let lower = name.to_lowercase();
+    let base = match lower.rsplit_once(" (") {
+        Some((base, note)) if note.ends_with(')') => base,
+        _ => lower.as_str(),
+    };
+    if DEFAULT_SCALE_FOLDERS.contains(&base) || IMAGE_FORMAT_FOLDERS.contains(&base) {
+        return Some(StackFolder::Copies { larger: false });
+    }
+    if LARGER_SCALE_FOLDERS.contains(&base) {
+        return Some(StackFolder::Copies { larger: true });
+    }
+    LARGER_SCALE_SUFFIXES
+        .iter()
+        .find(|suffix| lower.ends_with(*suffix) && lower.len() > suffix.len())
+        .map(|suffix| StackFolder::LargerOf(lower[..lower.len() - suffix.len()].to_string()))
+}
+
+/// `dir` as a 2D stack's folder (lowercase, without its scale and format folders, each folder
+/// with a larger scale's ending named as the folder it scales), and whether it holds a larger
+/// scale than the default.
+fn strip_stack_folders(dir: &str) -> (String, bool) {
+    let mut larger = false;
+    let kept: Vec<String> = dir
+        .split('/')
+        .filter_map(|name| match stack_folder(name) {
+            Some(StackFolder::Copies { larger: l }) => {
+                larger |= l;
+                None
+            }
+            Some(StackFolder::LargerOf(base)) => {
+                larger = true;
+                Some(base)
+            }
+            None => Some(name.to_lowercase()),
+        })
+        .collect();
+    (kept.join("/"), larger)
+}
+
+/// Adds the 2D stacks of `paths` (plan C13) to `groups`: images (`texture` and `image` kinds)
+/// that are in no group and are no support file stack when their lowercase stems are equal, and
+/// so are their folders once scale and format folders are taken out (`PNG/Blue/Default/`,
+/// `PNG/Blue/Double/` and `Vector/Blue/` are all `Blue/`). Style and color folders (`Dark`,
+/// `Blue`) are none of these, so their sprites stay apart. The main item is a PNG before other
+/// formats, then a copy at the default scale (in no scale folder, or in `Default`, `Default size`
+/// or `1x`) before larger ones, then the path that sorts first ignoring case.
+fn stacks(
+    paths: &[&str],
+    kinds: &[FileKind],
+    roles: &[Option<SupportRole>],
+    groups: &mut [Option<usize>],
+) {
+    // (folder without scale and format folders, stem)
+    type Key<'k> = (String, &'k str);
+    // (not a PNG, at a larger scale)
+    type Rank = (bool, bool);
+    let mut candidates: HashMap<Key, Vec<(Rank, usize)>> = HashMap::new();
+    for (i, (path, kind)) in paths.iter().zip(kinds).enumerate() {
+        if !kind.is_image || roles[i].is_some() || groups[i].is_some() {
+            continue;
+        }
+        let (dir, larger) = strip_stack_folders(split_dir(path).0);
+        candidates
+            .entry((dir, kind.stem.as_str()))
+            .or_default()
+            .push(((kind.ext != "png", larger), i));
+    }
+    form_groups(paths, candidates.into_values(), groups);
 }
 
 /// Whether `dir` is a pack or lies inside one.
@@ -1746,6 +1854,185 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn ui_pack_sprites_stack_across_their_scale_and_vector_copies_but_not_their_colors() {
+        let paths = [
+            UI_PACK.to_vec(),
+            vec![
+                "UI assets/UI Pack/PNG/Red/Default/button_rectangle.png",
+                "UI assets/UI Pack/PNG/Red/Double/button_rectangle.png",
+                "UI assets/UI Pack/Vector/Red/button_rectangle.svg",
+            ],
+        ]
+        .concat();
+        assert_eq!(
+            groups_of(&paths),
+            [
+                vec![
+                    "UI assets/UI Pack/PNG/Blue/Default/button_rectangle.png",
+                    "UI assets/UI Pack/PNG/Blue/Double/button_rectangle.png",
+                    "UI assets/UI Pack/Vector/Blue/button_rectangle.svg",
+                ],
+                vec![
+                    "UI assets/UI Pack/PNG/Red/Default/button_rectangle.png",
+                    "UI assets/UI Pack/PNG/Red/Double/button_rectangle.png",
+                    "UI assets/UI Pack/Vector/Red/button_rectangle.svg",
+                ],
+            ]
+        );
+        // Each color's folders count its stack once, next to the spritesheet, and the vector
+        // folder holds the stack without its main item.
+        let structure = derive(paths.iter().copied());
+        let count = |path: &str| structure.folders[path].item_count;
+        assert_eq!(count("UI assets/UI Pack"), 3);
+        assert_eq!(count("UI assets/UI Pack/PNG"), 2);
+        assert_eq!(count("UI assets/UI Pack/Vector/Blue"), 1);
+        assert_eq!(
+            structure.folders["UI assets/UI Pack/Vector"].split_groups,
+            2
+        );
+        assert_eq!(structure.folders["UI assets/UI Pack/PNG"].split_groups, 0);
+    }
+
+    #[test]
+    fn kenney_2d_sprites_stack_in_the_current_and_the_old_style() {
+        // The current style ships each sprite once, so nothing stacks, and two tiles that share a
+        // name in different folders are different pictures.
+        assert_eq!(groups_of(&KENNEY_2D), [] as [Vec<&str>; 0]);
+        // The old style ships PNG and vector copies under matching folders, and Holiday Pack's
+        // `Default size/` and `Retina/` copies.
+        let old = [
+            "2D assets/Abstract Platformer/License.txt",
+            "2D assets/Abstract Platformer/Preview.png",
+            "2D assets/Abstract Platformer/PNG/Players/Player Blue/playerBlue_walk1.png",
+            "2D assets/Abstract Platformer/PNG/Players/Player Green/playerGreen_walk1.png",
+            "2D assets/Abstract Platformer/Vector/Players/Player Blue/playerBlue_walk1.svg",
+            "2D assets/Abstract Platformer/Spritesheet/spritesheet_complete.png",
+            "2D assets/Abstract Platformer/Vector/vector_complete.svg",
+        ];
+        assert_eq!(
+            groups_of(&old),
+            [vec![
+                "2D assets/Abstract Platformer/PNG/Players/Player Blue/playerBlue_walk1.png",
+                "2D assets/Abstract Platformer/Vector/Players/Player Blue/playerBlue_walk1.svg",
+            ]]
+        );
+        assert_eq!(
+            groups_of(&HOLIDAY_PACK),
+            [vec![
+                "2D assets/Holiday Pack 2016/PNG/RTS pack/Default size/tree.png",
+                "2D assets/Holiday Pack 2016/PNG/RTS pack/Retina/tree.png",
+            ]]
+        );
+    }
+
+    #[test]
+    fn same_named_tiles_in_different_folders_stay_apart() {
+        let paths = [
+            "2D assets/Pixel Platformer/Tiles/tile_0000.png",
+            "2D assets/Pixel Platformer/Tiles/Characters/tile_0000.png",
+            "2D assets/Tiny Town/Tiles/tile_0000.png",
+            "2D assets/Tiny Dungeon/Tilemap/tile_0000.png",
+        ];
+        assert_eq!(grouped(&paths), []);
+        assert_eq!(derive(paths).folders[""].item_count, 4);
+    }
+
+    #[test]
+    fn scale_folders_stack_by_name_note_and_ending_but_style_and_color_folders_do_not() {
+        let stacked: [&[&str]; 8] = [
+            &["p/Default/a.png", "p/Double/a.png", "p/Retina/a.png"],
+            &["p/1x/a.png", "p/2x/a.png", "p/3x/a.png", "p/4x/a.png"],
+            &["p/Default (64px)/a.png", "p/Double (128px)/a.png"],
+            &["p/Default/a.png", "p/Large (2×)/a.png", "p/Vector/a.svg"],
+            &["p/PNG/Sprites/a.png", "p/PNG/Sprites X2/a.png"],
+            &[
+                "p/PNG/Poses/a.png",
+                "p/PNG/Poses HD/a.png",
+                "p/HD/Poses/a.png",
+            ],
+            &[
+                "p/PNG/Dark/a.png",
+                "p/PNG/Dark (2×)/a.png",
+                "p/SVG/Dark/a.svg",
+            ],
+            &[
+                "p/a.png",
+                "p/x2/a.png",
+                "p/Vectors/a.svg",
+                "p/Default size/A.PNG",
+            ],
+        ];
+        for paths in stacked {
+            assert_eq!(groups_of(paths).len(), 1, "{paths:?}");
+            assert_eq!(grouped(paths).len(), paths.len(), "{paths:?}");
+        }
+        let apart: [&[&str]; 6] = [
+            &["p/PNG/Dark/a.png", "p/PNG/Light/a.png"],
+            &["p/PNG/Blue/a.png", "p/PNG/Red/a.png"],
+            &["p/Tiles (Black)/a.png", "p/Tiles (White)/a.png"],
+            &["p/Fantasy (128px)/a.png", "p/Space (128px)/a.png"],
+            &["p/PNG/Dark (2×)/a.png", "p/PNG/Light/a.png"],
+            &["p/Small tiles/a.png", "p/Large tiles/a.png"],
+        ];
+        for paths in apart {
+            assert_eq!(grouped(paths), [], "{paths:?}");
+        }
+    }
+
+    #[test]
+    fn a_stack_is_led_by_a_png_then_by_the_default_scale() {
+        let main = |paths: &[&'static str]| groups_of(paths)[0][0];
+        // A PNG before a vector or a JPEG, even a larger one
+        assert_eq!(
+            main(&["p/Vector/a.svg", "p/Default/a.jpg", "p/Double/a.png"]),
+            "p/Double/a.png"
+        );
+        // The default scale before a larger one, whatever their paths
+        assert_eq!(
+            main(&["p/Double/a.png", "p/Default/a.png"]),
+            "p/Default/a.png"
+        );
+        assert_eq!(main(&["p/2x/a.png", "p/1x/a.png"]), "p/1x/a.png");
+        assert_eq!(main(&["p/Retina/a.png", "p/a.png"]), "p/a.png");
+        assert_eq!(
+            main(&["p/Sprites X2/a.png", "p/Sprites/a.png"]),
+            "p/Sprites/a.png"
+        );
+        // Two copies at the default scale: the path that sorts first ignoring case
+        assert_eq!(main(&["p/PNG/a.png", "p/Default/a.png"]), "p/Default/a.png");
+    }
+
+    #[test]
+    fn grouped_files_support_files_and_models_never_stack() {
+        let paths = [
+            // A pack's covers in a scale folder and beside it
+            "kit/License.txt",
+            "kit/Preview.png",
+            "kit/Default/Preview.png",
+            // A texture's copies under model format folders are a format group already. A scale
+            // copy beside the GLB one shares its stack folder, but doesn't join it.
+            "kit/Models/GLB format/Textures/colormap.png",
+            "kit/Models/OBJ format/Textures/colormap.png",
+            "kit/Models/GLB format/Textures/Double/colormap.png",
+            // A render is its model's bundled preview
+            "kit/Models/GLB format/barrel.glb",
+            "kit/Previews/barrel.png",
+            "kit/Default/barrel.png",
+            // A model and a sprite that share a name
+            "kit/PNG/crate.png",
+            "kit/crate.glb",
+        ];
+        assert_eq!(
+            groups_of(&paths),
+            [vec![
+                "kit/Models/GLB format/Textures/colormap.png",
+                "kit/Models/OBJ format/Textures/colormap.png",
+            ]]
+        );
+        assert_eq!(derive(paths).groups[5], None, "the scale copy stacks");
+    }
+
     /// Every `folders` row, every asset's support role, the main item's path of every grouped
     /// asset, and every bundled preview, in path order.
     #[derive(Debug, PartialEq)]
@@ -2138,6 +2425,36 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(derived_rows(&pool).await.bundled_previews, []);
+    }
+
+    #[tokio::test]
+    async fn a_stack_is_one_group_whose_main_item_alone_stays_queued() {
+        let (default, double, vector) = (
+            "UI Pack/PNG/Blue/Default/button.png",
+            "UI Pack/PNG/Blue/Double/button.png",
+            "UI Pack/Vector/Blue/button.svg",
+        );
+        let pool = memory_library_pool().await;
+        for path in [default, double, vector] {
+            insert_with_preview(&pool, path, "pending").await;
+            add_job(&pool, path, "pending").await;
+        }
+        rebuild(&pool).await.unwrap();
+        let rows = derived_rows(&pool).await;
+        let main = Some(default.to_string());
+        assert_eq!(
+            rows.groups,
+            [default, double, vector].map(|path| (path.to_string(), main.clone()))
+        );
+        assert_eq!(rows, fresh_pass(&[default, double, vector]).await);
+        assert_eq!(
+            previews(&pool).await,
+            (
+                pairs(&[(default, "pending"), (double, "none"), (vector, "none")]),
+                pairs(&[(default, "pending")]),
+            )
+        );
+        assert_eq!(rebuild(&pool).await.unwrap(), 0);
     }
 
     #[tokio::test]

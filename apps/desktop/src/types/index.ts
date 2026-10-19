@@ -70,8 +70,9 @@ export interface Asset {
   previewStatus: 'none' | 'pending' | 'generating' | 'done' | 'error';
   metadata: AssetMeta;
   /**
-   * For the main item of a format group (one model in several formats, or a file's copies under
-   * format folders), every member's extension, its own first. Absent for a file on its own.
+   * For the main item of a group (one model in several formats, a file's copies under format
+   * folders, or a sprite's scale and format copies in a 2D stack), every member's extension, its
+   * own first. Absent for a file on its own.
    */
   groupFormats?: string[];
   /**
