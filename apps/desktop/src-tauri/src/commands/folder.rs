@@ -939,4 +939,33 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn the_pack_holding_a_folder_is_the_innermost_of_nested_packs() {
+        let library = library_handle(
+            "a",
+            &[
+                "kit/License.txt",
+                "kit/Extra/License.txt",
+                "kit/Extra/sub/a.png",
+                "kit/Other/b.png",
+            ],
+        )
+        .await;
+        // The pass makes only the outermost marked folder a pack. A pack inside a pack comes from
+        // a "Mark as pack" override, so the inner one is marked here by hand.
+        sqlx::query("UPDATE folders SET is_pack = 1 WHERE path = 'kit/Extra'")
+            .execute(&library.pool)
+            .await
+            .unwrap();
+        for (path, pack) in [
+            ("kit/Extra", "kit/Extra"),
+            ("kit/Extra/sub", "kit/Extra"),
+            ("kit/Other", "kit"),
+            ("kit", "kit"),
+        ] {
+            let detail = pack_holding(&library, path).await.unwrap();
+            assert_eq!(detail.map(|d| d.path).as_deref(), Some(pack), "{path}");
+        }
+    }
 }
