@@ -174,6 +174,33 @@ export interface FolderNode {
   shownWithoutHidden: boolean;
   /** Whether a child shows with hidden files off */
   hasVisibleChildren: boolean;
+  /** A pack's cover image */
+  cover?: Cover | null;
+}
+
+/** A pack's cover image, shown as a grid tile shows an asset (`tileMedia`) */
+export interface Cover {
+  /** Absolute */
+  filePath: string;
+  /** Absolute, when the image has a thumbnail */
+  thumbnailPath?: string | null;
+  extension: string;
+  kind: AssetKind;
+}
+
+/** One card of the Packs view (`get_packs`) */
+export interface PackCard {
+  libraryId: string;
+  /** Relative to the library root */
+  path: string;
+  /** The license header's name, else the folder's */
+  name: string;
+  /** The folder holding the pack, the card's subtitle; `''` for the library root */
+  parentPath: string;
+  /** Visible files below the pack; 0 shows as "No visible items" */
+  itemCount: number;
+  hiddenCount: number;
+  cover?: Cover | null;
 }
 
 /**

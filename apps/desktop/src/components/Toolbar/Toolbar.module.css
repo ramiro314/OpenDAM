@@ -217,6 +217,13 @@
 .iconBtn.dimmed {
   color: var(--color-text-disabled);
 }
+/* The Packs/Assets toggle: icon buttons with a label */
+.iconBtn.segmentBtn {
+  width: auto;
+  gap: 6px;
+  padding: 0 var(--space-2);
+  font-size: 12px;
+}
 
 .gridSizeDot {
   line-height: 1;

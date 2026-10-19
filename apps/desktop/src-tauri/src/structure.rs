@@ -1,16 +1,18 @@
 //! The structure pass: a library's folder tree, its packs, its support files, its format groups
 //! with their bundled previews, and its 2D stacks, derived from the paths it has indexed
 //! (docs/plans/smarter-big-collections/plan.md, "The structure pass"). `derive` is a pure function
-//! over the paths, and the pass writes only the folder rows and `assets.support_role`,
+//! over the paths and the license headers, and the pass writes only the folder rows and `assets.support_role`,
 //! `assets.group_id` and `assets.bundled_preview` values that differ from it, and the metadata of
 //! the groups that form or grow (`apply_unions`). Every index run ends with the pass
 //! (`watcher::index_paths`), and so does every command that changes the paths, through
 //! `rebuild_library`. Nothing else writes `folders`, `support_role`, `group_id` or
 //! `bundled_preview`.
 
+use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
+use std::path::Path;
 use std::time::Instant;
 
 use crate::db::{Database, LibraryHandle};
@@ -24,7 +26,11 @@ const BATCH: usize = 200;
 const MARKER_STEMS: [&str; 4] = ["license", "licence", "preview", "sample"];
 /// Image stems (lowercase) that make a pack's cover images.
 const COVER_STEMS: [&str; 2] = ["preview", "sample"];
+/// Doc stems (lowercase) of a pack's license file, whose header names the pack.
+const LICENSE_STEMS: [&str; 2] = ["license", "licence"];
 const DOC_EXTENSIONS: [&str; 3] = ["txt", "md", "pdf"];
+/// How much of a license file the pass reads for its header.
+const HEADER_BYTES: u64 = 4096;
 /// The formats a group picks its main item by (plan D12), best first. Every other format ranks
 /// after them.
 const MAIN_FORMATS: [&str; 5] = ["glb", "gltf", "fbx", "blend", "obj"];
@@ -62,6 +68,36 @@ pub struct Folder {
     /// kit's models under `FBX format/`. A search for the folder finds those groups through their
     /// members, and finds every other item below it by the item's own path.
     pub split_groups: i64,
+    /// A pack's info, stored as `folders.pack_json`; `None` for a folder that is no pack
+    pub pack: Option<PackInfo>,
+}
+
+/// What the pass derives for one pack (plan C9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackInfo {
+    /// The name shown: the license header's, else the folder's
+    pub name: String,
+    /// The cover's path: the first `Preview*` cover image, else the first `Sample*` one, else the
+    /// pack's first image, else its first visible file (a model, whose thumbnail shows), each by
+    /// path
+    pub cover: Option<String>,
+    pub license: Option<LicenseFile>,
+}
+
+/// A pack's license file: its first `License*` doc by path, directly inside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LicenseFile {
+    pub path: String,
+    /// The pack's name from the file's Kenney header, if it has one (`kenney_header_name`)
+    pub header_name: Option<String>,
+    /// The file's size and mtime when the pass read its header, so a rerun reads only a changed
+    /// file. `derive` leaves them 0, and `rebuild` fills them from the file's row.
+    #[serde(default)]
+    pub size_bytes: i64,
+    #[serde(default)]
+    pub modified_at: i64,
 }
 
 /// Why a file is a pack's support file, hidden from the grid unless "Show hidden files" is on.
@@ -145,6 +181,10 @@ impl FileKind {
         (self.is_doc || self.is_image) && self.stem_starts_with(&MARKER_STEMS)
     }
 
+    fn is_license(&self) -> bool {
+        self.is_doc && self.stem_starts_with(&LICENSE_STEMS)
+    }
+
     fn support_role(&self) -> Option<SupportRole> {
         if self.is_doc {
             Some(SupportRole::Doc)
@@ -174,7 +214,12 @@ impl FileKind {
 ///    `Vector/`) form a group too, led by its PNG at the default scale.
 /// 7. **Counts:** each folder counts the grid items with a visible file below it, a group once,
 ///    and the support files below it.
-pub fn derive<'a>(paths: impl IntoIterator<Item = &'a str>) -> Structure {
+/// 7. **Pack info** (C9): each pack's cover and license file, and its name, which is the license
+///    file's header name (`header_name` reads it) or else the folder's.
+pub fn derive<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    mut header_name: impl FnMut(&str) -> Option<String>,
+) -> Structure {
     let paths: Vec<&str> = paths.into_iter().collect();
     let kinds: Vec<FileKind> = paths.iter().map(|p| FileKind::of(split_dir(p).1)).collect();
 
@@ -272,8 +317,25 @@ pub fn derive<'a>(paths: impl IntoIterator<Item = &'a str>) -> Structure {
             }
         }
     }
+    let mut info = pack_files(&packs, &paths, &kinds, &roles, &groups);
     for pack in packs {
-        folders.get_mut(pack).expect("a pack has a row").is_pack = true;
+        let folder = folders.get_mut(pack).expect("a pack has a row");
+        let files = info.remove(pack).unwrap_or_default();
+        let license = files.license.map(|path| LicenseFile {
+            header_name: header_name(path),
+            path: path.to_string(),
+            size_bytes: 0,
+            modified_at: 0,
+        });
+        folder.is_pack = true;
+        folder.pack = Some(PackInfo {
+            name: license
+                .as_ref()
+                .and_then(|l| l.header_name.clone())
+                .unwrap_or_else(|| folder.name.clone()),
+            cover: files.cover().map(str::to_string),
+            license,
+        });
     }
     Structure {
         folders,
@@ -350,6 +412,105 @@ fn bundled_previews(
         }
     }
     bundled
+}
+
+/// The files of one pack that its info is chosen from, each the first by path.
+#[derive(Default)]
+struct PackFiles<'a> {
+    preview: Option<&'a str>,
+    sample: Option<&'a str>,
+    image: Option<&'a str>,
+    visible: Option<&'a str>,
+    license: Option<&'a str>,
+}
+
+impl<'a> PackFiles<'a> {
+    fn cover(&self) -> Option<&'a str> {
+        self.preview.or(self.sample).or(self.image).or(self.visible)
+    }
+}
+
+/// Keeps the lesser of `slot` and `path`.
+fn first<'a>(slot: &mut Option<&'a str>, path: &'a str) {
+    if slot.is_none_or(|p| path < p) {
+        *slot = Some(path);
+    }
+}
+
+/// The files each pack's info is chosen from. A file belongs to the innermost pack above it.
+fn pack_files<'a>(
+    packs: &BTreeSet<&str>,
+    paths: &[&'a str],
+    kinds: &[FileKind],
+    roles: &[Option<SupportRole>],
+    groups: &[Option<usize>],
+) -> HashMap<String, PackFiles<'a>> {
+    let mut files: HashMap<String, PackFiles> = HashMap::new();
+    for (i, ((path, kind), role)) in paths.iter().zip(kinds).zip(roles).enumerate() {
+        let (dir, _) = split_dir(path);
+        let Some(pack) = std::iter::once(dir)
+            .chain(ancestors(dir).collect::<Vec<_>>().into_iter().rev())
+            .find(|d| packs.contains(d))
+        else {
+            continue;
+        };
+        let entry = files.entry(pack.to_string()).or_default();
+        // A grid item: a file on its own or a group's main item, never another member
+        if role.is_none() && groups[i].is_none_or(|main| main == i) {
+            first(&mut entry.visible, path);
+        }
+        if kind.is_image {
+            first(&mut entry.image, path);
+            if *role == Some(SupportRole::Cover) {
+                if kind.stem.starts_with("preview") {
+                    first(&mut entry.preview, path);
+                } else {
+                    first(&mut entry.sample, path);
+                }
+            }
+        }
+        if dir == pack && kind.is_license() {
+            first(&mut entry.license, path);
+        }
+    }
+    files
+}
+
+/// The pack name a Kenney license header gives: its first line (`Car Kit (3.1)`) without the
+/// version in parentheses, when the next line names Kenney as the author (`Created/distributed
+/// by Kenney` or `by Kenney Vleugels`). `None` for any other text, such as an MIT or CC license.
+pub fn kenney_header_name(text: &str) -> Option<String> {
+    let mut lines = text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty());
+    let title = lines.next()?;
+    let byline = lines.next()?.to_lowercase();
+    let names_kenney = ["created/distributed by kenney", "by kenney"]
+        .iter()
+        .any(|by| {
+            byline
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .starts_with(by)
+        });
+    if !names_kenney {
+        return None;
+    }
+    // Drops a version such as ` (3.1)` or ` (1.5A)`, wherever it sits.
+    let mut name = title.to_string();
+    if let Some(start) = name.find(" (") {
+        let rest = &name[start + 2..];
+        if rest.starts_with(|c: char| c.is_ascii_digit()) {
+            if let Some(len) = rest.find(')') {
+                name.replace_range(start..start + 2 + len + 1, "");
+            }
+        }
+    }
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!name.is_empty()).then_some(name)
 }
 
 /// A format's place in `MAIN_FORMATS`, ignoring case: lower is better, and every format not
@@ -569,6 +730,7 @@ fn folder(parent_path: Option<&str>, name: &str) -> Folder {
         item_count: 0,
         hidden_count: 0,
         split_groups: 0,
+        pack: None,
     }
 }
 
@@ -582,9 +744,81 @@ struct FileRow {
     group_id: Option<String>,
     bundled_preview: Option<String>,
     preview_status: String,
+    size_bytes: i64,
+    modified_at: i64,
 }
 
-pub(crate) type FolderRow = (String, Option<String>, String, bool, i64, i64, i64);
+pub(crate) type FolderRow = (
+    String,
+    Option<String>,
+    String,
+    bool,
+    i64,
+    i64,
+    i64,
+    Option<String>,
+);
+
+/// A `pack_json` value as `PackInfo`; one that doesn't parse is rewritten by the pass.
+fn parse_pack(json: Option<&str>) -> Option<PackInfo> {
+    serde_json::from_str(json?).ok()
+}
+
+/// The license files whose header the pass read before, by path, from the current `pack_json`s.
+async fn read_licenses(pool: &Pool<Sqlite>) -> sqlx::Result<HashMap<String, LicenseFile>> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT pack_json FROM folders WHERE pack_json IS NOT NULL")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|(json,)| parse_pack(Some(json))?.license)
+        .map(|l| (l.path.clone(), l))
+        .collect())
+}
+
+/// The header name of license file `file` from its last read, when its size and mtime haven't
+/// changed since; `None` when it must be read again.
+fn known_header(file: &FileRow, known: &HashMap<String, LicenseFile>) -> Option<Option<String>> {
+    known
+        .get(&file.file_path)
+        .filter(|l| (l.size_bytes, l.modified_at) == (file.size_bytes, file.modified_at))
+        .map(|l| l.header_name.clone())
+}
+
+/// The header name of each license file of `paths` below `root`, from its first `HEADER_BYTES`,
+/// or why it couldn't be read. The reads run on the blocking pool, off the async runtime, since a
+/// library on a network share can take long to open each file.
+async fn read_headers(
+    root: &Path,
+    paths: Vec<String>,
+) -> HashMap<String, std::io::Result<Option<String>>> {
+    use std::io::Read;
+    let read_all = {
+        let (root, paths) = (root.to_path_buf(), paths.clone());
+        move || {
+            paths
+                .into_iter()
+                .map(|path| {
+                    let mut head = Vec::new();
+                    let header = std::fs::File::open(root.join(&path))
+                        .and_then(|f| f.take(HEADER_BYTES).read_to_end(&mut head))
+                        .map(|_| kenney_header_name(&String::from_utf8_lossy(&head)));
+                    (path, header)
+                })
+                .collect()
+        }
+    };
+    tokio::task::spawn_blocking(read_all)
+        .await
+        .unwrap_or_else(|e| {
+            let error = format!("the license reads stopped: {e}");
+            paths
+                .into_iter()
+                .map(|path| (path, Err(std::io::Error::other(error.clone()))))
+                .collect()
+        })
+}
 
 /// Makes `folders` hold exactly `folders`, writing only the rows that differ, in transactions of
 /// `BATCH` rows. Returns how many rows it inserted, updated or deleted.
@@ -593,7 +827,7 @@ async fn apply_folders(
     folders: &BTreeMap<String, Folder>,
 ) -> sqlx::Result<usize> {
     let rows: Vec<FolderRow> = sqlx::query_as(
-        "SELECT path, parent_path, name, is_pack, item_count, hidden_count, split_groups
+        "SELECT path, parent_path, name, is_pack, item_count, hidden_count, split_groups, pack_json
          FROM folders",
     )
     .fetch_all(pool)
@@ -601,7 +835,16 @@ async fn apply_folders(
     let current: HashMap<String, Folder> = rows
         .into_iter()
         .map(
-            |(path, parent_path, name, is_pack, item_count, hidden_count, split_groups)| {
+            |(
+                path,
+                parent_path,
+                name,
+                is_pack,
+                item_count,
+                hidden_count,
+                split_groups,
+                pack_json,
+            )| {
                 let folder = Folder {
                     parent_path,
                     name,
@@ -609,6 +852,7 @@ async fn apply_folders(
                     item_count,
                     hidden_count,
                     split_groups,
+                    pack: parse_pack(pack_json.as_deref()),
                 };
                 (path, folder)
             },
@@ -626,15 +870,18 @@ async fn apply_folders(
     for chunk in changed.chunks(BATCH) {
         let mut tx = pool.begin().await?;
         for (path, folder) in chunk {
-            // An upsert, so a later step's pack info survives a change in the counts.
+            let pack_json = folder
+                .pack
+                .as_ref()
+                .map(|p| serde_json::to_string(p).expect("pack info serializes"));
             sqlx::query(
-                "INSERT INTO folders
-                     (path, parent_path, name, is_pack, item_count, hidden_count, split_groups)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                "INSERT INTO folders (path, parent_path, name, is_pack, item_count, hidden_count,
+                     split_groups, pack_json)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(path) DO UPDATE SET parent_path = excluded.parent_path,
                      name = excluded.name, is_pack = excluded.is_pack,
                      item_count = excluded.item_count, hidden_count = excluded.hidden_count,
-                     split_groups = excluded.split_groups",
+                     split_groups = excluded.split_groups, pack_json = excluded.pack_json",
             )
             .bind(path)
             .bind(&folder.parent_path)
@@ -643,6 +890,7 @@ async fn apply_folders(
             .bind(folder.item_count)
             .bind(folder.hidden_count)
             .bind(folder.split_groups)
+            .bind(pack_json)
             .execute(&mut *tx)
             .await?;
         }
@@ -950,17 +1198,59 @@ fn preview_stand_ins(files: &[FileRow], structure: &Structure) -> HashSet<usize>
     best.into_values().collect()
 }
 
-/// Runs the pass on the library DB at `pool`: reads every indexed path, derives the structure and
-/// applies it. Returns the rows written. The caller holds the library's `index_lock`.
-pub async fn rebuild(pool: &Pool<Sqlite>) -> sqlx::Result<usize> {
+/// Runs the pass on the library DB at `pool`, whose files lie below `root`: reads every indexed
+/// path, derives the structure and applies it. It reads a pack's license file only when its size
+/// or mtime changed since the last pass. Returns the rows written. The caller holds the library's
+/// `index_lock`.
+pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
     let started = Instant::now();
     let files: Vec<FileRow> = sqlx::query_as(
-        "SELECT id, file_path, extension, support_role, group_id, bundled_preview, preview_status
+        "SELECT id, file_path, extension, support_role, group_id, bundled_preview, preview_status,
+                size_bytes, modified_at
          FROM assets",
     )
     .fetch_all(pool)
     .await?;
-    let structure = derive(files.iter().map(|f| f.file_path.as_str()));
+    let known = read_licenses(pool).await?;
+    let by_path: HashMap<&str, &FileRow> =
+        files.iter().map(|f| (f.file_path.as_str(), f)).collect();
+    let paths = || files.iter().map(|f| f.file_path.as_str());
+    // Derive with the headers already read, noting each license that changed since. Only then
+    // read those, off the runtime, and derive again with what they say.
+    let mut changed = Vec::new();
+    let mut structure = derive(paths(), |path| {
+        known_header(by_path[path], &known).unwrap_or_else(|| {
+            changed.push(path.to_string());
+            None
+        })
+    });
+    let mut unread = HashSet::new();
+    if !changed.is_empty() {
+        let read = read_headers(root, changed).await;
+        structure = derive(paths(), |path| match read.get(path) {
+            None => known_header(by_path[path], &known).flatten(),
+            Some(Ok(header)) => header.clone(),
+            // An unreadable license keeps the name it gave last time, and records no read, so
+            // the next pass tries it again.
+            Some(Err(e)) => {
+                tracing::debug!(target: "structure", "Could not read {path}: {e}");
+                unread.insert(path.to_string());
+                known.get(path).and_then(|l| l.header_name.clone())
+            }
+        });
+    }
+    // A read license records the size and mtime it was read at; an unread one records none.
+    for license in structure
+        .folders
+        .values_mut()
+        .filter_map(|f| f.pack.as_mut()?.license.as_mut())
+        .filter(|l| !unread.contains(&l.path))
+    {
+        let file = by_path[license.path.as_str()];
+        (license.size_bytes, license.modified_at) = (file.size_bytes, file.modified_at);
+    }
+    let structure = structure;
+
     let mut written = apply_folders(pool, &structure.folders).await?
         + apply_roles(pool, &files, &structure.roles).await?;
     // A union follows from the `group_id` writes counted next, so it isn't counted itself.
@@ -998,7 +1288,7 @@ pub async fn rebuild(pool: &Pool<Sqlite>) -> sqlx::Result<usize> {
 pub async fn rebuild_library(db: &Database, library: &LibraryHandle) {
     let lock = db.index_lock(&library.id);
     let _guard = lock.lock().await;
-    if let Err(e) = rebuild(&library.pool).await {
+    if let Err(e) = rebuild(&library.pool, &library.root_path).await {
         tracing::error!(target: "structure", "Structure pass failed for library {}: {e}", library.id);
     }
 }
@@ -1008,6 +1298,16 @@ pub(crate) mod tests {
     use super::*;
     use crate::db::memory_library_pool;
 
+    /// A library root that doesn't exist, for passes that read no license file.
+    pub(crate) fn unmounted() -> &'static Path {
+        Path::new("/opendam-test-library-not-mounted")
+    }
+
+    /// The structure of `paths` when no license file has a header.
+    fn derive<'a>(paths: impl IntoIterator<Item = &'a str>) -> Structure {
+        super::derive(paths, |_| None)
+    }
+
     fn folder(parent_path: Option<&str>, name: &str, item_count: i64, hidden_count: i64) -> Folder {
         Folder {
             parent_path: parent_path.map(str::to_string),
@@ -1016,6 +1316,7 @@ pub(crate) mod tests {
             item_count,
             hidden_count,
             split_groups: 0,
+            pack: None,
         }
     }
 
@@ -1026,11 +1327,27 @@ pub(crate) mod tests {
         }
     }
 
-    fn pack(folder: Folder) -> Folder {
+    /// `folder` as a pack named after its folder, with `cover` and `license`.
+    fn pack(folder: Folder, cover: Option<&str>, license: Option<&str>) -> Folder {
         Folder {
             is_pack: true,
+            pack: Some(PackInfo {
+                name: folder.name.clone(),
+                cover: cover.map(str::to_string),
+                license: license.map(|path| LicenseFile {
+                    path: path.to_string(),
+                    header_name: None,
+                    size_bytes: 0,
+                    modified_at: 0,
+                }),
+            }),
             ..folder
         }
+    }
+
+    /// The pack info of `path` in `structure`.
+    fn info<'s>(structure: &'s Structure, path: &str) -> &'s PackInfo {
+        structure.folders[path].pack.as_ref().expect("a pack")
     }
 
     /// The packs of `structure`, by path.
@@ -1085,7 +1402,11 @@ pub(crate) mod tests {
                 ("3D assets", folder(Some(""), "3D assets", 3, 1)),
                 (
                     "3D assets/Platformer Kit",
-                    pack(folder(Some("3D assets"), "Platformer Kit", 1, 1)),
+                    pack(
+                        folder(Some("3D assets"), "Platformer Kit", 1, 1),
+                        Some("3D assets/Platformer Kit/Models/GLB format/block.glb"),
+                        Some("3D assets/Platformer Kit/License.txt"),
+                    ),
                 ),
                 (
                     "3D assets/Platformer Kit 2",
@@ -1855,6 +2176,131 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_packs_cover_is_its_first_preview_then_sample_then_image_then_visible_file() {
+        let cover = |paths: &[&str]| info(&derive(paths.iter().copied()), "kit").cover.clone();
+        let base = [
+            "kit/License.txt",
+            "kit/Models/rock.glb",
+            "kit/Models/barrel.glb",
+        ];
+        let with = |extra: &[&'static str]| [&base[..], extra].concat();
+        // With no image, the first visible file: a model, whose thumbnail shows.
+        assert_eq!(cover(&base).as_deref(), Some("kit/Models/barrel.glb"));
+        assert_eq!(cover(&["kit/License.txt"]), None);
+        assert_eq!(
+            cover(&with(&["kit/Tiles/b.png", "kit/Tiles/a.png"])).as_deref(),
+            Some("kit/Tiles/a.png")
+        );
+        assert_eq!(
+            cover(&with(&[
+                "kit/Tiles/a.png",
+                "kit/SampleB.png",
+                "kit/SampleA.png"
+            ]))
+            .as_deref(),
+            Some("kit/SampleA.png")
+        );
+        assert_eq!(
+            cover(&with(&[
+                "kit/Sample.png",
+                "kit/Preview2.png",
+                "kit/Preview.png"
+            ]))
+            .as_deref(),
+            Some("kit/Preview.png")
+        );
+        // A preview that is no cover image (in `Previews/`, or a doc) doesn't count as one.
+        assert_eq!(
+            cover(&with(&[
+                "kit/Previews/rock.png",
+                "kit/Preview.pdf",
+                "kit/Sample.png"
+            ]))
+            .as_deref(),
+            Some("kit/Sample.png")
+        );
+        // A marked folder inside the pack holds cover images too.
+        assert_eq!(
+            cover(&with(&["kit/Sources/Preview.png", "kit/Tiles/a.png"])).as_deref(),
+            Some("kit/Sources/Preview.png")
+        );
+        // A preview wins over a sample that sorts before it.
+        assert_eq!(
+            cover(&with(&["kit/Sample.png", "kit/Sources/Preview.png"])).as_deref(),
+            Some("kit/Sources/Preview.png")
+        );
+    }
+
+    #[test]
+    fn each_pack_takes_the_cover_and_license_from_its_own_files() {
+        let structure = derive(KENNEY_3D_KIT);
+        let car = info(&structure, "3D assets/Car Kit");
+        assert_eq!(car.cover.as_deref(), Some("3D assets/Car Kit/Preview.png"));
+        assert_eq!(
+            car.license.as_ref().map(|l| l.path.as_str()),
+            Some("3D assets/Car Kit/License.txt")
+        );
+        // A pack whose only file is its license has no cover.
+        let holiday = info(&structure, "3D assets/Holiday Kit");
+        assert_eq!(
+            (holiday.name.as_str(), &holiday.cover),
+            ("Holiday Kit", &None)
+        );
+        assert!(structure.folders["3D assets"].pack.is_none());
+        // Only a license directly in the pack names it.
+        let inner = derive(["kit/Preview.png", "kit/Sprites/License.txt"]);
+        assert_eq!(info(&inner, "kit").license, None);
+    }
+
+    #[test]
+    fn a_packs_name_is_its_license_header_name_else_its_folder_name() {
+        let structure = super::derive(KENNEY_3D_KIT, |path| {
+            (path == "3D assets/Car Kit/License.txt").then(|| "Car Kit Deluxe".to_string())
+        });
+        assert_eq!(info(&structure, "3D assets/Car Kit").name, "Car Kit Deluxe");
+        assert_eq!(
+            info(&structure, "3D assets/Holiday Kit").name,
+            "Holiday Kit"
+        );
+        // The folder keeps its own name in the tree.
+        assert_eq!(structure.folders["3D assets/Car Kit"].name, "Car Kit");
+    }
+
+    #[test]
+    fn the_kenney_header_names_the_pack_without_its_version() {
+        let header = |text: &str| kenney_header_name(text);
+        let kenney = "\u{feff}\r\n\tCar Kit (3.1)\r\n\r\n\tCreated/distributed by Kenney (www.kenney.nl)\r\n\tCreation date: 02-04-2026\r\n";
+        assert_eq!(header(kenney).as_deref(), Some("Car Kit"));
+        for (title, name) in [
+            ("Input Prompts (1.5A)", "Input Prompts"),
+            ("Space Kit (1.2) Exclusive", "Space Kit Exclusive"),
+            ("Sketch Desert 1.0", "Sketch Desert 1.0"),
+            ("Generic Items #1", "Generic Items #1"),
+            ("Platformer Pack (Redux)", "Platformer Pack (Redux)"),
+        ] {
+            let text = format!("{title}\n\nCreated/distributed by Kenney (www.kenney.nl)\n");
+            assert_eq!(header(&text).as_deref(), Some(name), "{title}");
+        }
+        // The older byline
+        assert_eq!(
+            header("Roguelike Indoor pack\nby Kenney Vleugels (Kenney.nl)\n---").as_deref(),
+            Some("Roguelike Indoor pack")
+        );
+        // Another license's first line names no pack.
+        for text in [
+            "MIT License\n\nCopyright (c) 2024 KayKit\n",
+            "Creative Commons Zero v1.0 Universal\n\nCC0 1.0 Universal\n",
+            "Car Kit (3.1)",
+            "",
+            // A byline that doesn't name Kenney
+            "License Agreement\n\nBy downloading this pack you agree to these terms.\n",
+            "Space Pack\n\nCreated/distributed by Someone Else\n",
+        ] {
+            assert_eq!(header(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
     fn ui_pack_sprites_stack_across_their_scale_and_vector_copies_but_not_their_colors() {
         let paths = [
             UI_PACK.to_vec(),
@@ -2043,15 +2489,33 @@ pub(crate) mod tests {
         pub bundled_previews: Vec<(String, String)>,
     }
 
-    /// What the pass has written to `pool`, for comparing a library with a fresh pass.
+    /// What the pass has written to `pool`, for comparing a library with a fresh pass. A license's
+    /// size and mtime are left out: they record when the pass last read the file, which depends
+    /// on the files on disk, not on the derived structure.
     pub(crate) async fn derived_rows(pool: &Pool<Sqlite>) -> DerivedRows {
-        let folders = sqlx::query_as(
-            "SELECT path, parent_path, name, is_pack, item_count, hidden_count, split_groups
+        let rows: Vec<FolderRow> = sqlx::query_as(
+            "SELECT path, parent_path, name, is_pack, item_count, hidden_count, split_groups,
+                    pack_json
              FROM folders ORDER BY path",
         )
         .fetch_all(pool)
         .await
         .unwrap();
+        let folders = rows
+            .into_iter()
+            .map(
+                |(path, parent, name, is_pack, items, hidden, split, pack_json)| {
+                    let pack_json = pack_json.map(|json| {
+                        let mut pack = parse_pack(Some(&json)).expect("pack_json holds pack info");
+                        if let Some(license) = pack.license.as_mut() {
+                            (license.size_bytes, license.modified_at) = (0, 0);
+                        }
+                        serde_json::to_string(&pack).unwrap()
+                    });
+                    (path, parent, name, is_pack, items, hidden, split, pack_json)
+                },
+            )
+            .collect();
         let roles = sqlx::query_as("SELECT file_path, support_role FROM assets ORDER BY file_path")
             .fetch_all(pool)
             .await
@@ -2084,7 +2548,7 @@ pub(crate) mod tests {
         for path in paths {
             insert_path(&pool, path).await;
         }
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         derived_rows(&pool).await
     }
 
@@ -2118,8 +2582,8 @@ pub(crate) mod tests {
             insert_path(&pool, path).await;
         }
         // 10 folders, the one support file and the two files of a group
-        assert_eq!(rebuild(&pool).await.unwrap(), 13);
-        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 13);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
         assert_eq!(derived_rows(&pool).await, fresh_pass(&KENNEY).await);
     }
 
@@ -2129,14 +2593,14 @@ pub(crate) mod tests {
         for path in KENNEY {
             insert_path(&pool, path).await;
         }
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         sqlx::query("DELETE FROM assets WHERE file_path = '2D assets/UI Pack/PNG/button.png'")
             .execute(&pool)
             .await
             .unwrap();
 
         // The root's count changes, and the three folders it emptied go.
-        assert_eq!(rebuild(&pool).await.unwrap(), 4);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 4);
         let rest: Vec<&str> = KENNEY
             .into_iter()
             .filter(|p| !p.starts_with("2D assets/"))
@@ -2151,7 +2615,7 @@ pub(crate) mod tests {
         for path in paths {
             insert_path(&pool, path).await;
         }
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         assert_eq!(
             derived_rows(&pool).await.roles,
             [
@@ -2166,7 +2630,7 @@ pub(crate) mod tests {
             .unwrap();
 
         // `kit` and the root change, and the Readme loses its role.
-        assert_eq!(rebuild(&pool).await.unwrap(), 3);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 3);
         assert_eq!(
             derived_rows(&pool).await,
             fresh_pass(&["kit/Readme.txt", "kit/rock.glb"]).await
@@ -2228,7 +2692,7 @@ pub(crate) mod tests {
 
         // 6 folders, 4 group ids, and the FBX and the OBJ, which go back to `none`. The FBX
         // loses its waiting jobs, while the OBJ's running job and the DAE's thumbnail stay.
-        assert_eq!(rebuild(&pool).await.unwrap(), 12);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 12);
         assert_eq!(
             previews(&pool).await,
             (
@@ -2241,7 +2705,7 @@ pub(crate) mod tests {
                 pairs(&[(glb, "pending"), (obj, "processing")]),
             )
         );
-        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
 
         // Without the GLB, the FBX leads the group and gets a job of its own.
         sqlx::query("DELETE FROM assets WHERE id = ?")
@@ -2254,7 +2718,7 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         assert_eq!(
             previews(&pool).await,
             (
@@ -2262,7 +2726,7 @@ pub(crate) mod tests {
                 pairs(&[(fbx, "pending"), (obj, "processing")]),
             )
         );
-        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -2280,7 +2744,7 @@ pub(crate) mod tests {
             insert_with_preview(&pool, path, "pending").await;
             add_job(&pool, path, "pending").await;
         }
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         // The OBJ ranks before the DAE, so it stands in, and the DAE comes off the queue
         assert_eq!(
             previews(&pool).await,
@@ -2293,7 +2757,7 @@ pub(crate) mod tests {
                 pairs(&[(paths[1], "pending")]),
             )
         );
-        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -2302,7 +2766,7 @@ pub(crate) mod tests {
         let (blend, obj) = ("kit/Blend/rock.blend", "kit/OBJ/rock.obj");
         insert_with_preview(&pool, blend, "none").await;
         insert_with_preview(&pool, obj, "none").await;
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         assert_eq!(previews(&pool).await.1, pairs(&[(obj, "pending")]));
     }
 
@@ -2317,7 +2781,7 @@ pub(crate) mod tests {
         for path in [blend, obj, render] {
             insert_with_preview(&pool, path, "none").await;
         }
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         // The `.blend` leads and shows the render, so the OBJ stands in for nothing.
         assert_eq!(
             derived_rows(&pool).await.bundled_previews,
@@ -2330,7 +2794,7 @@ pub(crate) mod tests {
                 pairs(&[(render, "pending")]),
             )
         );
-        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
 
         // Without the render, the OBJ is queued as the group's stand-in.
         sqlx::query("DELETE FROM assets WHERE id = ?")
@@ -2343,7 +2807,7 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         assert_eq!(previews(&pool).await.1, pairs(&[(obj, "pending")]));
     }
 
@@ -2353,7 +2817,7 @@ pub(crate) mod tests {
         for path in ["kit/rock.blend", "kit/notes.md", "kit/a/tree.glb"] {
             insert_with_preview(&pool, path, "none").await;
         }
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         // Only the GLB takes a preview.
         assert_eq!(
             previews(&pool).await.1,
@@ -2384,7 +2848,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         add_job(&pool, glb, "pending").await;
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         // The sedan shows its render, so neither of its files is queued, and the render is, for
         // its card. The truck has no render, so its GLB is queued and its FBX isn't.
         assert_eq!(
@@ -2400,7 +2864,7 @@ pub(crate) mod tests {
                 pairs(&[(truck_glb, "pending"), (render, "pending")]),
             )
         );
-        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
 
         // Without its GLB, the truck's FBX leads with no picture and gets a job. Without its
         // render, the sedan's GLB does.
@@ -2416,7 +2880,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
         }
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         assert_eq!(
             previews(&pool).await,
             (
@@ -2439,7 +2903,7 @@ pub(crate) mod tests {
             insert_with_preview(&pool, path, "pending").await;
             add_job(&pool, path, "pending").await;
         }
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         let rows = derived_rows(&pool).await;
         let main = Some(default.to_string());
         assert_eq!(
@@ -2454,7 +2918,7 @@ pub(crate) mod tests {
                 pairs(&[(default, "pending")]),
             )
         );
-        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -2464,7 +2928,7 @@ pub(crate) mod tests {
         for path in [glb, render] {
             insert_with_preview(&pool, path, "none").await;
         }
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         assert_eq!(derived_rows(&pool).await.bundled_previews, []);
         // The DDS takes no preview, so only the model is queued.
         assert_eq!(previews(&pool).await.1, pairs(&[(glb, "pending")]));
@@ -2482,36 +2946,112 @@ pub(crate) mod tests {
             insert_path(&pool, path).await;
         }
         // 6 folders, the render's role, 2 group ids and the GLB's bundled preview
-        assert_eq!(rebuild(&pool).await.unwrap(), 10);
-        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 10);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
         assert_eq!(
             derived_rows(&pool).await.bundled_previews,
             [(paths[0].to_string(), paths[2].to_string())]
         );
     }
 
+    /// The pack info `pool` holds for folder `path`.
+    async fn stored_pack(pool: &Pool<Sqlite>, path: &str) -> PackInfo {
+        let (json,): (Option<String>,) =
+            sqlx::query_as("SELECT pack_json FROM folders WHERE path = ?")
+                .bind(path)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        parse_pack(json.as_deref()).expect("pack_json holds pack info")
+    }
+
     #[tokio::test]
-    async fn a_count_change_keeps_the_pack_info() {
+    async fn the_pass_names_a_pack_from_its_license_and_rereads_it_only_once_it_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let license = root.path().join("kit/License.txt");
+        std::fs::create_dir_all(license.parent().unwrap()).unwrap();
+        std::fs::write(
+            &license,
+            "\tCar Kit (3.1)\r\n\r\n\tCreated/distributed by Kenney\r\n",
+        )
+        .unwrap();
+        let pool = memory_library_pool().await;
+        for path in ["kit/License.txt", "kit/Preview.png", "kit/Models/sedan.glb"] {
+            insert_path(&pool, path).await;
+        }
+
+        // Unreadable, the license names nothing and records no read.
+        rebuild(&pool, unmounted()).await.unwrap();
+        let unread = stored_pack(&pool, "kit").await;
+        assert_eq!(unread.name, "kit");
+        assert_eq!(unread.cover.as_deref(), Some("kit/Preview.png"));
+        assert_eq!(unread.license.as_ref().map(|l| l.size_bytes), Some(0));
+
+        rebuild(&pool, root.path()).await.unwrap();
+        let read = stored_pack(&pool, "kit").await;
+        assert_eq!(read.name, "Car Kit");
+        let file = read.license.unwrap();
+        assert_eq!(
+            (file.header_name.as_deref(), file.size_bytes),
+            (Some("Car Kit"), 1)
+        );
+
+        // An unchanged row means an unchanged file: the pass doesn't read it again.
+        std::fs::write(
+            &license,
+            "Space Kit (1.2)\nby Kenney Vleugels (Kenney.nl)\n",
+        )
+        .unwrap();
+        assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 0);
+        assert_eq!(stored_pack(&pool, "kit").await.name, "Car Kit");
+        sqlx::query("UPDATE assets SET modified_at = 5 WHERE file_path = 'kit/License.txt'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 1);
+        assert_eq!(stored_pack(&pool, "kit").await.name, "Space Kit");
+        assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 0);
+
+        // Changed again but unreadable, as on a share that dropped: the pack keeps its name, and
+        // records no read, so the next pass reads the file once it can.
+        sqlx::query("UPDATE assets SET modified_at = 6 WHERE file_path = 'kit/License.txt'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
+        let dropped = stored_pack(&pool, "kit").await;
+        assert_eq!(dropped.name, "Space Kit");
+        let file = dropped.license.unwrap();
+        assert_eq!(
+            (
+                file.header_name.as_deref(),
+                file.size_bytes,
+                file.modified_at
+            ),
+            (Some("Space Kit"), 0, 0)
+        );
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+        std::fs::write(&license, "Car Kit (3.2)\nby Kenney Vleugels (Kenney.nl)\n").unwrap();
+        assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 1);
+        let back = stored_pack(&pool, "kit").await;
+        assert_eq!(back.name, "Car Kit");
+        assert_eq!(back.license.map(|l| l.modified_at), Some(6));
+    }
+
+    #[tokio::test]
+    async fn a_count_change_keeps_the_pack_info_and_writes_only_the_counts() {
         let pool = memory_library_pool().await;
         for path in KENNEY {
             insert_path(&pool, path).await;
         }
-        rebuild(&pool).await.unwrap();
-        sqlx::query("UPDATE folders SET pack_json = '{}' WHERE path = '3D assets/Platformer Kit'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        insert_path(&pool, "3D assets/Platformer Kit/Preview.png").await;
-        rebuild(&pool).await.unwrap();
-
-        let row: (Option<String>, i64, i64) = sqlx::query_as(
-            "SELECT pack_json, item_count, hidden_count FROM folders
-             WHERE path = '3D assets/Platformer Kit'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(row, (Some("{}".to_string()), 1, 2));
+        rebuild(&pool, unmounted()).await.unwrap();
+        insert_path(&pool, "3D assets/Platformer Kit/Models/crate.glb").await;
+        // The kit, `Models`, `3D assets` and the root
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 4);
+        assert_eq!(
+            stored_pack(&pool, "3D assets/Platformer Kit").await,
+            info(&derive(KENNEY), "3D assets/Platformer Kit").clone()
+        );
     }
 
     #[tokio::test]
@@ -2557,7 +3097,7 @@ pub(crate) mod tests {
             insert_path(&pool, path).await;
         }
         // The root, `kits`, 450 kits and 450 licenses
-        assert_eq!(rebuild(&pool).await.unwrap(), 902);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 902);
         sqlx::query("DELETE FROM assets WHERE file_path LIKE 'kits/kit 1%'")
             .execute(&pool)
             .await
@@ -2568,7 +3108,7 @@ pub(crate) mod tests {
             .filter(|p| !p.starts_with("kits/kit 1"))
             .collect();
         // 111 kits go (1, 10-19, 100-199), and the root and `kits` change their count.
-        assert_eq!(rebuild(&pool).await.unwrap(), 113);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 113);
         assert_eq!(derived_rows(&pool).await, fresh_pass(&rest).await);
     }
 
@@ -2587,7 +3127,7 @@ pub(crate) mod tests {
         for path in KENNEY_3D_KIT {
             insert_path(&pool, path).await;
         }
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         pool
     }
 
@@ -2640,7 +3180,7 @@ pub(crate) mod tests {
         for path in [SEDAN[0], SEDAN_RENDER] {
             insert_path(&pool, path).await;
         }
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         // The FBX on its own is tagged, collected, rated and described, and so is the render.
         for sql in [
             "INSERT INTO asset_tags (asset_id, tag_id) VALUES
@@ -2665,7 +3205,7 @@ pub(crate) mod tests {
         )
         .await;
 
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
 
         let mut tags = [each(&SEDAN, "car"), each(&SEDAN, "low-poly")].concat();
         tags.push((SEDAN_RENDER.into(), "render".into()));
@@ -2696,7 +3236,7 @@ pub(crate) mod tests {
         for path in [SEDAN[0], SEDAN[1]] {
             insert_path(&pool, path).await;
         }
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         run(
             &pool,
             "INSERT INTO asset_tags (asset_id, tag_id) VALUES
@@ -2717,7 +3257,7 @@ pub(crate) mod tests {
         )
         .await;
 
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
 
         assert_eq!(
             rows(&pool, "SELECT asset_id, tag_id FROM asset_tags").await,
@@ -2743,7 +3283,7 @@ pub(crate) mod tests {
         )
         .await;
 
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
 
         // The FBX is on its own now, with the tag and the rating it had.
         assert_eq!(
@@ -2774,7 +3314,7 @@ pub(crate) mod tests {
         )
         .await;
 
-        rebuild(&pool).await.unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
         assert_eq!(
             rows(&pool, "SELECT asset_id, tag_id FROM asset_tags").await,
             each(&SEDAN, "car")
@@ -2782,7 +3322,7 @@ pub(crate) mod tests {
 
         // Once recorded, a pass with no change to the group leaves the tags alone.
         run(&pool, "DELETE FROM asset_tags WHERE asset_id LIKE '%.obj'").await;
-        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
         assert_eq!(
             rows(&pool, "SELECT asset_id, tag_id FROM asset_tags").await,
             each(&SEDAN[..2], "car")

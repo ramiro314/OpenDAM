@@ -187,9 +187,16 @@ The UI checks, each defined in its plan:
   neither `License.txt` nor `Preview.png`, while the status bar reads `<items> items (<files>
   files)` with the kit's hidden files counted as files only. A search for "license" in the kit
   then reads `0 items (1 file)`, and "Show hidden files" brings `License.txt` back and makes the
-  kit's badge count its hidden files.
+  kit's badge count its hidden files. Then the library root's Packs view holds 254 cards in name
+  order, each with a cover, the visible ones loaded, 24 labelled "No visible items" and none for
+  the 11 zip-only folders in `Archive/`. Search text, a kind filter and "Show hidden files" each
+  show assets until cleared, as does the toggle's Assets, and switching back to Packs clears an
+  asset selected there. A click selects the Car Kit card, a
+  double-click selects its pack in the tree, whose node shows the pack's cover, and shows its
+  assets, and Enter on a card does the same.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 2. Screenshots:
-  `U10-license-hidden`, `U10-license-shown`.
+  `U10-license-hidden`, `U10-license-shown`, `U10-packs-view`, `U10-no-visible-items`,
+  `U10-pack-opened`.
 - **U11** (format groups): in `3D assets/Car Kit`, the `GLB format/`, `FBX format/` and `OBJ
   format/` nodes each count as many items as `Models/`, and selecting `Models/` lists each model
   once, as its GLB, with a solid `GLB +2` badge whose tooltip reads `3 files: GLB, FBX, OBJ`, on

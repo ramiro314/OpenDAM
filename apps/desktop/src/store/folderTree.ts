@@ -12,6 +12,8 @@ interface FolderTreeStore {
   expanded: Record<string, string[]>;
   /** Expands a node, loading its children the first time, or collapses it */
   toggle: (libraryId: string, path: string) => Promise<void>;
+  /** Expands the library row and every folder above `path`, so its node shows; not `path` itself */
+  reveal: (libraryId: string, path: string) => Promise<void>;
   /**
    * Reloads every expanded node's children, for `library:updated`. Collapsed nodes' children are
    * dropped, so they load fresh when expanded, and expanded nodes whose folder is gone collapse.
@@ -84,6 +86,14 @@ export const useFolderTreeStore = create<FolderTreeStore>()((set, get) => ({
     set((s) => ({
       children: { ...s.children, [libraryId]: { ...s.children[libraryId], [path]: nodes } },
     }));
+  },
+
+  reveal: async (libraryId, path) => {
+    const above = [''];
+    for (let p = parentOf(path); p !== ''; p = parentOf(p)) above.splice(1, 0, p);
+    for (const p of path === '' ? [] : above) {
+      if (!get().expanded[libraryId]?.includes(p)) await get().toggle(libraryId, p);
+    }
   },
 
   refetch: async () => {

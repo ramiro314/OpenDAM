@@ -7,6 +7,7 @@ import type {
   FacetCounts,
   FolderCounts,
   FolderNode,
+  PackCard,
   Tag,
   TagPatch,
   AddLibraryPayload,
@@ -59,6 +60,9 @@ export const api = {
   // Folder tree: the children of one node, `''` being the library root
   getFolders: (libraryId: string, parentPath: string) =>
     invoke<FolderNode[]>('get_folders', { libraryId, parentPath }),
+  /** The packs below `underPath` in each of `libraryIds`, or in every library when null */
+  getPacks: (libraryIds: string[] | null, underPath: string) =>
+    invoke<PackCard[]>('get_packs', { libraryIds, underPath }),
 
   // Live counts while search text or a filter is active, each the grid's total for its value
   getFacetCounts: (query: SearchQuery) => invoke<FacetCounts>('get_facet_counts', { query }),

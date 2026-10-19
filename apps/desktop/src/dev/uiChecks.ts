@@ -13,9 +13,10 @@ import {
   useFolderTreeStore,
   useLibraryStore,
   useLiveCountsStore,
+  usePacksStore,
   useUIStore,
 } from '../store';
-import type { FolderNode, SearchQuery, SortField, SortOrder } from '../types';
+import type { FolderNode, PackCard, SearchQuery, SortField, SortOrder } from '../types';
 import { isFolderShown } from '../components/Sidebar/sidebarHelpers';
 import { formatItemsAndFiles, formatSize } from '../utils/format';
 import { assetAt } from '../store/pageCache';
@@ -1138,7 +1139,9 @@ export const UI_CHECKS: UiCheck[] = [
     id: 'U10',
     title:
       'Packs show a pack icon in the tree, their licenses and previews leave the grid, ' +
-      '"Show hidden files" brings them back, and the status bar counts items and files',
+      '"Show hidden files" brings them back, and the status bar counts items and files. The ' +
+      "library root's Packs view shows every pack with its cover, a search or filter shows " +
+      'assets until cleared, and a double-click or Enter selects a pack in the tree',
     run: async ({ assert, waitFor, pause, sleep }) => {
       await expandBenchLibrary({ assert, sleep });
       const kitPath = '3D assets/Car Kit';
@@ -1251,6 +1254,8 @@ export const UI_CHECKS: UiCheck[] = [
       );
       await waitFor(() => !useAssetStore.getState().loading, 30_000, 'the search');
       useAssetStore.getState().setQuery({ folder: undefined });
+
+      await checkPacksView({ assert, waitFor, pause });
     },
   },
   {
@@ -1900,6 +1905,186 @@ export const UI_CHECKS: UiCheck[] = [
     },
   },
 ];
+
+/** The 11 folders in `Archive/` that hold only a `.zip`, so no indexed file: never a card. */
+const ZIP_ONLY = [
+  'Isometric Overworld Pack',
+  'Isometric Renders',
+  'Isometric Road Assets',
+  'Medieval Town',
+  'Minigolf Pack',
+  'Nature Pack',
+  'Platformer Assets Pixel',
+  'Road Pack',
+  'Roguelike Pack (15×)',
+  'Space Shooter Assets',
+  'Tower Defense Assets',
+].map((name) => `Archive/${name}`);
+
+const packScroll = () => document.getElementById('pack-scroll');
+const assetScroll = () => document.getElementById('asset-scroll');
+
+/** The Packs view's card of `pack`, if it is rendered. */
+function packCard(pack: Pick<PackCard, 'libraryId' | 'path'>): HTMLElement | null {
+  return document.querySelector<HTMLElement>(
+    `[data-pack-card][data-pack-library="${CSS.escape(pack.libraryId)}"]` +
+      `[data-pack-path="${CSS.escape(pack.path)}"]`
+  );
+}
+
+/** Scrolls the Packs view to card `index`, `pack`, and returns the card once it renders. */
+async function scrollToCard(index: number, pack: PackCard, waitFor: UiCheckContext['waitFor']) {
+  const el = packScroll()!;
+  el.scrollTop = rowTop(rowOfIndex(index, Number(el.dataset.columns)), Number(el.dataset.rowPitch));
+  await waitFor(() => packCard(pack) !== null, 5_000, `the card of ${pack.path}`);
+  return packCard(pack)!;
+}
+
+/** Waits until the main area shows `view`, the Packs view or the assets' grid. */
+async function mainShows(
+  view: 'packs' | 'assets',
+  after: string,
+  waitFor: UiCheckContext['waitFor']
+) {
+  await waitFor(
+    () =>
+      view === 'packs'
+        ? packScroll() !== null && assetScroll() === null
+        : assetScroll() !== null && packScroll() === null,
+    10_000,
+    `${view} after ${after}`
+  );
+}
+
+/** Selects the bench library's row, whose root has packs below it, and waits for its packs. */
+async function benchLibraryRoot(waitFor: UiCheckContext['waitFor']) {
+  useUIStore.getState().setActiveLibrary(BENCH_LIBRARY);
+  await searchWith(
+    { libraryIds: [BENCH_LIBRARY], libraryId: BENCH_LIBRARY, folder: undefined, text: '' },
+    waitFor
+  );
+  await mainShows('packs', 'selecting the library', waitFor);
+}
+
+/** U10's Packs view (plan C17, D19, D20, D23) on the bench library's root. */
+async function checkPacksView({
+  assert,
+  waitFor,
+  pause,
+}: Pick<UiCheckContext, 'assert' | 'waitFor' | 'pause'>) {
+  usePacksStore.getState().setMode('packs');
+  await benchLibraryRoot(waitFor);
+  const cards = usePacksStore.getState().packs ?? [];
+  assert(cards.length === 254, `the Packs view holds ${cards.length} packs, not 254`);
+  const footer = document.getElementById('pack-count')?.textContent;
+  assert(footer === '254 packs', `the footer reads "${footer}"`);
+  assert(
+    document.getElementById('browse-packs')?.getAttribute('aria-pressed') === 'true',
+    'the toggle is not on Packs'
+  );
+  const coverless = cards.filter((c) => !c.cover).map((c) => c.path);
+  assert(coverless.length === 0, `${coverless.join(', ')} have no cover`);
+  const hiddenOnly = cards.filter((c) => c.itemCount === 0);
+  assert(hiddenOnly.length === 24, `${hiddenOnly.length} packs have no visible item, not 24`);
+  const zipOnly = cards.filter((c) => ZIP_ONLY.includes(c.path)).map((c) => c.path);
+  assert(zipOnly.length === 0, `zip-only folders show: ${zipOnly.join(', ')}`);
+  const names = cards.map((c) => c.name.toLowerCase());
+  assert(
+    names.every((n, i) => i === 0 || names[i - 1] <= n),
+    'the cards are not in name order'
+  );
+
+  // The visible cards show their covers, and a pack with no visible item says so
+  const shownCards = () => [...packScroll()!.querySelectorAll<HTMLElement>('[data-pack-card]')];
+  await waitFor(
+    () => shownCards().length > 0 && shownCards().every((c) => c.dataset.tileState === 'ready'),
+    30_000,
+    'the visible cards to load their covers'
+  );
+  const blank = shownCards().filter((c) => !c.querySelector('img')?.naturalWidth);
+  assert(blank.length === 0, `${blank[0]?.dataset.packPath} shows no cover image`);
+  await pause('U10-packs-view');
+  const hiddenCard = await scrollToCard(cards.indexOf(hiddenOnly[0]), hiddenOnly[0], waitFor);
+  const label = hiddenCard.querySelector('[data-no-visible-items]')?.textContent;
+  assert(label === 'No visible items', `${hiddenOnly[0].path} is labelled "${label}"`);
+  await pause('U10-no-visible-items');
+
+  // Search text, a filter and "Show hidden files" each show assets, and clearing returns to packs
+  const filters: [string, Partial<SearchQuery>, Partial<SearchQuery>][] = [
+    ['search text', { text: 'car' }, { text: '' }],
+    ['a kind filter', { filter: { kinds: ['texture'] } }, { filter: {} }],
+    ['"Show hidden files"', { filter: { showHidden: true } }, { filter: {} }],
+  ];
+  for (const [what, set, clear] of filters) {
+    await searchWith(set, waitFor);
+    await mainShows('assets', what, waitFor);
+    await searchWith(clear, waitFor);
+    await mainShows('packs', `clearing ${what}`, waitFor);
+  }
+  document.getElementById('browse-assets')!.click();
+  await mainShows('assets', 'the Assets toggle', waitFor);
+  // An asset selected there doesn't stay selected, out of sight, for Delete or Ctrl+C
+  const first = assetAt(useAssetStore.getState(), 0);
+  assert(first, 'no asset at index 0 to select');
+  useUIStore.getState().selectAsset(first!.id);
+  document.getElementById('browse-packs')!.click();
+  await mainShows('packs', 'the Packs toggle', waitFor);
+  await waitFor(
+    () => useUIStore.getState().selectedAssetIds.size === 0,
+    5_000,
+    'the Packs view to clear the asset selection'
+  );
+  assert(!useUIStore.getState().focusedAssetId, 'an asset stays focused in the Packs view');
+
+  // A click selects a card. A double-click, or Enter, selects its pack in the tree, which
+  // shows the pack's assets.
+  const opened = async (pack: PackCard, how: string) => {
+    await waitFor(
+      () => {
+        const { query, loading } = useAssetStore.getState();
+        return (
+          query.folder?.libraryId === pack.libraryId &&
+          query.folder.path === pack.path &&
+          !loading &&
+          folderRow(pack.path)?.getAttribute('aria-selected') === 'true'
+        );
+      },
+      30_000,
+      `${how} to select ${pack.path} in the tree`
+    );
+    await mainShows('assets', `opening ${pack.path}`, waitFor);
+  };
+  const kit = cards.find((c) => c.path === '3D assets/Car Kit');
+  assert(kit, 'no card for 3D assets/Car Kit');
+  let card = await scrollToCard(cards.indexOf(kit!), kit!, waitFor);
+  card.click();
+  await waitFor(() => card.getAttribute('aria-pressed') === 'true', 5_000, 'the card selected');
+  assert(!useAssetStore.getState().query.folder, 'a click opened the pack');
+  card.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+  await opened(kit!, 'a double-click');
+  // The tree's pack node shows the pack's cover
+  await waitFor(
+    () => {
+      const img = folderRow(kit!.path)?.querySelector<HTMLImageElement>('img[data-pack-cover]');
+      return Boolean(img?.complete && img.naturalWidth > 0);
+    },
+    10_000,
+    `the cover of ${kit!.path} in the tree`
+  );
+  await pause('U10-pack-opened');
+
+  await benchLibraryRoot(waitFor);
+  // A pack with visible items, whose assets fill the grid (one with none shows the empty state)
+  const next = cards[cards.indexOf(kit!) + 1];
+  assert(next.itemCount > 0, `${next.path}, after the Car Kit, has no visible item`);
+  card = await scrollToCard(cards.indexOf(next), next, waitFor);
+  card.focus();
+  press(card, 'Enter');
+  await opened(next, 'Enter');
+
+  useUIStore.getState().clearLibrarySelection();
+  await searchWith({ libraryIds: undefined, libraryId: undefined, folder: undefined }, waitFor);
+}
 
 /**
  * The checks `only` names, as comma-separated ids (`U8` or `U3,U8`), in registry order, or every

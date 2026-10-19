@@ -1,0 +1,85 @@
+/* A pack card in the Packs view. Like the asset cards, it uses no backdrop-filter: under GPU
+   rendering each one is a compositing layer that WebKitGTK 2.54 re-renders without end once the
+   grid scrolls (gridStyles.test.ts). */
+.card {
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  cursor: pointer;
+  transition:
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+.card:hover {
+  border-color: hsl(220 10% 32%);
+  box-shadow: var(--shadow-md);
+}
+.card:focus:not(:focus-visible) {
+  outline: none;
+}
+.card.selected {
+  border-color: var(--color-brand-400);
+  box-shadow:
+    0 0 0 2px hsl(220 85% 50% / 0.25),
+    var(--shadow-md);
+}
+
+.cover {
+  position: relative;
+  aspect-ratio: 1;
+  background: var(--color-bg-elevated);
+  overflow: hidden;
+}
+.coverImg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.coverPlaceholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-brand-400);
+  opacity: 0.6;
+}
+
+/* A fixed height (CARD_BODY_HEIGHT in cardMetrics.ts), as the asset cards have */
+.body {
+  height: var(--card-body-height);
+  overflow: hidden;
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.name {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-primary);
+  line-height: 1.4;
+}
+.packIcon {
+  flex-shrink: 0;
+  color: var(--color-brand-400);
+}
+.subtitle {
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+.count {
+  font-size: 10px;
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+}
+.empty {
+  font-size: 10px;
+  color: var(--color-warning);
+}
