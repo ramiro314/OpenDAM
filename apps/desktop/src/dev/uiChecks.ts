@@ -1324,6 +1324,34 @@ export const UI_CHECKS: UiCheck[] = [
       assert(background.startsWith('rgb('), `the badge's background is ${background}, not solid`);
       await pause('U11-kit-models');
 
+      // A list row shows the same badge, solid and whole, in its extension column
+      useUIStore.getState().setViewMode('list');
+      const rowBadge = () =>
+        [...document.querySelectorAll<HTMLElement>('[data-tile] [data-group-badge]')].find(
+          (b) => b.dataset.groupBadge === 'GLB +2'
+        );
+      await waitFor(() => rowBadge() !== undefined, 10_000, "a list row's GLB +2 badge");
+      const listBadge = rowBadge()!;
+      assert(
+        listBadge.textContent === 'GLB +2',
+        `the row's badge reads "${listBadge.textContent}"`
+      );
+      assert(
+        listBadge.title === '3 files: GLB, FBX, OBJ',
+        `the row badge's tooltip reads "${listBadge.title}"`
+      );
+      const rowBackground = getComputedStyle(listBadge).backgroundColor;
+      assert(
+        rowBackground.startsWith('rgb('),
+        `the row badge's background is ${rowBackground}, not solid`
+      );
+      assert(
+        listBadge.scrollWidth <= listBadge.clientWidth,
+        `the row badge is clipped: ${listBadge.scrollWidth} px of text in ${listBadge.clientWidth} px`
+      );
+      await pause('U11-list-badge');
+      useUIStore.getState().setViewMode('grid');
+
       // `FBX format/` still lists the models, as their GLBs, and holds no GLB itself
       const fbxPath = `${modelsPath}/FBX format`;
       await selectFolder(fbxPath);
