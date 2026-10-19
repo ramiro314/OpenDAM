@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { api } from '../api';
-import type { PackCard } from '../types';
+import type { FolderRef, PackCard } from '../types';
 import { scopeKey, type BrowseMode, type PacksScope } from '../utils/packsView';
 
 interface PacksStore {
@@ -24,6 +24,12 @@ interface PacksStore {
 /** A card's key, unique across libraries. */
 export function packKey(pack: Pick<PackCard, 'libraryId' | 'path'>): string {
   return `${pack.libraryId}\u0000${pack.path}`;
+}
+
+/** The pack a `packKey` names. */
+export function packRef(key: string): FolderRef {
+  const [libraryId, path] = key.split('\u0000');
+  return { libraryId, path: path ?? '' };
 }
 
 // Bumped by every load: only the latest one's packs are applied.

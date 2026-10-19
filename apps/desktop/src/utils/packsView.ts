@@ -1,4 +1,4 @@
-import type { FilterSpec, SearchQuery } from '../types';
+import type { FilterSpec, FolderRef, SearchQuery } from '../types';
 import { isFilterEmpty } from '../components/Sidebar/sidebarHelpers';
 
 /** Which of the toolbar's Packs/Assets toggle is picked; it lasts the session. */
@@ -59,4 +59,25 @@ export function browseView(
   if (mode === 'assets' || isSearching(query)) return 'assets';
   if (hasPacks === null) return 'loading';
   return hasPacks ? 'packs' : 'assets';
+}
+
+/**
+ * The folder whose pack the detail panel shows when it shows no asset (plan C18): the selected
+ * card in the Packs view, else the selected tree node, a folder or one library's root. Several
+ * libraries, every library and a collection are no folder, so they show no pack.
+ */
+export function panelPackTarget(
+  view: 'packs' | 'assets' | 'loading',
+  selectedCard: FolderRef | null,
+  query: Pick<SearchQuery, 'folder' | 'libraryId' | 'libraryIds' | 'collectionId'>
+): FolderRef | null {
+  if (view === 'packs' && selectedCard) return selectedCard;
+  if (query.collectionId) return null;
+  if (query.folder) return query.folder;
+  const libraries = query.libraryIds?.length
+    ? query.libraryIds
+    : query.libraryId
+      ? [query.libraryId]
+      : [];
+  return libraries.length === 1 ? { libraryId: libraries[0], path: '' } : null;
 }

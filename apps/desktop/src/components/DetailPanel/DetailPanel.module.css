@@ -762,3 +762,78 @@
 .backIcon {
   transform: rotate(180deg);
 }
+
+/* A pack's details (plan C18) */
+.packName {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.packIcon {
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+}
+.thumbPackIcon {
+  color: var(--color-text-disabled);
+}
+.packGallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(48px, 1fr));
+  gap: var(--space-2);
+}
+.packGalleryItem {
+  aspect-ratio: 1;
+  padding: 0;
+  background: var(--color-bg-base);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  cursor: pointer;
+}
+.packGalleryItem:hover {
+  border-color: var(--color-text-muted);
+}
+.packGalleryShown {
+  border-color: var(--color-accent);
+}
+.packGalleryItem img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.licenseRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.openLicenseBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+.openLicenseBtn:hover {
+  background: var(--color-bg-subtle);
+  color: var(--color-text-primary);
+}
+.packKinds {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.packKinds li {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+}

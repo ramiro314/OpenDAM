@@ -234,6 +234,16 @@ The UI checks, each defined in its plan:
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 4. Screenshots:
   `U14-library-root`, `U14-ui-pack`.
 
+- **U15** (pack detail): a click on the `3D assets/Car Kit` card shows the pack in the detail
+  panel: `Car Kit`, version `3.1` and author `Kenney` from its license header, license `CC0`,
+  a gallery holding its `Preview.png` with every image loaded, its files by kind adding up to the
+  kit's file total with hidden files shown, and its size. "Open license", recorded rather than
+  run, opens the kit's `License.txt`. Browsing the kit's `Models/` shows the pack while no asset
+  is selected, the selected `sedan.glb` while one is, and the pack again once the selection is
+  cleared; `3D assets` in the Assets view shows no pack.
+  [smarter-big-collections](../plans/smarter-big-collections/plan.md), C9 and C18. Screenshots:
+  `U15-pack-detail`, `U15-asset-in-pack`, `U15-pack-again`.
+
 Run it with the script, from the repo root:
 
 ```sh

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { SearchQuery } from '../types';
-import { browseView, isSearching, packsScope, scopeKey } from './packsView';
+import { browseView, isSearching, packsScope, panelPackTarget, scopeKey } from './packsView';
 
 const query = (patch: Partial<SearchQuery> = {}): SearchQuery => ({
   text: '',
@@ -83,5 +83,38 @@ describe('packsScope', () => {
     expect(key({ folder: { libraryId: 'a', path: 'b' } })).not.toBe(
       key({ folder: { libraryId: 'a', path: '' } })
     );
+  });
+});
+
+describe('panelPackTarget', () => {
+  const kit = { libraryId: 'a', path: '3D assets/Car Kit' };
+  const models = { libraryId: 'a', path: '3D assets/Car Kit/Models' };
+
+  test("the Packs view's selected card wins over the node", () => {
+    expect(
+      panelPackTarget('packs', kit, query({ folder: { libraryId: 'a', path: '3D assets' } }))
+    ).toEqual(kit);
+  });
+
+  test('with no card selected, or in Assets, the selected node is asked about', () => {
+    expect(panelPackTarget('packs', null, query({ folder: models }))).toEqual(models);
+    // A card selected before switching to Assets doesn't stand for the folder browsed there
+    expect(panelPackTarget('assets', kit, query({ folder: models }))).toEqual(models);
+    expect(panelPackTarget('loading', null, query({ libraryIds: ['a'] }))).toEqual({
+      libraryId: 'a',
+      path: '',
+    });
+    expect(panelPackTarget('assets', null, query({ libraryId: 'a' }))).toEqual({
+      libraryId: 'a',
+      path: '',
+    });
+  });
+
+  test('several libraries, every library and a collection are no folder', () => {
+    expect(panelPackTarget('assets', null, query({ libraryIds: ['a', 'b'] }))).toBeNull();
+    expect(panelPackTarget('assets', null, query())).toBeNull();
+    expect(
+      panelPackTarget('assets', null, query({ libraryId: 'a', collectionId: 'c' }))
+    ).toBeNull();
   });
 });

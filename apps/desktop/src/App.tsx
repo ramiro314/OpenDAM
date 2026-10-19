@@ -10,6 +10,7 @@ import { ConfirmDeleteDialog } from './components/ConfirmDeleteDialog';
 import { RunsPanel } from './components/Autotag/RunsPanel';
 import { AutotagDialog } from './components/Autotag/AutotagDialog';
 import { ReviewModal } from './components/Autotag/ReviewModal';
+import { FolderActionDialog } from './components/FolderActions';
 import { IconCheck } from './components/Icons';
 import { PanelResizer } from './components/PanelResizer/PanelResizer';
 import { useUIStore } from './store';
@@ -21,7 +22,9 @@ import {
   useAutotagStore,
   useFolderTreeStore,
   usePacksStore,
+  usePackDetailStore,
   useLiveCountsStore,
+  useFolderActionStore,
   lookupAsset,
 } from './store';
 import type { AutotagUpdate } from './types';
@@ -45,6 +48,8 @@ export default function App() {
   const runsPanelOpen = useAutotagStore((s) => s.runsPanelOpen);
   const autotagTarget = useAutotagStore((s) => s.dialogTarget);
   const openAutotagDialog = useAutotagStore((s) => s.openAutotagDialog);
+  const folderFailure = useFolderActionStore((s) => s.failure);
+  const setFolderFailure = useFolderActionStore((s) => s.setFailure);
   const reviewRunId = useAutotagStore((s) => s.reviewRunId);
   const assetsToDelete = useUIStore((s) => s.assetsToDelete);
   const requestDelete = useUIStore((s) => s.requestDelete);
@@ -104,6 +109,7 @@ export default function App() {
       useLibraryStore.getState().fetchLibraries();
       useFolderTreeStore.getState().refetch();
       usePacksStore.getState().refetch();
+      usePackDetailStore.getState().refetch();
     });
 
     // Keyboard shortcuts: F5, Space hold for QuickLook, Ctrl+C to copy path
@@ -296,6 +302,7 @@ export default function App() {
       {autotagTarget && (
         <AutotagDialog target={autotagTarget} onClose={() => openAutotagDialog(null)} />
       )}
+      <FolderActionDialog />
 
       {/* Delete Confirmation Dialog */}
       <ConfirmDeleteDialog
@@ -316,6 +323,19 @@ export default function App() {
         <div className={styles.copyToast}>
           <IconCheck size={14} className={styles.toastCheck} />
           <span>{copyToast}</span>
+        </div>
+      )}
+
+      {folderFailure && (
+        <div
+          className={`${styles.copyToast} ${styles.errorToast}`}
+          role="alert"
+          data-folder-action-failure
+        >
+          <span>{folderFailure}</span>
+          <button className={styles.toastDismiss} onClick={() => setFolderFailure(null)}>
+            Dismiss
+          </button>
         </div>
       )}
 

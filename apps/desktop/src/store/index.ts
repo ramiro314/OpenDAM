@@ -858,7 +858,14 @@ export { useFolderTreeStore } from './folderTree';
 export { useGroupDetailStore, shownMember } from './groupDetail';
 export { extensionCount, kindCount, useLiveCountsStore } from './liveCounts';
 
-export { usePacksStore, packKey } from './packs';
+export { usePacksStore, packKey, packRef } from './packs';
+export { usePackDetailStore } from './packDetail';
+export {
+  useFolderActionStore,
+  applyFolderAction,
+  revealFolder,
+  type FolderTarget,
+} from './folderActions';
 
 /**
  * Selects tree node `folder` and searches it. A folder names its own library, so it replaces the

@@ -8,6 +8,7 @@ import type {
   FolderCounts,
   FolderNode,
   PackCard,
+  PackDetail,
   Tag,
   TagPatch,
   AddLibraryPayload,
@@ -63,6 +64,15 @@ export const api = {
   /** The packs below `underPath` in each of `libraryIds`, or in every library when null */
   getPacks: (libraryIds: string[] | null, underPath: string) =>
     invoke<PackCard[]>('get_packs', { libraryIds, underPath }),
+  /** The pack holding `path`: the innermost pack at or above it, or null when none does */
+  getPackDetail: (libraryId: string, path: string) =>
+    invoke<PackDetail | null>('get_pack_detail', { libraryId, path }),
+  /** Tags every file below the folder and their groups' members; returns how many */
+  tagFolder: (libraryId: string, folderPath: string, tagId: string) =>
+    invoke<number>('tag_folder', { libraryId, folderPath, tagId }),
+  /** Adds every file below the folder and their groups' members to a collection */
+  collectFolder: (libraryId: string, folderPath: string, collectionId: string) =>
+    invoke<number>('collect_folder', { libraryId, folderPath, collectionId }),
 
   // Live counts while search text or a filter is active, each the grid's total for its value
   getFacetCounts: (query: SearchQuery) => invoke<FacetCounts>('get_facet_counts', { query }),

@@ -4,7 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 use tauri::State;
 
-use crate::db::{resolve_path, LibraryHandle};
+use crate::commands::asset::folder_range;
+use crate::db::{resolve_path, upsert_collection, upsert_tag, Database, LibraryHandle};
+use crate::structure::{self, LicenseKind, PackHeader};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -277,10 +279,332 @@ pub(crate) async fn packs_below(
     Ok(cards)
 }
 
+/// What the detail panel shows for one pack (plan C18), as the structure pass derived it (C9).
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackDetail {
+    pub library_id: String,
+    /// Relative to the library root
+    pub path: String,
+    /// The license header's name, else the folder's, else the library's for a root pack
+    pub name: String,
+    /// The folder holding the pack; `''` for the library root
+    pub parent_path: String,
+    pub item_count: i64,
+    pub hidden_count: i64,
+    pub cover: Option<Cover>,
+    /// The pack's `Preview*` and `Sample*` images, by path
+    pub gallery: Vec<Cover>,
+    pub license: Option<PackLicense>,
+    /// The Kenney header of the license file, if it has one
+    pub header: Option<PackHeader>,
+    /// Files below the pack by kind, support files and group members included
+    pub kinds: std::collections::BTreeMap<String, i64>,
+    /// Their total size in bytes
+    pub size_bytes: i64,
+}
+
+/// A pack's license file, as "Open license" opens it.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackLicense {
+    /// Absolute
+    pub file_path: String,
+    pub kind: LicenseKind,
+}
+
+/// The pack that holds `path` in library `library_id`: the innermost pack at or above it, the
+/// folder itself included, or `None` when no pack holds it. A pack card asks with the pack's own
+/// path; the detail panel asks with the selected folder, `''` for a library's root.
+#[tauri::command]
+pub async fn get_pack_detail(
+    library_id: String,
+    path: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<PackDetail>> {
+    let library = state
+        .db
+        .get_library_handle(&library_id)
+        .await
+        .ok_or_else(|| format!("Library {library_id} is not open"))?;
+    pack_holding(&library, &path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(sqlx::FromRow)]
+struct PackDetailRow {
+    path: String,
+    parent_path: Option<String>,
+    name: String,
+    item_count: i64,
+    hidden_count: i64,
+    pack_json: Option<String>,
+}
+
+/// `get_pack_detail` on an open library. The pack is found among `path` and its ancestors on the
+/// primary key, and its cover and gallery images on the unique `file_path` index.
+pub(crate) async fn pack_holding(
+    library: &LibraryHandle,
+    path: &str,
+) -> sqlx::Result<Option<PackDetail>> {
+    let path = path.trim_matches('/');
+    let mut candidates = vec![String::new()];
+    candidates.extend(
+        path.match_indices('/')
+            .map(|(end, _)| path[..end].to_string()),
+    );
+    if !path.is_empty() {
+        candidates.push(path.to_string());
+    }
+    let row: Option<PackDetailRow> = sqlx::query_as(
+        "SELECT path, parent_path, name, item_count, hidden_count, pack_json FROM folders
+         WHERE is_pack AND path IN (SELECT value FROM json_each(?))
+         ORDER BY length(path) DESC LIMIT 1",
+    )
+    .bind(serde_json::to_string(&candidates).expect("paths serialize"))
+    .fetch_optional(&library.pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let info = crate::structure::parse_pack(row.pack_json.as_deref()).unwrap_or_default();
+
+    let images: Vec<&str> = info
+        .cover
+        .iter()
+        .chain(&info.gallery)
+        .map(String::as_str)
+        .collect();
+    let covers: Vec<(String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT file_path, thumbnail_path, extension, kind FROM assets
+         WHERE file_path IN (SELECT value FROM json_each(?))",
+    )
+    .bind(serde_json::to_string(&images).expect("paths serialize"))
+    .fetch_all(&library.pool)
+    .await?;
+    let root = &library.root_path;
+    let cover_of = |path: &str| {
+        covers
+            .iter()
+            .find(|(p, ..)| p == path)
+            .map(|(p, thumbnail, extension, kind)| Cover {
+                file_path: resolve_path(root, p),
+                thumbnail_path: thumbnail.as_deref().map(|t| resolve_path(root, t)),
+                extension: extension.clone(),
+                kind: kind.clone(),
+            })
+    };
+
+    Ok(Some(PackDetail {
+        library_id: library.id.clone(),
+        name: [info.name, row.name]
+            .into_iter()
+            .find(|n| !n.is_empty())
+            .unwrap_or_else(|| library.name.clone()),
+        path: row.path,
+        parent_path: row.parent_path.unwrap_or_default(),
+        item_count: row.item_count,
+        hidden_count: row.hidden_count,
+        cover: info.cover.as_deref().and_then(cover_of),
+        gallery: info.gallery.iter().filter_map(|p| cover_of(p)).collect(),
+        header: info.license.as_ref().and_then(|l| l.text.header.clone()),
+        license: info.license.map(|l| PackLicense {
+            file_path: resolve_path(root, &l.path),
+            kind: l.text.kind,
+        }),
+        kinds: info.kinds,
+        size_bytes: info.size_bytes,
+    }))
+}
+
+/// A file a bulk write reaches, and the grid item it belongs to: its group's main item, or itself
+/// for a file on its own.
+type FileOfItem = (String, String);
+
+/// Every file below `folder` (`""` for the library root, which covers the whole library), with
+/// every member of the groups those files belong to, wherever it sits, so a bulk write keeps a
+/// group's members equal (plan C20). Support files are included: the write covers everything.
+/// Sorted by item, so each group's members come together for `group_batches`.
+async fn folder_members(pool: &Pool<Sqlite>, folder: &str) -> sqlx::Result<Vec<FileOfItem>> {
+    let Some([from, to]) = folder_range(folder) else {
+        return sqlx::query_as(
+            "SELECT id, COALESCE(group_id, id) AS item FROM assets ORDER BY item, id",
+        )
+        .fetch_all(pool)
+        .await;
+    };
+    sqlx::query_as(
+        "SELECT id, COALESCE(group_id, id) AS item FROM assets
+         WHERE file_path >= ?1 AND file_path < ?2
+            OR group_id IN (
+                SELECT group_id FROM assets
+                WHERE file_path >= ?1 AND file_path < ?2 AND group_id IS NOT NULL
+            )
+         ORDER BY item, id",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+}
+
+/// Cuts `files`, sorted by item, into batches of about `structure::BATCH` files that each end at
+/// an item's last file, so a group's members always commit together.
+fn group_batches(files: &[FileOfItem]) -> Vec<&[FileOfItem]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    for end in 1..=files.len() {
+        let full = end - start >= structure::BATCH;
+        if end == files.len() || (full && files[end].1 != files[end - 1].1) {
+            batches.push(&files[start..end]);
+            start = end;
+        }
+    }
+    batches
+}
+
+/// The open library `library_id`.
+async fn open_library(db: &Database, library_id: &str) -> Result<LibraryHandle> {
+    db.get_library_handle(library_id)
+        .await
+        .ok_or_else(|| format!("Library {library_id} is not open"))
+}
+
+/// "Add a tag to everything": tags every file below `folder_path` in library `library_id`, and
+/// the members of their groups (`folder_members`). Returns how many files that is.
+#[tauri::command]
+pub async fn tag_folder(
+    library_id: String,
+    folder_path: String,
+    tag_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<usize> {
+    tag_folder_in(&state.db, &library_id, &folder_path, &tag_id).await
+}
+
+/// Writes in transactions of about `structure::BATCH` files that never split a group
+/// (`group_batches`), each copying master's definition, with its ancestors root first, into the
+/// library's mirror before the memberships, since a mirror can lack it. It holds the library's
+/// index lock, so no structure pass regroups the files meanwhile, and stops at the first batch
+/// that finds the tag deleted. Each batch holds `Database::catalog_lock` from reading the
+/// definition until its commit, so a tag update or delete waits for at most one batch.
+async fn tag_folder_in(
+    db: &Database,
+    library_id: &str,
+    folder: &str,
+    tag_id: &str,
+) -> Result<usize> {
+    let lib = open_library(db, library_id).await?;
+    let lock = db.index_lock(&lib.id);
+    let _guard = lock.lock().await;
+    // The definition is read once the lock is held, and again for each batch under
+    // `Database::catalog_lock`, which every definition update and delete takes too: one deleted
+    // while the write waited, or between batches, must not come back through the mirror.
+    let write = async {
+        if db.tag_with_ancestors(tag_id).await?.is_empty() {
+            return Ok(None);
+        }
+        let files = folder_members(&lib.pool, folder).await?;
+        for batch in group_batches(&files) {
+            let _catalog = db.catalog_lock.lock().await;
+            let chain = db.tag_with_ancestors(tag_id).await?;
+            if chain.is_empty() {
+                return Ok(None);
+            }
+            let mut tx = lib.pool.begin().await?;
+            for definition in &chain {
+                upsert_tag(&mut *tx, definition).await?;
+            }
+            for (id, _) in batch {
+                sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
+                    .bind(id)
+                    .bind(tag_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+        }
+        Ok::<_, sqlx::Error>(Some(files.len()))
+    };
+    match write.await {
+        Ok(Some(written)) => Ok(written),
+        Ok(None) => Err("The tag no longer exists".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// "Add everything to a collection": adds every file below `folder_path` in library
+/// `library_id`, and the members of their groups (`folder_members`), to collection
+/// `collection_id`. Returns how many files that is.
+#[tauri::command]
+pub async fn collect_folder(
+    library_id: String,
+    folder_path: String,
+    collection_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<usize> {
+    collect_folder_in(&state.db, &library_id, &folder_path, &collection_id).await
+}
+
+/// Writes as `tag_folder_in` does, copying the collection's definition and its ancestors.
+async fn collect_folder_in(
+    db: &Database,
+    library_id: &str,
+    folder: &str,
+    collection_id: &str,
+) -> Result<usize> {
+    let lib = open_library(db, library_id).await?;
+    let lock = db.index_lock(&lib.id);
+    let _guard = lock.lock().await;
+    // The definition is read once the lock is held, and again for each batch under
+    // `Database::catalog_lock`, which every definition update and delete takes too: one deleted
+    // while the write waited, or between batches, must not come back through the mirror.
+    let write = async {
+        if db
+            .collection_with_ancestors(collection_id)
+            .await?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        let files = folder_members(&lib.pool, folder).await?;
+        for batch in group_batches(&files) {
+            let _catalog = db.catalog_lock.lock().await;
+            let chain = db.collection_with_ancestors(collection_id).await?;
+            if chain.is_empty() {
+                return Ok(None);
+            }
+            let mut tx = lib.pool.begin().await?;
+            for definition in &chain {
+                upsert_collection(&mut *tx, definition).await?;
+            }
+            for (id, _) in batch {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
+                )
+                .bind(collection_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+        }
+        Ok::<_, sqlx::Error>(Some(files.len()))
+    };
+    match write.await {
+        Ok(Some(written)) => Ok(written),
+        Ok(None) => Err("The collection no longer exists".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::memory_library_pool;
+    use crate::db::{
+        insert_asset, insert_collection, insert_tag, memory_database, memory_library,
+        memory_library_pool, memory_library_pool_enforcing_foreign_keys,
+    };
+    use crate::structure::tests::{SEDAN, SEDAN_RENDER};
 
     async fn library(paths: &[&str]) -> Pool<Sqlite> {
         let pool = memory_library_pool().await;
@@ -699,5 +1023,388 @@ mod tests {
             (node.name.as_str(), node.cover.as_ref()),
             ("kit", Some(cover))
         );
+    }
+
+    #[tokio::test]
+    async fn a_packs_detail_is_found_from_the_pack_or_any_folder_inside_it() {
+        let library = library_handle(
+            "a",
+            &[
+                "3D assets/Car Kit/License.txt",
+                "3D assets/Car Kit/Preview.png",
+                "3D assets/Car Kit/Sample.png",
+                "3D assets/Car Kit/Models/sedan.png",
+                "Goodies/w.png",
+            ],
+        )
+        .await;
+        sqlx::query(
+            r#"UPDATE folders SET pack_json = json_set(pack_json,
+                 '$.name', 'Car Kit',
+                 '$.license.kind', 'CC0',
+                 '$.license.header', json('{"name":"Car Kit","version":"3.1","author":"Kenney"}'))
+             WHERE path = '3D assets/Car Kit'"#,
+        )
+        .execute(&library.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE assets SET thumbnail_path = '.opendam/thumbs/s_thumb.png'
+             WHERE file_path = '3D assets/Car Kit/Sample.png'",
+        )
+        .execute(&library.pool)
+        .await
+        .unwrap();
+
+        let image = |path: &str, thumbnail: Option<&str>| Cover {
+            file_path: format!("/libraries/a/{path}"),
+            thumbnail_path: thumbnail.map(|t| format!("/libraries/a/{t}")),
+            extension: "png".into(),
+            kind: "texture".into(),
+        };
+        let detail = pack_holding(&library, "3D assets/Car Kit").await.unwrap();
+        assert_eq!(
+            detail,
+            Some(PackDetail {
+                library_id: "a".into(),
+                path: "3D assets/Car Kit".into(),
+                name: "Car Kit".into(),
+                parent_path: "3D assets".into(),
+                item_count: 1,
+                hidden_count: 3,
+                cover: Some(image("3D assets/Car Kit/Preview.png", None)),
+                gallery: vec![
+                    image("3D assets/Car Kit/Preview.png", None),
+                    image(
+                        "3D assets/Car Kit/Sample.png",
+                        Some(".opendam/thumbs/s_thumb.png")
+                    ),
+                ],
+                license: Some(PackLicense {
+                    file_path: "/libraries/a/3D assets/Car Kit/License.txt".into(),
+                    kind: LicenseKind::Cc0,
+                }),
+                header: Some(PackHeader {
+                    name: "Car Kit".into(),
+                    version: Some("3.1".into()),
+                    author: Some("Kenney".into()),
+                }),
+                // Kinds by extension, as the indexer gives them; the test library's files are
+                // 1 byte each.
+                kinds: [("document".to_string(), 1), ("texture".to_string(), 3)].into(),
+                size_bytes: 4,
+            })
+        );
+        // From a folder inside the pack, or with edge slashes
+        assert_eq!(
+            pack_holding(&library, "/3D assets/Car Kit/Models/")
+                .await
+                .unwrap(),
+            detail
+        );
+        // No pack holds a folder outside every pack, or the library root.
+        for path in ["Goodies", "3D assets", "", "3D assets/Car"] {
+            assert_eq!(pack_holding(&library, path).await.unwrap(), None, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_library_that_is_one_pack_shows_it_at_its_root_named_after_the_library() {
+        let mut solo = library_handle("solo", &["License.txt", "rock.png", "Tiles/a.png"]).await;
+        solo.name = "Solo Download".into();
+        for path in ["", "Tiles"] {
+            let detail = pack_holding(&solo, path).await.unwrap().unwrap();
+            assert_eq!(
+                (detail.path.as_str(), detail.name.as_str()),
+                ("", "Solo Download")
+            );
+            // A license the pass couldn't read is unknown, with no header.
+            assert_eq!(
+                (detail.license.map(|l| l.kind), detail.header),
+                (Some(LicenseKind::Unknown), None)
+            );
+            // Every file counts once, those at the root included.
+            assert_eq!(
+                (detail.kinds, detail.size_bytes),
+                (
+                    [("document".to_string(), 1), ("texture".to_string(), 2)].into(),
+                    3
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_pack_holding_a_folder_is_the_innermost_of_nested_packs() {
+        let library = library_handle(
+            "a",
+            &[
+                "kit/License.txt",
+                "kit/Extra/License.txt",
+                "kit/Extra/sub/a.png",
+                "kit/Other/b.png",
+            ],
+        )
+        .await;
+        // The pass makes only the outermost marked folder a pack. A pack inside a pack comes from
+        // a "Mark as pack" override, so the inner one is marked here by hand.
+        sqlx::query("UPDATE folders SET is_pack = 1 WHERE path = 'kit/Extra'")
+            .execute(&library.pool)
+            .await
+            .unwrap();
+        for (path, pack) in [
+            ("kit/Extra", "kit/Extra"),
+            ("kit/Extra/sub", "kit/Extra"),
+            ("kit/Other", "kit"),
+            ("kit", "kit"),
+        ] {
+            let detail = pack_holding(&library, path).await.unwrap();
+            assert_eq!(detail.map(|d| d.path).as_deref(), Some(pack), "{path}");
+        }
+    }
+
+    /// One open library over the Car Kit (`structure::tests::car_kit`, each asset's id its path),
+    /// with a tag `t` and a collection `c` in master alone.
+    async fn car_kit_database() -> (Database, Pool<Sqlite>) {
+        let pool = crate::structure::tests::car_kit().await;
+        let db = memory_database(vec![memory_library("lib", pool.clone())]).await;
+        insert_tag(&db.master_pool, "t", "vehicle").await;
+        insert_collection(&db.master_pool, "c", "cars", None).await;
+        (db, pool)
+    }
+
+    /// The assets holding tag `t` and those in collection `c`, each sorted.
+    async fn tagged_and_collected(pool: &Pool<Sqlite>) -> (Vec<String>, Vec<String>) {
+        let read = |sql: &'static str| async move {
+            sqlx::query_scalar::<_, String>(sql)
+                .fetch_all(pool)
+                .await
+                .unwrap()
+        };
+        (
+            read("SELECT asset_id FROM asset_tags WHERE tag_id = 't' ORDER BY 1").await,
+            read("SELECT asset_id FROM collection_assets WHERE collection_id = 'c' ORDER BY 1")
+                .await,
+        )
+    }
+
+    /// Runs both bulk actions on `folder` of library `lib`, checking each returns `expected`'s
+    /// length, and that they reached exactly `expected`.
+    async fn assert_both_reach(db: &Database, folder: &str, mut expected: Vec<String>) {
+        let pool = db.get_library_handle("lib").await.unwrap().pool;
+        assert_eq!(
+            tag_folder_in(db, "lib", folder, "t").await,
+            Ok(expected.len())
+        );
+        assert_eq!(
+            collect_folder_in(db, "lib", folder, "c").await,
+            Ok(expected.len())
+        );
+        expected.sort();
+        assert_eq!(
+            tagged_and_collected(&pool).await,
+            (expected.clone(), expected),
+            "{folder:?}"
+        );
+    }
+
+    async fn ids_where(pool: &Pool<Sqlite>, condition: &str) -> Vec<String> {
+        sqlx::query_scalar(&format!("SELECT id FROM assets WHERE {condition}"))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bulk_actions_on_a_format_folder_reach_its_groups_members_in_sibling_folders() {
+        let (db, _) = car_kit_database().await;
+        let mut expected: Vec<String> = SEDAN.map(String::from).to_vec();
+        expected.push("3D assets/Car Kit/Models/GLB format/Textures/colormap.png".into());
+
+        assert_both_reach(&db, "3D assets/Car Kit/Models/GLB format/", expected).await;
+    }
+
+    #[tokio::test]
+    async fn bulk_actions_on_a_pack_reach_every_file_in_it_support_files_included() {
+        let (db, pool) = car_kit_database().await;
+        let expected = ids_where(&pool, "file_path LIKE '3D assets/Car Kit/%'").await;
+        assert_eq!(expected.len(), 8);
+        assert!(expected.contains(&SEDAN_RENDER.to_string()));
+
+        assert_both_reach(&db, "3D assets/Car Kit", expected).await;
+    }
+
+    #[tokio::test]
+    async fn bulk_actions_on_the_library_root_reach_every_file_in_the_library() {
+        let (db, pool) = car_kit_database().await;
+        let expected = ids_where(&pool, "1").await;
+        assert_eq!(expected.len(), 9);
+
+        assert_both_reach(&db, "", expected).await;
+    }
+
+    #[tokio::test]
+    async fn bulk_actions_copy_the_definitions_into_the_mirror_with_their_ancestors() {
+        // Foreign keys on: a membership whose tag or collection the mirror lacks is refused.
+        let pool = memory_library_pool_enforcing_foreign_keys().await;
+        insert_asset(&pool, "rock").await;
+        let db = memory_database(vec![memory_library("lib", pool.clone())]).await;
+        insert_tag(&db.master_pool, "nature", "nature").await;
+        insert_tag(&db.master_pool, "t", "stone").await;
+        sqlx::query("UPDATE tags SET parent_id = 'nature' WHERE id = 't'")
+            .execute(&db.master_pool)
+            .await
+            .unwrap();
+        insert_collection(&db.master_pool, "props", "props", None).await;
+        insert_collection(&db.master_pool, "c", "rocks", Some("props")).await;
+
+        assert_eq!(tag_folder_in(&db, "lib", "", "t").await, Ok(1));
+        assert_eq!(collect_folder_in(&db, "lib", "", "c").await, Ok(1));
+
+        assert_eq!(
+            tagged_and_collected(&pool).await,
+            (vec!["rock".into()], vec!["rock".into()])
+        );
+        let mirrored: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM tags UNION ALL SELECT id FROM collections")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mirrored.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn bulk_actions_write_past_one_batch_and_leave_other_libraries_alone() {
+        let paths: Vec<String> = (0..450).map(|i| format!("big/{i}.png")).collect();
+        let big = library(&paths.iter().map(String::as_str).collect::<Vec<_>>()).await;
+        let other = library(&["big/0.png"]).await;
+        let db = memory_database(vec![
+            memory_library("lib", big.clone()),
+            memory_library("other", other.clone()),
+        ])
+        .await;
+        insert_tag(&db.master_pool, "t", "vehicle").await;
+        insert_collection(&db.master_pool, "c", "cars", None).await;
+
+        assert_both_reach(&db, "big", paths).await;
+        assert_eq!(tagged_and_collected(&other).await, (vec![], vec![]));
+    }
+
+    #[test]
+    fn a_batch_never_splits_a_group_that_reaches_past_its_size() {
+        // 199 files on their own, then a group of 3 straddling the 200th row, then 300 more.
+        let mut files: Vec<FileOfItem> = (0..199)
+            .map(|i| (format!("a{i:03}"), format!("a{i:03}")))
+            .collect();
+        files.extend((0..3).map(|i| (format!("b{i}"), "b0".to_string())));
+        files.extend((0..300).map(|i| (format!("c{i:03}"), format!("c{i:03}"))));
+
+        let batches = group_batches(&files);
+
+        let sizes: Vec<usize> = batches.iter().map(|b| b.len()).collect();
+        assert_eq!(sizes, [202, 200, 100]);
+        assert!(batches[0].ends_with(&files[199..202]));
+        assert_eq!(batches.concat(), files);
+        assert!(group_batches(&[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_folders_files_come_with_each_groups_members_side_by_side() {
+        let (_, pool) = car_kit_database().await;
+        for folder in ["", "3D assets/Car Kit/Models/OBJ format"] {
+            let files = folder_members(&pool, folder).await.unwrap();
+            let at = files.iter().position(|(_, item)| item == SEDAN[1]).unwrap();
+            let mut sedan: Vec<&str> = files[at..at + 3]
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect();
+            sedan.sort();
+            assert_eq!(sedan, SEDAN, "{folder:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tag_or_collection_deleted_while_a_bulk_write_waits_does_not_come_back() {
+        for collect in [false, true] {
+            let (db, pool) = car_kit_database().await;
+            let (id, read) = if collect {
+                ("c", "SELECT COUNT(*) FROM collections WHERE id = 'c'")
+            } else {
+                ("t", "SELECT COUNT(*) FROM tags WHERE id = 't'")
+            };
+            // An index run holds the lock while the write starts, and the definition goes meanwhile.
+            let lock = db.index_lock("lib");
+            let guard = lock.lock().await;
+            let write = async {
+                if collect {
+                    collect_folder_in(&db, "lib", "", id).await
+                } else {
+                    tag_folder_in(&db, "lib", "", id).await
+                }
+            };
+            let delete = async {
+                if collect {
+                    crate::commands::collection::delete_collection_in(&db, id).await
+                } else {
+                    crate::commands::tag::delete_tag_in(&db, id).await
+                }
+                .unwrap();
+                drop(guard);
+            };
+            let (written, ()) = tokio::join!(write, delete);
+
+            let noun = if collect { "collection" } else { "tag" };
+            assert_eq!(written, Err(format!("The {noun} no longer exists")));
+            for p in [&db.master_pool, &pool] {
+                let count: i64 = sqlx::query_scalar(read).fetch_one(p).await.unwrap();
+                assert_eq!(count, 0, "{noun}");
+            }
+            assert_eq!(tagged_and_collected(&pool).await, (vec![], vec![]));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_and_a_definition_delete_never_overlap() {
+        let (db, pool) = car_kit_database().await;
+        let wait = std::time::Duration::from_millis(100);
+
+        // While a batch holds the catalog lock, neither a delete nor another batch goes ahead.
+        let held = db.catalog_lock.lock().await;
+        let delete = tokio::time::timeout(wait, crate::commands::tag::delete_tag_in(&db, "t"));
+        assert!(
+            delete.await.is_err(),
+            "the delete went ahead during a batch"
+        );
+        let write = tokio::time::timeout(wait, tag_folder_in(&db, "lib", "", "t"));
+        assert!(write.await.is_err(), "a batch went ahead during another");
+        assert_eq!(tagged_and_collected(&pool).await, (vec![], vec![]));
+        drop(held);
+
+        assert_eq!(tag_folder_in(&db, "lib", "", "t").await, Ok(9));
+        crate::commands::tag::delete_tag_in(&db, "t").await.unwrap();
+        let mirrored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags WHERE id = 't'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mirrored, 0);
+    }
+
+    #[tokio::test]
+    async fn bulk_actions_refuse_an_unknown_tag_or_collection_and_a_closed_library() {
+        let (db, pool) = car_kit_database().await;
+
+        assert_eq!(
+            tag_folder_in(&db, "lib", "", "gone").await,
+            Err("The tag no longer exists".into())
+        );
+        assert_eq!(
+            collect_folder_in(&db, "lib", "", "gone").await,
+            Err("The collection no longer exists".into())
+        );
+        assert_eq!(
+            tag_folder_in(&db, "closed", "", "t").await,
+            Err("Library closed is not open".into())
+        );
+        assert_eq!(tagged_and_collected(&pool).await, (vec![], vec![]));
     }
 }
