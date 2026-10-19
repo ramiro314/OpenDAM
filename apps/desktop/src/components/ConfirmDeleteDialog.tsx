@@ -1,12 +1,15 @@
 import { useState, useEffect, useRef } from 'react';
 import clsx from 'clsx';
 import { IconTrash, IconX } from './Icons';
+import { formatTrashAction } from '../utils/format';
 import styles from './ConfirmDeleteDialog.module.css';
 
 interface ConfirmDeleteDialogProps {
   isOpen: boolean;
   itemType: 'tag' | 'collection' | 'library' | 'asset' | 'assets';
   itemName: string;
+  /** For assets, how many files go to the trash: a group's members and render count apart. */
+  fileCount?: number;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -15,6 +18,7 @@ export function ConfirmDeleteDialog({
   isOpen,
   itemType,
   itemName,
+  fileCount = 1,
   onConfirm,
   onCancel,
 }: ConfirmDeleteDialogProps) {
@@ -100,9 +104,9 @@ export function ConfirmDeleteDialog({
             </p>
           ) : isAsset ? (
             <p className={styles.subText}>
-              This will move the file to the{' '}
+              This will move {fileCount === 1 ? 'the file' : `all ${fileCount} files`} to the{' '}
               <strong style={{ color: 'var(--color-text-main, #ffffff)' }}>Recycle Bin</strong> on
-              your system and remove it from OpenDAM.
+              your system and remove {fileCount === 1 ? 'it' : 'them'} from OpenDAM.
             </p>
           ) : (
             <p className={styles.subText}>
@@ -139,7 +143,7 @@ export function ConfirmDeleteDialog({
                 disabled={!isMatched}
                 className={clsx(styles.btn, styles.deleteBtn, isMatched && styles.deleteBtnActive)}
               >
-                {actionWordCap} {isAsset ? (itemType === 'assets' ? 'Files' : 'File') : itemType}
+                {isAsset ? formatTrashAction(fileCount) : `${actionWordCap} ${itemType}`}
               </button>
             </div>
           </form>
