@@ -128,6 +128,11 @@ docs/plans                    Plans for this fork
     flat search.
   - A folder's `item_count` counts a group once under each folder holding one of its files, so
     it equals the grid's total for that folder.
+  - Metadata (rating, color label, favorite, description, tags, collections) is the same on
+    every member. Each write expands its asset id through `structure::group_members` in its own
+    transaction, which `no_metadata_write_bypasses_group_members` checks, and auto-tag sends
+    only main items. When a group forms or grows, the structure pass gives every member the
+    union of the group's tags and collections and the main item's fields (`apply_unions`).
   - The preview queue skips members other than the main item, and their thumbnails stay on disk.
     An index run queues no new file itself: the pass it ends with queues every file but those
     members (support files' cover images included), so a member is never queued, even during a

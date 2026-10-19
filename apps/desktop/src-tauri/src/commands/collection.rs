@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::db::{upsert_collection, CollectionRow, Database};
 use crate::models::Collection;
+use crate::structure;
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -137,7 +138,8 @@ pub async fn add_to_collection(
     add_assets_to_collection(&state.db, &collection_id, &asset_ids).await
 }
 
-/// Each membership row goes to the asset's own library only. The collection must be in the
+/// Each membership row goes to the asset's own library only, for every member of its group
+/// (`structure::group_members`). The collection must be in the
 /// master catalog; it is copied, ancestors first, into that library's mirror before the
 /// membership, since a mirror can lack it after a failed mirror write.
 async fn add_assets_to_collection(
@@ -165,13 +167,15 @@ async fn add_assets_to_collection(
             for definition in &chain {
                 upsert_collection(&mut *tx, definition).await?;
             }
-            sqlx::query(
-                "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
-            )
-            .bind(collection_id)
-            .bind(aid)
-            .execute(&mut *tx)
-            .await?;
+            for member in structure::group_members(&mut *tx, aid).await? {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
+                )
+                .bind(collection_id)
+                .bind(member)
+                .execute(&mut *tx)
+                .await?;
+            }
             tx.commit().await
         };
         add.await.map_err(|e| e.to_string())?;
@@ -188,7 +192,7 @@ pub async fn remove_from_collection(
     remove_assets_from_collection(&state.db, &collection_id, &asset_ids).await
 }
 
-/// Each membership row is removed from the asset's own library.
+/// Each membership row is removed from the asset's own library, for every member of its group.
 async fn remove_assets_from_collection(
     db: &Database,
     collection_id: &str,
@@ -196,12 +200,20 @@ async fn remove_assets_from_collection(
 ) -> Result<()> {
     for aid in asset_ids {
         if let Some(lib) = db.library_of_asset(aid).await.map_err(|e| e.to_string())? {
-            sqlx::query("DELETE FROM collection_assets WHERE collection_id = ? AND asset_id = ?")
-                .bind(collection_id)
-                .bind(aid)
-                .execute(&lib.pool)
-                .await
-                .map_err(|e| e.to_string())?;
+            let remove = async {
+                let mut tx = lib.pool.begin().await?;
+                for member in structure::group_members(&mut *tx, aid).await? {
+                    sqlx::query(
+                        "DELETE FROM collection_assets WHERE collection_id = ? AND asset_id = ?",
+                    )
+                    .bind(collection_id)
+                    .bind(member)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                tx.commit().await
+            };
+            remove.await.map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -526,5 +538,23 @@ mod tests {
 
         assert!(result.is_err());
         assert!(collected(&a).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collecting_a_group_adds_and_removes_its_three_formats_and_not_the_render() {
+        use crate::structure::tests::{car_kit, SEDAN};
+        let pool = car_kit().await;
+        let db = memory_database(vec![memory_library("a", pool.clone())]).await;
+        insert_collection(&db.master_pool, "c", "Vehicles", None).await;
+
+        add_assets_to_collection(&db, "c", &[SEDAN[1].to_string()])
+            .await
+            .unwrap();
+        assert_eq!(collected(&pool).await, SEDAN);
+
+        remove_assets_from_collection(&db, "c", &[SEDAN[1].to_string()])
+            .await
+            .unwrap();
+        assert!(collected(&pool).await.is_empty());
     }
 }

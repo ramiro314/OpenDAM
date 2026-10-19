@@ -309,12 +309,17 @@ async fn remove_pairs(
         }
         let mut tx = lib.pool.begin().await?;
         for (asset_id, tag_id) in chunk.iter().filter(|p| !shared.contains(&(&p.0, &p.1))) {
-            let deleted = sqlx::query("DELETE FROM asset_tags WHERE asset_id = ? AND tag_id = ?")
-                .bind(asset_id)
-                .bind(tag_id)
-                .execute(&mut *tx)
-                .await?;
-            if deleted.rows_affected() > 0 {
+            // The run tagged every member of the item's group (`store::write_batch`).
+            let mut deleted = 0;
+            for member in crate::structure::group_members(&mut *tx, asset_id).await? {
+                deleted += sqlx::query("DELETE FROM asset_tags WHERE asset_id = ? AND tag_id = ?")
+                    .bind(&member)
+                    .bind(tag_id)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+            }
+            if deleted > 0 {
                 changed.push(asset_id.clone());
             }
         }
@@ -1210,5 +1215,33 @@ mod tests {
             asset_tags(b).await.is_empty(),
             "the unapplied pair never lands"
         );
+    }
+
+    #[tokio::test]
+    async fn a_run_tags_every_member_of_a_group_and_undo_takes_it_back_from_each() {
+        let (db, pools) = libraries(
+            &["A"],
+            &[&["rock-a1", "rock-a1-fbx", "rock-a1-obj", "rock-a1-preview"]],
+        )
+        .await;
+        let a = &pools[0];
+        sqlx::query(
+            "UPDATE assets SET group_id = 'rock-a1' WHERE id IN ('rock-a1', 'rock-a1-fbx', 'rock-a1-obj');
+             UPDATE assets SET support_role = 'cover' WHERE id = 'rock-a1-preview'",
+        )
+        .execute(a)
+        .await
+        .unwrap();
+        let engine = started_engine(&db).await;
+
+        let run_id = run(&engine, &db, &["rock-a1"], Mode::ExistingOnly, "done").await;
+        let tagged: Vec<(String, String)> = ["rock-a1", "rock-a1-fbx", "rock-a1-obj"]
+            .iter()
+            .map(|id| (id.to_string(), "t-rock".to_string()))
+            .collect();
+        assert_eq!(asset_tags(a).await, tagged, "the cover is no member");
+
+        assert_eq!(engine.undo_run(&run_id).await.unwrap(), "undone");
+        assert!(asset_tags(a).await.is_empty());
     }
 }
