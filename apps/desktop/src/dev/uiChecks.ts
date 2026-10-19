@@ -1515,12 +1515,14 @@ export const UI_CHECKS: UiCheck[] = [
       );
       await pause('U12-ui-pack');
 
-      // Two tiles sharing a name in different folders are two pictures
+      // Tiles sharing a name in different folders are different pictures, each its own item
       await inFolder('2D assets/Pixel Platformer/Tiles');
       const tiles = (await results()).filter((a) => a.fileName === 'tile_0000.png');
+      const tileFolders = tiles.map((a) => a.filePath.split('/Pixel Platformer/Tiles/')[1]);
       assert(
-        tiles.length === 2 && tiles.every((a) => !a.groupFormats),
-        `tile_0000.png shows ${tiles.length} times: ${tiles.map((a) => a.filePath).join(', ')}`
+        ['tile_0000.png', 'Characters/tile_0000.png'].every((t) => tileFolders.includes(t)) &&
+          tiles.every((a) => !a.groupFormats),
+        `tile_0000.png shows as ${tileFolders.join(', ')}, grouped: ${tiles.some((a) => a.groupFormats)}`
       );
 
       // A crosshair's Dark and Light styles stay apart, each with its 2x and vector copies
