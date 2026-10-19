@@ -636,3 +636,125 @@
 .actionBtnLoading {
   color: var(--color-brand-400) !important;
 }
+
+/* Group files: a format group's members, main item first (plan C19) */
+.groupFiles {
+  flex-shrink: 0;
+  max-height: 188px;
+  overflow-y: auto;
+  padding: var(--space-2) var(--space-4) var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+}
+.groupFilesTitle {
+  margin-bottom: var(--space-2);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.groupFileList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  list-style: none;
+}
+.groupFile {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 4px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.groupFile:hover,
+.groupFile:focus-visible {
+  background: var(--color-bg-subtle);
+  outline: none;
+}
+.groupFileThumb {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-bg-base);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.groupFileThumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.groupFileExt {
+  font-size: 9px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--color-text-disabled);
+}
+.groupFileText {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.groupFileFormat {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.groupFileMain {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--color-brand-300);
+}
+.groupFileSize {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--color-text-secondary);
+}
+.groupFileFolder {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--color-text-muted);
+}
+.groupFileActions {
+  display: flex;
+  flex-shrink: 0;
+}
+
+/* A member's details: the bar back to its group */
+.memberBar {
+  display: flex;
+  align-items: center;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+.backBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.backBtn:hover {
+  background: var(--color-bg-subtle);
+  color: var(--color-text-primary);
+}
+.backIcon {
+  transform: rotate(180deg);
+}

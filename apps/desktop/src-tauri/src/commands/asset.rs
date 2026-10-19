@@ -6,7 +6,9 @@ use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use crate::db::{make_relative_path, resolve_path, upsert_tag, Database, LibraryHandle};
-use crate::models::{Asset, AssetPatch, FilterSpec, SearchPayload, SearchQuery, SearchResult};
+use crate::models::{
+    Asset, AssetPatch, FilterSpec, GroupMember, SearchPayload, SearchQuery, SearchResult,
+};
 use crate::structure;
 use crate::AppState;
 
@@ -878,6 +880,61 @@ pub async fn get_asset(id: String, state: State<'_, Arc<AppState>>) -> Result<As
     }
 
     Err(format!("Asset not found: {}", id))
+}
+
+/// The files of the group asset `id` belongs to, for the detail panel: the main item first, then
+/// the others in the order the group picks its main item by (`structure::format_rank`), ties by
+/// path ignoring case. A file on its own is listed alone.
+#[tauri::command]
+pub async fn get_group_members(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<GroupMember>> {
+    let lib = state
+        .db
+        .library_of_asset(&id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Asset not found: {}", id))?;
+    group_members(&lib, &id).await.map_err(|e| e.to_string())
+}
+
+#[derive(sqlx::FromRow)]
+struct MemberRow {
+    is_main: bool,
+    #[sqlx(flatten)]
+    row: RawAssetRow,
+}
+
+async fn group_members(lib: &LibraryHandle, id: &str) -> sqlx::Result<Vec<GroupMember>> {
+    let sql = format!(
+        "SELECT a.group_id IS a.id AS is_main, {ASSET_COLUMNS} FROM assets a
+         WHERE a.id = ?1 OR a.group_id = (SELECT group_id FROM assets WHERE id = ?1)"
+    );
+    let mut rows = sqlx::query_as::<_, MemberRow>(&sql)
+        .bind(id)
+        .fetch_all(&lib.pool)
+        .await?;
+    rows.sort_by_cached_key(|m| {
+        (
+            !m.is_main,
+            structure::format_rank(&m.row.extension),
+            m.row.file_path.to_ascii_lowercase(),
+            m.row.file_path.clone(),
+        )
+    });
+    Ok(rows
+        .into_iter()
+        .map(|m| GroupMember {
+            folder: m
+                .row
+                .file_path
+                .rsplit_once('/')
+                .map_or("", |(dir, _)| dir)
+                .to_string(),
+            asset: row_to_asset(Some(&lib.root_path), m.row),
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -3109,6 +3166,59 @@ mod tests {
         let size = |id: &String| GROUPED_FILES.iter().find(|(p, _)| p == id).unwrap().1;
         ids.sort_by_key(size);
         (ids, total, files)
+    }
+
+    #[tokio::test]
+    async fn a_groups_members_list_in_main_item_order_from_any_member() {
+        let lib = grouped_library().await;
+        let members = |id: &'static str| {
+            let lib = &lib;
+            async move {
+                group_members(lib, id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|m| (m.asset.id, m.folder, m.asset.size_bytes))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let sedan = vec![
+            (SEDAN.to_string(), "kit/Models/GLB format".to_string(), 30),
+            (
+                "kit/Models/FBX format/sedan.fbx".to_string(),
+                "kit/Models/FBX format".to_string(),
+                10,
+            ),
+            (
+                "kit/Models/OBJ format/sedan.obj".to_string(),
+                "kit/Models/OBJ format".to_string(),
+                20,
+            ),
+        ];
+        assert_eq!(members(SEDAN).await, sedan);
+        assert_eq!(members("kit/Models/OBJ format/sedan.obj").await, sedan);
+        // Copies of one format: the main item first, the rest by path.
+        let colormaps: Vec<String> = members(COLORMAP)
+            .await
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(
+            colormaps,
+            strings(&[COLORMAP, "kit/Models/FBX format/Textures/colormap.png"])
+        );
+        // A file on its own is listed alone.
+        assert_eq!(
+            members(ROCK).await,
+            vec![(ROCK.to_string(), "other".to_string(), 25)]
+        );
+        let paths: Vec<String> = group_members(&lib, SEDAN)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.asset.file_path)
+            .collect();
+        assert_eq!(paths[0], format!("/libraries/lib/{SEDAN}"));
     }
 
     #[tokio::test]

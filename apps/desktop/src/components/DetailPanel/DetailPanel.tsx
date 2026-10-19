@@ -5,10 +5,12 @@ import {
   useAssetStore,
   useTagStore,
   useCollectionStore,
+  useGroupDetailStore,
   lookupAsset,
+  shownMember,
 } from '../../store';
 import { convertFileSrc } from '@tauri-apps/api/core';
-import type { Asset, ColorLabel, Collection } from '../../types';
+import type { Asset, ColorLabel, Collection, GroupMember } from '../../types';
 import {
   IconStar,
   IconX,
@@ -22,10 +24,12 @@ import {
   IconTrash,
   IconHeart,
   IconHeartFilled,
+  IconChevronRight,
 } from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { api } from '../../api';
 import { isWebviewDisplayable } from '../../utils/media';
+import { formatSize } from '../../utils/format';
 import { useImageScaling } from '../../hooks/useImageScaling';
 import { ThreeViewer } from './ThreeViewer';
 import { SuggestTags } from './SuggestTags';
@@ -55,12 +59,24 @@ export function DetailPanel() {
   const addToCollection = useCollectionStore((s) => s.addToCollection);
   const removeFromCollection = useCollectionStore((s) => s.removeFromCollection);
   const [tab, setTab] = useState<'info' | 'tags' | 'collections' | 'preview'>('info');
-  const scaling = useImageScaling('contain');
 
   const [isEditingName, setIsEditingName] = useState(false);
   const [editingName, setEditingName] = useState('');
   const [panelError, setPanelError] = useState<string | null>(null);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
+
+  // A group card lists its files; the panel shows one of them in place of the group on a click,
+  // while the grid keeps the card selected (plan C19)
+  const groupId = useGroupDetailStore((s) => s.groupId);
+  const members = useGroupDetailStore((s) => s.members);
+  const member = useGroupDetailStore(shownMember);
+  const loadGroup = useGroupDetailStore((s) => s.load);
+  const showMember = useGroupDetailStore((s) => s.showMember);
+  const backToGroup = useGroupDetailStore((s) => s.backToGroup);
+  // Reloaded whenever the cached card changes, so a refresh after a rename or delete shows here
+  useEffect(() => {
+    loadGroup(asset?.groupFormats ? asset.id : null);
+  }, [asset, loadGroup]);
 
   useEffect(() => {
     setIsEditingName(false);
@@ -154,60 +170,48 @@ export function DetailPanel() {
     );
   }
 
+  const groupMembers = groupId === asset.id && members.length > 1 ? members : [];
+  if (member && groupId === asset.id) {
+    return (
+      <aside className={styles.panel} id="detail-panel" data-group-member-view={member.id}>
+        <div className={styles.memberBar}>
+          <button
+            id="detail-back-to-group"
+            className={styles.backBtn}
+            onClick={backToGroup}
+            title={`Back to ${asset.fileName}`}
+          >
+            <IconChevronRight size={12} className={styles.backIcon} />
+            <span>Back to group</span>
+          </button>
+        </div>
+        <div className={styles.thumbArea}>
+          <AssetPreview asset={member} />
+        </div>
+        <div className={styles.header}>
+          <p className={clsx(styles.fileName, 'truncate')} title={member.fileName}>
+            {member.fileName}
+          </p>
+          <div className={styles.headerActions}>
+            <FileActions filePath={member.filePath} idPrefix="detail-member" />
+          </div>
+        </div>
+        <div className={styles.tabContent}>
+          <div className={styles.infoGrid}>
+            <FileInfo asset={member} />
+          </div>
+        </div>
+      </aside>
+    );
+  }
+
   const isPending = asset.previewStatus === 'pending' || asset.previewStatus === 'generating';
-  const isError = asset.previewStatus === 'error';
 
   return (
     <aside className={styles.panel} id="detail-panel">
       {/* Preview thumbnail */}
       <div className={styles.thumbArea}>
-        {isWebviewDisplayable(asset.extension) ? (
-          <img
-            src={convertFileSrc(asset.filePath)}
-            alt={asset.fileName}
-            className={styles.thumbImg}
-            ref={scaling}
-          />
-        ) : asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb') ? (
-          <img
-            src={convertFileSrc(asset.thumbnailPath)}
-            alt={asset.fileName}
-            className={styles.thumbImg}
-            ref={scaling}
-          />
-        ) : asset.kind === 'video' && asset.filePath ? (
-          <video
-            src={convertFileSrc(asset.filePath)}
-            preload="metadata"
-            muted
-            playsInline
-            controls
-            className={styles.thumbImg}
-            style={{ objectFit: 'contain' }}
-            onLoadedMetadata={(e) => {
-              try {
-                e.currentTarget.currentTime = 0.1;
-              } catch {}
-            }}
-          />
-        ) : asset.metadata?.preview_model || asset.thumbnailPath?.endsWith('.glb') ? (
-          <ThreeViewer
-            modelPath={(asset.metadata?.preview_model as string) || asset.thumbnailPath!}
-          />
-        ) : (
-          <div className={styles.thumbPlaceholder}>
-            <span className={styles.thumbExt}>.{asset.extension}</span>
-            <button
-              className={styles.thumbGenerateBtn}
-              onClick={handleGeneratePreview}
-              disabled={isPending}
-              title={isError ? 'Preview failed. Click to retry' : 'Generate preview'}
-            >
-              <IconRefresh size={12} className={clsx(isPending && 'animate-spin')} />
-              <span>{isPending ? 'Generating…' : isError ? 'Retry' : 'Generate'}</span>
-            </button>
-          </div>
-        )}
+        <AssetPreview asset={asset} onGeneratePreview={handleGeneratePreview} />
       </div>
 
       {/* File name + actions */}
@@ -296,42 +300,7 @@ export function DetailPanel() {
           >
             <IconRefresh size={14} className={clsx(isPending && 'animate-spin')} />
           </button>
-          <button
-            id="detail-open-external"
-            className={styles.actionBtn}
-            title="Open with default app"
-            onClick={async () => {
-              try {
-                await api.openWithDefault(asset.filePath);
-              } catch (err) {
-                console.error('Failed to open with default app:', err);
-              }
-            }}
-          >
-            <IconExternal size={14} />
-          </button>
-          <button
-            id="detail-reveal"
-            className={styles.actionBtn}
-            title="Reveal in file manager"
-            onClick={async () => {
-              try {
-                await api.revealInFileManager(asset.filePath);
-              } catch (err) {
-                console.error('Failed to reveal in file manager:', err);
-              }
-            }}
-          >
-            <IconEye size={14} />
-          </button>
-          <button
-            id="detail-copy-path"
-            className={styles.actionBtn}
-            title="Copy path"
-            onClick={() => navigator.clipboard.writeText(asset.filePath)}
-          >
-            <IconCopy size={14} />
-          </button>
+          <FileActions filePath={asset.filePath} idPrefix="detail" />
           <button
             id="detail-delete"
             className={clsx(styles.actionBtn, styles.actionBtnDanger)}
@@ -355,6 +324,8 @@ export function DetailPanel() {
           {panelError}
         </div>
       )}
+
+      {groupMembers.length > 0 && <GroupFiles members={groupMembers} onShow={showMember} />}
 
       {/* Tabs */}
       <div className={styles.tabs}>
@@ -493,7 +464,16 @@ function InfoTab({
         ))}
       </div>
 
-      {/* File info */}
+      <FileInfo asset={asset} />
+    </div>
+  );
+}
+
+// ── File info ─────────────────────────────────────────────────────────────
+/** A file's own details, as rows of an `infoGrid`: the Info tab's and a group member's. */
+function FileInfo({ asset }: { asset: Asset }) {
+  return (
+    <>
       <label className={styles.infoLabel}>Path</label>
       <span
         className={clsx(styles.infoValue, styles.mono, 'truncate')}
@@ -545,7 +525,7 @@ function InfoTab({
           ))}
         </>
       )}
-    </div>
+    </>
   );
 }
 
@@ -692,11 +672,7 @@ function PreviewTab({ asset, onGeneratePreview }: { asset: Asset; onGeneratePrev
     (asset.metadata?.preview_model as string) ||
     (asset.thumbnailPath?.endsWith('.glb') ? asset.thumbnailPath : undefined);
   // The original where the webview can display it, as in the header preview
-  const imagePath = isWebviewDisplayable(asset.extension)
-    ? asset.filePath
-    : asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb')
-      ? asset.thumbnailPath
-      : undefined;
+  const imagePath = imageOf(asset);
   const isPending = asset.previewStatus === 'pending' || asset.previewStatus === 'generating';
   const isError = asset.previewStatus === 'error';
   const scaling = useImageScaling('contain');
@@ -783,5 +759,194 @@ function PreviewTab({ asset, onGeneratePreview }: { asset: Asset; onGeneratePrev
         </div>
       )}
     </div>
+  );
+}
+
+// ── Preview ───────────────────────────────────────────────────────────────
+/**
+ * The image that stands for `asset`: the original where the webview can display it, else its
+ * rendered thumbnail. `undefined` when it has neither, or its preview is a model.
+ */
+function imageOf(asset: Asset): string | undefined {
+  if (isWebviewDisplayable(asset.extension)) return asset.filePath;
+  if (asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb')) return asset.thumbnailPath;
+  return undefined;
+}
+
+/**
+ * The panel's preview of `asset`. Without `onGeneratePreview`, as for a group member, which the
+ * preview queue skips, a file with no preview shows only its extension.
+ */
+function AssetPreview({
+  asset,
+  onGeneratePreview,
+}: {
+  asset: Asset;
+  onGeneratePreview?: () => void;
+}) {
+  const scaling = useImageScaling('contain');
+  const image = imageOf(asset);
+  const isPending = asset.previewStatus === 'pending' || asset.previewStatus === 'generating';
+  const isError = asset.previewStatus === 'error';
+
+  if (image) {
+    return (
+      <img
+        src={convertFileSrc(image)}
+        alt={asset.fileName}
+        className={styles.thumbImg}
+        ref={scaling}
+      />
+    );
+  }
+  if (asset.kind === 'video' && asset.filePath) {
+    return (
+      <video
+        src={convertFileSrc(asset.filePath)}
+        preload="metadata"
+        muted
+        playsInline
+        controls
+        className={styles.thumbImg}
+        style={{ objectFit: 'contain' }}
+        onLoadedMetadata={(e) => {
+          try {
+            e.currentTarget.currentTime = 0.1;
+          } catch {}
+        }}
+      />
+    );
+  }
+  if (asset.metadata?.preview_model || asset.thumbnailPath?.endsWith('.glb')) {
+    return (
+      <ThreeViewer modelPath={(asset.metadata?.preview_model as string) || asset.thumbnailPath!} />
+    );
+  }
+  return (
+    <div className={styles.thumbPlaceholder}>
+      <span className={styles.thumbExt}>.{asset.extension}</span>
+      {onGeneratePreview && (
+        <button
+          className={styles.thumbGenerateBtn}
+          onClick={onGeneratePreview}
+          disabled={isPending}
+          title={isError ? 'Preview failed. Click to retry' : 'Generate preview'}
+        >
+          <IconRefresh size={12} className={clsx(isPending && 'animate-spin')} />
+          <span>{isPending ? 'Generating…' : isError ? 'Retry' : 'Generate'}</span>
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ── File actions ──────────────────────────────────────────────────────────
+/** Open, Reveal and Copy path on one file. With `idPrefix`, the buttons get ids under it. */
+function FileActions({ filePath, idPrefix }: { filePath: string; idPrefix?: string }) {
+  const id = (name: string) => (idPrefix ? `${idPrefix}-${name}` : undefined);
+  return (
+    <>
+      <button
+        id={id('open-external')}
+        data-file-action="open"
+        className={styles.actionBtn}
+        title="Open with default app"
+        onClick={async (e) => {
+          e.stopPropagation();
+          try {
+            await api.openWithDefault(filePath);
+          } catch (err) {
+            console.error('Failed to open with default app:', err);
+          }
+        }}
+      >
+        <IconExternal size={14} />
+      </button>
+      <button
+        id={id('reveal')}
+        data-file-action="reveal"
+        className={styles.actionBtn}
+        title="Reveal in file manager"
+        onClick={async (e) => {
+          e.stopPropagation();
+          try {
+            await api.revealInFileManager(filePath);
+          } catch (err) {
+            console.error('Failed to reveal in file manager:', err);
+          }
+        }}
+      >
+        <IconEye size={14} />
+      </button>
+      <button
+        id={id('copy-path')}
+        data-file-action="copy-path"
+        className={styles.actionBtn}
+        title="Copy path"
+        onClick={(e) => {
+          e.stopPropagation();
+          navigator.clipboard.writeText(filePath);
+        }}
+      >
+        <IconCopy size={14} />
+      </button>
+    </>
+  );
+}
+
+// ── Group files ───────────────────────────────────────────────────────────
+/**
+ * A format group's files, main item first, each with its format, folder and size and its own
+ * file actions. Clicking one shows its details in the panel.
+ */
+function GroupFiles({ members, onShow }: { members: GroupMember[]; onShow: (id: string) => void }) {
+  return (
+    <section className={styles.groupFiles} id="detail-group-files">
+      <p className={styles.groupFilesTitle}>Files ({members.length})</p>
+      <ul className={styles.groupFileList}>
+        {members.map((m, i) => {
+          const image = imageOf(m);
+          const folder = m.folder || '/';
+          return (
+            <li
+              key={m.id}
+              data-group-member={m.id}
+              className={styles.groupFile}
+              role="button"
+              tabIndex={0}
+              title={`Show ${m.fileName}`}
+              onClick={() => onShow(m.id)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onShow(m.id);
+                }
+              }}
+            >
+              <span className={styles.groupFileThumb}>
+                {image ? (
+                  <img src={convertFileSrc(image)} alt="" loading="lazy" />
+                ) : (
+                  <span className={styles.groupFileExt}>{m.extension.toUpperCase()}</span>
+                )}
+              </span>
+              <span className={styles.groupFileText}>
+                <span className={styles.groupFileFormat}>
+                  {m.extension.toUpperCase()}
+                  {i === 0 && <span className={styles.groupFileMain}>main</span>}
+                  <span className={styles.groupFileSize}>{formatSize(m.sizeBytes)}</span>
+                </span>
+                <span className={clsx(styles.groupFileFolder, 'truncate')} title={folder}>
+                  {folder}
+                </span>
+              </span>
+              <span className={styles.groupFileActions}>
+                <FileActions filePath={m.filePath} />
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
   );
 }

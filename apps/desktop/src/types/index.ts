@@ -76,6 +76,12 @@ export interface Asset {
   groupFormats?: string[];
 }
 
+/** One file of a format group, as the detail panel lists it (`get_group_members`) */
+export interface GroupMember extends Asset {
+  /** The folder holding the file, relative to its library root; `''` is the root */
+  folder: string;
+}
+
 export interface Library {
   id: string;
   name: string;

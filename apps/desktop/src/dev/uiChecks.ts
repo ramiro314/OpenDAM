@@ -1,13 +1,19 @@
 // The UI checks `VITE_SCROLL_BENCH=checks` runs (U1-U8 in
-// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U11 in
+// docs/plans/fast-collection-browsing/plan.md, M1 for the web process's memory, and U9-U12 in
 // docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
 // check here.
 
 import { api } from '../api';
-import { useAssetStore, useFolderTreeStore, useLibraryStore, useUIStore } from '../store';
+import {
+  cachedAssets,
+  useAssetStore,
+  useFolderTreeStore,
+  useLibraryStore,
+  useUIStore,
+} from '../store';
 import type { FolderNode, SortField, SortOrder } from '../types';
 import { isFolderShown } from '../components/Sidebar/sidebarHelpers';
-import { formatItemsAndFiles } from '../utils/format';
+import { formatItemsAndFiles, formatSize } from '../utils/format';
 import { assetAt } from '../store/pageCache';
 import { scrubKey } from '../utils/scrubKey';
 import {
@@ -1398,6 +1404,111 @@ export const UI_CHECKS: UiCheck[] = [
       );
 
       await searchWith({ text: '', folder: undefined }, waitFor);
+    },
+  },
+  {
+    id: 'U12',
+    title:
+      "A Kenney kit model's detail panel lists its GLB, FBX and OBJ files with folder and size, " +
+      'a member shows its own details and file actions, and Back to group returns, while the ' +
+      "grid's selection and cached pages stay as they were",
+    run: async ({ assert, waitFor, pause, sleep }) => {
+      // Waits out the first structure pass, which forms the groups
+      await expandBenchLibrary({ assert, sleep });
+      const modelsPath = '3D assets/Car Kit/Models';
+      await searchWith({ folder: { libraryId: BENCH_LIBRARY, path: modelsPath } }, waitFor);
+      const sedan = cachedAssets(useAssetStore.getState()).find((a) => a.fileName === 'sedan.glb');
+      assert(sedan, `no sedan.glb in the first pages of ${modelsPath}`);
+      useUIStore.getState().selectAsset(sedan!.id);
+
+      // The panel lists the model's files, main item first, each with its format, folder and size
+      const members = await api.getGroupMembers(sedan!.id);
+      const formats = members.map((m) => m.extension).join(',');
+      assert(formats === 'glb,fbx,obj', `sedan.glb's members are ${formats}`);
+      const memberRows = () => [...document.querySelectorAll<HTMLElement>('[data-group-member]')];
+      await waitFor(() => memberRows().length === members.length, 10_000, 'the group files');
+      memberRows().forEach((row, i) => {
+        const m = members[i];
+        assert(row.dataset.groupMember === m.id, `row ${i} is ${row.dataset.groupMember}`);
+        const folder = `${modelsPath}/${m.extension.toUpperCase()} format`;
+        assert(m.folder === folder, `${m.fileName}'s folder is ${m.folder}`);
+        for (const text of [m.extension.toUpperCase(), folder, formatSize(m.sizeBytes)]) {
+          assert(row.textContent?.includes(text), `${m.fileName}'s row lacks "${text}"`);
+        }
+      });
+      await pause('U12-group-files');
+
+      // What the grid holds while moving between members
+      const grid = () => {
+        const ui = useUIStore.getState();
+        const st = useAssetStore.getState();
+        return JSON.stringify({
+          selected: [...ui.selectedAssetIds],
+          focused: ui.focusedAssetId,
+          generation: st.generation,
+          epoch: st.epoch,
+          pages: [...st.pages].map(([page, assets]) => [page, assets.map((a) => a.id)]),
+        });
+      };
+      const before = grid();
+
+      // File actions act on the file they sit beside, recorded rather than run
+      const acted: string[] = [];
+      const realOpen = api.openWithDefault;
+      const realReveal = api.revealInFileManager;
+      const clipboard = navigator.clipboard;
+      assert(clipboard, 'no navigator.clipboard');
+      const realWrite = clipboard.writeText;
+      api.openWithDefault = async (path) => void acted.push(`open ${path}`);
+      api.revealInFileManager = async (path) => void acted.push(`reveal ${path}`);
+      clipboard.writeText = async (text) => void acted.push(`copy ${text}`);
+      const actOn = (scope: ParentNode) =>
+        (['open', 'reveal', 'copy-path'] as const).forEach((action) =>
+          scope.querySelector<HTMLElement>(`[data-file-action="${action}"]`)!.click()
+        );
+      const expectActed = (path: string, where: string) => {
+        const expected = [`open ${path}`, `reveal ${path}`, `copy ${path}`].join(' | ');
+        assert(acted.join(' | ') === expected, `${where} acted: ${acted.join(' | ')}`);
+        acted.length = 0;
+      };
+      try {
+        const fbx = members[1];
+        actOn(memberRows()[1]);
+        expectActed(fbx.filePath, "the FBX row's actions");
+        assert(!document.querySelector('[data-group-member-view]'), 'an action opened a member');
+
+        for (const m of [fbx, members[2]]) {
+          memberRows()
+            .find((r) => r.dataset.groupMember === m.id)!
+            .click();
+          const view = () =>
+            document.querySelector<HTMLElement>(`[data-group-member-view="${CSS.escape(m.id)}"]`);
+          await waitFor(() => view() !== null, 5_000, `${m.fileName}'s details`);
+          const text = view()!.textContent ?? '';
+          assert(text.includes(m.fileName), `the details lack ${m.fileName}`);
+          assert(text.includes(m.filePath), `the details lack ${m.filePath}`);
+          assert(!text.includes(sedan!.filePath), "the details show the GLB's path");
+          actOn(view()!);
+          expectActed(m.filePath, `${m.fileName}'s actions`);
+          if (m === fbx) await pause('U12-member');
+
+          document.getElementById('detail-back-to-group')!.click();
+          await waitFor(
+            () => !view() && memberRows().length === members.length,
+            5_000,
+            'back to the group'
+          );
+          assert(grid() === before, `the grid changed: ${before} became ${grid()}`);
+        }
+      } finally {
+        api.openWithDefault = realOpen;
+        api.revealInFileManager = realReveal;
+        clipboard.writeText = realWrite;
+      }
+      assert(useUIStore.getState().focusedAssetId === sedan!.id, 'the card lost the selection');
+
+      useUIStore.getState().clearSelection();
+      await searchWith({ folder: undefined }, waitFor);
     },
   },
 ];
