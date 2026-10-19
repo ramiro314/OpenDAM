@@ -200,6 +200,14 @@ The UI checks, each defined in its plan:
   finds `sedan.glb` through its FBX copy's folder.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 3. Screenshots:
   `U11-kit-models`, `U11-list-badge`, `U11-fbx-format`.
+- **U12** (group detail): selecting `sedan.glb` in `3D assets/Car Kit/Models` lists its GLB, FBX
+  and OBJ files in the detail panel, in that order, each with its format, folder and size. Each
+  file's Open, Reveal and Copy path, recorded rather than run, act on that file, in its row and in
+  its own details, which show on a click with "Back to group". Moving between the FBX and OBJ
+  files and back leaves the grid's selection and cached pages unchanged. Selecting the kit's
+  `colormap.png` then lists its copies, each row showing that copy's own image.
+  [smarter-big-collections](../plans/smarter-big-collections/plan.md), C19. Screenshots:
+  `U12-group-files`, `U12-member`, `U12-2d-members`.
 
 Run it with the script, from the repo root:
 

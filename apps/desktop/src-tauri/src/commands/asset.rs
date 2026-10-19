@@ -6,7 +6,9 @@ use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use crate::db::{make_relative_path, resolve_path, upsert_tag, Database, LibraryHandle};
-use crate::models::{Asset, AssetPatch, FilterSpec, SearchPayload, SearchQuery, SearchResult};
+use crate::models::{
+    Asset, AssetPatch, FilterSpec, GroupMember, SearchPayload, SearchQuery, SearchResult,
+};
 use crate::structure;
 use crate::AppState;
 
@@ -886,6 +888,61 @@ pub async fn get_asset(id: String, state: State<'_, Arc<AppState>>) -> Result<As
     }
 
     Err(format!("Asset not found: {}", id))
+}
+
+/// The files of the group asset `id` belongs to, for the detail panel: the main item first, then
+/// the others in the order the group picks its main item by (`structure::format_rank`), ties by
+/// path ignoring case. A file on its own is listed alone.
+#[tauri::command]
+pub async fn get_group_members(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<GroupMember>> {
+    let lib = state
+        .db
+        .library_of_asset(&id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Asset not found: {}", id))?;
+    group_members(&lib, &id).await.map_err(|e| e.to_string())
+}
+
+#[derive(sqlx::FromRow)]
+struct MemberRow {
+    is_main: bool,
+    #[sqlx(flatten)]
+    row: RawAssetRow,
+}
+
+async fn group_members(lib: &LibraryHandle, id: &str) -> sqlx::Result<Vec<GroupMember>> {
+    let sql = format!(
+        "SELECT a.group_id IS a.id AS is_main, {ASSET_COLUMNS} FROM assets a
+         WHERE a.id = ?1 OR a.group_id = (SELECT group_id FROM assets WHERE id = ?1)"
+    );
+    let mut rows = sqlx::query_as::<_, MemberRow>(&sql)
+        .bind(id)
+        .fetch_all(&lib.pool)
+        .await?;
+    rows.sort_by_cached_key(|m| {
+        (
+            !m.is_main,
+            structure::format_rank(&m.row.extension),
+            m.row.file_path.to_ascii_lowercase(),
+            m.row.file_path.clone(),
+        )
+    });
+    Ok(rows
+        .into_iter()
+        .map(|m| GroupMember {
+            folder: m
+                .row
+                .file_path
+                .rsplit_once('/')
+                .map_or("", |(dir, _)| dir)
+                .to_string(),
+            asset: row_to_asset(Some(&lib.root_path), m.row),
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -3629,8 +3686,13 @@ mod tests {
     /// A library holding `GROUPED_FILES`, each with its real extension and kind and its id the
     /// path, after its structure pass.
     async fn grouped_library() -> LibraryHandle {
+        sized_library(&GROUPED_FILES).await
+    }
+
+    /// A library holding `files`, as `grouped_library` holds `GROUPED_FILES`.
+    async fn sized_library(files: &[(&str, i64)]) -> LibraryHandle {
         let pool = memory_library_pool().await;
-        for (path, size) in GROUPED_FILES {
+        for &(path, size) in files {
             let name = path.rsplit('/').next().unwrap();
             let ext = name.rsplit_once('.').unwrap().1;
             sqlx::query(
@@ -3670,6 +3732,98 @@ mod tests {
         let size = |id: &String| GROUPED_FILES.iter().find(|(p, _)| p == id).unwrap().1;
         ids.sort_by_key(size);
         (ids, total, files)
+    }
+
+    #[tokio::test]
+    async fn a_groups_members_list_in_main_item_order_from_any_member() {
+        let lib = grouped_library().await;
+        let members = |id: &'static str| {
+            let lib = &lib;
+            async move {
+                group_members(lib, id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|m| (m.asset.id, m.folder, m.asset.size_bytes))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let sedan = vec![
+            (SEDAN.to_string(), "kit/Models/GLB format".to_string(), 30),
+            (
+                "kit/Models/FBX format/sedan.fbx".to_string(),
+                "kit/Models/FBX format".to_string(),
+                10,
+            ),
+            (
+                "kit/Models/OBJ format/sedan.obj".to_string(),
+                "kit/Models/OBJ format".to_string(),
+                20,
+            ),
+        ];
+        assert_eq!(members(SEDAN).await, sedan);
+        assert_eq!(members("kit/Models/OBJ format/sedan.obj").await, sedan);
+        // Copies of one format: the main item first, the rest by path.
+        let colormaps: Vec<String> = members(COLORMAP)
+            .await
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(
+            colormaps,
+            strings(&[COLORMAP, "kit/Models/FBX format/Textures/colormap.png"])
+        );
+        // A file on its own is listed alone.
+        assert_eq!(
+            members(ROCK).await,
+            vec![(ROCK.to_string(), "other".to_string(), 25)]
+        );
+        let paths: Vec<String> = group_members(&lib, SEDAN)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.asset.file_path)
+            .collect();
+        assert_eq!(paths[0], format!("/libraries/lib/{SEDAN}"));
+    }
+
+    #[tokio::test]
+    async fn a_groups_members_order_by_format_then_by_path_ignoring_case() {
+        let ids = |lib: LibraryHandle, id: &'static str| async move {
+            group_members(&lib, id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.asset.id)
+                .collect::<Vec<_>>()
+        };
+        // The OBJ's path sorts before the FBX's, but FBX ranks first as a format.
+        let ship = sized_library(&[
+            ("ship/ship.glb", 1),
+            ("ship/ship.fbx", 1),
+            ("ship/obj/ship.obj", 1),
+        ])
+        .await;
+        assert_eq!(
+            ids(ship, "ship/ship.glb").await,
+            strings(&["ship/ship.glb", "ship/ship.fbx", "ship/obj/ship.obj"])
+        );
+        // Copies of one format follow their path ignoring case: `fbx/` before `OBJ/`, which
+        // byte order would put first.
+        let kit = sized_library(&[
+            ("kit/GLB format/tex.png", 1),
+            ("kit/OBJ/tex.png", 1),
+            ("kit/fbx/tex.png", 1),
+        ])
+        .await;
+        assert_eq!(
+            ids(kit, "kit/OBJ/tex.png").await,
+            strings(&[
+                "kit/GLB format/tex.png",
+                "kit/fbx/tex.png",
+                "kit/OBJ/tex.png"
+            ])
+        );
     }
 
     #[tokio::test]

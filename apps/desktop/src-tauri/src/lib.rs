@@ -225,6 +225,7 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::library::refresh_all_libraries,
             commands::asset::search_assets,
             commands::asset::get_asset,
+            commands::asset::get_group_members,
             commands::asset::update_asset,
             commands::asset::delete_asset,
             commands::asset::delete_assets,
