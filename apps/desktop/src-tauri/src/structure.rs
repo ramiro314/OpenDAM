@@ -317,8 +317,8 @@ fn pack_files<'a>(
 }
 
 /// The pack name a Kenney license header gives: its first line (`Car Kit (3.1)`) without the
-/// version in parentheses, when the next line names the author (`Created/distributed by Kenney`
-/// or `by Kenney Vleugels`). `None` for any other text, such as an MIT or CC license.
+/// version in parentheses, when the next line names Kenney as the author (`Created/distributed
+/// by Kenney` or `by Kenney Vleugels`). `None` for any other text, such as an MIT or CC license.
 pub fn kenney_header_name(text: &str) -> Option<String> {
     let mut lines = text
         .trim_start_matches('\u{feff}')
@@ -327,7 +327,16 @@ pub fn kenney_header_name(text: &str) -> Option<String> {
         .filter(|l| !l.is_empty());
     let title = lines.next()?;
     let byline = lines.next()?.to_lowercase();
-    if !(byline.starts_with("created/distributed by") || byline.starts_with("by ")) {
+    let names_kenney = ["created/distributed by kenney", "by kenney"]
+        .iter()
+        .any(|by| {
+            byline
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .starts_with(by)
+        });
+    if !names_kenney {
         return None;
     }
     // Drops a version such as ` (3.1)` or ` (1.5A)`, wherever it sits.
@@ -1157,6 +1166,9 @@ pub(crate) mod tests {
             "Creative Commons Zero v1.0 Universal\n\nCC0 1.0 Universal\n",
             "Car Kit (3.1)",
             "",
+            // A byline that doesn't name Kenney
+            "License Agreement\n\nBy downloading this pack you agree to these terms.\n",
+            "Space Pack\n\nCreated/distributed by Someone Else\n",
         ] {
             assert_eq!(header(text), None, "{text:?}");
         }
