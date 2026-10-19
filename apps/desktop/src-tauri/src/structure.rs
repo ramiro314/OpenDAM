@@ -1,7 +1,7 @@
 //! The structure pass: a library's folder tree, its packs, its support files, its format groups
 //! with their bundled previews, and its 2D stacks, derived from the paths it has indexed
 //! (docs/plans/smarter-big-collections/plan.md, "The structure pass"). `derive` is a pure function
-//! over the paths and the license headers, and the pass writes only the folder rows and `assets.support_role`,
+//! over the paths, their sizes and what the license files say, and the pass writes only the folder rows and `assets.support_role`,
 //! `assets.group_id` and `assets.bundled_preview` values that differ from it, and the metadata of
 //! the groups that form or grow (`apply_unions`). Every index run ends with the pass
 //! (`watcher::index_paths`), and so does every command that changes the paths, through
