@@ -406,7 +406,8 @@ export const UI_CHECKS: UiCheck[] = [
         assert(
           first === Math.min(...shown) + 1 && last === Math.max(...shown) + 1,
           `step ${step}: the footer reads ${first}-${last}, rows ${Math.min(...shown) + 1}-` +
-            `${Math.max(...shown) + 1} are visible`
+            `${Math.max(...shown) + 1} are visible (scrollTop ${el.scrollTop}, viewport ` +
+            `${el.getBoundingClientRect().height} px)`
         );
         if (step === steps) assert(last === total, `at the bottom the footer ends at ${last}`);
         if (step === steps / 2) await pause('U3-list-middle');
