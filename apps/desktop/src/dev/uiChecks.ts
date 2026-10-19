@@ -1376,6 +1376,15 @@ async function checkPacksView({
   assert(!useAssetStore.getState().query.folder, 'a click opened the pack');
   card.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
   await opened(kit!, 'a double-click');
+  // The tree's pack node shows the pack's cover
+  await waitFor(
+    () => {
+      const img = folderRow(kit!.path)?.querySelector<HTMLImageElement>('img[data-pack-cover]');
+      return Boolean(img?.complete && img.naturalWidth > 0);
+    },
+    10_000,
+    `the cover of ${kit!.path} in the tree`
+  );
   await pause('U10-pack-opened');
 
   await benchLibraryRoot(waitFor);

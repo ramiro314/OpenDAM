@@ -191,8 +191,8 @@ The UI checks, each defined in its plan:
   order, each with a cover, the visible ones loaded, 24 labelled "No visible items" and none for
   the 11 zip-only folders in `Archive/`. Search text, a kind filter and "Show hidden files" each
   show assets until cleared, as does the toggle's Assets. A click selects the Car Kit card, a
-  double-click selects its pack in the tree and shows its assets, and Enter on a card does the
-  same.
+  double-click selects its pack in the tree, whose node shows the pack's cover, and shows its
+  assets, and Enter on a card does the same.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 2. Screenshots:
   `U10-license-hidden`, `U10-license-shown`, `U10-packs-view`, `U10-no-visible-items`,
   `U10-pack-opened`.
