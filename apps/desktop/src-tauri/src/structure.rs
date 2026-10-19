@@ -2010,11 +2010,11 @@ pub(crate) mod tests {
             "kit/License.txt",
             "kit/Preview.png",
             "kit/Default/Preview.png",
-            // A texture's copies under model format folders are a format group already, and a
-            // vector copy beside them doesn't join it.
+            // A texture's copies under model format folders are a format group already. A scale
+            // copy beside the GLB one shares its stack folder, but doesn't join it.
             "kit/Models/GLB format/Textures/colormap.png",
             "kit/Models/OBJ format/Textures/colormap.png",
-            "kit/Models/Vector/Textures/colormap.svg",
+            "kit/Models/GLB format/Textures/Double/colormap.png",
             // A render is its model's bundled preview
             "kit/Models/GLB format/barrel.glb",
             "kit/Previews/barrel.png",
@@ -2030,6 +2030,7 @@ pub(crate) mod tests {
                 "kit/Models/OBJ format/Textures/colormap.png",
             ]]
         );
+        assert_eq!(derive(paths).groups[5], None, "the scale copy stacks");
     }
 
     /// Every `folders` row, every asset's support role, the main item's path of every grouped
