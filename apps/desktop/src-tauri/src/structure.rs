@@ -1,7 +1,8 @@
 //! The structure pass: a library's folder tree, its packs, its support files and its format
 //! groups, derived from the paths it has indexed (docs/plans/smarter-big-collections/plan.md,
 //! "The structure pass"). `derive` is a pure function over the paths, and the pass writes only
-//! the folder rows and `assets.support_role` and `assets.group_id` values that differ from it.
+//! the folder rows and `assets.support_role` and `assets.group_id` values that differ from it,
+//! and the metadata of the groups that form or grow (`apply_unions`).
 //! Every index run ends with the pass (`watcher::index_paths`), and so does every command that
 //! changes the paths, through `rebuild_library`. Nothing else writes `folders`, `support_role`
 //! or `group_id`.
@@ -524,6 +525,130 @@ async fn apply_groups(
     Ok(changed.len())
 }
 
+/// The files a metadata write on `id` reaches (plan C20): every member of its group, the main
+/// item included, or `id` alone for a file on its own. Support files never group, so a model's
+/// bundled preview is never one. Rating, color label, favorite, description, tag and collection
+/// writes all go through it, in their own transaction.
+pub async fn group_members<'e, E>(executor: E, id: &str) -> sqlx::Result<Vec<String>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query_scalar(
+        "SELECT ?1 UNION SELECT id FROM assets WHERE group_id = (SELECT group_id FROM assets WHERE id = ?1)",
+    )
+    .bind(id)
+    .fetch_all(executor)
+    .await
+}
+
+/// The `library_meta` key recording that every group of a library had its metadata unioned
+/// once. Groups formed before group writes existed (plan step 3) never were.
+const GROUP_UNION_KEY: &str = "group_metadata_union";
+
+/// One file's metadata, as a group's union reads it. Each field's default means unset.
+#[derive(sqlx::FromRow)]
+struct Metadata {
+    rating: i64,
+    color_label: String,
+    is_favorite: bool,
+    description: String,
+}
+
+/// Unions the metadata of every group that forms or grows (plan C14), or of every group once per
+/// library (`GROUP_UNION_KEY`), in transactions of `BATCH` groups. Each member gets every tag and
+/// collection a member has, and the main item's rating, color label, favorite and description.
+/// A field the main item leaves unset takes the first member's that is set, by path, so a GLB
+/// that joins a rated FBX doesn't drop its rating. It runs before `apply_groups` and reads the
+/// groups from `groups`, so a pass interrupted between the two unions again. A dissolved group's
+/// files keep what they have. Returns how many groups it unioned.
+async fn apply_unions(
+    pool: &Pool<Sqlite>,
+    files: &[FileRow],
+    groups: &[Option<usize>],
+) -> sqlx::Result<usize> {
+    let all: bool =
+        sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM library_meta WHERE key = ?)")
+            .bind(GROUP_UNION_KEY)
+            .fetch_one(pool)
+            .await?;
+    let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, main) in groups.iter().enumerate() {
+        if let Some(main) = *main {
+            members.entry(main).or_default().push(i);
+        }
+    }
+    let changed: Vec<(usize, Vec<usize>)> = members
+        .into_iter()
+        .filter(|(main, group)| {
+            all || group
+                .iter()
+                .any(|&i| files[i].group_id.as_deref() != Some(files[*main].id.as_str()))
+        })
+        .collect();
+    for chunk in changed.chunks(BATCH) {
+        let mut tx = pool.begin().await?;
+        for (main, group) in chunk {
+            let mut group = group.clone();
+            group.sort_by_key(|&i| (i != *main, files[i].file_path.to_ascii_lowercase()));
+            let ids: Vec<&str> = group.iter().map(|&i| files[i].id.as_str()).collect();
+            let ids = serde_json::to_string(&ids).expect("ids serialize");
+            sqlx::query(
+                "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id)
+                 SELECT m.value, t.tag_id FROM json_each(?1) m
+                 JOIN asset_tags t ON t.asset_id IN (SELECT value FROM json_each(?1))",
+            )
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id)
+                 SELECT c.collection_id, m.value FROM json_each(?1) m
+                 JOIN collection_assets c ON c.asset_id IN (SELECT value FROM json_each(?1))",
+            )
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+
+            let rows: Vec<Metadata> = sqlx::query_as(
+                "SELECT a.rating, a.color_label, a.is_favorite, a.description
+                 FROM json_each(?) m JOIN assets a ON a.id = m.value ORDER BY m.key",
+            )
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            let first = |set: fn(&Metadata) -> bool| rows.iter().find(|r| set(r));
+            let rating = first(|r| r.rating != 0).map_or(0, |r| r.rating);
+            let color_label = first(|r| r.color_label != "none" && !r.color_label.is_empty())
+                .map_or("none", |r| r.color_label.as_str());
+            let is_favorite = rows.iter().any(|r| r.is_favorite);
+            let description =
+                first(|r| !r.description.is_empty()).map_or("", |r| r.description.as_str());
+            sqlx::query(
+                "UPDATE assets SET rating = ?, color_label = ?, is_favorite = ?, description = ?
+                 WHERE id IN (SELECT value FROM json_each(?))",
+            )
+            .bind(rating)
+            .bind(color_label)
+            .bind(is_favorite)
+            .bind(description)
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+    }
+    if all {
+        sqlx::query(
+            "INSERT INTO library_meta (key, value) VALUES (?, 'done')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(GROUP_UNION_KEY)
+        .execute(pool)
+        .await?;
+    }
+    Ok(changed.len())
+}
+
 /// Keeps group members off the preview queue (plan C15). A group member other than its main item
 /// comes off the queue, keeping any thumbnail it has, unless it is its group's stand-in
 /// (`preview_stand_ins`). Any other file at `none` whose format takes a preview goes on it: a new
@@ -610,9 +735,11 @@ pub async fn rebuild(pool: &Pool<Sqlite>) -> sqlx::Result<usize> {
     .fetch_all(pool)
     .await?;
     let structure = derive(files.iter().map(|f| f.file_path.as_str()));
-    let written = apply_folders(pool, &structure.folders).await?
-        + apply_roles(pool, &files, &structure.roles).await?
-        + apply_groups(pool, &files, &structure.groups).await?
+    let mut written = apply_folders(pool, &structure.folders).await?
+        + apply_roles(pool, &files, &structure.roles).await?;
+    // A union follows from the `group_id` writes counted next, so it isn't counted itself.
+    let unioned = apply_unions(pool, &files, &structure.groups).await?;
+    written += apply_groups(pool, &files, &structure.groups).await?
         + apply_previews(pool, &files, &structure).await?;
     let grouped = structure.groups.iter().flatten().count();
     let mains = structure
@@ -623,13 +750,14 @@ pub async fn rebuild(pool: &Pool<Sqlite>) -> sqlx::Result<usize> {
         .count();
     tracing::info!(
         target: "structure",
-        "Structure pass: {} files, {} folders, {} packs, {} support files, {} groups of {} files, {} rows written in {:?}",
+        "Structure pass: {} files, {} folders, {} packs, {} support files, {} groups of {} files, {} groups unioned, {} rows written in {:?}",
         files.len(),
         structure.folders.len(),
         structure.folders.values().filter(|f| f.is_pack).count(),
         structure.roles.iter().flatten().count(),
         mains,
         grouped,
+        unioned,
         written,
         started.elapsed()
     );
@@ -1713,5 +1841,306 @@ pub(crate) mod tests {
         // 111 kits go (1, 10-19, 100-199), and the root and `kits` change their count.
         assert_eq!(rebuild(&pool).await.unwrap(), 113);
         assert_eq!(derived_rows(&pool).await, fresh_pass(&rest).await);
+    }
+
+    /// The Car Kit's sedan in its three formats, by path. The GLB is the main item.
+    pub(crate) const SEDAN: [&str; 3] = [
+        "3D assets/Car Kit/Models/FBX format/sedan.fbx",
+        "3D assets/Car Kit/Models/GLB format/sedan.glb",
+        "3D assets/Car Kit/Models/OBJ format/sedan.obj",
+    ];
+    /// Kenney's render of the sedan, which is no member of its group.
+    pub(crate) const SEDAN_RENDER: &str = "3D assets/Car Kit/Previews/sedan.png";
+
+    /// A library holding `KENNEY_3D_KIT` after its first pass, each asset's id its path.
+    pub(crate) async fn car_kit() -> Pool<Sqlite> {
+        let pool = memory_library_pool().await;
+        for path in KENNEY_3D_KIT {
+            insert_path(&pool, path).await;
+        }
+        rebuild(&pool).await.unwrap();
+        pool
+    }
+
+    /// Every file holding a row of `sql` (`SELECT asset_id, <value> FROM ...`), by path, with
+    /// that row's value.
+    pub(crate) async fn rows(pool: &Pool<Sqlite>, sql: &str) -> Vec<(String, String)> {
+        sqlx::query_as(&format!("SELECT * FROM ({sql}) ORDER BY 1, 2"))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// `(id, value)` for each of `ids`, in order.
+    pub(crate) fn each(ids: &[&str], value: &str) -> Vec<(String, String)> {
+        ids.iter()
+            .map(|id| (id.to_string(), value.to_string()))
+            .collect()
+    }
+
+    async fn run(pool: &Pool<Sqlite>, sql: &str) {
+        sqlx::query(sql).execute(pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_members_are_a_files_whole_group_or_the_file_alone() {
+        let pool = car_kit().await;
+        for id in SEDAN {
+            let mut members = group_members(&pool, id).await.unwrap();
+            members.sort();
+            assert_eq!(members, SEDAN, "{id}");
+        }
+        for id in [SEDAN_RENDER, "3D assets/Car Kit/Preview.png", "not indexed"] {
+            assert_eq!(group_members(&pool, id).await.unwrap(), [id]);
+        }
+    }
+
+    /// The metadata columns of every model of the sedan and of its render.
+    async fn sedan_fields(pool: &Pool<Sqlite>) -> Vec<(String, String)> {
+        rows(
+            pool,
+            "SELECT id, rating || ' ' || color_label || ' ' || is_favorite || ' ' || description
+             FROM assets WHERE file_path LIKE '%/sedan.%'",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_group_that_forms_gives_every_member_the_union_of_its_files_metadata() {
+        let pool = memory_library_pool().await;
+        for path in [SEDAN[0], SEDAN_RENDER] {
+            insert_path(&pool, path).await;
+        }
+        rebuild(&pool).await.unwrap();
+        // The FBX on its own is tagged, collected, rated and described, and so is the render.
+        for sql in [
+            "INSERT INTO asset_tags (asset_id, tag_id) VALUES
+                 ('3D assets/Car Kit/Models/FBX format/sedan.fbx', 'car'),
+                 ('3D assets/Car Kit/Previews/sedan.png', 'render')",
+            "INSERT INTO collection_assets (collection_id, asset_id) VALUES
+                 ('vehicles', '3D assets/Car Kit/Models/FBX format/sedan.fbx'),
+                 ('pictures', '3D assets/Car Kit/Previews/sedan.png')",
+            "UPDATE assets SET rating = 4, color_label = 'blue', description = 'four doors'",
+        ] {
+            run(&pool, sql).await;
+        }
+        // The GLB and OBJ arrive, the GLB with a tag and a color label of its own.
+        for path in [SEDAN[1], SEDAN[2]] {
+            insert_path(&pool, path).await;
+        }
+        run(
+            &pool,
+            "INSERT INTO asset_tags (asset_id, tag_id) VALUES
+                 ('3D assets/Car Kit/Models/GLB format/sedan.glb', 'low-poly');
+             UPDATE assets SET color_label = 'red' WHERE extension = 'glb'",
+        )
+        .await;
+
+        rebuild(&pool).await.unwrap();
+
+        let mut tags = [each(&SEDAN, "car"), each(&SEDAN, "low-poly")].concat();
+        tags.push((SEDAN_RENDER.into(), "render".into()));
+        tags.sort();
+        assert_eq!(
+            rows(&pool, "SELECT asset_id, tag_id FROM asset_tags").await,
+            tags
+        );
+        let mut collections = each(&SEDAN, "vehicles");
+        collections.push((SEDAN_RENDER.into(), "pictures".into()));
+        assert_eq!(
+            rows(
+                &pool,
+                "SELECT asset_id, collection_id FROM collection_assets"
+            )
+            .await,
+            collections
+        );
+        // The GLB's color label wins. It has no rating or description, so the FBX's fill in.
+        let mut fields = each(&SEDAN, "4 red 0 four doors");
+        fields.push((SEDAN_RENDER.into(), "4 blue 0 four doors".into()));
+        assert_eq!(sedan_fields(&pool).await, fields);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_joins_a_group_gets_its_tags_and_its_main_items_fields() {
+        let pool = memory_library_pool().await;
+        for path in [SEDAN[0], SEDAN[1]] {
+            insert_path(&pool, path).await;
+        }
+        rebuild(&pool).await.unwrap();
+        run(
+            &pool,
+            "INSERT INTO asset_tags (asset_id, tag_id) VALUES
+                 ('3D assets/Car Kit/Models/FBX format/sedan.fbx', 'car'),
+                 ('3D assets/Car Kit/Models/GLB format/sedan.glb', 'car');
+             UPDATE assets SET rating = 2, is_favorite = 1, description = 'sedan'
+                 WHERE extension = 'glb';
+             UPDATE assets SET rating = 5, color_label = 'green', description = 'old'
+                 WHERE extension = 'fbx'",
+        )
+        .await;
+        insert_path(&pool, SEDAN[2]).await;
+        run(
+            &pool,
+            "INSERT INTO asset_tags (asset_id, tag_id) VALUES
+                 ('3D assets/Car Kit/Models/OBJ format/sedan.obj', 'wavefront');
+             UPDATE assets SET rating = 1 WHERE extension = 'obj'",
+        )
+        .await;
+
+        rebuild(&pool).await.unwrap();
+
+        assert_eq!(
+            rows(&pool, "SELECT asset_id, tag_id FROM asset_tags").await,
+            {
+                let mut tags = [each(&SEDAN, "car"), each(&SEDAN, "wavefront")].concat();
+                tags.sort();
+                tags
+            }
+        );
+        // The GLB's rating, favorite and description; the FBX's color label, the GLB having none.
+        assert_eq!(sedan_fields(&pool).await, each(&SEDAN, "2 green 1 sedan"));
+    }
+
+    #[tokio::test]
+    async fn a_dissolved_groups_files_keep_what_they_have() {
+        let pool = car_kit().await;
+        run(
+            &pool,
+            "INSERT INTO asset_tags (asset_id, tag_id) SELECT id, 'car' FROM assets
+                 WHERE file_path LIKE '%/sedan.%' AND extension != 'png';
+             UPDATE assets SET rating = 3;
+             DELETE FROM assets WHERE file_path LIKE '%/sedan.glb' OR file_path LIKE '%/sedan.obj'",
+        )
+        .await;
+
+        rebuild(&pool).await.unwrap();
+
+        // The FBX is on its own now, with the tag and the rating it had.
+        assert_eq!(
+            rows(
+                &pool,
+                "SELECT asset_id, tag_id FROM asset_tags WHERE asset_id IN (SELECT id FROM assets)"
+            )
+            .await,
+            each(&SEDAN[..1], "car")
+        );
+        assert_eq!(
+            sedan_fields(&pool).await,
+            [
+                (SEDAN[0].to_string(), "3 none 0 ".to_string()),
+                (SEDAN_RENDER.to_string(), "3 none 0 ".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn groups_formed_before_group_writes_union_once() {
+        let pool = car_kit().await;
+        run(
+            &pool,
+            "DELETE FROM library_meta;
+             INSERT INTO asset_tags (asset_id, tag_id) VALUES
+                 ('3D assets/Car Kit/Models/FBX format/sedan.fbx', 'car')",
+        )
+        .await;
+
+        rebuild(&pool).await.unwrap();
+        assert_eq!(
+            rows(&pool, "SELECT asset_id, tag_id FROM asset_tags").await,
+            each(&SEDAN, "car")
+        );
+
+        // Once recorded, a pass with no change to the group leaves the tags alone.
+        run(&pool, "DELETE FROM asset_tags WHERE asset_id LIKE '%.obj'").await;
+        assert_eq!(rebuild(&pool).await.unwrap(), 0);
+        assert_eq!(
+            rows(&pool, "SELECT asset_id, tag_id FROM asset_tags").await,
+            each(&SEDAN[..2], "car")
+        );
+    }
+
+    /// Statements that write one asset's metadata.
+    const METADATA_WRITES: [&str; 8] = [
+        "UPDATE assets SET rating",
+        "UPDATE assets SET color_label",
+        "UPDATE assets SET is_favorite",
+        "UPDATE assets SET description",
+        "INTO asset_tags",
+        "INTO collection_assets",
+        "DELETE FROM asset_tags WHERE asset_id = ? AND",
+        "DELETE FROM collection_assets WHERE collection_id = ? AND asset_id",
+    ];
+
+    /// Every function outside tests that holds one of `METADATA_WRITES`, by file, and whether it
+    /// calls `group_members`.
+    fn metadata_writers() -> Vec<(String, String, bool)> {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        files.sort();
+        let mut writers = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let code = text.split("mod tests {").next().unwrap();
+            // Each top-level item, from one unindented line to the next.
+            let mut items: Vec<String> = Vec::new();
+            for line in code.lines() {
+                if items.is_empty() || !(line.is_empty() || line.starts_with([' ', '}', ')'])) {
+                    items.push(String::new());
+                }
+                let item = items.last_mut().unwrap();
+                item.push_str(line);
+                item.push('\n');
+            }
+            for item in items {
+                if !METADATA_WRITES.iter().any(|w| item.contains(w)) {
+                    continue;
+                }
+                let name = item
+                    .split_once("fn ")
+                    .map(|(_, rest)| rest.split(['(', '<']).next().unwrap().to_string())
+                    .unwrap_or_default();
+                let file = file.strip_prefix(&root).unwrap().display().to_string();
+                writers.push((file, name, item.contains("group_members(")));
+            }
+        }
+        writers
+    }
+
+    #[test]
+    fn no_metadata_write_bypasses_group_members() {
+        let writers = metadata_writers();
+        let names: Vec<(&str, &str, bool)> = writers
+            .iter()
+            .map(|(file, name, expands)| (file.as_str(), name.as_str(), *expands))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("autotag/store.rs", "write_batch", true),
+                ("autotag/undo.rs", "remove_pairs", true),
+                ("commands/asset.rs", "apply_asset_patch", true),
+                ("commands/collection.rs", "add_assets_to_collection", true),
+                (
+                    "commands/collection.rs",
+                    "remove_assets_from_collection",
+                    true
+                ),
+                // The union itself, which writes to a group's members by their ids.
+                ("structure.rs", "apply_unions", false),
+            ],
+            "a metadata write must expand its asset through `group_members` (plan C20)"
+        );
     }
 }

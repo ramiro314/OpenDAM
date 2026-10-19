@@ -890,7 +890,9 @@ pub async fn update_asset(
     get_asset(id, state).await
 }
 
-/// Writes the patch to the asset's own library only, memberships included.
+/// Writes the patch to the asset's own library only, memberships included. Its metadata (rating,
+/// color label, favorite, description and tags) goes to every member of the asset's group
+/// (`structure::group_members`), and its thumbnail and preview status to the asset alone.
 async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Result<()> {
     let lib = db
         .library_of_asset(id)
@@ -899,39 +901,50 @@ async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Resul
         .ok_or_else(|| format!("Asset not found: {}", id))?;
     // One transaction, so a patch whose tags fail saves none of its other fields either.
     let mut tx = lib.pool.begin().await.map_err(|e| e.to_string())?;
+    let members = structure::group_members(&mut *tx, id)
+        .await
+        .map_err(|e| e.to_string())?;
 
     if let Some(rating) = patch.rating {
-        sqlx::query("UPDATE assets SET rating = ? WHERE id = ?")
-            .bind(rating)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        for member in &members {
+            sqlx::query("UPDATE assets SET rating = ? WHERE id = ?")
+                .bind(rating)
+                .bind(member)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
     if let Some(ref color_label) = patch.color_label {
-        sqlx::query("UPDATE assets SET color_label = ? WHERE id = ?")
-            .bind(color_label)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        for member in &members {
+            sqlx::query("UPDATE assets SET color_label = ? WHERE id = ?")
+                .bind(color_label)
+                .bind(member)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
     if let Some(is_fav) = patch.is_favorite {
         let fav_int: i64 = if is_fav { 1 } else { 0 };
-        sqlx::query("UPDATE assets SET is_favorite = ? WHERE id = ?")
-            .bind(fav_int)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        for member in &members {
+            sqlx::query("UPDATE assets SET is_favorite = ? WHERE id = ?")
+                .bind(fav_int)
+                .bind(member)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
     if let Some(ref description) = patch.description {
-        sqlx::query("UPDATE assets SET description = ? WHERE id = ?")
-            .bind(description)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        for member in &members {
+            sqlx::query("UPDATE assets SET description = ? WHERE id = ?")
+                .bind(description)
+                .bind(member)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
     if let Some(ref thumbnail_path) = patch.thumbnail_path {
         let rel_thumb = make_relative_path(&lib.root_path, Path::new(thumbnail_path));
@@ -951,11 +964,13 @@ async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Resul
             .map_err(|e| e.to_string())?;
     }
     if let Some(ref tags) = patch.tags {
-        sqlx::query("DELETE FROM asset_tags WHERE asset_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        for member in &members {
+            sqlx::query("DELETE FROM asset_tags WHERE asset_id = ?")
+                .bind(member)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         for tag_id in tags {
             // Copy master's definition, and its ancestors root first, into the mirror: a
             // mirror can lack them after a skipped name collision or a failed mirror write, and
@@ -977,12 +992,14 @@ async fn apply_asset_patch(db: &Database, id: &str, patch: &AssetPatch) -> Resul
                     .await
                     .map_err(|e| format!("Could not tag the asset with '{}': {}", tag.1, e))?;
             }
-            sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
-                .bind(id)
-                .bind(tag_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
+            for member in &members {
+                sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
+                    .bind(member)
+                    .bind(tag_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
         }
     }
 
@@ -4136,5 +4153,56 @@ mod tests {
                 times[times.len() - 1]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_patch_on_a_group_reaches_its_three_formats_and_not_the_render() {
+        use crate::structure::tests::{car_kit, each, rows, SEDAN, SEDAN_RENDER};
+        let pool = car_kit().await;
+        let db = memory_database(vec![memory_library("a", pool.clone())]).await;
+        insert_tag(&db.master_pool, "car", "Car").await;
+        let patch: AssetPatch = serde_json::from_value(serde_json::json!({
+            "rating": 4, "colorLabel": "red", "isFavorite": true,
+            "description": "four doors", "tags": ["car"],
+            "previewStatus": "error",
+        }))
+        .unwrap();
+
+        apply_asset_patch(&db, SEDAN[1], &patch).await.unwrap();
+
+        let tags = "SELECT asset_id, tag_id FROM asset_tags";
+        assert_eq!(rows(&pool, tags).await, each(&SEDAN, "car"));
+        assert_eq!(
+            rows(
+                &pool,
+                "SELECT id, rating || ' ' || color_label || ' ' || is_favorite || ' ' || description
+                 FROM assets WHERE rating != 0 OR color_label != 'none' OR is_favorite
+                     OR description != ''"
+            )
+            .await,
+            each(&SEDAN, "4 red 1 four doors")
+        );
+        // The preview status is the item's own.
+        assert_eq!(
+            rows(
+                &pool,
+                "SELECT id, preview_status FROM assets WHERE preview_status = 'error'"
+            )
+            .await,
+            each(&SEDAN[1..2], "error")
+        );
+        let render: Vec<String> = sqlx::query_scalar(
+            "SELECT rating || ' ' || color_label || ' ' || is_favorite FROM assets WHERE id = ?",
+        )
+        .bind(SEDAN_RENDER)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(render, ["0 none 0"]);
+
+        // Clearing the tags from a member's id clears them from the whole group.
+        let clear: AssetPatch = serde_json::from_value(serde_json::json!({ "tags": [] })).unwrap();
+        apply_asset_patch(&db, SEDAN[0], &clear).await.unwrap();
+        assert!(rows(&pool, tags).await.is_empty());
     }
 }
