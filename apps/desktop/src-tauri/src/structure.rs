@@ -1089,6 +1089,11 @@ pub(crate) mod tests {
             cover(&with(&["kit/Sources/Preview.png", "kit/Tiles/a.png"])).as_deref(),
             Some("kit/Sources/Preview.png")
         );
+        // A preview wins over a sample that sorts before it.
+        assert_eq!(
+            cover(&with(&["kit/Sample.png", "kit/Sources/Preview.png"])).as_deref(),
+            Some("kit/Sources/Preview.png")
+        );
     }
 
     #[test]
