@@ -8,6 +8,7 @@ import {
   useGroupDetailStore,
   usePackDetailStore,
   usePacksStore,
+  useFolderActionStore,
   lookupAsset,
   packRef,
   shownMember,
@@ -459,6 +460,9 @@ function PackPanel({ pack }: { pack: PackDetail }) {
       await api.setPackOverride(pack.libraryId, pack.path, { kind: 'cover', assetId: null });
     } catch (err) {
       console.error('Failed to reset the pack cover:', err);
+      useFolderActionStore
+        .getState()
+        .setFailure(`Resetting the cover of ${pack.name} failed: ${String(err)}`);
     }
   };
 
@@ -609,6 +613,9 @@ function PackPanel({ pack }: { pack: PackDetail }) {
                       await api.openUrl(edits.sourceUrl!);
                     } catch (err) {
                       console.error('Failed to open the source URL:', err);
+                      useFolderActionStore
+                        .getState()
+                        .setFailure(`Opening ${edits.sourceUrl} failed: ${String(err)}`);
                     }
                   }}
                 >
