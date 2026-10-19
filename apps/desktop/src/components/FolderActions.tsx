@@ -66,7 +66,11 @@ function PickerDialog({ target, action }: { target: FolderTarget; action: 'tag' 
 
   const noun = action === 'tag' ? 'tag' : 'collection';
   const title = action === 'tag' ? 'Add a tag to everything' : 'Add everything to a collection';
-  const close = () => !saving && closeDialog();
+  // Closing while a write waits on the library's index lock leaves the write running; it
+  // refetches the grid and the counts when it ends.
+  const close = closeDialog;
+  const dialog = useRef(useFolderActionStore.getState().dialog);
+  const stillOpen = () => useFolderActionStore.getState().dialog === dialog.current;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -74,8 +78,10 @@ function PickerDialog({ target, action }: { target: FolderTarget; action: 'tag' 
     setSaving(true);
     try {
       await applyFolderAction(target, action, chosen);
-      closeDialog();
+      if (stillOpen()) closeDialog();
     } catch (err) {
+      console.error(`Failed to ${title.toLowerCase()}:`, err);
+      if (!stillOpen()) return;
       setError(String(err));
       setSaving(false);
     }

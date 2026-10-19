@@ -279,27 +279,50 @@ pub(crate) async fn packs_below(
     Ok(cards)
 }
 
+/// A file a bulk write reaches, and the grid item it belongs to: its group's main item, or itself
+/// for a file on its own.
+type FileOfItem = (String, String);
+
 /// Every file below `folder` (`""` for the library root, which covers the whole library), with
 /// every member of the groups those files belong to, wherever it sits, so a bulk write keeps a
 /// group's members equal (plan C20). Support files are included: the write covers everything.
-async fn folder_members(pool: &Pool<Sqlite>, folder: &str) -> sqlx::Result<Vec<String>> {
+/// Sorted by item, so each group's members come together for `group_batches`.
+async fn folder_members(pool: &Pool<Sqlite>, folder: &str) -> sqlx::Result<Vec<FileOfItem>> {
     let Some([from, to]) = folder_range(folder) else {
-        return sqlx::query_scalar("SELECT id FROM assets ORDER BY rowid")
-            .fetch_all(pool)
-            .await;
+        return sqlx::query_as(
+            "SELECT id, COALESCE(group_id, id) AS item FROM assets ORDER BY item, id",
+        )
+        .fetch_all(pool)
+        .await;
     };
-    sqlx::query_scalar(
-        "SELECT id FROM assets WHERE file_path >= ?1 AND file_path < ?2
-         UNION
-         SELECT m.id FROM assets m WHERE m.group_id IN (
-             SELECT group_id FROM assets
-             WHERE file_path >= ?1 AND file_path < ?2 AND group_id IS NOT NULL
-         )",
+    sqlx::query_as(
+        "SELECT id, COALESCE(group_id, id) AS item FROM assets
+         WHERE file_path >= ?1 AND file_path < ?2
+            OR group_id IN (
+                SELECT group_id FROM assets
+                WHERE file_path >= ?1 AND file_path < ?2 AND group_id IS NOT NULL
+            )
+         ORDER BY item, id",
     )
     .bind(from)
     .bind(to)
     .fetch_all(pool)
     .await
+}
+
+/// Cuts `files`, sorted by item, into batches of about `structure::BATCH` files that each end at
+/// an item's last file, so a group's members always commit together.
+fn group_batches(files: &[FileOfItem]) -> Vec<&[FileOfItem]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    for end in 1..=files.len() {
+        let full = end - start >= structure::BATCH;
+        if end == files.len() || (full && files[end].1 != files[end - 1].1) {
+            batches.push(&files[start..end]);
+            start = end;
+        }
+    }
+    batches
 }
 
 /// The open library `library_id`.
@@ -321,7 +344,8 @@ pub async fn tag_folder(
     tag_folder_in(&state.db, &library_id, &folder_path, &tag_id).await
 }
 
-/// Writes in transactions of `structure::BATCH` files, each copying master's definition, with
+/// Writes in transactions of about `structure::BATCH` files that never split a group
+/// (`group_batches`), each copying master's definition, with
 /// its ancestors root first, into the library's mirror before the memberships, since a mirror can
 /// lack it. It holds the library's index lock, so no structure pass regroups the files meanwhile.
 async fn tag_folder_in(
@@ -341,13 +365,13 @@ async fn tag_folder_in(
     let lock = db.index_lock(&lib.id);
     let _guard = lock.lock().await;
     let write = async {
-        let ids = folder_members(&lib.pool, folder).await?;
-        for batch in ids.chunks(structure::BATCH) {
+        let files = folder_members(&lib.pool, folder).await?;
+        for batch in group_batches(&files) {
             let mut tx = lib.pool.begin().await?;
             for definition in &chain {
                 upsert_tag(&mut *tx, definition).await?;
             }
-            for id in batch {
+            for (id, _) in batch {
                 sqlx::query("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?, ?)")
                     .bind(id)
                     .bind(tag_id)
@@ -356,7 +380,7 @@ async fn tag_folder_in(
             }
             tx.commit().await?;
         }
-        Ok::<_, sqlx::Error>(ids.len())
+        Ok::<_, sqlx::Error>(files.len())
     };
     write.await.map_err(|e| e.to_string())
 }
@@ -392,13 +416,13 @@ async fn collect_folder_in(
     let lock = db.index_lock(&lib.id);
     let _guard = lock.lock().await;
     let write = async {
-        let ids = folder_members(&lib.pool, folder).await?;
-        for batch in ids.chunks(structure::BATCH) {
+        let files = folder_members(&lib.pool, folder).await?;
+        for batch in group_batches(&files) {
             let mut tx = lib.pool.begin().await?;
             for definition in &chain {
                 upsert_collection(&mut *tx, definition).await?;
             }
-            for id in batch {
+            for (id, _) in batch {
                 sqlx::query(
                     "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
                 )
@@ -409,7 +433,7 @@ async fn collect_folder_in(
             }
             tx.commit().await?;
         }
-        Ok::<_, sqlx::Error>(ids.len())
+        Ok::<_, sqlx::Error>(files.len())
     };
     write.await.map_err(|e| e.to_string())
 }
@@ -967,6 +991,39 @@ mod tests {
 
         assert_both_reach(&db, "big", paths).await;
         assert_eq!(tagged_and_collected(&other).await, (vec![], vec![]));
+    }
+
+    #[test]
+    fn a_batch_never_splits_a_group_that_reaches_past_its_size() {
+        // 199 files on their own, then a group of 3 straddling the 200th row, then 300 more.
+        let mut files: Vec<FileOfItem> = (0..199)
+            .map(|i| (format!("a{i:03}"), format!("a{i:03}")))
+            .collect();
+        files.extend((0..3).map(|i| (format!("b{i}"), "b0".to_string())));
+        files.extend((0..300).map(|i| (format!("c{i:03}"), format!("c{i:03}"))));
+
+        let batches = group_batches(&files);
+
+        let sizes: Vec<usize> = batches.iter().map(|b| b.len()).collect();
+        assert_eq!(sizes, [202, 200, 100]);
+        assert!(batches[0].ends_with(&files[199..202]));
+        assert_eq!(batches.concat(), files);
+        assert!(group_batches(&[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_folders_files_come_with_each_groups_members_side_by_side() {
+        let (_, pool) = car_kit_database().await;
+        for folder in ["", "3D assets/Car Kit/Models/OBJ format"] {
+            let files = folder_members(&pool, folder).await.unwrap();
+            let at = files.iter().position(|(_, item)| item == SEDAN[1]).unwrap();
+            let mut sedan: Vec<&str> = files[at..at + 3]
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect();
+            sedan.sort();
+            assert_eq!(sedan, SEDAN, "{folder:?}");
+        }
     }
 
     #[tokio::test]

@@ -58,15 +58,15 @@ describe('applyFolderAction', () => {
     expect(calls[0]).toBe("collect kenney '' c");
   });
 
-  test('refetches nothing when the write fails', async () => {
+  test('still refetches when the write fails, since earlier batches stay written', async () => {
     const calls = record(0);
     api.tagFolder = async () => {
-      throw 'The tag no longer exists';
+      throw 'database is locked';
     };
-    await expect(applyFolderAction({ libraryId: 'k', path: 'Kit' }, 'tag', 'gone')).rejects.toBe(
-      'The tag no longer exists'
+    await expect(applyFolderAction({ libraryId: 'k', path: 'Kit' }, 'tag', 't')).rejects.toBe(
+      'database is locked'
     );
-    expect(calls).toEqual([]);
+    expect(calls.sort()).toEqual(['list collections', 'list tags', 'refresh grid']);
   });
 });
 
