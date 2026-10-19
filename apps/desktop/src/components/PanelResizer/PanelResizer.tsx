@@ -5,6 +5,7 @@ import {
   PANEL_LIMITS,
   clampPanelWidth,
   dragPanelWidth,
+  keyPanelWidth,
   type PanelSide,
 } from '../../utils/panelSize';
 import styles from './PanelResizer.module.css';
@@ -13,8 +14,6 @@ const WIDTH_VAR: Record<PanelSide, string> = {
   sidebar: '--sidebar-width',
   detail: '--detail-panel-width',
 };
-
-const KEY_STEP = 16;
 
 interface Drag {
   startX: number;
@@ -35,6 +34,7 @@ interface Drag {
 export function PanelResizer({ side }: { side: PanelSide }) {
   const width = useUIStore((s) => (side === 'sidebar' ? s.sidebarWidth : s.detailPanelWidth));
   const setPanelWidth = useUIStore((s) => s.setPanelWidth);
+  const finishPanelDrag = useUIStore((s) => s.finishPanelDrag);
   const [state, setState] = useState<'resize' | 'collapse' | null>(null);
   const drag = useRef<Drag | null>(null);
   const { min, max, initial } = PANEL_LIMITS[side];
@@ -87,28 +87,17 @@ export function PanelResizer({ side }: { side: PanelSide }) {
     d.panel.style.opacity = '';
     document.body.style.cursor = '';
     setState(null);
-    if (d.width === null) {
-      // Put back the width the app last rendered, which the panel has again when it reopens
-      showWidth(e.currentTarget, clampPanelWidth(side, width));
-      const ui = useUIStore.getState();
-      if (side === 'sidebar') ui.toggleSidebar();
-      else ui.toggleDetailPanel();
-    } else {
-      showWidth(e.currentTarget, d.width);
-      setPanelWidth(side, d.width);
-    }
+    // A collapse puts back the width the app last rendered, which the panel has when it reopens
+    showWidth(e.currentTarget, d.width ?? clampPanelWidth(side, width));
+    finishPanelDrag(side, d.width);
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-    e.preventDefault();
-    const dx = e.key === 'ArrowRight' ? KEY_STEP : -KEY_STEP;
     const current = panelOf(e.currentTarget)?.getBoundingClientRect().width ?? width;
-    const room = roomFor(e.currentTarget, current);
-    setPanelWidth(
-      side,
-      clampPanelWidth(side, side === 'sidebar' ? current + dx : current - dx, room)
-    );
+    const next = keyPanelWidth(side, current, e.key, roomFor(e.currentTarget, current));
+    if (next === null) return;
+    e.preventDefault();
+    setPanelWidth(side, next);
   };
 
   return (

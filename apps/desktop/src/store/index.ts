@@ -62,6 +62,8 @@ interface UIState {
   toggleSidebar: () => void;
   toggleDetailPanel: () => void;
   setPanelWidth: (side: PanelSide, width: number) => void;
+  /** Stores the width a handle drag ended on, or closes the panel when it collapsed it (null) */
+  finishPanelDrag: (side: PanelSide, width: number | null) => void;
   selectAsset: (id: string, multi?: boolean) => void;
   selectAll: (ids: string[]) => void;
   clearSelection: () => void;
@@ -76,9 +78,20 @@ interface UIState {
   requestDelete: (ids: string[]) => void;
 }
 
+/** The UI state kept across restarts */
+export const persistedUI = (s: UIState) => ({
+  viewMode: s.viewMode,
+  gridSize: s.gridSize,
+  imageScaling: s.imageScaling,
+  sidebarOpen: s.sidebarOpen,
+  detailPanelOpen: s.detailPanelOpen,
+  sidebarWidth: s.sidebarWidth,
+  detailPanelWidth: s.detailPanelWidth,
+});
+
 export const useUIStore = create<UIState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       viewMode: 'grid',
       gridSize: 'md',
       imageScaling: 'pixelated',
@@ -104,6 +117,10 @@ export const useUIStore = create<UIState>()(
             ? { sidebarWidth: clampPanelWidth(side, width) }
             : { detailPanelWidth: clampPanelWidth(side, width) }
         ),
+      finishPanelDrag: (side, width) => {
+        if (width !== null) get().setPanelWidth(side, width);
+        else set(side === 'sidebar' ? { sidebarOpen: false } : { detailPanelOpen: false });
+      },
 
       selectAsset: (id, multi = false) =>
         set((s) => {
@@ -152,15 +169,7 @@ export const useUIStore = create<UIState>()(
     }),
     {
       name: 'opendam-ui',
-      partialize: (s) => ({
-        viewMode: s.viewMode,
-        gridSize: s.gridSize,
-        imageScaling: s.imageScaling,
-        sidebarOpen: s.sidebarOpen,
-        detailPanelOpen: s.detailPanelOpen,
-        sidebarWidth: s.sidebarWidth,
-        detailPanelWidth: s.detailPanelWidth,
-      }),
+      partialize: persistedUI,
     }
   )
 );

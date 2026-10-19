@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { COLLAPSE_SLACK, PANEL_LIMITS, clampPanelWidth, dragPanelWidth } from './panelSize';
+import {
+  COLLAPSE_SLACK,
+  KEY_STEP,
+  PANEL_LIMITS,
+  clampPanelWidth,
+  dragPanelWidth,
+  keyPanelWidth,
+} from './panelSize';
 
 const { sidebar, detail } = PANEL_LIMITS;
 
@@ -40,7 +47,32 @@ describe('dragPanelWidth', () => {
     expect(dragPanelWidth('detail', 320, 320 - detail.min + COLLAPSE_SLACK + 1)).toBeNull();
   });
 
+  test('a drag landing exactly on the collapse threshold keeps the panel at its minimum', () => {
+    expect(dragPanelWidth('sidebar', 240, -(240 - sidebar.min + COLLAPSE_SLACK))).toBe(sidebar.min);
+    expect(dragPanelWidth('detail', 320, 320 - detail.min + COLLAPSE_SLACK)).toBe(detail.min);
+  });
+
   test('stops at the room the grid leaves', () => {
     expect(dragPanelWidth('sidebar', 240, 200, 300)).toBe(300);
+  });
+});
+
+describe('keyPanelWidth', () => {
+  test('the arrow toward the grid widens each panel', () => {
+    expect(keyPanelWidth('sidebar', 240, 'ArrowRight')).toBe(240 + KEY_STEP);
+    expect(keyPanelWidth('sidebar', 240, 'ArrowLeft')).toBe(240 - KEY_STEP);
+    expect(keyPanelWidth('detail', 320, 'ArrowLeft')).toBe(320 + KEY_STEP);
+    expect(keyPanelWidth('detail', 320, 'ArrowRight')).toBe(320 - KEY_STEP);
+  });
+
+  test('stops at the limits and the room, never collapsing', () => {
+    expect(keyPanelWidth('sidebar', sidebar.min, 'ArrowLeft')).toBe(sidebar.min);
+    expect(keyPanelWidth('detail', detail.max, 'ArrowLeft')).toBe(detail.max);
+    expect(keyPanelWidth('detail', 400, 'ArrowLeft', 405)).toBe(405);
+  });
+
+  test('ignores other keys', () => {
+    expect(keyPanelWidth('sidebar', 240, 'ArrowUp')).toBeNull();
+    expect(keyPanelWidth('sidebar', 240, 'Enter')).toBeNull();
   });
 });

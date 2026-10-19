@@ -12,6 +12,9 @@ export const MAIN_MIN_WIDTH = 320;
 /** Dragging a panel this far below its minimum collapses it */
 export const COLLAPSE_SLACK = 60;
 
+/** How far an arrow key on a panel's handle resizes it */
+export const KEY_STEP = 16;
+
 /** `width` within the panel's limits and the `room` the grid leaves it, in whole pixels. */
 export function clampPanelWidth(side: PanelSide, width: number, room = Infinity): number {
   const { min, max } = PANEL_LIMITS[side];
@@ -33,4 +36,19 @@ export function dragPanelWidth(
   const width = side === 'sidebar' ? startWidth + dx : startWidth - dx;
   if (width < PANEL_LIMITS[side].min - COLLAPSE_SLACK) return null;
   return clampPanelWidth(side, width, room);
+}
+
+/**
+ * The width an arrow key on its handle gives a panel `current` pixels wide, or null for any
+ * other key. Like a drag, the key toward the grid widens the panel, and it never collapses it.
+ */
+export function keyPanelWidth(
+  side: PanelSide,
+  current: number,
+  key: string,
+  room = Infinity
+): number | null {
+  if (key !== 'ArrowLeft' && key !== 'ArrowRight') return null;
+  const dx = key === 'ArrowRight' ? KEY_STEP : -KEY_STEP;
+  return clampPanelWidth(side, side === 'sidebar' ? current + dx : current - dx, room);
 }
