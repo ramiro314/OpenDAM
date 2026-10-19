@@ -1,4 +1,4 @@
-import type { Asset, FilterSpec, FolderNode } from '../../types';
+import type { Asset, FilterSpec, FolderNode, SearchQuery } from '../../types';
 import { normalizeFolderPath } from '../../utils/folders';
 
 const DAY_MS = 86400000;
@@ -56,6 +56,24 @@ export function isFilterEmpty(filter: FilterSpec): boolean {
     !filter.previewStatus &&
     !filter.showHidden &&
     (!filter.tags || filter.tags.length === 0)
+  );
+}
+
+/**
+ * Whether the tree and the Types and format filters show live counts (plan C23): while search
+ * text or any filter is on. The selected folder and collection are views, not filters.
+ */
+export function showsLiveCounts(query: Pick<SearchQuery, 'text' | 'filter'>): boolean {
+  const f = query.filter;
+  return (
+    query.text.trim() !== '' ||
+    !isFilterEmpty(f) ||
+    (f.extensions?.length ?? 0) > 0 ||
+    Boolean(f.namePrefix?.trim() || f.nameSuffix?.trim()) ||
+    Boolean(f.collectionId) ||
+    (f.collectionIds?.length ?? 0) > 0 ||
+    f.tagLogic === 'none' ||
+    f.collectionLogic === 'none'
   );
 }
 
