@@ -128,8 +128,10 @@ docs/plans                    Plans for this fork
     flat search.
   - A folder's `item_count` counts a group once under each folder holding one of its files, so
     it equals the grid's total for that folder.
-  - The preview queue skips members other than the main item: the pass takes them off the queue
-    and `claim_jobs` skips them, and their thumbnails stay on disk. `preview.rs` owns the job
+  - The preview queue skips members other than the main item, and their thumbnails stay on disk.
+    An index run queues no new file itself: the pass it ends with queues the grid items, so a
+    member is never queued, even during a library's first index. The pass also takes a file
+    that has become a member off the queue, and `claim_jobs` skips members. `preview.rs` owns the job
     states and how an asset goes on or off the queue (`preview::enqueue`, `preview::unqueue`).
 
 ## Python preview worker
