@@ -119,6 +119,15 @@ pub struct Asset {
         skip_serializing_if = "Option::is_none"
     )]
     pub group_formats: Option<Vec<String>>,
+    /// The picture of a model's bundled preview, such as Kenney's `Previews/<name>.png`: the
+    /// render's thumbnail, or the render itself. Cards show it before `thumbnail_path`. Absent
+    /// when the item has none.
+    #[serde(
+        rename = "bundledPreview",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub bundled_preview: Option<String>,
 }
 
 /// One file of a format group, as the detail panel lists it (plan C19).

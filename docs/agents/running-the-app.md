@@ -193,7 +193,8 @@ The UI checks, each defined in its plan:
 - **U11** (format groups): in `3D assets/Car Kit`, the `GLB format/`, `FBX format/` and `OBJ
   format/` nodes each count as many items as `Models/`, and selecting `Models/` lists each model
   once, as its GLB, with a solid `GLB +2` badge whose tooltip reads `3 files: GLB, FBX, OBJ`, on
-  its card and, in the list view, unclipped in its row's extension column.
+  its card and, in the list view, unclipped in its row's extension column. Each card of a model
+  with a Kenney render shows that render, and the kit lists no `Previews/` file.
   Selecting `FBX format/` lists the same items and no FBX file, and adding `.glb` to it matches
   nothing. Filtering the kit by FBX lists every model, each as its GLB, and a search for "fbx"
   finds `sedan.glb` through its FBX copy's folder.
