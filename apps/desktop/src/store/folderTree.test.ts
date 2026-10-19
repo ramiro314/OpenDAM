@@ -20,7 +20,7 @@ function serve(tree: () => Record<string, Record<string, string[]>>) {
       itemCount: 1,
       hiddenCount: 0,
       hasChildren: (library[path] ?? []).length > 0,
-      holdsPack: false,
+      shownWithoutHidden: true,
       hasVisibleChildren: (library[path] ?? []).length > 0,
     }));
   };
@@ -147,7 +147,7 @@ describe('useFolderTreeStore', () => {
               itemCount: 1,
               hiddenCount: 0,
               hasChildren: true,
-              holdsPack: false,
+              shownWithoutHidden: true,
               hasVisibleChildren: true,
             }))
           );

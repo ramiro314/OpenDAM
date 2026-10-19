@@ -60,11 +60,11 @@ export function isFilterEmpty(filter: FilterSpec): boolean {
 }
 
 /**
- * Whether a tree node shows. With hidden files off, a folder whose files are all hidden support
- * files goes, unless it is or holds a pack: every pack shows, even one with no visible item.
+ * Whether a tree node shows: always with hidden files on, otherwise as `get_folders` decided
+ * (`shownWithoutHidden`), by the same rule that gives its parent `hasVisibleChildren`.
  */
 export function isFolderShown(node: FolderNode, showHidden: boolean): boolean {
-  return showHidden || node.itemCount > 0 || node.isPack || node.holdsPack;
+  return showHidden || node.shownWithoutHidden;
 }
 
 /** A tree node's badge: the files it shows, which counts its hidden ones when they show. */

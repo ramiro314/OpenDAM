@@ -117,21 +117,21 @@ describe('isFolderShown and folderCount', () => {
     itemCount: 0,
     hiddenCount: 0,
     hasChildren: false,
-    holdsPack: false,
+    shownWithoutHidden: false,
     hasVisibleChildren: false,
     ...patch,
   });
 
-  test('a folder holding only hidden files shows only with hidden files on', () => {
+  test('with hidden files off, a folder shows as get_folders decided', () => {
     const docs = node({ hiddenCount: 4 });
     expect(isFolderShown(docs, false)).toBe(false);
-    expect(isFolderShown(docs, true)).toBe(true);
-    expect(isFolderShown(node({ itemCount: 1, hiddenCount: 4 }), false)).toBe(true);
+    expect(
+      isFolderShown(node({ isPack: true, hiddenCount: 3, shownWithoutHidden: true }), false)
+    ).toBe(true);
   });
 
-  test('a pack, or a folder holding one, always shows', () => {
-    expect(isFolderShown(node({ isPack: true, hiddenCount: 3 }), false)).toBe(true);
-    expect(isFolderShown(node({ holdsPack: true, hiddenCount: 30 }), false)).toBe(true);
+  test('with hidden files on, every folder shows', () => {
+    expect(isFolderShown(node({ hiddenCount: 4 }), true)).toBe(true);
   });
 
   test('the count takes in hidden files while they show', () => {

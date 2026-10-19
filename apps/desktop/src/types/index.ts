@@ -149,9 +149,12 @@ export interface FolderNode {
   /** Support files below the folder, at any depth, hidden unless "Show hidden files" is on */
   hiddenCount: number;
   hasChildren: boolean;
-  /** Whether a pack lies below the folder */
-  holdsPack: boolean;
-  /** Whether a child has visible files or is or holds a pack */
+  /**
+   * Whether the folder shows with hidden files off: it has visible files, is a pack or holds one.
+   * `get_folders` owns the rule, for this and for `hasVisibleChildren`.
+   */
+  shownWithoutHidden: boolean;
+  /** Whether a child shows with hidden files off */
   hasVisibleChildren: boolean;
 }
 
