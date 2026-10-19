@@ -348,7 +348,8 @@ pub async fn tag_folder(
 /// (`group_batches`), each copying master's definition, with its ancestors root first, into the
 /// library's mirror before the memberships, since a mirror can lack it. It holds the library's
 /// index lock, so no structure pass regroups the files meanwhile, and stops at the first batch
-/// that finds the tag deleted.
+/// that finds the tag deleted. Each batch holds `Database::catalog_lock` from reading the
+/// definition until its commit, so a tag update or delete waits for at most one batch.
 async fn tag_folder_in(
     db: &Database,
     library_id: &str,
@@ -358,14 +359,16 @@ async fn tag_folder_in(
     let lib = open_library(db, library_id).await?;
     let lock = db.index_lock(&lib.id);
     let _guard = lock.lock().await;
-    // The definition is read once the lock is held, and again for each batch: one deleted while
-    // the write waited, or between batches, must not come back through the mirror.
+    // The definition is read once the lock is held, and again for each batch under
+    // `Database::catalog_lock`, which every definition update and delete takes too: one deleted
+    // while the write waited, or between batches, must not come back through the mirror.
     let write = async {
         if db.tag_with_ancestors(tag_id).await?.is_empty() {
             return Ok(None);
         }
         let files = folder_members(&lib.pool, folder).await?;
         for batch in group_batches(&files) {
+            let _catalog = db.catalog_lock.lock().await;
             let chain = db.tag_with_ancestors(tag_id).await?;
             if chain.is_empty() {
                 return Ok(None);
@@ -415,8 +418,9 @@ async fn collect_folder_in(
     let lib = open_library(db, library_id).await?;
     let lock = db.index_lock(&lib.id);
     let _guard = lock.lock().await;
-    // The definition is read once the lock is held, and again for each batch: one deleted while
-    // the write waited, or between batches, must not come back through the mirror.
+    // The definition is read once the lock is held, and again for each batch under
+    // `Database::catalog_lock`, which every definition update and delete takes too: one deleted
+    // while the write waited, or between batches, must not come back through the mirror.
     let write = async {
         if db
             .collection_with_ancestors(collection_id)
@@ -427,6 +431,7 @@ async fn collect_folder_in(
         }
         let files = folder_members(&lib.pool, folder).await?;
         for batch in group_batches(&files) {
+            let _catalog = db.catalog_lock.lock().await;
             let chain = db.collection_with_ancestors(collection_id).await?;
             if chain.is_empty() {
                 return Ok(None);
@@ -1081,6 +1086,32 @@ mod tests {
             }
             assert_eq!(tagged_and_collected(&pool).await, (vec![], vec![]));
         }
+    }
+
+    #[tokio::test]
+    async fn a_batch_and_a_definition_delete_never_overlap() {
+        let (db, pool) = car_kit_database().await;
+        let wait = std::time::Duration::from_millis(100);
+
+        // While a batch holds the catalog lock, neither a delete nor another batch goes ahead.
+        let held = db.catalog_lock.lock().await;
+        let delete = tokio::time::timeout(wait, crate::commands::tag::delete_tag_in(&db, "t"));
+        assert!(
+            delete.await.is_err(),
+            "the delete went ahead during a batch"
+        );
+        let write = tokio::time::timeout(wait, tag_folder_in(&db, "lib", "", "t"));
+        assert!(write.await.is_err(), "a batch went ahead during another");
+        assert_eq!(tagged_and_collected(&pool).await, (vec![], vec![]));
+        drop(held);
+
+        assert_eq!(tag_folder_in(&db, "lib", "", "t").await, Ok(9));
+        crate::commands::tag::delete_tag_in(&db, "t").await.unwrap();
+        let mirrored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags WHERE id = 't'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mirrored, 0);
     }
 
     #[tokio::test]

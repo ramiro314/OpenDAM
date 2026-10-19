@@ -149,9 +149,10 @@ docs/plans                    Plans for this fork
     writes (`tag_folder`, `collect_folder` in `commands/folder.rs`) expand a folder through
     `folder_members` instead, which the check also accepts: under the library's index lock, they
     commit about 200 files per transaction, cut only between groups (`group_batches`), and
-    re-read the tag or collection for each batch. When a group forms or grows, the structure
-    pass gives every member the union of the group's tags and collections and the main item's
-    fields (`apply_unions`).
+    re-read the tag or collection for each batch under `Database::catalog_lock`, which every
+    definition update and delete also takes. When a group forms or grows, the structure pass
+    gives every member the union of the group's tags and collections and the main item's fields
+    (`apply_unions`).
   - Delete and rename reach every member and the bundled preview, unless another item shows the
     same render (`item_files` in `commands/asset.rs`). A rename gives them all the new stem,
     refuses before anything moves when a name is taken, and puts files back if a step fails.

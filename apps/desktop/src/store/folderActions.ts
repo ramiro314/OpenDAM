@@ -14,14 +14,19 @@ export type FolderBulkAction = 'tag' | 'collection';
 interface FolderActionStore {
   /** The open "Add a tag to everything" or "Add everything to a collection" dialog */
   dialog: { target: FolderTarget; action: FolderBulkAction } | null;
+  /** Why a write whose dialog was closed failed, shown until dismissed */
+  failure: string | null;
   openDialog: (target: FolderTarget, action: FolderBulkAction) => void;
   closeDialog: () => void;
+  setFailure: (failure: string | null) => void;
 }
 
 export const useFolderActionStore = create<FolderActionStore>()((set) => ({
   dialog: null,
+  failure: null,
   openDialog: (target, action) => set({ dialog: { target, action } }),
   closeDialog: () => set({ dialog: null }),
+  setFailure: (failure) => set({ failure }),
 }));
 
 /**

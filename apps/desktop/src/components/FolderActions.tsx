@@ -81,7 +81,15 @@ function PickerDialog({ target, action }: { target: FolderTarget; action: 'tag' 
       if (stillOpen()) closeDialog();
     } catch (err) {
       console.error(`Failed to ${title.toLowerCase()}:`, err);
-      if (!stillOpen()) return;
+      // Closed meanwhile: the failure outlives the dialog, as a toast in `App`
+      if (!stillOpen()) {
+        useFolderActionStore
+          .getState()
+          .setFailure(
+            `${title} in ${target.name} failed: ${String(err)}. Files written before the failure keep the ${noun}.`
+          );
+        return;
+      }
       setError(String(err));
       setSaving(false);
     }
