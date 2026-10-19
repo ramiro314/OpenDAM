@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why KWin waited on the NVIDIA driver</title>
+<style>
+  :root {
+    --bg: #12141a;
+    --panel: #1b1e27;
+    --panel-2: #232735;
+    --rule: #343a4d;
+    --ink: #e6e8ef;
+    --ink-2: #b4bacb;
+    --accent: #8fb8ff;
+    --warn: #ffb86b;
+    --bad: #ff8a8a;
+    --good: #8fe0a8;
+    --code-bg: #0c0e13;
+    --code-ink: #d7dcea;
+    --svg-box: #232735;
+    --svg-box-hot: #3a2a2a;
+    --svg-line: #8a93ab;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f7f8fb;
+      --panel: #ffffff;
+      --panel-2: #eef1f7;
+      --rule: #d3d8e4;
+      --ink: #161a24;
+      --ink-2: #474f63;
+      --accent: #1d4fb8;
+      --warn: #8a4b00;
+      --bad: #a51d1d;
+      --good: #17663a;
+      --code-bg: #eef1f7;
+      --code-ink: #1d2230;
+      --svg-box: #eef1f7;
+      --svg-box-hot: #fde4e4;
+      --svg-line: #5b6479;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 920px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 1.7rem; line-height: 1.25; margin: 0 0 8px; }
+  h2 { font-size: 1.25rem; margin: 40px 0 12px; padding-top: 12px; border-top: 1px solid var(--rule); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p, li { color: var(--ink); }
+  .muted { color: var(--ink-2); }
+  .question { color: var(--ink-2); margin: 0 0 20px; }
+  .answer {
+    background: var(--panel); border: 1px solid var(--rule); border-left: 4px solid var(--accent);
+    border-radius: 8px; padding: 16px 20px; margin: 16px 0 24px;
+  }
+  .answer p:first-child { margin-top: 0; }
+  .answer p:last-child { margin-bottom: 0; }
+  code { font: 0.9em ui-monospace, "JetBrains Mono", Menlo, monospace; background: var(--code-bg); color: var(--code-ink); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); color: var(--code-ink); padding: 12px 14px; border-radius: 8px; overflow-x: auto; font: 13px/1.5 ui-monospace, Menlo, monospace; border: 1px solid var(--rule); }
+  pre code { background: none; padding: 0; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 16px; font-size: 0.95rem; }
+  th, td { text-align: left; vertical-align: top; padding: 7px 10px; border-bottom: 1px solid var(--rule); }
+  th { background: var(--panel-2); color: var(--ink); font-weight: 600; }
+  td { color: var(--ink); }
+  .tag { font-weight: 600; }
+  .tag.bad { color: var(--bad); }
+  .tag.warn { color: var(--warn); }
+  .tag.good { color: var(--good); }
+  nav ol { margin: 8px 0 0; padding-left: 20px; }
+  nav a, a { color: var(--accent); }
+  figure { margin: 16px 0 24px; }
+  figcaption { color: var(--ink-2); font-size: 0.9rem; margin-top: 6px; }
+  svg text { font-family: system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Why KWin waited on the NVIDIA driver</h1>
+<p class="question">Question: on 2026-10-18 the PC froze during the scroll bench and had to be powered off. The journal showed
+the desktop's KWin stuck inside the NVIDIA driver. Why was it waiting there?</p>
+
+<div class="answer">
+<p><strong>What it was waiting for (established).</strong> KWin was applying a display configuration for the
+monitor that had just come back. While doing that, the driver turned variable refresh rate (VRR) off on the
+DisplayPort link. That needs a small write over the DP AUX channel to the monitor. On this GPU every such request
+goes through the GPU's own firmware (GSP), and the firmware never answered. KWin kept polling for the reply while
+holding the driver's display lock. That blocked every other display operation, and the screen froze. All eight
+kernel hang reports between 12:04 and 12:18 show this same call, still unanswered.</p>
+<p><strong>Why the firmware didn't answer (not established).</strong> The evidence points to the GPU firmware
+having stopped answering requests about 3.5 minutes before KWin hit it, at 11:56:33. That is the moment the bench
+killed one app and started the next. The new app froze during startup. A second freshly started graphical program,
+KSplash, also failed to come up at 11:59:58. KWin was only the third victim, and the first to hold a lock the whole
+display stack needs. Two hypotheses are compared <a href="#hypotheses">below</a>. One question only you can answer
+would settle most of it: <strong>had the screen already frozen before the monitor went off and on at about
+12:00?</strong></p>
+</div>
+
+<nav>
+<strong>Contents</strong>
+<ol>
+<li><a href="#chain">The call KWin was stuck in</a></li>
+<li><a href="#timeline">Timeline</a></li>
+<li><a href="#hypotheses">Why the firmware didn't answer: two hypotheses</a></li>
+<li><a href="#system">System facts</a></li>
+<li><a href="#bench">What this means for the bench</a></li>
+<li><a href="#options">What could be done</a></li>
+<li><a href="#limits">What this report did not establish</a></li>
+</ol>
+</nav>
+
+<h2 id="chain">1. The call KWin was stuck in</h2>
+<p>Source: <code>journalctl -b -1 -k</code>, the kernel's hung-task report at 12:04:04. The report names the
+<code>nvidia-modeset</code> kernel thread as blocked "on a semaphore likely last held by task kwin_wayland:14716".
+PID 14716 is your desktop's KWin, running since Oct 10, not the bench's nested KWin. Read bottom to top, KWin's
+kernel stack is:</p>
+
+<figure>
+<div class="scroll">
+<svg viewBox="0 0 860 420" width="860" height="420" role="img" aria-label="Call chain from KWin's atomic commit down to the GSP firmware RPC">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--svg-line)"/>
+    </marker>
+  </defs>
+  <g font-size="14">
+    <rect x="20" y="16" width="380" height="50" rx="8" fill="var(--svg-box)" stroke="var(--rule)"/>
+    <text x="34" y="38" fill="var(--ink)" font-weight="600">KWin (desktop, PID 14716)</text>
+    <text x="34" y="56" fill="var(--ink-2)">drm_mode_atomic_ioctl: apply the output config</text>
+
+    <rect x="20" y="96" width="380" height="50" rx="8" fill="var(--svg-box)" stroke="var(--rule)"/>
+    <text x="34" y="118" fill="var(--ink)" font-weight="600">nvidia-drm</text>
+    <text x="34" y="136" fill="var(--ink-2)">nv_drm_atomic_commit, apply_modeset_config</text>
+
+    <rect x="20" y="176" width="380" height="50" rx="8" fill="var(--svg-box)" stroke="var(--rule)"/>
+    <text x="34" y="198" fill="var(--ink)" font-weight="600">nvidia-modeset (NVKMS), holds the lock</text>
+    <text x="34" y="216" fill="var(--ink-2)">nvSetDispModeEvo, nvDisableVrr</text>
+
+    <rect x="20" y="256" width="380" height="50" rx="8" fill="var(--svg-box)" stroke="var(--rule)"/>
+    <text x="34" y="278" fill="var(--ink)" font-weight="600">DisplayPort library</text>
+    <text x="34" y="296" fill="var(--ink-2)">setIgnoreMSAEnable, AuxRetry::write, AUX transaction</text>
+
+    <rect x="20" y="336" width="380" height="64" rx="8" fill="var(--svg-box-hot)" stroke="var(--bad)"/>
+    <text x="34" y="358" fill="var(--ink)" font-weight="600">nvidia (RM): RPC to the GSP firmware</text>
+    <text x="34" y="376" fill="var(--ink-2)">rpcRmApiControl_GSP, _issueRpcAndWait,</text>
+    <text x="34" y="392" fill="var(--ink-2)">kgspRecvPoll: no reply, 16+ minutes</text>
+
+    <line x1="210" y1="66" x2="210" y2="94" stroke="var(--svg-line)" stroke-width="2" marker-end="url(#arr)"/>
+    <line x1="210" y1="146" x2="210" y2="174" stroke="var(--svg-line)" stroke-width="2" marker-end="url(#arr)"/>
+    <line x1="210" y1="226" x2="210" y2="254" stroke="var(--svg-line)" stroke-width="2" marker-end="url(#arr)"/>
+    <line x1="210" y1="306" x2="210" y2="334" stroke="var(--svg-line)" stroke-width="2" marker-end="url(#arr)"/>
+
+    <rect x="470" y="176" width="370" height="64" rx="8" fill="var(--svg-box)" stroke="var(--rule)"/>
+    <text x="484" y="198" fill="var(--ink)" font-weight="600">nvidia-modeset kernel thread</text>
+    <text x="484" y="216" fill="var(--ink-2)">waits for the NVKMS lock KWin holds:</text>
+    <text x="484" y="232" fill="var(--ink-2)">blocked, state D, from 12:02</text>
+    <line x1="468" y1="208" x2="404" y2="204" stroke="var(--svg-line)" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+
+    <rect x="470" y="336" width="370" height="64" rx="8" fill="var(--svg-box)" stroke="var(--rule)"/>
+    <text x="484" y="358" fill="var(--ink)" font-weight="600">GSP firmware on the GPU</text>
+    <text x="484" y="376" fill="var(--ink-2)">would forward the AUX write to the monitor;</text>
+    <text x="484" y="392" fill="var(--ink-2)">never replied</text>
+    <line x1="402" y1="368" x2="466" y2="368" stroke="var(--bad)" stroke-width="2" marker-end="url(#arr)"/>
+  </g>
+</svg>
+</div>
+<figcaption>From KWin's kernel stack in the 12:04:04 hung-task report. Function names are the kernel symbols as
+printed, shortened where marked with commas.</figcaption>
+</figure>
+
+<ul>
+<li><strong>The same call every time.</strong> Across the eight reports (blocked 122 s, then 245 s, and so on up to
+983 s), <code>nvDisableVrr</code>, <code>setIgnoreMSAEnable</code> and the AUX transaction each appear eight
+times, and <code>kgspRecvPoll</code> 14 times. KWin never moved on to a different request.</li>
+<li><strong>KWin was spinning, not sleeping.</strong> It was in state <code>R</code> inside the poll loop, which
+also calls the firmware health check (<code>kgspHealthCheck_TU102</code>) and drains firmware events
+(<code>_kgspRpcDrainEvents</code>).</li>
+<li><strong>The driver never gave up or logged an error.</strong> There is no <code>NVRM</code>, Xid or "GSP RPC
+timeout" line anywhere in that boot's journal.</li>
+<li><strong>Why VRR was being turned off.</strong> In <code>~/.config/kwinoutputconfig.json</code>, DP-1's
+<code>vrrPolicy</code> is <code>"Automatic"</code>. Re-applying its mode after the reconnect went through the
+driver's VRR-off path. The DPCD bit being written, "ignore MSA timing parameters", is the monitor-side switch for
+adaptive sync.</li>
+</ul>
+
+<h2 id="timeline">2. Timeline</h2>
+<figure>
+<div class="scroll">
+<svg viewBox="0 0 860 230" width="860" height="230" role="img" aria-label="Timeline from 11:56 to 12:19">
+  <g font-size="13">
+    <line x1="30" y1="110" x2="840" y2="110" stroke="var(--svg-line)" stroke-width="2"/>
+    <!-- scale: 11:56:00 at x=30, 12:19:00 at x=840 -> 810px / 1380 s = 0.587 px/s -->
+    <g fill="var(--ink-2)">
+      <text x="30" y="132">11:56</text>
+      <text x="206" y="132">12:01</text>
+      <text x="382" y="132">12:06</text>
+      <text x="558" y="132">12:11</text>
+      <text x="734" y="132">12:16</text>
+    </g>
+    <circle cx="49" cy="110" r="6" fill="var(--warn)"/>
+    <line x1="49" y1="104" x2="49" y2="40" stroke="var(--warn)"/>
+    <text x="56" y="34" fill="var(--ink)">11:56:33 bench app starts, never</text>
+    <text x="56" y="50" fill="var(--ink)">gets its first page</text>
+
+    <circle cx="155" cy="110" r="6" fill="var(--warn)"/>
+    <line x1="155" y1="116" x2="155" y2="168" stroke="var(--warn)"/>
+    <text x="40" y="184" fill="var(--ink)">11:59:35 DP-1 drops,</text>
+    <text x="40" y="200" fill="var(--ink)">11:59:58 KSplash starts, never registers</text>
+
+    <circle cx="182" cy="110" r="6" fill="var(--bad)"/>
+    <line x1="182" y1="104" x2="182" y2="70" stroke="var(--bad)"/>
+    <text x="300" y="66" fill="var(--ink)">12:00:21 DP-1 back; KWin re-applies</text>
+    <text x="300" y="82" fill="var(--ink)">its mode and sticks in the GSP RPC</text>
+    <line x1="298" y1="70" x2="188" y2="70" stroke="var(--bad)"/>
+
+    <rect x="241" y="100" width="589" height="20" fill="var(--bad)" opacity="0.35"/>
+    <text x="440" y="160" fill="var(--ink)">nvidia-modeset blocked (reported from 12:04, 122 s in)</text>
+
+    <circle cx="830" cy="110" r="6" fill="var(--ink)"/>
+    <text x="700" y="200" fill="var(--ink)">12:18:43 power key</text>
+    <line x1="830" y1="116" x2="830" y2="186" stroke="var(--ink)"/>
+  </g>
+</svg>
+</div>
+<figcaption>All times local, from <code>journalctl -b -1</code>.</figcaption>
+</figure>
+
+<div class="scroll">
+<table>
+<tr><th>Time</th><th>Event</th><th>Source</th></tr>
+<tr><td>11:31-11:54</td><td>Bench warm-up app runs the thumbnail cleanup pass to the end (1 GB peak).</td><td><code>opendam-capped-*.scope</code> summary</td></tr>
+<tr><td>11:52:14</td><td>Last window-focus change before the hang (to Mission Control). A Chrome picture-in-picture video window was open since 11:39:41.</td><td><code>xremap</code> lines</td></tr>
+<tr><td>11:54:57-11:56:32</td><td>Two bench scenarios (sm continuous scroll, sm end to end), each a fresh app killed when its report arrives. Both finish normally: first page in about 50 ms, peaks 0.9 and 1.1 GB.</td><td>scope summaries, bench reports</td></tr>
+<tr><td>11:56:32-33</td><td>The sm end-to-end app is killed and the sm random-jumps app starts. It logs "indexing complete" at 11:56:33 and nothing after: no first page, no bench line. The two earlier launches got their first page within about 50 ms of that line.</td><td>run copy <code>app-sm-randomJumps.log</code></td></tr>
+<tr><td>11:59:35</td><td>DRM hotplug "change" on connector DP-1, the Philips monitor.</td><td><code>org_kde_powerdevil</code> udev detail</td></tr>
+<tr><td>11:59:58</td><td>Plasma: "There are no outputs". KWin removes the output (it is still processing events). <code>KSplash</code> is started.</td><td>plasmashell, kwin_wayland, systemd</td></tr>
+<tr><td>12:00:05-12:00:17</td><td>A device on the monitor's USB hub (ENE 6K7732) disconnects and reconnects twice. The hub itself stays.</td><td>kernel usb</td></tr>
+<tr><td>12:00:21</td><td>Second DP-1 hotplug: the monitor is back, and every Plasma process sees the output again.</td><td>powerdevil, plasma services</td></tr>
+<tr><td>12:00:57</td><td>KSplash: "WaitForName: Service was not registered within timeout". It never came up in 60 s.</td><td><code>plasma_waitforname</code></td></tr>
+<tr><td>12:04:04 to 12:18:24</td><td>Eight hung-task reports: <code>nvidia-modeset</code> blocked behind KWin, KWin in the GSP RPC poll.</td><td>kernel</td></tr>
+<tr><td>12:18:43</td><td>Power key pressed.</td><td><code>systemd-logind</code></td></tr>
+</table>
+</div>
+
+<h2 id="hypotheses">3. Why the firmware didn't answer: two hypotheses</h2>
+
+<h3>A. The GPU firmware stopped answering at about 11:56:33, and KWin was the first program to need it while holding the display lock</h3>
+<ul>
+<li><span class="tag good">For:</span> the bench app started at 11:56:33 froze at startup. In <code>gpu-shm</code> mode
+the web process creates a GPU context and buffers at startup, and on this driver those allocations are firmware
+requests. Nothing else explains its stall: the cleanup pass had finished (run copy <code>warmup.log</code>: 56,698
+cleared of 58,147 at 11:54:52), and the two launches before it reached their first page in about 50 ms.</li>
+<li><span class="tag good">For:</span> KSplash, a QML program that renders on the GPU, started at 11:59:58 and never
+registered within 60 s. That is a second fresh GPU client failing before KWin's 12:00:21 modeset.</li>
+<li><span class="tag good">For:</span> it fits the moment. 11:56:32-33 is a GPU process being killed mid-work, its GPU
+resources torn down, and a new one started within a second. The bench does this nine times per run. Run 1 survived
+eight cycles; run 2 froze on its third.</li>
+<li><span class="tag good">For:</span> screens can keep showing frames without the firmware. Flips go through display
+channels the CPU writes directly, so the desktop could look alive while new GPU programs hung at startup.</li>
+<li><span class="tag warn">Gap:</span> nothing in the journal shows the desktop between 11:56:33 and 11:59:35 (no
+focus change after 11:52:14), so whether the screen was still updating is unknown.</li>
+<li><span class="tag warn">Gap:</span> the driver logged no firmware timeout or error at all, which a dead firmware
+would normally produce.</li>
+</ul>
+
+<h3>B. The monitor dropped the link on its own, and the driver's AUX write to the reconnecting monitor hung</h3>
+<ul>
+<li><span class="tag good">For:</span> the stuck call is a DP AUX write to the monitor itself, made 0-40 s after it came
+back. A QD-OLED monitor coming out of standby may not answer AUX yet. The driver should time out and retry
+(<code>AuxRetry</code>), but here it never returned.</li>
+<li><span class="tag good">For:</span> monitor reconnects are normal on this machine. DP-1 hotplugged on Oct 16 and at
+10:29 today, and KWin recovered both times. At 10:29 it logged <code>GL_OUT_OF_MEMORY</code> four times while
+recreating its buffers, and still recovered.</li>
+<li><span class="tag bad">Against:</span> it doesn't explain the bench app freezing 3 minutes before the monitor dropped,
+or KSplash failing before KWin's modeset.</li>
+<li><span class="tag bad">Against:</span> the idle screen-off is unlikely as the trigger. Power settings turn the display
+off after 1800 s idle (<code>~/.config/powerdevilrc</code>). The last focus change was 7 minutes earlier, and a
+playing picture-in-picture video normally inhibits idle. The 11:59:35 drop is also not a suspend: the last suspend
+in that boot was Oct 16.</li>
+</ul>
+
+<p><strong>Reading:</strong> A explains more of the evidence. Under A, the monitor going off at 11:59:35 and back on
+at 12:00:21 may have been you power-cycling a frozen screen. The USB device on the monitor's hub flapping at
+12:00:05-12:00:17 fits that. If the screen was still live when it went dark, B gains weight, and the bench app's
+stall becomes a separate problem.</p>
+
+<h2 id="system">4. System facts</h2>
+<div class="scroll">
+<table>
+<tr><th>Item</th><th>Value</th><th>Source</th></tr>
+<tr><td>GPU</td><td>GeForce RTX 5080, 16 GB, VBIOS 98.03.3B.40.19</td><td><code>nvidia-smi</code></td></tr>
+<tr><td>Driver</td><td><code>nvidia-open</code> 615.78.08, the open kernel module (required for this GPU, and it always runs the GSP firmware: <code>EnableGpuFirmware: 18</code>)</td><td><code>/proc/driver/nvidia/version</code>, <code>params</code></td></tr>
+<tr><td>Kernel</td><td>7.2.9-arch1-1, <code>nvidia_drm modeset=Y fbdev=Y</code></td><td><code>uname</code>, <code>/sys/module</code></td></tr>
+<tr><td>Compositor</td><td>KWin 6.7.5 (Wayland)</td><td><code>pacman -Q</code></td></tr>
+<tr><td>Monitor on DP-1</td><td>Philips 34M2C8600 (QD-OLED), 3440x1440 at 175 Hz, HDR on, VRR policy Automatic</td><td>EDID, <code>kwinoutputconfig.json</code></td></tr>
+<tr><td>Second output</td><td>HDMI-A-1, 3840x2160 at 60 Hz, VRR policy Never (not connected now)</td><td><code>kwinoutputconfig.json</code></td></tr>
+<tr><td>nvidia-persistenced</td><td>inactive, disabled</td><td><code>systemctl</code></td></tr>
+<tr><td>Bench app memory</td><td>0.9-1.1 GB peaks, under its 10 GB cap; no OOM kill during the scenarios</td><td>scope summaries, <code>oom-kill</code> lines</td></tr>
+</table>
+</div>
+
+<h2 id="bench">5. What this means for the bench</h2>
+<ul>
+<li><strong>GPU modes are the risk.</strong> Under hypothesis A, the bench's pattern of killing a GPU-rendering
+WebKit process and starting another within a second is the most likely trigger. <code>gpu-shm</code> and
+<code>explicit-sync</code> both render on the GPU. <code>cpu</code> mode paints in software, but the nested KWin
+still uses the GPU, so it is lower risk, not zero.</li>
+<li><strong>The app itself is not the problem.</strong> Memory stayed far under the cap, and the frozen app did
+nothing unusual before it froze.</li>
+<li><strong>Unattended runs turn a GPU stall into a lost session.</strong> If the desktop KWin touches the display
+while the firmware is stuck, the whole machine freezes.</li>
+</ul>
+
+<h2 id="options">6. What could be done</h2>
+<p>None of these were tried. They are listed from cheapest to most involved.</p>
+<ul>
+<li><strong>Settle the question:</strong> recall whether the screen had frozen before the monitor went off at about
+12:00.</li>
+<li><strong>Space out bench launches:</strong> make <code>scroll-bench.sh</code> wait for the killed app's scope to be
+gone, plus a few seconds, before starting the next process. This is cheap and targets hypothesis A's trigger. It
+can't be shown to work without rerunning.</li>
+<li><strong>Set DP-1's VRR policy to Never:</strong> KWin would then stop taking the VRR-off AUX path on reconnect.
+That removes the exact call that hung, but not whatever stopped the firmware answering.</li>
+<li><strong>Enable <code>nvidia-persistenced</code>:</strong> NVIDIA forum replies to similar GSP hangs recommend it. It
+is unverified here.</li>
+<li><strong>Report it upstream:</strong> NVIDIA's open-gpu-kernel-modules issues or forum, with the eight stacks and an
+<code>nvidia-bug-report.sh</code> from a boot where it reproduces. The closest public report found is a different
+NVKMS lock hang on an RTX 5080 (DIFR prefetch), not this AUX path.</li>
+<li><strong>Only bench GPU modes while at the machine,</strong> so a stall can be caught, for example by switching
+to a VT, before it freezes the session.</li>
+</ul>
+
+<h2 id="limits">7. What this report did not establish</h2>
+<ul>
+<li><strong>Why the firmware stopped answering.</strong> The journal shows that KWin's request got no reply, not
+why. There is no firmware log: <code>EnableGpuFirmwareLogs</code> output isn't in the journal, and no
+<code>nvidia-bug-report.sh</code> was taken before the reboot.</li>
+<li><strong>Where the bench app froze.</strong> Its process is gone, and its log stops at "indexing complete", so it
+is inferred, not shown, that it froze in a GPU call.</li>
+<li><strong>Whether the screen was live from 11:56:33 to 11:59:35.</strong> No journal line shows the desktop
+rendering or taking input then.</li>
+<li><strong>The driver's AUX and RPC timeout logic.</strong> I didn't read the 615.78.08 source, so I don't know
+why the poll never timed out.</li>
+<li><strong>Reproduction.</strong> At your request, nothing was rerun, so neither hypothesis has been tested.</li>
+<li><strong>Web search.</strong> No public report names <code>nvDisableVrr</code>, <code>setIgnoreMSAEnable</code> or
+<code>EvoAuxBus</code> in a hang.
+  <ul>
+    <li>Closest: <a href="https://forums.developer.nvidia.com/t/bug-kwin-wayland-complete-hang-in-nvidia-open/381542">"kwin/wayland complete hang in nvidia-open"</a>,
+    an RTX 5080, but the NVKMS lock is held in a different path.</li>
+    <li>GSP hang advice: <a href="https://forums.developer.nvidia.com/t/570-124-04-hangs-unusable/325645/2">NVIDIA forum, 570.124.04 hangs</a>.</li>
+  </ul>
+</li>
+</ul>
+
+</main>
+</body>
+</html>
