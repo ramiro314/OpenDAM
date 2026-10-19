@@ -3,6 +3,7 @@
 // docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
 // check here.
 
+import { convertFileSrc } from '@tauri-apps/api/core';
 import { api } from '../api';
 import {
   cachedAssets,
@@ -1506,6 +1507,32 @@ export const UI_CHECKS: UiCheck[] = [
         clipboard.writeText = realWrite;
       }
       assert(useUIStore.getState().focusedAssetId === sedan!.id, 'the card lost the selection');
+
+      // 2D members show their own image: the kit's colormap.png copies, one per format folder
+      const colormap = cachedAssets(useAssetStore.getState()).find(
+        (a) => a.fileName === 'colormap.png' && a.groupFormats
+      );
+      assert(colormap, `no grouped colormap.png in the first pages of ${modelsPath}`);
+      useUIStore.getState().selectAsset(colormap!.id);
+      const copies = await api.getGroupMembers(colormap!.id);
+      assert(
+        copies.length > 1 && copies.every((c) => c.kind !== '3d_model'),
+        `colormap.png's members are ${copies.map((c) => c.filePath).join(', ')}`
+      );
+      const rowImage = (i: number) => memberRows()[i]?.querySelector('img') ?? null;
+      await waitFor(
+        () =>
+          memberRows().length === copies.length &&
+          memberRows()[0].dataset.groupMember === copies[0].id &&
+          copies.every((_, i) => rowImage(i)?.complete && rowImage(i)!.naturalWidth > 0),
+        10_000,
+        "the colormap copies' images"
+      );
+      copies.forEach((c, i) => {
+        const src = rowImage(i)!.getAttribute('src');
+        assert(src === convertFileSrc(c.filePath), `${c.filePath}'s row shows ${src}`);
+      });
+      await pause('U12-2d-members');
 
       useUIStore.getState().clearSelection();
       await searchWith({ folder: undefined }, waitFor);

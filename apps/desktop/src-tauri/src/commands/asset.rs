@@ -3125,8 +3125,13 @@ mod tests {
     /// A library holding `GROUPED_FILES`, each with its real extension and kind and its id the
     /// path, after its structure pass.
     async fn grouped_library() -> LibraryHandle {
+        sized_library(&GROUPED_FILES).await
+    }
+
+    /// A library holding `files`, as `grouped_library` holds `GROUPED_FILES`.
+    async fn sized_library(files: &[(&str, i64)]) -> LibraryHandle {
         let pool = memory_library_pool().await;
-        for (path, size) in GROUPED_FILES {
+        for &(path, size) in files {
             let name = path.rsplit('/').next().unwrap();
             let ext = name.rsplit_once('.').unwrap().1;
             sqlx::query(
@@ -3219,6 +3224,45 @@ mod tests {
             .map(|m| m.asset.file_path)
             .collect();
         assert_eq!(paths[0], format!("/libraries/lib/{SEDAN}"));
+    }
+
+    #[tokio::test]
+    async fn a_groups_members_order_by_format_then_by_path_ignoring_case() {
+        let ids = |lib: LibraryHandle, id: &'static str| async move {
+            group_members(&lib, id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.asset.id)
+                .collect::<Vec<_>>()
+        };
+        // The OBJ's path sorts before the FBX's, but FBX ranks first as a format.
+        let ship = sized_library(&[
+            ("ship/ship.glb", 1),
+            ("ship/ship.fbx", 1),
+            ("ship/obj/ship.obj", 1),
+        ])
+        .await;
+        assert_eq!(
+            ids(ship, "ship/ship.glb").await,
+            strings(&["ship/ship.glb", "ship/ship.fbx", "ship/obj/ship.obj"])
+        );
+        // Copies of one format follow their path ignoring case: `fbx/` before `OBJ/`, which
+        // byte order would put first.
+        let kit = sized_library(&[
+            ("kit/GLB format/tex.png", 1),
+            ("kit/OBJ/tex.png", 1),
+            ("kit/fbx/tex.png", 1),
+        ])
+        .await;
+        assert_eq!(
+            ids(kit, "kit/OBJ/tex.png").await,
+            strings(&[
+                "kit/GLB format/tex.png",
+                "kit/fbx/tex.png",
+                "kit/OBJ/tex.png"
+            ])
+        );
     }
 
     #[tokio::test]

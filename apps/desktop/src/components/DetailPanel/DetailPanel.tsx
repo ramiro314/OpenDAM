@@ -28,7 +28,7 @@ import {
 } from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { api } from '../../api';
-import { isWebviewDisplayable } from '../../utils/media';
+import { imageOf } from '../../utils/media';
 import { formatSize } from '../../utils/format';
 import { useImageScaling } from '../../hooks/useImageScaling';
 import { ThreeViewer } from './ThreeViewer';
@@ -763,16 +763,6 @@ function PreviewTab({ asset, onGeneratePreview }: { asset: Asset; onGeneratePrev
 }
 
 // ── Preview ───────────────────────────────────────────────────────────────
-/**
- * The image that stands for `asset`: the original where the webview can display it, else its
- * rendered thumbnail. `undefined` when it has neither, or its preview is a model.
- */
-function imageOf(asset: Asset): string | undefined {
-  if (isWebviewDisplayable(asset.extension)) return asset.filePath;
-  if (asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb')) return asset.thumbnailPath;
-  return undefined;
-}
-
 /**
  * The panel's preview of `asset`. Without `onGeneratePreview`, as for a group member, which the
  * preview queue skips, a file with no preview shows only its extension.

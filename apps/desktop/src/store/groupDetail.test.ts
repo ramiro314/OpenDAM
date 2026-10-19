@@ -113,6 +113,30 @@ describe('useGroupDetailStore', () => {
     expect(panel().members).toEqual(VAN);
   });
 
+  test('a failed load keeps a reloaded group as it was, and lists nothing for a new one', async () => {
+    serve(() => ({ [SEDAN[0].id]: SEDAN }));
+    await panel().load(SEDAN[0].id);
+    panel().showMember(SEDAN[1].id);
+    const realError = console.error;
+    console.error = () => {};
+    try {
+      api.getGroupMembers = async () => {
+        throw new Error('database is locked');
+      };
+      await panel().load(SEDAN[0].id);
+      expect(panel().groupId).toBe(SEDAN[0].id);
+      expect(panel().members).toEqual(SEDAN);
+      expect(shownMember(panel())).toEqual(SEDAN[1]);
+
+      await panel().load(VAN[0].id);
+      expect(panel().groupId).toBe(VAN[0].id);
+      expect(panel().members).toEqual([]);
+      expect(shownMember(panel())).toBeNull();
+    } finally {
+      console.error = realError;
+    }
+  });
+
   test('a file that is not listed never shows', async () => {
     serve(() => ({ [SEDAN[0].id]: SEDAN }));
     await panel().load(SEDAN[0].id);
