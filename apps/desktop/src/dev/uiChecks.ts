@@ -2132,11 +2132,17 @@ export const UI_CHECKS: UiCheck[] = [
         'the panel to show the edits'
       );
       await waitFor(
-        () =>
-          folderRow(kitPath)?.textContent?.includes(name) === true &&
-          packCard(kit)?.title.startsWith(`${name} (`) === true,
+        () => folderRow(kitPath)?.textContent?.includes(name) === true,
         editTimeout,
-        'the tree node and the card to show the new name'
+        'the tree node to show the new name'
+      );
+      // The new name sorts the card elsewhere in the Packs view
+      await waitFor(() => card(kitPath)?.name === name, editTimeout, 'the card to take the name');
+      const renamed = card(kitPath)!;
+      const renamedCard = await scrollToCard(cards().indexOf(renamed), renamed, waitFor);
+      assert(
+        renamedCard.title.startsWith(`${name} (`),
+        `the card reads "${renamedCard.title}", not "${name}"`
       );
       // "Open" opens the source URL, recorded rather than run
       const opened: string[] = [];
