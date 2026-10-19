@@ -25,6 +25,7 @@ import type { AutotagUpdate } from './types';
 import { api } from './api';
 import { startModelThumbnailer } from './preview/modelThumbnailer';
 import { isEditingText, isInControl } from './utils/keyboard';
+import { itemFileCount } from './utils/format';
 import styles from './App.module.css';
 
 export default function App() {
@@ -233,10 +234,16 @@ export default function App() {
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // A group's members and its bundled preview go with it (plan C21)
+  const deleteFileCount = assetsToDelete.reduce((n, id) => {
+    const asset = useAssetStore.getState().getById(id);
+    return n + (asset ? itemFileCount(asset) : 1);
+  }, 0);
+
   const handleConfirmAppDelete = async () => {
     const ids = assetsToDelete;
     if (ids.length === 0) return;
-    const count = ids.length;
+    const count = deleteFileCount;
     requestDelete([]);
     setDeleteError(null);
     try {
@@ -278,8 +285,9 @@ export default function App() {
         itemName={
           assetsToDelete.length === 1
             ? useAssetStore.getState().getById(assetsToDelete[0])?.fileName || '1 file'
-            : `${assetsToDelete.length} files`
+            : `${assetsToDelete.length} ${deleteFileCount === assetsToDelete.length ? 'files' : 'items'}`
         }
+        fileCount={deleteFileCount}
         onConfirm={handleConfirmAppDelete}
         onCancel={() => requestDelete([])}
       />

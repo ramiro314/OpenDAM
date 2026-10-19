@@ -135,6 +135,9 @@ docs/plans                    Plans for this fork
     transaction, which `no_metadata_write_bypasses_group_members` checks, and auto-tag sends
     only main items. When a group forms or grows, the structure pass gives every member the
     union of the group's tags and collections and the main item's fields (`apply_unions`).
+  - Delete and rename reach every member and the bundled preview, unless another item shows the
+    same render (`item_files` in `commands/asset.rs`). A rename gives them all the new stem,
+    refuses before anything moves when a name is taken, and puts files back if a step fails.
   - The preview queue skips members other than the main item, and their thumbnails stay on disk.
     An index run queues no new file itself: the pass it ends with queues every file but those
     members (support files' cover images included), so a member is never queued, even during a

@@ -26,6 +26,7 @@ import {
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { api } from '../../api';
 import { isWebviewDisplayable } from '../../utils/media';
+import { itemFileCount } from '../../utils/format';
 import { useImageScaling } from '../../hooks/useImageScaling';
 import { ThreeViewer } from './ThreeViewer';
 import { SuggestTags } from './SuggestTags';
@@ -403,6 +404,7 @@ export function DetailPanel() {
         isOpen={isDeleteDialogOpen}
         itemType="asset"
         itemName={asset.fileName}
+        fileCount={itemFileCount(asset)}
         onConfirm={handleConfirmDelete}
         onCancel={() => setIsDeleteDialogOpen(false)}
       />

@@ -1,3 +1,5 @@
+import type { Asset } from '../types';
+
 /** Compact file size for grid cards and list rows, e.g. `512B`, `1.5KB`, `2.00GB`. */
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
@@ -39,4 +41,17 @@ export function formatGroupBadge(
     label: `${formats[0]} +${formats.length - 1}`,
     title: `${formats.length} files: ${[...new Set(formats)].join(', ')}`,
   };
+}
+
+/**
+ * How many files deleting or renaming an item reaches (plan C21): each member of its format
+ * group, or the file alone, plus its bundled preview.
+ */
+export function itemFileCount(asset: Pick<Asset, 'groupFormats' | 'bundledPreview'>): number {
+  return (asset.groupFormats?.length ?? 1) + (asset.bundledPreview ? 1 : 0);
+}
+
+/** A delete dialog's action for `files` files, `Move 4 files to the trash`. */
+export function formatTrashAction(files: number): string {
+  return `Move ${files === 1 ? '1 file' : `${files.toLocaleString('en-US')} files`} to the trash`;
 }
