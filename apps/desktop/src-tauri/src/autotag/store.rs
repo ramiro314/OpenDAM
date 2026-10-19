@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::provider::ProposedTag;
 use super::vocabulary::normalize_name;
-use crate::commands::asset::{folder_range, MAIN_OR_SINGLE, NOT_SUPPORT};
 use crate::db::{create_master_tag, upsert_tag, Database, LibraryHandle};
 
 /// Rows per transaction, the repository's batch size.
@@ -189,39 +188,6 @@ pub async fn inline_runs_of(
     .bind(asset_id)
     .fetch_all(master)
     .await
-}
-
-/// The grid items below `folder` of a library with no tag, or all of them with `all_assets`, in
-/// file path order (plan C22). Like the grid with that folder selected, it holds main items and
-/// files on their own, never support files, and a group whose files lie below the folder counts
-/// even when its main item lies elsewhere. A group sends only its main item, whose tags reach
-/// its members (plan D18). The root (`""`) covers the whole library.
-pub async fn folder_assets(
-    lib: &Pool<Sqlite>,
-    folder: &str,
-    all_assets: bool,
-) -> sqlx::Result<Vec<String>> {
-    let range = folder_range(folder);
-    let below = if range.is_some() {
-        "AND a.id IN (SELECT COALESCE(m.group_id, m.id) FROM assets m
-                      WHERE m.file_path >= ? AND m.file_path < ?)"
-    } else {
-        ""
-    };
-    let untagged = if all_assets {
-        ""
-    } else {
-        "AND NOT EXISTS (SELECT 1 FROM asset_tags t WHERE t.asset_id = a.id)"
-    };
-    let sql = format!(
-        "SELECT id FROM assets a WHERE {MAIN_OR_SINGLE} AND {NOT_SUPPORT} {below} {untagged}
-         ORDER BY file_path"
-    );
-    let mut query = sqlx::query_scalar(&sql);
-    for bound in range.into_iter().flatten() {
-        query = query.bind(bound);
-    }
-    query.fetch_all(lib).await
 }
 
 /// The overlap rule (D13), over an item `o` joined to its run `r`: an item that is `queued` or
@@ -1950,41 +1916,5 @@ mod tests {
             .unwrap();
 
         assert_eq!(count_rows(master, "tag_run_applied").await, 0);
-    }
-
-    #[tokio::test]
-    async fn a_folder_sends_its_grid_items_one_per_group_and_no_support_file() {
-        use crate::structure::tests::{car_kit, SEDAN};
-        const COLORMAP: &str = "3D assets/Car Kit/Models/GLB format/Textures/colormap.png";
-        let pool = car_kit().await;
-        let sent = |folder: &'static str, all_assets| {
-            let pool = pool.clone();
-            async move { folder_assets(&pool, folder, all_assets).await.unwrap() }
-        };
-
-        // The root is the whole library: the sedan as its GLB, and the texture. The FBX and OBJ,
-        // the render, the covers and the licenses never go.
-        assert_eq!(sent("", true).await, [COLORMAP, SEDAN[1]]);
-        assert_eq!(sent("3D assets/Car Kit", true).await, [COLORMAP, SEDAN[1]]);
-        // The FBX's folder shows the sedan, so it sends the main item that lies outside it.
-        assert_eq!(
-            sent("3D assets/Car Kit/Models/FBX format", true).await,
-            [SEDAN[1]]
-        );
-        assert!(sent("3D assets/Car Kit/Previews", true).await.is_empty());
-        assert!(sent("3D assets/Holiday Kit", true).await.is_empty());
-        assert!(sent("3D assets/Car", true).await.is_empty());
-
-        insert_tag(&pool, "t-car", "Car").await;
-        sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES (?, 't-car')")
-            .bind(SEDAN[1])
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert_eq!(sent("3D assets/Car Kit", false).await, [COLORMAP]);
-        assert_eq!(sent("3D assets/Car Kit", true).await, [COLORMAP, SEDAN[1]]);
-        assert!(sent("3D assets/Car Kit/Models/FBX format", false)
-            .await
-            .is_empty());
     }
 }

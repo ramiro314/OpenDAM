@@ -580,8 +580,8 @@ impl Engine {
         }
     }
 
-    /// The items below `path` of a library (`store::folder_assets`), named by the folder, or by
-    /// the library at its root.
+    /// The grid's items below `path` of a library (`asset::folder_item_ids`), named by the
+    /// folder, or by the library at its root.
     async fn folder_items(
         &self,
         library_id: &str,
@@ -593,7 +593,7 @@ impl Engine {
             .get_library_handle(library_id)
             .await
             .ok_or("This library is offline")?;
-        let asset_ids = store::folder_assets(&lib.pool, path, all_assets)
+        let asset_ids = crate::commands::asset::folder_item_ids(&lib.pool, path, !all_assets)
             .await
             .map_err(|e| e.to_string())?;
         let name = match path.trim_matches('/').rsplit('/').next() {

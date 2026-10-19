@@ -145,9 +145,9 @@ docs/plans                    Plans for this fork
     every member. Each write expands its asset id through `structure::group_members` in its own
     transaction, which `no_metadata_write_bypasses_group_members` checks, and auto-tag sends
     only main items. A library or folder run sends the grid's items below it, never support
-    files (`autotag::store::folder_assets`). When a group forms or grows, the structure pass
-    gives every member the union of the group's tags and collections and the main item's
-    fields (`apply_unions`).
+    files: `asset::folder_item_ids` runs the grid's own search for the folder. When a group
+    forms or grows, the structure pass gives every member the union of the group's tags and
+    collections and the main item's fields (`apply_unions`).
   - Delete and rename reach every member and the bundled preview, unless another item shows the
     same render (`item_files` in `commands/asset.rs`). A rename gives them all the new stem,
     refuses before anything moves when a name is taken, and puts files back if a step fails.
