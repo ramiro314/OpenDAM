@@ -109,10 +109,15 @@ docs/plans                    Plans for this fork
   `structure.rs` from the indexed paths and sizes: `structure::derive` is a pure function, and
   the pass writes only the rows that changed, in 200-row transactions. The pass reads a pack's
   license file (`structure::parse_license`) only when the file's size or mtime changed since it
-  last read it, or an older `LICENSE_PARSER` read it, so a rerun reads no file. Opening a library DB (`connect_library_sqlite`)
-  runs the pass once, and
+  last read it, or an older `LICENSE_PARSER` read it, and a render's header only when it has no
+  read recorded or its size or mtime changed since, so a rerun reads no file. It caches a
+  render's size on the render's own row: `render_width` and `render_height`, with the
+  `size_bytes` and `modified_at` it read them at in `render_read_bytes` and `render_read_mtime`.
+  A header it can't read sets all four to `NULL`, so the next pass reads it again. Opening a
+  library DB (`connect_library_sqlite`) runs the pass once, and
   every `watcher::index_paths` run ends with it, under the library's `Database::index_lock`. Only
-  `structure.rs` writes `folders`, `support_role`, `group_id` and `bundled_preview`: a command
+  `structure.rs` writes `folders`, `support_role`, `group_id`, `bundled_preview` and the
+  `render_*` columns: a command
   that changes the
   indexed paths (`delete_asset`, `delete_assets`, `rename_asset`) calls
   `structure::rebuild_library` before it returns, rather than patching rows, and that waits for
@@ -168,22 +173,30 @@ docs/plans                    Plans for this fork
     library's first index. The pass also takes a file that has become a member off the queue,
     and `claim_jobs` skips members. One exception: a group whose main item takes no preview,
     such as a `.blend`, keeps its best previewable member queued as a stand-in
-    (`structure::preview_stand_ins`, `preview::claim_jobs`'s `STANDS_IN`), and its card shows
+    (`structure::preview_stand_ins`, `preview::claim_jobs`'s `stands_in`), and its card shows
     that member's thumbnail. `preview.rs` owns the job
     states and how an asset goes on or off the queue (`preview::enqueue`, `preview::unqueue`).
 - **Bundled previews.** An image in a folder named `Previews`, `Preview` or `Renders` (any case)
   renders each model below that folder's parent with the same stem, ignoring case (plan C12).
   The pass makes it a `model_preview` support file and stores its path in `bundled_preview` on
-  the model's main item, or on the model when it is on its own. An image that renders no model,
+  the model's main item, or on the model when it is on its own. A render **fits** a card when
+  both of its cached sides are at least `preview::THUMB_SIZE` (512 px). One of unknown size,
+  never read or unreadable, doesn't (`structure::fits`). An item rendered more than once names
+  its first render by path that fits, else its first by path, and a render too small to fit
+  stays a hidden `model_preview` that moves with its model (plan small-bundled-previews C1-C3).
+  An image that renders no model,
   or that the webview can't display itself (`preview::is_webview_displayable`), stays an
   ordinary image, so a render without a thumbnail still shows. Cards and list rows show the
   bundled preview first, then the thumbnail, then the original (`tileMedia`), and
   `ASSET_COLUMNS` sends the render's own thumbnail when it has one. `preview:done` carries the
   finished file's `filePath` and its `previousThumbnailPath`, so cached models showing either as
   their render switch to its new thumbnail, or to the render itself when the thumbnail was
-  cleared (`updateAssetPreview`). The pass keeps an item with a bundled preview off the preview queue
-  and gives its group no stand-in, `claim_jobs` skips its jobs, and an item that loses its render
-  goes back on the queue.
+  cleared (`updateAssetPreview`). An item is **pictured** when its bundled preview fits. The
+  pass keeps a pictured item off the preview queue and gives its group no stand-in, and
+  `claim_jobs` skips its jobs. An item whose render is too small, or that loses its render,
+  goes back on the queue unless it already has a preview, and a group whose main item takes no
+  preview gets its stand-in. The Rust side is `structure::Structure::pictured`, and every SQL
+  check is the one fragment `commands::asset::pictured`.
 
 ## Python preview worker
 

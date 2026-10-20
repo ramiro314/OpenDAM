@@ -187,8 +187,10 @@ async fn add_tag_description_column(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// Backward compatibility: assets gained `support_role` and `group_id`, and folders
-/// `split_groups`, which the structure pass derives. As with tag descriptions, any failure other
+/// Backward compatibility: assets gained `support_role`, `group_id`, `bundled_preview` and a
+/// render's cached size (`render_*`), and folders `split_groups`, which the structure pass
+/// derives. A library that gains the sizes reads its renders' headers in the pass at open, and
+/// keeps the thumbnails it has. As with tag descriptions, any failure other
 /// than a column already being there is an error, since every search reads them. Their indexes are
 /// made here rather than in the schema, which runs before an old library has the columns.
 async fn add_structure_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
@@ -196,6 +198,10 @@ async fn add_structure_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
         ("assets", "support_role", "TEXT"),
         ("assets", "group_id", "TEXT"),
         ("assets", "bundled_preview", "TEXT"),
+        ("assets", "render_width", "INTEGER"),
+        ("assets", "render_height", "INTEGER"),
+        ("assets", "render_read_bytes", "INTEGER"),
+        ("assets", "render_read_mtime", "INTEGER"),
         ("folders", "split_groups", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         let present: bool =
@@ -1120,6 +1126,120 @@ mod tests {
         assert_eq!(
             derived.bundled_previews,
             [(paths[1].to_string(), paths[3].to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_library_made_before_render_sizes_reads_them_and_rerenders_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".opendam/library.sqlite");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let pool = connect_library_sqlite(&file).await.unwrap();
+        // As plan C12 left a Kenney kit: each model records its 64 px render and is off the
+        // queue. The sedan was rendered before C12, the van never was.
+        let (sedan, van) = ("kit/Models/sedan.glb", "kit/Models/van.glb");
+        for (path, status, thumbnail, role, render) in [
+            (
+                sedan,
+                "done",
+                Some(".opendam/thumbs/sedan_thumb.png"),
+                None,
+                Some("kit/Previews/sedan.png"),
+            ),
+            (van, "none", None, None, Some("kit/Previews/van.png")),
+            (
+                "kit/Previews/sedan.png",
+                "done",
+                None,
+                Some("model_preview"),
+                None,
+            ),
+            (
+                "kit/Previews/van.png",
+                "done",
+                None,
+                Some("model_preview"),
+                None,
+            ),
+        ] {
+            if role.is_some() {
+                crate::structure::tests::write_png(&dir.path().join(path), 64, 64);
+            }
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, preview_status, thumbnail_path, support_role, bundled_preview)
+                 VALUES (?, ?, 'f', ?, ?, 1, 0, 0, ?, ?, ?, ?)",
+            )
+            .bind(path)
+            .bind(path)
+            .bind(path.rsplit('.').next().unwrap())
+            .bind(if path.ends_with(".glb") { "3d_model" } else { "texture" })
+            .bind(status)
+            .bind(thumbnail)
+            .bind(role)
+            .bind(render)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "ALTER TABLE assets DROP COLUMN render_width; ALTER TABLE assets DROP COLUMN render_height;
+             ALTER TABLE assets DROP COLUMN render_read_bytes;
+             ALTER TABLE assets DROP COLUMN render_read_mtime;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let reopened = connect_library_sqlite(&file).await.unwrap();
+
+        // The pass at open reads both renders: too small, so the van is queued, and the sedan
+        // keeps the thumbnail it has. Nothing else changes, and a rerun reads nothing.
+        use crate::structure::tests::render_read;
+        for render in ["kit/Previews/sedan.png", "kit/Previews/van.png"] {
+            assert_eq!(
+                render_read(&reopened, render).await,
+                [Some(64), Some(64), Some(1), Some(0)]
+            );
+        }
+        let models: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT file_path, preview_status, thumbnail_path FROM assets
+             WHERE extension = 'glb' ORDER BY file_path",
+        )
+        .fetch_all(&reopened)
+        .await
+        .unwrap();
+        assert_eq!(
+            models,
+            [
+                (
+                    sedan.to_string(),
+                    "done".to_string(),
+                    Some(".opendam/thumbs/sedan_thumb.png".to_string())
+                ),
+                (van.to_string(), "pending".to_string(), None),
+            ]
+        );
+        let jobs: Vec<String> = sqlx::query_scalar("SELECT asset_id FROM preview_jobs")
+            .fetch_all(&reopened)
+            .await
+            .unwrap();
+        assert_eq!(jobs, [van]);
+        assert_eq!(
+            crate::structure::pass(&reopened, dir.path()).await.unwrap(),
+            crate::structure::PassRun {
+                written: 0,
+                render_reads: 0
+            }
+        );
+        assert_eq!(
+            crate::structure::tests::derived_rows(&reopened)
+                .await
+                .bundled_previews,
+            [
+                (sedan.to_string(), "kit/Previews/sedan.png".to_string()),
+                (van.to_string(), "kit/Previews/van.png".to_string()),
+            ]
         );
     }
 
