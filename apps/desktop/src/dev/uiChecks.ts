@@ -4,6 +4,7 @@
 // check here.
 
 import { convertFileSrc } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { api } from '../api';
 import {
   cachedAssets,
@@ -178,6 +179,9 @@ const BENCH_LIBRARY = 'bench';
  * (docs/plans/smarter-big-collections/plan.md, A3), from the golden snapshot's 83,095 files.
  */
 const ROOT_ITEMS = 51_139;
+
+/** The grid items an earlier check in this process deleted from the run copy (U9 deletes one). */
+let deletedItems = 0;
 
 /** How long U9 waits for the folder tree, and for a write to get through. */
 const STRUCTURE_TIMEOUT_MS = 900_000;
@@ -483,9 +487,10 @@ export const UI_CHECKS: UiCheck[] = [
   {
     id: 'U5',
     title:
-      'Right-clicking a card, then a list row, at offset 60,000 opens the menu, and Escape closes it',
+      'Right-clicking a card, then a list row, at offset 45,000 opens the menu, and Escape closes it',
     run: async ({ scroll, assert, pause }) => {
-      const target = 60_000;
+      // Deep in the 51,139 grid items, far past the cached pages
+      const target = 45_000;
       const { total } = useAssetStore.getState();
       assert(total > target, `only ${total} results`);
       const rightClick = async (what: string, idPrefix: string, shot: string) => {
@@ -897,12 +902,25 @@ export const UI_CHECKS: UiCheck[] = [
           // What the screenshot shows must still be the state asserted before it
           await assertScaling(assert, 'grid after the screenshot', el, 'cover', pref);
           await assertScaling(assert, 'detail panel after the screenshot', panel!, 'contain', pref);
+          // App closes QuickLook when the window loses focus, as a screenshot taken late could
+          // make it: a timeout says whether it did
+          let blurs = 0;
+          const onBlur = () => void (blurs += 1);
+          window.addEventListener('blur', onBlur);
           await quickLook(true);
           await untilFrame(
             () => !!quickLookImage()?.complete && quickLookImage()!.naturalWidth > 0,
             5_000,
             'the QuickLook image'
-          );
+          )
+            .catch((e: unknown) => {
+              const dialog = document.querySelector('[role="dialog"][aria-modal="true"]');
+              throw new Error(
+                `${String(e)} (QuickLook ${dialog ? 'open' : 'closed'}, ${blurs} window blurs, ` +
+                  `focused: ${document.hasFocus()}, image: ${quickLookImage()?.src ?? 'none'})`
+              );
+            })
+            .finally(() => window.removeEventListener('blur', onBlur));
           const big = quickLookImage()!;
           assert(isEnlarged(big, 'contain'), `QuickLook shows ${what} at ${big.clientWidth} px`);
           await assertScaling(assert, 'QuickLook', big.parentElement!, 'contain', pref);
@@ -1124,6 +1142,7 @@ export const UI_CHECKS: UiCheck[] = [
 
       // Rows only: the file stays on the run copy rather than going to the trash
       await useAssetStore.getState().deleteAsset(asset.id, false);
+      deletedItems += 1;
       await waitFor(() => folderRow(folder.path) === null, 30_000, `${folder.path} to drop out`);
       await waitFor(
         () => ancestors.every((path, i) => shownCount(folderRow(path)!) === before[i] - 1),
@@ -1204,7 +1223,7 @@ export const UI_CHECKS: UiCheck[] = [
       await waitFor(() => status() === '0 items (1 file)', 5_000, 'the status bar');
       await pause('U10-license-hidden');
 
-      // "Show hidden files" brings it back, and the kit's badge counts its hidden files
+      // "Show hidden files" brings it back, and the kit's live badge counts it
       const checkbox = document.querySelector<HTMLInputElement>(
         '#sidebar-filter-show-hidden input'
       );
@@ -1227,13 +1246,19 @@ export const UI_CHECKS: UiCheck[] = [
         'the License.txt tile'
       );
       assert(status() === '1 item (1 file)', `the status bar reads "${status()}"`);
-      assert(
-        shownCount(folderRow(kitPath)!) === kit.itemCount + kit.hiddenCount,
-        `${kitPath}'s badge doesn't count its hidden files`
-      );
+      // Search text and "Show hidden files" both make the tree's counts live: each badge is the
+      // grid's total for its folder
+      const kitBadge = () => shownCount(folderRow(kitPath)!);
+      await waitFor(() => kitBadge() === 1, 10_000, `${kitPath}'s badge to count the license`);
       await pause('U10-license-shown');
 
+      // With the text cleared, the kit's badge counts its hidden files
       await searchWith({ text: '' }, waitFor);
+      await waitFor(
+        () => kitBadge() === kit.itemCount + kit.hiddenCount,
+        10_000,
+        `${kitPath}'s badge to count its hidden files, ${kit.itemCount} + ${kit.hiddenCount}`
+      );
       s = useAssetStore.getState();
       // The hidden files join the items, while group members stay out of the grid
       assert(
@@ -1494,18 +1519,24 @@ export const UI_CHECKS: UiCheck[] = [
       });
       await pause('U12-group-files');
 
-      // What the grid holds while moving between members
+      // What the grid holds while moving between members: its selection and cached pages, and
+      // the search they came from. The app polls the library DB's mtime every 30 s (lib.rs) and
+      // sends `library:updated` after any write, its own included, which refreshes the grid: a
+      // new search then follows from that event, not from the detail panel.
       const grid = () => {
         const ui = useUIStore.getState();
         const st = useAssetStore.getState();
-        return JSON.stringify({
-          selected: [...ui.selectedAssetIds],
-          focused: ui.focusedAssetId,
-          generation: st.generation,
-          epoch: st.epoch,
-          pages: [...st.pages].map(([page, assets]) => [page, assets.map((a) => a.id)]),
-        });
+        return {
+          held: JSON.stringify({
+            selected: [...ui.selectedAssetIds],
+            focused: ui.focusedAssetId,
+            pages: [...st.pages].map(([page, assets]) => [page, assets.map((a) => a.id)]),
+          }),
+          search: `generation ${st.generation}, epoch ${st.epoch}`,
+        };
       };
+      let updates = 0;
+      const unlisten = await listen('library:updated', () => void (updates += 1));
       const before = grid();
 
       // File actions act on the file they sit beside, recorded rather than run
@@ -1580,9 +1611,15 @@ export const UI_CHECKS: UiCheck[] = [
             5_000,
             'back to the group'
           );
-          assert(grid() === before, `the grid changed: ${before} became ${grid()}`);
+          const now = grid();
+          assert(now.held === before.held, `the grid changed: ${before.held} became ${now.held}`);
+          assert(
+            now.search === before.search || updates > 0,
+            `the grid searched again, from ${before.search} to ${now.search}`
+          );
         }
       } finally {
+        unlisten();
         api.openWithDefault = realOpen;
         api.revealInFileManager = realReveal;
         clipboard.writeText = realWrite;
@@ -1814,7 +1851,7 @@ export const UI_CHECKS: UiCheck[] = [
     id: 'U14',
     title:
       'UI Pack sprites show once each with a solid x3 badge, same-named tiles and color or ' +
-      'style variants stay apart, and the library root shows 51,139 items',
+      'style variants stay apart, and the library root shows 51,139 items, less any U9 deleted',
     run: async ({ assert, waitFor, pause, sleep }) => {
       await expandBenchLibrary({ assert, sleep });
       const results = async () => {
@@ -1825,10 +1862,12 @@ export const UI_CHECKS: UiCheck[] = [
         searchWith({ text: '', folder: { libraryId: BENCH_LIBRARY, path } }, waitFor);
       const status = () => document.getElementById('status-count')?.textContent ?? '';
 
-      // The library root: plan A3's item count, for the golden snapshot's 83,095 files
+      // The library root: plan A3's item count, for the golden snapshot's 83,095 files, less the
+      // item U9 deleted when it ran before in this process
       await inFolder('');
       let s = useAssetStore.getState();
-      assert(s.total === ROOT_ITEMS, `the library root shows ${s.total} items, not ${ROOT_ITEMS}`);
+      const rootItems = ROOT_ITEMS - deletedItems;
+      assert(s.total === rootItems, `the library root shows ${s.total} items, not ${rootItems}`);
       const rootStatus = formatItemsAndFiles(s.total, s.fileTotal);
       await waitFor(() => status() === rootStatus, 5_000, `the status bar to read ${rootStatus}`);
       await pause('U14-library-root');

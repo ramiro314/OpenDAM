@@ -186,8 +186,8 @@ The UI checks, each defined in its plan:
   in `Audio/` whose files are all hidden still shows with a count of 0, and the kit's grid holds
   neither `License.txt` nor `Preview.png`, while the status bar reads `<items> items (<files>
   files)` with the kit's hidden files counted as files only. A search for "license" in the kit
-  then reads `0 items (1 file)`, and "Show hidden files" brings `License.txt` back and makes the
-  kit's badge count its hidden files. Then the library root's Packs view holds 254 cards in name
+  then reads `0 items (1 file)`, and "Show hidden files" brings `License.txt` back, the kit's live
+  badge counting it, and once the text is cleared the badge counts the kit's hidden files. Then the library root's Packs view holds 254 cards in name
   order, each with a cover, the visible ones loaded, 24 labelled "No visible items" and none for
   the 11 zip-only folders in `Archive/`. Search text, a kind filter and "Show hidden files" each
   show assets until cleared, as does the toggle's Assets, and switching back to Packs clears an
@@ -228,8 +228,8 @@ The UI checks, each defined in its plan:
   `.fbx` and then `.png` confirms. Each node's `get_folder_counts` call takes under 300 ms.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 5. Screenshots:
   `U13-tree-counts`, `U13-filter-counts`, `U13-format-union`.
-- **U14** (2D stacks): the library root shows 51,139 items (plan A3) and the status bar counts
-  them. `UI assets/UI Pack` lists each sprite once, as its `Default/` PNG standing for its
+- **U14** (2D stacks): the library root shows 51,139 items (plan A3), less the one U9 deletes
+  when it ran first in the same process, and the status bar counts them. `UI assets/UI Pack` lists each sprite once, as its `Default/` PNG standing for its
   `Double/` PNG and its vector, with a solid `x3` badge whose tooltip reads `3 files: PNG, SVG`,
   and its five colors stay five items. `2D assets/Pixel Platformer/Tiles` still lists both
   `tile_0000.png` files, and the Crosshair Pack's Dark, Glow, Light and Outline styles stay
