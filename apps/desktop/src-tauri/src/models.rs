@@ -47,7 +47,7 @@ impl AssetKind {
 
             "psd" | "psb" | "ai" | "svg" | "gif" => AssetKind::Image,
 
-            "pdf" | "txt" | "md" | "rtf" | "docx" => AssetKind::Document,
+            "pdf" | "txt" | "md" | "rtf" | "docx" | "json" => AssetKind::Document,
 
             _ => AssetKind::Other,
         }

@@ -215,15 +215,16 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
                 .unwrap_or("")
                 .to_lowercase();
 
-            if !is_supported(&ext) {
-                continue;
-            }
-
             let file_name = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
+
+            // A pack's `datapackage.json` is the only JSON file indexed.
+            if !is_supported(&ext) && !crate::structure::is_package_file(&file_name) {
+                continue;
+            }
 
             // Skip Revit backup files (e.g. name.0001.rfa, name.0002.rvt)
             if is_revit_backup(&file_name) {
@@ -678,6 +679,57 @@ mod tests {
         assert!(
             assets.iter().all(|(_, status)| status == "none"),
             "{assets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_datapackage_json_is_the_only_json_file_indexed_and_makes_a_pack() {
+        let (dir, db, lib) = temp_library().await;
+        std::fs::create_dir_all(dir.path().join("kit/Sub")).unwrap();
+        for (path, text) in [
+            ("kit/datapackage.json", r#"{"title": "City Pack"}"#),
+            ("kit/Sub/DataPackage.JSON", r#"{"title": "Sub Pack"}"#),
+            ("kit/other.json", "{}"),
+            ("kit/rock.glb", "glTF"),
+        ] {
+            std::fs::write(dir.path().join(path), text).unwrap();
+        }
+        reindex(&db, &lib).await;
+
+        let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT file_path, kind, preview_status, support_role FROM assets
+             WHERE extension = 'json' ORDER BY file_path",
+        )
+        .fetch_all(&lib.pool)
+        .await
+        .unwrap();
+        let doc = |path: &str| {
+            let (kind, none, role) = ("document".into(), "none".into(), Some("doc".into()));
+            (path.to_string(), kind, none, role)
+        };
+        assert_eq!(
+            rows,
+            [doc("kit/Sub/DataPackage.JSON"), doc("kit/datapackage.json")]
+        );
+        assert_eq!(
+            queued(&lib.pool).await.1,
+            pairs(&[("kit/rock.glb", "pending")])
+        );
+        let names: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT path, pack_json FROM folders WHERE is_pack ORDER BY path")
+                .fetch_all(&lib.pool)
+                .await
+                .unwrap();
+        let names: Vec<(&str, String)> = names
+            .iter()
+            .map(|(path, json)| {
+                let pack = crate::structure::parse_pack(json.as_deref()).unwrap();
+                (path.as_str(), pack.name)
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [("kit", "City Pack".into()), ("kit/Sub", "Sub Pack".into())]
         );
     }
 

@@ -104,13 +104,18 @@ docs/plans                    Plans for this fork
 
 - **Structure is derived.** `folders` (each folder's path, parent, name, `is_pack`, and its
   recursive `item_count`, `hidden_count` and `split_groups`, the root being `path = ''`, and a
-  pack's name, cover, gallery, license and files by kind in `pack_json`) and
+  pack's name, cover, gallery, license, `datapackage.json` and files by kind in `pack_json`) and
   `assets.support_role`, `assets.group_id` and `assets.bundled_preview` are recomputed by
   `structure.rs` from the indexed paths and sizes: `structure::derive` is a pure function, and
   the pass writes only the rows that changed, in 200-row transactions. The pass reads a pack's
   license file (`structure::parse_license`) only when the file's size or mtime changed since it
-  last read it, or an older `LICENSE_PARSER` read it, and a render's header only when it has no
-  read recorded or its size or mtime changed since, so a rerun reads no file. It caches a
+  last read it, or an older `LICENSE_PARSER` read it, and a pack's `datapackage.json`
+  (`structure::parse_package`, at most 1 MiB) on the same terms under `PACKAGE_PARSER`, and a
+  render's header only when it has no read recorded or its size or mtime changed since, so a
+  rerun reads no file. A `datapackage.json` (any ASCII case, `structure::is_package_file`) is the
+  only JSON file the watcher indexes: a Document whose folder is a pack, as if marked, unless
+  it is "Not a pack". A malformed one is ignored with its read recorded, and one it can't read
+  records none. It caches a
   render's size on the render's own row: `render_width` and `render_height`, with the
   `size_bytes` and `modified_at` it read them at in `render_read_bytes` and `render_read_mtime`.
   A header it can't read sets all four to `NULL`, so the next pass reads it again. Opening a
@@ -128,6 +133,9 @@ docs/plans                    Plans for this fork
     folder going away and coming back. The pass reads them (`structure::read_overrides`) and
     never writes or deletes them. `set_pack_override` writes one, then calls
     `structure::rebuild_library` before it emits `library:updated`, like the commands above.
+    Your edits win: a pack's name is yours, else the `datapackage.json` `title`, else the license
+    header's, else the folder's, and its cover is yours, else the file's `image`, else its first
+    `Preview*` image.
 - **One grid item per group.** A format group (one model in several formats, or a file's copies
   under format folders, plan C11) holds its main item's id in `group_id` on every member, the
   main item included; a file on its own has `NULL`. The main item is chosen GLB > glTF > FBX >
