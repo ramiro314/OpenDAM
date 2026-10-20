@@ -1,6 +1,16 @@
 # Pack metadata files: read a pack's `datapackage.json`
 
-Status: shaped 2026-10-19 in a two-round interview (D1-D22 below), for final review.
+Status: shaped 2026-10-19 in a two-round interview (D1-D22 below), and approved at final review
+(revision 1).
+
+Revised 2026-10-19 after GitHub Inspector's review of PR #140. No decision changed:
+
+- **"Open license" opens only a document.** A license's file `path` now counts only when its
+  extension is a document type, `LICENSE_EXTENSIONS` (C8). The button hands the file to the
+  desktop's default handler, and a store's `datapackage.json` could name `install.sh`,
+  `tool.desktop` or an AppImage. Any other file is ignored, and the button falls back to the
+  pack's license file, as when there is no `path`. D7 and C9 point to the rule, step 2 adds the
+  constant, and the Verification cases and A9 test it.
 
 ## Problem
 
@@ -46,7 +56,7 @@ Facts that shape the design:
 | D4 | Publisher and authors | Only the `publisher` and `author` roles, from `roles`, else `role`, ignoring case. Publisher is the first `publisher` contributor, and Authors are every `author` one, in order. A contributor's name is its `title`, else `givenName familyName`. Other roles (`creator`, `maintainer`, `contributor`) and contributors with no role are ignored. |
 | D5 | Source URL | The first http(s) `sources[].path`, else an http(s) `homepage`, in one Source row. |
 | D6 | License label | The first `licenses` entry with a `name` or a `path`. A known id shows its kind label (CC0, CC-BY...), anything else its `title`, else the id as written. Later entries are ignored. |
-| D7 | License button | The license's `path`. A file opens with "Open license", and a URL opens in your browser only when you click Open, as Source does. With no `path`, the button opens the pack's license file. |
+| D7 | License button | The license's `path`. A file, which must be a document (C8), opens with "Open license", and a URL opens in your browser only when you click Open, as Source does. With no `path`, the button opens the pack's license file. |
 | D8 | `image` | It picks the cover, after the cover you chose and before `Preview*`. The image keeps its role and stays visible. A URL `image` is ignored. |
 | D9 | Optional fields | None shown. `description`, `keywords`, `created`, `id`, `name` and `resources` are ignored. |
 | D10 | New edit fields | None. To change publisher, authors or version, edit the file. |
@@ -193,7 +203,12 @@ Open button that opens it in your browser only when you click it.
   and inside the pack.
 - **`image`** counts only when it names an indexed image inside the pack: the rule
   `cover_allowed` and your chosen cover follow. A URL `image` is ignored.
-- **A license's file `path`** isn't checked against the index, since a license can be in a
+- **A license's file `path`** counts only when its extension, ignoring case, is a document type in
+  `LICENSE_EXTENSIONS`: `txt`, `md`, `pdf`, `rtf`, `html` or `htm`. "Open license" hands the file
+  to the desktop's default handler, and a pack from a store can name any file. So any other file,
+  such as `install.sh`, `tool.desktop`, an AppImage or a file with no extension, is ignored, and
+  the button falls back to the pack's license file (C9).
+- **A license file that counts** isn't checked against the index, since a license can be in a
   format OpenDAM doesn't index (`.rtf`, `.html`). Opening a missing file fails as any open does.
 - **A license's URL `path`** must be http(s) (`is_web_url`). Any other scheme is ignored.
 - **Source URLs** must be http(s) (`is_web_url`), as your edited source URL must be. Any other
@@ -210,7 +225,7 @@ license file give the license.
 | Authors | the `author` contributors > license header author |
 | Source URL | your source URL > first http(s) `sources[].path` > http(s) `homepage` |
 | License label | your license > the file's license (C7) > the license file's kind > "No license file" |
-| License button | the file's license `path` (a file: Open license; a URL: Open) > the pack's license file > none |
+| License button | the file's license `path` (a document file, C8: Open license; a URL: Open) > the pack's license file > none |
 | Cover | your cover > `image` > first `Preview*` > first `Sample*` > first image > first visible file |
 
 `derive` resolves the name and the cover into `PackInfo`, as it does today. `pack_holding`
@@ -384,7 +399,7 @@ edits and its folder name, and only your edit gave a source URL.
    - `PackFiles::package`;
    - a `read_package` lookup in `derive`, used for the name and cover orders;
    - `PackageFile`, `PackageMeta`, `PackageLicense` and `PACKAGE_PARSER`;
-   - the pure `parse_package` and `spdx_kind`, and `PACKAGE_BYTES`;
+   - the pure `parse_package` and `spdx_kind`, `PACKAGE_BYTES` and `LICENSE_EXTENSIONS`;
    - `known_packages` and `read_package_files`;
    - the read bookkeeping in `pass`, plus "package files read" and "package files ignored" in
      its info line;
@@ -424,7 +439,10 @@ Unit tests only (D17), run by file or name.
     `CC-BY-NC-4.0`, `MIT-0`, an expression and `LicenseRef-*`;
   - licenses: an entry with neither `name` nor `path` is skipped for the next one;
   - paths: `../x`, `/x`, `.hidden/x`, `a/../b` and `a\b` are rejected for `image` and a license
-    `path`, and `ftp://` URLs are rejected.
+    `path`, and `ftp://` URLs are rejected;
+  - license file types: `LICENSE.txt`, `License.PDF`, `eula.rtf` and `terms.html` are kept, while
+    `install.sh`, `tool.desktop`, `Tool.AppImage`, `license.exe` and an extensionless `LICENSE`
+    are ignored.
 - **`structure::tests`, `derive`:**
   - a folder of models with a `datapackage.json` is a pack named by `title`, with the file a
     hidden `doc` of kind `document`;
@@ -454,6 +472,8 @@ Unit tests only (D17), run by file or name.
   and license by C9:
   - edits beat the file, and the file beats the license file;
   - a file license with no `path` keeps the license file's button;
+  - a license `path` that isn't a document, such as `install.sh`, keeps the license file's
+    button, or no button when the pack has no license file;
   - a URL `path` gives `url` and no `filePath`.
 
 **TypeScript** (`bun test src/utils/packEdits.test.ts`):
@@ -480,6 +500,9 @@ Unit tests only (D17), run by file or name.
 - **A7:** No code path fetches a URL from the file.
 - **A8:** A pack with no `datapackage.json` keeps a byte-identical `pack_json`, and no license
   file is read again.
+- **A9:** "Open license" only ever opens a file with a document extension. A `datapackage.json`
+  whose license `path` names `install.sh` leaves the button on the pack's license file, or shows
+  none.
 
 ## Known gaps and trade-offs
 
