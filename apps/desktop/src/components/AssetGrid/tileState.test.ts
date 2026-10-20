@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { tileImage, tileMedia, tileState } from './tileState';
+import { type TileMedia, tileImage, tileMedia, tileState } from './tileState';
 
 const png = { kind: 'texture' as const, filePath: '/lib/rock.png', extension: 'png' };
 const thumbnailed = { ...png, thumbnailPath: '/lib/.opendam/thumbs/a_thumb.png' };
@@ -48,6 +48,48 @@ describe('tileMedia', () => {
     const renderedPng = { ...png, bundledPreview: '/lib/Previews/rock.png' };
     expect(tileMedia(renderedPng, { failed: 'bundled' })).toBe('original');
     expect(tileImage(renderedPng, 'original')).toBe('/lib/rock.png');
+  });
+
+  test('shows a small render only after the thumbnail, and before the original', () => {
+    const small = '/lib/Previews/ship.png';
+    expect(tileMedia({ ...model, fallbackRender: small })).toBe('fallback');
+    expect(tileImage({ ...model, fallbackRender: small }, 'fallback')).toBe(small);
+    expect(
+      tileMedia({ ...model, fallbackRender: small, thumbnailPath: '/lib/.opendam/thumbs/s.png' })
+    ).toBe('thumbnail');
+    expect(tileMedia({ ...png, fallbackRender: '/lib/Previews/rock.png' })).toBe('fallback');
+  });
+
+  test('falls back through a fitting render, the thumbnail, a small render and the original', () => {
+    const everything = {
+      ...png,
+      bundledPreview: '/lib/Previews/big.png',
+      thumbnailPath: '/lib/.opendam/thumbs/r_thumb.png',
+      fallbackRender: '/lib/Previews/small.png',
+    };
+    const steps: (TileMedia | undefined)[] = [undefined];
+    for (;;) {
+      const next = tileMedia(everything, { failed: steps.at(-1) });
+      steps.push(next);
+      if (next === 'none') break;
+    }
+    expect(steps.slice(1)).toEqual(['bundled', 'thumbnail', 'fallback', 'original', 'none']);
+  });
+
+  test('each failed step skips to the next media the asset has', () => {
+    const small = { ...model, fallbackRender: '/lib/Previews/ship.png' };
+    expect(tileMedia({ ...small, bundledPreview: '/b.png' }, { failed: 'bundled' })).toBe(
+      'fallback'
+    );
+    expect(tileMedia({ ...small, thumbnailPath: '/t.png' }, { failed: 'thumbnail' })).toBe(
+      'fallback'
+    );
+    expect(tileMedia(small, { failed: 'fallback' })).toBe('none');
+    const smallPng = { ...png, fallbackRender: '/lib/Previews/rock.png' };
+    expect(tileMedia(smallPng, { failed: 'fallback' })).toBe('original');
+    expect(
+      tileMedia({ ...video, fallbackRender: '/v.png' }, { failed: 'fallback', withVideo: true })
+    ).toBe('video');
   });
 
   test('a failed thumbnail falls back to the original, then the icon', () => {

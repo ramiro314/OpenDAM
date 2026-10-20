@@ -67,7 +67,7 @@ export const AssetCard = memo(function AssetCard({
   useEffect(() => {
     setFailed(undefined);
     setMediaLoaded(false);
-  }, [asset.bundledPreview, asset.thumbnailPath, asset.filePath]);
+  }, [asset.bundledPreview, asset.fallbackRender, asset.thumbnailPath, asset.filePath]);
 
   const media = tileMedia(asset, { failed, withVideo: true });
   const image = tileImage(asset, media);

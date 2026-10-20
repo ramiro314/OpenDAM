@@ -77,10 +77,15 @@ export interface Asset {
   groupFormats?: string[];
   /**
    * For a model with a bundled preview (a render shipped beside it, such as Kenney's
-   * `Previews/<name>.png`), the picture to show: the render's thumbnail, or the render itself.
-   * Cards show it before `thumbnailPath`.
+   * `Previews/<name>.png`) that fits a card, the picture to show: the render's thumbnail, or the
+   * render itself. Cards show it before `thumbnailPath`.
    */
   bundledPreview?: string;
+  /**
+   * For a model whose render is too small to fit a card (under 512 px on its shorter side), the
+   * render's picture, as `bundledPreview`. Cards show it only after `thumbnailPath`.
+   */
+  fallbackRender?: string;
 }
 
 /** One file of a format group, as the detail panel lists it (`get_group_members`) */

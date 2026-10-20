@@ -186,12 +186,17 @@ docs/plans                    Plans for this fork
   stays a hidden `model_preview` that moves with its model (plan small-bundled-previews C1-C3).
   An image that renders no model,
   or that the webview can't display itself (`preview::is_webview_displayable`), stays an
-  ordinary image, so a render without a thumbnail still shows. Cards and list rows show the
-  bundled preview first, then the thumbnail, then the original (`tileMedia`), and
-  `ASSET_COLUMNS` sends the render's own thumbnail when it has one. `preview:done` carries the
+  ordinary image, so a render without a thumbnail still shows. `ASSET_COLUMNS` sends an item's
+  render as `bundledPreview` when the item is pictured (below), else as `fallbackRender`, each as
+  the render's own thumbnail when it has one, else the render itself. Cards and list rows show
+  the bundled preview first, then the thumbnail, then the fallback render, then the original,
+  then an icon, and move to the next when one fails to load (`tileMedia`), so a model whose
+  render is too small shows that render only until it has its own thumbnail. The detail panel
+  and the pack gallery show neither. `preview:done` carries the
   finished file's `filePath` and its `previousThumbnailPath`, so cached models showing either as
-  their render switch to its new thumbnail, or to the render itself when the thumbnail was
-  cleared (`updateAssetPreview`). An item is **pictured** when its bundled preview fits. The
+  their bundled preview or fallback render switch to its new thumbnail, or to the render itself
+  when the thumbnail was cleared (`updateAssetPreview`). An item is **pictured** when its bundled
+  preview fits. The
   pass keeps a pictured item off the preview queue and gives its group no stand-in, and
   `claim_jobs` skips its jobs. An item whose render is too small, or that loses its render,
   goes back on the queue unless it already has a preview, and a group whose main item takes no

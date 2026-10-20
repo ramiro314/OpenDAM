@@ -119,15 +119,24 @@ pub struct Asset {
         skip_serializing_if = "Option::is_none"
     )]
     pub group_formats: Option<Vec<String>>,
-    /// The picture of a model's bundled preview, such as Kenney's `Previews/<name>.png`: the
-    /// render's thumbnail, or the render itself. Cards show it before `thumbnail_path`. Absent
-    /// when the item has none.
+    /// The picture of a model's bundled preview, such as Kenney's `Previews/<name>.png`, when
+    /// the render fits a card: the render's thumbnail, or the render itself. Cards show it before
+    /// `thumbnail_path`. Absent when the item has none.
     #[serde(
         rename = "bundledPreview",
         default,
         skip_serializing_if = "Option::is_none"
     )]
     pub bundled_preview: Option<String>,
+    /// The picture of a model's render that is too small to fit a card, as `bundled_preview`.
+    /// Cards show it only after `thumbnail_path`. Absent when the item has none, or its render
+    /// fits (plan small-bundled-previews C5).
+    #[serde(
+        rename = "fallbackRender",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fallback_render: Option<String>,
 }
 
 /// One file of a format group, as the detail panel lists it (plan C19).

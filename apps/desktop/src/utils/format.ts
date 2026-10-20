@@ -48,10 +48,12 @@ export function formatGroupBadge(
 
 /**
  * How many files deleting or renaming an item reaches (plan C21): each member of its format
- * group, or the file alone, plus its bundled preview.
+ * group, or the file alone, plus its render, whether it fits a card or not.
  */
-export function itemFileCount(asset: Pick<Asset, 'groupFormats' | 'bundledPreview'>): number {
-  return (asset.groupFormats?.length ?? 1) + (asset.bundledPreview ? 1 : 0);
+export function itemFileCount(
+  asset: Pick<Asset, 'groupFormats' | 'bundledPreview' | 'fallbackRender'>
+): number {
+  return (asset.groupFormats?.length ?? 1) + (asset.bundledPreview || asset.fallbackRender ? 1 : 0);
 }
 
 /** A delete dialog's action for `files` files, `Move 4 files to the trash`. */

@@ -3,7 +3,8 @@
 // docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
 // check here.
 
-import { convertFileSrc } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { api } from '../api';
 import {
   cachedAssets,
@@ -178,6 +179,9 @@ const BENCH_LIBRARY = 'bench';
  * (docs/plans/smarter-big-collections/plan.md, A3), from the golden snapshot's 83,095 files.
  */
 const ROOT_ITEMS = 51_139;
+
+/** The grid items an earlier check in this process deleted from the run copy (U9 deletes one). */
+let deletedItems = 0;
 
 /** How long U9 waits for the folder tree, and for a write to get through. */
 const STRUCTURE_TIMEOUT_MS = 900_000;
@@ -483,9 +487,10 @@ export const UI_CHECKS: UiCheck[] = [
   {
     id: 'U5',
     title:
-      'Right-clicking a card, then a list row, at offset 60,000 opens the menu, and Escape closes it',
+      'Right-clicking a card, then a list row, at offset 45,000 opens the menu, and Escape closes it',
     run: async ({ scroll, assert, pause }) => {
-      const target = 60_000;
+      // Deep in the 51,139 grid items, far past the cached pages
+      const target = 45_000;
       const { total } = useAssetStore.getState();
       assert(total > target, `only ${total} results`);
       const rightClick = async (what: string, idPrefix: string, shot: string) => {
@@ -897,12 +902,25 @@ export const UI_CHECKS: UiCheck[] = [
           // What the screenshot shows must still be the state asserted before it
           await assertScaling(assert, 'grid after the screenshot', el, 'cover', pref);
           await assertScaling(assert, 'detail panel after the screenshot', panel!, 'contain', pref);
+          // App closes QuickLook when the window loses focus, as a screenshot taken late could
+          // make it: a timeout says whether it did
+          let blurs = 0;
+          const onBlur = () => void (blurs += 1);
+          window.addEventListener('blur', onBlur);
           await quickLook(true);
           await untilFrame(
             () => !!quickLookImage()?.complete && quickLookImage()!.naturalWidth > 0,
             5_000,
             'the QuickLook image'
-          );
+          )
+            .catch((e: unknown) => {
+              const dialog = document.querySelector('[role="dialog"][aria-modal="true"]');
+              throw new Error(
+                `${String(e)} (QuickLook ${dialog ? 'open' : 'closed'}, ${blurs} window blurs, ` +
+                  `focused: ${document.hasFocus()}, image: ${quickLookImage()?.src ?? 'none'})`
+              );
+            })
+            .finally(() => window.removeEventListener('blur', onBlur));
           const big = quickLookImage()!;
           assert(isEnlarged(big, 'contain'), `QuickLook shows ${what} at ${big.clientWidth} px`);
           await assertScaling(assert, 'QuickLook', big.parentElement!, 'contain', pref);
@@ -1124,6 +1142,7 @@ export const UI_CHECKS: UiCheck[] = [
 
       // Rows only: the file stays on the run copy rather than going to the trash
       await useAssetStore.getState().deleteAsset(asset.id, false);
+      deletedItems += 1;
       await waitFor(() => folderRow(folder.path) === null, 30_000, `${folder.path} to drop out`);
       await waitFor(
         () => ancestors.every((path, i) => shownCount(folderRow(path)!) === before[i] - 1),
@@ -1204,7 +1223,7 @@ export const UI_CHECKS: UiCheck[] = [
       await waitFor(() => status() === '0 items (1 file)', 5_000, 'the status bar');
       await pause('U10-license-hidden');
 
-      // "Show hidden files" brings it back, and the kit's badge counts its hidden files
+      // "Show hidden files" brings it back, and the kit's live badge counts it
       const checkbox = document.querySelector<HTMLInputElement>(
         '#sidebar-filter-show-hidden input'
       );
@@ -1227,13 +1246,19 @@ export const UI_CHECKS: UiCheck[] = [
         'the License.txt tile'
       );
       assert(status() === '1 item (1 file)', `the status bar reads "${status()}"`);
-      assert(
-        shownCount(folderRow(kitPath)!) === kit.itemCount + kit.hiddenCount,
-        `${kitPath}'s badge doesn't count its hidden files`
-      );
+      // Search text and "Show hidden files" both make the tree's counts live: each badge is the
+      // grid's total for its folder
+      const kitBadge = () => shownCount(folderRow(kitPath)!);
+      await waitFor(() => kitBadge() === 1, 10_000, `${kitPath}'s badge to count the license`);
       await pause('U10-license-shown');
 
+      // With the text cleared, the kit's badge counts its hidden files
       await searchWith({ text: '' }, waitFor);
+      await waitFor(
+        () => kitBadge() === kit.itemCount + kit.hiddenCount,
+        10_000,
+        `${kitPath}'s badge to count its hidden files, ${kit.itemCount} + ${kit.hiddenCount}`
+      );
       s = useAssetStore.getState();
       // The hidden files join the items, while group members stay out of the grid
       assert(
@@ -1344,35 +1369,103 @@ export const UI_CHECKS: UiCheck[] = [
       const background = getComputedStyle(modelBadge!).backgroundColor;
       assert(background.startsWith('rgb('), `the badge's background is ${background}, not solid`);
 
-      // Each model's card shows Kenney's render, from `Previews/`, which lists no item of its own
-      assert(sedan!.bundledPreview, 'sedan.glb has no bundled preview');
-      const byId = new Map(found.assets.map((a) => [a.id, a]));
-      const renderedCards = () =>
-        [...document.querySelectorAll<HTMLElement>('[data-tile]')].flatMap((tile) => {
-          const asset = byId.get(tile.id.replace(/^asset-/, ''));
-          return asset?.bundledPreview ? [{ tile, asset }] : [];
-        });
-      await waitFor(() => renderedCards().length > 0, 10_000, 'a card with a bundled preview');
-      for (const { tile, asset } of renderedCards()) {
-        const src = tile.querySelector('img')?.getAttribute('src');
-        assert(
-          src === convertFileSrc(asset.bundledPreview!),
-          `${asset.fileName}'s card shows ${src}, not ${asset.bundledPreview}`
-        );
-      }
+      // Each model's card shows its own 512 px thumbnail, not Kenney's 64 px render from
+      // `Previews/`, which is too small to fit a card and lists no item of its own (plan
+      // small-bundled-previews A1)
       await searchWith({ folder: { libraryId: BENCH_LIBRARY, path: kitPath } }, waitFor);
       const kitItems = await results();
       const renders = kitItems.assets.filter((a) => a.filePath.includes('/Previews/'));
       assert(renders.length === 0, `${kitPath} lists ${renders[0]?.fileName} from Previews/`);
       await selectFolder(modelsPath);
       found = await results();
+      const byId = new Map(found.assets.map((a) => [a.id, a]));
+      const modelCards = () =>
+        [...document.querySelectorAll<HTMLElement>('[data-tile]')].flatMap((tile) => {
+          const asset = byId.get(tile.id.replace(/^asset-/, ''));
+          return asset?.kind === '3d_model' ? [{ tile, asset }] : [];
+        });
       await waitFor(
-        () =>
-          renderedCards().length > 0 && !document.querySelector('[data-tile-state="placeholder"]'),
+        () => modelCards().length > 0 && !document.querySelector('[data-tile-state="placeholder"]'),
         10_000,
-        "the kit's pictures"
+        "the kit's model cards"
       );
       await pause('U11-kit-models');
+      for (const { tile, asset } of modelCards()) {
+        assert(asset.thumbnailPath, `${asset.fileName} has no thumbnail`);
+        const img = tile.querySelector('img');
+        const src = img?.getAttribute('src');
+        assert(
+          src === convertFileSrc(asset.thumbnailPath!),
+          `${asset.fileName}'s card shows ${src}, not its thumbnail ${asset.thumbnailPath}`
+        );
+        assert(
+          Math.min(img!.naturalWidth, img!.naturalHeight) >= 512,
+          `${asset.fileName}'s card loaded a ${img!.naturalWidth}x${img!.naturalHeight} image`
+        );
+      }
+      // The render stays tied to its model, as the fallback for a card with no thumbnail
+      const sedanNow = found.assets.find((a) => a.fileName === 'sedan.glb')!;
+      assert(!sedanNow.bundledPreview, `sedan.glb's bundled preview is ${sedanNow.bundledPreview}`);
+      assert(
+        sedanNow.fallbackRender?.endsWith('/Previews/sedan.png'),
+        `sedan.glb's fallback render is ${sedanNow.fallbackRender}`
+      );
+
+      // A model with a small render and no thumbnail shows that render in its card and its list
+      // row until its preview is rendered (small-bundled-previews A3). The bench clears the first
+      // model card's group's thumbnails, as a library first indexed after its renders were tied
+      // has none, then queues its preview: the worker leaves a .glb, which tiles skip, and the
+      // model thumbnailer renders the 512 px PNG.
+      const pending = modelCards()[0].asset;
+      const render = pending.fallbackRender;
+      assert(render, `${pending.fileName} has no fallback render`);
+      await invoke('bench_clear_thumbnails', { id: pending.id });
+      await useAssetStore.getState().refreshAssets([pending.id]);
+      const cached = () => cachedAssets(useAssetStore.getState()).find((a) => a.id === pending.id);
+      assert(!cached()?.thumbnailPath, `${pending.fileName} kept ${cached()?.thumbnailPath}`);
+      /** Waits until tile `id` has loaded `path`, and returns its image. */
+      const loads = async (id: string, path: string, what: string, timeoutMs = 10_000) => {
+        const tile = () => document.getElementById(id);
+        const img = () => tile()?.querySelector('img');
+        await waitFor(
+          () =>
+            img()?.getAttribute('src') === convertFileSrc(path) &&
+            img()!.complete &&
+            img()!.naturalWidth > 0 &&
+            tile()!.dataset.tileState === 'ready',
+          timeoutMs,
+          `${what} to show ${path}, not ${img()?.getAttribute('src')}`
+        );
+        return img()!;
+      };
+      let tileImg = await loads(`asset-${pending.id}`, render!, `${pending.fileName}'s card`);
+      assert(
+        Math.min(tileImg.naturalWidth, tileImg.naturalHeight) < 512,
+        `${pending.fileName}'s small render is ${tileImg.naturalWidth}x${tileImg.naturalHeight}`
+      );
+      await pause('U11-fallback-card');
+      useUIStore.getState().setViewMode('list');
+      await loads(`asset-row-${pending.id}`, render!, `${pending.fileName}'s list row`);
+      await pause('U11-fallback-row');
+      useUIStore.getState().setViewMode('grid');
+      await loads(`asset-${pending.id}`, render!, `${pending.fileName}'s card, back in the grid`);
+
+      await api.requestPreview([pending.id]);
+      await waitFor(
+        () => cached()?.thumbnailPath?.endsWith('.png') ?? false,
+        300_000,
+        `${pending.fileName}'s preview to be rendered`
+      );
+      tileImg = await loads(
+        `asset-${pending.id}`,
+        cached()!.thumbnailPath!,
+        `${pending.fileName}'s rendered card`
+      );
+      assert(
+        Math.min(tileImg.naturalWidth, tileImg.naturalHeight) >= 512,
+        `${pending.fileName}'s new thumbnail is ${tileImg.naturalWidth}x${tileImg.naturalHeight}`
+      );
+      await pause('U11-fallback-rendered');
 
       // A list row shows the same badge, solid and whole, in its extension column
       useUIStore.getState().setViewMode('list');
@@ -1482,18 +1575,46 @@ export const UI_CHECKS: UiCheck[] = [
       });
       await pause('U12-group-files');
 
-      // What the grid holds while moving between members
+      // What the grid holds while moving between members: its selection and cached pages, and
+      // the search generation they came from
       const grid = () => {
         const ui = useUIStore.getState();
         const st = useAssetStore.getState();
-        return JSON.stringify({
-          selected: [...ui.selectedAssetIds],
-          focused: ui.focusedAssetId,
+        return {
+          held: JSON.stringify({
+            selected: [...ui.selectedAssetIds],
+            focused: ui.focusedAssetId,
+            pages: [...st.pages].map(([page, assets]) => [page, assets.map((a) => a.id)]),
+          }),
           generation: st.generation,
-          epoch: st.epoch,
-          pages: [...st.pages].map(([page, assets]) => [page, assets.map((a) => a.id)]),
-        });
+        };
       };
+      // The app polls the library DB's mtime every 30 s (lib.rs) and sends `library:updated`
+      // after any write, its own included, and App refreshes the grid on it. So the store's
+      // searches and refreshes are counted: moving between members may start no search, and
+      // the grid may refresh only once per `library:updated`. A refresh that finds a load in
+      // flight hands it to `search` at once, which isn't a search of its own.
+      const { search: realSearch, refresh: realRefresh } = useAssetStore.getState();
+      let updates = 0;
+      let searches = 0;
+      let refreshes = 0;
+      let handingOver = false;
+      useAssetStore.setState({
+        search: () => {
+          if (!handingOver) searches += 1;
+          return realSearch();
+        },
+        refresh: () => {
+          refreshes += 1;
+          handingOver = true;
+          try {
+            return realRefresh();
+          } finally {
+            handingOver = false;
+          }
+        },
+      });
+      const unlisten = await listen('library:updated', () => void (updates += 1));
       const before = grid();
 
       // File actions act on the file they sit beside, recorded rather than run
@@ -1568,9 +1689,22 @@ export const UI_CHECKS: UiCheck[] = [
             5_000,
             'back to the group'
           );
-          assert(grid() === before, `the grid changed: ${before} became ${grid()}`);
+          const now = grid();
+          assert(now.held === before.held, `the grid changed: ${before.held} became ${now.held}`);
+          assert(searches === 0, `moving between members started ${searches} searches`);
+          assert(
+            refreshes <= updates,
+            `the grid refreshed ${refreshes} times on ${updates} library:updated events`
+          );
+          assert(
+            now.generation - before.generation <= refreshes,
+            `the search generation went from ${before.generation} to ${now.generation} ` +
+              `with ${refreshes} refreshes`
+          );
         }
       } finally {
+        unlisten();
+        useAssetStore.setState({ search: realSearch, refresh: realRefresh });
         api.openWithDefault = realOpen;
         api.revealInFileManager = realReveal;
         clipboard.writeText = realWrite;
@@ -1802,7 +1936,7 @@ export const UI_CHECKS: UiCheck[] = [
     id: 'U14',
     title:
       'UI Pack sprites show once each with a solid x3 badge, same-named tiles and color or ' +
-      'style variants stay apart, and the library root shows 51,139 items',
+      'style variants stay apart, and the library root shows 51,139 items, less any U9 deleted',
     run: async ({ assert, waitFor, pause, sleep }) => {
       await expandBenchLibrary({ assert, sleep });
       const results = async () => {
@@ -1813,10 +1947,12 @@ export const UI_CHECKS: UiCheck[] = [
         searchWith({ text: '', folder: { libraryId: BENCH_LIBRARY, path } }, waitFor);
       const status = () => document.getElementById('status-count')?.textContent ?? '';
 
-      // The library root: plan A3's item count, for the golden snapshot's 83,095 files
+      // The library root: plan A3's item count, for the golden snapshot's 83,095 files, less the
+      // item U9 deleted when it ran before in this process
       await inFolder('');
       let s = useAssetStore.getState();
-      assert(s.total === ROOT_ITEMS, `the library root shows ${s.total} items, not ${ROOT_ITEMS}`);
+      const rootItems = ROOT_ITEMS - deletedItems;
+      assert(s.total === rootItems, `the library root shows ${s.total} items, not ${rootItems}`);
       const rootStatus = formatItemsAndFiles(s.total, s.fileTotal);
       await waitFor(() => status() === rootStatus, 5_000, `the status bar to read ${rootStatus}`);
       await pause('U14-library-root');

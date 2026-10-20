@@ -154,7 +154,7 @@ the Kenney bench data, so every change to the grid is judged on the same numbers
 ([plan](../plans/fast-collection-browsing/plan.md), "Scroll benchmark"). `main.tsx` loads it only
 when `import.meta.env.DEV` is true and `VITE_SCROLL_BENCH` is set, so release builds don't contain
 it. Its Tauri commands (`bench_rss`, `bench_render_mode`, `bench_log`, `bench_only`,
-`bench_report`) exist only under `debug_assertions`.
+`bench_report`, `bench_clear_thumbnails`) exist only under `debug_assertions`.
 
 - `VITE_SCROLL_BENCH=1` runs the timing scenarios at sm, md and lg: continuous scroll (60 s at
   3,000 px/s), end to end, and 20 seeded random jumps. On the grid that appends pages,
@@ -186,8 +186,8 @@ The UI checks, each defined in its plan:
   in `Audio/` whose files are all hidden still shows with a count of 0, and the kit's grid holds
   neither `License.txt` nor `Preview.png`, while the status bar reads `<items> items (<files>
   files)` with the kit's hidden files counted as files only. A search for "license" in the kit
-  then reads `0 items (1 file)`, and "Show hidden files" brings `License.txt` back and makes the
-  kit's badge count its hidden files. Then the library root's Packs view holds 254 cards in name
+  then reads `0 items (1 file)`, and "Show hidden files" brings `License.txt` back, the kit's live
+  badge counting it, and once the text is cleared the badge counts the kit's hidden files. Then the library root's Packs view holds 254 cards in name
   order, each with a cover, the visible ones loaded, 24 labelled "No visible items" and none for
   the 11 zip-only folders in `Archive/`. Search text, a kind filter and "Show hidden files" each
   show assets until cleared, as does the toggle's Assets, and switching back to Packs clears an
@@ -200,13 +200,20 @@ The UI checks, each defined in its plan:
 - **U11** (format groups): in `3D assets/Car Kit`, the `GLB format/`, `FBX format/` and `OBJ
   format/` nodes each count as many items as `Models/`, and selecting `Models/` lists each model
   once, as its GLB, with a solid `GLB +2` badge whose tooltip reads `3 files: GLB, FBX, OBJ`, on
-  its card and, in the list view, unclipped in its row's extension column. Each card of a model
-  with a Kenney render shows that render, and the kit lists no `Previews/` file.
+  its card and, in the list view, unclipped in its row's extension column. Each model's card
+  shows its own thumbnail, loaded at 512 px or more on its shorter side, not Kenney's 64 px
+  render, which is too small to fit a card: `sedan.glb` sends it only as its `fallbackRender`.
+  The kit lists no `Previews/` file. With the first model card's thumbnails cleared
+  (`bench_clear_thumbnails`, as a library first indexed after its renders were tied has none),
+  its card and its list row show its 64 px render, and once its queued preview is rendered the
+  card shows the new 512 px thumbnail (plan small-bundled-previews A3).
   Selecting `FBX format/` lists the same items and no FBX file, and adding `.glb` to it matches
   nothing. Filtering the kit by FBX lists every model, each as its GLB, and a search for "fbx"
   finds `sedan.glb` through its FBX copy's folder.
-  [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 3. Screenshots:
-  `U11-kit-models`, `U11-list-badge`, `U11-fbx-format`.
+  [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 3, and
+  [small-bundled-previews](../plans/small-bundled-previews/plan.md), A1. Screenshots:
+  `U11-kit-models`, `U11-fallback-card`, `U11-fallback-row`, `U11-fallback-rendered`,
+  `U11-list-badge`, `U11-fbx-format`.
 - **U12** (group detail): selecting `sedan.glb` in `3D assets/Car Kit/Models` lists its GLB, FBX
   and OBJ files in the detail panel, in that order, each with its format, folder and size. Each
   file's Open, Reveal and Copy path, recorded rather than run, act on that file, in its row and in
@@ -225,8 +232,8 @@ The UI checks, each defined in its plan:
   `.fbx` and then `.png` confirms. Each node's `get_folder_counts` call takes under 300 ms.
   [smarter-big-collections](../plans/smarter-big-collections/plan.md), step 5. Screenshots:
   `U13-tree-counts`, `U13-filter-counts`, `U13-format-union`.
-- **U14** (2D stacks): the library root shows 51,139 items (plan A3) and the status bar counts
-  them. `UI assets/UI Pack` lists each sprite once, as its `Default/` PNG standing for its
+- **U14** (2D stacks): the library root shows 51,139 items (plan A3), less the one U9 deletes
+  when it ran first in the same process, and the status bar counts them. `UI assets/UI Pack` lists each sprite once, as its `Default/` PNG standing for its
   `Double/` PNG and its vector, with a solid `x3` badge whose tooltip reads `3 files: PNG, SVG`,
   and its five colors stay five items. `2D assets/Pixel Platformer/Tiles` still lists both
   `tile_0000.png` files, and the Crosshair Pack's Dark, Glow, Light and Outline styles stay

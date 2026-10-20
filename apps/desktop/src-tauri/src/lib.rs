@@ -278,6 +278,8 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::autotag::retry_failed_autotag_run,
             commands::autotag::clear_autotag_runs,
             #[cfg(debug_assertions)]
+            commands::bench::bench_clear_thumbnails,
+            #[cfg(debug_assertions)]
             commands::bench::bench_rss,
             #[cfg(debug_assertions)]
             commands::bench::bench_render_mode,

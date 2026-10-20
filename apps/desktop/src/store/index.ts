@@ -274,9 +274,9 @@ interface AssetStore extends PageCache {
   renameAsset: (id: string, newName: string) => Promise<Asset>;
   /**
    * Applies a finished preview: `thumbnailPath` replaces the old one, and `null` clears it. A
-   * cached model whose bundled preview is this asset, as its own file (`render.filePath`) or its
-   * thumbnail before the job (`render.previousThumbnailPath`), shows the new thumbnail instead,
-   * or the file itself when the thumbnail was cleared.
+   * cached model whose bundled preview or fallback render is this asset, as its own file
+   * (`render.filePath`) or its thumbnail before the job (`render.previousThumbnailPath`), shows
+   * the new thumbnail instead, or the file itself when the thumbnail was cleared.
    */
   updateAssetPreview: (
     id: string,
@@ -624,13 +624,13 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
     if (!render) return;
     const shown = new Set([render.filePath, render.previousThumbnailPath].filter(Boolean));
     const picture = thumbnailPath ?? render.filePath;
-    const rendered = cachedAssets(get())
-      .filter(
-        (a) => a.bundledPreview && shown.has(a.bundledPreview) && a.bundledPreview !== picture
-      )
-      .map((a) => a.id);
-    if (rendered.length > 0) {
-      get().patchCached(rendered, (asset) => ({ ...asset, bundledPreview: picture }));
+    for (const field of ['bundledPreview', 'fallbackRender'] as const) {
+      const rendered = cachedAssets(get())
+        .filter((a) => a[field] && shown.has(a[field]) && a[field] !== picture)
+        .map((a) => a.id);
+      if (rendered.length > 0) {
+        get().patchCached(rendered, (asset) => ({ ...asset, [field]: picture }));
+      }
     }
   },
 

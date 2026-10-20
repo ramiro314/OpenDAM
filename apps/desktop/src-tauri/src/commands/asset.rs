@@ -39,8 +39,10 @@ struct RawAssetRow {
     pub collections: Option<String>,
     /// A main item's members' extensions, as a JSON array, itself included
     pub group_formats: Option<String>,
-    /// The picture of an item's bundled preview: its render's thumbnail, or the render itself
+    /// The picture of an item's render that fits a card: its thumbnail, or the render itself
     pub bundled_preview: Option<String>,
+    /// The picture of an item's render that is too small to fit a card, as `bundled_preview`
+    pub fallback_render: Option<String>,
 }
 
 /// Build an Asset from a raw SQLite row, resolving relative paths to absolute paths
@@ -77,6 +79,7 @@ fn row_to_asset(root: Option<&Path>, row: RawAssetRow) -> Asset {
     };
     let resolved_thumb_path = resolve(row.thumbnail_path);
     let bundled_preview = resolve(row.bundled_preview);
+    let fallback_render = resolve(row.fallback_render);
 
     Asset {
         id: row.id,
@@ -98,6 +101,7 @@ fn row_to_asset(root: Option<&Path>, row: RawAssetRow) -> Asset {
         metadata,
         group_formats,
         bundled_preview,
+        fallback_render,
     }
 }
 
@@ -1055,8 +1059,15 @@ async fn folder_counts(
 
 /// The columns of a `RawAssetRow` selected from `assets a`. A main item with no thumbnail
 /// of its own, such as a `.blend`, shows a member's (`structure::preview_stand_ins`). An item's
-/// bundled preview is shown by its render's thumbnail when the render has one (plan C12).
-const ASSET_COLUMNS: &str = r#"
+/// render is shown by its thumbnail when it has one, else by itself (plan C12): as
+/// `bundled_preview` when the item is `pictured`, else as `fallback_render`, which cards show only
+/// after the item's own thumbnail (plan small-bundled-previews C5).
+static ASSET_COLUMNS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let picture = "(SELECT COALESCE(p.thumbnail_path, p.file_path) FROM assets p
+         WHERE p.file_path = a.bundled_preview)";
+    let pictured = pictured("a");
+    format!(
+        r#"
     a.id, a.file_path, a.file_name, a.extension, a.kind,
     a.size_bytes, a.modified_at, a.indexed_at, a.rating,
     a.color_label, a.is_favorite, a.description,
@@ -1071,8 +1082,10 @@ const ASSET_COLUMNS: &str = r#"
     CASE WHEN a.group_id = a.id THEN
         (SELECT json_group_array(m.extension) FROM assets m WHERE m.group_id = a.id)
     END AS group_formats,
-    (SELECT COALESCE(p.thumbnail_path, p.file_path) FROM assets p
-     WHERE p.file_path = a.bundled_preview) AS bundled_preview"#;
+    CASE WHEN {pictured} THEN {picture} END AS bundled_preview,
+    CASE WHEN NOT {pictured} THEN {picture} END AS fallback_render"#
+    )
+});
 
 #[derive(sqlx::FromRow)]
 struct RowidAssetRow {
@@ -1088,8 +1101,9 @@ async fn fetch_assets_by_rowid(
     rowids: &[i64],
 ) -> sqlx::Result<Vec<(i64, Asset)>> {
     let sql = format!(
-        "SELECT a.rowid AS rowid, {ASSET_COLUMNS} FROM assets a WHERE a.rowid IN ({})",
-        placeholders(rowids.len())
+        "SELECT a.rowid AS rowid, {columns} FROM assets a WHERE a.rowid IN ({})",
+        placeholders(rowids.len()),
+        columns = *ASSET_COLUMNS,
     );
     let mut query = sqlx::query_as::<_, RowidAssetRow>(&sql);
     for rowid in rowids {
@@ -1112,14 +1126,15 @@ async fn fetch_assets(
     offset: Option<i64>,
 ) -> sqlx::Result<Vec<Asset>> {
     let sql = format!(
-        r#"SELECT {ASSET_COLUMNS}
+        r#"SELECT {columns}
            FROM assets a
            {}
            ORDER BY {}
            LIMIT ?{}"#,
         filter.where_clause(),
         order_by,
-        if offset.is_some() { " OFFSET ?" } else { "" }
+        if offset.is_some() { " OFFSET ?" } else { "" },
+        columns = *ASSET_COLUMNS,
     );
     let mut query = sqlx::query_as::<_, RawAssetRow>(&sql);
     for b in filter.binds() {
@@ -1143,7 +1158,8 @@ pub async fn get_asset(id: String, state: State<'_, Arc<AppState>>) -> Result<As
     // Search across open libraries
     for lib in libs {
         let row = sqlx::query_as::<_, RawAssetRow>(&format!(
-            "SELECT {ASSET_COLUMNS} FROM assets a WHERE a.id = ?"
+            "SELECT {columns} FROM assets a WHERE a.id = ?",
+            columns = *ASSET_COLUMNS
         ))
         .bind(&id)
         .fetch_optional(&lib.pool)
@@ -1184,8 +1200,9 @@ struct MemberRow {
 
 async fn group_members(lib: &LibraryHandle, id: &str) -> sqlx::Result<Vec<GroupMember>> {
     let sql = format!(
-        "SELECT a.group_id IS a.id AS is_main, {ASSET_COLUMNS} FROM assets a
-         WHERE a.id = ?1 OR a.group_id = (SELECT group_id FROM assets WHERE id = ?1)"
+        "SELECT a.group_id IS a.id AS is_main, {columns} FROM assets a
+         WHERE a.id = ?1 OR a.group_id = (SELECT group_id FROM assets WHERE id = ?1)",
+        columns = *ASSET_COLUMNS
     );
     let mut rows = sqlx::query_as::<_, MemberRow>(&sql)
         .bind(id)
@@ -4565,8 +4582,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_item_with_a_render_shows_the_renders_thumbnail_or_else_the_render() {
+    async fn an_items_render_is_its_bundled_preview_when_it_fits_else_its_fallback_render() {
         let libs = [grouped_library().await];
+        let pool = &libs[0].pool;
         let pictures = || async {
             let payload: SearchPayload = serde_json::from_value(serde_json::json!({
                 "query": { "text": "", "filter": {}, "sort": { "field": "size", "order": "asc" } },
@@ -4579,31 +4597,32 @@ mod tests {
                 .unwrap()
                 .assets
                 .into_iter()
-                .filter_map(|a| a.bundled_preview.map(|p| (a.id, p)))
+                .filter(|a| a.bundled_preview.is_some() || a.fallback_render.is_some())
+                .map(|a| (a.id, a.bundled_preview, a.fallback_render))
                 .collect::<Vec<_>>()
         };
-        // The render has no thumbnail, as one of 512 px or less never does.
-        assert_eq!(
-            pictures().await,
-            [(
-                SEDAN.to_string(),
-                "/libraries/lib/kit/Previews/sedan.png".to_string()
-            )]
-        );
-        sqlx::query(
-            "UPDATE assets SET thumbnail_path = '.opendam/thumbs/r_thumb.png' WHERE id = ?",
-        )
-        .bind(RENDER)
-        .execute(&libs[0].pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            pictures().await,
-            [(
-                SEDAN.to_string(),
-                "/libraries/lib/.opendam/thumbs/r_thumb.png".to_string()
-            )]
-        );
+        let set = |sql: &'static str| async move {
+            sqlx::query(sql).bind(RENDER).execute(pool).await.unwrap();
+        };
+        let render = Some("/libraries/lib/kit/Previews/sedan.png".to_string());
+        let thumb = Some("/libraries/lib/.opendam/thumbs/r_thumb.png".to_string());
+        let shows = |bundled: &Option<String>, fallback: &Option<String>| {
+            vec![(SEDAN.to_string(), bundled.clone(), fallback.clone())]
+        };
+
+        // Unmounted, the render's size is unknown, so it doesn't fit, and it has no thumbnail, as
+        // one of 512 px or less never does.
+        assert_eq!(pictures().await, shows(&None, &render));
+        set("UPDATE assets SET render_width = 512, render_height = 511 WHERE id = ?").await;
+        assert_eq!(pictures().await, shows(&None, &render));
+        set("UPDATE assets SET thumbnail_path = '.opendam/thumbs/r_thumb.png' WHERE id = ?").await;
+        assert_eq!(pictures().await, shows(&None, &thumb));
+
+        // Both sides at least 512 px: it fits
+        set("UPDATE assets SET render_height = 512 WHERE id = ?").await;
+        assert_eq!(pictures().await, shows(&thumb, &None));
+        set("UPDATE assets SET thumbnail_path = NULL WHERE id = ?").await;
+        assert_eq!(pictures().await, shows(&render, &None));
     }
 
     #[tokio::test]
@@ -5837,8 +5856,15 @@ mod tests {
                 .as_deref()
                 .unwrap_or("3D assets/Car Kit/Previews/sedan.png")
         );
-        println!("sedan.glb shows {:?}", sedan.bundled_preview);
-        assert_eq!(sedan.bundled_preview.as_deref(), Some(picture.as_str()));
+        // Its 64 px render is too small to fit a card, so the card shows its own thumbnail and
+        // keeps the render as a fallback (small-bundled-previews A1).
+        println!(
+            "sedan.glb shows {:?}, falls back to {:?}",
+            sedan.thumbnail_path, sedan.fallback_render
+        );
+        assert_eq!(sedan.bundled_preview, None);
+        assert_eq!(sedan.fallback_render.as_deref(), Some(picture.as_str()));
+        assert!(sedan.thumbnail_path.is_some());
         let previews = format!("{kit}/Previews");
         let (hidden_total, shown_total) = (
             search(&previews, false).await.total,
