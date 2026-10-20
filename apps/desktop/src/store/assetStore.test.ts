@@ -753,6 +753,29 @@ describe('useAssetStore updateAssetPreview', () => {
     update('render', null, undefined, { filePath: render, previousThumbnailPath: renamed });
     expect(useAssetStore.getState().assetAt(0)?.bundledPreview).toBe(render);
   });
+
+  test("a small render's thumbnail patches the models showing it as their fallback", async () => {
+    const render = '/lib/kit/Previews/rock.png';
+    serve(() => [
+      { ...named('rock'), fallbackRender: render },
+      { ...named('tree'), fallbackRender: '/lib/kit/Previews/tree.png' },
+    ]);
+    await useAssetStore.getState().search();
+    const update = useAssetStore.getState().updateAssetPreview;
+
+    const thumb = '/lib/.opendam/thumbs/r_thumb.png';
+    update('render', thumb, undefined, { filePath: render });
+    let s = useAssetStore.getState();
+    expect([s.assetAt(0)?.fallbackRender, s.assetAt(0)?.bundledPreview]).toEqual([
+      thumb,
+      undefined,
+    ]);
+    expect(s.assetAt(1)?.fallbackRender).toBe('/lib/kit/Previews/tree.png');
+
+    update('render', null, undefined, { filePath: render, previousThumbnailPath: thumb });
+    s = useAssetStore.getState();
+    expect(s.assetAt(0)?.fallbackRender).toBe(render);
+  });
 });
 
 describe('useAutotagStore applyUpdate', () => {

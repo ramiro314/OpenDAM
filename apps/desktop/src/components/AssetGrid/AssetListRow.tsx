@@ -40,7 +40,7 @@ export const AssetListRow = memo(function AssetListRow({
   useEffect(() => {
     setFailed(undefined);
     setMediaSettled(false);
-  }, [asset.bundledPreview, asset.thumbnailPath, asset.filePath]);
+  }, [asset.bundledPreview, asset.fallbackRender, asset.thumbnailPath, asset.filePath]);
 
   const media = tileMedia(asset, { failed });
   const image = tileImage(asset, media);

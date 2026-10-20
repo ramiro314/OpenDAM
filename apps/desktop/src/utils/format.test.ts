@@ -85,6 +85,13 @@ describe('itemFileCount', () => {
     expect(itemFileCount({ groupFormats: ['glb', 'fbx'] })).toBe(2);
     expect(itemFileCount({ bundledPreview: '/kit/Previews/a.png' })).toBe(2);
   });
+
+  test('counts a render too small to fit a card too', () => {
+    expect(
+      itemFileCount({ groupFormats: ['glb', 'fbx', 'obj'], fallbackRender: '/kit/Previews/a.png' })
+    ).toBe(4);
+    expect(itemFileCount({ fallbackRender: '/kit/Previews/a.png' })).toBe(2);
+  });
 });
 
 describe('formatTrashAction', () => {

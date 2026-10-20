@@ -1344,35 +1344,47 @@ export const UI_CHECKS: UiCheck[] = [
       const background = getComputedStyle(modelBadge!).backgroundColor;
       assert(background.startsWith('rgb('), `the badge's background is ${background}, not solid`);
 
-      // Each model's card shows Kenney's render, from `Previews/`, which lists no item of its own
-      assert(sedan!.bundledPreview, 'sedan.glb has no bundled preview');
-      const byId = new Map(found.assets.map((a) => [a.id, a]));
-      const renderedCards = () =>
-        [...document.querySelectorAll<HTMLElement>('[data-tile]')].flatMap((tile) => {
-          const asset = byId.get(tile.id.replace(/^asset-/, ''));
-          return asset?.bundledPreview ? [{ tile, asset }] : [];
-        });
-      await waitFor(() => renderedCards().length > 0, 10_000, 'a card with a bundled preview');
-      for (const { tile, asset } of renderedCards()) {
-        const src = tile.querySelector('img')?.getAttribute('src');
-        assert(
-          src === convertFileSrc(asset.bundledPreview!),
-          `${asset.fileName}'s card shows ${src}, not ${asset.bundledPreview}`
-        );
-      }
+      // Each model's card shows its own 512 px thumbnail, not Kenney's 64 px render from
+      // `Previews/`, which is too small to fit a card and lists no item of its own (plan
+      // small-bundled-previews A1)
       await searchWith({ folder: { libraryId: BENCH_LIBRARY, path: kitPath } }, waitFor);
       const kitItems = await results();
       const renders = kitItems.assets.filter((a) => a.filePath.includes('/Previews/'));
       assert(renders.length === 0, `${kitPath} lists ${renders[0]?.fileName} from Previews/`);
       await selectFolder(modelsPath);
       found = await results();
+      const byId = new Map(found.assets.map((a) => [a.id, a]));
+      const modelCards = () =>
+        [...document.querySelectorAll<HTMLElement>('[data-tile]')].flatMap((tile) => {
+          const asset = byId.get(tile.id.replace(/^asset-/, ''));
+          return asset?.kind === '3d_model' ? [{ tile, asset }] : [];
+        });
       await waitFor(
-        () =>
-          renderedCards().length > 0 && !document.querySelector('[data-tile-state="placeholder"]'),
+        () => modelCards().length > 0 && !document.querySelector('[data-tile-state="placeholder"]'),
         10_000,
-        "the kit's pictures"
+        "the kit's model cards"
       );
       await pause('U11-kit-models');
+      for (const { tile, asset } of modelCards()) {
+        assert(asset.thumbnailPath, `${asset.fileName} has no thumbnail`);
+        const img = tile.querySelector('img');
+        const src = img?.getAttribute('src');
+        assert(
+          src === convertFileSrc(asset.thumbnailPath!),
+          `${asset.fileName}'s card shows ${src}, not its thumbnail ${asset.thumbnailPath}`
+        );
+        assert(
+          Math.min(img!.naturalWidth, img!.naturalHeight) >= 512,
+          `${asset.fileName}'s card loaded a ${img!.naturalWidth}x${img!.naturalHeight} image`
+        );
+      }
+      // The render stays tied to its model, as the fallback for a card with no thumbnail
+      const sedanNow = found.assets.find((a) => a.fileName === 'sedan.glb')!;
+      assert(!sedanNow.bundledPreview, `sedan.glb's bundled preview is ${sedanNow.bundledPreview}`);
+      assert(
+        sedanNow.fallbackRender?.endsWith('/Previews/sedan.png'),
+        `sedan.glb's fallback render is ${sedanNow.fallbackRender}`
+      );
 
       // A list row shows the same badge, solid and whole, in its extension column
       useUIStore.getState().setViewMode('list');
