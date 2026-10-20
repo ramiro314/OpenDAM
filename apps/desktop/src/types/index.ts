@@ -239,14 +239,21 @@ export interface PackCard {
   mark?: PackMark | null;
 }
 
-/** The license a pack's license file names, or `unknown` for any other */
+/** The license a pack's license file or `datapackage.json` names, or `unknown` for any other */
 export type LicenseKind = 'CC0' | 'CC-BY' | 'CC-BY-SA' | 'MIT' | 'Apache-2.0' | 'OFL' | 'unknown';
 
-/** A Kenney license header: `Car Kit (3.1)`, `Created/distributed by Kenney` */
-export interface PackHeader {
-  name: string;
-  version?: string | null;
-  author?: string | null;
+/**
+ * A pack's license: its `datapackage.json` one, else its license file's. At most one of
+ * `filePath` ("Open license") and `url` ("Open") is set.
+ */
+export interface PackLicense {
+  kind: LicenseKind;
+  /** The `datapackage.json` license's title, else its id: the label of an unknown kind */
+  name?: string | null;
+  /** Absolute: an indexed txt, md or pdf file */
+  filePath?: string | null;
+  /** An http(s) URL, opened only on a click */
+  url?: string | null;
 }
 
 /** What the detail panel shows for one pack (`get_pack_detail`) */
@@ -262,8 +269,15 @@ export interface PackDetail {
   cover?: Cover | null;
   /** The pack's `Preview*` and `Sample*` images, by path */
   gallery: Cover[];
-  license?: { filePath: string; kind: LicenseKind } | null;
-  header?: PackHeader | null;
+  /** The `datapackage.json` version, else the license header's */
+  version?: string | null;
+  /** The `datapackage.json` publisher */
+  publisher?: string | null;
+  /** The `datapackage.json` authors, else the license header's author */
+  authors: string[];
+  /** The detected source URL, without yours */
+  sourceUrl?: string | null;
+  license?: PackLicense | null;
   /** Files below the pack by kind, hidden files and every format of a model included */
   kinds: Partial<Record<AssetKind, number>>;
   /** Their total size in bytes */

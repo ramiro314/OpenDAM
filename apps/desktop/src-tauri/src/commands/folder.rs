@@ -6,7 +6,7 @@ use tauri::{Emitter, State};
 
 use crate::commands::asset::folder_range;
 use crate::db::{resolve_path, upsert_collection, upsert_tag, Database, LibraryHandle};
-use crate::structure::{self, LicenseKind, PackHeader, PackMark, PackOverride};
+use crate::structure::{self, LicenseKind, PackMark, PackOverride};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -311,9 +311,16 @@ pub struct PackDetail {
     pub cover: Option<Cover>,
     /// The pack's `Preview*` and `Sample*` images, by path
     pub gallery: Vec<Cover>,
+    /// The `datapackage.json` version, else the license header's
+    pub version: Option<String>,
+    /// The `datapackage.json` publisher
+    pub publisher: Option<String>,
+    /// The `datapackage.json` authors, else the license header's author
+    pub authors: Vec<String>,
+    /// The detected source URL, without yours: the `datapackage.json` one
+    pub source_url: Option<String>,
+    /// The `datapackage.json` license, else the license file's, or `None` when there is neither
     pub license: Option<PackLicense>,
-    /// The Kenney header of the license file, if it has one
-    pub header: Option<PackHeader>,
     /// Files below the pack by kind, support files and group members included
     pub kinds: std::collections::BTreeMap<String, i64>,
     /// Their total size in bytes
@@ -323,13 +330,19 @@ pub struct PackDetail {
     pub edits: PackOverride,
 }
 
-/// A pack's license file, as "Open license" opens it.
+/// A pack's license (plan pack-metadata-files C9, C11): the one its `datapackage.json` names,
+/// else its license file's. At most one of `file_path` and `url` is set, for the button beside it.
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackLicense {
-    /// Absolute
-    pub file_path: String,
     pub kind: LicenseKind,
+    /// The `datapackage.json` license's title, else its id, the label of an unknown kind
+    pub name: Option<String>,
+    /// The file "Open license" opens, absolute: the `datapackage.json` license's indexed doc,
+    /// else the pack's license file, when the `datapackage.json` license has no URL
+    pub file_path: Option<String>,
+    /// The `datapackage.json` license's http(s) URL, which "Open" opens
+    pub url: Option<String>,
 }
 
 /// The pack that holds `path` in library `library_id`: the innermost pack at or above it, the
@@ -408,6 +421,9 @@ pub(crate) async fn pack_holding(
     .fetch_all(&library.pool)
     .await?;
     let root = &library.root_path;
+    let license = pack_license(&info, root);
+    let meta = info.package.as_ref().map(|p| &p.meta);
+    let header = info.license.as_ref().and_then(|l| l.text.header.as_ref());
     let cover_of = |path: &str| {
         covers
             .iter()
@@ -432,15 +448,49 @@ pub(crate) async fn pack_holding(
         hidden_count: row.hidden_count,
         cover: info.cover.as_deref().and_then(cover_of),
         gallery: info.gallery.iter().filter_map(|p| cover_of(p)).collect(),
-        header: info.license.as_ref().and_then(|l| l.text.header.clone()),
-        license: info.license.map(|l| PackLicense {
-            file_path: resolve_path(root, &l.path),
-            kind: l.text.kind,
-        }),
+        version: meta
+            .and_then(|m| m.version.clone())
+            .or_else(|| header?.version.clone()),
+        publisher: meta.and_then(|m| m.publisher.clone()),
+        authors: match meta.map(|m| &m.authors) {
+            Some(authors) if !authors.is_empty() => authors.clone(),
+            _ => header.and_then(|h| h.author.clone()).into_iter().collect(),
+        },
+        source_url: meta.and_then(|m| m.source_url.clone()),
+        license,
         kinds: info.kinds,
         size_bytes: info.size_bytes,
         edits,
     }))
+}
+
+/// The license `info` shows, with its button (plan pack-metadata-files C9): the `datapackage.json`
+/// license, whose indexed doc opens with "Open license" and URL with "Open", else the pack's
+/// license file, which also opens with "Open license" when the `datapackage.json` license has
+/// neither.
+fn pack_license(info: &structure::PackInfo, root: &Path) -> Option<PackLicense> {
+    let package = info.package.as_ref();
+    let named = package.and_then(|p| p.license.as_ref());
+    let url = named.and_then(|l| l.url.clone());
+    let file = named
+        .and_then(|l| l.file_path.as_deref())
+        .or_else(|| Some(info.license.as_ref()?.path.as_str()))
+        .filter(|_| url.is_none())
+        .map(|path| resolve_path(root, path));
+    match named {
+        Some(license) => Some(PackLicense {
+            kind: license.kind,
+            name: license.title.clone().or_else(|| license.id.clone()),
+            file_path: file,
+            url,
+        }),
+        None => info.license.as_ref().map(|license| PackLicense {
+            kind: license.text.kind,
+            name: None,
+            file_path: file,
+            url: None,
+        }),
+    }
 }
 
 /// One edit to a folder's pack (plan C18), stored in `pack_overrides`.
@@ -1300,14 +1350,16 @@ mod tests {
                         Some(".opendam/thumbs/s_thumb.png")
                     ),
                 ],
+                // The license header gives the version and the author.
+                version: Some("3.1".into()),
+                publisher: None,
+                authors: vec!["Kenney".into()],
+                source_url: None,
                 license: Some(PackLicense {
-                    file_path: "/libraries/a/3D assets/Car Kit/License.txt".into(),
                     kind: LicenseKind::Cc0,
-                }),
-                header: Some(PackHeader {
-                    name: "Car Kit".into(),
-                    version: Some("3.1".into()),
-                    author: Some("Kenney".into()),
+                    name: None,
+                    file_path: Some("/libraries/a/3D assets/Car Kit/License.txt".into()),
+                    url: None,
                 }),
                 // Kinds by extension, as the indexer gives them; the test library's files are
                 // 1 byte each.
@@ -1329,6 +1381,278 @@ mod tests {
         }
     }
 
+    /// A Kenney license file: CC0, version 3.1, by Kenney.
+    const KENNEY_LICENSE: &str =
+        "Car Kit (3.1)\n\nCreated/distributed by Kenney (www.kenney.nl)\n\n\
+        License: (Creative Commons Zero, CC0)\nhttp://creativecommons.org/publicdomain/zero/1.0/\n";
+
+    /// The detail of pack `kit` in a library over a temporary folder holding `files`, each a
+    /// path and its text, with your `edits` to `kit` and its pass run. Paths in it are below
+    /// `/libraries/lib`.
+    async fn kit_detail(files: &[(&str, &str)], edits: Option<(&str, &str, &str)>) -> PackDetail {
+        let root = tempfile::tempdir().unwrap();
+        let pool = memory_library_pool().await;
+        for (path, text) in files {
+            let file = root.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, text).unwrap();
+            crate::structure::tests::insert_path(&pool, path).await;
+        }
+        if let Some((name, license, source_url)) = edits {
+            sqlx::query(
+                "INSERT INTO pack_overrides (path, name, license, source_url, updated_at)
+                 VALUES ('kit', ?, ?, ?, 0)",
+            )
+            .bind(name)
+            .bind(license)
+            .bind(source_url)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        crate::structure::rebuild(&pool, root.path()).await.unwrap();
+        let mut library = memory_library("lib", pool);
+        library.root_path = "/libraries/lib".into();
+        pack_holding(&library, "kit")
+            .await
+            .unwrap()
+            .expect("kit is a pack")
+    }
+
+    /// A pack's license as `(kind, name, file_path, url)`, paths below `/libraries/lib`.
+    type License = (LicenseKind, Option<String>, Option<String>, Option<String>);
+
+    fn license_of(detail: &PackDetail) -> Option<License> {
+        detail
+            .license
+            .as_ref()
+            .map(|l| (l.kind, l.name.clone(), l.file_path.clone(), l.url.clone()))
+    }
+
+    fn license(
+        kind: LicenseKind,
+        name: Option<&str>,
+        file: Option<&str>,
+        url: Option<&str>,
+    ) -> Option<License> {
+        Some((
+            kind,
+            name.map(str::to_string),
+            file.map(|f| format!("/libraries/lib/{f}")),
+            url.map(str::to_string),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_packs_detail_takes_your_edits_then_its_datapackage_then_its_license_file() {
+        let package = r#"{
+            "title": "Package Kit",
+            "version": "2.0",
+            "contributors": [
+                { "title": "Studio", "roles": ["publisher"] },
+                { "title": "Ann", "roles": ["author"] },
+                { "givenName": "Bob", "familyName": "Lee", "role": "author" }
+            ],
+            "sources": [{ "path": "https://store.example.com/kit" }],
+            "licenses": [{ "name": "CC-BY-4.0", "title": "Attribution 4.0" }]
+        }"#;
+        let files = [
+            ("kit/License.txt", KENNEY_LICENSE),
+            ("kit/a.glb", ""),
+            ("kit/datapackage.json", package),
+        ];
+        let detail = kit_detail(&files, None).await;
+        assert_eq!(
+            (
+                detail.name.as_str(),
+                detail.version.as_deref(),
+                detail.publisher.as_deref(),
+                detail.authors.clone(),
+                detail.source_url.as_deref(),
+            ),
+            (
+                "Package Kit",
+                Some("2.0"),
+                Some("Studio"),
+                vec!["Ann".to_string(), "Bob Lee".to_string()],
+                Some("https://store.example.com/kit"),
+            )
+        );
+        // The file's license wins, and its button stays on the license file.
+        assert_eq!(
+            license_of(&detail),
+            license(
+                LicenseKind::CcBy,
+                Some("Attribution 4.0"),
+                Some("kit/License.txt"),
+                None
+            )
+        );
+
+        // Your edits win: the name here, and the license and source URL the panel shows.
+        let edited = kit_detail(
+            &files,
+            Some(("Mine", "My license", "https://mine.example.com")),
+        )
+        .await;
+        assert_eq!(edited.name, "Mine");
+        assert_eq!(
+            (
+                edited.edits.license.as_deref(),
+                edited.edits.source_url.as_deref()
+            ),
+            (Some("My license"), Some("https://mine.example.com"))
+        );
+        // The detected source URL still comes, for the form's placeholder.
+        assert_eq!(edited.source_url, detail.source_url);
+
+        // Field by field, the license file gives what the datapackage.json leaves out.
+        let titled = [
+            files[0],
+            files[1],
+            ("kit/datapackage.json", r#"{"title": "Titled"}"#),
+        ];
+        let detail = kit_detail(&titled, None).await;
+        assert_eq!(
+            (
+                detail.name.as_str(),
+                detail.version.as_deref(),
+                detail.publisher.as_deref(),
+                detail.authors.clone(),
+                detail.source_url.as_deref(),
+            ),
+            (
+                "Titled",
+                Some("3.1"),
+                None,
+                vec!["Kenney".to_string()],
+                None
+            )
+        );
+        assert_eq!(
+            license_of(&detail),
+            license(LicenseKind::Cc0, None, Some("kit/License.txt"), None)
+        );
+
+        // Without the file, the license file names the pack, and without both, its folder does.
+        let detail = kit_detail(&files[..2], None).await;
+        assert_eq!(
+            (detail.name.as_str(), detail.version.as_deref()),
+            ("Car Kit", Some("3.1"))
+        );
+        let detail = kit_detail(&[("kit/a.glb", ""), ("kit/datapackage.json", "{}")], None).await;
+        assert_eq!((detail.name.as_str(), license_of(&detail)), ("kit", None));
+    }
+
+    #[tokio::test]
+    async fn open_license_opens_only_an_indexed_doc_and_open_only_an_http_url() {
+        let with = |path: &str| {
+            serde_json::json!({ "licenses": [{ "name": "MIT", "path": path }] }).to_string()
+        };
+        let mit = |file: Option<&str>, url: Option<&str>| {
+            license(LicenseKind::Mit, Some("MIT"), file, url)
+        };
+        // An indexed doc in the pack opens with "Open license", over the license file.
+        for doc in ["kit/Docs/terms.md", "kit/Docs/EULA.PDF"] {
+            let package = with(doc.strip_prefix("kit/").unwrap());
+            let files = [
+                ("kit/License.txt", KENNEY_LICENSE),
+                (doc, "terms"),
+                ("kit/datapackage.json", package.as_str()),
+            ];
+            assert_eq!(
+                license_of(&kit_detail(&files, None).await),
+                mit(Some(doc), None),
+                "{doc}"
+            );
+        }
+        // A URL opens with "Open", and the license file gets no button.
+        let package = with("https://example.com/terms");
+        let files = [
+            ("kit/License.txt", KENNEY_LICENSE),
+            ("kit/datapackage.json", package.as_str()),
+        ];
+        assert_eq!(
+            license_of(&kit_detail(&files, None).await),
+            mit(None, Some("https://example.com/terms"))
+        );
+        // Any other path leaves the button on the license file, or shows none without one.
+        for path in [
+            "install.sh",
+            "terms.html",
+            "eula.rtf",
+            "Models/rock.fbx",
+            "gone.txt",
+            "../License.txt",
+            "ftp://example.com/terms",
+            "file:///etc/passwd",
+        ] {
+            let package = with(path);
+            let mut files = vec![
+                ("kit/a.glb", ""),
+                ("kit/datapackage.json", package.as_str()),
+            ];
+            // Indexed, though the watcher indexes none of these but the model
+            for indexed in [
+                "kit/install.sh",
+                "kit/terms.html",
+                "kit/eula.rtf",
+                "kit/Models/rock.fbx",
+            ] {
+                files.push((indexed, "x"));
+            }
+            assert_eq!(
+                license_of(&kit_detail(&files, None).await),
+                mit(None, None),
+                "{path}"
+            );
+            files.push(("kit/License.txt", KENNEY_LICENSE));
+            assert_eq!(
+                license_of(&kit_detail(&files, None).await),
+                mit(Some("kit/License.txt"), None),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_nameless_license_whose_path_doesnt_count_gives_way_to_the_next_or_the_license_file()
+    {
+        let files = |licenses: &str| {
+            let package = format!(r#"{{"licenses": {licenses}}}"#);
+            vec![
+                ("kit/a.glb".to_string(), String::new()),
+                ("kit/install.sh".to_string(), "x".to_string()),
+                ("kit/Models/rock.fbx".to_string(), "x".to_string()),
+                ("kit/datapackage.json".to_string(), package),
+            ]
+        };
+        let detail = |files: Vec<(String, String)>| async move {
+            let files: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(p, t)| (p.as_str(), t.as_str()))
+                .collect();
+            kit_detail(&files, None).await
+        };
+        for path in ["LICENSE", "install.sh", "Models/rock.fbx", "gone.txt"] {
+            // The next named entry is shown, with no button and no license file.
+            let named = files(&format!(r#"[{{"path": "{path}"}}, {{"name": "MIT"}}]"#));
+            assert_eq!(
+                license_of(&detail(named).await),
+                license(LicenseKind::Mit, Some("MIT"), None, None),
+                "{path}"
+            );
+            // Alone beside a license file, the license file gives the license and its button.
+            let mut alone = files(&format!(r#"[{{"path": "{path}"}}]"#));
+            alone.push(("kit/License.txt".to_string(), KENNEY_LICENSE.to_string()));
+            assert_eq!(
+                license_of(&detail(alone).await),
+                license(LicenseKind::Cc0, None, Some("kit/License.txt"), None),
+                "{path}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_library_that_is_one_pack_shows_it_at_its_root_named_after_the_library() {
         let mut solo = library_handle("solo", &["License.txt", "rock.png", "Tiles/a.png"]).await;
@@ -1341,8 +1665,12 @@ mod tests {
             );
             // A license the pass couldn't read is unknown, with no header.
             assert_eq!(
-                (detail.license.map(|l| l.kind), detail.header),
-                (Some(LicenseKind::Unknown), None)
+                (
+                    detail.license.map(|l| l.kind),
+                    detail.version,
+                    detail.authors
+                ),
+                (Some(LicenseKind::Unknown), None, vec![])
             );
             // Every file counts once, those at the root included.
             assert_eq!(
