@@ -1,14 +1,15 @@
 //! The structure pass: a library's folder tree, its packs, its support files, its format groups
 //! with their bundled previews, and its 2D stacks, derived from the paths it has indexed
 //! (docs/plans/smarter-big-collections/plan.md, "The structure pass"). `derive` is a pure function
-//! over the paths, their sizes, what the license files say and your edits to packs
-//! (`pack_overrides`, which it never writes), and the pass writes only the folder rows and
+//! over the paths, their sizes, what the license files say, the renders' sizes and your edits to
+//! packs (`pack_overrides`, which it never writes), and the pass writes only the folder rows and
 //! `assets.support_role`, `assets.group_id` and `assets.bundled_preview` values that differ from
-//! it, and the metadata of
+//! it, a render's size as its header gives it (`render_width`, `render_height`, and the
+//! `render_read_bytes` and `render_read_mtime` it was read at), and the metadata of
 //! the groups that form or grow (`apply_unions`). Every index run ends with the pass
 //! (`watcher::index_paths`), and so does every command that changes the paths, through
-//! `rebuild_library`. Nothing else writes `folders`, `support_role`, `group_id` or
-//! `bundled_preview`.
+//! `rebuild_library`. Nothing else writes `folders`, `support_role`, `group_id`,
+//! `bundled_preview` or the `render_*` columns.
 
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
@@ -271,6 +272,24 @@ pub struct Structure {
     /// The bundled preview of each input path, in input order: the input index of its render,
     /// for a main item or a file on its own whose model has one, and `None` for every other file
     pub bundled_previews: Vec<Option<usize>>,
+    /// The size of each render in input order, width then height, as `derive`'s lookup gave
+    /// it, and `None` for a render whose size is unknown and for every other file
+    pub render_sizes: Vec<Option<(u32, u32)>>,
+}
+
+impl Structure {
+    /// Whether input path `i` is an item whose card shows its bundled preview: it has one, and
+    /// the render fits a card (`fits`). Only such an item stays off the preview queue.
+    pub fn pictured(&self, i: usize) -> bool {
+        self.bundled_previews[i].is_some_and(|r| fits(self.render_sizes[r]))
+    }
+}
+
+/// Whether a render of `size` (width, height) fits a card: both of its sides are at least the
+/// thumbnail size, since cards cover their tile. One of unknown size doesn't (plan
+/// small-bundled-previews D1, D9). `commands::asset::pictured` is the same rule in SQL.
+pub fn fits(size: Option<(u32, u32)>) -> bool {
+    size.is_some_and(|(w, h)| w.min(h) >= crate::preview::THUMB_SIZE)
 }
 
 /// The folder holding `path` (`""` for the root) and the file's name.
@@ -348,7 +367,8 @@ impl FileKind {
 /// 4. **Format groups** (C11, `format_groups`): one model shipped in several formats, and the
 ///    copies of a file under format folders, form one grid item led by its main item.
 /// 5. **Bundled previews** (C12, `model_previews`): a render of a model is a `ModelPreview`
-///    support file, and the model's main item records it.
+///    support file, and the model's main item records it: its first render by path that fits a
+///    card (`fits`), else its first by path. `render_size` gives each render's size.
 /// 6. **2D stacks** (C13, `stacks`): a sprite's scale and format copies (`Default/`, `Double/`,
 ///    `Vector/`) form a group too, led by its PNG at the default scale.
 /// 7. **Counts:** each folder counts the grid items with a visible file below it, a group once,
@@ -364,6 +384,7 @@ pub fn derive<'a>(
     files: impl IntoIterator<Item = (&'a str, i64)>,
     overrides: &Overrides,
     mut read_license: impl FnMut(&str) -> LicenseText,
+    mut render_size: impl FnMut(&str) -> Option<(u32, u32)>,
 ) -> Structure {
     let (paths, sizes): (Vec<&str>, Vec<i64>) = files.into_iter().unzip();
     let kinds: Vec<FileKind> = paths.iter().map(|p| FileKind::of(split_dir(p).1)).collect();
@@ -435,7 +456,11 @@ pub fn derive<'a>(
     let renders = model_previews(&paths, &kinds, &mut roles);
     let mut groups = format_groups(&paths, &kinds, &roles);
     stacks(&paths, &kinds, &roles, &mut groups);
-    let bundled_previews = bundled_previews(&paths, &groups, &renders);
+    let mut render_sizes = vec![None; paths.len()];
+    for (render, _) in &renders {
+        render_sizes[*render] = render_size(paths[*render]);
+    }
+    let bundled_previews = bundled_previews(&paths, &groups, &renders, &render_sizes);
 
     // A file on its own counts toward the folders above it. A group counts once toward each
     // folder above any of its files, so every format folder of a kit counts all its models.
@@ -520,6 +545,7 @@ pub fn derive<'a>(
         roles,
         groups,
         bundled_previews,
+        render_sizes,
     }
 }
 
@@ -581,13 +607,15 @@ fn model_previews(
 /// `Structure::bundled_previews` for `renders` as `model_previews` returns them: each rendered
 /// model's main item, or the model itself when it is on its own, records its render. A render of
 /// models in several groups is each group's preview, and an item rendered more than once takes
-/// the render whose path sorts first ignoring case, as `format_groups` breaks ties.
+/// a render that fits a card (`fits`, by `sizes`) over one that doesn't, then the render whose
+/// path sorts first ignoring case, as `format_groups` breaks ties.
 fn bundled_previews(
     paths: &[&str],
     groups: &[Option<usize>],
     renders: &[(usize, Vec<usize>)],
+    sizes: &[Option<(u32, u32)>],
 ) -> Vec<Option<usize>> {
-    let key = |i: usize| (paths[i].to_ascii_lowercase(), paths[i]);
+    let key = |i: usize| (!fits(sizes[i]), paths[i].to_ascii_lowercase(), paths[i]);
     let mut bundled: Vec<Option<usize>> = vec![None; paths.len()];
     for (render, models) in renders {
         for &model in models {
@@ -1085,6 +1113,10 @@ struct FileRow {
     preview_status: String,
     size_bytes: i64,
     modified_at: i64,
+    render_width: Option<i64>,
+    render_height: Option<i64>,
+    render_read_bytes: Option<i64>,
+    render_read_mtime: Option<i64>,
 }
 
 pub(crate) type FolderRow = (
@@ -1160,6 +1192,109 @@ async fn read_license_files(
                 .map(|path| (path, Err(std::io::Error::other(error.clone()))))
                 .collect()
         })
+}
+
+/// The size render `file` had when the pass last read its header, when its size and mtime
+/// haven't changed since; `None` when it must be read, because it never was, its last read
+/// failed or it changed.
+fn known_size(file: &FileRow) -> Option<(u32, u32)> {
+    if (file.render_read_bytes, file.render_read_mtime)
+        != (Some(file.size_bytes), Some(file.modified_at))
+    {
+        return None;
+    }
+    Some((
+        u32::try_from(file.render_width?).ok()?,
+        u32::try_from(file.render_height?).ok()?,
+    ))
+}
+
+/// The size of each render of `paths` below `root`, from its header, or why it couldn't be
+/// read. The reads run on the blocking pool, as `read_license_files` does.
+async fn read_render_sizes(
+    root: &Path,
+    paths: Vec<String>,
+) -> HashMap<String, image::ImageResult<(u32, u32)>> {
+    let read_all = {
+        let (root, paths) = (root.to_path_buf(), paths.clone());
+        move || {
+            paths
+                .into_iter()
+                .map(|path| {
+                    let size = image::image_dimensions(root.join(&path));
+                    (path, size)
+                })
+                .collect()
+        }
+    };
+    tokio::task::spawn_blocking(read_all)
+        .await
+        .unwrap_or_else(|e| {
+            let error = format!("the render reads stopped: {e}");
+            paths
+                .into_iter()
+                .map(|path| {
+                    let error = std::io::Error::other(error.clone());
+                    (path, Err(image::ImageError::IoError(error)))
+                })
+                .collect()
+        })
+}
+
+/// Records what the pass read of each render in `read`: its size with the `size_bytes` and
+/// `modified_at` it was read at, or, when it couldn't be read, no read at all, so the next pass
+/// reads it again (plan small-bundled-previews C2, D9). Writes only the rows that differ, in
+/// transactions of `BATCH` rows, and returns how many it updated.
+async fn apply_render_sizes(
+    pool: &Pool<Sqlite>,
+    by_path: &HashMap<&str, &FileRow>,
+    read: &HashMap<String, image::ImageResult<(u32, u32)>>,
+) -> sqlx::Result<usize> {
+    type Read = [Option<i64>; 4];
+    let changed: Vec<(&str, Read)> = read
+        .iter()
+        .map(|(path, size)| {
+            let file = by_path[path.as_str()];
+            let new: Read = match size {
+                Ok((w, h)) => [
+                    Some(i64::from(*w)),
+                    Some(i64::from(*h)),
+                    Some(file.size_bytes),
+                    Some(file.modified_at),
+                ],
+                Err(_) => [None; 4],
+            };
+            (file, new)
+        })
+        .filter(|(file, new)| {
+            *new != [
+                file.render_width,
+                file.render_height,
+                file.render_read_bytes,
+                file.render_read_mtime,
+            ]
+        })
+        .map(|(file, new)| (file.id.as_str(), new))
+        .collect();
+    for chunk in changed.chunks(BATCH) {
+        let mut tx = pool.begin().await?;
+        for (id, [width, height, bytes, mtime]) in chunk {
+            sqlx::query(
+                "UPDATE assets SET render_width = ?, render_height = ?, render_read_bytes = ?,
+                     render_read_mtime = ?
+                 WHERE id = ?",
+            )
+            .bind(width)
+            .bind(height)
+            .bind(bytes)
+            .bind(mtime)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+    }
+    Ok(changed.len())
 }
 
 /// Makes `folders` hold exactly `folders`, writing only the rows that differ, in transactions of
@@ -1460,12 +1595,14 @@ async fn apply_bundled_previews(
     Ok(changed.len())
 }
 
-/// Keeps group members and models with a bundled preview off the preview queue (plan C15). A
-/// group member other than its main item comes off the queue, keeping any thumbnail it has,
-/// unless it is its group's stand-in (`preview_stand_ins`), and so does an item whose card shows
-/// its bundled preview. Any other file at `none` whose format takes a preview goes on it: a new
-/// file, a member that became a main item with no picture, a stand-in, or a pack's cover image or
-/// a render, which "Show hidden files" shows and pack and model cards picture.
+/// Keeps group members and models whose bundled preview fits a card off the preview queue (plan
+/// C15, narrowed by small-bundled-previews C4). A group member other than its main item comes
+/// off the queue, keeping any thumbnail it has, unless it is its group's stand-in
+/// (`preview_stand_ins`), and so does a pictured item (`Structure::pictured`). Any other file at
+/// `none` whose format takes a preview goes on it: a new file, a member that became a main item
+/// with no picture, a model whose render is too small, a stand-in, or a pack's cover image or a
+/// render, which "Show hidden files" shows and pack and model cards picture. A file that already
+/// has a preview keeps it.
 /// `preview::unqueue` and `preview::enqueue` own how. Returns how many assets it changed.
 async fn apply_previews(
     pool: &Pool<Sqlite>,
@@ -1478,8 +1615,7 @@ async fn apply_previews(
     let mut items = Vec::new();
     for (i, file) in files.iter().enumerate() {
         let main = structure.groups[i];
-        let pictured = structure.bundled_previews[i].is_some();
-        if (main.is_some_and(|m| m != i) && !stand_ins.contains(&i)) || pictured {
+        if (main.is_some_and(|m| m != i) && !stand_ins.contains(&i)) || structure.pictured(i) {
             if file.preview_status == "pending" || waiting.contains(&file.id) {
                 members.push(file.id.as_str());
             }
@@ -1506,8 +1642,8 @@ async fn apply_previews(
 }
 
 /// The member that is previewed for its group, by index into `files`, for each group whose main
-/// item's format takes no preview, such as a `.blend` beside an `.obj`, and that has no bundled
-/// preview: the previewable member that ranks first by format, then by path ignoring case. The
+/// item's format takes no preview, such as a `.blend` beside an `.obj`, and that isn't pictured
+/// (`Structure::pictured`): the previewable member that ranks first by format, then by path ignoring case. The
 /// card shows its thumbnail (`commands::asset`'s `ASSET_COLUMNS`), and `preview::claim_jobs`
 /// lets its job through.
 fn preview_stand_ins(files: &[FileRow], structure: &Structure) -> HashSet<usize> {
@@ -1523,7 +1659,7 @@ fn preview_stand_ins(files: &[FileRow], structure: &Structure) -> HashSet<usize>
     for (i, main) in structure.groups.iter().enumerate() {
         let Some(main) = *main else { continue };
         if main == i
-            || structure.bundled_previews[main].is_some()
+            || structure.pictured(main)
             || crate::preview::needs_preview(&files[main].extension)
             || !crate::preview::needs_preview(&files[i].extension)
         {
@@ -1540,15 +1676,31 @@ fn preview_stand_ins(files: &[FileRow], structure: &Structure) -> HashSet<usize>
     best.into_values().collect()
 }
 
+/// What one run of the pass did (`pass`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PassRun {
+    /// Rows written
+    pub written: usize,
+    /// Render headers read
+    pub render_reads: usize,
+}
+
 /// Runs the pass on the library DB at `pool`, whose files lie below `root`: reads every indexed
 /// path, derives the structure and applies it. It reads a pack's license file only when its size
-/// or mtime changed since the last pass. Returns the rows written. The caller holds the library's
-/// `index_lock`.
+/// or mtime changed since the last pass, and a render's header only when the render has no read
+/// recorded or its size or mtime changed since. Returns the rows written. The caller holds the
+/// library's `index_lock`.
 pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
+    Ok(pass(pool, root).await?.written)
+}
+
+/// `rebuild`, saying what it did.
+pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassRun> {
     let started = Instant::now();
     let files: Vec<FileRow> = sqlx::query_as(
         "SELECT id, file_path, extension, support_role, group_id, bundled_preview, preview_status,
-                size_bytes, modified_at
+                size_bytes, modified_at, render_width, render_height, render_read_bytes,
+                render_read_mtime
          FROM assets",
     )
     .fetch_all(pool)
@@ -1558,30 +1710,65 @@ pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
     let by_path: HashMap<&str, &FileRow> =
         files.iter().map(|f| (f.file_path.as_str(), f)).collect();
     let inputs = || files.iter().map(|f| (f.file_path.as_str(), f.size_bytes));
-    // Derive with the licenses already read, noting each one that changed since. Only then read
-    // those, off the runtime, and derive again with what they say.
+    // Derive with the licenses and render sizes already read, noting each file that changed
+    // since. Only then read those, off the runtime, and derive again with what they say.
     let mut changed = Vec::new();
-    let mut structure = derive(inputs(), &overrides, |path| {
-        known_text(by_path[path], &known).unwrap_or_else(|| {
-            changed.push(path.to_string());
-            LicenseText::default()
-        })
-    });
+    let mut stale_renders = Vec::new();
+    let mut structure = derive(
+        inputs(),
+        &overrides,
+        |path| {
+            known_text(by_path[path], &known).unwrap_or_else(|| {
+                changed.push(path.to_string());
+                LicenseText::default()
+            })
+        },
+        |path| {
+            let size = known_size(by_path[path]);
+            if size.is_none() {
+                stale_renders.push(path.to_string());
+            }
+            size
+        },
+    );
     let mut unread = HashSet::new();
     let reads = changed.len();
-    if !changed.is_empty() {
-        let read = read_license_files(root, changed).await;
-        structure = derive(inputs(), &overrides, |path| match read.get(path) {
-            None => known_text(by_path[path], &known).unwrap_or_default(),
-            Some(Ok(text)) => text.clone(),
-            // An unreadable license keeps what it said last time, and records no read, so the
-            // next pass tries it again.
-            Some(Err(e)) => {
-                tracing::debug!(target: "structure", "Could not read {path}: {e}");
-                unread.insert(path.to_string());
-                known.get(path).map(|l| l.text.clone()).unwrap_or_default()
-            }
-        });
+    let render_reads = stale_renders.len();
+    let read = if changed.is_empty() {
+        HashMap::new()
+    } else {
+        read_license_files(root, changed).await
+    };
+    let sizes = if stale_renders.is_empty() {
+        HashMap::new()
+    } else {
+        read_render_sizes(root, stale_renders).await
+    };
+    if !read.is_empty() || !sizes.is_empty() {
+        structure = derive(
+            inputs(),
+            &overrides,
+            |path| match read.get(path) {
+                None => known_text(by_path[path], &known).unwrap_or_default(),
+                Some(Ok(text)) => text.clone(),
+                // An unreadable license keeps what it said last time, and records no read, so
+                // the next pass tries it again.
+                Some(Err(e)) => {
+                    tracing::debug!(target: "structure", "Could not read {path}: {e}");
+                    unread.insert(path.to_string());
+                    known.get(path).map(|l| l.text.clone()).unwrap_or_default()
+                }
+            },
+            // An unreadable render is too small, and records no read (`apply_render_sizes`).
+            |path| match sizes.get(path) {
+                None => known_size(by_path[path]),
+                Some(Ok(size)) => Some(*size),
+                Some(Err(e)) => {
+                    tracing::debug!(target: "structure", "Could not read the size of {path}: {e}");
+                    None
+                }
+            },
+        );
     }
     // A read license records the parser, size and mtime it was read with; an unread one records
     // none.
@@ -1598,7 +1785,8 @@ pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
     let structure = structure;
 
     let mut written = apply_folders(pool, &structure.folders).await?
-        + apply_roles(pool, &files, &structure.roles).await?;
+        + apply_roles(pool, &files, &structure.roles).await?
+        + apply_render_sizes(pool, &by_path, &sizes).await?;
     // A union follows from the `group_id` writes counted next, so it isn't counted itself.
     let unioned = apply_unions(pool, &files, &structure.groups).await?;
     written += apply_groups(pool, &files, &structure.groups).await?
@@ -1611,9 +1799,15 @@ pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
         .enumerate()
         .filter(|(i, main)| **main == Some(*i))
         .count();
+    let too_small = structure
+        .roles
+        .iter()
+        .zip(&structure.render_sizes)
+        .filter(|(role, size)| **role == Some(SupportRole::ModelPreview) && !fits(**size))
+        .count();
     tracing::info!(
         target: "structure",
-        "Structure pass: {} files, {} folders, {} packs, {} license files read, {} support files, {} groups of {} files, {} groups unioned, {} bundled previews, {} rows written in {:?}",
+        "Structure pass: {} files, {} folders, {} packs, {} license files read, {} support files, {} groups of {} files, {} groups unioned, {} bundled previews, {} render headers read, {} renders too small, {} rows written in {:?}",
         files.len(),
         structure.folders.len(),
         structure.folders.values().filter(|f| f.is_pack).count(),
@@ -1623,10 +1817,15 @@ pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
         grouped,
         unioned,
         structure.bundled_previews.iter().flatten().count(),
+        render_reads,
+        too_small,
         written,
         started.elapsed()
     );
-    Ok(written)
+    Ok(PassRun {
+        written,
+        render_reads,
+    })
 }
 
 /// Reruns the pass for `library` once any index run on it has finished, for a command that
@@ -1660,9 +1859,12 @@ pub(crate) mod tests {
         paths: impl IntoIterator<Item = &'a str>,
         overrides: &Overrides,
     ) -> Structure {
-        super::derive(paths.into_iter().map(|p| (p, 1)), overrides, |_| {
-            LicenseText::default()
-        })
+        super::derive(
+            paths.into_iter().map(|p| (p, 1)),
+            overrides,
+            |_| LicenseText::default(),
+            |_| None,
+        )
     }
 
     fn folder(parent_path: Option<&str>, name: &str, item_count: i64, hidden_count: i64) -> Folder {
@@ -2286,9 +2488,12 @@ pub(crate) mod tests {
         let car = "3D assets/Car Kit";
         let derived = |edit: PackOverride| {
             let overrides = Overrides::from([(car.to_string(), edit)]);
-            let structure = super::derive(KENNEY_3D_KIT.map(|p| (p, 1)), &overrides, |_| {
-                kenney("Car Kit Deluxe", LicenseKind::Cc0)
-            });
+            let structure = super::derive(
+                KENNEY_3D_KIT.map(|p| (p, 1)),
+                &overrides,
+                |_| kenney("Car Kit Deluxe", LicenseKind::Cc0),
+                |_| None,
+            );
             let info = info(&structure, car);
             (info.name.clone(), info.cover.clone().unwrap())
         };
@@ -2681,6 +2886,75 @@ pub(crate) mod tests {
         assert_eq!(hidden(&paths).len(), 2);
     }
 
+    /// `derive` with each render's size from `sizes`, by path, and unknown for any other.
+    fn derive_sized(paths: &[&str], sizes: &[(&str, (u32, u32))]) -> Structure {
+        let sizes: HashMap<&str, (u32, u32)> = sizes.iter().copied().collect();
+        super::derive(
+            paths.iter().map(|p| (*p, 1)),
+            &Overrides::new(),
+            |_| LicenseText::default(),
+            |path| sizes.get(path).copied(),
+        )
+    }
+
+    #[test]
+    fn a_render_fits_when_both_its_sides_are_at_least_the_thumbnail_size() {
+        assert!(fits(Some((512, 512))));
+        assert!(fits(Some((1024, 600))));
+        assert!(!fits(Some((64, 64))));
+        assert!(!fits(Some((1024, 511))));
+        assert!(!fits(Some((300, 900))));
+        assert!(!fits(None));
+    }
+
+    #[test]
+    fn a_small_render_is_still_its_models_bundled_preview_but_pictures_nothing() {
+        let paths = ["kit/Models/sedan.glb", "kit/Previews/sedan.png"];
+        for (size, pictured) in [
+            (None, false),
+            (Some((64, 64)), false),
+            (Some((918, 515)), true),
+        ] {
+            let sizes: Vec<(&str, (u32, u32))> = size.map(|s| (paths[1], s)).into_iter().collect();
+            let structure = derive_sized(&paths, &sizes);
+            assert_eq!(structure.bundled_previews, [Some(1), None], "{size:?}");
+            assert_eq!(structure.roles[1], Some(SupportRole::ModelPreview));
+            assert_eq!(structure.render_sizes, [None, size]);
+            assert_eq!(structure.pictured(0), pictured, "{size:?}");
+            assert!(!structure.pictured(1));
+        }
+    }
+
+    #[test]
+    fn a_render_that_fits_beats_a_smaller_one_that_sorts_first() {
+        // A model at the root of two render folders' parent: each renders it.
+        let paths = [
+            "kit/sedan.glb",
+            "kit/Previews/sedan.png",
+            "kit/Renders/sedan.png",
+        ];
+        let fitting = derive_sized(&paths, &[(paths[1], (64, 64)), (paths[2], (1024, 1024))]);
+        assert_eq!(fitting.bundled_previews[0], Some(2));
+        assert!(fitting.pictured(0));
+        // When none fits, the first by path is the bundled preview, as when every one does.
+        for sizes in [
+            [(paths[1], (64, 64)), (paths[2], (128, 128))],
+            [(paths[1], (512, 512)), (paths[2], (1024, 1024))],
+        ] {
+            let structure = derive_sized(&paths, &sizes);
+            assert_eq!(structure.bundled_previews[0], Some(1), "{sizes:?}");
+        }
+        // Either way both stay renders.
+        assert_eq!(
+            fitting.roles,
+            [
+                None,
+                Some(SupportRole::ModelPreview),
+                Some(SupportRole::ModelPreview)
+            ]
+        );
+    }
+
     #[test]
     fn an_image_the_webview_cant_display_is_no_render() {
         // A render with no thumbnail shows as itself, so it must be one the webview decodes.
@@ -2811,13 +3085,18 @@ pub(crate) mod tests {
 
     #[test]
     fn a_packs_name_is_its_license_header_name_else_its_folder_name() {
-        let structure = super::derive(KENNEY_3D_KIT.map(|p| (p, 1)), &Overrides::new(), |path| {
-            if path == "3D assets/Car Kit/License.txt" {
-                kenney("Car Kit Deluxe", LicenseKind::Cc0)
-            } else {
-                LicenseText::default()
-            }
-        });
+        let structure = super::derive(
+            KENNEY_3D_KIT.map(|p| (p, 1)),
+            &Overrides::new(),
+            |path| {
+                if path == "3D assets/Car Kit/License.txt" {
+                    kenney("Car Kit Deluxe", LicenseKind::Cc0)
+                } else {
+                    LicenseText::default()
+                }
+            },
+            |_| None,
+        );
         let car = info(&structure, "3D assets/Car Kit");
         assert_eq!(car.name, "Car Kit Deluxe");
         assert_eq!(
@@ -2867,6 +3146,7 @@ pub(crate) mod tests {
             KENNEY_3D_KIT.into_iter().zip(sizes),
             &Overrides::new(),
             |_| LicenseText::default(),
+            |_| None,
         );
         let car = info(&structure, "3D assets/Car Kit");
         // Support files and every group member count, the render and the license included.
@@ -2893,6 +3173,7 @@ pub(crate) mod tests {
             ],
             &Overrides::new(),
             |_| LicenseText::default(),
+            |_| None,
         );
         assert_eq!(info(&structure, "kit").size_bytes, 7);
         // A library that is one pack counts each file once, those at its root included.
@@ -2900,6 +3181,7 @@ pub(crate) mod tests {
             [("License.txt", 1), ("rock.png", 2), ("Tiles/a.png", 4)],
             &Overrides::new(),
             |_| LicenseText::default(),
+            |_| None,
         );
         let root = info(&structure, "");
         assert_eq!((root.kinds.values().sum::<i64>(), root.size_bytes), (3, 7));
@@ -3566,6 +3848,244 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// Records `size` as what the pass last read of render `path`'s header, at the file's
+    /// current size and mtime, so a pass takes it as current.
+    pub(crate) async fn cache_render_size(pool: &Pool<Sqlite>, path: &str, size: (u32, u32)) {
+        sqlx::query(
+            "UPDATE assets SET render_width = ?, render_height = ?, render_read_bytes = size_bytes,
+                 render_read_mtime = modified_at
+             WHERE file_path = ?",
+        )
+        .bind(size.0)
+        .bind(size.1)
+        .bind(path)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// What `pool` records of render `path`'s header: width, height, and the size and mtime it
+    /// was read at.
+    pub(crate) async fn render_read(pool: &Pool<Sqlite>, path: &str) -> [Option<i64>; 4] {
+        let row: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT render_width, render_height, render_read_bytes, render_read_mtime
+             FROM assets WHERE file_path = ?",
+        )
+        .bind(path)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        [row.0, row.1, row.2, row.3]
+    }
+
+    /// The items `commands::asset::pictured` finds in `pool`, by path.
+    async fn pictured_items(pool: &Pool<Sqlite>) -> Vec<String> {
+        sqlx::query_scalar(&format!(
+            "SELECT file_path FROM assets a WHERE {} ORDER BY file_path",
+            crate::commands::asset::pictured("a")
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Writes a `width` x `height` PNG at `path`, making its folders.
+    pub(crate) fn write_png(path: &Path, width: u32, height: u32) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        image::RgbaImage::new(width, height).save(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_model_whose_render_is_too_small_is_queued_unless_it_has_a_thumbnail() {
+        let pool = memory_library_pool().await;
+        // Each model's render: Kenney's 64 px one, a wide one under 512 px tall, and one that
+        // fits. `car` is new; `van` was previewed before its render came.
+        let (car, van, bus, ship) = (
+            "kit/Models/car.glb",
+            "kit/Models/van.glb",
+            "kit/Models/bus.glb",
+            "kit/Models/ship.glb",
+        );
+        let renders = [
+            ("kit/Previews/car.png", (64, 64)),
+            ("kit/Previews/van.png", (1024, 300)),
+            ("kit/Previews/bus.png", (512, 600)),
+        ];
+        for path in [car, bus, ship] {
+            insert_with_preview(&pool, path, "none").await;
+        }
+        insert_with_preview(&pool, van, "done").await;
+        for (path, size) in renders {
+            insert_with_preview(&pool, path, "done").await;
+            cache_render_size(&pool, path, size).await;
+        }
+        // `ship`'s render was never read: the pass reads it at the unmounted root and fails.
+        insert_with_preview(&pool, "kit/Previews/ship.png", "done").await;
+        rebuild(&pool, unmounted()).await.unwrap();
+
+        // Every model still records its render, but only the bus's fits: it alone stays off the
+        // queue. The van keeps its thumbnail and isn't rendered again.
+        assert_eq!(
+            derived_rows(&pool).await.bundled_previews,
+            [bus, car, ship, van].map(|m| {
+                let stem = m.rsplit_once('/').unwrap().1.replace(".glb", ".png");
+                (m.to_string(), format!("kit/Previews/{stem}"))
+            })
+        );
+        assert_eq!(
+            previews(&pool).await.1,
+            pairs(&[(car, "pending"), (ship, "pending")])
+        );
+        assert_eq!(
+            previews(&pool)
+                .await
+                .0
+                .into_iter()
+                .filter(|(path, _)| path.ends_with(".glb"))
+                .collect::<Vec<_>>(),
+            pairs(&[
+                (bus, "none"),
+                (car, "pending"),
+                (ship, "pending"),
+                (van, "done")
+            ])
+        );
+        assert_eq!(pictured_items(&pool).await, [bus]);
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+
+        // Once the car's render fits, the car comes off the queue.
+        cache_render_size(&pool, "kit/Previews/car.png", (512, 512)).await;
+        rebuild(&pool, unmounted()).await.unwrap();
+        assert_eq!(previews(&pool).await.1, pairs(&[(ship, "pending")]));
+    }
+
+    #[tokio::test]
+    async fn a_blend_led_group_whose_render_is_too_small_gets_a_stand_in() {
+        let pool = memory_library_pool().await;
+        let (blend, obj, render) = (
+            "kit/ship.blend",
+            "kit/OBJ format/ship.obj",
+            "kit/Previews/ship.png",
+        );
+        for path in [blend, obj, render] {
+            insert_with_preview(&pool, path, "none").await;
+        }
+        cache_render_size(&pool, render, (64, 64)).await;
+        rebuild(&pool, unmounted()).await.unwrap();
+        // The `.blend` still records the render, but it is too small, so the OBJ stands in.
+        assert_eq!(
+            derived_rows(&pool).await.bundled_previews,
+            [(blend.to_string(), render.to_string())]
+        );
+        assert_eq!(
+            previews(&pool).await.1,
+            pairs(&[(obj, "pending"), (render, "pending")])
+        );
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_pass_reads_a_renders_header_once_and_again_only_once_it_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let (sedan, van) = ("kit/Previews/sedan.png", "kit/Previews/van.png");
+        write_png(&root.path().join(sedan), 64, 64);
+        write_png(&root.path().join(van), 64, 48);
+        let pool = memory_library_pool().await;
+        for path in [
+            "kit/Models/sedan.glb",
+            "kit/Models/van.glb",
+            "kit/Models/tree.glb",
+            sedan,
+            van,
+        ] {
+            insert_path(&pool, path).await;
+        }
+        let first = pass(&pool, root.path()).await.unwrap();
+        // Only the two renders are read, and each records its size and the read. Neither fits.
+        assert_eq!(first.render_reads, 2);
+        assert_eq!(pictured_items(&pool).await, [] as [&str; 0]);
+        assert_eq!(
+            render_read(&pool, sedan).await,
+            [Some(64), Some(64), Some(1), Some(0)]
+        );
+        assert_eq!(
+            render_read(&pool, van).await,
+            [Some(64), Some(48), Some(1), Some(0)]
+        );
+        assert_eq!(
+            pass(&pool, root.path()).await.unwrap(),
+            PassRun {
+                written: 0,
+                render_reads: 0
+            }
+        );
+
+        // The sedan's render grows to fit: once its row shows the change, the pass reads it
+        // alone, and the sedan is pictured.
+        write_png(&root.path().join(sedan), 600, 512);
+        sqlx::query("UPDATE assets SET size_bytes = 2, modified_at = 7 WHERE file_path = ?")
+            .bind(sedan)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let grown = pass(&pool, root.path()).await.unwrap();
+        assert_eq!(grown.render_reads, 1);
+        assert_eq!(
+            render_read(&pool, sedan).await,
+            [Some(600), Some(512), Some(2), Some(7)]
+        );
+        assert_eq!(pictured_items(&pool).await, ["kit/Models/sedan.glb"]);
+        assert_eq!(
+            pass(&pool, root.path()).await.unwrap(),
+            PassRun {
+                written: 0,
+                render_reads: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_render_is_too_small_records_no_read_and_is_read_again() {
+        let root = tempfile::tempdir().unwrap();
+        let (model, render) = ("kit/Models/sedan.glb", "kit/Previews/sedan.png");
+        let pool = memory_library_pool().await;
+        insert_with_preview(&pool, model, "none").await;
+        insert_path(&pool, render).await;
+        // A render the pass read before, whose file has since changed and can't be read
+        cache_render_size(&pool, render, (512, 512)).await;
+        sqlx::query("UPDATE assets SET modified_at = 3 WHERE file_path = ?")
+            .bind(render)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // It counts as too small, so the model is queued, and it records no read.
+        assert_eq!(pass(&pool, root.path()).await.unwrap().render_reads, 1);
+        assert_eq!(render_read(&pool, render).await, [None; 4]);
+        assert_eq!(
+            derived_rows(&pool).await.bundled_previews,
+            [(model.to_string(), render.to_string())]
+        );
+        assert_eq!(previews(&pool).await.1, pairs(&[(model, "pending")]));
+        // The next pass tries it again, and writes nothing while it still can't be read.
+        assert_eq!(
+            pass(&pool, root.path()).await.unwrap(),
+            PassRun {
+                written: 0,
+                render_reads: 1
+            }
+        );
+
+        // Once it can be read and fits, the model shows it and comes off the queue.
+        write_png(&root.path().join(render), 512, 512);
+        assert_eq!(pass(&pool, root.path()).await.unwrap().render_reads, 1);
+        assert_eq!(
+            render_read(&pool, render).await,
+            [Some(512), Some(512), Some(1), Some(3)]
+        );
+        assert_eq!(previews(&pool).await.1, []);
+    }
+
     #[tokio::test]
     async fn the_preview_queue_keeps_to_main_items_and_files_on_their_own() {
         let pool = memory_library_pool().await;
@@ -3677,8 +4197,9 @@ pub(crate) mod tests {
         for path in [blend, obj, render] {
             insert_with_preview(&pool, path, "none").await;
         }
+        cache_render_size(&pool, render, (512, 512)).await;
         rebuild(&pool, unmounted()).await.unwrap();
-        // The `.blend` leads and shows the render, so the OBJ stands in for nothing.
+        // The `.blend` leads and shows the render, which fits, so the OBJ stands in for nothing.
         assert_eq!(
             derived_rows(&pool).await.bundled_previews,
             [(blend.to_string(), render.to_string())]
@@ -3744,9 +4265,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         add_job(&pool, glb, "pending").await;
+        cache_render_size(&pool, render, (1024, 512)).await;
         rebuild(&pool, unmounted()).await.unwrap();
-        // The sedan shows its render, so neither of its files is queued, and the render is, for
-        // its card. The truck has no render, so its GLB is queued and its FBX isn't.
+        // The sedan shows its render, which fits, so neither of its files is queued, and the
+        // render is, for its card. The truck has no render, so its GLB is queued and its FBX isn't.
         assert_eq!(
             previews(&pool).await,
             (

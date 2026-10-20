@@ -423,6 +423,19 @@ struct SqlFilter {
 /// on `assets a`.
 pub(crate) const MAIN_OR_SINGLE: &str = "(a.group_id IS NULL OR a.group_id = a.id)";
 
+/// Whether item `item` (an alias of `assets`) is pictured: its `bundled_preview` names a render
+/// that fits a card, both of its cached sides at least `THUMB_SIZE`. A render of unknown size
+/// doesn't fit. It is `structure::Structure::pictured` in SQL (plan small-bundled-previews C1),
+/// and only a pictured item stays off the preview queue (`preview::claim_jobs`). Its render's
+/// cached size is current: the pass writes it before the `bundled_preview` that names it.
+pub(crate) fn pictured(item: &str) -> String {
+    let side = crate::preview::THUMB_SIZE;
+    format!(
+        "EXISTS (SELECT 1 FROM assets r WHERE r.file_path = {item}.bundled_preview
+             AND r.render_width >= {side} AND r.render_height >= {side})"
+    )
+}
+
 /// The support-file half of the grid's visibility rule: a pack's support files show only with
 /// "Show hidden files".
 const NOT_SUPPORT: &str = "a.support_role IS NULL";
@@ -3416,6 +3429,26 @@ mod tests {
         files
     }
 
+    /// Makes the sedan's render under `root` Kenney's 64 px one, and runs the pass, which reads
+    /// it as too small to picture the sedan.
+    async fn small_sedan_render(root: &Path, pool: &Pool<Sqlite>) {
+        use crate::structure::tests::{render_read, write_png, SEDAN_RENDER};
+        write_png(&root.join(SEDAN_RENDER), 64, 64);
+        crate::structure::rebuild(pool, root).await.unwrap();
+        assert_eq!(
+            render_read(pool, SEDAN_RENDER).await[..2],
+            [Some(64), Some(64)]
+        );
+        let pictured: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM assets a WHERE {}",
+            pictured("a")
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(pictured, 0);
+    }
+
     /// Registers the test library and another one in master, each counting 99 assets.
     async fn register_libraries(db: &Database) {
         sqlx::query(
@@ -3444,6 +3477,8 @@ mod tests {
     async fn renaming_a_group_renames_every_member_and_its_render() {
         let files = sedan_kit();
         let (root, db, pool) = library_in_folders(&files).await;
+        // A render too small to picture the sedan is still its render, and moves with it.
+        small_sedan_render(&root, &pool).await;
 
         let result = rename_asset_with(&db, SEDAN_GLB, "coupe.glb", fs_rename).await;
 
@@ -3471,6 +3506,7 @@ mod tests {
     async fn deleting_a_group_trashes_every_member_and_its_render() {
         let files = sedan_kit();
         let (root, db, pool) = library_in_folders(&files).await;
+        small_sedan_render(&root, &pool).await;
         register_libraries(&db).await;
         let trashed = RefCell::new(Vec::new());
 
@@ -4094,6 +4130,7 @@ mod tests {
             (items.clone(), Some(4), Some(10))
         );
         // "Show hidden files" brings back the license and the sedan's render, but no member.
+        // The render is of unknown size, so too small to picture the sedan, and still hidden.
         let mut with_license = items;
         with_license.insert(0, "kit/License.txt".to_string());
         with_license.insert(2, RENDER.to_string());
@@ -5572,8 +5609,10 @@ mod tests {
 
     /// Kenney's renders on a copy of the golden snapshot's library DB, named by
     /// `OPENDAM_GOLDEN_DB` as above (A4): every render is a hidden bundled preview, each kit
-    /// model's GLB records one, and no model with one waits for a preview job. It writes to the
-    /// copy: it clears the renders for a first pass. Run it with
+    /// model's GLB records one, and every render is 64 px, too small to picture its model, so
+    /// each such model has a thumbnail or waits for a preview job (small-bundled-previews A2,
+    /// A3). It writes to the copy: it clears the renders and their sizes for a first pass. Run
+    /// it with
     /// `cargo nextest run --run-ignored only golden_snapshot_renders --no-capture`.
     #[tokio::test]
     #[ignore = "needs OPENDAM_GOLDEN_DB, a copy of the golden snapshot's library.sqlite"]
@@ -5593,30 +5632,35 @@ mod tests {
             }
         };
 
-        // A first pass deriving every render, then a rerun writing nothing (A1).
+        // A first pass deriving every render and reading its header, then a rerun reading none
+        // and writing nothing (A1, small-bundled-previews A2).
         sqlx::query(
-            "UPDATE assets SET bundled_preview = NULL;
+            "UPDATE assets SET bundled_preview = NULL, render_width = NULL, render_height = NULL,
+                 render_read_bytes = NULL, render_read_mtime = NULL;
              UPDATE assets SET support_role = NULL WHERE support_role = 'model_preview';",
         )
         .execute(&pool)
         .await
         .unwrap();
         let started = Instant::now();
-        let written = crate::structure::rebuild(&pool, &golden_root())
-            .await
-            .unwrap();
+        let first = crate::structure::pass(&pool, &golden_root()).await.unwrap();
         let took = started.elapsed();
-        println!("first render pass: {written} rows written in {took:?}");
+        println!(
+            "first render pass: {} render headers read, {} rows written in {took:?}",
+            first.render_reads, first.written
+        );
+        assert_eq!(first.render_reads, 3741);
         assert!(took < Duration::from_secs(10));
         let started = Instant::now();
         assert_eq!(
-            crate::structure::rebuild(&pool, &golden_root())
-                .await
-                .unwrap(),
-            0
+            crate::structure::pass(&pool, &golden_root()).await.unwrap(),
+            crate::structure::PassRun {
+                written: 0,
+                render_reads: 0
+            }
         );
         let took = started.elapsed();
-        println!("rerun: 0 rows written in {took:?}");
+        println!("rerun: no header read, 0 rows written in {took:?}");
         assert!(took < Duration::from_secs(2));
 
         // Every `Previews/` image is a hidden render that an item records, and only main items
@@ -5669,16 +5713,43 @@ mod tests {
         assert_eq!(unmatched.len(), 4);
         assert!(unmatched.iter().all(|(_, role)| role.is_none()));
 
-        // No model with a render waits for a preview.
+        // Every render is Kenney's 64 px one, so none pictures its model, and each model with one
+        // has a thumbnail or waits for a preview job.
+        let sizes: Vec<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT render_width, render_height, COUNT(*) FROM assets
+             WHERE support_role = 'model_preview' GROUP BY 1, 2",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        println!("render sizes: {sizes:?}");
+        assert_eq!(sizes, [(64, 64, 3741)]);
+        assert_eq!(
+            count(format!(
+                "SELECT COUNT(*) FROM assets a WHERE {}",
+                pictured("a")
+            ))
+            .await,
+            0
+        );
+        let thumbnailed = count(
+            "SELECT COUNT(*) FROM assets a WHERE a.bundled_preview IS NOT NULL
+             AND a.thumbnail_path IS NOT NULL"
+                .into(),
+        )
+        .await;
         let queued = count(format!(
             "SELECT COUNT(*) FROM assets a WHERE a.bundled_preview IS NOT NULL
-             AND (a.preview_status = 'pending' OR EXISTS (SELECT 1 FROM preview_jobs p
-                  WHERE p.asset_id = a.id AND p.status IN {}))",
+             AND a.thumbnail_path IS NULL AND a.preview_status = 'pending'
+             AND EXISTS (SELECT 1 FROM preview_jobs p
+                  WHERE p.asset_id = a.id AND p.status IN {})",
             crate::preview::WAITING_JOBS
         ))
         .await;
-        println!("models with a render waiting for a preview: {queued}");
-        assert_eq!(queued, 0);
+        println!(
+            "models with a render: {items}, {thumbnailed} with a thumbnail, {queued} waiting for one"
+        );
+        assert_eq!(thumbnailed + queued, items);
 
         // In every kit with a `Models/GLB format/` folder, each model item is a GLB, and each one
         // Kenney ships a render of shows it. Some kits also ship older models under other names

@@ -1,4 +1,4 @@
-use crate::commands::asset::MAIN_OR_SINGLE;
+use crate::commands::asset::{pictured, MAIN_OR_SINGLE};
 use crate::db::{make_relative_path, resolve_path, LibraryHandle};
 use crate::AppState;
 use anyhow::{anyhow, Result};
@@ -298,12 +298,18 @@ pub(crate) const NATIVE_EXTS_SQL: &str =
 /// A claimed job: (job_id, asset_id, file_path)
 type Job = (String, String, String);
 
-/// A group member whose main item has no preview of its own, as a `.blend` never does, nor a
-/// bundled one: the structure pass queues one such member as the group's stand-in
-/// (`structure::apply_previews`), and its job is claimed. Every other member's is skipped.
-const STANDS_IN: &str = "EXISTS (SELECT 1 FROM assets g
-    WHERE g.id = a.group_id AND g.preview_status = 'none' AND g.thumbnail_path IS NULL
-      AND g.bundled_preview IS NULL)";
+/// A group member whose main item has no preview of its own, as a `.blend` never does, and is
+/// not pictured by a render that fits (`commands::asset::pictured`): the structure pass queues
+/// one such member as the group's stand-in (`structure::apply_previews`), and its job is
+/// claimed. Every other member's is skipped.
+fn stands_in() -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM assets g
+             WHERE g.id = a.group_id AND g.preview_status = 'none' AND g.thumbnail_path IS NULL
+               AND NOT {})",
+        pictured("g")
+    )
+}
 
 /// The job states a worker can still claim a job from.
 pub(crate) const WAITING_JOBS: &str = "('pending', 'queued', 'fallback')";
@@ -367,12 +373,15 @@ pub(crate) async fn enqueue(
 /// Fetches up to `limit` jobs matching `filter` and marks them as 'processing'.
 async fn claim_jobs(pool: &Pool<Sqlite>, filter: &str, limit: usize) -> Vec<Job> {
     let jobs: Vec<Job> = sqlx::query_as(&format!(
-        // A group member other than its main item never shows in the grid, and an item with a
-        // bundled preview shows that, so neither gets a preview (plan C15). The structure pass
-        // drops their waiting jobs; this skips any queued since.
+        // A group member other than its main item never shows in the grid, and an item whose
+        // bundled preview fits a card shows that, so neither gets a preview (plan C15, narrowed
+        // by small-bundled-previews C4). The structure pass drops their waiting jobs; this skips
+        // any queued since.
         "SELECT p.id, p.asset_id, a.file_path FROM preview_jobs p JOIN assets a ON p.asset_id = a.id
          WHERE ({filter})
-           AND (({MAIN_OR_SINGLE} AND a.bundled_preview IS NULL) OR {STANDS_IN}) LIMIT {limit}"
+           AND (({MAIN_OR_SINGLE} AND NOT {}) OR {}) LIMIT {limit}",
+        pictured("a"),
+        stands_in()
     ))
     .fetch_all(pool)
     .await
@@ -1058,17 +1067,16 @@ mod tests {
         assert_eq!(claimed, ["glb", "obj"]);
     }
 
-    #[tokio::test]
-    async fn claiming_skips_a_job_for_an_item_with_a_bundled_preview() {
+    /// An item's id, extension, group and its render's size when it records one.
+    type RenderedItem<'a> = (&'a str, &'a str, Option<&'a str>, Option<(u32, u32)>);
+
+    /// The pending jobs `claim_jobs` claims from a library holding `items`, each an id, its
+    /// extension, its group, and its render's size when it records one, at `Previews/<id>.png`.
+    /// Every item but a group's main item has a job.
+    async fn claimed_with_renders(items: &[RenderedItem<'_>]) -> Vec<String> {
         let pool = crate::db::memory_library_pool().await;
-        // `rock` shows its render, and `blend` leads a group whose OBJ would stand in, but the
-        // group has a render too. Only `tree` has no picture.
-        for (id, ext, group, render) in [
-            ("rock", "glb", None, Some("Previews/rock.png")),
-            ("blend", "blend", Some("blend"), Some("Previews/ship.png")),
-            ("obj", "obj", Some("blend"), None),
-            ("tree", "glb", None, None),
-        ] {
+        for &(id, ext, group, render) in items {
+            let render_path = format!("Previews/{id}.png");
             sqlx::query(
                 "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, group_id, bundled_preview, preview_status)
                  VALUES (?, ?, ?, ?, '3d_model', 1, 0, 0, ?, ?, 'none')",
@@ -1078,25 +1086,70 @@ mod tests {
             .bind(format!("a.{ext}"))
             .bind(ext)
             .bind(group)
-            .bind(render)
+            .bind(render.map(|_| &render_path))
             .execute(&pool)
             .await
             .unwrap();
-        }
-        for id in ["rock", "obj", "tree"] {
-            sqlx::query("INSERT INTO preview_jobs (id, asset_id, status, created_at) VALUES (?, ?, 'pending', 0)")
-                .bind(format!("job-{id}"))
-                .bind(id)
+            if let Some((width, height)) = render {
+                sqlx::query(
+                    "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, support_role, preview_status, render_width, render_height, render_read_bytes, render_read_mtime)
+                     VALUES (?, ?, ?, 'png', 'texture', 1, 0, 0, 'model_preview', 'done', ?, ?, 1, 0)",
+                )
+                .bind(&render_path)
+                .bind(&render_path)
+                .bind(format!("{id}.png"))
+                .bind(width)
+                .bind(height)
                 .execute(&pool)
                 .await
                 .unwrap();
+            }
+            if group.is_none_or(|g| g != id) {
+                sqlx::query("INSERT INTO preview_jobs (id, asset_id, status, created_at) VALUES (?, ?, 'pending', 0)")
+                    .bind(format!("job-{id}"))
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
         }
-        let claimed: Vec<String> = claim_jobs(&pool, "p.status = 'pending'", 10)
+        let mut claimed: Vec<String> = claim_jobs(&pool, "p.status = 'pending'", 10)
             .await
             .into_iter()
             .map(|(_, asset, _)| asset)
             .collect();
+        claimed.sort();
+        claimed
+    }
+
+    #[tokio::test]
+    async fn claiming_skips_a_job_for_an_item_with_a_bundled_preview() {
+        // `rock` shows its render, which fits, and `blend` leads a group whose OBJ would stand
+        // in, but the group has a render that fits too. Only `tree` has no picture.
+        let claimed = claimed_with_renders(&[
+            ("rock", "glb", None, Some((512, 512))),
+            ("blend", "blend", Some("blend"), Some((1024, 768))),
+            ("obj", "obj", Some("blend"), None),
+            ("tree", "glb", None, None),
+        ])
+        .await;
         assert_eq!(claimed, ["tree"]);
+    }
+
+    #[tokio::test]
+    async fn claiming_takes_a_job_for_an_item_whose_render_is_too_small() {
+        // `car`'s render is Kenney's 64 px one and `van`'s is under 512 px tall, so both are
+        // rendered. So is `obj`, the stand-in of a `.blend` group whose render is too small.
+        // `bus`'s render fits, so its job is skipped.
+        let claimed = claimed_with_renders(&[
+            ("car", "glb", None, Some((64, 64))),
+            ("van", "glb", None, Some((1024, 300))),
+            ("bus", "glb", None, Some((600, 512))),
+            ("blend", "blend", Some("blend"), Some((64, 64))),
+            ("obj", "obj", Some("blend"), None),
+        ])
+        .await;
+        assert_eq!(claimed, ["car", "obj", "van"]);
     }
 
     #[tokio::test]

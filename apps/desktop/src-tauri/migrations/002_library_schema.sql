@@ -41,7 +41,11 @@ CREATE TABLE IF NOT EXISTS assets (
     metadata         TEXT NOT NULL DEFAULT '{}', -- JSON object
     support_role     TEXT,                -- 'doc' or 'cover' or 'model_preview' for a support file (structure.rs)
     group_id         TEXT,                -- its format group's main item (itself included) (structure.rs)
-    bundled_preview  TEXT                 -- the render a main item shows (relative to library root) (structure.rs)
+    bundled_preview  TEXT,                -- the render a main item shows (relative to library root) (structure.rs)
+    render_width     INTEGER,             -- a render's size from its header, NULL until read (structure.rs)
+    render_height    INTEGER,
+    render_read_bytes INTEGER,            -- the size_bytes and modified_at the header was read at
+    render_read_mtime INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_assets_kind         ON assets(kind);
