@@ -1576,9 +1576,7 @@ export const UI_CHECKS: UiCheck[] = [
       await pause('U12-group-files');
 
       // What the grid holds while moving between members: its selection and cached pages, and
-      // the search they came from. The app polls the library DB's mtime every 30 s (lib.rs) and
-      // sends `library:updated` after any write, its own included, which refreshes the grid: a
-      // new search then follows from that event, not from the detail panel.
+      // the search generation they came from
       const grid = () => {
         const ui = useUIStore.getState();
         const st = useAssetStore.getState();
@@ -1588,10 +1586,34 @@ export const UI_CHECKS: UiCheck[] = [
             focused: ui.focusedAssetId,
             pages: [...st.pages].map(([page, assets]) => [page, assets.map((a) => a.id)]),
           }),
-          search: `generation ${st.generation}, epoch ${st.epoch}`,
+          generation: st.generation,
         };
       };
+      // The app polls the library DB's mtime every 30 s (lib.rs) and sends `library:updated`
+      // after any write, its own included, and App refreshes the grid on it. So the store's
+      // searches and refreshes are counted: moving between members may start no search, and
+      // the grid may refresh only once per `library:updated`. A refresh that finds a load in
+      // flight hands it to `search` at once, which isn't a search of its own.
+      const { search: realSearch, refresh: realRefresh } = useAssetStore.getState();
       let updates = 0;
+      let searches = 0;
+      let refreshes = 0;
+      let handingOver = false;
+      useAssetStore.setState({
+        search: () => {
+          if (!handingOver) searches += 1;
+          return realSearch();
+        },
+        refresh: () => {
+          refreshes += 1;
+          handingOver = true;
+          try {
+            return realRefresh();
+          } finally {
+            handingOver = false;
+          }
+        },
+      });
       const unlisten = await listen('library:updated', () => void (updates += 1));
       const before = grid();
 
@@ -1669,13 +1691,20 @@ export const UI_CHECKS: UiCheck[] = [
           );
           const now = grid();
           assert(now.held === before.held, `the grid changed: ${before.held} became ${now.held}`);
+          assert(searches === 0, `moving between members started ${searches} searches`);
           assert(
-            now.search === before.search || updates > 0,
-            `the grid searched again, from ${before.search} to ${now.search}`
+            refreshes <= updates,
+            `the grid refreshed ${refreshes} times on ${updates} library:updated events`
+          );
+          assert(
+            now.generation - before.generation <= refreshes,
+            `the search generation went from ${before.generation} to ${now.generation} ` +
+              `with ${refreshes} refreshes`
           );
         }
       } finally {
         unlisten();
+        useAssetStore.setState({ search: realSearch, refresh: realRefresh });
         api.openWithDefault = realOpen;
         api.revealInFileManager = realReveal;
         clipboard.writeText = realWrite;
