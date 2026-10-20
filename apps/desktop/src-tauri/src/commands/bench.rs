@@ -43,6 +43,30 @@ pub async fn register_bench_library(db: &Database, root: Option<String>) {
     }
 }
 
+/// Clears the thumbnails of asset `id`'s format group in the bench library, its members' too,
+/// and marks them unrendered, as a library first indexed after its renders were tied has them.
+/// The files stay on disk. U11 uses it to show a model with a small render and no thumbnail.
+#[tauri::command]
+pub async fn bench_clear_thumbnails(
+    id: String,
+    state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
+) -> Result<u64> {
+    let lib = state
+        .db
+        .get_library_handle("bench")
+        .await
+        .ok_or("no bench library")?;
+    let done = sqlx::query(
+        "UPDATE assets SET thumbnail_path = NULL, preview_status = 'none'
+         WHERE id = ?1 OR group_id = (SELECT group_id FROM assets WHERE id = ?1)",
+    )
+    .bind(&id)
+    .execute(&lib.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(done.rows_affected())
+}
+
 /// Resident memory, in bytes, of the WebKit web processes this app started. Async, so the
 /// `/proc` scan runs off the main thread while the harness times frames.
 #[tauri::command]

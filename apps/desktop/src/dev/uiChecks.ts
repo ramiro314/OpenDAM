@@ -3,7 +3,7 @@
 // docs/plans/smarter-big-collections/plan.md). Each ticket that delivers a behavior adds its
 // check here.
 
-import { convertFileSrc } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { api } from '../api';
 import {
@@ -1410,6 +1410,62 @@ export const UI_CHECKS: UiCheck[] = [
         sedanNow.fallbackRender?.endsWith('/Previews/sedan.png'),
         `sedan.glb's fallback render is ${sedanNow.fallbackRender}`
       );
+
+      // A model with a small render and no thumbnail shows that render in its card and its list
+      // row until its preview is rendered (small-bundled-previews A3). The bench clears the first
+      // model card's group's thumbnails, as a library first indexed after its renders were tied
+      // has none, then queues its preview: the worker leaves a .glb, which tiles skip, and the
+      // model thumbnailer renders the 512 px PNG.
+      const pending = modelCards()[0].asset;
+      const render = pending.fallbackRender;
+      assert(render, `${pending.fileName} has no fallback render`);
+      await invoke('bench_clear_thumbnails', { id: pending.id });
+      await useAssetStore.getState().refreshAssets([pending.id]);
+      const cached = () => cachedAssets(useAssetStore.getState()).find((a) => a.id === pending.id);
+      assert(!cached()?.thumbnailPath, `${pending.fileName} kept ${cached()?.thumbnailPath}`);
+      /** Waits until tile `id` has loaded `path`, and returns its image. */
+      const loads = async (id: string, path: string, what: string, timeoutMs = 10_000) => {
+        const tile = () => document.getElementById(id);
+        const img = () => tile()?.querySelector('img');
+        await waitFor(
+          () =>
+            img()?.getAttribute('src') === convertFileSrc(path) &&
+            img()!.complete &&
+            img()!.naturalWidth > 0 &&
+            tile()!.dataset.tileState === 'ready',
+          timeoutMs,
+          `${what} to show ${path}, not ${img()?.getAttribute('src')}`
+        );
+        return img()!;
+      };
+      let tileImg = await loads(`asset-${pending.id}`, render!, `${pending.fileName}'s card`);
+      assert(
+        Math.min(tileImg.naturalWidth, tileImg.naturalHeight) < 512,
+        `${pending.fileName}'s small render is ${tileImg.naturalWidth}x${tileImg.naturalHeight}`
+      );
+      await pause('U11-fallback-card');
+      useUIStore.getState().setViewMode('list');
+      await loads(`asset-row-${pending.id}`, render!, `${pending.fileName}'s list row`);
+      await pause('U11-fallback-row');
+      useUIStore.getState().setViewMode('grid');
+      await loads(`asset-${pending.id}`, render!, `${pending.fileName}'s card, back in the grid`);
+
+      await api.requestPreview([pending.id]);
+      await waitFor(
+        () => cached()?.thumbnailPath?.endsWith('.png') ?? false,
+        300_000,
+        `${pending.fileName}'s preview to be rendered`
+      );
+      tileImg = await loads(
+        `asset-${pending.id}`,
+        cached()!.thumbnailPath!,
+        `${pending.fileName}'s rendered card`
+      );
+      assert(
+        Math.min(tileImg.naturalWidth, tileImg.naturalHeight) >= 512,
+        `${pending.fileName}'s new thumbnail is ${tileImg.naturalWidth}x${tileImg.naturalHeight}`
+      );
+      await pause('U11-fallback-rendered');
 
       // A list row shows the same badge, solid and whole, in its extension column
       useUIStore.getState().setViewMode('list');
