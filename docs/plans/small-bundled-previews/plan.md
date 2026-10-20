@@ -1,7 +1,12 @@
 # Small bundled previews: render the model when its render is too small
 
-Status: draft for review, 2026-10-19. Shaped in a three-round interview (D1-D12 below). Once this
-plan merges, Mission Control slices it into tickets.
+Status: approved 2026-10-19. Shaped in a three-round interview (D1-D12 below) and approved at
+final review. Once this plan merges, Mission Control slices it into tickets.
+
+Revised 2026-10-19 after GitHub Inspector's review of PR #135. No decision changed:
+
+- **The invariants live in `AGENTS.md`.** D12 and step 7 now name `AGENTS.md`, the file that holds
+  them. The root `CLAUDE.md` is a symlink to it.
 
 ## Problem
 
@@ -36,7 +41,7 @@ renders are tiny:
 | D9 | Unreadable header | It counts as too small and records no read, so the next pass tries again, as with an unreadable license file. |
 | D10 | Verification | Reproduce first. Flip U11 so that a Kenney model card must show its own 512 px thumbnail, run it on the unfixed code, and record it failing on the 64 px render. Then fix and show it passing. Add unit tests for the new card order, Rust unit tests, one `checks` run, and one timing run compared with the gpu-shm baseline. The golden snapshot is not re-warmed or replaced. Timing drift is reported, not re-baselined. |
 | D11 | TS test runner | `bun:test`, in the existing `components/AssetGrid/tileState.test.ts`. The verify answer said `node:test`, but every TypeScript test here uses `bun:test` and CI runs only `bun test`. |
-| D12 | Recording the change to C12/C15 | In this plan, plus the "Bundled previews" invariant in `CLAUDE.md`. `smarter-big-collections/plan.md` stays as history, unedited. |
+| D12 | Recording the change to C12/C15 | In this plan, plus the "Bundled previews" invariant in `AGENTS.md` (which `CLAUDE.md` links to). `smarter-big-collections/plan.md` stays as history, unedited. |
 
 ## Supersedes
 
@@ -159,7 +164,7 @@ the queue, and the card always showed the render first.
    `AssetListRow` effect dependencies, `itemFileCount` in `format.ts`, and `updateAssetPreview`
    in `store/index.ts` (C6).
 7. **Tests** (below), then **docs**:
-   - the `CLAUDE.md` "Bundled previews" and "Structure is derived" invariants (the fit rule, the
+   - the `AGENTS.md` "Bundled previews" and "Structure is derived" invariants (the fit rule, the
      fallback and the new pass-written columns);
    - U11's text in `docs/agents/running-the-app.md`.
 
