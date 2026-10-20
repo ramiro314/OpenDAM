@@ -2054,7 +2054,7 @@ export const UI_CHECKS: UiCheck[] = [
       // The first structure pass reads the kit's license once, then keeps what it said
       const deadline = performance.now() + STRUCTURE_TIMEOUT_MS;
       let detail = await api.getPackDetail(BENCH_LIBRARY, kitPath);
-      while (!detail?.header) {
+      while (!detail?.version) {
         assert(performance.now() < deadline, `${kitPath}'s license was never read`);
         await sleep(1_000);
         detail = await api.getPackDetail(BENCH_LIBRARY, kitPath);

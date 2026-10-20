@@ -133,9 +133,14 @@ docs/plans                    Plans for this fork
     folder going away and coming back. The pass reads them (`structure::read_overrides`) and
     never writes or deletes them. `set_pack_override` writes one, then calls
     `structure::rebuild_library` before it emits `library:updated`, like the commands above.
-    Your edits win: a pack's name is yours, else the `datapackage.json` `title`, else the license
-    header's, else the folder's, and its cover is yours, else the file's `image`, else its first
-    `Preview*` image.
+    Each field falls back on its own, and your edits win: a pack's name is yours, else the
+    `datapackage.json` `title`, else the license header's, else the folder's; its cover is yours,
+    else the file's `image`, else its first `Preview*` image; its license is yours, else the
+    file's, else the license file's; and its source URL is yours, else the file's. Version and
+    authors come from the file, else the license header, and the publisher only from the file
+    (`pack_holding`). "Open license" opens the file's license `path` only when it is an indexed
+    `txt`, `md` or `pdf` file in the pack (`PackageFile::license_document`), else the pack's
+    license file; a license URL opens with "Open", and no URL is fetched until you click.
 - **One grid item per group.** A format group (one model in several formats, or a file's copies
   under format folders, plan C11) holds its main item's id in `group_id` on every member, the
   main item included; a file on its own has `NULL`. The main item is chosen GLB > glTF > FBX >

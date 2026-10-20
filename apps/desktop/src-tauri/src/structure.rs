@@ -41,8 +41,9 @@ const LICENSE_PARSER: u32 = 1;
 /// The name of a pack's Frictionless Data Package file, ignoring ASCII case: the only JSON file
 /// the watcher indexes (plan pack-metadata-files C1).
 const PACKAGE_FILE: &str = "datapackage.json";
-/// The version of `parse_package`, stored with each read as `LICENSE_PARSER` is.
-const PACKAGE_PARSER: u32 = 1;
+/// The version of `parse_package`, stored with each read as `LICENSE_PARSER` is. Version 2 reads
+/// the version, contributors, sources and license too.
+const PACKAGE_PARSER: u32 = 2;
 /// The largest `datapackage.json` the pass reads (plan pack-metadata-files D12).
 const PACKAGE_BYTES: u64 = 1 << 20;
 /// The formats a group picks its main item by (plan D12), best first. Every other format ranks
@@ -142,6 +143,11 @@ pub struct PackageFile {
     /// What the pass read from the file (`parse_package`), empty for a file it ignored
     #[serde(flatten)]
     pub meta: PackageMeta,
+    /// The license's file `path` when it is an indexed doc (`txt`, `md` or `pdf`) in the pack,
+    /// the only file "Open license" opens from the file (plan pack-metadata-files C8). `derive`
+    /// sets it on every pass, so the read cached in `meta` keeps the path as the file wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license_document: Option<String>,
     /// The `PACKAGE_PARSER` that read it, and the file's size and mtime then, as
     /// `LicenseFile` records them
     #[serde(default)]
@@ -161,6 +167,41 @@ pub struct PackageMeta {
     /// The `image`, relative to the library root and inside the file's folder
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The first contributor with the `publisher` role
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    /// Every contributor with the `author` role, in order
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authors: Vec<String>,
+    /// The first http(s) `sources[].path`, else an http(s) `homepage`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    /// The first `licenses` entry with a `name` or a usable `path`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<PackageLicense>,
+}
+
+/// A `datapackage.json` license entry (plan pack-metadata-files C7, C8).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageLicense {
+    /// The kind its `name` names (`spdx_kind`)
+    #[serde(default)]
+    pub kind: LicenseKind,
+    /// Its `name`, as written: an SPDX id such as `CC0-1.0`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Its `path` when it is a safe relative path, relative to the library root and inside the
+    /// file's folder. `derive` checks that it names an indexed doc (`license_document`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    /// Its `path` when it is an http(s) URL, which only a click on Open opens
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// What a license file says (`parse_license`).
@@ -432,7 +473,8 @@ impl FileKind {
 ///    which is the image you chose when it is still in the pack, else the file's `image` on the
 ///    same terms, its gallery and license file, which `read_license` reads, its name, which is
 ///    yours, else the file's `title`, else the license's header name, else the folder's, and the
-///    files below it by kind with their total size.
+///    files below it by kind with their total size. The file's license `path` is kept as its
+///    `license_document` only when it names an indexed `txt`, `md` or `pdf` file in the pack.
 ///
 /// Each file comes with its size in bytes. An override of a folder that holds no file does
 /// nothing until files come back to it.
@@ -575,6 +617,7 @@ pub fn derive<'a>(
             let file = PackageFile {
                 meta: read_package(path),
                 path: path.to_string(),
+                license_document: None,
                 parser: 0,
                 size_bytes: 0,
                 modified_at: 0,
@@ -582,11 +625,14 @@ pub fn derive<'a>(
             Some((*pack, file))
         })
         .collect();
-    // The covers you chose and the images the packages name that are indexed
+    // The covers you chose, and the images and license files the packages name, that are indexed
     let chosen: HashSet<&str> = overrides
         .values()
         .filter_map(|o| o.cover_path.as_deref())
-        .chain(packages.values().filter_map(|p| p.meta.image.as_deref()))
+        .chain(packages.values().flat_map(|p| {
+            let license = p.meta.license.as_ref().and_then(|l| l.file_path.as_deref());
+            p.meta.image.as_deref().into_iter().chain(license)
+        }))
         .collect();
     let indexed: HashSet<&str> = paths
         .iter()
@@ -596,7 +642,17 @@ pub fn derive<'a>(
     for pack in packs {
         let folder = folders.get_mut(pack).expect("a pack has a row");
         let files = info.remove(pack).unwrap_or_default();
-        let package = packages.remove(pack);
+        let mut package = packages.remove(pack);
+        if let Some(file) = package.as_mut() {
+            let license = file
+                .meta
+                .license
+                .as_ref()
+                .and_then(|l| l.file_path.as_deref());
+            file.license_document = license
+                .filter(|p| indexed.contains(p) && is_document(p))
+                .map(str::to_string);
+        }
         let edit = overrides.get(pack);
         let usable = |c: &&str| indexed.contains(c) && cover_allowed(pack, c);
         let cover = edit
@@ -637,6 +693,12 @@ pub fn derive<'a>(
         bundled_previews,
         render_sizes,
     }
+}
+
+/// Whether the file at `path` is a doc by its extension (`txt`, `md` or `pdf`, ignoring case), the
+/// only kind of file "Open license" opens (plan pack-metadata-files C8).
+fn is_document(path: &str) -> bool {
+    DOC_EXTENSIONS.contains(&FileKind::of(split_dir(path).1).ext.as_str())
 }
 
 /// Whether the file at `path` can be the cover of the pack at `pack` (`""` for the root), the
@@ -823,23 +885,136 @@ pub fn parse_license(text: &str) -> LicenseText {
 /// What the `datapackage.json` at `path` says, from its `bytes`, or why the pass ignores it: not
 /// UTF-8, not JSON, or not a JSON object (plan pack-metadata-files C5, C6). A leading byte order
 /// mark is skipped. Each field is taken on its own, trimmed, and one that is empty or of the
-/// wrong type is left out. The `image` is joined to the file's folder, and left out unless it is
-/// a safe relative path (`package_path`).
+/// wrong type is left out:
+///
+/// - `title`, `version` and `image`, which is joined to the file's folder, and left out unless it
+///   is a safe relative path (`package_path`);
+/// - the publisher, the first contributor with the `publisher` role, and the authors, every one
+///   with the `author` role (`contributor`);
+/// - the source URL, the first http(s) `sources[].path`, else an http(s) `homepage`;
+/// - the license, the first `licenses` entry with a `name`, or a `path` that is an http(s) URL or
+///   a safe relative path (`package_license`).
 pub fn parse_package(path: &str, bytes: &[u8]) -> Result<PackageMeta, String> {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     let text = std::str::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
     let object = value.as_object().ok_or("not a JSON object")?;
-    let string = |key: &str| {
-        let text = object.get(key)?.as_str()?.trim();
-        (!text.is_empty()).then(|| text.to_string())
+    let string = |key: &str| json_string(object, key);
+    let array = |key: &str| {
+        object
+            .get(key)
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
     };
     let (dir, _) = split_dir(path);
+    let contributors: Vec<(String, Vec<String>)> =
+        array("contributors").filter_map(contributor).collect();
+    let with_role = |role: &'static str| {
+        contributors
+            .iter()
+            .filter(move |(_, roles)| roles.iter().any(|r| r.eq_ignore_ascii_case(role)))
+            .map(|(name, _)| name.clone())
+    };
+    let web = |url: Option<String>| url.filter(|u| crate::commands::folder::is_web_url(u));
     Ok(PackageMeta {
         title: string("title"),
         image: string("image").and_then(|image| package_path(dir, &image)),
+        version: string("version"),
+        publisher: with_role("publisher").next(),
+        authors: with_role("author").collect(),
+        source_url: array("sources")
+            .find_map(|source| web(json_string(source.as_object()?, "path")))
+            .or_else(|| web(string("homepage"))),
+        license: array("licenses").find_map(|entry| package_license(dir, entry)),
     })
+}
+
+/// The string at `key` in `object`, trimmed, or `None` when it is empty or not a string.
+fn json_string(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    let text = object.get(key)?.as_str()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// A `datapackage.json` contributor's name and roles, or `None` when it isn't an object or has no
+/// name. Its name is its `title`, else its `givenName` and `familyName` joined by a space. Its
+/// roles are its `roles` when that is an array of strings, else its v1 `role` when that is a
+/// string.
+fn contributor(value: &serde_json::Value) -> Option<(String, Vec<String>)> {
+    let object = value.as_object()?;
+    let name = json_string(object, "title").or_else(|| {
+        let parts: Vec<String> = ["givenName", "familyName"]
+            .iter()
+            .filter_map(|key| json_string(object, key))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
+    })?;
+    let roles = object
+        .get("roles")
+        .and_then(|roles| roles.as_array())
+        .and_then(|roles| {
+            let roles = roles.iter().map(|r| Some(r.as_str()?.trim().to_string()));
+            roles.collect::<Option<Vec<_>>>()
+        })
+        .or_else(|| Some(vec![json_string(object, "role")?]))
+        .unwrap_or_default();
+    Some((name, roles))
+}
+
+/// A `datapackage.json` license entry, or `None` when it isn't an object or has neither a `name`
+/// nor a usable `path`: an http(s) URL, kept as `url`, or a safe relative path (`package_path`),
+/// joined to `dir` as `file_path`. Its kind is the one its `name` names (`spdx_kind`).
+fn package_license(dir: &str, value: &serde_json::Value) -> Option<PackageLicense> {
+    let object = value.as_object()?;
+    let id = json_string(object, "name");
+    let path = json_string(object, "path");
+    let (url, file_path) = match path {
+        Some(url) if crate::commands::folder::is_web_url(&url) => (Some(url), None),
+        Some(path) => (None, package_path(dir, &path)),
+        None => (None, None),
+    };
+    if id.is_none() && url.is_none() && file_path.is_none() {
+        return None;
+    }
+    Some(PackageLicense {
+        kind: id.as_deref().map_or(LicenseKind::Unknown, spdx_kind),
+        id,
+        title: json_string(object, "title"),
+        file_path,
+        url,
+    })
+}
+
+/// The license an SPDX id names, matched as a whole id, ignoring ASCII case (plan
+/// pack-metadata-files C7): `CC0-1.0`, `CC-BY-` or `CC-BY-SA-` and a version, with any port
+/// suffix (`CC-BY-3.0-US`), `MIT`, `Apache-2.0`, and `OFL-1.0` or `OFL-1.1`, each with an
+/// optional `-RFN` or `-no-RFN`. Anything else is `Unknown`: `CC-BY-NC-4.0`, `MIT-0`, an
+/// expression such as `MIT OR Apache-2.0`, or a `LicenseRef-*`.
+pub fn spdx_kind(id: &str) -> LicenseKind {
+    let id = id.trim().to_ascii_lowercase();
+    let versioned = |prefix: &str| {
+        id.strip_prefix(prefix).is_some_and(|version| {
+            version.starts_with(|c: char| c.is_ascii_digit())
+                && version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        })
+    };
+    let ofl = ["ofl-1.0", "ofl-1.1"].iter().any(|v| {
+        ["", "-rfn", "-no-rfn"]
+            .iter()
+            .any(|s| id == format!("{v}{s}"))
+    });
+    match id.as_str() {
+        "cc0-1.0" => LicenseKind::Cc0,
+        "mit" => LicenseKind::Mit,
+        "apache-2.0" => LicenseKind::Apache2,
+        _ if ofl => LicenseKind::Ofl,
+        _ if versioned("cc-by-sa-") => LicenseKind::CcBySa,
+        _ if versioned("cc-by-") => LicenseKind::CcBy,
+        _ => LicenseKind::Unknown,
+    }
 }
 
 /// `relative`, a path in a `datapackage.json` in folder `dir`, as a path relative to the library
@@ -4782,6 +4957,7 @@ pub(crate) mod tests {
         PackageMeta {
             title: title.map(str::to_string),
             image: image.map(str::to_string),
+            ..PackageMeta::default()
         }
     }
 
@@ -4891,6 +5067,322 @@ pub(crate) mod tests {
         }
     }
 
+    /// What `datapackage.json` in folder `kit` says, from `json`.
+    fn parsed(json: serde_json::Value) -> PackageMeta {
+        parse_package("kit/datapackage.json", json.to_string().as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn the_unity_example_gives_its_title_publisher_and_eula_and_nothing_else() {
+        let file = br#"{
+          "$schema": "https://datapackage.org/profiles/2.0/datapackage.json",
+          "name": "polygon-city-pack-art-by-synty",
+          "title": "POLYGON - City Pack - Art by Synty",
+          "contributors": [
+            { "title": "Synty Studios", "roles": ["publisher"] }
+          ],
+          "licenses": [
+            {
+              "name": "LicenseRef-Unity-Asset-Store-EULA",
+              "title": "Standard Unity Asset Store EULA",
+              "path": "https://unity.com/legal/as-terms"
+            }
+          ],
+          "resources": [
+            { "name": "characters.fbx", "path": "Assets/Synty/PolygonCity/Models/Characters.fbx" }
+          ]
+        }"#;
+        assert_eq!(
+            parse_package("Unity/POLYGON City Pack/datapackage.json", file),
+            Ok(PackageMeta {
+                title: Some("POLYGON - City Pack - Art by Synty".into()),
+                publisher: Some("Synty Studios".into()),
+                license: Some(PackageLicense {
+                    kind: LicenseKind::Unknown,
+                    id: Some("LicenseRef-Unity-Asset-Store-EULA".into()),
+                    title: Some("Standard Unity Asset Store EULA".into()),
+                    file_path: None,
+                    url: Some("https://unity.com/legal/as-terms".into()),
+                }),
+                ..PackageMeta::default()
+            })
+        );
+    }
+
+    #[test]
+    fn a_full_package_gives_every_field_and_a_partial_one_only_its_own() {
+        let full = parsed(serde_json::json!({
+            "title": "Kit",
+            "version": " 1.2.0 ",
+            "image": "cover.png",
+            "homepage": "https://example.com/home",
+            "contributors": [
+                { "title": "Ann", "roles": ["author"] },
+                { "title": "Studio", "roles": ["publisher"] },
+                { "title": "Bob", "roles": ["author", "maintainer"] },
+                { "title": "Other Studio", "roles": ["publisher"] },
+            ],
+            "sources": [
+                { "title": "Mail", "path": "mailto:a@example.com" },
+                { "title": "Store", "path": "https://store.example.com/kit" },
+                { "path": "https://second.example.com" },
+            ],
+            "licenses": [{ "name": "CC-BY-4.0", "path": "Docs/LICENSE.txt" }],
+        }));
+        assert_eq!(
+            full,
+            PackageMeta {
+                title: Some("Kit".into()),
+                image: Some("kit/cover.png".into()),
+                version: Some("1.2.0".into()),
+                publisher: Some("Studio".into()),
+                authors: vec!["Ann".into(), "Bob".into()],
+                source_url: Some("https://store.example.com/kit".into()),
+                license: Some(PackageLicense {
+                    kind: LicenseKind::CcBy,
+                    id: Some("CC-BY-4.0".into()),
+                    title: None,
+                    file_path: Some("kit/Docs/LICENSE.txt".into()),
+                    url: None,
+                }),
+            }
+        );
+        // The homepage counts only without an http(s) source, and must be http(s) itself.
+        let source = |json| parsed(json).source_url;
+        assert_eq!(
+            source(serde_json::json!({ "homepage": "http://example.com" })),
+            Some("http://example.com".into())
+        );
+        assert_eq!(
+            source(serde_json::json!({
+                "sources": [{ "path": "ftp://example.com/kit" }, "https://not-an-object"],
+                "homepage": "https://example.com"
+            })),
+            Some("https://example.com".into())
+        );
+        assert_eq!(
+            source(serde_json::json!({ "homepage": "javascript:alert(1)" })),
+            None
+        );
+        // A file with only a title leaves every other field empty.
+        assert_eq!(
+            parsed(serde_json::json!({ "title": "Kit" })),
+            meta(Some("Kit"), None)
+        );
+    }
+
+    #[test]
+    fn contributors_count_by_their_publisher_and_author_roles_ignoring_case() {
+        let people = |contributors: serde_json::Value| {
+            let meta = parsed(serde_json::json!({ "contributors": contributors }));
+            (meta.publisher, meta.authors)
+        };
+        let named = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            people(serde_json::json!([
+                // `roles` beats `role`
+                { "title": "A", "roles": ["Author"], "role": "publisher" },
+                // The v1 `role` alone
+                { "title": "P", "role": "PUBLISHER" },
+                // Both roles count as both
+                { "title": "Both", "roles": ["publisher", "author"] },
+                // Other roles, no role and an empty `roles` are ignored.
+                { "title": "C", "roles": ["creator"] },
+                { "title": "M", "role": "maintainer" },
+                { "title": "N" },
+                { "title": "E", "roles": [], "role": "author" },
+                // A name from `givenName` and `familyName`, or either alone
+                { "givenName": "Ada", "familyName": "Lovelace", "roles": ["author"] },
+                { "familyName": "Hopper", "roles": ["author"] },
+                // No name, or not an object: skipped
+                { "roles": ["author"] },
+                { "title": " ", "roles": ["author"] },
+                "Someone",
+            ])),
+            (
+                Some("P".into()),
+                named(&["A", "Both", "Ada Lovelace", "Hopper"])
+            )
+        );
+    }
+
+    #[test]
+    fn a_wrong_typed_field_drops_only_itself() {
+        let base = serde_json::json!({
+            "title": "Kit",
+            "version": "1.0",
+            "contributors": [{ "title": "Studio", "roles": ["publisher"] }],
+            "licenses": [{ "name": "MIT" }],
+        });
+        let with = |key: &str, value: serde_json::Value| {
+            let mut json = base.clone();
+            json[key] = value;
+            parsed(json)
+        };
+        let whole = parsed(base.clone());
+        assert_eq!(
+            with("version", serde_json::json!(3)),
+            PackageMeta {
+                version: None,
+                ..whole.clone()
+            }
+        );
+        assert_eq!(
+            with("contributors", serde_json::json!({})),
+            PackageMeta {
+                publisher: None,
+                ..whole.clone()
+            }
+        );
+        assert_eq!(
+            with("licenses", serde_json::json!("MIT")),
+            PackageMeta {
+                license: None,
+                ..whole.clone()
+            }
+        );
+        // A `roles` that isn't an array of strings falls back to `role`.
+        for roles in [
+            serde_json::json!("author"),
+            serde_json::json!(["author", 3]),
+            serde_json::json!({}),
+        ] {
+            let contributors = serde_json::json!([
+                { "title": "Studio", "roles": roles, "role": "publisher" }
+            ]);
+            assert_eq!(with("contributors", contributors), whole, "{roles}");
+        }
+    }
+
+    #[test]
+    fn spdx_ids_map_to_license_kinds_as_whole_ids_ignoring_case() {
+        for (id, kind) in [
+            ("CC0-1.0", LicenseKind::Cc0),
+            ("cc0-1.0", LicenseKind::Cc0),
+            ("CC-BY-4.0", LicenseKind::CcBy),
+            ("cc-by-4.0", LicenseKind::CcBy),
+            ("CC-BY-3.0-US", LicenseKind::CcBy),
+            ("CC-BY-2.5", LicenseKind::CcBy),
+            ("CC-BY-SA-4.0", LicenseKind::CcBySa),
+            ("CC-BY-SA-3.0-AT", LicenseKind::CcBySa),
+            ("MIT", LicenseKind::Mit),
+            ("mit", LicenseKind::Mit),
+            ("Apache-2.0", LicenseKind::Apache2),
+            ("OFL-1.0", LicenseKind::Ofl),
+            ("OFL-1.1", LicenseKind::Ofl),
+            ("OFL-1.1-RFN", LicenseKind::Ofl),
+            ("OFL-1.0-no-RFN", LicenseKind::Ofl),
+            ("CC-BY-NC-4.0", LicenseKind::Unknown),
+            ("CC-BY-ND-4.0", LicenseKind::Unknown),
+            ("CC-BY-NC-SA-4.0", LicenseKind::Unknown),
+            ("CC-BY-", LicenseKind::Unknown),
+            ("CC-BY", LicenseKind::Unknown),
+            ("CC0", LicenseKind::Unknown),
+            ("MIT-0", LicenseKind::Unknown),
+            ("Apache-1.1", LicenseKind::Unknown),
+            ("OFL-1.1-RFN-extra", LicenseKind::Unknown),
+            ("GPL-3.0-only", LicenseKind::Unknown),
+            ("MIT OR Apache-2.0", LicenseKind::Unknown),
+            ("CC-BY-4.0 AND MIT", LicenseKind::Unknown),
+            ("(MIT)", LicenseKind::Unknown),
+            ("LicenseRef-Unity-Asset-Store-EULA", LicenseKind::Unknown),
+        ] {
+            assert_eq!(spdx_kind(id), kind, "{id}");
+        }
+    }
+
+    #[test]
+    fn a_package_license_is_its_first_entry_with_a_name_or_a_usable_path() {
+        let license = |licenses: serde_json::Value| {
+            parsed(serde_json::json!({ "licenses": licenses })).license
+        };
+        let entry = |id: Option<&str>, file_path: Option<&str>, url: Option<&str>| {
+            Some(PackageLicense {
+                kind: id.map_or(LicenseKind::Unknown, spdx_kind),
+                id: id.map(str::to_string),
+                title: None,
+                file_path: file_path.map(str::to_string),
+                url: url.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            license(serde_json::json!([
+                "MIT",
+                { "title": "No name or path" },
+                { "name": " ", "path": "" },
+                { "path": "ftp://example.com/LICENSE" },
+                { "path": "../LICENSE.txt" },
+                { "name": "CC0-1.0" },
+                { "name": "MIT" },
+            ])),
+            entry(Some("CC0-1.0"), None, None)
+        );
+        // A path alone counts, and so does a name with an unusable path.
+        assert_eq!(
+            license(serde_json::json!([{ "path": "LICENSE.md" }])),
+            entry(None, Some("kit/LICENSE.md"), None)
+        );
+        assert_eq!(
+            license(serde_json::json!([{ "path": "HTTPS://example.com/terms" }])),
+            entry(None, None, Some("HTTPS://example.com/terms"))
+        );
+        for path in [
+            "../x.txt",
+            "/x.txt",
+            ".hidden/x.txt",
+            "a/../b.txt",
+            "a\\b.txt",
+            "ftp://example.com/x.txt",
+            "file:///etc/passwd",
+            "https://",
+        ] {
+            assert_eq!(
+                license(serde_json::json!([{ "name": "MIT", "path": path }])),
+                entry(Some("MIT"), None, None),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_package_license_file_counts_only_as_an_indexed_doc_in_the_pack() {
+        let document = |paths: &[&str], path: &str| {
+            let file = "kit/datapackage.json";
+            let package = PackageMeta {
+                license: Some(PackageLicense {
+                    file_path: Some(path.to_string()),
+                    ..PackageLicense::default()
+                }),
+                ..PackageMeta::default()
+            };
+            let all: Vec<&str> = [file, "kit/a.glb"].iter().chain(paths).copied().collect();
+            let (structure, _) = derive_packaged(&all, &Overrides::new(), &[(file, package)]);
+            let stored = info(&structure, "kit").package.clone().unwrap();
+            // What the file said stays as it said it, for the next pass's cached read.
+            let license = stored.meta.license.unwrap();
+            assert_eq!(license.file_path.as_deref(), Some(path));
+            stored.license_document
+        };
+        for path in ["kit/LICENSE.txt", "kit/Docs/License.PDF", "kit/terms.md"] {
+            assert_eq!(document(&[path], path).as_deref(), Some(path));
+        }
+        // An indexed file that isn't a doc, or a file that isn't indexed, is ignored.
+        for path in [
+            "kit/Models/rock.fbx",
+            "kit/terms.svg",
+            "kit/datapackage.json",
+            "kit/install.sh",
+            "kit/tool.desktop",
+            "kit/Tool.AppImage",
+            "kit/terms.html",
+            "kit/eula.rtf",
+            "kit/LICENSE",
+        ] {
+            assert_eq!(document(&[path], path), None, "{path}");
+        }
+        assert_eq!(document(&[], "kit/gone.txt"), None);
+    }
+
     #[test]
     fn a_folder_holding_a_datapackage_json_is_a_pack_named_by_its_title() {
         for file in ["Unity/City/datapackage.json", "Unity/City/DataPackage.JSON"] {
@@ -4910,6 +5402,7 @@ pub(crate) mod tests {
                 Some(PackageFile {
                     path: file.to_string(),
                     meta: meta(Some("POLYGON City"), None),
+                    license_document: None,
                     parser: 0,
                     size_bytes: 0,
                     modified_at: 0,
@@ -5258,6 +5751,7 @@ pub(crate) mod tests {
                 Some(PackageFile {
                     path: path.to_string(),
                     meta: PackageMeta::default(),
+                    license_document: None,
                     parser: PACKAGE_PARSER,
                     size_bytes: size,
                     modified_at: 0,

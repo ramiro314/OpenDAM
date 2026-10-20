@@ -21,7 +21,6 @@ import type {
   Collection,
   Cover,
   GroupMember,
-  LicenseKind,
   PackDetail,
 } from '../../types';
 import {
@@ -47,7 +46,15 @@ import { formatSize, itemFileCount } from '../../utils/format';
 import { useImageScaling } from '../../hooks/useImageScaling';
 import { useBrowseView } from '../../hooks/useBrowseView';
 import { panelPackTarget } from '../../utils/packsView';
-import { detailsEdit, packForm, sourceUrlProblem, type PackForm } from '../../utils/packEdits';
+import {
+  authorsLabel,
+  detailsEdit,
+  formPlaceholders,
+  licenseLabel,
+  packForm,
+  sourceUrlProblem,
+  type PackForm,
+} from '../../utils/packEdits';
 import { KIND_LABEL } from '../../utils/scrubKey';
 import { ThreeViewer } from './ThreeViewer';
 import { SuggestTags } from './SuggestTags';
@@ -417,26 +424,17 @@ export function DetailPanel() {
 }
 
 // ── Pack ──────────────────────────────────────────────────────────────────
-const LICENSE_LABEL: Record<LicenseKind, string> = {
-  CC0: 'CC0',
-  'CC-BY': 'CC-BY',
-  'CC-BY-SA': 'CC-BY-SA',
-  MIT: 'MIT',
-  'Apache-2.0': 'Apache-2.0',
-  OFL: 'OFL',
-  unknown: 'Unknown',
-};
-
 /** The image that stands for a cover, as `imageOf` picks it for an asset. */
 const coverImage = (cover: Cover) =>
   imageOf({ ...cover, thumbnailPath: cover.thumbnailPath ?? undefined });
 
 /**
- * A pack's details (plan C18): its cover, or the gallery image clicked, its name, its gallery of
- * `Preview*` and `Sample*` images, its Kenney header's version and author, its license with "Open
- * license", its source URL with "Open", and its files by kind with their total size. The edit
- * button opens a form for its name, license and source URL. Each save reruns the structure pass,
- * whose `library:updated` reloads the pack here.
+ * A pack's details (plan C18, plan pack-metadata-files C12): its cover, or the gallery image
+ * clicked, its name, its gallery of `Preview*` and `Sample*` images, its version, publisher and
+ * authors, its license with "Open license" for a file or "Open" for a URL, its source URL with
+ * "Open", and its files by kind with their total size. The edit button opens a form for its
+ * name, license and source URL. Each save reruns the structure pass, whose `library:updated`
+ * reloads the pack here.
  */
 function PackPanel({ pack }: { pack: PackDetail }) {
   const scaling = useImageScaling('contain');
@@ -452,9 +450,17 @@ function PackPanel({ pack }: { pack: PackDetail }) {
     ([a, m], [b, n]) => n - m || a.localeCompare(b)
   );
   const files = kinds.reduce((sum, [, n]) => sum + n, 0);
-  const { header, license, edits } = pack;
-  const licenseName =
-    edits.license ?? (license ? (LICENSE_LABEL[license.kind] ?? license.kind) : null);
+  const { license, edits } = pack;
+  const sourceUrl = edits.sourceUrl ?? pack.sourceUrl;
+  /** Opens `url` in the browser, only ever on a click */
+  const openUrl = async (url: string, what: string) => {
+    try {
+      await api.openUrl(url);
+    } catch (err) {
+      console.error(`Failed to open the ${what}:`, err);
+      useFolderActionStore.getState().setFailure(`Opening ${url} failed: ${String(err)}`);
+    }
+  };
   const resetCover = async () => {
     try {
       await api.setPackOverride(pack.libraryId, pack.path, { kind: 'cover', assetId: null });
@@ -552,36 +558,44 @@ function PackPanel({ pack }: { pack: PackDetail }) {
 
       <div className={styles.tabContent}>
         <div className={styles.infoGrid}>
-          {header?.version && (
+          {pack.version && (
             <>
               <label className={styles.infoLabel}>Version</label>
               <span id="detail-pack-version" className={styles.infoValue}>
-                {header.version}
+                {pack.version}
               </span>
             </>
           )}
-          {header?.author && (
+          {pack.publisher && (
             <>
-              <label className={styles.infoLabel}>Author</label>
+              <label className={styles.infoLabel}>Publisher</label>
+              <span id="detail-pack-publisher" className={styles.infoValue}>
+                {pack.publisher}
+              </span>
+            </>
+          )}
+          {pack.authors.length > 0 && (
+            <>
+              <label className={styles.infoLabel}>{authorsLabel(pack.authors)}</label>
               <span id="detail-pack-author" className={styles.infoValue}>
-                {header.author}
+                {pack.authors.join(', ')}
               </span>
             </>
           )}
 
           <label className={styles.infoLabel}>License</label>
-          {license ? (
-            <span className={styles.licenseRow}>
-              <span id="detail-pack-license" className={styles.infoValue}>
-                {licenseName}
-              </span>
+          <span className={styles.licenseRow}>
+            <span id="detail-pack-license" className={styles.infoValue}>
+              {licenseLabel(pack)}
+            </span>
+            {license?.filePath && (
               <button
                 id="detail-open-license"
                 className={styles.openLicenseBtn}
                 title={license.filePath}
                 onClick={async () => {
                   try {
-                    await api.openWithDefault(license.filePath);
+                    await api.openWithDefault(license.filePath!);
                   } catch (err) {
                     console.error('Failed to open the license:', err);
                   }
@@ -590,34 +604,32 @@ function PackPanel({ pack }: { pack: PackDetail }) {
                 <IconExternal size={11} />
                 <span>Open license</span>
               </button>
-            </span>
-          ) : (
-            <span id="detail-pack-license" className={styles.infoValue}>
-              {licenseName ?? 'No license file'}
-            </span>
-          )}
+            )}
+            {license?.url && (
+              <button
+                id="detail-open-license-url"
+                className={styles.openLicenseBtn}
+                title={license.url}
+                onClick={() => openUrl(license.url!, 'license')}
+              >
+                <IconExternal size={11} />
+                <span>Open</span>
+              </button>
+            )}
+          </span>
 
-          {edits.sourceUrl && (
+          {sourceUrl && (
             <>
               <label className={styles.infoLabel}>Source</label>
               <span className={styles.licenseRow}>
                 <span id="detail-pack-source" className={clsx(styles.infoValue, styles.mono)}>
-                  {edits.sourceUrl}
+                  {sourceUrl}
                 </span>
                 <button
                   id="detail-open-source"
                   className={styles.openLicenseBtn}
-                  title={edits.sourceUrl}
-                  onClick={async () => {
-                    try {
-                      await api.openUrl(edits.sourceUrl!);
-                    } catch (err) {
-                      console.error('Failed to open the source URL:', err);
-                      useFolderActionStore
-                        .getState()
-                        .setFailure(`Opening ${edits.sourceUrl} failed: ${String(err)}`);
-                    }
-                  }}
+                  title={sourceUrl}
+                  onClick={() => openUrl(sourceUrl, 'source URL')}
                 >
                   <IconExternal size={11} />
                   <span>Open</span>
@@ -667,6 +679,7 @@ function PackEditForm({ pack, onDone }: { pack: PackDetail; onDone: () => void }
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const urlProblem = sourceUrlProblem(form.sourceUrl);
+  const placeholders = formPlaceholders(pack);
   const field = (key: keyof PackForm) => ({
     value: form[key],
     onChange: (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -711,7 +724,7 @@ function PackEditForm({ pack, onDone }: { pack: PackDetail; onDone: () => void }
       <input
         id="detail-pack-form-license"
         className={styles.packFormInput}
-        placeholder={pack.license ? LICENSE_LABEL[pack.license.kind] : 'CC0, CC-BY 4.0...'}
+        placeholder={placeholders.license}
         {...field('license')}
       />
       <label className={styles.infoLabel} htmlFor="detail-pack-form-source">
@@ -721,7 +734,7 @@ function PackEditForm({ pack, onDone }: { pack: PackDetail; onDone: () => void }
         id="detail-pack-form-source"
         className={styles.packFormInput}
         type="url"
-        placeholder="https://"
+        placeholder={placeholders.sourceUrl}
         {...field('sourceUrl')}
       />
       {(urlProblem || error) && (
