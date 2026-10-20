@@ -1,7 +1,8 @@
 //! The structure pass: a library's folder tree, its packs, its support files, its format groups
 //! with their bundled previews, and its 2D stacks, derived from the paths it has indexed
 //! (docs/plans/smarter-big-collections/plan.md, "The structure pass"). `derive` is a pure function
-//! over the paths, their sizes, what the license files say, the renders' sizes and your edits to
+//! over the paths, their sizes, what the license files and `datapackage.json` files say
+//! (docs/plans/pack-metadata-files/plan.md), the renders' sizes and your edits to
 //! packs (`pack_overrides`, which it never writes), and the pass writes only the folder rows and
 //! `assets.support_role`, `assets.group_id` and `assets.bundled_preview` values that differ from
 //! it, a render's size as its header gives it (`render_width`, `render_height`, and the
@@ -37,6 +38,13 @@ const HEADER_BYTES: u64 = 4096;
 /// The version of `parse_license`. A license file read by an older one is read again once, so a
 /// library indexed before a field existed gains it.
 const LICENSE_PARSER: u32 = 1;
+/// The name of a pack's Frictionless Data Package file, ignoring ASCII case: the only JSON file
+/// the watcher indexes (plan pack-metadata-files C1).
+const PACKAGE_FILE: &str = "datapackage.json";
+/// The version of `parse_package`, stored with each read as `LICENSE_PARSER` is.
+const PACKAGE_PARSER: u32 = 1;
+/// The largest `datapackage.json` the pass reads (plan pack-metadata-files D12).
+const PACKAGE_BYTES: u64 = 1 << 20;
 /// The formats a group picks its main item by (plan D12), best first. Every other format ranks
 /// after them.
 const MAIN_FORMATS: [&str; 5] = ["glb", "gltf", "fbx", "blend", "obj"];
@@ -82,16 +90,22 @@ pub struct Folder {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackInfo {
-    /// The name shown: yours (`PackOverride::name`), else the license header's, else the folder's
+    /// The name shown: yours (`PackOverride::name`), else the `datapackage.json` title, else the
+    /// license header's, else the folder's
     pub name: String,
-    /// The cover's path: the image you chose, while it is an image in the pack, else the first
-    /// `Preview*` cover image, else the first `Sample*` one, else the pack's first image, else its
-    /// first visible file (a model, whose thumbnail shows), each by path
+    /// The cover's path: the image you chose, while it is an image in the pack, else the
+    /// `datapackage.json` image, on the same terms, else the first `Preview*` cover image, else
+    /// the first `Sample*` one, else the pack's first image, else its first visible file (a
+    /// model, whose thumbnail shows), each by path
     pub cover: Option<String>,
     /// Every cover image of the pack (its `Preview*` and `Sample*` images), by path
     #[serde(default)]
     pub gallery: Vec<String>,
     pub license: Option<LicenseFile>,
+    /// The pack's `datapackage.json`, left out of `pack_json` for a pack without one, so its
+    /// row stays as passes before it wrote it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<PackageFile>,
     /// How many files of each kind (`AssetKind::as_str`) lie below the pack, at any depth,
     /// support files and group members included
     #[serde(default)]
@@ -118,6 +132,35 @@ pub struct LicenseFile {
     pub size_bytes: i64,
     #[serde(default)]
     pub modified_at: i64,
+}
+
+/// A pack's `datapackage.json`: the first directly inside it, by path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageFile {
+    pub path: String,
+    /// What the pass read from the file (`parse_package`), empty for a file it ignored
+    #[serde(flatten)]
+    pub meta: PackageMeta,
+    /// The `PACKAGE_PARSER` that read it, and the file's size and mtime then, as
+    /// `LicenseFile` records them
+    #[serde(default)]
+    pub parser: u32,
+    #[serde(default)]
+    pub size_bytes: i64,
+    #[serde(default)]
+    pub modified_at: i64,
+}
+
+/// What a `datapackage.json` says (`parse_package`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The `image`, relative to the library root and inside the file's folder
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 /// What a license file says (`parse_license`).
@@ -306,11 +349,19 @@ fn ancestors(dir: &str) -> impl Iterator<Item = &str> {
     )
 }
 
-/// A file's lowercase stem and extension, and whether it is a doc, an image or a model.
+/// Whether a file named `name` is a `datapackage.json`, ignoring ASCII case: the one check the
+/// watcher indexes it by and the pass reads it by.
+pub fn is_package_file(name: &str) -> bool {
+    name.eq_ignore_ascii_case(PACKAGE_FILE)
+}
+
+/// A file's lowercase stem and extension, and whether it is a doc, an image or a model. A
+/// `datapackage.json` is a doc too.
 struct FileKind {
     stem: String,
     ext: String,
     is_doc: bool,
+    is_package: bool,
     is_image: bool,
     is_model: bool,
 }
@@ -320,9 +371,11 @@ impl FileKind {
         let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
         let ext = ext.to_lowercase();
         let kind = AssetKind::from_extension(&ext);
+        let is_package = is_package_file(name);
         FileKind {
             stem: stem.to_lowercase(),
-            is_doc: DOC_EXTENSIONS.contains(&ext.as_str()),
+            is_doc: is_package || DOC_EXTENSIONS.contains(&ext.as_str()),
+            is_package,
             is_image: matches!(kind, AssetKind::Texture | AssetKind::Image),
             is_model: kind == AssetKind::Model3d,
             ext,
@@ -361,7 +414,9 @@ impl FileKind {
 ///    pack and holds no pack is also one when its parent has at least 2 pack children and packs
 ///    are more than half of its child folders. Your overrides come last (rule 4): a folder
 ///    you said is "Not a pack" is neither marked nor a pack to these rules, so the marked folders
-///    inside it can be packs, and one you marked as a pack is one, even inside another pack.
+///    inside it can be packs, and one you marked as a pack is one, even inside another pack. A
+///    folder directly holding a `datapackage.json` is one too, as if you had marked it, unless
+///    you said it is "Not a pack" (plan pack-metadata-files C2).
 /// 3. **Support roles** (C10): in a pack's own folder, or in a marked folder inside a pack, docs
 ///    are `Doc` and `Preview*`/`Sample*` images are `Cover`.
 /// 4. **Format groups** (C11, `format_groups`): one model shipped in several formats, and the
@@ -373,10 +428,11 @@ impl FileKind {
 ///    `Vector/`) form a group too, led by its PNG at the default scale.
 /// 7. **Counts:** each folder counts the grid items with a visible file below it, a group once,
 ///    and the support files below it.
-/// 8. **Pack info** (C9): each pack's cover, which is the image you chose when it is still in
-///    the pack, its gallery and license file, which `read_license` reads, its name, which is
-///    yours, else the license's header name, else the folder's, and the files below it by kind
-///    with their total size.
+/// 8. **Pack info** (C9): each pack's `datapackage.json`, which `read_package` reads, its cover,
+///    which is the image you chose when it is still in the pack, else the file's `image` on the
+///    same terms, its gallery and license file, which `read_license` reads, its name, which is
+///    yours, else the file's `title`, else the license's header name, else the folder's, and the
+///    files below it by kind with their total size.
 ///
 /// Each file comes with its size in bytes. An override of a folder that holds no file does
 /// nothing until files come back to it.
@@ -384,6 +440,7 @@ pub fn derive<'a>(
     files: impl IntoIterator<Item = (&'a str, i64)>,
     overrides: &Overrides,
     mut read_license: impl FnMut(&str) -> LicenseText,
+    mut read_package: impl FnMut(&str) -> PackageMeta,
     mut render_size: impl FnMut(&str) -> Option<(u32, u32)>,
 ) -> Structure {
     let (paths, sizes): (Vec<&str>, Vec<i64>) = files.into_iter().unzip();
@@ -392,11 +449,15 @@ pub fn derive<'a>(
     let mut folders: BTreeMap<String, Folder> = BTreeMap::new();
     let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut marked: HashSet<&str> = HashSet::new();
+    let mut packaged: BTreeSet<&str> = BTreeSet::new();
     folders.insert(String::new(), folder(None, ""));
     for (path, kind) in paths.iter().zip(&kinds) {
         let (dir, _) = split_dir(path);
         if kind.is_marker() {
             marked.insert(dir);
+        }
+        if kind.is_package {
+            packaged.insert(dir);
         }
         for (end, _) in path.match_indices('/') {
             let dir = &path[..end];
@@ -409,8 +470,9 @@ pub fn derive<'a>(
         }
     }
 
-    // The outermost marked folders, then the sibling rule's packs, then your marks. A "Not a
-    // pack" folder still hides the support files it holds inside a pack (`marked`).
+    // The outermost marked folders, then the sibling rule's packs, then your marks and the
+    // folders holding a `datapackage.json`. A "Not a pack" folder still hides the support files
+    // it holds inside a pack (`marked`).
     let mark = |dir: &str| overrides.get(dir).and_then(|o| o.mark);
     let markers: HashSet<&str> = marked
         .iter()
@@ -441,6 +503,11 @@ pub fn derive<'a>(
             .iter()
             .filter(|(dir, o)| o.mark == Some(PackMark::Pack) && folders.contains_key(*dir))
             .map(|(dir, _)| dir.as_str()),
+    );
+    packs.extend(
+        packaged
+            .into_iter()
+            .filter(|dir| mark(dir) != Some(PackMark::NotPack)),
     );
 
     let mut roles: Vec<Option<SupportRole>> = paths
@@ -501,10 +568,25 @@ pub fn derive<'a>(
     }
     let mut info = pack_files(&packs, &paths, &kinds, &roles, &groups);
     let mut contents = pack_contents(&packs, &paths, &kinds, &sizes);
-    // The covers you chose that are still indexed
+    let mut packages: HashMap<&str, PackageFile> = packs
+        .iter()
+        .filter_map(|pack| {
+            let path = info.get(*pack)?.package?;
+            let file = PackageFile {
+                meta: read_package(path),
+                path: path.to_string(),
+                parser: 0,
+                size_bytes: 0,
+                modified_at: 0,
+            };
+            Some((*pack, file))
+        })
+        .collect();
+    // The covers you chose and the images the packages name that are indexed
     let chosen: HashSet<&str> = overrides
         .values()
         .filter_map(|o| o.cover_path.as_deref())
+        .chain(packages.values().filter_map(|p| p.meta.image.as_deref()))
         .collect();
     let indexed: HashSet<&str> = paths
         .iter()
@@ -514,12 +596,19 @@ pub fn derive<'a>(
     for pack in packs {
         let folder = folders.get_mut(pack).expect("a pack has a row");
         let files = info.remove(pack).unwrap_or_default();
+        let package = packages.remove(pack);
         let edit = overrides.get(pack);
+        let usable = |c: &&str| indexed.contains(c) && cover_allowed(pack, c);
         let cover = edit
             .and_then(|o| o.cover_path.as_deref())
-            .filter(|c| indexed.contains(c) && cover_allowed(pack, c))
-            .or_else(|| files.cover());
-        let name = edit.and_then(|o| o.name.clone()).filter(|n| !n.is_empty());
+            .filter(usable)
+            .or_else(|| package.as_ref()?.meta.image.as_deref().filter(usable))
+            .or_else(|| files.cover())
+            .map(str::to_string);
+        let name = edit
+            .and_then(|o| o.name.clone())
+            .filter(|n| !n.is_empty())
+            .or_else(|| package.as_ref()?.meta.title.clone());
         let license = files.license.map(|path| LicenseFile {
             text: read_license(path),
             path: path.to_string(),
@@ -533,9 +622,10 @@ pub fn derive<'a>(
             name: name
                 .or_else(|| Some(license.as_ref()?.text.header.as_ref()?.name.clone()))
                 .unwrap_or_else(|| folder.name.clone()),
-            cover: cover.map(str::to_string),
+            cover,
             gallery: files.gallery.iter().map(|p| p.to_string()).collect(),
             license,
+            package,
             kinds,
             size_bytes,
         });
@@ -636,6 +726,7 @@ struct PackFiles<'a> {
     image: Option<&'a str>,
     visible: Option<&'a str>,
     license: Option<&'a str>,
+    package: Option<&'a str>,
     /// Every cover image, by path
     gallery: BTreeSet<&'a str>,
 }
@@ -689,6 +780,9 @@ fn pack_files<'a>(
         if dir == pack && kind.is_license() {
             first(&mut entry.license, path);
         }
+        if dir == pack && kind.is_package {
+            first(&mut entry.package, path);
+        }
     }
     files
 }
@@ -723,6 +817,44 @@ pub fn parse_license(text: &str) -> LicenseText {
     LicenseText {
         kind: license_kind(text),
         header: kenney_header(text),
+    }
+}
+
+/// What the `datapackage.json` at `path` says, from its `bytes`, or why the pass ignores it: not
+/// UTF-8, not JSON, or not a JSON object (plan pack-metadata-files C5, C6). A leading byte order
+/// mark is skipped. Each field is taken on its own, trimmed, and one that is empty or of the
+/// wrong type is left out. The `image` is joined to the file's folder, and left out unless it is
+/// a safe relative path (`package_path`).
+pub fn parse_package(path: &str, bytes: &[u8]) -> Result<PackageMeta, String> {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let text = std::str::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
+    let object = value.as_object().ok_or("not a JSON object")?;
+    let string = |key: &str| {
+        let text = object.get(key)?.as_str()?.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    };
+    let (dir, _) = split_dir(path);
+    Ok(PackageMeta {
+        title: string("title"),
+        image: string("image").and_then(|image| package_path(dir, &image)),
+    })
+}
+
+/// `relative`, a path in a `datapackage.json` in folder `dir`, as a path relative to the library
+/// root, or `None` when it isn't a safe POSIX path inside `dir`: empty, absolute, with a `\`, an
+/// empty segment (which a URL's `://` has) or a segment that is `..` or starts with `.` (plan
+/// pack-metadata-files C8).
+fn package_path(dir: &str, relative: &str) -> Option<String> {
+    let safe = !relative.contains('\\')
+        && relative
+            .split('/')
+            .all(|segment| !segment.is_empty() && !segment.starts_with('.'));
+    match (safe, dir) {
+        (false, _) => None,
+        (true, "") => Some(relative.to_string()),
+        (true, dir) => Some(format!("{dir}/{relative}")),
     }
 }
 
@@ -1135,22 +1267,89 @@ pub(crate) fn parse_pack(json: Option<&str>) -> Option<PackInfo> {
     serde_json::from_str(json?).ok()
 }
 
-/// The license files the pass read before, by path, from the current `pack_json`s.
-async fn known_licenses(pool: &Pool<Sqlite>) -> sqlx::Result<HashMap<String, LicenseFile>> {
+/// The license files and `datapackage.json` files the pass read before, each by path, from the
+/// current `pack_json`s.
+async fn known_files(pool: &Pool<Sqlite>) -> sqlx::Result<(KnownLicenses, KnownPackages)> {
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT pack_json FROM folders WHERE pack_json IS NOT NULL")
             .fetch_all(pool)
             .await?;
-    Ok(rows
-        .iter()
-        .filter_map(|(json,)| parse_pack(Some(json))?.license)
-        .map(|l| (l.path.clone(), l))
-        .collect())
+    let (mut licenses, mut packages) = (HashMap::new(), HashMap::new());
+    for pack in rows.iter().filter_map(|(json,)| parse_pack(Some(json))) {
+        if let Some(l) = pack.license {
+            licenses.insert(l.path.clone(), l);
+        }
+        if let Some(p) = pack.package {
+            packages.insert(p.path.clone(), p);
+        }
+    }
+    Ok((licenses, packages))
+}
+
+type KnownLicenses = HashMap<String, LicenseFile>;
+type KnownPackages = HashMap<String, PackageFile>;
+
+/// What `datapackage.json` `file` said when the pass last read it, when its size and mtime
+/// haven't changed since and the same `PACKAGE_PARSER` read it; `None` when it must be read
+/// again. A file the pass ignored said nothing.
+fn known_package(file: &FileRow, known: &KnownPackages) -> Option<PackageMeta> {
+    known
+        .get(&file.file_path)
+        .filter(|p| {
+            (p.parser, p.size_bytes, p.modified_at)
+                == (PACKAGE_PARSER, file.size_bytes, file.modified_at)
+        })
+        .map(|p| p.meta.clone())
+}
+
+/// What each `datapackage.json` of `files` (path and indexed size) below `root` says
+/// (`parse_package`), why the pass ignores it, or why it couldn't be read. A file indexed or
+/// read at more than `PACKAGE_BYTES` is ignored, and one indexed at more isn't opened. The reads
+/// run on the blocking pool, as `read_license_files` does.
+async fn read_package_files(
+    root: &Path,
+    files: Vec<(String, i64)>,
+) -> HashMap<String, std::io::Result<Result<PackageMeta, String>>> {
+    use std::io::Read;
+    let too_large = || format!("larger than {PACKAGE_BYTES} bytes");
+    let read_all = {
+        let (root, files) = (root.to_path_buf(), files.clone());
+        move || {
+            files
+                .into_iter()
+                .map(|(path, size)| {
+                    if u64::try_from(size).is_ok_and(|size| size > PACKAGE_BYTES) {
+                        return (path, Ok(Err(too_large())));
+                    }
+                    let mut bytes = Vec::new();
+                    let read = std::fs::File::open(root.join(&path))
+                        .and_then(|f| f.take(PACKAGE_BYTES + 1).read_to_end(&mut bytes))
+                        .map(|n| {
+                            if n as u64 > PACKAGE_BYTES {
+                                Err(too_large())
+                            } else {
+                                parse_package(&path, &bytes)
+                            }
+                        });
+                    (path, read)
+                })
+                .collect()
+        }
+    };
+    tokio::task::spawn_blocking(read_all)
+        .await
+        .unwrap_or_else(|e| {
+            let error = format!("the package reads stopped: {e}");
+            files
+                .into_iter()
+                .map(|(path, _)| (path, Err(std::io::Error::other(error.clone()))))
+                .collect()
+        })
 }
 
 /// What license file `file` said when the pass last read it, when its size and mtime haven't
 /// changed since and the same `LICENSE_PARSER` read it; `None` when it must be read again.
-fn known_text(file: &FileRow, known: &HashMap<String, LicenseFile>) -> Option<LicenseText> {
+fn known_text(file: &FileRow, known: &KnownLicenses) -> Option<LicenseText> {
     known
         .get(&file.file_path)
         .filter(|l| {
@@ -1686,9 +1885,10 @@ pub(crate) struct PassRun {
 }
 
 /// Runs the pass on the library DB at `pool`, whose files lie below `root`: reads every indexed
-/// path, derives the structure and applies it. It reads a pack's license file only when its size
-/// or mtime changed since the last pass, and a render's header only when the render has no read
-/// recorded or its size or mtime changed since. Returns the rows written. The caller holds the
+/// path, derives the structure and applies it. It reads a pack's license file and its
+/// `datapackage.json` only when the file's size or mtime changed since the last pass, and a
+/// render's header only when the render has no read recorded or its size or mtime changed since.
+/// Returns the rows written. The caller holds the
 /// library's `index_lock`.
 pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
     Ok(pass(pool, root).await?.written)
@@ -1705,14 +1905,15 @@ pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassR
     )
     .fetch_all(pool)
     .await?;
-    let known = known_licenses(pool).await?;
+    let (known, known_packages) = known_files(pool).await?;
     let overrides = read_overrides(pool).await?;
     let by_path: HashMap<&str, &FileRow> =
         files.iter().map(|f| (f.file_path.as_str(), f)).collect();
     let inputs = || files.iter().map(|f| (f.file_path.as_str(), f.size_bytes));
-    // Derive with the licenses and render sizes already read, noting each file that changed
-    // since. Only then read those, off the runtime, and derive again with what they say.
+    // Derive with the licenses, packages and render sizes already read, noting each file that
+    // changed since. Only then read those, off the runtime, and derive again with what they say.
     let mut changed = Vec::new();
+    let mut stale_packages = Vec::new();
     let mut stale_renders = Vec::new();
     let mut structure = derive(
         inputs(),
@@ -1724,6 +1925,13 @@ pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassR
             })
         },
         |path| {
+            let file = by_path[path];
+            known_package(file, &known_packages).unwrap_or_else(|| {
+                stale_packages.push((path.to_string(), file.size_bytes));
+                PackageMeta::default()
+            })
+        },
+        |path| {
             let size = known_size(by_path[path]);
             if size.is_none() {
                 stale_renders.push(path.to_string());
@@ -1731,20 +1939,33 @@ pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassR
             size
         },
     );
-    let mut unread = HashSet::new();
+    let (mut unread, mut unread_packages) = (HashSet::new(), HashSet::new());
     let reads = changed.len();
     let render_reads = stale_renders.len();
+    let package_reads = stale_packages.len();
     let read = if changed.is_empty() {
         HashMap::new()
     } else {
         read_license_files(root, changed).await
     };
+    let packages = if stale_packages.is_empty() {
+        HashMap::new()
+    } else {
+        read_package_files(root, stale_packages).await
+    };
+    let mut packages_ignored = 0;
+    for (path, read) in &packages {
+        if let Ok(Err(reason)) = read {
+            tracing::warn!(target: "structure", "Ignoring {path}: {reason}");
+            packages_ignored += 1;
+        }
+    }
     let sizes = if stale_renders.is_empty() {
         HashMap::new()
     } else {
         read_render_sizes(root, stale_renders).await
     };
-    if !read.is_empty() || !sizes.is_empty() {
+    if !read.is_empty() || !packages.is_empty() || !sizes.is_empty() {
         structure = derive(
             inputs(),
             &overrides,
@@ -1759,6 +1980,18 @@ pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassR
                     known.get(path).map(|l| l.text.clone()).unwrap_or_default()
                 }
             },
+            // An ignored package says nothing, and an unreadable one is kept as a license is.
+            |path| match packages.get(path) {
+                None => known_package(by_path[path], &known_packages).unwrap_or_default(),
+                Some(Ok(Ok(meta))) => meta.clone(),
+                Some(Ok(Err(_))) => PackageMeta::default(),
+                Some(Err(e)) => {
+                    tracing::debug!(target: "structure", "Could not read {path}: {e}");
+                    unread_packages.insert(path.to_string());
+                    let known = known_packages.get(path);
+                    known.map(|p| p.meta.clone()).unwrap_or_default()
+                }
+            },
             // An unreadable render is too small, and records no read (`apply_render_sizes`).
             |path| match sizes.get(path) {
                 None => known_size(by_path[path]),
@@ -1770,17 +2003,27 @@ pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassR
             },
         );
     }
-    // A read license records the parser, size and mtime it was read with; an unread one records
-    // none.
-    for license in structure
+    // A read license or package records the parser, size and mtime it was read with; an unread
+    // one records none.
+    for pack in structure
         .folders
         .values_mut()
-        .filter_map(|f| f.pack.as_mut()?.license.as_mut())
-        .filter(|l| !unread.contains(&l.path))
+        .filter_map(|f| f.pack.as_mut())
     {
-        let file = by_path[license.path.as_str()];
-        (license.parser, license.size_bytes, license.modified_at) =
-            (LICENSE_PARSER, file.size_bytes, file.modified_at);
+        if let Some(license) = pack.license.as_mut().filter(|l| !unread.contains(&l.path)) {
+            let file = by_path[license.path.as_str()];
+            (license.parser, license.size_bytes, license.modified_at) =
+                (LICENSE_PARSER, file.size_bytes, file.modified_at);
+        }
+        if let Some(package) = pack
+            .package
+            .as_mut()
+            .filter(|p| !unread_packages.contains(&p.path))
+        {
+            let file = by_path[package.path.as_str()];
+            (package.parser, package.size_bytes, package.modified_at) =
+                (PACKAGE_PARSER, file.size_bytes, file.modified_at);
+        }
     }
     let structure = structure;
 
@@ -1807,11 +2050,13 @@ pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassR
         .count();
     tracing::info!(
         target: "structure",
-        "Structure pass: {} files, {} folders, {} packs, {} license files read, {} support files, {} groups of {} files, {} groups unioned, {} bundled previews, {} render headers read, {} renders too small, {} rows written in {:?}",
+        "Structure pass: {} files, {} folders, {} packs, {} license files read, {} package files read, {} package files ignored, {} support files, {} groups of {} files, {} groups unioned, {} bundled previews, {} render headers read, {} renders too small, {} rows written in {:?}",
         files.len(),
         structure.folders.len(),
         structure.folders.values().filter(|f| f.is_pack).count(),
         reads,
+        package_reads,
+        packages_ignored,
         structure.roles.iter().flatten().count(),
         mains,
         grouped,
@@ -1863,6 +2108,7 @@ pub(crate) mod tests {
             paths.into_iter().map(|p| (p, 1)),
             overrides,
             |_| LicenseText::default(),
+            |_| PackageMeta::default(),
             |_| None,
         )
     }
@@ -1909,6 +2155,7 @@ pub(crate) mod tests {
                 }),
                 kinds: kinds.iter().map(|(k, n)| (k.to_string(), *n)).collect(),
                 size_bytes: kinds.iter().map(|(_, n)| n).sum(),
+                package: None,
             }),
             ..folder
         }
@@ -2492,6 +2739,7 @@ pub(crate) mod tests {
                 KENNEY_3D_KIT.map(|p| (p, 1)),
                 &overrides,
                 |_| kenney("Car Kit Deluxe", LicenseKind::Cc0),
+                |_| PackageMeta::default(),
                 |_| None,
             );
             let info = info(&structure, car);
@@ -2893,6 +3141,7 @@ pub(crate) mod tests {
             paths.iter().map(|p| (*p, 1)),
             &Overrides::new(),
             |_| LicenseText::default(),
+            |_| PackageMeta::default(),
             |path| sizes.get(path).copied(),
         )
     }
@@ -3095,6 +3344,7 @@ pub(crate) mod tests {
                     LicenseText::default()
                 }
             },
+            |_| PackageMeta::default(),
             |_| None,
         );
         let car = info(&structure, "3D assets/Car Kit");
@@ -3146,6 +3396,7 @@ pub(crate) mod tests {
             KENNEY_3D_KIT.into_iter().zip(sizes),
             &Overrides::new(),
             |_| LicenseText::default(),
+            |_| PackageMeta::default(),
             |_| None,
         );
         let car = info(&structure, "3D assets/Car Kit");
@@ -3173,6 +3424,7 @@ pub(crate) mod tests {
             ],
             &Overrides::new(),
             |_| LicenseText::default(),
+            |_| PackageMeta::default(),
             |_| None,
         );
         assert_eq!(info(&structure, "kit").size_bytes, 7);
@@ -3181,6 +3433,7 @@ pub(crate) mod tests {
             [("License.txt", 1), ("rock.png", 2), ("Tiles/a.png", 4)],
             &Overrides::new(),
             |_| LicenseText::default(),
+            |_| PackageMeta::default(),
             |_| None,
         );
         let root = info(&structure, "");
@@ -4522,6 +4775,530 @@ pub(crate) mod tests {
             ),
             (Some("Car Kit".to_string()), 0, 0)
         );
+    }
+
+    /// A `PackageMeta` with `title` and `image`.
+    fn meta(title: Option<&str>, image: Option<&str>) -> PackageMeta {
+        PackageMeta {
+            title: title.map(str::to_string),
+            image: image.map(str::to_string),
+        }
+    }
+
+    /// `derive` of `paths` with your `overrides`, where each `datapackage.json` says what
+    /// `packages` gives for its path, else nothing, and no license file says anything. Also
+    /// returns the `datapackage.json` paths it asked for, in order.
+    fn derive_packaged(
+        paths: &[&str],
+        overrides: &Overrides,
+        packages: &[(&str, PackageMeta)],
+    ) -> (Structure, Vec<String>) {
+        let mut asked = Vec::new();
+        let structure = super::derive(
+            paths.iter().map(|p| (*p, 1)),
+            overrides,
+            |_| LicenseText::default(),
+            |path| {
+                asked.push(path.to_string());
+                let found = packages.iter().find(|(p, _)| *p == path);
+                found.map(|(_, m)| m.clone()).unwrap_or_default()
+            },
+            |_| None,
+        );
+        (structure, asked)
+    }
+
+    #[test]
+    fn a_package_gives_its_title_and_its_image_joined_to_its_folder() {
+        let file = br#"{
+            "$schema": "https://datapackage.org/profiles/2.0/datapackage.json",
+            "name": "polygon-city-pack",
+            "title": "  POLYGON - City Pack  ",
+            "image": "Previews/My Cover.png",
+            "resources": [{ "name": "car.fbx", "path": "Models/car.fbx" }]
+        }"#;
+        assert_eq!(
+            parse_package("Unity/City/datapackage.json", file),
+            Ok(meta(
+                Some("POLYGON - City Pack"),
+                Some("Unity/City/Previews/My Cover.png")
+            ))
+        );
+        // A file at the library root, with a byte order mark
+        let bom = [b"\xEF\xBB\xBF".as_slice(), br#"{"image": "cover.png"}"#].concat();
+        assert_eq!(
+            parse_package("datapackage.json", &bom),
+            Ok(meta(None, Some("cover.png")))
+        );
+        // Empty and wrong-typed fields are left out on their own.
+        for (json, expected) in [
+            ("{}", meta(None, None)),
+            (r#"{"title": " ", "image": ""}"#, meta(None, None)),
+            (
+                r#"{"title": 3, "image": "a.png"}"#,
+                meta(None, Some("kit/a.png")),
+            ),
+            (
+                r#"{"title": "Kit", "image": ["a.png"]}"#,
+                meta(Some("Kit"), None),
+            ),
+        ] {
+            assert_eq!(
+                parse_package("kit/datapackage.json", json.as_bytes()),
+                Ok(expected),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_package_that_isnt_a_utf8_json_object_is_ignored_with_a_reason() {
+        for (bytes, reason) in [
+            (b"{\"title\": ".as_slice(), "invalid JSON"),
+            (b"[]".as_slice(), "not a JSON object"),
+            (b"\"text\"".as_slice(), "not a JSON object"),
+            (b"{\"title\": \"\xff\xfe\"}".as_slice(), "not UTF-8"),
+        ] {
+            let parsed = parse_package("kit/datapackage.json", bytes);
+            assert!(
+                parsed.as_ref().is_err_and(|e| e.starts_with(reason)),
+                "{parsed:?} for {}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn a_package_image_must_be_a_safe_relative_path() {
+        for image in [
+            "../x.png",
+            "/x.png",
+            ".hidden/x.png",
+            "./x.png",
+            "a/../b.png",
+            "a\\b.png",
+            "a//b.png",
+            "a/",
+            "https://example.com/x.png",
+            "ftp://example.com/x.png",
+        ] {
+            let json = serde_json::json!({ "title": "Kit", "image": image }).to_string();
+            assert_eq!(
+                parse_package("kit/datapackage.json", json.as_bytes()),
+                Ok(meta(Some("Kit"), None)),
+                "{image}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_folder_holding_a_datapackage_json_is_a_pack_named_by_its_title() {
+        for file in ["Unity/City/datapackage.json", "Unity/City/DataPackage.JSON"] {
+            let paths = [
+                file,
+                "Unity/City/Assets/Models/car.fbx",
+                "Unity/City/Assets/Models/house.fbx",
+            ];
+            let packages = [(file, meta(Some("POLYGON City"), None))];
+            let (structure, asked) = derive_packaged(&paths, &Overrides::new(), &packages);
+            assert_eq!(asked, [file]);
+            assert_eq!(packs(&structure), ["Unity/City"]);
+            let city = info(&structure, "Unity/City");
+            assert_eq!(city.name, "POLYGON City");
+            assert_eq!(
+                city.package,
+                Some(PackageFile {
+                    path: file.to_string(),
+                    meta: meta(Some("POLYGON City"), None),
+                    parser: 0,
+                    size_bytes: 0,
+                    modified_at: 0,
+                })
+            );
+            // The file is a hidden doc, counted under Documents.
+            assert_eq!(
+                structure.roles,
+                [Some(SupportRole::Doc), None, None],
+                "{file}"
+            );
+            assert_eq!(
+                city.kinds,
+                BTreeMap::from([("3d_model".to_string(), 2), ("document".to_string(), 1)])
+            );
+            let unity = &structure.folders["Unity"];
+            assert_eq!((unity.item_count, unity.hidden_count), (2, 1));
+        }
+    }
+
+    #[test]
+    fn a_packs_name_is_yours_then_its_title_then_its_license_header_then_its_folder() {
+        let named = |paths: &[&str], package: PackageMeta, yours: Option<&str>| {
+            let edit = PackOverride {
+                name: yours.map(str::to_string),
+                ..PackOverride::default()
+            };
+            let structure = super::derive(
+                paths.iter().map(|p| (*p, 1)),
+                &Overrides::from([("kit".to_string(), edit)]),
+                |_| kenney("Header Kit", LicenseKind::Cc0),
+                |_| package.clone(),
+                |_| None,
+            );
+            info(&structure, "kit").name.clone()
+        };
+        let paths = ["kit/datapackage.json", "kit/License.txt", "kit/a.glb"];
+        let titled = meta(Some("Title Kit"), None);
+        assert_eq!(named(&paths, titled.clone(), Some("Mine")), "Mine");
+        assert_eq!(named(&paths, titled.clone(), Some("")), "Title Kit");
+        assert_eq!(named(&paths, titled, None), "Title Kit");
+        assert_eq!(named(&paths, meta(None, None), None), "Header Kit");
+        let unlicensed = ["kit/datapackage.json", "kit/a.glb"];
+        assert_eq!(named(&unlicensed, meta(None, None), None), "kit");
+    }
+
+    #[test]
+    fn a_packs_cover_is_yours_then_its_image_then_its_preview() {
+        let file = "kit/datapackage.json";
+        let paths = [
+            file,
+            "kit/Preview.png",
+            "kit/Art/cover.png",
+            "kit/Art/mine.png",
+            "kit/Art/notes.txt",
+            "kit/a.glb",
+            "other/x.png",
+        ];
+        let cover = |image: PackageMeta, yours: Option<&str>| {
+            let edit = PackOverride {
+                cover_path: yours.map(str::to_string),
+                ..PackOverride::default()
+            };
+            let overrides = Overrides::from([("kit".to_string(), edit)]);
+            let (structure, _) = derive_packaged(&paths, &overrides, &[(file, image)]);
+            let cover = info(&structure, "kit").cover.clone().unwrap();
+            // The image stays visible, and the gallery holds only the `Preview*` image.
+            assert_eq!(structure.roles[2], None);
+            assert_eq!(info(&structure, "kit").gallery, ["kit/Preview.png"]);
+            cover
+        };
+        let image = || meta(None, Some("kit/Art/cover.png"));
+        assert_eq!(cover(image(), None), "kit/Art/cover.png");
+        assert_eq!(cover(image(), Some("kit/Art/mine.png")), "kit/Art/mine.png");
+        assert_eq!(
+            cover(image(), Some("kit/Art/gone.png")),
+            "kit/Art/cover.png"
+        );
+        // An image outside the pack, not indexed, not an image, or a URL is ignored.
+        let url = parse_package(file, br#"{"image": "https://example.com/c.png"}"#).unwrap();
+        for ignored in [
+            meta(None, Some("other/x.png")),
+            meta(None, Some("kit/Art/gone.png")),
+            meta(None, Some("kit/Art/notes.txt")),
+            url,
+        ] {
+            assert_eq!(
+                cover(ignored.clone(), None),
+                "kit/Preview.png",
+                "{ignored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_package_above_two_license_packs_makes_three_packs_that_share_nothing() {
+        let outer = "Bundle/datapackage.json";
+        let paths = [
+            outer,
+            "Bundle/A/License.txt",
+            "Bundle/A/a.glb",
+            "Bundle/B/License.txt",
+            "Bundle/B/b.glb",
+        ];
+        let packages = [(outer, meta(Some("Mega Bundle"), Some("Bundle/A/a.png")))];
+        let (structure, asked) = derive_packaged(&paths, &Overrides::new(), &packages);
+        assert_eq!(asked, [outer]);
+        assert_eq!(packs(&structure), ["Bundle", "Bundle/A", "Bundle/B"]);
+        assert_eq!(info(&structure, "Bundle").name, "Mega Bundle");
+        for inner in ["A", "B"] {
+            let pack = info(&structure, &format!("Bundle/{inner}"));
+            assert_eq!((pack.name.as_str(), &pack.package), (inner, &None));
+        }
+    }
+
+    #[test]
+    fn a_package_inside_a_license_pack_makes_a_nested_pack() {
+        let file = "Kenney/Extra/datapackage.json";
+        let paths = [
+            "Kenney/License.txt",
+            "Kenney/Preview.png",
+            "Kenney/Extra/x.glb",
+            file,
+        ];
+        let packages = [(file, meta(Some("Extra Kit"), None))];
+        let (structure, asked) = derive_packaged(&paths, &Overrides::new(), &packages);
+        assert_eq!(asked, [file]);
+        assert_eq!(packs(&structure), ["Kenney", "Kenney/Extra"]);
+        assert_eq!(info(&structure, "Kenney").package, None);
+        assert_eq!(info(&structure, "Kenney/Extra").name, "Extra Kit");
+        assert_eq!(structure.roles[3], Some(SupportRole::Doc));
+    }
+
+    #[test]
+    fn not_a_pack_keeps_a_package_folder_plain_and_its_file_unread() {
+        let paths = ["kit/datapackage.json", "kit/a.glb"];
+        let (structure, asked) = derive_packaged(
+            &paths,
+            &marks(&[("kit", PackMark::NotPack)]),
+            &[(paths[0], meta(Some("Kit"), None))],
+        );
+        assert_eq!(asked, [] as [&str; 0]);
+        assert_eq!(packs(&structure), [] as [&str; 0]);
+        // Outside any pack, the file is a visible document.
+        assert_eq!(structure.roles, [None, None]);
+        assert_eq!(structure.folders["kit"].item_count, 2);
+    }
+
+    #[test]
+    fn package_packs_dont_count_toward_the_sibling_rule() {
+        let with = |marker: &str| {
+            let paths = [
+                format!("P/A/{marker}"),
+                "P/A/a.glb".to_string(),
+                format!("P/B/{marker}"),
+                "P/B/b.glb".to_string(),
+                "P/C/c.glb".to_string(),
+            ];
+            let (structure, _) = derive_packaged(
+                &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+                &Overrides::new(),
+                &[],
+            );
+            packs(&structure)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(with("datapackage.json"), ["P/A", "P/B"]);
+        // Two license packs of three make the third one too.
+        assert_eq!(with("License.txt"), ["P/A", "P/B", "P/C"]);
+    }
+
+    #[test]
+    fn a_pack_without_a_datapackage_json_derives_as_before_and_reads_none() {
+        let structure = super::derive(
+            KENNEY.map(|p| (p, 1)),
+            &Overrides::new(),
+            |_| LicenseText::default(),
+            |path| panic!("read {path}"),
+            |_| None,
+        );
+        assert_eq!(structure, derive(KENNEY));
+        assert!(structure
+            .folders
+            .values()
+            .filter_map(|f| f.pack.as_ref())
+            .all(|p| p.package.is_none()));
+    }
+
+    /// Collects what is logged on this thread while the guard lives.
+    fn capture_logs() -> (
+        tracing::subscriber::DefaultGuard,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        #[derive(Clone)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer(Default::default());
+        let logs = buffer.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || buffer.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        (tracing::subscriber::set_default(subscriber), logs)
+    }
+
+    /// The `datapackage.json` that `pool` holds for pack `path`.
+    async fn stored_package(pool: &Pool<Sqlite>, path: &str) -> PackageFile {
+        stored_pack(pool, path).await.package.expect("a package")
+    }
+
+    async fn set_mtime(pool: &Pool<Sqlite>, path: &str, mtime: i64) {
+        sqlx::query("UPDATE assets SET modified_at = ? WHERE file_path = ?")
+            .bind(mtime)
+            .bind(path)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_pass_reads_a_datapackage_json_once_and_again_only_once_it_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("kit/datapackage.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, r#"{"title": "City Pack", "image": "Art/cover.png"}"#).unwrap();
+        let pool = memory_library_pool().await;
+        let path = "kit/datapackage.json";
+        for path in [path, "kit/Art/cover.png", "kit/Preview.png", "kit/a.glb"] {
+            insert_path(&pool, path).await;
+        }
+
+        rebuild(&pool, root.path()).await.unwrap();
+        let read = stored_pack(&pool, "kit").await;
+        assert_eq!(read.name, "City Pack");
+        assert_eq!(read.cover.as_deref(), Some("kit/Art/cover.png"));
+        let package = read.package.unwrap();
+        assert_eq!(
+            (package.meta, package.parser, package.size_bytes),
+            (
+                meta(Some("City Pack"), Some("kit/Art/cover.png")),
+                PACKAGE_PARSER,
+                1
+            )
+        );
+        let (role,): (Option<String>,) =
+            sqlx::query_as("SELECT support_role FROM assets WHERE file_path = ?")
+                .bind(path)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(role.as_deref(), Some("doc"));
+
+        // A rerun reads nothing: a read of the missing root would fail and clear the record.
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+        std::fs::write(&file, r#"{"title": "Town Pack"}"#).unwrap();
+        assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 0);
+        assert_eq!(stored_pack(&pool, "kit").await.name, "City Pack");
+
+        // A changed mtime reads the file again, once.
+        set_mtime(&pool, path, 5).await;
+        assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 1);
+        let changed = stored_pack(&pool, "kit").await;
+        assert_eq!(changed.name, "Town Pack");
+        assert_eq!(changed.cover.as_deref(), Some("kit/Preview.png"));
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+
+        // Changed again but missing on disk: the pack keeps what the file said and records no
+        // read, so the next pass reads it once it can.
+        set_mtime(&pool, path, 6).await;
+        rebuild(&pool, unmounted()).await.unwrap();
+        let dropped = stored_pack(&pool, "kit").await;
+        assert_eq!(dropped.name, "Town Pack");
+        let package = dropped.package.unwrap();
+        assert_eq!(
+            (package.parser, package.size_bytes, package.modified_at),
+            (0, 0, 0)
+        );
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+        std::fs::write(&file, r#"{"title": "Village Pack"}"#).unwrap();
+        assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 1);
+        let back = stored_package(&pool, "kit").await;
+        assert_eq!(
+            (back.meta.title.as_deref(), back.modified_at),
+            (Some("Village Pack"), 6)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_datapackage_json_is_ignored_once_and_read_again_once_it_changes() {
+        let big = format!(
+            "{{\"title\": \"Big\"{}}}",
+            " ".repeat(PACKAGE_BYTES as usize)
+        );
+        let valid = r#"{"title": "Too Big"}"#;
+        // The bytes on disk, the size indexed, and the reason logged
+        for (bytes, size, reason) in [
+            (b"{\"title\": ".as_slice(), 1, "invalid JSON"),
+            (b"[]".as_slice(), 1, "not a JSON object"),
+            (b"\"text\"".as_slice(), 1, "not a JSON object"),
+            (b"{\"title\": \"\xff\"}".as_slice(), 1, "not UTF-8"),
+            // Indexed at more than 1 MiB: never opened, so its valid title isn't seen
+            (valid.as_bytes(), PACKAGE_BYTES as i64 + 1, "larger than"),
+            // Grown past 1 MiB since it was indexed
+            (big.as_bytes(), 1, "larger than"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let kit = root.path().join("kit");
+            std::fs::create_dir_all(&kit).unwrap();
+            std::fs::write(kit.join("datapackage.json"), bytes).unwrap();
+            std::fs::write(kit.join("License.txt"), KENNEY_LICENSE).unwrap();
+            let pool = memory_library_pool().await;
+            let path = "kit/datapackage.json";
+            for path in [path, "kit/License.txt", "kit/a.glb"] {
+                insert_path(&pool, path).await;
+            }
+            sqlx::query("UPDATE assets SET size_bytes = ? WHERE file_path = ?")
+                .bind(size)
+                .bind(path)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let (guard, logs) = capture_logs();
+            rebuild(&pool, root.path()).await.unwrap();
+            drop(guard);
+            let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+            let warning = format!("WARN structure: Ignoring {path}: {reason}");
+            assert!(logs.contains(&warning), "{reason}: {logs}");
+            // The pack falls back to its license file, and records the read with no fields.
+            let pack = stored_pack(&pool, "kit").await;
+            assert_eq!(pack.name, "Car Kit", "{reason}");
+            assert_eq!(
+                pack.package,
+                Some(PackageFile {
+                    path: path.to_string(),
+                    meta: PackageMeta::default(),
+                    parser: PACKAGE_PARSER,
+                    size_bytes: size,
+                    modified_at: 0,
+                }),
+                "{reason}"
+            );
+            // Neither file is read again.
+            assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0, "{reason}");
+
+            // Fixed, with a new mtime, it is read again.
+            std::fs::write(kit.join("datapackage.json"), r#"{"title": "Fixed"}"#).unwrap();
+            sqlx::query("UPDATE assets SET size_bytes = 1, modified_at = 7 WHERE file_path = ?")
+                .bind(path)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 1, "{reason}");
+            assert_eq!(stored_pack(&pool, "kit").await.name, "Fixed", "{reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pack_without_a_datapackage_json_keeps_its_pack_json_byte_for_byte() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("kit")).unwrap();
+        std::fs::write(root.path().join("kit/License.txt"), KENNEY_LICENSE).unwrap();
+        let pool = memory_library_pool().await;
+        for path in ["kit/License.txt", "kit/Preview.png", "kit/a.glb"] {
+            insert_path(&pool, path).await;
+        }
+        rebuild(&pool, root.path()).await.unwrap();
+        let (json,): (String,) = sqlx::query_as("SELECT pack_json FROM folders WHERE path = 'kit'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // As passes before `PackInfo::package` wrote it
+        let before = r#"{"name":"Car Kit","cover":"kit/Preview.png","gallery":["kit/Preview.png"],"license":{"path":"kit/License.txt","kind":"CC0","header":{"name":"Car Kit","version":"3.1","author":"Kenney"},"parser":1,"sizeBytes":1,"modifiedAt":0},"kinds":{"3d_model":1,"document":1,"texture":1},"sizeBytes":3}"#;
+        assert_eq!(json, before);
+        assert_eq!(parse_pack(Some(before)).unwrap().package, None);
+        // Nothing is read or written again.
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
     }
 
     #[tokio::test]
