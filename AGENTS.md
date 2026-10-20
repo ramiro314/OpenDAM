@@ -138,9 +138,10 @@ docs/plans                    Plans for this fork
     else the file's `image`, else its first `Preview*` image; its license is yours, else the
     file's, else the license file's; and its source URL is yours, else the file's. Version and
     authors come from the file, else the license header, and the publisher only from the file
-    (`pack_holding`). "Open license" opens the file's license `path` only when it is an indexed
-    `txt`, `md` or `pdf` file in the pack (`PackageFile::license_document`), else the pack's
-    license file; a license URL opens with "Open", and no URL is fetched until you click.
+    (`pack_holding`). The file's license is its first entry with a `name`, an http(s) URL, or a
+    `path` that is an indexed `txt`, `md` or `pdf` file in the pack (`PackageFile::license`).
+    "Open license" opens that file, else the pack's license file; a license URL opens with
+    "Open", and no URL is fetched until you click.
 - **One grid item per group.** A format group (one model in several formats, or a file's copies
   under format folders, plan C11) holds its main item's id in `group_id` on every member, the
   main item included; a file on its own has `NULL`. The main item is chosen GLB > glTF > FBX >

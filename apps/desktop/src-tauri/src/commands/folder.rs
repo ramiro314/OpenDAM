@@ -470,10 +470,10 @@ pub(crate) async fn pack_holding(
 /// neither.
 fn pack_license(info: &structure::PackInfo, root: &Path) -> Option<PackLicense> {
     let package = info.package.as_ref();
-    let named = package.and_then(|p| p.meta.license.as_ref());
+    let named = package.and_then(|p| p.license.as_ref());
     let url = named.and_then(|l| l.url.clone());
-    let file = package
-        .and_then(|p| p.license_document.as_deref())
+    let file = named
+        .and_then(|l| l.file_path.as_deref())
         .or_else(|| Some(info.license.as_ref()?.path.as_str()))
         .filter(|_| url.is_none())
         .map(|path| resolve_path(root, path));
@@ -1610,6 +1610,44 @@ mod tests {
             assert_eq!(
                 license_of(&kit_detail(&files, None).await),
                 mit(Some("kit/License.txt"), None),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_nameless_license_whose_path_doesnt_count_gives_way_to_the_next_or_the_license_file()
+    {
+        let files = |licenses: &str| {
+            let package = format!(r#"{{"licenses": {licenses}}}"#);
+            vec![
+                ("kit/a.glb".to_string(), String::new()),
+                ("kit/install.sh".to_string(), "x".to_string()),
+                ("kit/Models/rock.fbx".to_string(), "x".to_string()),
+                ("kit/datapackage.json".to_string(), package),
+            ]
+        };
+        let detail = |files: Vec<(String, String)>| async move {
+            let files: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(p, t)| (p.as_str(), t.as_str()))
+                .collect();
+            kit_detail(&files, None).await
+        };
+        for path in ["LICENSE", "install.sh", "Models/rock.fbx", "gone.txt"] {
+            // The next named entry is shown, with no button and no license file.
+            let named = files(&format!(r#"[{{"path": "{path}"}}, {{"name": "MIT"}}]"#));
+            assert_eq!(
+                license_of(&detail(named).await),
+                license(LicenseKind::Mit, Some("MIT"), None, None),
+                "{path}"
+            );
+            // Alone beside a license file, the license file gives the license and its button.
+            let mut alone = files(&format!(r#"[{{"path": "{path}"}}]"#));
+            alone.push(("kit/License.txt".to_string(), KENNEY_LICENSE.to_string()));
+            assert_eq!(
+                license_of(&detail(alone).await),
+                license(LicenseKind::Cc0, None, Some("kit/License.txt"), None),
                 "{path}"
             );
         }

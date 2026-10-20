@@ -143,11 +143,13 @@ pub struct PackageFile {
     /// What the pass read from the file (`parse_package`), empty for a file it ignored
     #[serde(flatten)]
     pub meta: PackageMeta,
-    /// The license's file `path` when it is an indexed doc (`txt`, `md` or `pdf`) in the pack,
-    /// the only file "Open license" opens from the file (plan pack-metadata-files C8). `derive`
-    /// sets it on every pass, so the read cached in `meta` keeps the path as the file wrote it.
+    /// The license shown: the first of `meta.licenses` with a `name`, a URL, or a file `path`
+    /// that is an indexed doc (`txt`, `md` or `pdf`) in the pack, the only file "Open license"
+    /// opens from the file (plan pack-metadata-files C8). Its `file_path` is kept only when it is
+    /// such a doc. `derive` picks it on every pass, so the read cached in `meta` keeps every entry
+    /// as the file wrote it, and a doc indexed later still counts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub license_document: Option<String>,
+    pub license: Option<PackageLicense>,
     /// The `PACKAGE_PARSER` that read it, and the file's size and mtime then, as
     /// `LicenseFile` records them
     #[serde(default)]
@@ -178,9 +180,10 @@ pub struct PackageMeta {
     /// The first http(s) `sources[].path`, else an http(s) `homepage`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
-    /// The first `licenses` entry with a `name` or a usable `path`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub license: Option<PackageLicense>,
+    /// Every `licenses` entry with a `name`, an http(s) URL or a safe relative `path`, in order.
+    /// `derive` picks the one shown (`PackageFile::license`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub licenses: Vec<PackageLicense>,
 }
 
 /// A `datapackage.json` license entry (plan pack-metadata-files C7, C8).
@@ -196,7 +199,7 @@ pub struct PackageLicense {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Its `path` when it is a safe relative path, relative to the library root and inside the
-    /// file's folder. `derive` checks that it names an indexed doc (`license_document`).
+    /// file's folder. `derive` checks that it names an indexed doc (`PackageFile::license`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
     /// Its `path` when it is an http(s) URL, which only a click on Open opens
@@ -474,7 +477,8 @@ impl FileKind {
 ///    same terms, its gallery and license file, which `read_license` reads, its name, which is
 ///    yours, else the file's `title`, else the license's header name, else the folder's, and the
 ///    files below it by kind with their total size. The file's license `path` is kept as its
-///    `license_document` only when it names an indexed `txt`, `md` or `pdf` file in the pack.
+///    license only when it names an indexed `txt`, `md` or `pdf` file in the pack, and the license
+///    shown is the first entry with a `name`, a URL or such a file.
 ///
 /// Each file comes with its size in bytes. An override of a folder that holds no file does
 /// nothing until files come back to it.
@@ -617,7 +621,7 @@ pub fn derive<'a>(
             let file = PackageFile {
                 meta: read_package(path),
                 path: path.to_string(),
-                license_document: None,
+                license: None,
                 parser: 0,
                 size_bytes: 0,
                 modified_at: 0,
@@ -630,8 +634,12 @@ pub fn derive<'a>(
         .values()
         .filter_map(|o| o.cover_path.as_deref())
         .chain(packages.values().flat_map(|p| {
-            let license = p.meta.license.as_ref().and_then(|l| l.file_path.as_deref());
-            p.meta.image.as_deref().into_iter().chain(license)
+            let licenses = p
+                .meta
+                .licenses
+                .iter()
+                .filter_map(|l| l.file_path.as_deref());
+            p.meta.image.as_deref().into_iter().chain(licenses)
         }))
         .collect();
     let indexed: HashSet<&str> = paths
@@ -644,14 +652,17 @@ pub fn derive<'a>(
         let files = info.remove(pack).unwrap_or_default();
         let mut package = packages.remove(pack);
         if let Some(file) = package.as_mut() {
-            let license = file
-                .meta
-                .license
-                .as_ref()
-                .and_then(|l| l.file_path.as_deref());
-            file.license_document = license
-                .filter(|p| indexed.contains(p) && is_document(p))
-                .map(str::to_string);
+            file.license = file.meta.licenses.iter().find_map(|license| {
+                let file_path = license
+                    .file_path
+                    .clone()
+                    .filter(|p| indexed.contains(p.as_str()) && is_document(p));
+                let usable = license.id.is_some() || license.url.is_some() || file_path.is_some();
+                usable.then(|| PackageLicense {
+                    file_path,
+                    ..license.clone()
+                })
+            });
         }
         let edit = overrides.get(pack);
         let usable = |c: &&str| indexed.contains(c) && cover_allowed(pack, c);
@@ -892,8 +903,8 @@ pub fn parse_license(text: &str) -> LicenseText {
 /// - the publisher, the first contributor with the `publisher` role, and the authors, every one
 ///   with the `author` role (`contributor`);
 /// - the source URL, the first http(s) `sources[].path`, else an http(s) `homepage`;
-/// - the license, the first `licenses` entry with a `name`, or a `path` that is an http(s) URL or
-///   a safe relative path (`package_license`).
+/// - the licenses, every `licenses` entry with a `name`, or a `path` that is an http(s) URL or a
+///   safe relative path (`package_license`), from which `derive` picks the one shown.
 pub fn parse_package(path: &str, bytes: &[u8]) -> Result<PackageMeta, String> {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     let text = std::str::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
@@ -927,7 +938,9 @@ pub fn parse_package(path: &str, bytes: &[u8]) -> Result<PackageMeta, String> {
         source_url: array("sources")
             .find_map(|source| web(json_string(source.as_object()?, "path")))
             .or_else(|| web(string("homepage"))),
-        license: array("licenses").find_map(|entry| package_license(dir, entry)),
+        licenses: array("licenses")
+            .filter_map(|entry| package_license(dir, entry))
+            .collect(),
     })
 }
 
@@ -5097,13 +5110,13 @@ pub(crate) mod tests {
             Ok(PackageMeta {
                 title: Some("POLYGON - City Pack - Art by Synty".into()),
                 publisher: Some("Synty Studios".into()),
-                license: Some(PackageLicense {
+                licenses: vec![PackageLicense {
                     kind: LicenseKind::Unknown,
                     id: Some("LicenseRef-Unity-Asset-Store-EULA".into()),
                     title: Some("Standard Unity Asset Store EULA".into()),
                     file_path: None,
                     url: Some("https://unity.com/legal/as-terms".into()),
-                }),
+                }],
                 ..PackageMeta::default()
             })
         );
@@ -5138,13 +5151,13 @@ pub(crate) mod tests {
                 publisher: Some("Studio".into()),
                 authors: vec!["Ann".into(), "Bob".into()],
                 source_url: Some("https://store.example.com/kit".into()),
-                license: Some(PackageLicense {
+                licenses: vec![PackageLicense {
                     kind: LicenseKind::CcBy,
                     id: Some("CC-BY-4.0".into()),
                     title: None,
                     file_path: Some("kit/Docs/LICENSE.txt".into()),
                     url: None,
-                }),
+                }],
             }
         );
         // The homepage counts only without an http(s) source, and must be http(s) itself.
@@ -5237,7 +5250,7 @@ pub(crate) mod tests {
         assert_eq!(
             with("licenses", serde_json::json!("MIT")),
             PackageMeta {
-                license: None,
+                licenses: vec![],
                 ..whole.clone()
             }
         );
@@ -5291,41 +5304,42 @@ pub(crate) mod tests {
         }
     }
 
+    /// A license entry with `id`, a file path and a URL, and no title.
+    fn entry(id: Option<&str>, file_path: Option<&str>, url: Option<&str>) -> PackageLicense {
+        PackageLicense {
+            kind: id.map_or(LicenseKind::Unknown, spdx_kind),
+            id: id.map(str::to_string),
+            title: None,
+            file_path: file_path.map(str::to_string),
+            url: url.map(str::to_string),
+        }
+    }
+
     #[test]
-    fn a_package_license_is_its_first_entry_with_a_name_or_a_usable_path() {
-        let license = |licenses: serde_json::Value| {
-            parsed(serde_json::json!({ "licenses": licenses })).license
-        };
-        let entry = |id: Option<&str>, file_path: Option<&str>, url: Option<&str>| {
-            Some(PackageLicense {
-                kind: id.map_or(LicenseKind::Unknown, spdx_kind),
-                id: id.map(str::to_string),
-                title: None,
-                file_path: file_path.map(str::to_string),
-                url: url.map(str::to_string),
-            })
+    fn a_package_keeps_each_license_entry_with_a_name_or_a_usable_path_in_order() {
+        let licenses = |licenses: serde_json::Value| {
+            parsed(serde_json::json!({ "licenses": licenses })).licenses
         };
         assert_eq!(
-            license(serde_json::json!([
+            licenses(serde_json::json!([
                 "MIT",
                 { "title": "No name or path" },
                 { "name": " ", "path": "" },
                 { "path": "ftp://example.com/LICENSE" },
                 { "path": "../LICENSE.txt" },
+                { "path": "LICENSE.md" },
+                { "path": "HTTPS://example.com/terms" },
                 { "name": "CC0-1.0" },
                 { "name": "MIT" },
             ])),
-            entry(Some("CC0-1.0"), None, None)
+            [
+                entry(None, Some("kit/LICENSE.md"), None),
+                entry(None, None, Some("HTTPS://example.com/terms")),
+                entry(Some("CC0-1.0"), None, None),
+                entry(Some("MIT"), None, None),
+            ]
         );
-        // A path alone counts, and so does a name with an unusable path.
-        assert_eq!(
-            license(serde_json::json!([{ "path": "LICENSE.md" }])),
-            entry(None, Some("kit/LICENSE.md"), None)
-        );
-        assert_eq!(
-            license(serde_json::json!([{ "path": "HTTPS://example.com/terms" }])),
-            entry(None, None, Some("HTTPS://example.com/terms"))
-        );
+        // A name with an unusable path keeps its name.
         for path in [
             "../x.txt",
             "/x.txt",
@@ -5337,37 +5351,40 @@ pub(crate) mod tests {
             "https://",
         ] {
             assert_eq!(
-                license(serde_json::json!([{ "name": "MIT", "path": path }])),
-                entry(Some("MIT"), None, None),
+                licenses(serde_json::json!([{ "name": "MIT", "path": path }])),
+                [entry(Some("MIT"), None, None)],
                 "{path}"
             );
         }
     }
 
+    /// The license `derive` shows for pack `kit`, whose `datapackage.json` names `licenses`,
+    /// with `paths` indexed beside it. Also checks that the cached read keeps every entry as the
+    /// file wrote it.
+    fn shown_license(paths: &[&str], licenses: Vec<PackageLicense>) -> Option<PackageLicense> {
+        let file = "kit/datapackage.json";
+        let package = PackageMeta {
+            licenses: licenses.clone(),
+            ..PackageMeta::default()
+        };
+        let all: Vec<&str> = [file, "kit/a.glb"].iter().chain(paths).copied().collect();
+        let (structure, _) = derive_packaged(&all, &Overrides::new(), &[(file, package)]);
+        let stored = info(&structure, "kit").package.clone().unwrap();
+        assert_eq!(stored.meta.licenses, licenses);
+        stored.license
+    }
+
     #[test]
     fn a_package_license_file_counts_only_as_an_indexed_doc_in_the_pack() {
         let document = |paths: &[&str], path: &str| {
-            let file = "kit/datapackage.json";
-            let package = PackageMeta {
-                license: Some(PackageLicense {
-                    file_path: Some(path.to_string()),
-                    ..PackageLicense::default()
-                }),
-                ..PackageMeta::default()
-            };
-            let all: Vec<&str> = [file, "kit/a.glb"].iter().chain(paths).copied().collect();
-            let (structure, _) = derive_packaged(&all, &Overrides::new(), &[(file, package)]);
-            let stored = info(&structure, "kit").package.clone().unwrap();
-            // What the file said stays as it said it, for the next pass's cached read.
-            let license = stored.meta.license.unwrap();
-            assert_eq!(license.file_path.as_deref(), Some(path));
-            stored.license_document
+            let named = shown_license(paths, vec![entry(Some("MIT"), Some(path), None)]);
+            named.expect("a named entry is shown").file_path
         };
         for path in ["kit/LICENSE.txt", "kit/Docs/License.PDF", "kit/terms.md"] {
             assert_eq!(document(&[path], path).as_deref(), Some(path));
         }
         // An indexed file that isn't a doc, or a file that isn't indexed, is ignored.
-        for path in [
+        let ignored = [
             "kit/Models/rock.fbx",
             "kit/terms.svg",
             "kit/datapackage.json",
@@ -5377,10 +5394,36 @@ pub(crate) mod tests {
             "kit/terms.html",
             "kit/eula.rtf",
             "kit/LICENSE",
-        ] {
+        ];
+        for path in ignored {
             assert_eq!(document(&[path], path), None, "{path}");
         }
         assert_eq!(document(&[], "kit/gone.txt"), None);
+
+        // A nameless entry whose path doesn't count is skipped for the next one, and with none
+        // left the file shows no license.
+        for path in ignored.iter().chain(&["kit/gone.txt"]) {
+            let nameless = entry(None, Some(path), None);
+            assert_eq!(
+                shown_license(
+                    &ignored,
+                    vec![nameless.clone(), entry(Some("MIT"), None, None)]
+                ),
+                Some(entry(Some("MIT"), None, None)),
+                "{path}"
+            );
+            assert_eq!(shown_license(&ignored, vec![nameless]), None, "{path}");
+        }
+        // A nameless entry with an indexed doc or a URL counts.
+        let doc = entry(None, Some("kit/terms.md"), None);
+        let url = entry(None, None, Some("https://example.com/terms"));
+        for first in [doc, url] {
+            let mit = entry(Some("MIT"), None, None);
+            assert_eq!(
+                shown_license(&["kit/terms.md"], vec![first.clone(), mit]),
+                Some(first)
+            );
+        }
     }
 
     #[test]
@@ -5402,7 +5445,7 @@ pub(crate) mod tests {
                 Some(PackageFile {
                     path: file.to_string(),
                     meta: meta(Some("POLYGON City"), None),
-                    license_document: None,
+                    license: None,
                     parser: 0,
                     size_bytes: 0,
                     modified_at: 0,
@@ -5751,7 +5794,7 @@ pub(crate) mod tests {
                 Some(PackageFile {
                     path: path.to_string(),
                     meta: PackageMeta::default(),
-                    license_document: None,
+                    license: None,
                     parser: PACKAGE_PARSER,
                     size_bytes: size,
                     modified_at: 0,
