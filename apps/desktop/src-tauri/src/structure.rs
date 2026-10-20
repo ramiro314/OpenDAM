@@ -5280,6 +5280,86 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_datapackage_json_of_exactly_the_limit_is_read() {
+        let head = r#"{"title": "Exact""#;
+        let exact = format!(
+            "{head}{}}}",
+            " ".repeat(PACKAGE_BYTES as usize - head.len() - 1)
+        );
+        assert_eq!(exact.len() as u64, PACKAGE_BYTES);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("kit")).unwrap();
+        std::fs::write(root.path().join("kit/datapackage.json"), &exact).unwrap();
+        let pool = memory_library_pool().await;
+        let path = "kit/datapackage.json";
+        for path in [path, "kit/a.glb"] {
+            insert_path(&pool, path).await;
+        }
+        sqlx::query("UPDATE assets SET size_bytes = ? WHERE file_path = ?")
+            .bind(PACKAGE_BYTES as i64)
+            .bind(path)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (guard, logs) = capture_logs();
+        rebuild(&pool, root.path()).await.unwrap();
+        drop(guard);
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(!logs.contains("Ignoring"), "{logs}");
+        let package = stored_package(&pool, "kit").await;
+        assert_eq!(
+            (package.meta.title.as_deref(), package.size_bytes),
+            (Some("Exact"), PACKAGE_BYTES as i64)
+        );
+        assert_eq!(stored_pack(&pool, "kit").await.name, "Exact");
+    }
+
+    #[tokio::test]
+    async fn a_datapackage_json_read_by_an_older_parser_is_read_again_once() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("kit")).unwrap();
+        std::fs::write(
+            root.path().join("kit/datapackage.json"),
+            r#"{"title": "City Pack"}"#,
+        )
+        .unwrap();
+        let pool = memory_library_pool().await;
+        for path in ["kit/datapackage.json", "kit/a.glb"] {
+            insert_path(&pool, path).await;
+        }
+        rebuild(&pool, root.path()).await.unwrap();
+        // A read with the file's own size and mtime, by a parser older than `PACKAGE_PARSER`
+        sqlx::query(
+            r#"UPDATE folders SET pack_json = json_set(pack_json, '$.package.title', 'Stale',
+                   '$.name', 'Stale', '$.package.parser', 0)
+               WHERE path = 'kit'"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stale = stored_package(&pool, "kit").await;
+        assert_eq!(
+            (
+                stale.meta.title.as_deref(),
+                stale.parser,
+                stale.size_bytes,
+                stale.modified_at
+            ),
+            (Some("Stale"), 0, 1, 0)
+        );
+
+        assert_eq!(rebuild(&pool, root.path()).await.unwrap(), 1);
+        let package = stored_package(&pool, "kit").await;
+        assert_eq!(
+            (package.meta.title.as_deref(), package.parser),
+            (Some("City Pack"), PACKAGE_PARSER)
+        );
+        assert_eq!(stored_pack(&pool, "kit").await.name, "City Pack");
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn a_pack_without_a_datapackage_json_keeps_its_pack_json_byte_for_byte() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("kit")).unwrap();
