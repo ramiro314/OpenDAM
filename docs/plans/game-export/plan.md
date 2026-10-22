@@ -134,6 +134,14 @@ decision changed:
   `Rock` set's Normal in DirectX and exports with its green flipped. Sets, suffix lookups and
   default names all compare stems without it (C5, C7, C8, C16, AC4, AC7).
 
+Revised a fourteenth time 2026-10-22 after GitHub Inspector's tenth review of PR #165. No
+decision changed:
+
+- **When several images match a slot's role, one texture set wins, by folder.** The model's own
+  folder first, then the nearest folder, then the folder path ignoring case. A role never mixes
+  files from two sets, so resolution variants and copies in other folders bind the same set on
+  every run (C7, C16, AC4).
+
 ## Goal
 
 The Dungeon Game takes its art only as **bundles** that OpenDAM exports and the game's importer
@@ -461,6 +469,13 @@ For each slot, the first source with an answer wins (D11):
    `Rock`, and every stem comparison (this lookup, C5's names, C8's sets) is made without it.
 4. **Images in the model's format group or folder** with the model's stem, as BaseColor.
 
+- **When several images match** a slot's role, in step 1's search by name or in step 3, the
+  role is filled from one texture set (C8), never from files of two sets. The set is chosen by its
+  folder: the model's own folder first, then the folder nearest to it (fewest steps up and down
+  the folder tree), then the folder path ignoring case. So with `Textures/1K/T_Crate_N.png` and
+  `Textures/4K/T_Crate_N.png`, equally near `Models/`, `SM_Crate` binds the `1K` set, and the
+  texture picker (C13) can choose `4K`. A new matching file can change the choice, and the
+  Check's pack file list (C14) catches it.
 - **Your edits** (C4) replace any inferred field.
 - **Surface:** when no Unity material says cutout, a BaseColor whose alpha has any pixel below
   0.5 is shown as a cutout suggestion. You accept it with one click, and until then it exports
@@ -699,6 +714,8 @@ answer per file's size and mtime for the session.
   - standalone member images used by no model: a `T_Rock_R.png` and `T_Rock_M.png` pair, a
     `T_Rock_N_DX.png` normal map in the same folder, a lone `_M` map and an ORM map (step 4 for
     the sets, step 5 for their outputs);
+  - a model `Models/SM_Crate.fbx` whose pack holds `T_Crate_N.png` in both `Textures/1K/` and
+    `Textures/4K/` (step 4);
   - an FBX with only a `UCX_` hull and no take, which must be refused (step 4);
   - a model whose only material is named `Material`, which must keep that name, and one with two
     materials of one name, which must be refused (step 4);
@@ -810,7 +827,8 @@ problem in the Export view, naming the asset, and the step that delivers the wor
 - **AC4.** On the fixtures, inference gives the expected materials, roles, layouts, surfaces and
   conventions. `fbx_facts` lists no collision hull's material and not assimp's added
   `DefaultMaterial`, but keeps a real slot named `DefaultMaterial`. `T_Rock_N_DX` joins the `Rock`
-  set as its Normal, in DirectX. An FBX with only a `UCX_` hull and no take is refused, naming
+  set as its Normal, in DirectX. `SM_Crate` binds `Textures/1K/T_Crate_N.png` as its Normal on
+  every run, not the `4K` copy. An FBX with only a `UCX_` hull and no take is refused, naming
   C3's rule. Each edit replaces its
   inferred value, and a reset restores it.
 - **AC5.** Normalized fixture models re-import with bounds within 0.1% of the expected metre
