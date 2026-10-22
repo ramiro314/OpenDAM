@@ -157,6 +157,10 @@ jobs:
         if: ${{ !cancelled() && steps.test.outcome == 'success' }}
         working-directory: apps/desktop/src-tauri
         run: cargo nextest run --locked --profile ci
+      - name: Test (Python)
+        if: ${{ !cancelled() && steps.test.outcome == 'success' }}
+        working-directory: packages/preview-engine
+        run: uv run --frozen pytest
 
   # Publishes the "Flaky tests" check and keeps one issue per flaky test.
   flake-report:

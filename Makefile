@@ -44,15 +44,17 @@ check: deps
 	cd $(DESKTOP) && bun run typecheck
 	cd $(TAURI) && cargo check --locked
 
-# Both runners write JUnit: bun to apps/desktop/test-results/junit.xml,
+# bun and nextest write JUnit: bun to apps/desktop/test-results/junit.xml,
 # nextest's ci profile to apps/desktop/src-tauri/target/nextest/ci/junit.xml.
 # bun neither creates the report's directory nor fails when it can't write it.
-# Both runners always run, so a TypeScript failure still leaves Rust results.
+# All three runners always run, so a TypeScript failure still leaves Rust and
+# Python results.
 test: deps
 	mkdir -p $(DESKTOP)/test-results
 	(cd $(DESKTOP) && bun test --reporter=junit --reporter-outfile=test-results/junit.xml); bun=$$?; \
 	(cd $(TAURI) && cargo nextest run --locked --profile ci); nextest=$$?; \
-	exit $$((bun || nextest))
+	(cd $(PREVIEW) && uv run --frozen pytest); pytest=$$?; \
+	exit $$((bun || nextest || pytest))
 
 # tauri build runs the vite build first (beforeBuildCommand in tauri.conf.json).
 # `bun run dev` and `bun run build` run tauri under scripts/memory-cap.sh (AGENTS.md,

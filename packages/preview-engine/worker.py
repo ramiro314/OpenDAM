@@ -20,6 +20,7 @@ Phase 2 will add:
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -72,6 +73,130 @@ def video_thumb(source: str, output: str, timestamp: str = "00:00:01") -> dict:
         return {"ok": False, "error": "ffmpeg not found — install ffmpeg and add to PATH"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ── FBX/3DS scenes ────────────────────────────────────────────────────────
+# assimp's FBX importer adds helper nodes such as `Tree_LOD1_$AssimpFbx$_PreRotation`.
+_ASSIMP_HELPER_SUFFIX = re.compile(r"_\$AssimpFbx\$_.*$")
+# An LOD number of 1 or more at the end of the name: `LOD`, an optional `_`, optional zeros
+# and a number from 1. `LOD` is any case at the start or after a non-letter, and uppercase
+# after a letter, so `TreeLOD2` is an LOD but `Ballod2` isn't.
+_LOD_SUFFIX = re.compile(r"(?:(?<![A-Za-z])(?i:lod)|(?<=[A-Za-z])LOD)_?0*[1-9][0-9]*$")
+_COLLISION_PREFIXES = ("ucx_", "ubx_", "usp_", "ucp_")
+
+# Material for meshes whose material has no diffuse color.
+_DEFAULT_GRAY = (0.8, 0.8, 0.8)
+
+
+def is_skipped_node(name: str) -> bool:
+    """Whether a node and its subtree are left out of the preview: LOD1+ and collision."""
+    name = _ASSIMP_HELPER_SUFFIX.sub("", name)
+    lower = name.lower()
+    return (
+        bool(_LOD_SUFFIX.search(name))
+        or lower.startswith(_COLLISION_PREFIXES)
+        or "convexhull" in lower
+    )
+
+
+def fbx_material(ai_material: dict):
+    """An assimp material as a glTF PBR material in its diffuse color, or 0.8 gray."""
+    from trimesh.visual.material import PBRMaterial
+
+    rgb = list(ai_material.get("COLOR_DIFFUSE") or _DEFAULT_GRAY)[:3]
+    alpha = ai_material.get("OPACITY", 1.0)
+    return PBRMaterial(
+        name=ai_material.get("NAME"),
+        baseColorFactor=[*rgb, alpha],
+        metallicFactor=0.0,
+        roughnessFactor=0.9,
+        alphaMode="OPAQUE",
+    )
+
+
+def _fbx_geometry(ai_mesh, material):
+    """A trimesh geometry with the mesh's normals and UV channel 0, or None without triangles."""
+    import numpy as np
+    import trimesh
+
+    faces = np.asarray(ai_mesh.indices, dtype=np.int64)
+    # After Process_SortByPType a mesh holds one primitive type, and only triangles
+    # have three indices per face.
+    if ai_mesh.num_faces == 0 or len(faces) != 3 * ai_mesh.num_faces:
+        return None
+    vertices = np.asarray(ai_mesh.vertices, dtype=np.float64).reshape(-1, 3)
+    normals = None
+    if ai_mesh.normals is not None:
+        normals = np.asarray(ai_mesh.normals, dtype=np.float64).reshape(-1, 3)
+    uv = None
+    if ai_mesh.texcoords and ai_mesh.texcoords[0] is not None:
+        components = ai_mesh.num_uv_components[0]
+        uv = np.asarray(ai_mesh.texcoords[0], dtype=np.float64).reshape(-1, components)[:, :2]
+    return trimesh.Trimesh(
+        vertices=vertices,
+        faces=faces.reshape(-1, 3),
+        vertex_normals=normals,
+        visual=trimesh.visual.TextureVisuals(uv=uv, material=material),
+        process=False,
+    )
+
+
+def fbx_scene(ai_scene):
+    """
+    Build the preview scene from an assimp scene's node tree.
+
+    Walks `root_node` depth-first, multiplying each node's transformation into its parent's,
+    and draws every mesh of every node at its world transform, so a mesh used by several
+    nodes is drawn at each. LOD1+ and collision nodes are skipped with their subtrees, unless
+    skipping would leave nothing to draw. Returns `(scene, poly_count, object_count)`, the
+    counts covering only what is drawn.
+    """
+    import numpy as np
+    import trimesh
+
+    materials = [fbx_material(m) for m in ai_scene.materials]
+    default_material = fbx_material({})
+    geometries: dict[int, trimesh.Trimesh | None] = {}
+
+    def geometry(index: int):
+        if index not in geometries:
+            ai_mesh = ai_scene.meshes[index]
+            mat_index = ai_mesh.material_index
+            mat = materials[mat_index] if 0 <= mat_index < len(materials) else default_material
+            geometries[index] = _fbx_geometry(ai_mesh, mat)
+        return geometries[index]
+
+    def drawn(skip: bool) -> list[tuple[str, int, np.ndarray]]:
+        out = []
+        stack = [(ai_scene.root_node, np.eye(4))]
+        while stack:
+            node, parent = stack.pop()
+            if skip and is_skipped_node(node.name):
+                continue
+            world = parent @ np.array(node.transformation, dtype=np.float64).reshape(4, 4)
+            for index in node.mesh_indices:
+                if geometry(index) is not None:
+                    out.append((node.name, index, world))
+            stack.extend((child, world) for child in reversed(node.children))
+        return out
+
+    instances = drawn(skip=True) or drawn(skip=False)
+
+    scene = trimesh.Scene()
+    poly_count = 0
+    for n, (node_name, index, world) in enumerate(instances):
+        # One glTF mesh per assimp mesh, referenced by every node that draws it.
+        geom_name, frame = f"mesh_{index}", f"{node_name}_{n}"
+        if geom_name in scene.geometry:
+            scene.graph.update(
+                frame_from=scene.graph.base_frame, frame_to=frame, matrix=world, geometry=geom_name
+            )
+        else:
+            scene.add_geometry(
+                geometries[index], node_name=frame, geom_name=geom_name, transform=world
+            )
+        poly_count += len(geometries[index].faces)
+    return scene, poly_count, len(instances)
 
 
 # ── 3D model metadata & previews ──────────────────────────────────────────────
@@ -287,41 +412,25 @@ def model_meta(source: str, output_dir: str, name: str | None = None) -> dict:
             res["preview_error"] = f"3D convert failed: {e}"
 
     elif ext in [".fbx", ".3ds"]:
-        # Convert FBX/3DS via assimp_py and generate GLB + snapshot PNG
+        # Convert FBX/3DS via assimp_py into a GLB built from the node tree
         try:
             import assimp_py
-            import numpy as np
-            import trimesh
 
             ai_scene = assimp_py.import_file(
-                source, assimp_py.Process_Triangulate | assimp_py.Process_GenNormals
+                source,
+                assimp_py.Process_Triangulate
+                | assimp_py.Process_GenNormals
+                | assimp_py.Process_JoinIdenticalVertices
+                | assimp_py.Process_SortByPType,
             )
-            meshes = []
-            poly_count = 0
-            for m in ai_scene.meshes:
-                v = np.array(m.vertices).reshape(-1, 3)
-                f = np.array(m.indices).reshape(-1, 3)
-                if len(v) > 0 and len(f) > 0:
-                    meshes.append(trimesh.Trimesh(vertices=v, faces=f))
-                    poly_count += len(f)
+            t_scene, poly_count, object_count = fbx_scene(ai_scene)
 
-            if meshes:
-                t_scene = trimesh.Scene(meshes)
+            if object_count:
                 out_path = Path(output_dir) / f"{out_name}_preview.glb"
-                t_scene.export(str(out_path), file_type="glb")
+                t_scene.export(str(out_path), file_type="glb", include_normals=True)
                 res["preview_model"] = str(out_path)
-
-                try:
-                    png = t_scene.save_image(resolution=(1024, 1024))
-                    if png:
-                        thumb_path = Path(output_dir) / f"{out_name}_thumb.png"
-                        thumb_path.write_bytes(png)
-                        res["thumbnail"] = str(thumb_path)
-                except Exception:
-                    pass
-
                 meta["poly_count"] = poly_count
-                meta["object_count"] = len(meshes)
+                meta["object_count"] = object_count
             else:
                 res["preview_error"] = "No valid meshes in FBX/3DS file"
         except Exception as e:
