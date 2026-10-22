@@ -1,4 +1,4 @@
-"""FBX/3DS previews built from assimp's node tree (plan textured-fbx-previews, C2 and C4).
+"""FBX/3DS previews built from assimp's node tree (plan textured-fbx-previews, C2, C4 and C7).
 
 The scenes are fake assimp-like objects handed to `model_meta` in place of
 `assimp_py.import_file`, so no binary FBX is committed. Each test reads the exported GLB back.
@@ -6,14 +6,18 @@ The scenes are fake assimp-like objects handed to `model_meta` in place of
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import struct
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import pytest
+from PIL import Image
 
+import textures
 import worker
 
 IDENTITY = (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)
@@ -375,3 +379,245 @@ def test_a_scene_with_nothing_to_draw_fails_with_preview_error(tmp_path, monkeyp
     assert res["ok"] is False
     assert res["preview_error"] == "No valid meshes in FBX/3DS file"
     assert not (tmp_path / "thumbs" / "42_preview.glb").exists()
+
+
+# ── Base color textures ───────────────────────────────────────────────────
+
+UV = {"texcoords": [[0, 0, 1, 0, 0, 1]], "num_uv_components": [2]}
+
+
+@pytest.fixture(autouse=True)
+def fresh_index_cache():
+    textures._INDEXES.clear()
+
+
+def textured_preview(tmp_path, monkeypatch, scene: FakeScene, images: dict[str, Image.Image]):
+    """
+    Run `model_meta` on `lib/Pack/Meshes/model.fbx`, with `images` saved under `lib/Pack`
+    and `lib` and `lib/Pack` sent as the library and pack roots.
+    """
+    import assimp_py
+
+    pack = tmp_path / "lib" / "Pack"
+    for rel, img in images.items():
+        (pack / rel).parent.mkdir(parents=True, exist_ok=True)
+        img.save(pack / rel)
+    source = pack / "Meshes" / "model.fbx"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"fake")
+    monkeypatch.setattr(assimp_py, "import_file", lambda path, flags: scene)
+    return worker.model_meta(
+        str(source), str(tmp_path / "thumbs"), "42", str(tmp_path / "lib"), str(pack)
+    )
+
+
+def one_material(material: dict, **mesh) -> FakeScene:
+    return FakeScene(
+        root_node=FakeNode("Root", (0,)), meshes=[triangle(**mesh)], materials=[material]
+    )
+
+
+def glb_images(gltf: dict, binary: bytes) -> list[tuple[str, Image.Image]]:
+    """Each image in the GLB as `(mimeType, decoded image)`."""
+    out = []
+    for image in gltf.get("images", []):
+        view = gltf["bufferViews"][image["bufferView"]]
+        start = view.get("byteOffset", 0)
+        data = binary[start : start + view["byteLength"]]
+        out.append((image["mimeType"], Image.open(io.BytesIO(data))))
+    return out
+
+
+def rgba(size, alpha) -> Image.Image:
+    img = Image.new("RGBA", size, (90, 140, 60, 255))
+    img.putalpha(alpha)
+    return img
+
+
+def test_a_resolved_texture_is_the_base_color_on_white(tmp_path, monkeypatch):
+    scene = one_material({"NAME": "Rock", "TEXTURES": {1: ["..\\Textures\\rock.png"]}}, **UV)
+    res = textured_preview(
+        tmp_path, monkeypatch, scene, {"Textures/rock.png": Image.new("RGB", (2048, 1024))}
+    )
+
+    assert res["ok"], res
+    gltf, binary = read_glb(res["preview_model"])
+    pbr = gltf["materials"][0]["pbrMetallicRoughness"]
+    assert "baseColorTexture" in pbr
+    np.testing.assert_allclose(pbr.get("baseColorFactor", [1, 1, 1, 1]), [1, 1, 1, 1])
+    assert gltf["materials"][0].get("alphaMode", "OPAQUE") == "OPAQUE"
+    [(mime, img)] = glb_images(gltf, binary)
+    assert mime == "image/jpeg"
+    assert img.size == (1024, 512)
+    report = res["preview_textures"]
+    assert report["textured"] == 1
+    assert report["via"] == {"relative": 1}
+    assert report["alpha"] == {"cutout": 0, "ignored": 0, "none": 1}
+
+
+def test_a_cutout_texture_is_a_double_sided_png_mask(tmp_path, monkeypatch):
+    alpha = Image.new("L", (2048, 2048), 0)
+    alpha.paste(255, (512, 0, 1536, 2048))
+    scene = one_material({"NAME": "Leaves", "TEXTURES": {12: ["C:\\leaves.tga"]}}, **UV)
+    res = textured_preview(
+        tmp_path, monkeypatch, scene, {"Textures/leaves.png": rgba((2048, 2048), alpha)}
+    )
+
+    gltf, binary = read_glb(res["preview_model"])
+    material = gltf["materials"][0]
+    assert material["alphaMode"] == "MASK"
+    assert material["alphaCutoff"] == 0.5
+    assert material["doubleSided"] is True
+    [(mime, img)] = glb_images(gltf, binary)
+    assert mime == "image/png"
+    assert img.mode == "RGBA"
+    assert max(img.size) <= 1024
+    assert res["preview_textures"]["via"] == {"name": 1}
+    assert res["preview_textures"]["alpha"] == {"cutout": 1, "ignored": 0, "none": 0}
+
+
+def test_all_zero_alpha_is_opaque_and_jpeg(tmp_path, monkeypatch):
+    scene = one_material({"NAME": "Crate", "TEXTURES": {1: ["crate.tga"]}}, **UV)
+    res = textured_preview(tmp_path, monkeypatch, scene, {"Meshes/crate.tga": rgba((64, 64), 0)})
+
+    gltf, binary = read_glb(res["preview_model"])
+    assert gltf["materials"][0].get("alphaMode", "OPAQUE") == "OPAQUE"
+    [(mime, _)] = glb_images(gltf, binary)
+    assert mime == "image/jpeg"
+    assert res["preview_textures"]["alpha"] == {"cutout": 0, "ignored": 1, "none": 0}
+
+
+def test_a_missing_texture_leaves_a_valid_colored_preview(tmp_path, monkeypatch):
+    scene = one_material(
+        {"NAME": "Red", "COLOR_DIFFUSE": [1, 0, 0], "TEXTURES": {1: ["..\\T_Fill_B.png"]}},
+        **UV,
+    )
+    res = textured_preview(tmp_path, monkeypatch, scene, {})
+
+    assert res["ok"], res
+    gltf, _ = read_glb(res["preview_model"])
+    assert "images" not in gltf
+    pbr = gltf["materials"][0]["pbrMetallicRoughness"]
+    assert "baseColorTexture" not in pbr
+    np.testing.assert_allclose(pbr["baseColorFactor"], [1, 0, 0, 1], atol=1 / 255)
+    assert res["preview_textures"]["missing"] == ["T_Fill_B"]
+    assert res["preview_textures"]["textured"] == 0
+
+
+def test_an_unreadable_texture_leaves_a_valid_colored_preview(tmp_path, monkeypatch):
+    scene = one_material({"NAME": "Rock", "TEXTURES": {1: ["rock.png"]}}, **UV)
+    bad = tmp_path / "lib" / "Pack" / "Meshes" / "rock.png"
+    bad.parent.mkdir(parents=True)
+    bad.write_bytes(b"not a png")
+    res = textured_preview(tmp_path, monkeypatch, scene, {})
+
+    assert res["ok"], res
+    assert "images" not in read_glb(res["preview_model"])[0]
+    assert res["preview_textures"]["unreadable"] == ["rock.png"]
+
+
+def test_a_mesh_without_uvs_keeps_the_color(tmp_path, monkeypatch):
+    scene = FakeScene(
+        root_node=FakeNode("Root", (0, 1)),
+        meshes=[triangle(**UV), triangle()],
+        materials=[{"NAME": "Rock", "COLOR_DIFFUSE": [0, 0, 1], "TEXTURES": {1: ["rock.png"]}}],
+    )
+    res = textured_preview(
+        tmp_path, monkeypatch, scene, {"Meshes/rock.png": Image.new("RGB", (8, 8))}
+    )
+
+    gltf, _ = read_glb(res["preview_model"])
+    by_mesh = [gltf["materials"][m["primitives"][0]["material"]] for m in gltf["meshes"]]
+    assert "baseColorTexture" in by_mesh[0]["pbrMetallicRoughness"]
+    assert "baseColorTexture" not in by_mesh[1]["pbrMetallicRoughness"]
+    report = res["preview_textures"]
+    assert (report["materials"], report["textured"], report["no_uv"]) == (1, 1, 1)
+
+
+def test_a_shared_atlas_is_decoded_once(tmp_path, monkeypatch):
+    atlas = {"TEXTURES": {1: ["atlas.png"]}}
+    scene = FakeScene(
+        root_node=FakeNode("Root", (0, 1)),
+        meshes=[triangle(material_index=0, **UV), triangle(material_index=1, **UV)],
+        materials=[{"NAME": "A", **atlas}, {"NAME": "B", **atlas}],
+    )
+    calls = []
+    real = textures._load
+    monkeypatch.setattr(textures, "_load", lambda p: calls.append(p) or real(p))
+    res = textured_preview(
+        tmp_path, monkeypatch, scene, {"Textures/atlas.png": Image.new("RGB", (32, 32))}
+    )
+
+    assert len(calls) == 1
+    assert res["preview_textures"]["textured"] == 2
+
+
+def test_without_a_library_root_no_texture_is_read(tmp_path, monkeypatch):
+    # The texture sits next to the model, but no root bounds the lookup.
+    Image.new("RGB", (8, 8)).save(tmp_path / "rock.png")
+    monkeypatch.setattr(textures, "load_texture", pytest.fail)
+    scene = one_material(
+        {"NAME": "Rock", "COLOR_DIFFUSE": [0, 1, 0], "TEXTURES": {1: ["rock.png"]}}, **UV
+    )
+    res = preview(tmp_path, monkeypatch, scene)
+
+    assert res["ok"], res
+    gltf, _ = read_glb(res["preview_model"])
+    assert "images" not in gltf
+    assert res["preview_textures"]["no_root"] is True
+    assert res["preview_textures"]["textured"] == 0
+
+
+def test_the_report_counts_drawn_and_skipped_nodes(tmp_path, monkeypatch):
+    scene = FakeScene(
+        root_node=FakeNode(
+            "Root",
+            children=[
+                FakeNode("Tree_LOD0", (0,)),
+                FakeNode("Tree_LOD1", (0,), children=[FakeNode("Leaves", (0,))]),
+                FakeNode("UCX_Tree", (0,)),
+                FakeNode("Twin", (0,)),
+            ],
+        ),
+        meshes=[triangle()],
+    )
+    res = preview(tmp_path, monkeypatch, scene)
+
+    report = res["preview_textures"]
+    assert (report["drawn_nodes"], report["skipped_nodes"]) == (2, 2)
+    assert set(report) == {
+        "materials",
+        "textured",
+        "via",
+        "missing",
+        "unreadable",
+        "too_large",
+        "no_uv",
+        "alpha",
+        "drawn_nodes",
+        "skipped_nodes",
+        "no_root",
+    }
+
+
+def test_the_request_params_reach_the_lookup(tmp_path, monkeypatch):
+    import assimp_py
+
+    lib = tmp_path / "lib"
+    source = lib / "Pack" / "Meshes" / "model.fbx"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"fake")
+    Image.new("RGB", (8, 8)).save(lib / "Pack" / "rock.png")
+    scene = one_material({"NAME": "Rock", "TEXTURES": {1: ["rock.png"]}}, **UV)
+    monkeypatch.setattr(assimp_py, "import_file", lambda path, flags: scene)
+    params = {
+        "source": str(source),
+        "output_dir": str(tmp_path / "thumbs"),
+        "name": "42",
+        "library_root": str(lib),
+        "pack_root": str(lib / "Pack"),
+    }
+    res = worker.DISPATCH["model_meta"](params)
+
+    assert res["preview_textures"]["via"] == {"name": 1}
+    assert Path(res["preview_model"]).name == "42_preview.glb"

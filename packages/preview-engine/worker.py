@@ -99,23 +99,35 @@ def is_skipped_node(name: str) -> bool:
     )
 
 
-def fbx_material(ai_material: dict):
-    """An assimp material as a glTF PBR material in its diffuse color, or 0.8 gray."""
+def fbx_material(ai_material: dict, texture=None):
+    """
+    An assimp material as a glTF PBR material. With a loaded `textures.Texture`, its base
+    color is that texture on white, cut out (`MASK`, double-sided) when the texture's alpha
+    looks like a cutout. Without one, it is the diffuse color, or 0.8 gray, with `OPACITY`.
+    """
     from trimesh.visual.material import PBRMaterial
 
+    common = {"name": ai_material.get("NAME"), "metallicFactor": 0.0, "roughnessFactor": 0.9}
+    if texture is not None:
+        cutout = texture.alpha == "cutout"
+        return PBRMaterial(
+            **common,
+            baseColorTexture=texture.image,
+            baseColorFactor=[1.0, 1.0, 1.0, 1.0],
+            alphaMode="MASK" if cutout else "OPAQUE",
+            alphaCutoff=0.5 if cutout else None,
+            doubleSided=cutout,
+        )
     rgb = list(ai_material.get("COLOR_DIFFUSE") or _DEFAULT_GRAY)[:3]
     alpha = ai_material.get("OPACITY", 1.0)
-    return PBRMaterial(
-        name=ai_material.get("NAME"),
-        baseColorFactor=[*rgb, alpha],
-        metallicFactor=0.0,
-        roughnessFactor=0.9,
-        alphaMode="OPAQUE",
-    )
+    return PBRMaterial(**common, baseColorFactor=[*rgb, alpha], alphaMode="OPAQUE")
 
 
-def _fbx_geometry(ai_mesh, material):
-    """A trimesh geometry with the mesh's normals and UV channel 0, or None without triangles."""
+def _fbx_geometry(ai_mesh, material_for):
+    """
+    A trimesh geometry with the mesh's normals and UV channel 0, or None without triangles.
+    `material_for(has_uv)` gives its material, asked only for a mesh that is drawn.
+    """
     import numpy as np
     import trimesh
 
@@ -136,57 +148,81 @@ def _fbx_geometry(ai_mesh, material):
         vertices=vertices,
         faces=faces.reshape(-1, 3),
         vertex_normals=normals,
-        visual=trimesh.visual.TextureVisuals(uv=uv, material=material),
+        visual=trimesh.visual.TextureVisuals(uv=uv, material=material_for(uv is not None)),
         process=False,
     )
 
 
-def fbx_scene(ai_scene):
+def fbx_scene(ai_scene, textures):
     """
     Build the preview scene from an assimp scene's node tree.
 
     Walks `root_node` depth-first, multiplying each node's transformation into its parent's,
     and draws every mesh of every node at its world transform, so a mesh used by several
     nodes is drawn at each. LOD1+ and collision nodes are skipped with their subtrees, unless
-    skipping would leave nothing to draw. Returns `(scene, poly_count, object_count)`, the
-    counts covering only what is drawn.
+    skipping would leave nothing to draw. Each drawn material asks `textures` (a
+    `textures.SceneTextures`) for its base color texture, and a mesh without UVs keeps the
+    material's color. Returns `(scene, poly_count, object_count)`, the counts covering only
+    what is drawn, and fills the node and UV counts of `textures.report`.
     """
     import numpy as np
     import trimesh
 
-    materials = [fbx_material(m) for m in ai_scene.materials]
     default_material = fbx_material({})
+    # Material index -> (colored, textured or None), built when a drawn mesh first uses it.
+    materials: dict[int, tuple] = {}
     geometries: dict[int, trimesh.Trimesh | None] = {}
+
+    def material_for(mat_index: int, has_uv: bool):
+        if not 0 <= mat_index < len(ai_scene.materials):
+            return default_material
+        if mat_index not in materials:
+            ai_material = ai_scene.materials[mat_index]
+            texture = textures.texture(ai_material)
+            materials[mat_index] = (
+                fbx_material(ai_material),
+                fbx_material(ai_material, texture) if texture else None,
+            )
+        colored, textured = materials[mat_index]
+        if textured is not None and not has_uv:
+            textures.report["no_uv"] += 1
+            return colored
+        return colored if textured is None else textured
 
     def geometry(index: int):
         if index not in geometries:
             ai_mesh = ai_scene.meshes[index]
-            mat_index = ai_mesh.material_index
-            mat = materials[mat_index] if 0 <= mat_index < len(materials) else default_material
-            geometries[index] = _fbx_geometry(ai_mesh, mat)
+            geometries[index] = _fbx_geometry(
+                ai_mesh, lambda has_uv: material_for(ai_mesh.material_index, has_uv)
+            )
         return geometries[index]
 
-    def drawn(skip: bool) -> list[tuple[str, int, np.ndarray]]:
-        out = []
+    def drawn(skip: bool) -> tuple[list[tuple[object, int, np.ndarray]], int]:
+        out, skipped = [], 0
         stack = [(ai_scene.root_node, np.eye(4))]
         while stack:
             node, parent = stack.pop()
             if skip and is_skipped_node(node.name):
+                skipped += 1
                 continue
             world = parent @ np.array(node.transformation, dtype=np.float64).reshape(4, 4)
             for index in node.mesh_indices:
                 if geometry(index) is not None:
-                    out.append((node.name, index, world))
+                    out.append((node, index, world))
             stack.extend((child, world) for child in reversed(node.children))
-        return out
+        return out, skipped
 
-    instances = drawn(skip=True) or drawn(skip=False)
+    instances, skipped = drawn(skip=True)
+    if not instances:
+        instances, skipped = drawn(skip=False)
+    textures.report["drawn_nodes"] = len({id(node) for node, _, _ in instances})
+    textures.report["skipped_nodes"] = skipped
 
     scene = trimesh.Scene()
     poly_count = 0
-    for n, (node_name, index, world) in enumerate(instances):
+    for n, (node, index, world) in enumerate(instances):
         # One glTF mesh per assimp mesh, referenced by every node that draws it.
-        geom_name, frame = f"mesh_{index}", f"{node_name}_{n}"
+        geom_name, frame = f"mesh_{index}", f"{node.name}_{n}"
         if geom_name in scene.geometry:
             scene.graph.update(
                 frame_from=scene.graph.base_frame, frame_to=frame, matrix=world, geometry=geom_name
@@ -200,10 +236,19 @@ def fbx_scene(ai_scene):
 
 
 # ── 3D model metadata & previews ──────────────────────────────────────────────
-def model_meta(source: str, output_dir: str, name: str | None = None) -> dict:
+def model_meta(
+    source: str,
+    output_dir: str,
+    name: str | None = None,
+    library_root: str | None = None,
+    pack_root: str | None = None,
+) -> dict:
     """
     Extract metadata and preview from a 3D model file.
     Supports: .max, .skp, .rfa, .rvt, .obj, .stl, .ply, .dae, .gltf, .glb, .fbx, .3ds, .dwg, .3dm
+
+    FBX/3DS textures are looked up only inside `library_root`, bounded by `pack_root`, and
+    none is read without a library root that contains `source`.
     """
     p = Path(source)
     # Output files are named by `name` (the asset id) so assets that share a
@@ -423,12 +468,16 @@ def model_meta(source: str, output_dir: str, name: str | None = None) -> dict:
                 | assimp_py.Process_JoinIdenticalVertices
                 | assimp_py.Process_SortByPType,
             )
-            t_scene, poly_count, object_count = fbx_scene(ai_scene)
+            from textures import SceneTextures
+
+            textures = SceneTextures(source, library_root, pack_root)
+            t_scene, poly_count, object_count = fbx_scene(ai_scene, textures)
 
             if object_count:
                 out_path = Path(output_dir) / f"{out_name}_preview.glb"
                 t_scene.export(str(out_path), file_type="glb", include_normals=True)
                 res["preview_model"] = str(out_path)
+                res["preview_textures"] = textures.report
                 meta["poly_count"] = poly_count
                 meta["object_count"] = object_count
             else:
@@ -990,7 +1039,13 @@ def model_meta(source: str, output_dir: str, name: str | None = None) -> dict:
 DISPATCH = {
     "image_thumb": lambda p: image_thumb(p["source"], p["output"], p.get("size", 256)),
     "video_thumb": lambda p: video_thumb(p["source"], p["output"], p.get("timestamp", "00:00:01")),
-    "model_meta": lambda p: model_meta(p["source"], p.get("output_dir", ""), p.get("name")),
+    "model_meta": lambda p: model_meta(
+        p["source"],
+        p.get("output_dir", ""),
+        p.get("name"),
+        p.get("library_root"),
+        p.get("pack_root"),
+    ),
 }
 
 
