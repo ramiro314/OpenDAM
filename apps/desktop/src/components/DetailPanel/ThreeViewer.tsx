@@ -4,6 +4,7 @@ import { Suspense, Component, useEffect, useState, type ReactNode } from 'react'
 import { PMREMGenerator, type Texture } from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { convertFileSrc } from '@tauri-apps/api/core';
+import { useAssetStore } from '../../store';
 
 interface ErrorBoundaryProps {
   fallback: ReactNode;
@@ -36,11 +37,21 @@ class ThreeErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryStat
   }
 }
 
-function Model({ url }: { url: string }) {
+export function Model({ url }: { url: string }) {
   const fileUrl = convertFileSrc(url);
   // No Draco or meshopt: their decoders come from a CDN or inline WASM, which the CSP blocks.
   const { scene } = useGLTF(fileUrl, false, false);
   return <primitive object={scene} />;
+}
+
+/**
+ * Shows a rerun preview model: a rerun overwrites the same `<id>_preview.glb`, so this drops
+ * drei's cached copy, under the converted URL `Model` loads it by, and bumps the path's
+ * revision, which remounts every open viewer of it so it loads the new file.
+ */
+export function reloadModel(path: string) {
+  useGLTF.clear(convertFileSrc(path));
+  useAssetStore.getState().bumpModelRevision(path);
 }
 
 /** Lights the scene with a generated room, as the thumbnailer does, instead of a downloaded HDR. */
@@ -65,8 +76,12 @@ function RoomLighting() {
 }
 
 export function ThreeViewer({ modelPath }: { modelPath: string }) {
+  // Each rerun remounts the whole viewer, canvas included, as reopening it would. Remounting only
+  // `Model` inside the live canvas loads the new GLB but leaves it out of the scene.
+  const revision = useAssetStore((s) => s.modelRevisions[modelPath] ?? 0);
   return (
     <ThreeErrorBoundary
+      key={revision}
       fallback={
         <div
           style={{

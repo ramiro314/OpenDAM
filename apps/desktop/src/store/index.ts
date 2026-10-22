@@ -243,6 +243,12 @@ interface AssetStore extends PageCache {
   /** Why the last search failed; the grid shows it instead of results */
   searchError: string | null;
   query: SearchQuery;
+  /**
+   * How many times each preview model (an absolute `<id>_preview.glb` path) was rerun since
+   * the app started. `ThreeViewer` keys itself by it, so a rerun remounts open viewers.
+   * Paths never rerun have no entry.
+   */
+  modelRevisions: Record<string, number>;
 
   setQuery: (q: Partial<SearchQuery>) => void;
   setFilter: (f: Partial<FilterSpec>) => void;
@@ -285,6 +291,8 @@ interface AssetStore extends PageCache {
     render?: { filePath: string; previousThumbnailPath?: string }
   ) => void;
   setPreviewStatus: (id: string, status: Asset['previewStatus']) => void;
+  /** Bumps `path`'s revision in `modelRevisions` */
+  bumpModelRevision: (path: string) => void;
   /** Re-fetches the given assets that are cached or pinned; other ids are ignored */
   refreshAssets: (ids: string[]) => Promise<void>;
 }
@@ -390,6 +398,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
   loading: false,
   searchError: null,
   query: defaultQuery,
+  modelRevisions: {},
 
   setQuery: (q) => set((s) => ({ query: { ...s.query, ...q } })),
 
@@ -637,6 +646,11 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
   setPreviewStatus: (id, status) => {
     get().patchCached(id, (asset) => ({ ...asset, previewStatus: status }));
   },
+
+  bumpModelRevision: (path) =>
+    set((s) => ({
+      modelRevisions: { ...s.modelRevisions, [path]: (s.modelRevisions[path] ?? 0) + 1 },
+    })),
 
   refreshAssets: async (ids) => {
     const loaded = ids.filter((id) => lookupAsset(get(), id));
