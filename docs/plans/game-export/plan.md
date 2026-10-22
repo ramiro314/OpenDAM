@@ -93,6 +93,17 @@ changed:
   each pack's indexed file list. A `conversion.json`, `.meta` or newly matching texture added
   between Check and Export makes Export ask for a new Check (C14, AC11).
 
+Revised a tenth time 2026-10-22 after GitHub Inspector's sixth review of PR #165. No decision
+changed:
+
+- **The added material has a fixed name, chosen before Blender runs.** It is `OpenDAMDefault`, or
+  `OpenDAMDefault2` and up when a kept slot already uses that name. Rust picks it from
+  `fbx_facts`, the Game tab shows it, and the job carries it, so it is in the cache key. Renaming
+  a file no longer leaves a stale slot name in the cache, and the name can't clash with a source
+  slot (C7, C9, C11, C12).
+- **A clashing pack id's suffix skips ids already in the manifest,** so `foo-2` can't collide
+  with a pack really named `foo-2` (C6).
+
 ## Goal
 
 The Dungeon Game takes its art only as **bundles** that OpenDAM exports and the game's importer
@@ -357,8 +368,10 @@ that asset as removed before anything is written (C15).
 
 - **Pack id** (D16): the `datapackage.json` `name` when it matches `^[a-z0-9][a-z0-9-]*$`, else
   the pack folder's name lowercased, with each run of other characters turned into `-` and
-  `-` trimmed from the ends. On a clash within a manifest, the later pack by library order, then
-  path, gets `-2`, `-3`.
+  `-` trimmed from the ends. Every pack gets that natural id first. Then, on a clash, each later
+  pack by library order, then path, gets the lowest `-2`, `-3`, ... suffix whose id no other pack
+  in the manifest holds, natural or suffixed. So `foo`, `foo` and a pack named `foo-2` become
+  `foo`, `foo-3` and `foo-2`.
 - **The other pack fields:** `name` is the pack's shown name (`pack_holding`). `version`,
   `publisher` and `sourceUrl` come from `PackInfo` and your overrides, and are left out when
   absent.
@@ -385,8 +398,8 @@ that asset as removed before anything is written (C15).
 **C7. Materials and roles.** `export::infer` builds each model's materials. The slot list comes
 from `fbx_facts` for the UI and from Blender at export (A3). Both list only the kept meshes'
 slots (C9 step 2), so the Game tab never shows a collision hull's material. When a kept mesh
-has no material, the tab also shows the slot the script will add, named after the model's
-stem and marked as added at export, so its roles can be inferred and edited like any other.
+has no material, the tab also shows the slot the script will add, under the name C9 step 2 gives
+it, marked as added at export, so its roles can be inferred and edited like any other.
 For each slot, the first source with an answer wins (D11):
 
 1. **The FBX's texture references** for the slot (diffuse/base color, normal, metalness,
@@ -441,8 +454,8 @@ passes through.
 `<blender> -b --factory-startup -P <script> -- <job.json> <result.json>`, one process per model
 or animation, at most `max(1, cores / 4)` at a time, each with a 120 s timeout. A timeout or
 crash is a problem naming the asset (D30). The job names the input FBX, the output path, the
-kind, `facingQuarterTurns` and, for an animation, the transform of the model it follows. The
-script:
+kind, `facingQuarterTurns`, the collision patterns, the name of the material to add (step 2) and,
+for an animation, the transform of the model it follows. The script:
 
 1. **Starts from an empty scene and imports** the FBX with Blender's importer (units and axes as
    the file states them). Before importing, the script clears the scene `--factory-startup`
@@ -457,9 +470,13 @@ script:
    one list, `export::collision::PATTERNS`, passed to the script in the job and to `fbx_facts` in
    its request, so both sides keep the same meshes. A material used only by dropped meshes goes
    with them.
-   - **A kept mesh with no material** gets one material named after the model's stem, created
-     in the script, so every exported model has at least one slot (the schema's `materials`
-     needs `minItems` 1). The step records it (`addedMaterial`).
+   - **A kept mesh with no material** gets one material, created in the script, so every
+     exported model has at least one slot (the schema's `materials` needs `minItems` 1). Its
+     name comes from the job, not from any file name. Rust picks it before Blender runs:
+     `OpenDAMDefault` (`export::names::ADDED_MATERIAL`), or the lowest `OpenDAMDefault2`,
+     `OpenDAMDefault3`, ... that no kept slot in `fbx_facts` already uses. So it never clashes
+     with a source slot, and renaming a file doesn't change it. The script refuses a job whose
+     name is already taken, and the step records it (`addedMaterial`).
    - **The source's kept slots and takes** are recorded here, before any change: the materials
      of the kept meshes in Blender's slot order, and the takes that animate something.
 3. **For a model, applies one root transform:**
@@ -514,15 +531,16 @@ sha256 of the source's sha256 (every input's, in order), the operation's setting
 JSON, the tool and its version, and the script or texture constant `<N>` (D3, D33). A Blender
 job's settings include the collision patterns it is sent (`export::collision::PATTERNS`, C9 step
 2), so a change to them re-runs every model and animation rather than reusing a file cut with the
-old patterns. For Blender the tool version in the key is `BLENDER_SERIES` (`5.2`), the only
-versions the gate accepts, so a lookup needs no Blender. An animation's key also includes the
-cache key of the model it follows (C9 step 4). That key covers the model's source,
-`facingQuarterTurns` and origin, so a change to any of them re-runs the animation rather than
-shipping a clip that no longer lines up with its avatarFrom model. The entry holds the output
-file and, for Blender, the result JSON, which records the exact version that made it (`5.2.2`)
-for the step's `toolVersion`. A hit skips Blender and the pixel work, so re-exporting an
-unchanged domain writes byte-identical files: only `exportedAt` changes in the manifest. Source
-hashes are memoized in `file_hashes` (A4). The cache is cleared only from Settings (A9).
+old patterns. They also include the added material's name (C9 step 2), so every input the script
+reads besides the FBX is in the key. For Blender the tool version in the key is `BLENDER_SERIES`
+(`5.2`), the only versions the gate accepts, so a lookup needs no Blender. An animation's key
+also includes the cache key of the model it follows (C9 step 4). That key covers the model's
+source, `facingQuarterTurns` and origin, so a change to any of them re-runs the animation rather
+than shipping a clip that no longer lines up with its avatarFrom model. The entry holds the
+output file and, for Blender, the result JSON, which records the exact version that made it
+(`5.2.2`) for the step's `toolVersion`. A hit skips Blender and the pixel work, so re-exporting
+an unchanged domain writes byte-identical files: only `exportedAt` changes in the manifest.
+Source hashes are memoized in `file_hashes` (A4). The cache is cleared only from Settings (A9).
 
 **C12. The worker's `fbx_facts`.** `worker.py` gains an `fbx_facts` request, which loads the FBX
 with `assimp_py`, as `model_meta` does. The request carries the collision patterns (C9 step 2),
@@ -534,7 +552,8 @@ and the answer follows the script's rules:
   its own named material for such a mesh (C9 step 2);
 - each slot's texture references by type;
 - the mesh names, kept and dropped, whether any kept mesh exists, and whether any kept mesh has
-  no material (so the Game tab can show the slot the script will add);
+  no material (so the Game tab can show the slot the script will add, under the name C9 step 2
+  picks from these slots);
 - the bone names;
 - the takes that animate something (at least one channel), by their FBX take names.
 
@@ -624,6 +643,8 @@ answer per file's size and mtime for the session.
   - an FBX with only a `UCX_` hull and no take, which must be refused (step 4);
   - a model whose only material is named `Material`, which must keep that name, and one with two
     materials of one name, which must be refused (step 4);
+  - a model with a kept slot named `OpenDAMDefault` and a mesh with no material, whose added slot
+    must be `OpenDAMDefault2` (step 4);
   - a mesh-less FBX with a take, and one whose only mesh is a `UCX_` hull plus a take (step 7).
 - **Rust tests (nextest), without Blender:** names, inference, the texture operations
   (pixel-exact on tiny images), `conversion.json` merging, packs and licences, cache keys,
@@ -733,9 +754,11 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   sizes, `min.y` 0, the X and Z centre 0, and the nose toward +Z. The collision meshes are
   dropped, the LOD names are kept, and the take names are preserved. Both `UCX_` variants (a
   hull with its own material, and one with none) export, and so does a model with no material,
-  with one added slot. A model whose material is named `Material` keeps that slot name, and no
-  default cube reaches its bounds or FBX. An FBX with two materials of one name is refused by
-  name.
+  with one added slot named `OpenDAMDefault`. A model that has a kept slot named `OpenDAMDefault`
+  and a mesh with no material gets `OpenDAMDefault2`, and renaming its file changes neither the
+  slot name nor the cached file. A model whose material is named `Material` keeps that slot
+  name, and no default cube reaches its bounds or FBX. An FBX with two materials of one name is
+  refused by name.
 - **AC6.** The animation fixture gets its model's transform, and an animation whose bones don't
   match is refused. An FBX whose only mesh is a `UCX_` hull plus a take exports as an
   animation. Changing the model's `facingQuarterTurns` and exporting again re-runs the
@@ -746,7 +769,8 @@ problem in the Export view, naming the asset, and the step that delivers the wor
 - **AC8.** An asset's `conversion` holds its nearest `conversion.json`'s steps, then OpenDAM's.
   An invalid `conversion.json` refuses the export.
 - **AC9.** The pack id, licence (a `LicenseRef-` kept, Unknown with null), origin, sourcePath and
-  sha256 follow C6. From step 3, a pack whose files' nearest `conversion.json` lies above the
+  sha256 follow C6. Two packs named `foo` and one named `foo-2` in one manifest get `foo`, `foo-3`
+  and `foo-2`. From step 3, a pack whose files' nearest `conversion.json` lies above the
   pack folder and has a `from: "uasset"` step is `unreal`.
 - **AC10.** A second export of the unchanged fixture domain runs no Blender job and writes
   byte-identical files.
