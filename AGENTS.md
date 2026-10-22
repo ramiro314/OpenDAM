@@ -19,12 +19,12 @@ uv and cargo-nextest; uv pins Python from `packages/preview-engine/.python-versi
 | `make dev` | Runs the app with hot reload (`tauri dev`), under a memory cap (see [Memory-heavy tools](#memory-heavy-tools)) |
 | `make lint` | oxlint, oxfmt check, `cargo fmt --check`, clippy (`-D warnings`), ruff format check, ruff check |
 | `make check` | Tauri crate/npm version match, `tsc`, `cargo check` |
-| `make test` | `bun test` and `cargo nextest run`, both writing JUnit XML (see below) |
+| `make test` | `bun test` and `cargo nextest run`, both writing JUnit XML (see below), and the preview engine's `pytest` |
 | `make build` | Release build without bundling (`tauri build --no-bundle`) |
 | `make install` | `make build`, then installs `~/.local/bin/opendam`, a desktop entry, an icon and the preview engine under `~/.local/share/opendam/preview-engine` |
 | `make uninstall` | Removes exactly what `make install` created, never the master DB or a library's `.opendam/` |
 
-CI runs `make deps check lint build` and, in a separate job, the same bun test and nextest runs as `make test`, as separate steps so failed TypeScript test files are rerun once to tell flakes from failures (`.github/actions/mission-flake-report`, settings in `.mission/testing.json`). Pull requests that change only Markdown, `docs/`, `.gitignore` or `LICENSE` skip both jobs, which still passes the required check. Formatting is enforced: run `bun run format`,
+CI runs `make deps check lint build` and, in a separate job, the same bun test, nextest and pytest runs as `make test`, as separate steps so failed TypeScript test files are rerun once to tell flakes from failures (`.github/actions/mission-flake-report`, settings in `.mission/testing.json`). Pull requests that change only Markdown, `docs/`, `.gitignore` or `LICENSE` skip both jobs, which still passes the required check. Formatting is enforced: run `bun run format`,
 `cargo fmt` (in `apps/desktop/src-tauri`) or `uv run ruff format` (in `packages/preview-engine`)
 before committing.
 
@@ -266,6 +266,8 @@ bench's WebKit web process reached 15 to 20 GB in `checks` mode. The cause was t
   - Rust: `cd apps/desktop/src-tauri && cargo nextest run db::tests` (a test-name filter). Unit
     tests live in a `#[cfg(test)] mod tests` in the module they test; `db::memory_library_pool()`
     gives a test an in-memory SQLite database with the library schema.
+  - Python: `cd packages/preview-engine && uv run --frozen pytest tests/test_fbx_scene.py` (or
+    `-k '<name>'`). Tests live in `packages/preview-engine/tests/` and import `worker` directly.
   - JUnit: bun writes `apps/desktop/test-results/junit.xml`, whose `file` attribute names each
     test's file. nextest writes `apps/desktop/src-tauri/target/nextest/ci/junit.xml`, which names
     no file: `classname` is the test binary and `name` the module path, so `db::tests::x` in
