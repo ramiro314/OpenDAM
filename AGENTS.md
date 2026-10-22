@@ -36,8 +36,11 @@ To run, inspect or screenshot the app, read [docs/agents/running-the-app.md](doc
 apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
   src/                        React frontend: components/, store/ (Zustand), api/ (IPC wrappers), types/, utils/
   src-tauri/
-    src/commands/             Tauri IPC commands (asset, autotag, collection, library, preview, settings, shell, tag)
+    src/commands/             Tauri IPC commands (asset, autotag, collection, export, library, preview, settings, shell, tag)
     src/autotag/              AI auto-tagging: settings, keyring credentials, providers, run engine and run tables
+    src/export/               Game export (docs/plans/game-export/plan.md): settings, the export cache, and
+                              check_outside_libraries, which refuses an export root equal to, inside or
+                              holding a library root, after resolving symlinks
     src/db.rs                 Master DB + per-library SQLite pools and pragmas
     src/watcher.rs            Directory indexing and change detection
     src/preview.rs            Rust raster thumbnails + the persistent Python worker bridge
