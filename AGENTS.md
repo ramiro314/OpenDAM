@@ -256,6 +256,13 @@ docs/plans                    Plans for this fork
     FBX/3DS preview is left, done or waiting, so jobs an older process served are redone later.
   - `packages/preview-engine/tools/measure_textures.py` measures all of this on a real library
     without writing to it. Run it under `scripts/memory-cap.sh`.
+- **Source hashes are a memo.** `file_hashes` (library DB) holds a sha256 per file path,
+  relative to the library root, with the size and mtime (nanoseconds) it was taken at. Only the
+  game export's Check writes it (`export::hashes`): a row is used while the file keeps that size
+  and mtime, else the file is hashed again, and fresh hashes are saved in 200-row transactions
+  after the Check reads its files. Nothing prunes rows of files that went away, so never read a
+  row as proof a file exists, and don't treat the table as authoritative: it can always be
+  dropped and refilled.
 
 ## Python preview worker
 
