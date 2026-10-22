@@ -858,10 +858,9 @@ impl PreviewEngine {
         }
     }
 
-    /// Runs one job's request. A worker that fails or takes over `JOB_TIMEOUT` is killed, and
-    /// a new one starts at once.
+    /// Runs one job's request on the serving worker, which `ready` has started. A worker that
+    /// fails or takes over `JOB_TIMEOUT` is killed, and the next `ready` starts a new one.
     async fn run(&mut self, req: &serde_json::Value, source: &Path) -> Result<serde_json::Value> {
-        self.ready().await;
         let Some(worker) = self.worker.as_mut() else {
             return Err(anyhow!("Python worker unavailable"));
         };
@@ -911,9 +910,10 @@ async fn run_python_queue(state: Arc<AppState>, py_exec: PathBuf, worker_py: Pat
 }
 
 /// One round of the Python queue. It starts `engine`'s worker when none is serving and a start
-/// is due, with or without jobs waiting, then claims and runs a batch of each library's jobs,
-/// passing each one's outcome to `finished`. Jobs wait while no worker serves. Returns whether
-/// any job was claimed.
+/// is due, with or without jobs waiting, then runs up to 10 of each library's jobs, passing each
+/// one's outcome to `finished`. Jobs wait while no worker serves: each is claimed only once a
+/// worker is ready for it, so a worker that dies fails only the job it was running, and a round
+/// whose restart backs off leaves the rest queued. Returns whether any job was claimed.
 async fn python_queue_round(
     libs: &[LibraryHandle],
     engine: &mut PreviewEngine,
@@ -934,7 +934,14 @@ async fn python_queue_round(
         let thumb_dir = root_path.join(".opendam").join("thumbs");
         let _ = tokio::fs::create_dir_all(&thumb_dir).await;
 
-        for (job_id, asset_id, file_path) in claim_jobs(pool, &filter, 10).await {
+        for _ in 0..10 {
+            if !engine.ready().await {
+                return processed_any;
+            }
+            let Some((job_id, asset_id, file_path)) = claim_jobs(pool, &filter, 1).await.pop()
+            else {
+                break;
+            };
             processed_any = true;
             let full_source = resolve_source(root_path, &file_path);
             let req = model_meta_request(lib, &job_id, &asset_id, &file_path).await;
@@ -1764,14 +1771,11 @@ done
     }
 
     #[tokio::test]
-    async fn a_job_that_kills_the_worker_unpublishes_and_the_next_round_restarts_it() {
+    async fn a_job_that_kills_the_worker_unpublishes_and_a_new_one_starts_at_once() {
         let dir = tempfile::tempdir().unwrap();
-        // The first process exits on its job, as a crash does; later ones serve jobs
-        let crash = format!(r#"if [ "$n" = 1 ]; then exit 1; fi; {JOB_DONE}"#);
-        let mut engine = stub_engine(dir.path(), ANSWER_2, &crash);
+        // Every process exits on its job, as a crash does
+        let mut engine = stub_engine(dir.path(), ANSWER_2, "exit 1");
         let lib = library_with_pending_job(dir.path(), "models/ship.fbx", "").await;
-        assert!(queue_round(&mut engine, &[]).await.is_empty());
-        assert_eq!(*engine.version.borrow(), Some(2));
 
         let outcomes = queue_round(&mut engine, std::slice::from_ref(&lib)).await;
         assert!(
@@ -1780,16 +1784,17 @@ done
         );
         let (_, status, job) = job_outcome(&lib.pool).await;
         assert_eq!((status.as_str(), job.as_str()), ("error", "error"));
-        assert!(engine.worker.is_none(), "the worker is killed");
-        assert_eq!(
-            *engine.version.borrow(),
-            None,
-            "none yet until a new process answers"
-        );
-
-        // With no job waiting, the next round starts a new process and publishes its answer
-        assert!(queue_round(&mut engine, &[]).await.is_empty());
+        // The same round starts a new process, without waiting for a job, and publishes again
         assert_eq!((engine.starts, *engine.version.borrow()), (2, Some(2)));
+
+        // A failed job kills its worker, and "none yet" holds until a new process answers
+        let req = json!({"id": "j2", "method": "model_meta", "params": {}});
+        assert!(engine.run(&req, Path::new("ship.fbx")).await.is_err());
+        assert!(engine.worker.is_none(), "the worker is killed");
+        assert_eq!(*engine.version.borrow(), None);
+
+        assert!(queue_round(&mut engine, &[]).await.is_empty());
+        assert_eq!((engine.starts, *engine.version.borrow()), (3, Some(2)));
     }
 
     #[tokio::test]
@@ -1806,6 +1811,61 @@ done
         assert!(engine.worker.is_none());
         let (_, status, job) = job_outcome(&lib.pool).await;
         assert_eq!((status.as_str(), job.as_str()), ("pending", "pending"));
+    }
+
+    #[tokio::test]
+    async fn jobs_wait_when_the_worker_dies_mid_round_and_its_restarts_back_off() {
+        let dir = tempfile::tempdir().unwrap();
+        // The first process serves until its job kills it; later ones never answer
+        let engine_info = format!(r#"if [ "$n" = 1 ]; then {ANSWER_2}; else exec sleep 3600; fi"#);
+        let mut engine = stub_engine(dir.path(), &engine_info, "exit 1");
+        engine.info_timeout = Duration::from_millis(200);
+        let a = library_with_pending_job(dir.path(), "models/a.fbx", "").await;
+        sqlx::query(
+            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, preview_status)
+             VALUES ('a2', 'models/a2.fbx', 'a2.fbx', 'fbx', 'model', 0, 0, 0, 'pending');
+             INSERT INTO preview_jobs (id, asset_id, status, created_at) VALUES ('j2', 'a2', 'pending', 0)",
+        )
+        .execute(&a.pool)
+        .await
+        .unwrap();
+        let b = library_with_pending_job(dir.path(), "models/b.fbx", "").await;
+
+        let outcomes = queue_round(&mut engine, &[a.clone(), b.clone()]).await;
+        let [Err(failed)] = &outcomes[..] else {
+            panic!("only the running job fails: {outcomes:?}");
+        };
+        assert_eq!(
+            engine.starts, 3,
+            "the worker and two restarts that time out"
+        );
+        assert!(engine.retry_at.is_some_and(|at| at > Instant::now()));
+
+        let statuses = |pool: Pool<Sqlite>| async move {
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT p.id, p.status, a.preview_status FROM preview_jobs p
+                 JOIN assets a ON a.id = p.asset_id ORDER BY p.id",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        };
+        let waiting = if failed.0 == "j1" { "j2" } else { "j1" };
+        let mut expected = vec![
+            (failed.0.clone(), "error".to_string(), "error".to_string()),
+            (waiting.to_string(), "pending".into(), "pending".into()),
+        ];
+        expected.sort();
+        assert_eq!(statuses(a.pool.clone()).await, expected);
+        assert_eq!(
+            statuses(b.pool.clone()).await,
+            [(
+                "j1".to_string(),
+                "pending".to_string(),
+                "pending".to_string()
+            )],
+            "a later library's job isn't claimed"
+        );
     }
 
     #[tokio::test]
