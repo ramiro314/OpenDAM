@@ -23,6 +23,15 @@ changed:
 - **The largest files are measured.** C12 also runs the 3 largest FBX of each library and reports
   their time and peak RSS against the 60 s job timeout.
 
+Revised a third time 2026-10-21 after the feasibility review of revision 3. No decision changed:
+
+- **No root, no lookup.** A `model_meta` request without `library_root`, or whose source isn't
+  inside it, now reads no texture file at all. Before, it searched the model's folder and 2 levels
+  up with no root bound. This case arises when an app that doesn't send the param drives the new
+  worker. C1, C3, C11 and AC3 say so.
+- **AC6 matches C6.** Only images the worker downscales are re-encoded, so AC6 no longer claims
+  every opaque OBJ or GLB texture becomes JPEG.
+
 ## Problem
 
 FBX and 3DS models preview as plain gray. `model_meta` in `packages/preview-engine/worker.py`
@@ -174,8 +183,18 @@ flowchart LR
   the model's folder or one of its ancestors, or absent when there is none. It is matched with
   `substr` and `path || '/'`, not `LIKE`, since paths hold `_` and `%`.
 
-The JSON-over-stdio protocol and the one persistent process stay as they are. A worker that gets
-neither param still works: it searches only the model's folder and the 2 levels above it.
+The JSON-over-stdio protocol and the one persistent process stay as they are.
+
+**Without a root, no lookup.** A request can lack `library_root`, or name a `library_root` that
+doesn't contain `source`, for example:
+
+- between the step 2 and step 3 tickets;
+- when an older checkout's app drives a newly installed engine.
+
+Then the worker reads no texture file. The FBX still previews, with its transforms, UVs and each
+material's diffuse color (C4), and `preview_textures` records `"no_root": true`. Every C3 step
+needs the root to bound it, so skipping them is the only way to never read outside it. A
+`pack_root` that isn't inside `library_root` is ignored, as if absent.
 
 **C2. FBX/3DS scene.** Import with `Process_Triangulate | Process_GenNormals |
 Process_JoinIdenticalVertices | Process_SortByPType`. Then walk `root_node` depth-first, multiplying
@@ -195,7 +214,8 @@ each node's `transformation` into its parent's.
 
 **C3. Texture resolution** (`resolve_texture`, in a new `packages/preview-engine/textures.py`). For
 each material, the reference is the first path in `TEXTURES[1]` (diffuse), else in `TEXTURES[12]`
-(base color). A `*N` (embedded) reference counts as missing (D2). The steps, first hit wins:
+(base color). A `*N` (embedded) reference counts as missing (D2). Resolution runs only with a
+`library_root` that contains the model (C1). The steps, first hit wins:
 
 1. **As given:** an absolute path that exists and is inside `library_root`.
 2. **Relative:** the path, with `\` read as `/`, joined to the model's folder. Each component is
@@ -342,6 +362,9 @@ GLB fresh and needs nothing.
     - each heuristic, a default material name skipped, and file-prefix refused with 2 materials;
     - not found;
     - no pack (2-level bound);
+    - no `library_root`, and a `library_root` that doesn't contain the model: a texture sitting next
+      to the model is not read, the material keeps its color, and `no_root` is true;
+    - a `pack_root` outside `library_root` is ignored;
     - an `*0` embedded reference counted missing;
     - unreadable, too large, and alpha versus opaque encoding;
     - downscale to 1024.
@@ -465,13 +488,17 @@ invariant. It covers:
 - **AC2.** A missing, unreadable or too-large texture leaves a valid, untextured or colored preview,
   never an error.
 - **AC3.** No lookup reads outside the library root. The by-name search stays within the pack, or
-  2 levels up without one.
+  2 levels up without one. A request without a `library_root` that contains the model reads no
+  texture file.
 - **AC4.** Multi-part and Z-up FBX are drawn with their node transforms, and LOD1+ and collision
   nodes are not drawn.
 - **AC5.** Existing libraries requeue only `done` FBX/3DS items the queue rules allow, once, and
   only when the resolved worker declares a current `PREVIEW_VERSION`. Nothing else is reprocessed.
 - **AC6.** New OBJ, glTF and GLB previews keep their textures, with each one at most 1024 px.
-  Opaque textures are stored as `image/jpeg` and textures with alpha as `image/png`.
+  - An image the worker downscales (C6) is stored as `image/jpeg` when opaque and as `image/png`
+    with alpha.
+  - An image already at most 1024 px keeps trimesh's own encoding.
+  - Every FBX/3DS texture goes through C5, so it always follows the JPEG/PNG rule.
 - **AC7.** The worker stays one process speaking the same protocol. The time and peak RSS on the
   3 largest FBX of each library are reported, against the 60 s job timeout.
 - **AC8.** The PR reports textured counts per sampled pack and why the others aren't.
