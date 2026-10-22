@@ -91,13 +91,15 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
   const setJev = (patch: Partial<AiSettings['jev']>) =>
     setDraft((d) => d && { ...d, jev: { ...d.jev, ...patch } });
 
+  // Each side saves only once it has loaded, so one failing to load doesn't block the other
   const handleSave = async () => {
-    if (!saved || !draft) return;
-    const trimmed = {
-      ...draft,
-      anthropic: { ...draft.anthropic, model: draft.anthropic.model.trim() },
-    };
-    const patch = settingsPatch(saved, trimmed);
+    const patch =
+      saved && draft
+        ? settingsPatch(saved, {
+            ...draft,
+            anthropic: { ...draft.anthropic, model: draft.anthropic.model.trim() },
+          })
+        : null;
     const exportPatch =
       exportSaved && exportDraft ? exportSettingsPatch(exportSaved, exportDraft) : null;
     if (!patch && !exportPatch) {
@@ -105,8 +107,9 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
       return;
     }
     setSaving(true);
-    setError(null);
-    setExportError(null);
+    // Keep a load error on the side that has nothing to save
+    if (patch) setError(null);
+    if (exportPatch) setExportError(null);
     // The export root can be refused, so it saves first and keeps the dialog open when it is
     if (exportPatch) {
       try {
@@ -309,7 +312,7 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
             id="settings-save"
             type="button"
             className={clsx(styles.btn, styles.primaryBtn)}
-            disabled={!draft || saving}
+            disabled={(!draft && !exportDraft) || saving}
             onClick={handleSave}
           >
             Save
