@@ -1,6 +1,7 @@
 pub mod autotag;
 pub mod commands;
 pub mod db;
+pub mod export;
 pub mod model_preview_regen;
 pub mod models;
 pub mod preview;

@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ramiro314/dungeon-game/blob/main/docs/asset-contract.schema.json",
+  "title": "Dungeon Game asset contract, version 1",
+  "description": "A bundle's manifest.json, and (under $defs/conversionFile) a conversion.json. The prose spec is docs/asset-contract.md.",
+  "$ref": "#/$defs/manifest",
+  "$defs": {
+    "pascalName": { "type": "string", "pattern": "^[A-Z][A-Za-z0-9]*$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "vector3": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "role": {
+      "enum": ["BaseColor", "Normal", "MetallicSmoothness", "Occlusion", "Emission", "Height"]
+    },
+    "conversionStep": {
+      "type": "object",
+      "required": ["tool", "toolVersion", "from"],
+      "additionalProperties": false,
+      "properties": {
+        "tool": { "type": "string", "minLength": 1 },
+        "toolVersion": { "type": "string", "minLength": 1 },
+        "by": { "type": "string", "minLength": 1 },
+        "from": { "type": "string", "minLength": 1 },
+        "settings": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "number", "boolean", "null"] }
+        }
+      }
+    },
+    "conversionFile": {
+      "type": "object",
+      "required": ["contractVersion", "steps"],
+      "additionalProperties": false,
+      "properties": {
+        "contractVersion": { "const": 1 },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/conversionStep" }, "minItems": 1 }
+      }
+    },
+    "pack": {
+      "type": "object",
+      "required": ["id", "name", "licence", "origin"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string" },
+        "publisher": { "type": "string" },
+        "sourceUrl": { "type": "string" },
+        "licence": {
+          "type": "object",
+          "required": ["spdx", "name"],
+          "additionalProperties": false,
+          "properties": {
+            "spdx": { "type": ["string", "null"] },
+            "name": { "type": "string" },
+            "url": { "type": "string" }
+          }
+        },
+        "origin": { "enum": ["unity", "unreal", "generic"] }
+      }
+    },
+    "assetCommon": {
+      "type": "object",
+      "required": ["kind", "assetName", "file", "sha256", "pack", "sourcePath", "conversion"],
+      "properties": {
+        "assetName": { "$ref": "#/$defs/pascalName" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "pack": { "type": "string" },
+        "sourcePath": { "type": "string", "minLength": 1 },
+        "conversion": { "type": "array", "items": { "$ref": "#/$defs/conversionStep" } }
+      }
+    },
+    "model": {
+      "allOf": [{ "$ref": "#/$defs/assetCommon" }],
+      "required": ["bounds", "rig", "materials"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "kind": { "const": "model" },
+        "file": { "type": "string", "pattern": "^Models/[A-Z][A-Za-z0-9]*\\.fbx$" },
+        "bounds": {
+          "type": "object",
+          "required": ["min", "max"],
+          "additionalProperties": false,
+          "properties": {
+            "min": { "$ref": "#/$defs/vector3" },
+            "max": { "$ref": "#/$defs/vector3" }
+          }
+        },
+        "rig": { "enum": ["none", "generic", "humanoid"] },
+        "clips": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "materials": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["slot", "name", "textures"],
+            "additionalProperties": false,
+            "properties": {
+              "slot": { "type": "string" },
+              "name": { "$ref": "#/$defs/pascalName" },
+              "surface": { "enum": ["opaque", "cutout"] },
+              "textures": {
+                "type": "object",
+                "propertyNames": { "$ref": "#/$defs/role" },
+                "additionalProperties": { "$ref": "#/$defs/pascalName" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "texture": {
+      "allOf": [{ "$ref": "#/$defs/assetCommon" }],
+      "required": ["role"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "kind": { "const": "texture" },
+        "file": {
+          "type": "string",
+          "pattern": "^Textures/[A-Z][A-Za-z0-9]*_(BaseColor|Normal|MetallicSmoothness|Occlusion|Emission|Height)\\.(png|tga|psd|tif)$"
+        },
+        "role": { "$ref": "#/$defs/role" }
+      }
+    },
+    "animation": {
+      "allOf": [{ "$ref": "#/$defs/assetCommon" }],
+      "required": ["avatarFrom", "clips"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "kind": { "const": "animation" },
+        "file": { "type": "string", "pattern": "^Animations/[A-Z][A-Za-z0-9]*\\.fbx$" },
+        "avatarFrom": { "$ref": "#/$defs/pascalName" },
+        "clips": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "required": ["contractVersion", "domain", "exportedAt", "exporter", "packs", "assets"],
+      "additionalProperties": false,
+      "properties": {
+        "contractVersion": { "const": 1 },
+        "domain": { "$ref": "#/$defs/pascalName" },
+        "exportedAt": { "type": "string", "format": "date-time" },
+        "exporter": {
+          "type": "object",
+          "required": ["name", "version"],
+          "additionalProperties": false,
+          "properties": {
+            "name": { "const": "OpenDAM" },
+            "version": { "type": "string", "minLength": 1 }
+          }
+        },
+        "packs": { "type": "array", "items": { "$ref": "#/$defs/pack" } },
+        "assets": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "$ref": "#/$defs/model" },
+              { "$ref": "#/$defs/texture" },
+              { "$ref": "#/$defs/animation" }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
