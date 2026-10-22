@@ -1490,6 +1490,21 @@ fn known_package(file: &FileRow, known: &KnownPackages) -> Option<PackageMeta> {
         .map(|p| p.meta.clone())
 }
 
+/// The bytes of the `datapackage.json` at `path`, read up to `PACKAGE_BYTES`, or why it is too
+/// large: the one bounded read of the file, for the pass and for the game export's Check.
+pub(crate) fn read_package_bytes(path: &Path) -> std::io::Result<Result<Vec<u8>, String>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path)?
+        .take(PACKAGE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(if read as u64 > PACKAGE_BYTES {
+        Err(format!("larger than {PACKAGE_BYTES} bytes"))
+    } else {
+        Ok(bytes)
+    })
+}
+
 /// What each `datapackage.json` of `files` (path and indexed size) below `root` says
 /// (`parse_package`), why the pass ignores it, or why it couldn't be read. A file indexed or
 /// read at more than `PACKAGE_BYTES` is ignored, and one indexed at more isn't opened. The reads
@@ -1498,7 +1513,6 @@ async fn read_package_files(
     root: &Path,
     files: Vec<(String, i64)>,
 ) -> HashMap<String, std::io::Result<Result<PackageMeta, String>>> {
-    use std::io::Read;
     let too_large = || format!("larger than {PACKAGE_BYTES} bytes");
     let read_all = {
         let (root, files) = (root.to_path_buf(), files.clone());
@@ -1509,16 +1523,8 @@ async fn read_package_files(
                     if u64::try_from(size).is_ok_and(|size| size > PACKAGE_BYTES) {
                         return (path, Ok(Err(too_large())));
                     }
-                    let mut bytes = Vec::new();
-                    let read = std::fs::File::open(root.join(&path))
-                        .and_then(|f| f.take(PACKAGE_BYTES + 1).read_to_end(&mut bytes))
-                        .map(|n| {
-                            if n as u64 > PACKAGE_BYTES {
-                                Err(too_large())
-                            } else {
-                                parse_package(&path, &bytes)
-                            }
-                        });
+                    let read = read_package_bytes(&root.join(&path))
+                        .map(|bytes| bytes.and_then(|bytes| parse_package(&path, &bytes)));
                     (path, read)
                 })
                 .collect()

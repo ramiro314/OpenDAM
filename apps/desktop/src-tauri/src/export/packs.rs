@@ -264,9 +264,12 @@ pub fn licence(info: &PackInfo, edits: &PackOverride) -> Licence {
 }
 
 /// The `name` of the `datapackage.json` at `path` (relative to `root`), if the file reads and
-/// has a string `name`.
+/// has a string `name`. It is read under the structure pass's size limit, so a file the pass
+/// ignores as too large gives no name either.
 pub fn read_package_name(root: &Path, path: &str) -> Option<String> {
-    let bytes = std::fs::read(root.join(path)).ok()?;
+    let bytes = crate::structure::read_package_bytes(&root.join(path))
+        .ok()?
+        .ok()?;
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
     let value: Value = serde_json::from_slice(bytes).ok()?;
     Some(value.get("name")?.as_str()?.trim().to_string()).filter(|n| !n.is_empty())
@@ -570,5 +573,20 @@ mod tests {
         );
         assert_eq!(Origin::Unreal.normal_convention(), Convention::DirectX);
         assert_eq!(Origin::Unity.normal_convention(), Convention::OpenGl);
+    }
+
+    #[test]
+    fn a_package_name_is_read_only_under_the_passes_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.json"), r#"{"name": "props"}"#).unwrap();
+        let big = format!(r#"{{"name": "props"{}}}"#, " ".repeat(1 << 20));
+        std::fs::write(dir.path().join("big.json"), big).unwrap();
+
+        assert_eq!(
+            read_package_name(dir.path(), "small.json").as_deref(),
+            Some("props")
+        );
+        assert_eq!(read_package_name(dir.path(), "big.json"), None);
+        assert_eq!(read_package_name(dir.path(), "missing.json"), None);
     }
 }
