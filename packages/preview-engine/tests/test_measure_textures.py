@@ -104,3 +104,42 @@ def test_a_pack_row_counts_deaths_and_timeouts_as_themselves(worker, tmp_path, m
         "timeout after 0.5 s": 1,
         "no preview": 1,
     }
+
+
+def test_app_previews_follows_the_queue_claim_rule():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """CREATE TABLE assets (id TEXT, file_path TEXT, extension TEXT, size_bytes INTEGER,
+           group_id TEXT, support_role TEXT, bundled_preview TEXT, render_width INTEGER,
+           render_height INTEGER, preview_status TEXT, thumbnail_path TEXT)"""
+    )
+    rows = [
+        # id, path, group, support, bundled preview, size of a render, preview status, thumb
+        ("single", "single.fbx", None, None, None, None, "done", "t.png"),
+        ("glb", "glb.glb", "glb", None, None, None, "done", "t.png"),
+        ("member", "member.fbx", "glb", None, None, None, "done", "t.png"),
+        ("blend", "blend.blend", "blend", None, None, None, "none", None),
+        ("stand_in", "stand_in.fbx", "blend", None, None, None, "done", "t.png"),
+        ("support", "support.fbx", None, "model_preview", None, None, "done", "t.png"),
+        ("pictured", "pictured.fbx", None, None, "big.png", None, "done", "t.png"),
+        ("small", "small.fbx", None, None, "tiny.png", None, "done", "t.png"),
+        ("big", "big.png", None, None, None, 1024, "done", None),
+        ("tiny", "tiny.png", None, None, None, 64, "done", None),
+    ]
+    for i, path, group, support, bundled, side, status, thumb in rows:
+        ext = path.rsplit(".", 1)[1]
+        conn.execute(
+            "INSERT INTO assets VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
+            (i, path, ext, group, support, bundled, side, side, status, thumb),
+        )
+
+    got = {r["id"]: r["app_previews"] for r in measure_textures.fbx_rows(conn, "1", ())}
+    assert got == {
+        "single": 1,
+        "member": 0,  # its GLB main item is what the grid shows
+        "stand_in": 1,  # stands in for a Blend main item with no preview
+        "support": 0,
+        "pictured": 0,  # its render fits a card
+        "small": 1,  # its render is too small to picture it
+    }

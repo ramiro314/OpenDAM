@@ -41,13 +41,25 @@ WHERE is_pack AND (path = '' OR path = ?1 OR substr(?1, 1, length(path) + 1) = p
 ORDER BY length(path) DESC LIMIT 1
 """
 
-# Whether the app previews the file itself: a main item or a file on its own, not a support
-# file and not pictured by a bundled render (`MAIN_OR_SINGLE`, `NOT_SUPPORT`, `pictured`).
-# Other FBX are format-group members whose main item, often a GLB, is what the grid shows.
-APP_PREVIEWS = """
-(a.group_id IS NULL OR a.group_id = a.id) AND a.support_role IS NULL
-AND NOT EXISTS (SELECT 1 FROM assets r WHERE r.file_path = a.bundled_preview
-                AND r.render_width >= 512 AND r.render_height >= 512)
+
+def _pictured(item: str) -> str:
+    """`commands::asset::pictured`: `item`'s bundled render fits a card (`THUMB_SIZE` 512)."""
+    return f"""EXISTS (SELECT 1 FROM assets r WHERE r.file_path = {item}.bundled_preview
+                AND r.render_width >= 512 AND r.render_height >= 512)"""
+
+
+# Whether the app's queue would claim the file's preview job, as the model preview pass requeues
+# it: not a support file (`NOT_SUPPORT`) and `preview::claimable`, so a main item or a file on
+# its own that isn't pictured, or a member standing in for a main item with no preview
+# (`preview::stands_in`). Other FBX are format-group members whose main item, often a GLB, is
+# what the grid shows.
+APP_PREVIEWS = f"""
+a.support_role IS NULL AND (
+  ((a.group_id IS NULL OR a.group_id = a.id) AND NOT {_pictured("a")})
+  OR EXISTS (SELECT 1 FROM assets g
+             WHERE g.id = a.group_id AND g.preview_status = 'none' AND g.thumbnail_path IS NULL
+               AND NOT {_pictured("g")})
+)
 """
 
 
