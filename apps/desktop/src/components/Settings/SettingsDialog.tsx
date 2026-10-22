@@ -7,6 +7,7 @@ import type {
   AiProvider,
   AiSettings,
   AnthropicAccess,
+  BlenderStatus,
   ClaudePlanStatus,
   ConnectionTest,
   ExportSettings,
@@ -16,6 +17,7 @@ import { formatCost } from '../../utils/autotag';
 import { IconSettings, IconX } from '../Icons';
 import {
   ANTHROPIC_MODELS,
+  blenderLine,
   claudePlanLines,
   exportSettingsPatch,
   ignoredOverridesNote,
@@ -420,6 +422,10 @@ function ExportSection({ draft, onChange, error }: ExportSectionProps) {
               A top-level collection whose subcollections are the export domains
             </span>
           </p>
+          <BlenderField
+            path={draft.blenderPath}
+            onChange={(blenderPath) => onChange({ ...draft, blenderPath })}
+          />
         </>
       )}
       {error && (
@@ -574,6 +580,94 @@ function ApiKeyField({ provider, status, onStatus }: ApiKeyFieldProps) {
         </p>
       )}
       {status?.keyringProblem && <p className={styles.warning}>{status.keyringProblem}</p>}
+      {error && (
+        <p className={styles.error} role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+interface BlenderFieldProps {
+  path: string | null;
+  onChange: (path: string | null) => void;
+}
+
+/**
+ * Blender's path, saved with the dialog, and the version found there, checked as the path
+ * changes. Exports that run Blender accept only 5.2.x.
+ */
+function BlenderField({ path, onChange }: BlenderFieldProps) {
+  const [status, setStatus] = useState<BlenderStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [checks, setChecks] = useState(0);
+
+  // Waits for typing to pause, and drops the answer for a path that has since changed
+  useEffect(() => {
+    let current = true;
+    setStatus(null);
+    setError(null);
+    const timer = setTimeout(() => {
+      api
+        .getBlenderStatus(path?.trim() || null)
+        .then((s) => current && setStatus(s))
+        .catch((e) => current && setError(String(e)));
+    }, 400);
+    return () => {
+      current = false;
+      clearTimeout(timer);
+    };
+  }, [path, checks]);
+
+  const choose = async () => {
+    const picked = await open({ directory: false, multiple: false, title: 'Select Blender' });
+    if (typeof picked === 'string') onChange(picked);
+  };
+
+  return (
+    <div className={styles.keyBlock} id="settings-export-blender">
+      <div className={styles.row}>
+        <span className={styles.label}>Blender</span>
+        <input
+          id="settings-export-blender-path"
+          className={styles.input}
+          value={path ?? ''}
+          placeholder="blender on PATH"
+          spellCheck={false}
+          onChange={(e) => onChange(e.target.value || null)}
+        />
+        <button type="button" className={clsx(styles.btn, styles.secondaryBtn)} onClick={choose}>
+          Choose…
+        </button>
+        <button
+          type="button"
+          className={clsx(styles.btn, styles.secondaryBtn)}
+          disabled={!status && !error}
+          onClick={() => setChecks((n) => n + 1)}
+          title="Ask Blender for its version again"
+        >
+          Check again
+        </button>
+      </div>
+      <p className={styles.keyStatus} id="settings-export-blender-status" role="status">
+        {!status && !error && 'Checking Blender…'}
+        {status && (
+          <>
+            <span
+              className={clsx(styles.dot, status.accepted ? styles.dotOn : styles.dotOff)}
+              aria-hidden
+            />
+            {blenderLine(status)}
+          </>
+        )}
+      </p>
+      {status?.version && status.problem && <p className={styles.warning}>{status.problem}</p>}
+      <p className={styles.keyStatus}>
+        <span className={styles.hint}>
+          Exports run Blender 5.2.x for models and animations not already in the export cache
+        </span>
+      </p>
       {error && (
         <p className={styles.error} role="alert">
           {error}

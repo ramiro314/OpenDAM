@@ -25,6 +25,7 @@ import type {
   AnthropicAccess,
   ClaudePlanStatus,
   AiSettingsPatch,
+  BlenderStatus,
   ExportSettings,
   ExportSettingsPatch,
   ProviderStatus,
@@ -155,6 +156,8 @@ export const api = {
     invoke<ExportSettings>('set_export_settings', { patch }),
   /** Deletes every open library's export cache, returning how many it deleted */
   clearExportCache: () => invoke<number>('clear_export_cache'),
+  /** The Blender at `path` (null is `blender` on PATH), its version, and whether exports accept it */
+  getBlenderStatus: (path: string | null) => invoke<BlenderStatus>('get_blender_status', { path }),
 
   // Auto-tagging runs. Progress arrives as `autotag:updated` events.
   listAutotagProviders: () => invoke<AutotagProviderOption[]>('list_autotag_providers'),

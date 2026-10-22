@@ -399,6 +399,19 @@ export interface ExportSettings {
   root: string | null;
   /** A top-level, non-smart collection whose children are the export domains */
   rootCollection: string | null;
+  /** An absolute path to Blender. Null means `blender` on PATH. */
+  blenderPath: string | null;
+}
+
+/** The Blender an export would run, read for Settings */
+export interface BlenderStatus {
+  path: string | null;
+  /** "5.2.2" */
+  version: string | null;
+  /** Whether exports accept it: only Blender 5.2.x */
+  accepted: boolean;
+  /** Why exports can't use it, when they can't */
+  problem: string | null;
 }
 
 /** The fields to change, where null clears one */
