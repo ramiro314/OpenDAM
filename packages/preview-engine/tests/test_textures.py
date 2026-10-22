@@ -392,6 +392,14 @@ def test_the_synty_reference_prefix_takes_the_plain_atlas(lib):
         "Pack/Textures/PolygonCity_01.png",
         "ref_prefix",
     )
+    # `PolygonCity_B` and `_C` have one extra part, like `PolygonCity_01`: the path breaks the tie.
+    touch(lib / "Pack/Textures/PolygonCity_B.png")
+    touch(lib / "Pack/Textures/PolygonCity_C.png")
+    textures.clear_index_cache()
+    assert guess(reference, src, lib, "lambert2") == (
+        "Pack/Textures/PolygonCity_01.png",
+        "ref_prefix",
+    )
 
 
 def test_the_reference_prefix_prefers_the_fewest_extra_parts(lib):
