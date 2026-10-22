@@ -57,6 +57,14 @@ Revised a fifth time 2026-10-22 after GitHub Inspector's review of PR #165. No d
 - **`Mat` is no longer a name prefix,** so `Mattress_01` stays `Mattress01`. `MAT_` still drops,
   in any case (C5).
 
+Revised a sixth time 2026-10-22 after GitHub Inspector's second review of PR #165. No decision
+changed:
+
+- **The collision patterns are in every Blender cache key,** so changing them re-runs the jobs
+  instead of reusing a model cut with the old patterns (C11).
+- **An export root inside a library, or holding one, is refused,** so exported files never get
+  indexed as new assets (C2, AC15).
+
 ## Goal
 
 The Dungeon Game takes its art only as **bundles** that OpenDAM exports and the game's importer
@@ -245,6 +253,11 @@ The Settings dialog gains a **Game export** section with a folder picker, a pick
 top-level, non-smart collection, Blender's path with its detected version, and "Clear export
 cache". An export with the root or the root collection unset is refused.
 
+- **The export root must lie outside every library.** An export root that equals a library root,
+  lies inside one, or contains one is refused, both when it is set and at each check. Otherwise
+  the watcher would index the written `Models/*.fbx` and `Textures/*` files as new assets. They
+  would join format groups beside their sources and feed back into texture inference on the
+  next export. Paths are compared after resolving symlinks.
 - **The Blender gate** (D29) applies only to an export that has at least one uncached model or
   animation job (C9, C11). Such an export is refused when Blender is missing or isn't 5.2.x. An
   export of textures only, or one whose models and animations all hit the cache, never starts
@@ -252,9 +265,9 @@ cache". An export with the root or the root collection unset is refused.
   (C11).
 - **The accepted series** is the constant `BLENDER_SERIES = "5.2"`, and a test checks that CI's
   pinned version starts with it.
-- **When they land:** `export.root`, `export.rootCollection` and the cache button come in step 1.
-  `export.blenderPath`, the gate, `BLENDER_SERIES` and its CI-pin test come in step 6, together
-  with the CI install they check.
+- **When they land:** `export.root` (with its outside-every-library check),
+  `export.rootCollection` and the cache button come in step 1. `export.blenderPath`, the gate,
+  `BLENDER_SERIES` and its CI-pin test come in step 6, together with the CI install they check.
 
 **C3. Domains.** A domain is a direct child of the root collection.
 
@@ -455,16 +468,18 @@ settings (D17).
 
 **C11. The export cache.** Each library has `.opendam/export-cache/`. An entry is keyed by the
 sha256 of the source's sha256 (every input's, in order), the operation's settings as canonical
-JSON, the tool and its version, and the script or texture constant `<N>` (D3, D33). For Blender
-the tool version in the key is `BLENDER_SERIES` (`5.2`), the only versions the gate accepts, so a
-lookup needs no Blender. An animation's key also includes the cache key of the model it follows
-(C9 step 4). That key covers the model's source, `facingQuarterTurns` and origin, so a change to
-any of them re-runs the animation rather than shipping a clip that no longer lines up with its
-avatarFrom model. The entry holds the output file and, for Blender, the result JSON,
-which records the exact version that made it (`5.2.2`) for the step's `toolVersion`. A hit
-skips Blender and the pixel work, so re-exporting an unchanged domain writes byte-identical
-files: only `exportedAt` changes in the manifest. Source hashes are memoized in `file_hashes`
-(A4). The cache is cleared only from Settings (A9).
+JSON, the tool and its version, and the script or texture constant `<N>` (D3, D33). A Blender
+job's settings include the collision patterns it is sent (`export::collision::PATTERNS`, C9 step
+2), so a change to them re-runs every model and animation rather than reusing a file cut with the
+old patterns. For Blender the tool version in the key is `BLENDER_SERIES` (`5.2`), the only
+versions the gate accepts, so a lookup needs no Blender. An animation's key also includes the
+cache key of the model it follows (C9 step 4). That key covers the model's source,
+`facingQuarterTurns` and origin, so a change to any of them re-runs the animation rather than
+shipping a clip that no longer lines up with its avatarFrom model. The entry holds the output
+file and, for Blender, the result JSON, which records the exact version that made it (`5.2.2`)
+for the step's `toolVersion`. A hit skips Blender and the pixel work, so re-exporting an
+unchanged domain writes byte-identical files: only `exportedAt` changes in the manifest. Source
+hashes are memoized in `file_hashes` (A4). The cache is cleared only from Settings (A9).
 
 **C12. The worker's `fbx_facts`.** `worker.py` gains an `fbx_facts` request, which loads the FBX
 with `assimp_py`, as `model_meta` does. The request carries the collision patterns (C9 step 2),
@@ -567,7 +582,8 @@ answer per file's size and mtime for the session.
 Each one names the asset (or file) and the rule it broke, and the Export view lists them all:
 
 - The root or root collection is unset, a domain or root name isn't PascalCase, or the domain or
-  one of its subcollections is smart.
+  one of its subcollections is smart. The export root equals a library root, lies inside one, or
+  contains one (C2).
 - An uncached model or animation needs Blender, and Blender is missing or isn't 5.2.x (C2). A
   Blender job timed out or crashed.
 - A member is in no pack. A model's group has no FBX. A member is neither a model, an animation
@@ -673,6 +689,9 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   The ticket that carries it writes "Part of", not "Closes".
 - **AC14.** Each guard in [Build order](#build-order) refuses its case, naming the asset, until
   the step that delivers the work, and that step's tests show the case exporting instead.
+- **AC15.** An export root equal to a library root, inside one, or containing one is refused,
+  both in Settings and at the check (step 1). From step 6, changing the collision patterns
+  changes every Blender cache key, so the next export re-runs the jobs.
 
 ## Known gaps
 
