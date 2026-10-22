@@ -381,7 +381,7 @@ def test_the_synty_reference_prefix_takes_the_plain_atlas(lib):
         touch(lib / f"Pack/Textures/{stem}.png")
     touch(lib / "Pack/Textures/PolygonCity_01_Normal.png")
     reference = "U:\\Dropbox\\SyntyStudios\\PolygonCity\\PolygonCity_Texture.psd"
-    # The fewest extra parts win; a non-diffuse map is never a candidate.
+    # A non-diffuse map is never a candidate.
     assert guess(reference, src, lib, "lambert2") == (
         "Pack/Textures/PolygonCity_01_A.png",
         "ref_prefix",
@@ -390,6 +390,17 @@ def test_the_synty_reference_prefix_takes_the_plain_atlas(lib):
     textures.clear_index_cache()
     assert guess(reference, src, lib, "lambert2") == (
         "Pack/Textures/PolygonCity_01.png",
+        "ref_prefix",
+    )
+
+
+def test_the_reference_prefix_prefers_the_fewest_extra_parts(lib):
+    # `PolygonCity_01_A` sorts first by path, so only the part count picks `PolygonCity_Atlas`.
+    src = model(lib, "Pack/Models/house.fbx")
+    touch(lib / "Pack/Textures/PolygonCity_01_A.png")
+    touch(lib / "Pack/Textures/PolygonCity_Atlas.png")
+    assert guess("PolygonCity_Texture.psd", src, lib) == (
+        "Pack/Textures/PolygonCity_Atlas.png",
         "ref_prefix",
     )
 
@@ -426,6 +437,7 @@ def test_core_tries_stop_at_the_floor():
         "barrel",
     ]
     assert list(textures.core_tries("fill_b")) == ["fill_b"]
+    assert list(textures.core_tries("stone_01")) == ["stone_01"]  # `stone` is 5 characters
     assert list(textures.core_tries("123456_7_x")) == ["123456_7_x"]
     assert list(textures.core_tries("")) == []
     assert textures.core_stem("SM_Rock") == textures.core_stem("TX_Rock") == "rock"
