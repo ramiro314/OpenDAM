@@ -67,7 +67,7 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
           {!check && !error && (
             <p className={styles.hint}>
               Check reads {domain.name} and its subcollections, and lists what the bundle would hold
-              and what refuses the export. It writes nothing.
+              and what refuses the export. It writes no files, only cached file hashes.
             </p>
           )}
           {error && <p className={dialog.error}>{error}</p>}

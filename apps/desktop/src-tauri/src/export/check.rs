@@ -628,6 +628,13 @@ fn names(reads: &[Read], problems: &mut Vec<Problem>) {
     }
 }
 
+/// One asset's manifest entry, with the asset it is and its pack's index in the domain's packs.
+struct Entry<'a> {
+    value: Value,
+    asset: &'a AssetRef,
+    pack: usize,
+}
+
 /// The manifest of the assets no problem names, and the problems its schema validation and the
 /// importer's rules (C1) find, each naming the asset at its pointer.
 fn manifest(
@@ -641,8 +648,7 @@ fn manifest(
         .flat_map(|p| &p.assets)
         .map(|a| a.asset_id.as_str())
         .collect();
-    let mut entries: Vec<(Value, &AssetRef)> = Vec::new();
-    let mut used_packs = std::collections::BTreeSet::new();
+    let mut entries: Vec<Entry> = Vec::new();
     for read in reads {
         let (Some(texture), Some(pack)) = (&read.ready, read.pack) else {
             continue;
@@ -650,10 +656,9 @@ fn manifest(
         if refused.contains(read.row.asset.asset_id.as_str()) {
             continue;
         }
-        used_packs.insert(pack);
         let role = texture.role.as_str();
-        entries.push((
-            json!({
+        entries.push(Entry {
+            value: json!({
                 "kind": "texture",
                 "assetName": texture.name,
                 "file": format!("Textures/{}_{role}.{}", texture.name, texture.extension),
@@ -663,35 +668,69 @@ fn manifest(
                 "conversion": [],
                 "role": role,
             }),
-            &read.row.asset,
-        ));
+            asset: &read.row.asset,
+            pack,
+        });
     }
     let kind_rank = |v: &Value| match v["kind"].as_str() {
         Some("model") => 0,
         Some("texture") => 1,
         _ => 2,
     };
-    entries.sort_by(|(a, _), (b, _)| {
-        (kind_rank(a), a["assetName"].as_str(), a["role"].as_str()).cmp(&(
-            kind_rank(b),
-            b["assetName"].as_str(),
-            b["role"].as_str(),
-        ))
+    entries.sort_by(|a, b| {
+        let key = |v: &Value| {
+            (
+                kind_rank(v),
+                v["assetName"].as_str().map(str::to_string),
+                v["role"].as_str().map(str::to_string),
+            )
+        };
+        key(&a.value).cmp(&key(&b.value))
     });
-    let mut packs: Vec<&packs::ExportPack> = used_packs.iter().map(|p| &export_packs[*p]).collect();
-    packs.sort_by(|a, b| a.id.cmp(&b.id));
-    let manifest = json!({
-        "contractVersion": contract::CONTRACT_VERSION,
-        "domain": domain,
-        "exportedAt": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
-        "exporter": { "name": "OpenDAM", "version": env!("CARGO_PKG_VERSION") },
-        "packs": packs.iter().map(|p| p.manifest_entry()).collect::<Vec<_>>(),
-        "assets": entries.iter().map(|(v, _)| v.clone()).collect::<Vec<_>>(),
-    });
+    validated(domain, entries, export_packs)
+}
 
-    let assets: Vec<&AssetRef> = entries.iter().map(|(_, asset)| *asset).collect();
-    let found = invalid(&manifest, domain, &assets);
-    (manifest, found)
+/// Validates the manifest of `entries` and drops every asset an error names, with the packs only
+/// it used, until what is left passes, so the manifest holds exactly the assets that are ready.
+/// Returns that manifest and the problems found on the way.
+fn validated(
+    domain: &str,
+    mut entries: Vec<Entry>,
+    export_packs: &[packs::ExportPack],
+) -> (Value, Vec<Problem>) {
+    let exported_at = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let mut found: Vec<Problem> = Vec::new();
+    loop {
+        let used: std::collections::BTreeSet<usize> = entries.iter().map(|e| e.pack).collect();
+        let mut packs: Vec<&packs::ExportPack> = used.iter().map(|p| &export_packs[*p]).collect();
+        packs.sort_by(|a, b| a.id.cmp(&b.id));
+        let manifest = json!({
+            "contractVersion": contract::CONTRACT_VERSION,
+            "domain": domain,
+            "exportedAt": exported_at,
+            "exporter": { "name": "OpenDAM", "version": env!("CARGO_PKG_VERSION") },
+            "packs": packs.iter().map(|p| p.manifest_entry()).collect::<Vec<_>>(),
+            "assets": entries.iter().map(|e| e.value.clone()).collect::<Vec<_>>(),
+        });
+
+        let assets: Vec<&AssetRef> = entries.iter().map(|e| e.asset).collect();
+        let problems = invalid(&manifest, domain, &assets);
+        let named: HashSet<String> = problems
+            .iter()
+            .flat_map(|p| &p.assets)
+            .map(|a| a.asset_id.clone())
+            .collect();
+        for problem in problems {
+            if !found.contains(&problem) {
+                found.push(problem);
+            }
+        }
+        // Each round drops at least one asset, so this ends
+        if named.is_empty() {
+            return (manifest, found);
+        }
+        entries.retain(|e| !named.contains(&e.asset.asset_id));
+    }
 }
 
 /// The problems of `manifest` that schema validation and the importer's rules (C1) find, each
@@ -1569,5 +1608,56 @@ mod tests {
         assert!(unnamed[0]
             .message
             .starts_with("The manifest is invalid at /domain: "));
+    }
+
+    #[test]
+    fn assets_the_manifest_validation_refuses_leave_the_manifest_with_their_packs() {
+        let asset = |id: &str| AssetRef {
+            library_id: "lib".into(),
+            asset_id: id.into(),
+            file_path: format!("Pack/{id}.png"),
+        };
+        let (rock, moss) = (asset("rock"), asset("moss"));
+        let pack = |id: &str| packs::ExportPack {
+            id: id.into(),
+            name: id.into(),
+            version: None,
+            publisher: None,
+            source_url: None,
+            licence: packs::Licence {
+                spdx: None,
+                name: "Unknown".into(),
+                url: None,
+            },
+            origin: packs::Origin::Generic,
+        };
+        let entry = |name: &str, sha256: &str, pack: usize, asset| Entry {
+            value: json!({
+                "pack": (["rocks", "moss"][pack]),
+                "kind": "texture", "assetName": name, "file": format!("Textures/{name}_BaseColor.png"),
+                "sha256": sha256, "sourcePath": format!("{name}.png"),
+                "conversion": [], "role": "BaseColor"
+            }),
+            asset,
+            pack,
+        };
+        let entries = vec![
+            entry("Moss", &"0".repeat(64), 1, &moss),
+            // A bad sha256: the schema refuses this asset
+            entry("Rock", "BAD", 0, &rock),
+        ];
+
+        let (manifest, problems) = validated("Props", entries, &[pack("rocks"), pack("moss")]);
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].assets, std::slice::from_ref(&rock));
+        assert!(problems[0]
+            .message
+            .starts_with("Pack/rock.png: the manifest is invalid at /assets/1/sha256: "));
+        assert_eq!(manifest["assets"].as_array().unwrap().len(), 1);
+        assert_eq!(manifest["assets"][0]["assetName"], "Moss");
+        assert_eq!(manifest["packs"], json!([pack("moss").manifest_entry()]));
+        assert_eq!(contract::validate_manifest(&manifest), Ok(()));
+        assert_eq!(contract::check_rules(&manifest), Ok(()));
     }
 }
