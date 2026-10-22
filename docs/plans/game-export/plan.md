@@ -1,7 +1,18 @@
 # Game export: collections to Dungeon Game bundles
 
-Status: shaped 2026-10-22 in a three-round interview (D1-D34 below). Once this plan merges,
-Mission Control slices it into tickets.
+Status: shaped 2026-10-22 in a three-round interview (D1-D34 below) and approved at final review.
+Once this plan merges, Mission Control slices it into tickets.
+
+Revised 2026-10-22 after the plan validation workflow's review. No decision changed:
+
+- **Every intermediate step is safe to ship.** The build order now guards textures as it guards
+  models. Until step 3, a texture under a `conversion.json` is refused. Until step 5, so is a
+  texture that needs a conversion. Neither ships with a false `conversion: []` or unconverted
+  pixels.
+- **Animations wait for step 7.** Until then, a domain holding an animation is refused. The
+  mesh-less fixture, the animation assertions, AC6 and AC2's animation move to step 7, so step 6
+  consumes nothing that step 7 makes.
+- **Default names come in step 1,** with the first export, and step 2 adds editing them.
 
 ## Goal
 
@@ -432,7 +443,7 @@ answer per file's size and mtime for the session.
   `blender -b -P`, writes a small library that is committed with its output:
   - a centimetre, Z-up FBX with an asymmetric nose on its front;
   - an Unreal-style FBX with a `UCX_` mesh, `_LOD0`/`_LOD1` and two material slots;
-  - a skinned model with one take, and a mesh-less FBX with a take;
+  - a skinned model with one take, and (from step 7) a mesh-less FBX with a take;
   - textures: an AORM PNG, a DirectX normal map, a JPG base color with a cut-out alpha, and a
     separate Roughness and Metallic pair;
   - a `conversion.json` in a folder, and a deeper one below it;
@@ -446,7 +457,7 @@ answer per file's size and mtime for the session.
   model. They check:
   - bounds, pivot, and that the nose is at +Z;
   - that the collision mesh is gone and the LOD names are kept;
-  - take names, and that the animation follows its model;
+  - take names, and (from step 7) that the animation follows its model;
   - a second export reusing the cache, byte-identical.
   They find Blender through `OPENDAM_BLENDER`. Locally they skip with a message when it is
   missing. Under `CI` they fail.
@@ -479,19 +490,36 @@ Mission Control slices this into tickets after the plan merges. The natural orde
 shippable on its own:
 
 1. **Contract and skeleton:** C1 (schema copy, pin test, sync script, validation), C2 settings,
-   C3 domains, C6 packs and provenance, and C15's staging and swap. These export pass-through
-   textures with sha256, provenance and `conversion: []`, plus the Export view's list, problems
-   and diff (C14).
-2. **Names and edits:** C4, C5, and the Game tab's name fields (C13).
+   C3 domains, C5's default names, C6 packs and provenance, and C15's staging and swap. These
+   export standalone pass-through textures with their default names, sha256, provenance and
+   `conversion: []`, plus the Export view's list, problems and diff (C14).
+2. **Edits:** C4, and the Game tab's name fields (C13), so a default name can be changed.
 3. **conversion.json:** C10.
 4. **Materials and roles:** C12 `fbx_facts`, C7 inference, and the Game tab's material editor.
 5. **Texture conversion:** C8 and C11 for textures.
-6. **Blender normalization:** C9, C11 for models, the CI Blender install, and the fixtures
-   (C16). Models enter the export here.
-7. **Animations and rigs:** the rest of C9 (avatarFrom, follow transform, humanoid suggestion).
+6. **Blender normalization of models:** C9 for models (steps 1-3, 5 and 6 of the script), C11
+   for models, the CI Blender install, and the fixtures (C16) except the mesh-less animation FBX.
+   Models enter the export here, with AC2 (without its animation), AC5 and AC10.
+7. **Animations and rigs:** the rest of C9 (script step 4, avatarFrom, the follow transform and
+   the humanoid suggestion), the mesh-less animation fixture, the Blender-backed animation
+   assertions, AC6, and AC2 with its animation.
 
-Until step 6, a domain holding a model is refused with "model export not built yet", so no
-bundle ever carries an unnormalized model.
+**Guards between steps.** Each step refuses what a later step has yet to make right, so no
+intermediate build ever writes a bundle that breaks the contract. Each guard is an ordinary
+problem in the Export view, naming the asset, and the step that delivers the work removes it:
+
+- **Until step 3,** a texture with a `conversion.json` anywhere from its folder up to its library
+  root is refused with "conversion.json support not built yet". Shipping it with
+  `conversion: []` would claim it is the pack's own.
+- **Until step 5,** a texture that needs any C8 operation is refused with "texture conversion not
+  built yet". That covers a source format other than png/tga/psd/tif (`.tiff` excepted), an ORM,
+  split or MaskMap layout, and a normal map whose convention (D14) is DirectX. Only textures that
+  pass through byte for byte are exported.
+- **Until step 6,** a domain holding a format group with an FBX member (a model, or an animation)
+  is refused with "model export not built yet", so no bundle ever carries an unnormalized model.
+- **Until step 7,** a domain holding an animation (an FBX with no mesh and at least one take,
+  from `fbx_facts`) is refused with "animation export not built yet". Models that carry their own
+  takes export from step 6, with their `clips`.
 
 ## Acceptance criteria
 
@@ -499,7 +527,8 @@ bundle ever carries an unnormalized model.
   reproduces it from dungeon-game at the recorded commit.
 - **AC2.** The fixture domain exports to `<root>/<Root>/<Domain>/`, holding `manifest.json` and
   exactly the listed files. The manifest passes the schema and C1's checks, and every file
-  matches its sha256 (a Blender-backed test, in CI).
+  matches its sha256 (a Blender-backed test, in CI). From step 6 it covers the fixture's models
+  and textures, and from step 7 its animation too.
 - **AC3.** Default names follow C5. A collision refuses the export, naming both assets, and an
   edit fixes it and survives a reindex.
 - **AC4.** On the fixtures, inference gives the expected materials, roles, layouts, surfaces and
@@ -525,6 +554,8 @@ bundle ever carries an unnormalized model.
 - **AC13 (by hand, not an agent's).** The fixture bundle that OpenDAM writes passes dungeon-game's
   `make art BUNDLE=<path>` once the importer exists. This confirms the axes and units end to end.
   The ticket that carries it writes "Part of", not "Closes".
+- **AC14.** Each guard in [Build order](#build-order) refuses its case, naming the asset, until
+  the step that delivers the work, and that step's tests show the case exporting instead.
 
 ## Known gaps
 
