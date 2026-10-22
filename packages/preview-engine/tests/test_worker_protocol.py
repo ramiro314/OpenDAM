@@ -99,17 +99,39 @@ def test_every_pbr_slot_over_1024_px_is_downscaled_and_a_shared_one_once(tmp_pat
 def test_every_slot_is_checked_and_small_images_keep_their_encoding(tmp_path):
     big = Image.new("RGB", (2048, 2048))
     small = Image.new("RGB", (512, 512))
+    edge = Image.new("RGB", (600, 1024))
     simple = trimesh.visual.material.SimpleMaterial(image=Image.new("RGB", (4096, 1024)))
     pbr = PBRMaterial(**{slot: big for slot in worker.PBR_TEXTURE_SLOTS})
-    kept = PBRMaterial(baseColorTexture=small)
-    scene = trimesh.Scene([quad(simple), quad(pbr, 2), quad(kept, 4)])
+    kept = PBRMaterial(baseColorTexture=small, normalTexture=edge)
+    over = PBRMaterial(baseColorTexture=Image.new("RGB", (1025, 600)))
+    scene = trimesh.Scene([quad(simple), quad(pbr, 2), quad(kept, 4), quad(over, 6)])
 
     worker.downscale_textures(scene)
 
     assert simple.image.size == (1024, 256) and simple.image.format == "JPEG"
     shrunk = [getattr(pbr, slot) for slot in worker.PBR_TEXTURE_SLOTS]
     assert len({id(img) for img in shrunk}) == 1 and shrunk[0].size == (1024, 1024)
-    assert kept.baseColorTexture is small
+    assert kept.baseColorTexture is small and kept.normalTexture is edge
+    assert max(over.baseColorTexture.size) == 1024
+
+
+def test_an_image_that_fails_to_shrink_is_kept(tmp_path, monkeypatch):
+    bad = Image.new("RGB", (2048, 2048))
+    good = Image.new("RGB", (2048, 2048))
+    first = PBRMaterial(baseColorTexture=bad, normalTexture=good)
+    second = PBRMaterial(baseColorTexture=bad)
+    shrink = textures.shrink_image
+
+    def failing(img):
+        if img is bad:
+            raise OSError("truncated")
+        return shrink(img)
+
+    monkeypatch.setattr(textures, "shrink_image", failing)
+    worker.downscale_textures(trimesh.Scene([quad(first), quad(second, 2)]))
+
+    assert first.baseColorTexture is bad and second.baseColorTexture is bad
+    assert first.normalTexture.size == (1024, 1024)
 
 
 def test_an_image_with_any_alpha_below_255_stays_png():
