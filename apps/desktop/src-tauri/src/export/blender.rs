@@ -47,7 +47,8 @@ pub async fn gate(configured: Option<&str>) -> Result<Blender, String> {
 
 /// `gate`'s answer, for Settings.
 pub async fn status(configured: Option<&str>) -> BlenderStatus {
-    let path = program(configured, std::env::var_os("PATH").as_deref());
+    let path = program(configured, std::env::var_os("PATH").as_deref())
+        .filter(|_| configured.is_none_or(|p| check_path(p).is_ok()));
     let mut status = BlenderStatus {
         series: BLENDER_SERIES,
         path: path.as_ref().map(|p| p.display().to_string()),
@@ -66,6 +67,9 @@ pub async fn status(configured: Option<&str>) -> BlenderStatus {
 
 /// Finds Blender and asks its version.
 pub async fn detect(configured: Option<&str>) -> Result<Blender, String> {
+    if let Some(path) = configured {
+        check_path(path)?;
+    }
     let Some(program) = program(configured, std::env::var_os("PATH").as_deref()) else {
         return Err(match configured {
             Some(path) => format!("No Blender at {path}"),
@@ -95,6 +99,16 @@ pub async fn detect(configured: Option<&str>) -> Result<Blender, String> {
     let version = parse_version(&String::from_utf8_lossy(&output.stdout))
         .ok_or_else(|| format!("{} didn't report a Blender version", program.display()))?;
     Ok(Blender { program, version })
+}
+
+/// Refuses a configured path that isn't absolute, both when it is saved and when it is checked,
+/// so Settings never accepts a path relative to the app's working directory that it can't save.
+pub fn check_path(path: &str) -> Result<(), String> {
+    if Path::new(path).is_absolute() {
+        Ok(())
+    } else {
+        Err(format!("Blender's path {path} is not an absolute path"))
+    }
 }
 
 /// The executable an export would run: `configured` if it is one, else `blender` on `path_var`.
@@ -266,6 +280,26 @@ mod tests {
             assert_eq!(status.version, None);
             assert_eq!(status.problem, Some(error));
         }
+    }
+
+    #[tokio::test]
+    async fn a_relative_path_is_refused_even_when_it_reaches_a_blender() {
+        let dir = tempfile::tempdir().unwrap();
+        let blender = stub(dir.path(), "Blender 5.2.2\\n");
+        // The same stub, reached from the working directory through `..`
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count() - 1);
+        let relative = format!("{up}{}", blender.strip_prefix("/").unwrap().display());
+        assert!(Path::new(&relative).is_file(), "{relative}");
+
+        let error = gate(Some(&relative)).await.unwrap_err();
+        let status = status(Some(&relative)).await;
+
+        assert!(error.contains("is not an absolute path"), "{error}");
+        assert_eq!(status.path, None);
+        assert_eq!(status.version, None);
+        assert!(!status.accepted);
+        assert_eq!(status.problem, Some(error));
     }
 
     #[test]

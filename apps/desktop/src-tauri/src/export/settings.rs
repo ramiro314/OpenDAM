@@ -7,6 +7,8 @@ use serde_json::Value;
 use sqlx::{Pool, Sqlite};
 use std::path::{Path, PathBuf};
 
+use super::blender;
+
 const ROOT_KEY: &str = "export.root";
 const ROOT_COLLECTION_KEY: &str = "export.rootCollection";
 const BLENDER_PATH_KEY: &str = "export.blenderPath";
@@ -66,18 +68,17 @@ pub async fn update(pool: &Pool<Sqlite>, patch: Value) -> Result<ExportSettings,
         };
         let value = match value {
             Value::Null => None,
-            Value::String(s) if !s.trim().is_empty() => Some(s),
-            Value::String(_) => None,
+            // Blender's path is saved trimmed, as Settings checks it (`blender::check_path`)
+            Value::String(s) if key == BLENDER_PATH_KEY => Some(s.trim().to_string()),
+            Value::String(s) => Some(s),
             _ => return Err(format!("export.{field} must be a string or null")),
-        };
+        }
+        .filter(|s| !s.trim().is_empty());
         if let Some(value) = &value {
             match key {
                 ROOT_KEY => check_root(pool, value).await?,
                 ROOT_COLLECTION_KEY => check_root_collection(pool, value).await?,
-                _ if !Path::new(value).is_absolute() => {
-                    return Err(format!("Blender's path {value} is not an absolute path"))
-                }
-                _ => {}
+                _ => blender::check_path(value)?,
             }
         }
         changed.push((key, value));
@@ -275,6 +276,15 @@ mod tests {
                 ("export.root".to_string(), json!(root).to_string()),
                 ("export.rootCollection".to_string(), "\"dg\"".to_string()),
             ]
+        );
+
+        // Blender's path is saved trimmed
+        let trimmed = update(pool, json!({"blenderPath": " /opt/blender/blender "}))
+            .await
+            .unwrap();
+        assert_eq!(
+            trimmed.blender_path.as_deref(),
+            Some("/opt/blender/blender")
         );
 
         // A patch saves only what it names, and null or an empty string clears a field
