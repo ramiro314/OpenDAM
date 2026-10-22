@@ -29,7 +29,31 @@ fn validator(def: &str) -> Validator {
         .expect("the pinned schema compiles")
 }
 
-/// Each error as `<JSON pointer>: <message>`, the pointer `/` for the document itself.
+/// An error as both validators write it: `<JSON pointer>: <message>`, the pointer `/` for the
+/// document itself. `pointer_of`, `asset_index` and `is_domain_error` read it back, so callers
+/// never parse the text themselves.
+fn at(pointer: &str, message: impl std::fmt::Display) -> String {
+    format!("{pointer}: {message}")
+}
+
+/// The JSON pointer an error of `validate_manifest` or `check_rules` is about.
+pub fn pointer_of(error: &str) -> &str {
+    error.split_once(": ").map_or(error, |(pointer, _)| pointer)
+}
+
+/// The index in the manifest's `assets` of the asset an error is about, when it is about one:
+/// its pointer is `/assets/<i>` or lies below it.
+pub fn asset_index(error: &str) -> Option<usize> {
+    let rest = pointer_of(error).strip_prefix("/assets/")?;
+    rest.split('/').next()?.parse().ok()
+}
+
+/// Whether an error is about the manifest's `domain`.
+pub fn is_domain_error(error: &str) -> bool {
+    pointer_of(error) == "/domain"
+}
+
+/// Each error as `at` writes it.
 fn errors(validator: &Validator, instance: &Value) -> Result<(), Vec<String>> {
     let found: Vec<ValidationError> = validator.iter_errors(instance).collect();
     let mut errors = Vec::new();
@@ -72,10 +96,7 @@ fn describe(errors: &[ValidationError], out: &mut Vec<String>) {
             }
             _ => {}
         }
-        out.push(format!(
-            "{}: {error}",
-            if path.is_empty() { "/" } else { path }
-        ));
+        out.push(at(if path.is_empty() { "/" } else { path }, error));
     }
 }
 
@@ -101,7 +122,10 @@ pub fn check_rules(manifest: &Value) -> Result<(), Vec<String>> {
     for (i, pack) in list("packs").iter().enumerate() {
         if let Some(id) = text(&pack["id"]) {
             if !packs.insert(id.clone()) {
-                errors.push(format!("/packs/{i}/id: another pack has the id {id}"));
+                errors.push(at(
+                    &format!("/packs/{i}/id"),
+                    format!("another pack has the id {id}"),
+                ));
             }
         }
     }
@@ -138,14 +162,18 @@ pub fn check_rules(manifest: &Value) -> Result<(), Vec<String>> {
             } else {
                 format!("model or animation named {name}")
             };
-            errors.push(format!("/assets/{i}: /assets/{first} is already a {what}"));
+            errors.push(at(
+                &format!("/assets/{i}"),
+                format!("/assets/{first} is already a {what}"),
+            ));
         } else {
             names.insert(key, i);
         }
         if let Some(file) = text(&asset["file"]) {
             if let Some(first) = files.get(&file) {
-                errors.push(format!(
-                    "/assets/{i}/file: /assets/{first} is already {file}"
+                errors.push(at(
+                    &format!("/assets/{i}/file"),
+                    format!("/assets/{first} is already {file}"),
                 ));
             } else {
                 files.insert(file, i);
@@ -153,7 +181,10 @@ pub fn check_rules(manifest: &Value) -> Result<(), Vec<String>> {
         }
         if let Some(pack) = text(&asset["pack"]) {
             if !packs.contains(&pack) {
-                errors.push(format!("/assets/{i}/pack: no pack has the id {pack}"));
+                errors.push(at(
+                    &format!("/assets/{i}/pack"),
+                    format!("no pack has the id {pack}"),
+                ));
             }
         }
     }
@@ -167,16 +198,18 @@ pub fn check_rules(manifest: &Value) -> Result<(), Vec<String>> {
             for (role, name) in map {
                 let Some(name) = name.as_str() else { continue };
                 if !textures.contains(&(name.to_string(), role.clone())) {
-                    errors.push(format!(
-                        "/assets/{i}/materials/{m}/textures/{role}: no texture {name} has the role {role}"
+                    errors.push(at(
+                        &format!("/assets/{i}/materials/{m}/textures/{role}"),
+                        format!("no texture {name} has the role {role}"),
                     ));
                 }
             }
         }
         if let Some(avatar) = text(&asset["avatarFrom"]) {
             if !rigged.contains(&avatar) {
-                errors.push(format!(
-                    "/assets/{i}/avatarFrom: no rigged model is named {avatar}"
+                errors.push(at(
+                    &format!("/assets/{i}/avatarFrom"),
+                    format!("no rigged model is named {avatar}"),
                 ));
             }
         }
@@ -478,5 +511,50 @@ mod tests {
             errors,
             ["/assets/2/avatarFrom: no rigged model is named Rock"]
         );
+    }
+
+    #[test]
+    fn errors_are_read_back_to_their_asset_and_the_domain() {
+        // Schema errors, a whole asset's and one below it
+        let errors = manifest_errors(|m| {
+            m["domain"] = json!("dungeon");
+            m["assets"][1]["sha256"] = json!("ABC");
+            m["assets"][0].as_object_mut().unwrap().remove("bounds");
+        });
+        let read: Vec<(Option<usize>, bool)> = errors
+            .iter()
+            .map(|e| (asset_index(e), is_domain_error(e)))
+            .collect();
+        assert!(read.contains(&(None, true)), "{errors:?}");
+        assert!(read.contains(&(Some(0), false)), "{errors:?}");
+        assert!(read.contains(&(Some(1), false)), "{errors:?}");
+        assert_eq!(read.len(), 3, "{errors:?}");
+
+        // Rule errors, at an asset, below one, and at a pack
+        let errors = rule_errors(|m| {
+            let mut copy = m["assets"][1].clone();
+            copy["pack"] = json!("nope");
+            m["assets"].as_array_mut().unwrap().push(copy);
+            let pack = m["packs"][0].clone();
+            m["packs"].as_array_mut().unwrap().push(pack);
+        });
+        let read: Vec<(&str, Option<usize>)> = errors
+            .iter()
+            .map(|e| (pointer_of(e), asset_index(e)))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("/packs/1/id", None),
+                ("/assets/2", Some(2)),
+                ("/assets/2/file", Some(2)),
+                ("/assets/2/pack", Some(2)),
+            ],
+            "{errors:?}"
+        );
+        assert!(errors.iter().all(|e| !is_domain_error(e)));
+        // A pointer's tail never reads as an index, and a message never reads as a pointer
+        assert_eq!(asset_index("/assets/x: bad"), None);
+        assert_eq!(asset_index("/packs/0/id: like /assets/3: here"), None);
     }
 }

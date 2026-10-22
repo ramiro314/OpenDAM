@@ -689,34 +689,40 @@ fn manifest(
         "assets": entries.iter().map(|(v, _)| v.clone()).collect::<Vec<_>>(),
     });
 
-    let mut found = Vec::new();
+    let assets: Vec<&AssetRef> = entries.iter().map(|(_, asset)| *asset).collect();
+    let found = invalid(&manifest, domain, &assets);
+    (manifest, found)
+}
+
+/// The problems of `manifest` that schema validation and the importer's rules (C1) find, each
+/// naming the asset at its index in `assets`, the manifest's assets in order. An error about the
+/// domain is left out when the domain's name isn't PascalCase, which is a problem already.
+fn invalid(manifest: &Value, domain: &str, assets: &[&AssetRef]) -> Vec<Problem> {
     let errors = [
-        contract::validate_manifest(&manifest),
-        contract::check_rules(&manifest),
+        contract::validate_manifest(manifest),
+        contract::check_rules(manifest),
     ];
-    // A domain name that isn't PascalCase is already a problem of its own
-    let reported = |e: &String| !is_pascal(domain) && e.starts_with("/domain: ");
-    for error in errors
+    let reported = |e: &String| !is_pascal(domain) && contract::is_domain_error(e);
+    errors
         .into_iter()
         .filter_map(Result::err)
         .flatten()
         .filter(|e| !reported(e))
-    {
-        // `/assets/<i>...: message` names the asset at that index
-        let asset = error
-            .strip_prefix("/assets/")
-            .and_then(|rest| rest.split(['/', ':']).next()?.parse::<usize>().ok())
-            .and_then(|i| entries.get(i))
-            .map(|(_, asset)| (*asset).clone());
-        found.push(Problem {
-            message: match &asset {
-                Some(asset) => format!("{}: the manifest is invalid at {error}", asset.file_path),
-                None => format!("The manifest is invalid at {error}"),
-            },
-            assets: asset.into_iter().collect(),
-        });
-    }
-    (manifest, found)
+        .map(|error| {
+            let asset = contract::asset_index(&error)
+                .and_then(|i| assets.get(i))
+                .map(|asset| (*asset).clone());
+            Problem {
+                message: match &asset {
+                    Some(asset) => {
+                        format!("{}: the manifest is invalid at {error}", asset.file_path)
+                    }
+                    None => format!("The manifest is invalid at {error}"),
+                },
+                assets: asset.into_iter().collect(),
+            }
+        })
+        .collect()
 }
 
 /// `assets` with the status their problems give them.
@@ -1506,5 +1512,62 @@ mod tests {
             ]
         );
         assert_valid(&report);
+    }
+
+    #[test]
+    fn manifest_errors_name_the_asset_they_are_about() {
+        let asset = |id: &str| AssetRef {
+            library_id: "lib".into(),
+            asset_id: id.into(),
+            file_path: format!("Pack/{id}.png"),
+        };
+        let (rock, moss) = (asset("rock"), asset("moss"));
+        let texture = |name: &str, sha256: &str| {
+            json!({
+                "kind": "texture", "assetName": name, "file": format!("Textures/{name}_BaseColor.png"),
+                "sha256": sha256, "pack": "pack", "sourcePath": format!("{name}.png"),
+                "conversion": [], "role": "BaseColor"
+            })
+        };
+        let manifest = |domain: &str| {
+            json!({
+                "contractVersion": 1, "domain": domain, "exportedAt": "2026-10-22T12:00:00Z",
+                "exporter": {"name": "OpenDAM", "version": "0.1.0"},
+                "packs": [{"id": "pack", "name": "Pack", "licence": {"spdx": null, "name": "Unknown"}, "origin": "generic"}],
+                // A schema error at the first asset, a rule error at the second
+                "assets": [texture("Rock", "BAD"), texture("Moss", &"0".repeat(64))]
+            })
+        };
+        let mut broken = manifest("Props");
+        broken["assets"][1]["pack"] = json!("nope");
+
+        let problems = invalid(&broken, "Props", &[&rock, &moss]);
+        let named: Vec<(&str, &str)> = problems
+            .iter()
+            .map(|p| (p.assets[0].asset_id.as_str(), p.message.as_str()))
+            .collect();
+        assert_eq!(named.len(), 2, "{named:?}");
+        assert_eq!(named[0].0, "rock");
+        assert!(named[0]
+            .1
+            .starts_with("Pack/rock.png: the manifest is invalid at /assets/0/sha256: "));
+        assert_eq!(
+            named[1],
+            (
+                "moss",
+                "Pack/moss.png: the manifest is invalid at /assets/1/pack: no pack has the id nope"
+            )
+        );
+
+        // A bad domain name is reported once, by the Check, not again by the schema
+        let mut lower = manifest("props");
+        lower["assets"][0]["sha256"] = json!("0".repeat(64));
+        assert_eq!(invalid(&lower, "props", &[&rock, &moss]), []);
+        let unnamed = invalid(&lower, "Props", &[&rock, &moss]);
+        assert_eq!(unnamed.len(), 1);
+        assert!(unnamed[0].assets.is_empty());
+        assert!(unnamed[0]
+            .message
+            .starts_with("The manifest is invalid at /domain: "));
     }
 }
