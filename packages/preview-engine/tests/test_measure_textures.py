@@ -7,6 +7,7 @@ that dies are reported apart: a death is a finding, never a timeout.
 from __future__ import annotations
 
 import importlib.util
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -21,14 +22,18 @@ STUB = """
 import json, os, signal, sys, time
 for line in sys.stdin:
     req = json.loads(line)
+    # What to do: `do`, else the stem of `source` as `measure` sends it
+    do = req["params"].get("do") or os.path.basename(req["params"].get("source", "")).split(".")[0]
     if req["method"] == "engine_info":
         print(json.dumps({"id": req["id"], "result": {"preview_version": 2}}), flush=True)
-    elif req["params"].get("do") == "crash":
+    elif do == "crash":
         os.kill(os.getpid(), signal.SIGSEGV)
-    elif req["params"].get("do") == "exit":
+    elif do == "exit":
         sys.exit(3)
-    elif req["params"].get("do") == "hang":
+    elif do == "hang":
         time.sleep(30)
+    elif do == "empty":
+        print(json.dumps({"id": req["id"], "result": {"ok": True}}), flush=True)
     else:
         print(json.dumps({"id": "stray"}), flush=True)
         print(json.dumps({"id": req["id"], "result": {"ok": True}}), flush=True)
@@ -75,3 +80,27 @@ def test_a_request_past_its_deadline_is_a_timeout(worker):
     assert seconds >= 0.5
     assert peak > 0
     assert worker.proc.pid != pid
+
+
+def test_a_pack_row_counts_deaths_and_timeouts_as_themselves(worker, tmp_path, monkeypatch):
+    monkeypatch.setattr(measure_textures, "JOB_TIMEOUT", 0.5)
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE folders (path TEXT, is_pack INTEGER)")
+    rows = [
+        {"id": stem, "file_path": f"Kit/{stem}.fbx", "size_bytes": 1, "app_previews": 1}
+        for stem in ("crash", "hang", "empty")
+    ]
+    results = [measure_textures.measure(worker, conn, tmp_path, tmp_path / "out", r) for r in rows]
+
+    assert [r["error"] for r in results] == [
+        "worker died (signal 11)",
+        "timeout after 0.5 s",
+        "no preview",
+    ]
+    summary = measure_textures.summarize(results)
+    assert summary["loaded"] == 0
+    assert summary["failed"] == {
+        "worker died (signal 11)": 1,
+        "timeout after 0.5 s": 1,
+        "no preview": 1,
+    }

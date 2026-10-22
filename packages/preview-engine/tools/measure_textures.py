@@ -205,10 +205,10 @@ def measure(worker: Worker, conn, root: Path, out: Path, row) -> dict:
         params["pack_root"] = str(root / pack) if pack else str(root)
     reply, seconds, peak, failure = worker.call("model_meta", params, timeout=JOB_TIMEOUT)
     result = (reply or {}).get("result") or {}
-    error = failure
-    if reply is not None and "error" in reply:
+    error = failure  # a timeout or a dead worker wins: it is the finding
+    if failure is None and "error" in reply:
         error = reply["error"]
-    elif "preview_model" not in result:
+    elif failure is None and "preview_model" not in result:
         error = result.get("preview_error") or result.get("error") or "no preview"
     if error:
         # Without the file's own path, so the pack's row can count alike failures together
