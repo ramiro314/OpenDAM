@@ -337,17 +337,38 @@ def _load(path: Path) -> Texture:
         return Texture("unreadable")
 
     alpha = classify_alpha(img.getchannel("A")) if has_alpha else "none"
+    return Texture("ok", fit(img, keep_alpha=alpha == "cutout"), alpha)
+
+
+def fit(img, keep_alpha: bool):
+    """
+    An RGB or RGBA `img` shrunk in place to 1024 px on its longest side. With `keep_alpha` it
+    stays a plain Pillow image, which trimesh's exporter writes as PNG; otherwise it is
+    re-encoded as JPEG, which the exporter keeps as `image/jpeg`.
+    """
+    from PIL import Image
+
     if max(img.size) > MAX_SIDE:
         img.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)
-    if alpha == "cutout":
-        return Texture("ok", img, alpha)
+    if keep_alpha:
+        return img
 
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=JPEG_QUALITY)
     buf.seek(0)
     jpeg = Image.open(buf)
     jpeg.load()
-    return Texture("ok", jpeg, alpha)
+    return jpeg
+
+
+def shrink_image(img):
+    """
+    An image a trimesh material holds, through `fit` (plan C6), leaving `img` untouched. Any
+    alpha below 255 keeps it PNG, since the source material decides how its alpha is used.
+    """
+    has_alpha = "A" in img.getbands() or "transparency" in img.info
+    img = img.convert("RGBA" if has_alpha else "RGB")
+    return fit(img, keep_alpha=has_alpha and img.getchannel("A").getextrema()[0] < 255)
 
 
 # ── Per-model report ──────────────────────────────────────────────────────
