@@ -54,14 +54,15 @@ AND NOT EXISTS (SELECT 1 FROM assets r WHERE r.file_path = a.bundled_preview
 class Worker:
     """One persistent `worker.py` process, asked one JSON request at a time, as the app does."""
 
-    def __init__(self, log):
+    def __init__(self, log, command: list[str] | None = None):
         self.log = log
+        self.command = command or [sys.executable, str(ENGINE / "worker.py")]
         self.next_id = 0
         self._start()
 
     def _start(self) -> None:
         self.proc = subprocess.Popen(
-            [sys.executable, str(ENGINE / "worker.py")],
+            self.command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=self.log,
@@ -79,11 +80,18 @@ class Worker:
             lines.put(line)
         lines.put(None)
 
-    def call(self, method: str, params: dict, timeout: float) -> tuple[dict | None, float, int]:
-        """`(reply, seconds, peak RSS in bytes)`; the reply is None after a timeout or a crash."""
+    def call(
+        self, method: str, params: dict, timeout: float
+    ) -> tuple[dict | None, float, int | None, str | None]:
+        """
+        `(reply, seconds, peak RSS in bytes, failure)`. After a timeout or the worker's death the
+        reply is None, `failure` says which, and the worker is replaced. A dead worker's peak RSS
+        is unknown (None): its `/proc` entry no longer holds one.
+        """
         self.next_id += 1
         req_id = f"m{self.next_id}"
         _reset_peak(self.proc.pid)
+        kills = _oom_kills()
         start = time.monotonic()
         self.proc.stdin.write(json.dumps({"id": req_id, "method": method, "params": params}))
         self.proc.stdin.write("\n")
@@ -93,20 +101,31 @@ class Worker:
             try:
                 line = self.lines.get(timeout=max(0.0, deadline - time.monotonic()))
             except queue.Empty:
-                line = None
-            if line is None:
-                elapsed, peak = time.monotonic() - start, _peak(self.proc.pid)
                 # As the app does after a job timeout: kill the process and start another.
+                elapsed, peak = time.monotonic() - start, _peak(self.proc.pid)
                 self.proc.kill()
                 self.proc.wait()
-                self._start()
-                return None, elapsed, peak
+                return self._replace(method, None, elapsed, peak, f"timeout after {timeout:g} s")
+            if line is None:  # stdout closed: the worker died on this request
+                elapsed = time.monotonic() - start
+                code = self.proc.wait()
+                failure = f"worker died ({_exit(code)})"
+                if _oom_kills() > kills:
+                    failure += ", killed at the memory cap"
+                return self._replace(method, None, elapsed, None, failure)
             try:
                 reply = json.loads(line)
             except ValueError:
                 continue
             if reply.get("id") == req_id:
-                return reply, time.monotonic() - start, _peak(self.proc.pid)
+                return reply, time.monotonic() - start, _peak(self.proc.pid), None
+
+    def _replace(self, method: str, *result):
+        print(f"{method}: {result[-1]}", file=sys.stderr)
+        if method == "engine_info":
+            sys.exit(f"the worker failed to start: {result[-1]}")
+        self._start()
+        return result
 
     def close(self) -> None:
         self.proc.stdin.close()
@@ -119,6 +138,23 @@ def _reset_peak(pid: int) -> None:
         Path(f"/proc/{pid}/clear_refs").write_text("5")
     except OSError:
         pass
+
+
+def _exit(code: int) -> str:
+    return f"signal {-code}" if code < 0 else f"exit status {code}"
+
+
+def _oom_kills() -> int:
+    """
+    OOM kills so far in this process's cgroup, which `scripts/memory-cap.sh` makes the capped
+    scope holding the script and its worker; 0 where cgroup v2 doesn't say.
+    """
+    try:
+        group = Path("/proc/self/cgroup").read_text().strip().split("::", 1)[1]
+        events = Path(f"/sys/fs/cgroup{group}/memory.events").read_text().split()
+        return int(events[events.index("oom_kill") + 1])
+    except OSError, IndexError, ValueError:
+        return 0
 
 
 def _peak(pid: int) -> int:
@@ -153,7 +189,11 @@ def fbx_rows(conn: sqlite3.Connection, where: str, params: tuple) -> list[sqlite
 
 
 def measure(worker: Worker, conn, root: Path, out: Path, row) -> dict:
-    """One `model_meta` request built as `preview::model_meta_request` builds it."""
+    """
+    One `model_meta` request built as `preview::model_meta_request` builds it. The file is named
+    on stderr first, so a run the memory cap kills shows which file it was on.
+    """
+    print(f"measuring {row['file_path']}", file=sys.stderr, flush=True)
     params = {
         "source": str(root / row["file_path"]),
         "output_dir": str(out),
@@ -163,18 +203,17 @@ def measure(worker: Worker, conn, root: Path, out: Path, row) -> dict:
     pack = pack_root(conn, row["file_path"])
     if pack is not None:
         params["pack_root"] = str(root / pack) if pack else str(root)
-    reply, seconds, peak = worker.call("model_meta", params, timeout=JOB_TIMEOUT)
+    reply, seconds, peak, failure = worker.call("model_meta", params, timeout=JOB_TIMEOUT)
     result = (reply or {}).get("result") or {}
-    error = None
-    if reply is None:
-        error = f"timeout after {JOB_TIMEOUT} s"
-    elif "error" in reply:
+    error = failure
+    if reply is not None and "error" in reply:
         error = reply["error"]
     elif "preview_model" not in result:
         error = result.get("preview_error") or result.get("error") or "no preview"
     if error:
         # Without the file's own path, so the pack's row can count alike failures together
         error = error.replace(params["source"], "<file>").strip()
+    print(f"  {seconds:.1f} s{f', {failure}' if failure else ''}", file=sys.stderr, flush=True)
     return {
         "file": row["file_path"],
         "size_bytes": row["size_bytes"],
@@ -183,6 +222,7 @@ def measure(worker: Worker, conn, root: Path, out: Path, row) -> dict:
         "seconds": round(seconds, 3),
         "peak_rss": peak,
         "error": error,
+        "failure": failure,
         "report": result.get("preview_textures"),
         "params": params,
     }
@@ -263,7 +303,7 @@ def summarize(results: list[dict]) -> dict:
         "alpha": alpha,
         "median_s": statistics.median(times) if times else 0,
         "max_s": max(times, default=0),
-        "peak_rss": max((r["peak_rss"] for r in results), default=0),
+        "peak_rss": max((r["peak_rss"] or 0 for r in results), default=0),
     }
 
 
@@ -271,8 +311,8 @@ def counts(counter: Counter, top: int | None = None) -> str:
     return ", ".join(f"{k} {v}" for k, v in counter.most_common(top)) or "-"
 
 
-def mb(n: int) -> str:
-    return f"{n / 2**20:.0f} MB"
+def mb(n: int | None) -> str:
+    return "unknown" if n is None else f"{n / 2**20:.0f} MB"
 
 
 def main() -> None:
@@ -306,7 +346,6 @@ def main() -> None:
             results = []
             for row in sorted(sample, key=lambda r: r["file_path"]):
                 results.append(measure(worker, conn, root, out, row))
-                print(f"{pack}: {row['file_path']} {results[-1]['seconds']:.1f} s", file=sys.stderr)
             for r in results:
                 alpha = (r["report"] or {}).get("alpha", {})
                 if alpha.get("cutout") or alpha.get("ignored"):
@@ -353,7 +392,8 @@ def main() -> None:
         print("|---|---|---|---|---|")
     for r in large:
         rep = r["report"] or {}
-        verdict = "timed out" if r["error"] and r["error"].startswith("timeout") else "within"
+        failure = r["failure"] or ""
+        verdict = failure.split(" (")[0] if failure else "within"
         textured = (
             r["error"]
             if r["error"]
