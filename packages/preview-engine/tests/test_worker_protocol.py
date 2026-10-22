@@ -195,5 +195,24 @@ def test_model_meta_over_stdio_downscales_an_obj_texture(tmp_path):
     for reply in replies:
         result = reply["result"]
         assert result["ok"], result
+        assert result["preview_version"] == worker.PREVIEW_VERSION
         gltf, binary = read_glb(result["preview_model"])
         assert image_sizes(gltf, binary) == [expected[reply["id"]]]
+
+
+def test_engine_info_returns_the_preview_version():
+    """Over stdio, as the app asks each new worker process (plan C7)."""
+    run = subprocess.run(
+        [sys.executable, "worker.py"],
+        cwd=ENGINE,
+        input=json.dumps({"id": "engine_info", "method": "engine_info", "params": {}}) + "\n",
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert worker.PREVIEW_VERSION == 2
+    assert json.loads(run.stdout) == {
+        "id": "engine_info",
+        "result": {"preview_version": worker.PREVIEW_VERSION},
+    }, run.stderr

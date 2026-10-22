@@ -66,7 +66,9 @@ docs/plans                    Plans for this fork
   made before this rule lose their upscaled thumbnails once, in the background, through
   `thumb_cleanup.rs`, which records `thumbs_no_upscale` in the library's `library_meta` table.
 - **One persistent Python worker.** The worker is a long-lived JSON-over-stdio daemon. Send it
-  requests over the existing stream; one process serves every file.
+  requests over the existing stream; one process serves every file. The queue starts it eagerly
+  and asks each new process its `engine_info`, publishing the answer in
+  `AppState::engine_version` (`preview::PreviewEngine`). Replies are matched to requests by `id`.
 - **Zero telemetry.** The app makes no network calls to analytics or tracking services. The only
   outbound calls are AI tagging requests to the provider you configured (the Anthropic API, your
   local `claude` CLI, or TypeSafe's Jev). They are made only for runs you start, and nothing is
