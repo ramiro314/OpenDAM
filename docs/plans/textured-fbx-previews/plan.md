@@ -65,6 +65,18 @@ changed:
   NatureManufacture's `MapleSpringTree04LOD3`, with no separator, which the old rule missed. C2's
   rule now also takes leading zeros, an optional `_`, and assimp's `$AssimpFbx$` helper suffixes.
 
+Revised a seventh time 2026-10-22 after GitHub Inspector's fourth review of PR #145. No decision
+changed:
+
+- **The Synty heuristic can find the plain atlas.** The diffuse-suffix filter now applies only to
+  the two name-guess heuristics (material name, FBX file name). The reference stem prefix
+  heuristic starts from a reference already in a diffuse slot. So it takes any texture except
+  one with a non-diffuse map suffix, and prefers the stem with the fewest extra parts, which
+  makes `PolygonCity_01` beat `PolygonCity_01_A`. This narrows D14's "diffuse suffixes only" to
+  the heuristics that guess from names.
+- **`_B`, `_C` and `_D` count as diffuse only after a `T_` or `TX_` prefix**, the Unreal-style
+  naming Stylarts uses. So the A/B/C atlas variants don't read as diffuse maps.
+
 ## Problem
 
 FBX and 3DS models preview as plain gray. `model_meta` in `packages/preview-engine/worker.py`
@@ -276,19 +288,41 @@ each material, the reference is the first path in `TEXTURES[1]` (diffuse), else 
    - Folders named `Previews`, `Preview`, `Renders`, `Isometric` or `Sprites` (any case) and
      `.opendam` are never searched.
 4. **Heuristics** (D14), over the same tiers, only when steps 1-3 found nothing or there was no
-   reference. Each looks only at files whose stem ends in a **diffuse suffix**: `_BC`, `_B`, `_C`,
-   `_D`, `_basecolor`, `_base_color`, `_albedo`, `_albedotransparency`, `_color`, `_colour`,
-   `_diffuse` or `_diff`, any case. They match that stem with the suffix and a `T_`/`TX_` prefix
-   removed.
-   1. **Material name:** strip `MI_`, `M_`, `MAT_` and a trailing `.NNN`. Skip default names:
-      `lambert*`, `phong*`, `blinn*`, `DefaultMaterial`, `Material`, `Material.NNN`, `No Name`,
-      `skin`, and names under 3 characters.
-   2. **Reference stem prefix:** drop `_Texture`, then trailing `_parts` one at a time, until a
-      file stem (its trailing `_parts` dropped the same way) equals it. Atlas variants such as
-      `PolygonCity_01_A` lose to the plain `PolygonCity_01`.
-   3. **FBX file-name prefix,** only when the model has exactly one material: strip `SM_` and
-      `_LODn`, then drop trailing `_parts` the same way.
+   reference. They are described below.
 5. **Nothing found:** no texture. The material keeps its color (C4).
+
+**Step 4 heuristics.** Two suffix lists apply, any case.
+
+- **Diffuse suffixes:** `_BC`, `_basecolor`, `_base_color`, `_albedo`, `_albedotransparency`,
+  `_color`, `_colour`, `_diffuse` and `_diff`. Also `_B`, `_C` and `_D`, but only on a stem that
+  starts with `T_` or `TX_`: the single letters mean base color only in that naming, and
+  elsewhere they are atlas variants.
+- **Non-diffuse suffixes:** `_N`, `_normal`, `_normals`, `_nrm`, `_ORM`, `_AORM`, `_R`,
+  `_roughness`, `_M`, `_metallic`, `_metallicsmoothness`, `_mask`, `_maskmap`, `_E`, `_emission`,
+  `_emissive`, `_AO`, `_height`, `_specular`, `_SmMetAO`.
+
+The heuristics run in this order:
+
+1. **Material name.**
+   - Strip `MI_`, `M_`, `MAT_` and a trailing `.NNN` from the material name.
+   - Skip default names: `lambert*`, `phong*`, `blinn*`, `DefaultMaterial`, `Material`,
+     `Material.NNN`, `No Name`, `skin`, and names under 3 characters.
+   - Look only at files whose stem ends in a diffuse suffix. The name matches a file whose stem,
+     with that suffix and a `T_`/`TX_` prefix removed, equals it.
+2. **Reference stem prefix.** The reference was in a diffuse slot, so the file's own suffix isn't
+   required to say "diffuse". Any texture file counts unless its stem ends in a non-diffuse
+   suffix.
+   - Take the reference stem and drop a `_Texture` part.
+   - Then drop trailing `_parts` one at a time until some candidate stem equals it, or starts
+     with it followed by `_`.
+   - Among those candidates, the stem with the fewest extra `_parts` wins, then the tier, then the
+     path ignoring case.
+   - So `PolygonCity_Texture` becomes `PolygonCity` and picks `PolygonCity_01` over
+     `PolygonCity_01_A`, `_B` and `_C`. A `PolygonCity_01_Normal` is never a candidate.
+3. **FBX file-name prefix,** only when the model has exactly one material.
+   - Strip `SM_` and `_LODn`, then drop trailing `_parts` one at a time.
+   - Each try uses heuristic 1's rule: diffuse-suffix files only, matched after the suffix and a
+     `T_`/`TX_` prefix are removed.
 
 **Precedence across steps, tiers and extensions.**
 
@@ -450,6 +484,11 @@ GLB fresh and needs nothing.
     - a nearer different-extension file beats an exact extension further away in the pack;
     - a PSD found by a literal step beats a heuristic match;
     - each heuristic, a default material name skipped, and file-prefix refused with 2 materials;
+    - **Synty case:** a `PolygonCity_Texture.psd` reference, with `PolygonCity_01`,
+      `PolygonCity_01_A`, `_B`, `_C` and `PolygonCity_01_Normal` in `Textures/`, takes
+      `PolygonCity_01`;
+    - `T_Stone_Trim_B` is matched by material `MI_Stone_Trim`, while a `Stone_Trim_B` without
+      the prefix is not taken as a diffuse map;
     - not found;
     - no pack (2-level bound);
     - no `library_root`, and a `library_root` that doesn't contain the model: a texture sitting next
