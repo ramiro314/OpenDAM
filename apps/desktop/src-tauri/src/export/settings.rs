@@ -1,14 +1,17 @@
 //! Game export settings, one row per field in the master DB's `settings` table (`export.<field>`,
-//! JSON value), as plan C2 describes: the export root folder and the root collection whose
-//! children are the export domains. An unset field has no row.
+//! JSON value), as plan C2 describes: the export root folder, the root collection whose children
+//! are the export domains, and Blender's path. An unset field has no row.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Pool, Sqlite};
 use std::path::{Path, PathBuf};
 
+use super::blender;
+
 const ROOT_KEY: &str = "export.root";
 const ROOT_COLLECTION_KEY: &str = "export.rootCollection";
+const BLENDER_PATH_KEY: &str = "export.blenderPath";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,14 +20,17 @@ pub struct ExportSettings {
     pub root: Option<String>,
     /// A top-level, non-smart collection's id. Its children are the export domains.
     pub root_collection: Option<String>,
+    /// An absolute path to Blender. Unset means `blender` on `PATH` (`blender::gate`).
+    pub blender_path: Option<String>,
 }
 
 /// The saved settings. A saved value that isn't a JSON string counts as unset.
 pub async fn load(pool: &Pool<Sqlite>) -> sqlx::Result<ExportSettings> {
     let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT key, value FROM settings WHERE key IN (?, ?)")
+        sqlx::query_as("SELECT key, value FROM settings WHERE key IN (?, ?, ?)")
             .bind(ROOT_KEY)
             .bind(ROOT_COLLECTION_KEY)
+            .bind(BLENDER_PATH_KEY)
             .fetch_all(pool)
             .await?;
 
@@ -36,7 +42,8 @@ pub async fn load(pool: &Pool<Sqlite>) -> sqlx::Result<ExportSettings> {
         };
         match key.as_str() {
             ROOT_KEY => settings.root = Some(value),
-            _ => settings.root_collection = Some(value),
+            ROOT_COLLECTION_KEY => settings.root_collection = Some(value),
+            _ => settings.blender_path = Some(value),
         }
     }
     Ok(settings)
@@ -44,8 +51,9 @@ pub async fn load(pool: &Pool<Sqlite>) -> sqlx::Result<ExportSettings> {
 
 /// Applies `patch`, such as `{"root": "/home/me/export"}` or `{"rootCollection": null}`, where
 /// null clears a field, and saves the fields it names in one transaction. An unknown field, a
-/// wrong type, an export root that isn't an absolute folder outside every library, or a root
-/// collection that isn't a top-level, non-smart collection saves nothing.
+/// wrong type, an export root that isn't an absolute folder outside every library, a root
+/// collection that isn't a top-level, non-smart collection, or a Blender path that isn't absolute
+/// saves nothing. Blender's path isn't required to exist: Settings shows what it finds there.
 pub async fn update(pool: &Pool<Sqlite>, patch: Value) -> Result<ExportSettings, String> {
     let Value::Object(fields) = patch else {
         return Err("Export settings patch must be an object".into());
@@ -55,18 +63,22 @@ pub async fn update(pool: &Pool<Sqlite>, patch: Value) -> Result<ExportSettings,
         let key = match field.as_str() {
             "root" => ROOT_KEY,
             "rootCollection" => ROOT_COLLECTION_KEY,
+            "blenderPath" => BLENDER_PATH_KEY,
             _ => return Err(format!("Unknown setting export.{field}")),
         };
         let value = match value {
             Value::Null => None,
-            Value::String(s) if !s.trim().is_empty() => Some(s),
-            Value::String(_) => None,
+            // Blender's path is saved trimmed, as Settings checks it (`blender::check_path`)
+            Value::String(s) if key == BLENDER_PATH_KEY => Some(s.trim().to_string()),
+            Value::String(s) => Some(s),
             _ => return Err(format!("export.{field} must be a string or null")),
-        };
+        }
+        .filter(|s| !s.trim().is_empty());
         if let Some(value) = &value {
             match key {
                 ROOT_KEY => check_root(pool, value).await?,
-                _ => check_root_collection(pool, value).await?,
+                ROOT_COLLECTION_KEY => check_root_collection(pool, value).await?,
+                _ => blender::check_path(value)?,
             }
         }
         changed.push((key, value));
@@ -228,7 +240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_empty_table_leaves_both_settings_unset() {
+    async fn an_empty_table_leaves_every_setting_unset() {
         let db = memory_database(vec![]).await;
 
         assert_eq!(
@@ -245,24 +257,44 @@ mod tests {
         let root = dir.path().display().to_string();
         insert_collection(pool, "dg", "DungeonGame", None).await;
 
-        let saved = update(pool, json!({"root": root, "rootCollection": "dg"}))
-            .await
-            .unwrap();
+        let saved = update(
+            pool,
+            json!({"root": root, "rootCollection": "dg", "blenderPath": "/opt/blender/blender"}),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(load(pool).await.unwrap(), saved);
         assert_eq!(saved.root.as_deref(), Some(root.as_str()));
         assert_eq!(saved.root_collection.as_deref(), Some("dg"));
+        assert_eq!(saved.blender_path.as_deref(), Some("/opt/blender/blender"));
         assert_eq!(
             saved_rows(pool).await,
             [
+                (
+                    "export.blenderPath".to_string(),
+                    "\"/opt/blender/blender\"".to_string()
+                ),
                 ("export.root".to_string(), json!(root).to_string()),
                 ("export.rootCollection".to_string(), "\"dg\"".to_string()),
             ]
         );
 
-        // A patch saves only what it names, and null clears a field
-        let cleared = update(pool, json!({"root": null})).await.unwrap();
+        // Blender's path is saved trimmed
+        let trimmed = update(pool, json!({"blenderPath": " /opt/blender/blender "}))
+            .await
+            .unwrap();
+        assert_eq!(
+            trimmed.blender_path.as_deref(),
+            Some("/opt/blender/blender")
+        );
+
+        // A patch saves only what it names, and null or an empty string clears a field
+        let cleared = update(pool, json!({"root": null, "blenderPath": " "}))
+            .await
+            .unwrap();
         assert_eq!(cleared.root, None);
+        assert_eq!(cleared.blender_path, None);
         assert_eq!(cleared.root_collection.as_deref(), Some("dg"));
         assert_eq!(saved_rows(pool).await.len(), 1);
     }
@@ -290,7 +322,10 @@ mod tests {
             json!({"rootCollection": "nope"}),
             json!({"rootCollection": "dungeon"}),
             json!({"rootCollection": "smart"}),
-            json!({"rootCollection": "dg", "blenderPath": "/usr/bin/blender"}),
+            json!({"rootCollection": "dg", "blender": "/usr/bin/blender"}),
+            json!({"blenderPath": "blender"}),
+            json!({"blenderPath": "bin/blender"}),
+            json!({"rootCollection": "dg", "blenderPath": 5}),
             json!({"root": dir.path(), "rootCollection": "smart"}),
             json!(["not", "an", "object"]),
         ] {

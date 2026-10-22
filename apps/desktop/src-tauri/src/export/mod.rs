@@ -1,5 +1,6 @@
 //! Game export to Dungeon Game bundles (docs/plans/game-export/plan.md).
 
+pub mod blender;
 pub mod cache;
 pub mod check;
 pub mod contract;

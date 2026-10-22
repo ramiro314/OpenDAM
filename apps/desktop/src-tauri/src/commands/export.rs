@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tauri::State;
 
+use crate::export::blender::{self, BlenderStatus};
 use crate::export::settings::{self, ExportSettings};
 use crate::export::{cache, check};
 use crate::AppState;
@@ -28,6 +29,14 @@ pub async fn set_export_settings(
 #[tauri::command]
 pub async fn clear_export_cache(state: State<'_, Arc<AppState>>) -> Result<usize> {
     cache::clear(&state.db.get_all_libraries().await).await
+}
+
+/// The Blender an export would run from `path`, Blender's path as typed in Settings (null or
+/// empty means `blender` on `PATH`): its version, and why exports can't use it, when they can't.
+#[tauri::command]
+pub async fn get_blender_status(path: Option<String>) -> Result<BlenderStatus> {
+    let path = path.filter(|p| !p.trim().is_empty());
+    Ok(blender::status(path.as_deref().map(str::trim)).await)
 }
 
 /// Checks the domain collection `domain_id` for export (plan C14): every asset with its kind,

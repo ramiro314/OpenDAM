@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import type { ExportCheck, ExportCheckAsset } from '../types';
 import { checkSummary, exportMenuReason } from './exportView';
 
-const settings = { root: '/export', rootCollection: 'dg' };
+const settings = { rootCollection: 'dg' };
 const collections = [{ id: 'dg', name: 'DungeonGame' }];
 
 describe('exportMenuReason', () => {
@@ -14,9 +14,9 @@ describe('exportMenuReason', () => {
     expect(exportMenuReason({ parentId: 'dg', isSmart: false }, null, collections)).toBe(
       'Loading the export settings…'
     );
-    expect(
-      exportMenuReason({ parentId: 'dg', isSmart: false }, { root: null, rootCollection: null }, [])
-    ).toBe('Set a root collection in Settings, under Game export');
+    expect(exportMenuReason({ parentId: 'dg', isSmart: false }, { rootCollection: null }, [])).toBe(
+      'Set a root collection in Settings, under Game export'
+    );
     expect(exportMenuReason({ parentId: 'dg', isSmart: true }, settings, collections)).toBe(
       'A smart collection can’t be a domain'
     );

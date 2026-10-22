@@ -7,7 +7,7 @@ import type { Collection, ExportCheck, ExportSettings } from '../types';
  */
 export function exportMenuReason(
   collection: Pick<Collection, 'parentId' | 'isSmart'>,
-  settings: ExportSettings | null,
+  settings: Pick<ExportSettings, 'rootCollection'> | null,
   collections: Pick<Collection, 'id' | 'name'>[]
 ): string | null {
   if (!settings) return 'Loading the export settings…';
