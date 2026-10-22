@@ -85,6 +85,14 @@ changed:
   overrides, settings, membership and every file it opened. Export compares it and asks for a
   new Check when anything changed, so a rename made after the Check never ships stale (C14).
 
+Revised a ninth time 2026-10-22 after GitHub Inspector's fifth review of PR #165. No decision
+changed:
+
+- **The fingerprint covers files that appear after the Check.** It also records every path the
+  Check probed and found missing (each `conversion.json` and `<file>.meta` it looked for), and
+  each pack's indexed file list. A `conversion.json`, `.meta` or newly matching texture added
+  between Check and Export makes Export ask for a new Check (C14, AC11).
+
 ## Goal
 
 The Dungeon Game takes its art only as **bundles** that OpenDAM exports and the game's importer
@@ -560,7 +568,12 @@ answer per file's size and mtime for the session.
   - the `pack_overrides` rows of its packs;
   - the export settings;
   - the size and mtime of every file it opened: sources, `conversion.json`, Unity `.mat` and
-    `.meta`, `datapackage.json` and licence files.
+    `.meta`, `datapackage.json` and licence files;
+  - every path it probed and found missing: each folder's `conversion.json` on C10's walk to the
+    library root (C6 uses the same walk), and each `<file>.meta` A1 looked for. A file that
+    appears there later changes the fingerprint;
+  - each of the domain's packs' indexed file list (paths, sizes and mtimes), which C7's suffix
+    and same-stem lookups read, so a newly matching texture changes it too.
 
   Export recomputes the fingerprint first. If it differs, Export discards the staged bundle and
   asks for a new Check. Any edit made in the Game tab or the pack form to a domain's asset or
@@ -741,7 +754,8 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   and removed assets before "Export". A crash simulated between the swap's two renames is
   recovered at the next check: `D/` is restored from `.D.old-*` with its files intact. An
   asset renamed, or a role changed, between Check and Export makes Export refuse and ask for a
-  new Check, and no bundle is written.
+  new Check, and no bundle is written. So does a file added between them: a `conversion.json`
+  above a texture, a `.meta` beside a pack file, or a new image matching a material by suffix.
 - **AC12.** CI's test job installs the pinned Blender and runs the Blender-backed tests, and
   fails when Blender is missing.
 - **AC13 (by hand, not an agent's).** The fixture bundle that OpenDAM writes passes dungeon-game's
