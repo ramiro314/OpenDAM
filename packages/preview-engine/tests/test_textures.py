@@ -424,6 +424,56 @@ def test_opaque_alpha_counts_as_none(tmp_path):
     assert tex.image.format == "JPEG"
 
 
+def alpha_with_holes(holes: int) -> Image.Image:
+    """A 100x100 alpha channel, opaque but for `holes` fully transparent pixels."""
+    alpha = Image.new("L", (100, 100), 255)
+    for n in range(holes):
+        alpha.putpixel((n % 100, n // 100), 0)
+    return alpha
+
+
+def test_a_cutout_needs_at_least_one_percent_transparent_pixels():
+    assert textures.classify_alpha(alpha_with_holes(99)) == "ignored"
+    assert textures.classify_alpha(alpha_with_holes(100)) == "cutout"
+    assert textures.classify_alpha(alpha_with_holes(101)) == "cutout"
+    # Near-opaque alpha with nothing below 128 is no cutout either.
+    assert textures.classify_alpha(Image.new("L", (100, 100), 250)) == "ignored"
+
+
+def test_near_opaque_alpha_is_loaded_as_jpeg(tmp_path):
+    tex = load_texture(save(rgba((100, 100), alpha_with_holes(99)), tmp_path / "speck.png"))
+    assert (tex.alpha, tex.image.format) == ("ignored", "JPEG")
+    tex = load_texture(save(rgba((100, 100), 250), tmp_path / "haze.png"))
+    assert (tex.alpha, tex.image.format) == ("ignored", "JPEG")
+
+
+def palette(transparent: bool) -> Image.Image:
+    """A palette image, half index 0 and half index 1, with index 0 transparent if asked."""
+    img = Image.new("P", (64, 64), 1)
+    img.putpalette([0, 0, 0, 40, 160, 60] + [0] * 762)
+    img.paste(0, (0, 0, 32, 64))
+    if transparent:
+        img.info["transparency"] = 0
+    return img
+
+
+def test_a_palette_png_with_a_transparent_index_is_a_cutout(tmp_path):
+    path = save(palette(transparent=True), tmp_path / "leaf.png")
+    with Image.open(path) as img:
+        assert (img.mode, img.info.get("transparency")) == ("P", 0)  # a tRNS chunk
+    tex = load_texture(path)
+    assert tex.alpha == "cutout"
+    assert tex.image.mode == "RGBA"
+    assert tex.image.format != "JPEG"
+    assert tex.image.getpixel((0, 0))[3] == 0
+    assert tex.image.getpixel((63, 0)) == (40, 160, 60, 255)
+
+
+def test_a_palette_png_without_transparency_is_opaque(tmp_path):
+    tex = load_texture(save(palette(transparent=False), tmp_path / "flat.png"))
+    assert (tex.alpha, tex.image.format, tex.image.mode) == ("none", "JPEG", "RGB")
+
+
 def test_a_thin_blade_atlas_is_classified_before_the_resize(tmp_path):
     # A 2048 px atlas of binary blades 2 px wide, offset so each straddles two output pixels.
     alpha = Image.new("L", (2048, 2048), 0)
