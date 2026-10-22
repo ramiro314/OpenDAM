@@ -46,6 +46,17 @@ Revised a fourth time 2026-10-22 after the workflow's fourth review. No decision
 - **A cached export needs no Blender.** Cache keys use `BLENDER_SERIES` (`5.2`) rather than the
   exact Blender version, and each entry keeps the exact version it was made with, for its step.
 
+Revised a fifth time 2026-10-22 after GitHub Inspector's review of PR #165. No decision changed:
+
+- **An animation's cache key includes its model's.** A change to the followed model (its
+  source, facing or origin) re-runs the animation, so a stale clip never ships (C11).
+- **Crash recovery keeps the last bundle.** A `.D.old-*` folder is renamed back to `D/` when
+  `D/` is missing, and is deleted only when `D/` exists (C15).
+- **A lone FBX is a model or an animation,** treated as a group of one. A lone OBJ, glTF, GLB
+  or `.blend` is refused like a group with no FBX (C3, D31, A5).
+- **`Mat` is no longer a name prefix,** so `Mattress_01` stays `Mattress01`. `MAT_` still drops,
+  in any case (C5).
+
 ## Goal
 
 The Dungeon Game takes its art only as **bundles** that OpenDAM exports and the game's importer
@@ -173,7 +184,7 @@ These are agent decisions, made while writing the plan. Each is reviewed at fina
 | A2 | **The Blender script is embedded in the app** (`include_str!`) and written to a temp file per run. | `make install` and the installed app need no new file. Its version is `opendam-normalize/<N>`. |
 | A3 | **The UI reads model facts through the preview worker.** A new `fbx_facts` request (assimp) returns the kept meshes' material slots, texture references by type, mesh and bone names, and the takes that animate something, by the same rules as the Blender script (C9, C12). Blender's result at export is authoritative. A slot or take set that differs from the worker's is a problem that refuses the export, naming the model. | The Game tab needs facts in milliseconds, and Blender takes seconds per model. |
 | A4 | **Source sha256s are memoized** in a library DB table `file_hashes(file_path, size_bytes, modified_at, sha256)`. | The Export view shows "changed" without hashing a whole domain each time. |
-| A5 | **The exported FBX is the group's first FBX member**, preferring one in an `fbx(unity)` format folder, then by path ignoring case. | D31 says the group's FBX, but a group can hold two. |
+| A5 | **The exported FBX is the group's first FBX member**, preferring one in an `fbx(unity)` format folder, then by path ignoring case. A lone FBX file (`group_id` NULL) is its own group of one. | D31 says the group's FBX, but a group can hold two, and most FBX files have no copies. |
 | A6 | **A domain member that is neither a model, an animation nor an image is a problem that refuses the export** (audio, documents). | "What the manifest doesn't list leaves the game." Skipping members silently would drop them from the game without a word. |
 | A7 | **When a group forms, the main item's export edits win** (`structure::apply_unions`, as for the main item's own fields). | Groups share metadata. |
 | A8 | **A pack with no licence at all exports `{ "spdx": null, "name": "Unknown" }`.** | The schema requires `name`. |
@@ -252,9 +263,10 @@ cache". An export with the root or the root collection unset is refused.
 - **Members:** the members of the domain and of all its subcollections, deduplicated, across
   every library (D7). A smart collection can't be a domain or sit below one.
 - **How each member is read** (members are grid items: a main item or a file on its own):
-  - a format group with an FBX member is a **model**, or an **animation** when its FBX has no
-    mesh and at least one take (D21);
-  - a format group with no FBX is refused (D31);
+  - a format group with an FBX member, or a lone FBX file (no copies in other formats, so
+    `group_id` is NULL), which is treated as a group of one, is a **model**, or an **animation**
+    when its FBX has no mesh and at least one take (D21);
+  - a format group with no FBX, or a lone OBJ, glTF, GLB or `.blend` file, is refused (D31);
   - an image is a standalone **texture**, with its role inferred from its suffix, else
     `BaseColor`;
   - anything else is refused (A6).
@@ -278,10 +290,12 @@ that asset as removed before anything is written (C15).
 
 **C5. Names.** `export::names::pascal(stem)` makes every default (D9, D22, D24):
 
-- **The rule:** drop one leading type prefix (`SM_ SK_ S_ T_ M_ MI_ MAT_ Mat A_ AN_ P_ BP_`, any
-  case). Split on `_`, `-`, spaces and lower-to-upper case changes. Capitalise each word, keep
-  digits, and drop every other character. A result starting with a digit gets an `X` prefix. So
-  `SM_arch01_broken` becomes `Arch01Broken`, and `Small_chest` becomes `SmallChest`.
+- **The rule:** drop one leading type prefix (`SM_ SK_ S_ T_ M_ MI_ MAT_ A_ AN_ P_ BP_`, any
+  case). Every prefix ends in `_`, so a word that only starts like one is kept. Split on `_`,
+  `-`, spaces and lower-to-upper case changes. Capitalise each word, keep digits, and drop every
+  other character. A result starting with a digit gets an `X` prefix. So `SM_arch01_broken`
+  becomes `Arch01Broken`, `Small_chest` becomes `SmallChest`, `mattress_01` becomes
+  `Mattress01`, and `Material_Wood` becomes `MaterialWood`.
 - **A model's or animation's default** comes from its group's main item's stem (D31: the file is
   the FBX, the name is the main item's).
 - **A material's default** comes from its slot name.
@@ -443,7 +457,10 @@ settings (D17).
 sha256 of the source's sha256 (every input's, in order), the operation's settings as canonical
 JSON, the tool and its version, and the script or texture constant `<N>` (D3, D33). For Blender
 the tool version in the key is `BLENDER_SERIES` (`5.2`), the only versions the gate accepts, so a
-lookup needs no Blender. The entry holds the output file and, for Blender, the result JSON,
+lookup needs no Blender. An animation's key also includes the cache key of the model it follows
+(C9 step 4). That key covers the model's source, `facingQuarterTurns` and origin, so a change to
+any of them re-runs the animation rather than shipping a clip that no longer lines up with its
+avatarFrom model. The entry holds the output file and, for Blender, the result JSON,
 which records the exact version that made it (`5.2.2`) for the step's `toolVersion`. A hit
 skips Blender and the pixel work, so re-exporting an unchanged domain writes byte-identical
 files: only `exportedAt` changes in the manifest. Source hashes are memoized in `file_hashes`
@@ -495,8 +512,15 @@ answer per file's size and mtime for the session.
    file against its `sha256`.
 3. **On "Export":** renames an existing `D/` to `.D.old-<uuid>/`, renames staging to `D/`, then
    deletes the old folder. If the second rename fails, the old folder is renamed back.
-4. **Cleans up:** staging is deleted when the view closes or the check fails, and a leftover
-   `.D.staging-*` or `.D.old-*` from a crash is deleted at the next check.
+4. **Cleans up and recovers:** staging is deleted when the view closes or the check fails. At
+   the next check, a leftover `.D.staging-*` from a crash is deleted. A leftover `.D.old-*` is
+   handled by whether `D/` exists:
+   - **`D/` exists:** the swap finished, so every `.D.old-*` is deleted.
+   - **`D/` is missing and exactly one `.D.old-*` exists:** a crash fell between the two renames,
+     so it is renamed back to `D/` before anything else. The previous bundle is restored, and
+     the diff (C14) reads its manifest.
+   - **`D/` is missing and several `.D.old-*` exist:** nothing is renamed or deleted. A problem
+     names the folders and the export refuses until one is chosen by hand.
 
 - **The manifest** is pretty-printed UTF-8 JSON. Assets are sorted by kind (model, texture,
   animation), then assetName, then role, and packs by id, so a diff of two exports shows only
@@ -601,8 +625,9 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   built yet". That covers a source format other than png/tga/psd/tif (`.tiff` excepted), an ORM,
   split or MaskMap layout, and a normal map whose convention (D14) is DirectX. Only textures that
   pass through byte for byte are exported.
-- **Until step 6,** a domain holding a format group with an FBX member (a model, or an animation)
-  is refused with "model export not built yet", so no bundle ever carries an unnormalized model.
+- **Until step 6,** a domain holding a format group with an FBX member or a lone FBX (a model,
+  or an animation) is refused with "model export not built yet", so no bundle ever carries an
+  unnormalized model.
 - **Until step 7,** a domain holding an animation (an FBX with no mesh and at least one take,
   from `fbx_facts`) is refused with "animation export not built yet". Models that carry their own
   takes export from step 6, with their `clips`.
@@ -615,8 +640,9 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   exactly the listed files. The manifest passes the schema and C1's checks, and every file
   matches its sha256 (a Blender-backed test, in CI). From step 6 it covers the fixture's models
   and textures, and from step 7 its animation too.
-- **AC3.** Default names follow C5. A collision refuses the export, naming both assets, and an
-  edit fixes it and survives a reindex.
+- **AC3.** Default names follow C5, including C5's examples (`mattress_01` stays
+  `Mattress01`). A collision refuses the export, naming both assets, and an edit fixes it and
+  survives a reindex.
 - **AC4.** On the fixtures, inference gives the expected materials, roles, layouts, surfaces and
   conventions. `fbx_facts` lists no collision hull's material and no `DefaultMaterial`. Each
   edit replaces its inferred value, and a reset restores it.
@@ -626,7 +652,8 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   hull with its own material, and one with none) export, and so does a model with no material,
   with one added slot.
 - **AC6.** The animation fixture gets its model's transform, and an animation whose bones don't
-  match is refused.
+  match is refused. Changing the model's `facingQuarterTurns` and exporting again re-runs the
+  animation's Blender job, not a cache hit, and the new clip follows the new transform.
 - **AC7.** The texture operations are pixel-exact on test images: ORM split, roughness
   inversion, gloss pass-through, MaskMap split, green flip, and JPG to PNG. Each records C8's
   steps.
@@ -637,7 +664,8 @@ problem in the Export view, naming the asset, and the step that delivers the wor
 - **AC10.** A second export of the unchanged fixture domain runs no Blender job and writes
   byte-identical files.
 - **AC11.** A failed check leaves the previous bundle untouched. The diff lists added, changed
-  and removed assets before "Export".
+  and removed assets before "Export". A crash simulated between the swap's two renames is
+  recovered at the next check: `D/` is restored from `.D.old-*` with its files intact.
 - **AC12.** CI's test job installs the pinned Blender and runs the Blender-backed tests, and
   fails when Blender is missing.
 - **AC13 (by hand, not an agent's).** The fixture bundle that OpenDAM writes passes dungeon-game's
