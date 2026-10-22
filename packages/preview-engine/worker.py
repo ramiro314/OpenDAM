@@ -8,6 +8,7 @@ Supported operations (Phase 1):
   - image_thumb   → generate thumbnail for common image formats
   - video_thumb   → extract a frame from a video (requires ffmpeg)
   - model_meta    → extract metadata from 3D model files (stub → Phase 2)
+  - engine_info   → the engine's `preview_version`
 
 Phase 2 will add:
   - 3D thumbnails via assimp/Three.js headless or Blender headless
@@ -24,6 +25,10 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+# Bumped when model previews improve enough to redo old ones (plan textured-fbx-previews C7).
+# Every `model_meta` result carries it, and `engine_info` reports it.
+PREVIEW_VERSION = 2
 
 
 # ── Image thumbnails ──────────────────────────────────────────────────────
@@ -312,7 +317,7 @@ def model_meta(
         "dimensions": None,
     }
 
-    res = {"ok": True, "metadata": meta}
+    res = {"ok": True, "metadata": meta, "preview_version": PREVIEW_VERSION}
 
     if ext == ".max":
         # Extract embedded thumbnail from 3ds Max OLE storage
@@ -1083,7 +1088,13 @@ def model_meta(
 
 
 # ── JSON-RPC loop ─────────────────────────────────────────────────────────
+def engine_info() -> dict:
+    """The engine's version, which the app asks each new worker process. Loads nothing."""
+    return {"preview_version": PREVIEW_VERSION}
+
+
 DISPATCH = {
+    "engine_info": lambda p: engine_info(),
     "image_thumb": lambda p: image_thumb(p["source"], p["output"], p.get("size", 256)),
     "video_thumb": lambda p: video_thumb(p["source"], p["output"], p.get("timestamp", "00:00:01")),
     "model_meta": lambda p: model_meta(

@@ -30,6 +30,9 @@ pub struct AppState {
     pub jev: Arc<JevProvider>,
     pub autotag: Arc<Engine>,
     pub app_handle: tauri::AppHandle,
+    /// The preview engine version the Python queue's worker process reported to `engine_info`,
+    /// or `None` until a process answers (`preview::PreviewEngine`).
+    pub engine_version: tokio::sync::watch::Sender<Option<i64>>,
 }
 
 /// The tagging providers runs can use, plus the fake ones in a debug build run with
@@ -150,6 +153,7 @@ pub fn run(render_choice: render::RenderChoice) {
                 jev,
                 autotag: autotag.clone(),
                 app_handle: app.handle().clone(),
+                engine_version: tokio::sync::watch::Sender::new(None),
             });
 
             app.manage(state.clone());
