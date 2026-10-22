@@ -87,6 +87,14 @@ changed:
   once, with a capped backoff, instead of waiting for a job. "None yet" stays published until a
   process actually answers (C9).
 
+Revised a ninth time 2026-10-22 after GitHub Inspector's sixth review of PR #145. No decision
+changed:
+
+- **The prefix heuristics have a floor.** Both work on a core stem with any `T_`, `TX_` or `SM_`
+  prefix removed, on file stems as well as references. They stop dropping `_parts` before the
+  core falls under 6 characters or becomes only digits. So `T_Fill_B` can't shrink to `T` and
+  grab an unrelated `T_*` texture: it stays `missing`.
+
 ## Problem
 
 FBX and 3DS models preview as plain gray. `model_meta` in `packages/preview-engine/worker.py`
@@ -311,6 +319,14 @@ each material, the reference is the first path in `TEXTURES[1]` (diffuse), else 
   `_roughness`, `_M`, `_metallic`, `_metallicsmoothness`, `_mask`, `_maskmap`, `_E`, `_emission`,
   `_emissive`, `_AO`, `_height`, `_specular`, `_SmMetAO`.
 
+**Core stems.** The prefix heuristics (2 and 3) compare core stems.
+
+- **What a core stem is:** a stem with a leading `T_`, `TX_` or `SM_` removed. This applies to
+  file stems and references alike.
+- **When dropping stops:** heuristics 2 and 3 drop trailing `_parts` one at a time, but never
+  once the next drop would leave a core under 6 characters, or one made only of digits and `_`.
+- **No match:** when nothing matches before that floor, the material counts as `missing`.
+
 The heuristics run in this order:
 
 1. **Material name.**
@@ -322,15 +338,19 @@ The heuristics run in this order:
 2. **Reference stem prefix.** The reference was in a diffuse slot, so the file's own suffix isn't
    required to say "diffuse". Any texture file counts unless its stem ends in a non-diffuse
    suffix.
-   - Take the reference stem and drop a `_Texture` part.
-   - Then drop trailing `_parts` one at a time until some candidate stem equals it, or starts
-     with it followed by `_`.
+   - Take the reference's core stem and drop a `_Texture` part.
+   - Try that core, then drop trailing `_parts` one at a time down to the floor, until some
+     candidate core stem equals it, or starts with it followed by `_`.
    - Among those candidates, the stem with the fewest extra `_parts` wins, then the tier, then the
      path ignoring case.
    - So `PolygonCity_Texture` becomes `PolygonCity` and picks `PolygonCity_01` over
      `PolygonCity_01_A`, `_B` and `_C`. A `PolygonCity_01_Normal` is never a candidate.
+   - And `T_Fill_B` becomes the core `Fill_B`, whose next drop, `Fill`, is under the floor. With
+     no file core equal to `Fill_B` or starting with `Fill_B_`, it stays `missing`, even when the
+     pack is full of other `T_*` textures.
 3. **FBX file-name prefix,** only when the model has exactly one material.
-   - Strip `SM_` and `_LODn`, then drop trailing `_parts` one at a time.
+   - Take the FBX's core stem, without `_LODn`. Try it, then drop trailing `_parts` one at a
+     time down to the floor.
    - Each try uses heuristic 1's rule: diffuse-suffix files only, matched after the suffix and a
      `T_`/`TX_` prefix are removed.
 
@@ -517,6 +537,8 @@ GLB fresh and needs nothing.
       `PolygonCity_01`;
     - `T_Stone_Trim_B` is matched by material `MI_Stone_Trim`, while a `Stone_Trim_B` without
       the prefix is not taken as a diffuse map;
+    - a `T_Fill_B` reference, in a pack holding `T_Rock_BC`, `T_Fill_Wall_N` and other `T_*`
+      files, resolves to `missing`, and the same holds for an FBX named `SM_A_01`;
     - not found;
     - no pack (2-level bound);
     - no `library_root`, and a `library_root` that doesn't contain the model: a texture sitting next
