@@ -95,6 +95,12 @@ changed:
   core falls under 6 characters or becomes only digits. So `T_Fill_B` can't shrink to `T` and
   grab an unrelated `T_*` texture: it stays `missing`.
 
+Revised a tenth time 2026-10-22 after GitHub Inspector's seventh review of PR #145. No decision
+changed:
+
+- **C6 names every image slot it downscales**, so AC6 holds for glTF and GLB sources with normal,
+  metallic/roughness, emissive or occlusion maps, not only base color.
+
 ## Problem
 
 FBX and 3DS models preview as plain gray. `model_meta` in `packages/preview-engine/worker.py`
@@ -421,9 +427,17 @@ reads no file outside `library_root` and follows no symlink out of it.
   is `unreadable`, and the material falls back to its color. **No texture failure ever fails the
   preview.**
 
-**C6. Downscale in the trimesh branch** (D6). After `trimesh.load`, each geometry whose material
-holds an image larger than 1024 px gets that image replaced through `load_texture`'s downscale and
-encode. The rest of the branch is unchanged.
+**C6. Downscale in the trimesh branch** (D6). After `trimesh.load`, every image a geometry's
+material holds is checked, and any image larger than 1024 px on a side is replaced through
+`load_texture`'s downscale and encode. The rest of the branch is unchanged.
+
+- **The slots checked:** `SimpleMaterial.image` (OBJ+MTL), and on a `PBRMaterial` (glTF, GLB) all
+  five texture slots: `baseColorTexture`, `normalTexture`, `metallicRoughnessTexture`,
+  `emissiveTexture` and `occlusionTexture`.
+- **Encoding:** every slot follows the same rule. An image with any alpha below 255 stays PNG,
+  any other becomes JPEG.
+- **Shared images:** an image object several slots or materials share is downscaled once and the
+  result reused, so the GLB holds it once.
 
 **C7. Worker result.** A new `engine_info` method, on the same JSON-over-stdio protocol, returns
 `{"preview_version": PREVIEW_VERSION}` and loads nothing. An older worker answers it with
@@ -565,6 +579,9 @@ GLB fresh and needs nothing.
       1024 px.
   - `test_worker_protocol.py`:
     - `engine_info` returns `PREVIEW_VERSION`;
+    - a generated glTF with a 2048 px base color, a 2048 px normal map and a 2048 px
+      metallic/roughness map comes back with all three at most 1024 px, and a texture shared
+      by two materials is stored once;
     - one `model_meta` request over stdio, on a generated OBJ+MTL with a 2048 px opaque texture,
       returns `preview_version` equal to `PREVIEW_VERSION`, and the GLB's image is `image/jpeg`
       and at most 1024 px.
