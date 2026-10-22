@@ -1764,6 +1764,51 @@ done
     }
 
     #[tokio::test]
+    async fn a_job_that_kills_the_worker_unpublishes_and_the_next_round_restarts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // The first process exits on its job, as a crash does; later ones serve jobs
+        let crash = format!(r#"if [ "$n" = 1 ]; then exit 1; fi; {JOB_DONE}"#);
+        let mut engine = stub_engine(dir.path(), ANSWER_2, &crash);
+        let lib = library_with_pending_job(dir.path(), "models/ship.fbx", "").await;
+        assert!(queue_round(&mut engine, &[]).await.is_empty());
+        assert_eq!(*engine.version.borrow(), Some(2));
+
+        let outcomes = queue_round(&mut engine, std::slice::from_ref(&lib)).await;
+        assert!(
+            matches!(&outcomes[..], [Err((job, asset))] if job == "j1" && asset == "a1"),
+            "the job fails: {outcomes:?}"
+        );
+        let (_, status, job) = job_outcome(&lib.pool).await;
+        assert_eq!((status.as_str(), job.as_str()), ("error", "error"));
+        assert!(engine.worker.is_none(), "the worker is killed");
+        assert_eq!(
+            *engine.version.borrow(),
+            None,
+            "none yet until a new process answers"
+        );
+
+        // With no job waiting, the next round starts a new process and publishes its answer
+        assert!(queue_round(&mut engine, &[]).await.is_empty());
+        assert_eq!((engine.starts, *engine.version.borrow()), (2, Some(2)));
+    }
+
+    #[tokio::test]
+    async fn jobs_wait_unclaimed_while_no_worker_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = stub_engine(dir.path(), "exec sleep 3600", JOB_DONE);
+        engine.info_timeout = Duration::from_millis(200);
+        let lib = library_with_pending_job(dir.path(), "models/ship.fbx", "").await;
+
+        // Both starts time out, so the engine backs off with the job still waiting
+        let outcomes = queue_round(&mut engine, std::slice::from_ref(&lib)).await;
+        assert!(outcomes.is_empty(), "no job is claimed: {outcomes:?}");
+        assert_eq!(engine.starts, 2);
+        assert!(engine.worker.is_none());
+        let (_, status, job) = job_outcome(&lib.pool).await;
+        assert_eq!((status.as_str(), job.as_str()), ("pending", "pending"));
+    }
+
+    #[tokio::test]
     async fn execute_skips_a_reply_to_another_request() {
         let dir = tempfile::tempdir().unwrap();
         let stray = r#"echo 'not json'; printf '{"id":"other","result":{}}\n'; printf '{"id":"%s","result":{"real":true}}\n' "$id""#;
