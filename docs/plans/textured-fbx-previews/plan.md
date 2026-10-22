@@ -110,6 +110,16 @@ changed:
   `preview_textures`, which search doesn't index (C8). D7 and D17 said "in `metadata`". The
   values are the same, only their place changes.
 
+Revised a twelfth time 2026-10-22 after GitHub Inspector's ninth review of PR #145. No decision
+changed:
+
+- **D7 and D17 name the new columns**, so the Decisions table and C8 state the storage rule the
+  same way.
+- **An open 3D view reloads the new GLB.** Clearing drei's cache alone leaves a mounted viewer
+  showing the old scene. C10 now clears the key `ThreeViewer` actually caches under,
+  `convertFileSrc(previewModel)`, and remounts the viewer's model through a per-path revision
+  bumped on `preview:done`. C11 tests the reload, and C12 checks it in the app.
+
 ## Problem
 
 FBX and 3DS models preview as plain gray. `model_meta` in `packages/preview-engine/worker.py`
@@ -225,7 +235,7 @@ memory cap, and each job has a 60 s timeout in `run_python_queue`.
 | D4 | Maps | **Base color only**, with an alpha cutout when the texture has transparent pixels. At 512 px under room light, normal and metallic/roughness maps barely show and double the texture cost. Foliage without cutout shows as opaque quads, which does show. |
 | D5 | Texture size in the GLB | Longest side **1024 px**. **JPEG** when opaque, **PNG** when it has alpha. |
 | D6 | Downscale in the trimesh branch (OBJ, glTF, GLB, ...) | **Yes, for new previews only.** Existing ones are not regenerated, since their thumbnails would look the same. A manual Re-generate picks it up. |
-| D7 | Regenerating existing previews | A **per-asset preview version** in `metadata.preview_version`. A **one-time library pass** keyed in `library_meta` requeues FBX/3DS items whose `done` preview predates it, under the normal queue rules. A future bump reuses the pass. |
+| D7 | Regenerating existing previews | A **per-asset preview version** in the `assets.preview_version` column (C8). A **one-time library pass** keyed in `library_meta` requeues FBX/3DS items whose `done` preview predates it, under the normal queue rules. A future bump reuses the pass. |
 | D8 | Errored previews | Not retried by the pass. **Only `done` previews** are. |
 | D9 | Worker memory | **In-process limits.** Read a texture's size from its header first, skip it past a pixel cap, decode one at a time, and cache per request. No rlimit and no systemd scope. |
 | D10 | Measurement | A **script runs the worker on sampled FBX into a scratch folder** and reports textured or not, and why. Plus before-and-after app screenshots under `scripts/memory-cap.sh`, from a scratch library of copied packs (C12). |
@@ -235,7 +245,7 @@ memory cap, and each job has a 60 s timeout in `run_python_queue`.
 | D14 | Name heuristics, after the literal lookups fail | All three, in this order: **material name** match, **reference stem prefix** match, **FBX file-name prefix** match (single-material meshes only). Diffuse suffixes only, default material names skipped. |
 | D15 | Extensions | png, jpg, jpeg, tga, tif, tiff, bmp, webp, and **psd last**: a PSD only when no other format has the stem. |
 | D16 | Base color factor | **White when a texture is found**, else the material's diffuse color. |
-| D17 | Reporting | The worker returns a short **`preview_textures` summary**, and Rust stores it in `metadata`. No UI. |
+| D17 | Reporting | The worker returns a short **`preview_textures` summary**, and Rust stores it in the `assets.preview_textures` column (C8), outside the searched `metadata`. No UI. |
 | D18 | OBJ fallback to our resolver | **No.** All Kenney `map_Kd` paths resolve. |
 
 ## Behaviour
@@ -538,10 +548,23 @@ exports:
 - **Cost:** about every `done` FBX preview, since each gains normals, colors, transforms or LOD
   filtering. Knowing which wouldn't change costs the same parse.
 
-**C10. 3D view refresh.** drei's `useGLTF` caches by URL, and a rerun overwrites the same
-`<id>_preview.glb`. On `preview:done` with a `previewModel`, the frontend calls `useGLTF.clear`
-for that URL, so an open detail panel or Quick Look shows the new GLB. The thumbnailer loads each
-GLB fresh and needs nothing.
+**C10. 3D view refresh.** A rerun overwrites the same `<id>_preview.glb`, and two things would
+keep an open detail panel or Quick Look on the old one:
+
+- **drei's cache.** `useGLTF` caches by the URL it was given, and `ThreeViewer`'s `Model` gives it
+  `convertFileSrc(url)`, not the raw path. So on `preview:done` with a `previewModel`, the
+  frontend calls `useGLTF.clear(convertFileSrc(previewModel))`. Clearing the raw path would
+  miss the entry.
+- **The mounted scene.** Clearing only drops the cache entry. A mounted `Model` keeps its old
+  `scene`, and its `url` prop hasn't changed, so nothing re-renders it.
+  - The asset store keeps a revision number per preview model path, bumped by the same
+    `preview:done` handler after the clear.
+  - `ThreeViewer` reads the revision for its `modelPath` and passes it as the `key` of `Model`.
+  - A bump therefore remounts `Model`, which suspends, loads the new GLB, and shows it.
+  - Paths that were never rerun have no revision, and their viewers are untouched.
+
+The thumbnailer creates a new `GLTFLoader` for each capture, without drei's cache, and needs
+nothing.
 
 **C11. Tests** (by file; CI runs them).
 
@@ -633,7 +656,11 @@ GLB fresh and needs nothing.
     - a stub that always times out is restarted on the 10 s, 30 s, 60 s, 5 min backoff and
       never publishes 1;
     - `execute` given a stray line with another `id` before the real reply returns the real one.
-- **TypeScript:** the `useGLTF.clear` call on `preview:done`.
+- **TypeScript:**
+  - a `preview:done` with a `previewModel` clears `convertFileSrc(previewModel)`, not the raw
+    path, and bumps that path's revision;
+  - a mounted `ThreeViewer` for that path remounts its `Model` and loads the GLB again, while a
+    viewer for another path does not.
 
 **C12. Measurement** (D10). Your three libraries are read only. Nothing in this section writes to
 them or to their `.opendam/` folders.
@@ -684,7 +711,9 @@ scratch library, never from your registered libraries:
    scratch library and capture its thumbnails, then take the shots.
 4. **After:** start the new build on the same `XDG_DATA_HOME`, with the two variables pointing at
    this branch's worker. Its regeneration pass (C9) requeues the scratch copies' FBX previews.
-   Take the same shots once they are recaptured.
+   Take the same shots once they are recaptured. Keep the detail panel open on one requeued FBX
+   while its rerun completes, and screenshot it switching to the textured GLB without being
+   closed (C10).
 5. Every app run goes through `scripts/memory-cap.sh`. The temp dir and copies are deleted
    afterwards.
 
@@ -722,7 +751,8 @@ invariant. It covers:
    The queue starts its worker eagerly and publishes the `engine_info` version (C9).
 4. `model_preview_regen.rs`, its engine gate and key rule, and its wiring in `lib.rs`,
    `commands/library.rs` and the queue's version publication (C9).
-5. Frontend `useGLTF.clear` on `preview:done` (C10).
+5. Frontend: on `preview:done`, `useGLTF.clear` with the converted URL and the per-path revision
+   that remounts the viewer's model (C10).
 6. `measure_textures.py` and the measurement run (C12). `AGENTS.md` invariant (C13).
 7. `uv run ruff format`, `bun run format`, `cargo fmt`, and `make lint`, before each commit.
 
