@@ -218,6 +218,35 @@ docs/plans                    Plans for this fork
   goes back on the queue unless it already has a preview, and a group whose main item takes no
   preview gets its stand-in. The Rust side is `structure::Structure::pictured`, and every SQL
   check is the one fragment `commands::asset::pictured`.
+- **Textured model previews.** FBX and 3DS previews carry their base color textures, found by
+  `packages/preview-engine/textures.py` (plan textured-fbx-previews).
+  - **Inside the library, bounded by the pack.** `model_meta` gets `library_root` and, inside a
+    pack, `pack_root` (`preview::model_meta_request`). The worker reads texture files only inside
+    `library_root`, follows no symlink out of it, and searches by name only within the pack, or
+    2 levels up without one. A request without a `library_root` that contains the model reads no
+    texture file at all.
+  - **At most 1024 px.** Every texture in a preview GLB is downscaled to 1024 px on its longest
+    side (`MAX_SIDE`), FBX/3DS and trimesh-branch (OBJ, glTF, GLB) alike: JPEG when opaque, PNG
+    when its alpha is a cutout or, in the trimesh branch, any alpha.
+  - **A texture failure never fails a preview.** A missing, unreadable or too large texture
+    leaves the material its color, and the preview still succeeds.
+  - **Preview changes reach existing libraries through a version.** `worker.py` declares
+    `PREVIEW_VERSION`, each `model_meta` result carries it, and `complete_job` stores it in
+    `assets.preview_version`. When previews improve, bump it together with
+    `model_preview_regen::MODEL_PREVIEW_VERSION` (a Rust test keeps the two equal): the
+    `model_preview_version` pass in `library_meta` then requeues the stale `done` FBX/3DS items
+    the queue rules allow, rather than a migration or a manual Re-generate.
+  - **Bookkeeping stays out of `metadata`.** `preview_version` and the `preview_textures` report
+    have their own `assets` columns (`db::add_preview_columns`). `metadata` is indexed by
+    `assets_fts`, and the report's words and texture names would make searches match.
+  - **The pass trusts only the running worker.** It requeues only while the worker process
+    serving the queue has declared, through `engine_info`, a version of at least
+    `MODEL_PREVIEW_VERSION`, never from a file on disk. Before any answer it returns silently,
+    and below the constant it requeues nothing and warns.
+  - **The key waits for the work.** The pass records `model_preview_version` only once no stale
+    FBX/3DS preview is left, done or waiting, so jobs an older process served are redone later.
+  - `packages/preview-engine/tools/measure_textures.py` measures all of this on a real library
+    without writing to it. Run it under `scripts/memory-cap.sh`.
 
 ## Python preview worker
 
