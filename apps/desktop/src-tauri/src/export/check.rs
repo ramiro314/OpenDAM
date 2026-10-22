@@ -4,8 +4,9 @@
 //!
 //! A domain is a direct child of the root collection (C3). Its assets are the grid items in it
 //! and all its subcollections, across every library, each once. Until later steps of the plan's
-//! build order land, only standalone textures that pass through byte for byte export: the guards
-//! refuse a texture under a `conversion.json`, a texture that needs converting, and any FBX.
+//! build order land, only standalone textures that pass through byte for byte export, each with
+//! its nearest `conversion.json`'s steps (C10): the guards refuse a texture that needs converting,
+//! and any FBX.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -14,7 +15,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::db::{Database, LibraryHandle};
-use crate::export::conversion::Walker;
+use crate::export::conversion::{Invalid, Walker};
 use crate::export::names::{is_pascal, pascal};
 use crate::export::packs::{self, PackSource};
 use crate::export::textures::{self, Convention, Layout, Refusal, Role};
@@ -378,6 +379,7 @@ struct ReadyTexture {
     extension: &'static str,
     sha256: String,
     source_path: String,
+    conversion: Vec<Value>,
 }
 
 /// One asset as the check reads it, before names are compared.
@@ -436,6 +438,9 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
         .map(|(i, key)| (*key, i))
         .collect();
 
+    // Each invalid conversion.json, by library and path, with the assets it covers
+    let mut invalid_conversions: BTreeMap<(usize, String), (Invalid, Vec<AssetRef>)> =
+        BTreeMap::new();
     let mut seen = HashSet::new();
     for (l, input) in inputs.iter_mut().enumerate() {
         let root = input.library.root_path.clone();
@@ -496,35 +501,43 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                     if let Layout::Role(role) = layout {
                         row.role = Some(role);
                     }
-                    let mut exportable = pack.is_some();
-                    if let Some(nearest) = walkers[l].nearest_for_file(&item.file_path) {
-                        issue(format!(
-                            "conversion.json support not built yet ({} covers this file)",
-                            nearest.path
-                        ));
-                        exportable = false;
-                    }
-                    match textures::pass_through(&extension, layout, convention) {
-                        Err(Refusal::NeedsConversion(m) | Refusal::Unsupported(m)) => {
-                            issue(m);
-                            exportable = false;
+                    // A pass-through texture has no step of OpenDAM's own
+                    let conversion = match walkers[l].chain(&[&item.file_path], Vec::new()) {
+                        Ok(chain) => Some(chain),
+                        Err(invalid) => {
+                            invalid_conversions
+                                .entry((l, invalid.path.clone()))
+                                .or_insert_with(|| (invalid, Vec::new()))
+                                .1
+                                .push(asset.clone());
+                            None
                         }
-                        Ok(pass) if exportable && is_pascal(&name) => {
-                            match input.memo.sha256(&root, &item.file_path) {
-                                Ok(sha256) => {
-                                    let pack_path = &sources[pack.expect("exportable")].path;
-                                    ready = Some(ReadyTexture {
-                                        name,
-                                        role: pass.role,
-                                        extension: pass.extension,
-                                        sha256,
-                                        source_path: relative_to(pack_path, &item.file_path),
-                                    })
-                                }
-                                Err(e) => issue(format!("it can't be read: {e}")),
+                    };
+                    match (
+                        textures::pass_through(&extension, layout, convention),
+                        pack,
+                        conversion,
+                    ) {
+                        (Err(Refusal::NeedsConversion(m) | Refusal::Unsupported(m)), _, _) => {
+                            issue(m)
+                        }
+                        (Ok(pass), Some(pack), Some(conversion)) if is_pascal(&name) => match input
+                            .memo
+                            .sha256(&root, &item.file_path)
+                        {
+                            Ok(sha256) => {
+                                ready = Some(ReadyTexture {
+                                    name,
+                                    role: pass.role,
+                                    extension: pass.extension,
+                                    sha256,
+                                    source_path: relative_to(&sources[pack].path, &item.file_path),
+                                    conversion,
+                                })
                             }
-                        }
-                        Ok(_) => {}
+                            Err(e) => issue(format!("it can't be read: {e}")),
+                        },
+                        _ => {}
                     }
                 }
                 _ => issue(
@@ -534,6 +547,15 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
             }
             reads.push(Read { row, pack, ready });
         }
+    }
+    for ((_, path), (invalid, assets)) in invalid_conversions {
+        problems.push(Problem {
+            message: format!(
+                "{path}: this conversion.json is invalid, so no file it covers can be exported: {}",
+                invalid.errors.join("; ")
+            ),
+            assets,
+        });
     }
 
     names(&reads, &mut problems);
@@ -665,7 +687,7 @@ fn manifest(
                 "sha256": texture.sha256,
                 "pack": export_packs[pack].id,
                 "sourcePath": texture.source_path,
-                "conversion": [],
+                "conversion": texture.conversion,
                 "role": role,
             }),
             asset: &read.row.asset,
@@ -1077,7 +1099,6 @@ mod tests {
         let report = check_domain(
             &f,
             &[
-                "Converted/Ruins/T_Pillar_D.png",
                 "Converted/Ruins/T_Pillar_N.png",
                 "Dungeon Props/Textures/T_StoneFloor_ORM.png",
                 "Dungeon Props/Textures/T_Wall_N_DX.png",
@@ -1090,8 +1111,6 @@ mod tests {
         assert_eq!(
             messages(&report),
             [
-                "Converted/Ruins/T_Pillar_D.png: conversion.json support not built yet (Converted/conversion.json covers this file)",
-                "Converted/Ruins/T_Pillar_N.png: conversion.json support not built yet (Converted/conversion.json covers this file)",
                 "Converted/Ruins/T_Pillar_N.png: texture conversion not built yet: it needs its DirectX normal map's green channel flipped",
                 "Dungeon Props/Models/SM_Chest.fbx: model export not built yet (an FBX exports as a model or an animation, and neither is built yet)",
                 "Dungeon Props/Textures/T_StoneFloor_ORM.png: texture conversion not built yet: it needs its ORM channels split into URP roles",
@@ -1111,6 +1130,140 @@ mod tests {
         assert_eq!(ruins.pack.origin, packs::Origin::Unreal);
         assert_eq!(ruins.normal_convention, Convention::DirectX);
         assert_eq!(ruins.pack.licence.spdx.as_deref(), Some("CC-BY-4.0"));
+    }
+
+    #[tokio::test]
+    async fn textures_carry_their_nearest_conversion_json_steps() {
+        let f = fixture().await;
+        let report = check_domain(
+            &f,
+            &[
+                "Converted/Ruins/T_Pillar_D.png",
+                "Scans/T_Boulder_D.png",
+                "Scans/Cliffs/T_Cliff_D.png",
+                "Kenney Crates/crate_wood.png",
+            ],
+        )
+        .await;
+
+        // The step-3 guard's case now exports (AC14)
+        assert_eq!(messages(&report), Vec::<&str>::new());
+        assert_valid(&report);
+        let assets = report.manifest["assets"].as_array().unwrap();
+        let chains: Vec<(&str, &Value)> = assets
+            .iter()
+            .map(|a| (a["assetName"].as_str().unwrap(), &a["conversion"]))
+            .collect();
+        let uasset = json!([{"tool": "UE Asset Exporter", "toolVersion": "5.4", "from": "uasset"}]);
+        let sampler = json!([{
+            "tool": "Substance 3D Sampler", "toolVersion": "4.2", "from": "jpg",
+            "settings": {"resolution": 2048}
+        }]);
+        // The deeper Scans/Cliffs/conversion.json replaces the pack's, in its own order
+        let cliffs = json!([
+            {"tool": "RealityScan", "toolVersion": "2.0", "from": "jpg"},
+            {
+                "tool": "Substance 3D Sampler", "toolVersion": "4.2", "by": "delight",
+                "from": "exr", "settings": {"resolution": 4096, "tiling": true}
+            }
+        ]);
+        assert_eq!(
+            chains,
+            [
+                ("Boulder", &sampler),
+                ("Cliff", &cliffs),
+                ("CrateWood", &json!([])),
+                ("Pillar", &uasset),
+            ]
+        );
+        assert_eq!(assets[1]["sourcePath"], "Cliffs/T_Cliff_D.png");
+
+        // A conversion.json above the pack folder with a uasset step makes the pack unreal (AC9)
+        let origins: Vec<(&str, packs::Origin)> = report
+            .packs
+            .iter()
+            .map(|p| (p.pack.id.as_str(), p.pack.origin))
+            .collect();
+        assert_eq!(
+            origins,
+            [
+                ("ruins", packs::Origin::Unreal),
+                ("kenney-crates", packs::Origin::Generic),
+                ("scans", packs::Origin::Generic),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_conversion_json_is_one_problem_naming_it_and_its_files() {
+        let f = fixture().await;
+        let invalid =
+            json!({"contractVersion": 1, "steps": [{"tool": "RealityScan", "from": "jpg"}]});
+        std::fs::write(
+            f.library.root_path.join("Scans/Cliffs/conversion.json"),
+            invalid.to_string(),
+        )
+        .unwrap();
+        std::fs::copy(
+            f.library.root_path.join("Scans/Cliffs/T_Cliff_D.png"),
+            f.library.root_path.join("Scans/Cliffs/T_Ledge_D.png"),
+        )
+        .unwrap();
+        crate::watcher::index_paths(
+            &f.db,
+            "fixture",
+            &[f.library.root_path.display().to_string()],
+        )
+        .await
+        .unwrap();
+        let report = check_domain(
+            &f,
+            &[
+                "Scans/T_Boulder_D.png",
+                "Scans/Cliffs/T_Cliff_D.png",
+                "Scans/Cliffs/T_Ledge_D.png",
+            ],
+        )
+        .await;
+
+        assert_eq!(report.problems.len(), 1, "{:?}", messages(&report));
+        let problem = &report.problems[0];
+        assert!(
+            problem.message.starts_with(
+                "Scans/Cliffs/conversion.json: this conversion.json is invalid, so no file it covers can be exported: /steps/0"
+            ),
+            "{}",
+            problem.message
+        );
+        assert!(
+            problem.message.contains("toolVersion"),
+            "{}",
+            problem.message
+        );
+        let named: Vec<&str> = problem
+            .assets
+            .iter()
+            .map(|a| a.file_path.as_str())
+            .collect();
+        assert_eq!(
+            named,
+            ["Scans/Cliffs/T_Cliff_D.png", "Scans/Cliffs/T_Ledge_D.png"]
+        );
+        let statuses: Vec<(&str, Status)> = report
+            .assets
+            .iter()
+            .map(|a| (a.asset.file_path.as_str(), a.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                ("Scans/T_Boulder_D.png", Status::Ready),
+                ("Scans/Cliffs/T_Cliff_D.png", Status::Problem),
+                ("Scans/Cliffs/T_Ledge_D.png", Status::Problem),
+            ]
+        );
+        assert_eq!(texture_entries(&report).len(), 1);
+        assert_valid(&report);
     }
 
     #[tokio::test]
@@ -1352,11 +1505,7 @@ mod tests {
         .await;
         let report = check(&f.db, "domain").await.unwrap();
 
-        assert_eq!(
-            messages(&report),
-            ["Unreal/Rocks/T_Rock_D.png: conversion.json support not built yet (Unreal/conversion.json covers this file)"]
-        );
-        assert_eq!(report.problems[0].assets[0].library_id, "second");
+        assert_eq!(messages(&report), Vec::<&str>::new());
         let rows: Vec<(&str, &str, Option<&str>, Status)> = report
             .assets
             .iter()
@@ -1377,7 +1526,7 @@ mod tests {
                     "second",
                     "Unreal/Rocks/T_Rock_D.png",
                     Some("rocks"),
-                    Status::Problem
+                    Status::Ready
                 ),
                 ("fixture", "Foo A/tile_a.png", Some("foo"), Status::Ready),
                 (
@@ -1418,7 +1567,7 @@ mod tests {
             .iter()
             .map(|p| p["id"].as_str().unwrap())
             .collect();
-        assert_eq!(manifest_packs, ["foo", "foo-2"]);
+        assert_eq!(manifest_packs, ["foo", "foo-2", "rocks"]);
         let assets = report.manifest["assets"].as_array().unwrap();
         let entries: Vec<(&str, &str, &str)> = assets
             .iter()
@@ -1430,26 +1579,33 @@ mod tests {
         assert_eq!(
             entries,
             [
+                ("Rock", "rocks", "T_Rock_D.png"),
                 ("TileA", "foo", "tile_a.png"),
                 ("TileC", "foo-2", "tile_c.png")
             ]
         );
         assert_eq!(
-            assets[1]["sha256"],
+            assets[0]["conversion"],
+            json!([{"tool": "UE", "toolVersion": "5.4", "from": "uasset"}])
+        );
+        assert_eq!(assets[1]["conversion"], json!([]));
+        assert_eq!(
+            assets[2]["sha256"],
             hashes::sha256_file(&root.join("Foo Copy/tile_c.png")).unwrap()
         );
-        // Each library memoizes its own file's hash
+        // Each library memoizes its own files' hashes
         for library in [&f.library, &second] {
-            let memo: Vec<String> = sqlx::query_scalar("SELECT file_path FROM file_hashes")
-                .fetch_all(&library.pool)
-                .await
-                .unwrap();
-            let expected = if library.id == "second" {
-                "Foo Copy/tile_c.png"
+            let memo: Vec<String> =
+                sqlx::query_scalar("SELECT file_path FROM file_hashes ORDER BY file_path")
+                    .fetch_all(&library.pool)
+                    .await
+                    .unwrap();
+            let expected: &[&str] = if library.id == "second" {
+                &["Foo Copy/tile_c.png", "Unreal/Rocks/T_Rock_D.png"]
             } else {
-                "Foo A/tile_a.png"
+                &["Foo A/tile_a.png"]
             };
-            assert_eq!(memo, [expected], "{}", library.id);
+            assert_eq!(memo, expected, "{}", library.id);
         }
     }
 
