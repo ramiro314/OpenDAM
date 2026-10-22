@@ -45,7 +45,9 @@ CREATE TABLE IF NOT EXISTS assets (
     render_width     INTEGER,             -- a render's size from its header, NULL until read (structure.rs)
     render_height    INTEGER,
     render_read_bytes INTEGER,            -- the size_bytes and modified_at the header was read at
-    render_read_mtime INTEGER
+    render_read_mtime INTEGER,
+    preview_version  INTEGER,             -- the preview engine version that made the preview, NULL for 1 (preview.rs)
+    preview_textures TEXT                 -- the engine's texture report as JSON, never searched (preview.rs)
 );
 
 CREATE INDEX IF NOT EXISTS idx_assets_kind         ON assets(kind);

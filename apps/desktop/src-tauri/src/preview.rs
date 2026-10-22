@@ -435,16 +435,41 @@ fn emit_done(state: &AppState, done: &PreviewDone) {
     );
 }
 
+/// What the preview engine reports about a preview it made (plan textured-fbx-previews C7): its
+/// `preview_version`, and for FBX/3DS its `preview_textures` summary as JSON. A result without
+/// them, from an older engine or a Rust thumbnail, has neither, which reads as version 1.
+#[derive(Debug, Default)]
+pub(crate) struct EngineReport {
+    version: Option<i64>,
+    textures: Option<String>,
+}
+
+impl EngineReport {
+    /// The report in a worker's `model_meta` result.
+    pub(crate) fn of_result(result: &serde_json::Value) -> Self {
+        EngineReport {
+            version: result.get("preview_version").and_then(|v| v.as_i64()),
+            textures: result
+                .get("preview_textures")
+                .filter(|v| !v.is_null())
+                .map(|v| v.to_string()),
+        }
+    }
+}
+
 /// Marks a job done and stores the asset's preview paths, replacing any old ones: a `None`
 /// `rel_thumb` clears `thumbnail_path`, and an old `_thumb` file the new path doesn't name is
-/// deleted first. `rel_thumb` is relative to the library root; `model_path` is absolute.
-async fn complete_job(
+/// deleted first. `rel_thumb` is relative to the library root; `model_path` is absolute. The
+/// engine's `report` replaces the old one in `preview_version` and `preview_textures`, outside
+/// the searched `metadata`.
+pub(crate) async fn complete_job(
     pool: &Pool<Sqlite>,
     root_path: &Path,
     job_id: &str,
     asset_id: &str,
     rel_thumb: Option<String>,
     model_path: Option<String>,
+    report: &EngineReport,
 ) -> PreviewDone {
     let _ = sqlx::query("UPDATE preview_jobs SET status = 'done' WHERE id = ?")
         .bind(job_id)
@@ -465,18 +490,22 @@ async fn complete_job(
     if let Some(ref model_path) = model_path {
         let rel_model = make_relative_path(root_path, Path::new(model_path));
         let _ = sqlx::query(
-            "UPDATE assets SET preview_status = 'done', thumbnail_path = ?, metadata = json_set(coalesce(nullif(metadata, ''), '{}'), '$.preview_model', ?) WHERE id = ?"
+            "UPDATE assets SET preview_status = 'done', thumbnail_path = ?, metadata = json_set(coalesce(nullif(metadata, ''), '{}'), '$.preview_model', ?), preview_version = ?, preview_textures = ? WHERE id = ?"
         )
         .bind(&rel_thumb)
         .bind(&rel_model)
+        .bind(report.version)
+        .bind(&report.textures)
         .bind(asset_id)
         .execute(pool)
         .await;
     } else {
         let _ = sqlx::query(
-            "UPDATE assets SET preview_status = 'done', thumbnail_path = ? WHERE id = ?",
+            "UPDATE assets SET preview_status = 'done', thumbnail_path = ?, preview_version = ?, preview_textures = ? WHERE id = ?",
         )
         .bind(&rel_thumb)
+        .bind(report.version)
+        .bind(&report.textures)
         .bind(asset_id)
         .execute(pool)
         .await;
@@ -632,6 +661,7 @@ pub(crate) async fn process_image_jobs(
                         &asset_id,
                         rel_thumb,
                         None,
+                        &EngineReport::default(),
                     )
                     .await,
                 );
@@ -725,6 +755,7 @@ async fn run_python_queue(state: Arc<AppState>, py_exec: PathBuf, worker_py: Pat
                 let mut success = false;
                 let mut result_thumb = None;
                 let mut result_model = None;
+                let mut report = EngineReport::default();
 
                 if let Ok(resp) = py_resp {
                     if let Some(res) = resp.get("result") {
@@ -736,6 +767,7 @@ async fn run_python_queue(state: Arc<AppState>, py_exec: PathBuf, worker_py: Pat
                             if let Some(model) = res.get("preview_model").and_then(|v| v.as_str()) {
                                 result_model = Some(model.to_string());
                             }
+                            report = EngineReport::of_result(res);
                         } else {
                             tracing::error!("Python returned ok=false: {:?}", res);
                         }
@@ -754,9 +786,16 @@ async fn run_python_queue(state: Arc<AppState>, py_exec: PathBuf, worker_py: Pat
                     let rel_thumb = result_thumb
                         .or_else(|| result_model.clone())
                         .map(|abs| make_relative_path(root_path, Path::new(&abs)));
-                    let done =
-                        complete_job(pool, root_path, &job_id, &asset_id, rel_thumb, result_model)
-                            .await;
+                    let done = complete_job(
+                        pool,
+                        root_path,
+                        &job_id,
+                        &asset_id,
+                        rel_thumb,
+                        result_model,
+                        &report,
+                    )
+                    .await;
                     emit_done(&state, &done);
                 } else {
                     fail_job(&state, pool, &job_id, &asset_id).await;
@@ -1266,6 +1305,7 @@ mod tests {
             "a1",
             Some(".opendam/thumbs/a1_preview.glb".into()),
             Some(model_abs.clone()),
+            &EngineReport::default(),
         )
         .await;
         assert!(!old_thumb.exists());
@@ -1280,9 +1320,52 @@ mod tests {
             "a1",
             Some(".opendam/thumbs/a1_thumb.png".into()),
             Some(model_abs),
+            &EngineReport::default(),
         )
         .await;
         assert!(model.exists());
+    }
+
+    #[tokio::test]
+    async fn a_job_stores_the_engines_report_and_one_without_it_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let lib = library_with_pending_job(root, "models/ship.fbx", "").await;
+        let textures = json!({
+            "materials": 3, "textured": 2, "via": {"relative": 1, "name": 1},
+            "missing": ["T_Fill_B"], "unreadable": [], "too_large": [], "no_uv": 0,
+        });
+        let current = json!({"ok": true, "preview_version": 2, "preview_textures": textures});
+        let model = root.join(".opendam/thumbs/a1_preview.glb");
+        let stored = || async {
+            let (version, report): (Option<i64>, Option<String>) =
+                sqlx::query_as("SELECT preview_version, preview_textures FROM assets")
+                    .fetch_one(&lib.pool)
+                    .await
+                    .unwrap();
+            let report = report.map(|r| serde_json::from_str::<serde_json::Value>(&r).unwrap());
+            (version, report)
+        };
+
+        // With and without a converted model, as Python and Rust jobs complete
+        for model_path in [Some(model.to_string_lossy().to_string()), None] {
+            let thumb = Some(".opendam/thumbs/a1_preview.glb".to_string());
+            let complete = |result: serde_json::Value| {
+                let (thumb, model_path) = (thumb.clone(), model_path.clone());
+                let lib = &lib;
+                async move {
+                    let report = EngineReport::of_result(&result);
+                    complete_job(&lib.pool, root, "j1", "a1", thumb, model_path, &report).await;
+                }
+            };
+
+            complete(current.clone()).await;
+            assert_eq!(stored().await, (Some(2), Some(textures.clone())));
+
+            // An older engine's result, which reads as version 1
+            complete(json!({"ok": true})).await;
+            assert_eq!(stored().await, (None, None));
+        }
     }
 
     #[test]

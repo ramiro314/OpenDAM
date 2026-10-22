@@ -4445,6 +4445,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_search_or_live_count_matches_the_words_of_a_preview_texture_report() {
+        let ship = "ships/Models/ship.fbx";
+        let rock = "textures/rock.png";
+        let libs = [sized_library(&[(ship, 1), (rock, 1)]).await];
+        let lib = &libs[0];
+        // Completed as the worker reports an FBX it couldn't fully texture (plan C7)
+        let result = serde_json::json!({
+            "ok": true,
+            "preview_version": 2,
+            "preview_textures": {
+                "materials": 2, "textured": 1, "via": {"name": 1}, "missing": ["T_Rock_BC"],
+                "alpha": {"cutout": 0, "ignored": 0, "none": 1},
+            },
+        });
+        let model = lib.root_path.join(".opendam/thumbs/ship_preview.glb");
+        crate::preview::complete_job(
+            &lib.pool,
+            &lib.root_path,
+            "j1",
+            ship,
+            Some(".opendam/thumbs/ship_preview.glb".to_string()),
+            Some(model.to_string_lossy().to_string()),
+            &crate::preview::EngineReport::of_result(&result),
+        )
+        .await;
+        let report: String = sqlx::query_scalar("SELECT preview_textures FROM assets WHERE id = ?")
+            .bind(ship)
+            .fetch_one(&lib.pool)
+            .await
+            .unwrap();
+        assert!(report.contains("T_Rock_BC"));
+        assert_eq!(
+            counted_search(&libs, serde_json::json!({ "text": "ship" }))
+                .await
+                .0,
+            [ship]
+        );
+
+        for (text, found) in [
+            ("rock", &[rock][..]),
+            ("none", &[]),
+            ("name", &[]),
+            ("textured", &[]),
+        ] {
+            let query = serde_json::json!({ "text": text });
+            let (ids, total, _) = counted_search(&libs, query.clone()).await;
+            assert_eq!(ids, found, "{text}");
+            assert_eq!(total, Some(found.len() as i64), "{text}");
+            let counts = live_folder_counts(lib, query.clone(), &["", "ships"]).await;
+            assert!(!counts[""].contains_key("ships"), "{text}: {counts:?}");
+            assert!(counts["ships"].is_empty(), "{text}: {counts:?}");
+            let facets = live_facet_counts(&libs, query).await;
+            assert_eq!(facets.extension("fbx"), 0, "{text}");
+            assert!(!facets.kinds.contains_key("3d_model"), "{text}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_kits_format_folders_each_count_its_models_and_their_parent_counts_them_once() {
         let library = grouped_library().await;
         let counts = live_folder_counts(

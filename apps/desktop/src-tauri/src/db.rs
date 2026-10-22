@@ -194,30 +194,20 @@ async fn add_tag_description_column(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
 /// than a column already being there is an error, since every search reads them. Their indexes are
 /// made here rather than in the schema, which runs before an old library has the columns.
 async fn add_structure_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
-    for (table, column, definition) in [
-        ("assets", "support_role", "TEXT"),
-        ("assets", "group_id", "TEXT"),
-        ("assets", "bundled_preview", "TEXT"),
-        ("assets", "render_width", "INTEGER"),
-        ("assets", "render_height", "INTEGER"),
-        ("assets", "render_read_bytes", "INTEGER"),
-        ("assets", "render_read_mtime", "INTEGER"),
-        ("folders", "split_groups", "INTEGER NOT NULL DEFAULT 0"),
-    ] {
-        let present: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)")
-                .bind(table)
-                .bind(column)
-                .fetch_one(pool)
-                .await?;
-        if !present {
-            sqlx::query(&format!(
-                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-            ))
-            .execute(pool)
-            .await?;
-        }
-    }
+    add_missing_columns(
+        pool,
+        &[
+            ("assets", "support_role", "TEXT"),
+            ("assets", "group_id", "TEXT"),
+            ("assets", "bundled_preview", "TEXT"),
+            ("assets", "render_width", "INTEGER"),
+            ("assets", "render_height", "INTEGER"),
+            ("assets", "render_read_bytes", "INTEGER"),
+            ("assets", "render_read_mtime", "INTEGER"),
+            ("folders", "split_groups", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+    )
+    .await?;
     // The grid items by path: a search of the library or of a folder counts them from this
     // index alone, and finds a folder's items without reading its members and support files.
     // Its `WHERE` must stay term for term the visibility rule's (`commands::asset`'s
@@ -236,7 +226,30 @@ async fn add_structure_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
 /// failure other than a column already being there is an error, since every run query selects
 /// them.
 async fn add_run_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
-    for (table, column, definition) in crate::autotag::store::ADDED_COLUMNS {
+    add_missing_columns(pool, &crate::autotag::store::ADDED_COLUMNS).await
+}
+
+/// Backward compatibility: assets gained the preview engine version that made a preview and the
+/// engine's texture report (plan textured-fbx-previews C8), which `preview::complete_job`
+/// stores. Older rows read as `NULL`, version 1. As with tag descriptions, any failure other
+/// than a column already being there is an error. Neither is indexed or searched.
+async fn add_preview_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
+    add_missing_columns(
+        pool,
+        &[
+            ("assets", "preview_version", "INTEGER"),
+            ("assets", "preview_textures", "TEXT"),
+        ],
+    )
+    .await
+}
+
+/// Adds each `(table, column, definition)` of `columns` that its table lacks.
+async fn add_missing_columns(
+    pool: &Pool<Sqlite>,
+    columns: &[(&str, &str, &str)],
+) -> sqlx::Result<()> {
+    for (table, column, definition) in columns {
         let present: bool =
             sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)")
                 .bind(table)
@@ -339,6 +352,9 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     add_structure_columns(&pool)
         .await
         .context("Could not add the support role and group columns")?;
+    add_preview_columns(&pool)
+        .await
+        .context("Could not add the preview version columns")?;
     // Search still works on the old index, so a failed conversion only waits for the next open.
     if let Err(e) = index_file_paths(&pool, false).await {
         tracing::warn!("Could not index folder names for search in {db_path:?}: {e}");
@@ -737,6 +753,7 @@ async fn memory_pool(foreign_keys: bool) -> Pool<Sqlite> {
         .unwrap();
     create_library_schema(&pool).await.unwrap();
     add_structure_columns(&pool).await.unwrap();
+    add_preview_columns(&pool).await.unwrap();
     // The schema script sets the pragma itself, so pin it again afterwards.
     sqlx::query(&format!(
         "PRAGMA foreign_keys = {}",
@@ -1690,6 +1707,29 @@ mod tests {
 
         assert!(lacking.is_err());
         assert!(present.is_ok());
+    }
+
+    #[tokio::test]
+    async fn adding_the_preview_columns_to_a_library_made_before_them_keeps_its_rows() {
+        let pool = memory_library_pool().await;
+        insert_asset(&pool, "a1").await;
+        sqlx::query(
+            "ALTER TABLE assets DROP COLUMN preview_version;
+             ALTER TABLE assets DROP COLUMN preview_textures;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        add_preview_columns(&pool).await.unwrap();
+        add_preview_columns(&pool).await.unwrap();
+
+        let row: (String, Option<i64>, Option<String>) =
+            sqlx::query_as("SELECT id, preview_version, preview_textures FROM assets")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, ("a1".to_string(), None, None));
     }
 
     #[tokio::test]
