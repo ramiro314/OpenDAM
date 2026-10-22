@@ -235,6 +235,52 @@ def fbx_scene(ai_scene, textures):
     return scene, poly_count, len(instances)
 
 
+# ── Trimesh-branch textures ───────────────────────────────────────────────
+PBR_TEXTURE_SLOTS = (
+    "baseColorTexture",
+    "normalTexture",
+    "metallicRoughnessTexture",
+    "emissiveTexture",
+    "occlusionTexture",
+)
+
+
+def downscale_textures(scene, source: str = "") -> None:
+    """
+    Shrinks every image over 1024 px that a geometry's material holds, in `SimpleMaterial.image`
+    and the five `PBRMaterial` texture slots (plan C6). An image shared by several slots or
+    materials is shrunk once, so the GLB stores it once. An image that fails to shrink is kept,
+    with a warning on stderr naming `source`, which the app logs under `preview_worker`.
+    """
+    from trimesh.visual.material import PBRMaterial, SimpleMaterial
+
+    from textures import MAX_SIDE, shrink_image
+
+    shrunk = {}  # id(image) -> (image, its replacement), holding the image so its id stays unique
+
+    def fitted(img):
+        if img is None or not hasattr(img, "getbands") or max(img.size) <= MAX_SIDE:
+            return img
+        if id(img) not in shrunk:
+            try:
+                shrunk[id(img)] = (img, shrink_image(img))
+            except Exception as e:
+                print(
+                    f"{source}: kept a {img.size[0]}x{img.size[1]} texture, shrink failed: {e}",
+                    file=sys.stderr,
+                )
+                shrunk[id(img)] = (img, img)
+        return shrunk[id(img)][1]
+
+    for geom in scene.geometry.values():
+        material = getattr(getattr(geom, "visual", None), "material", None)
+        if isinstance(material, SimpleMaterial):
+            material.image = fitted(material.image)
+        elif isinstance(material, PBRMaterial):
+            for slot in PBR_TEXTURE_SLOTS:
+                setattr(material, slot, fitted(getattr(material, slot)))
+
+
 # ── 3D model metadata & previews ──────────────────────────────────────────────
 def model_meta(
     source: str,
@@ -435,6 +481,7 @@ def model_meta(
             import trimesh
 
             scene = trimesh.load(source, force="scene")
+            downscale_textures(scene, source)
 
             out_path = Path(output_dir) / f"{out_name}_preview.glb"
             scene.export(str(out_path), file_type="glb")
