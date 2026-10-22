@@ -126,6 +126,14 @@ decision changed:
 - **A pack id that slugifies to nothing becomes `pack`,** which the clash suffix then makes unique
   like any other (C6, AC9).
 
+Revised a thirteenth time 2026-10-22 after GitHub Inspector's ninth review of PR #165. No
+decision changed:
+
+- **A `_DX` or `_GL` suffix is dropped before anything else is read.** It sets a normal map's
+  convention (D14), and the role or layout suffix before it is read next, so `T_Rock_N_DX` is the
+  `Rock` set's Normal in DirectX and exports with its green flipped. Sets, suffix lookups and
+  default names all compare stems without it (C5, C7, C8, C16, AC4, AC7).
+
 ## Goal
 
 The Dungeon Game takes its art only as **bundles** that OpenDAM exports and the game's importer
@@ -386,8 +394,9 @@ that asset as removed before anything is written (C15).
 - **A texture's default** (D24) is its texture set's (C8): a set used by one model takes that
   model's `assetName`, or `<AssetName><MaterialName>` when that model has more than one set in
   the role. A set used by several models in the domain, or by none (standalone members), takes
-  its stem, with prefix and role or layout suffix dropped (`PolygonCity_Texture_01_A` becomes
-  `PolygonCityTexture01A`, and `T_Rune_N` and `T_Rock_R` become `Rune` and `Rock`).
+  its stem, with prefix and suffixes dropped as C7 step 3 drops them (`PolygonCity_Texture_01_A`
+  becomes `PolygonCityTexture01A`, and `T_Rune_N`, `T_Rock_R` and `T_Rock_N_DX` become `Rune`,
+  `Rock` and `Rock`).
 - **Uniqueness:** two models or animations with one name, two textures with one name and role,
   or two materials of one model with one name, are each a problem naming both assets. The export
   refuses (D10).
@@ -446,7 +455,10 @@ For each slot, the first source with an answer wins (D11):
    matches the slot's or the model's (`_D _BaseColor _Albedo _Diffuse _Color`, `_N _Normal _NRM`,
    `_ORM _AORM _ARM`, `_MaskMap _Mask`, `_R _Roughness _Rough`, `_G _Gloss _Glossiness
    _Smoothness`, `_M _Metallic _Metalness`, `_AO _Occlusion`, `_E _Emissive _Emission`,
-   `_H _Height _Disp _Displacement`, `_MetallicSmoothness _MS`).
+   `_H _Height _Disp _Displacement`, `_MetallicSmoothness _MS`). A trailing `_DX` or `_GL`
+   (any case) is read and dropped first: it sets a normal map's convention (D14), and the role or
+   layout suffix before it is read next. So `T_Rock_N_DX` is a Normal in DirectX with the stem
+   `Rock`, and every stem comparison (this lookup, C5's names, C8's sets) is made without it.
 4. **Images in the model's format group or folder** with the model's stem, as BaseColor.
 
 - **Your edits** (C4) replace any inferred field.
@@ -460,13 +472,13 @@ For each slot, the first source with an answer wins (D11):
 the files its roles need, at source resolution and bit depth (8 or 16 bit), as PNG unless it
 passes through.
 
-**Texture sets.** Images are grouped before conversion. A texture set is the images in one
-folder whose stems match, ignoring case, once the type prefix (C5) and the role or layout suffix
-(C7 step 3) are dropped: `T_Rock_D`, `T_Rock_N`, `T_Rock_R` and `T_Rock_M` form the set `Rock`.
-A domain's member image brings in its whole set, and a material brings in the sources of the
-roles it uses. A set's sources go through the table below together, so it exports one texture
-asset per output role, all sharing the set's `assetName` (C5). An image whose suffix names no
-role or layout is a set of its own, as BaseColor.
+**Texture sets.** Images are grouped before conversion. A texture set is the images in one folder
+whose stems match, ignoring case, once the type prefix (C5), a `_DX` or `_GL` convention suffix and
+the role or layout suffix (C7 step 3) are dropped: `T_Rock_D`, `T_Rock_N_DX`, `T_Rock_R` and
+`T_Rock_M` form the set `Rock`. A domain's member image brings in its whole set, and a material
+brings in the sources of the roles it uses. A set's sources go through the table below together, so
+it exports one texture asset per output role, all sharing the set's `assetName` (C5). An image
+whose suffix names no role or layout is a set of its own, as BaseColor.
 
 | Source layout | Inferred from | Output |
 |---|---|---|
@@ -684,8 +696,9 @@ answer per file's size and mtime for the session.
     base color with a cut-out alpha, a JPG base color, an AORM PNG, a DirectX normal map, and a
     separate Roughness and Metallic pair (step 4, for `fbx_facts`, inference and the step-5
     guard's refusals; step 5 converts the same files);
-  - standalone member images used by no model: a `T_Rock_R.png` and `T_Rock_M.png` pair, a lone
-    `_M` map and an ORM map (step 4 for the sets, step 5 for their outputs);
+  - standalone member images used by no model: a `T_Rock_R.png` and `T_Rock_M.png` pair, a
+    `T_Rock_N_DX.png` normal map in the same folder, a lone `_M` map and an ORM map (step 4 for
+    the sets, step 5 for their outputs);
   - an FBX with only a `UCX_` hull and no take, which must be refused (step 4);
   - a model whose only material is named `Material`, which must keep that name, and one with two
     materials of one name, which must be refused (step 4);
@@ -796,8 +809,9 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   survives a reindex.
 - **AC4.** On the fixtures, inference gives the expected materials, roles, layouts, surfaces and
   conventions. `fbx_facts` lists no collision hull's material and not assimp's added
-  `DefaultMaterial`, but keeps a real slot named `DefaultMaterial`. An FBX with only a `UCX_` hull
-  and no take is refused, naming C3's rule. Each edit replaces its
+  `DefaultMaterial`, but keeps a real slot named `DefaultMaterial`. `T_Rock_N_DX` joins the `Rock`
+  set as its Normal, in DirectX. An FBX with only a `UCX_` hull and no take is refused, naming
+  C3's rule. Each edit replaces its
   inferred value, and a reset restores it.
 - **AC5.** Normalized fixture models re-import with bounds within 0.1% of the expected metre
   sizes, `min.y` 0, the X and Z centre 0, and the nose toward +Z. The collision meshes are
@@ -817,7 +831,8 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   inversion, gloss pass-through, MaskMap split, green flip, and JPG to PNG. Each records C8's
   steps. Standalone `T_Rock_R` and `T_Rock_M` members export as one `Rock` MetallicSmoothness, a
   lone metallic map with smoothness 0.5, and an ORM member as an Occlusion and a
-  MetallicSmoothness of one name.
+  MetallicSmoothness of one name. `T_Rock_N_DX` exports as the `Rock` Normal with its green
+  channel flipped.
 - **AC8.** An asset's `conversion` holds its nearest `conversion.json`'s steps, then OpenDAM's.
   An invalid `conversion.json` refuses the export.
 - **AC9.** The pack id, licence (a `LicenseRef-` kept, Unknown with null), origin, sourcePath and
