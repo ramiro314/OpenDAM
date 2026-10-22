@@ -393,6 +393,17 @@ export interface AiSettingsPatch {
   jev?: Partial<JevSettings>;
 }
 
+/** Game export settings (plan C2). Null is unset. */
+export interface ExportSettings {
+  /** An absolute folder outside every library */
+  root: string | null;
+  /** A top-level, non-smart collection whose children are the export domains */
+  rootCollection: string | null;
+}
+
+/** The fields to change, where null clears one */
+export type ExportSettingsPatch = Partial<ExportSettings>;
+
 /** Where a provider's key comes from. It never carries the key. */
 export interface ProviderStatus {
   provider: AiProvider;

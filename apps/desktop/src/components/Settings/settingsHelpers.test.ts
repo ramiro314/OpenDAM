@@ -1,12 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import {
   claudePlanLines,
+  exportSettingsPatch,
   ignoredOverridesNote,
   isKnownModel,
   parseNumberInput,
+  rootCollectionOptions,
   settingsPatch,
 } from './settingsHelpers';
-import type { AiSettings, ClaudePlanStatus } from '../../types';
+import type { AiSettings, ClaudePlanStatus, Collection } from '../../types';
 
 const saved: AiSettings = {
   anthropic: {
@@ -101,5 +103,42 @@ describe('ignoredOverridesNote', () => {
     expect(ignoredOverridesNote(['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'])).toBe(
       'ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL are set for the app, but claude never gets them'
     );
+  });
+});
+
+describe('exportSettingsPatch', () => {
+  const exportSaved = { root: '/home/me/export', rootCollection: 'dg' };
+
+  test('is null when nothing changed', () => {
+    expect(exportSettingsPatch(exportSaved, { ...exportSaved })).toBeNull();
+  });
+
+  test('holds only the changed fields, with null for a cleared one', () => {
+    expect(exportSettingsPatch(exportSaved, { ...exportSaved, root: null })).toEqual({
+      root: null,
+    });
+  });
+});
+
+describe('rootCollectionOptions', () => {
+  const collection = (id: string, name: string, extra: Partial<Collection> = {}): Collection => ({
+    id,
+    name,
+    description: '',
+    assetIds: [],
+    isSmart: false,
+    createdAt: 0,
+    ...extra,
+  });
+
+  test('offers only top-level, non-smart collections, by name', () => {
+    const options = rootCollectionOptions([
+      collection('dg', 'DungeonGame'),
+      collection('dungeon', 'Dungeon', { parentId: 'dg' }),
+      collection('recent', 'Recent', { isSmart: true, filterSpec: '{}' }),
+      collection('art', 'Art'),
+    ]);
+
+    expect(options.map((c) => c.id)).toEqual(['art', 'dg']);
   });
 });

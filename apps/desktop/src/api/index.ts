@@ -25,6 +25,8 @@ import type {
   AnthropicAccess,
   ClaudePlanStatus,
   AiSettingsPatch,
+  ExportSettings,
+  ExportSettingsPatch,
   ProviderStatus,
   AutotagMode,
   ConnectionTest,
@@ -146,6 +148,13 @@ export const api = {
       model: model ?? null,
       access: access ?? null,
     }),
+
+  // Game export settings. An export root in or around a library is refused.
+  getExportSettings: () => invoke<ExportSettings>('get_export_settings'),
+  setExportSettings: (patch: ExportSettingsPatch) =>
+    invoke<ExportSettings>('set_export_settings', { patch }),
+  /** Deletes every open library's export cache, returning how many it deleted */
+  clearExportCache: () => invoke<number>('clear_export_cache'),
 
   // Auto-tagging runs. Progress arrives as `autotag:updated` events.
   listAutotagProviders: () => invoke<AutotagProviderOption[]>('list_autotag_providers'),

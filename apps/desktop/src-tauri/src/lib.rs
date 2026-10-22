@@ -1,6 +1,7 @@
 pub mod autotag;
 pub mod commands;
 pub mod db;
+pub mod export;
 pub mod model_preview_regen;
 pub mod models;
 pub mod preview;
@@ -274,6 +275,9 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::settings::get_provider_status,
             commands::settings::test_provider,
             commands::settings::get_claude_plan_status,
+            commands::export::get_export_settings,
+            commands::export::set_export_settings,
+            commands::export::clear_export_cache,
             commands::autotag::list_autotag_providers,
             commands::autotag::estimate_autotag_run,
             commands::autotag::start_autotag_run,

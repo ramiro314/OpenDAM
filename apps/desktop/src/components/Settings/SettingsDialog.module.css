@@ -80,6 +80,8 @@
 .provider {
   display: flex;
   flex-direction: column;
+  /* Keep each section whole: the dialog scrolls rather than squashing them */
+  flex-shrink: 0;
   gap: var(--space-3);
   padding: var(--space-3);
   border: 1px solid var(--color-border);
