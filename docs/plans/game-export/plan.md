@@ -104,6 +104,15 @@ changed:
 - **A clashing pack id's suffix skips ids already in the manifest,** so `foo-2` can't collide
   with a pack really named `foo-2` (C6).
 
+Revised an eleventh time 2026-10-22 after GitHub Inspector's seventh review of PR #165. No
+decision changed:
+
+- **A real material named `DefaultMaterial` is kept.** `fbx_facts` builds its slot list from the
+  materials the FBX itself declares, read by a small reader of the file's node tree, so only the
+  material assimp adds for a mesh without one is left out (C12, C16, AC4, AC5).
+- **Renaming the domain or the root collection forces a new Check.** Their names make the bundle
+  path and the manifest's `domain`, so they are in the Check's fingerprint (C14, AC11).
+
 ## Goal
 
 The Dungeon Game takes its art only as **bundles** that OpenDAM exports and the game's importer
@@ -547,13 +556,17 @@ with `assimp_py`, as `model_meta` does. The request carries the collision patter
 and the answer follows the script's rules:
 
 - the material slots used by kept meshes, in the scene's material order, duplicates included,
-  so C9 step 1 can refuse an FBX with two materials of one name. assimp's synthetic
-  `DefaultMaterial`, which it adds for a mesh with no material, is left out, since Blender adds
-  its own named material for such a mesh (C9 step 2);
+  so C9 step 1 can refuse an FBX with two materials of one name. Only materials the FBX itself
+  declares count. assimp adds a material named `DefaultMaterial` for a mesh with no material,
+  and an artist or exporter can use that name too, so the name alone can't tell them apart.
+  `fbx_facts` therefore reads the file's own `Material` objects and their connections to models
+  with a small reader of the FBX node tree (`fbx_nodes.py`, binary and ASCII, no geometry). A
+  real `DefaultMaterial` is a declared material and is kept, and assimp's is left out, since
+  Blender adds its own named material for such a mesh (C9 step 2);
 - each slot's texture references by type;
 - the mesh names, kept and dropped, whether any kept mesh exists, and whether any kept mesh has
-  no material (so the Game tab can show the slot the script will add, under the name C9 step 2
-  picks from these slots);
+  no material, meaning its model connects to no declared material (so the Game tab can show the
+  slot the script will add, under the name C9 step 2 picks from these slots);
 - the bone names;
 - the takes that animate something (at least one channel), by their FBX take names.
 
@@ -583,6 +596,8 @@ answer per file's size and mtime for the session.
 - **What "nothing changed" means:** the Check records a fingerprint of every input it read.
   That covers:
   - the domain's member list;
+  - the names of the root collection and the domain, which make the bundle path (D6) and the
+    manifest's `domain`, so renaming either after the Check forces a new one;
   - the `export_edits` rows of its assets and textures;
   - the `pack_overrides` rows of its packs;
   - the export settings;
@@ -643,6 +658,8 @@ answer per file's size and mtime for the session.
   - an FBX with only a `UCX_` hull and no take, which must be refused (step 4);
   - a model whose only material is named `Material`, which must keep that name, and one with two
     materials of one name, which must be refused (step 4);
+  - a model with a real material named `DefaultMaterial` and a mesh with no material, which must
+    keep its `DefaultMaterial` slot and add `OpenDAMDefault` (step 4);
   - a model with a kept slot named `OpenDAMDefault` and a mesh with no material, whose added slot
     must be `OpenDAMDefault2` (step 4);
   - a mesh-less FBX with a take, and one whose only mesh is a `UCX_` hull plus a take (step 7).
@@ -747,8 +764,9 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   `Mattress01`). A collision refuses the export, naming both assets, and an edit fixes it and
   survives a reindex.
 - **AC4.** On the fixtures, inference gives the expected materials, roles, layouts, surfaces and
-  conventions. `fbx_facts` lists no collision hull's material and no `DefaultMaterial`. An FBX
-  with only a `UCX_` hull and no take is refused, naming C3's rule. Each edit replaces its
+  conventions. `fbx_facts` lists no collision hull's material and not assimp's added
+  `DefaultMaterial`, but keeps a real slot named `DefaultMaterial`. An FBX with only a `UCX_` hull
+  and no take is refused, naming C3's rule. Each edit replaces its
   inferred value, and a reset restores it.
 - **AC5.** Normalized fixture models re-import with bounds within 0.1% of the expected metre
   sizes, `min.y` 0, the X and Z centre 0, and the nose toward +Z. The collision meshes are
@@ -758,7 +776,8 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   and a mesh with no material gets `OpenDAMDefault2`, and renaming its file changes neither the
   slot name nor the cached file. A model whose material is named `Material` keeps that slot
   name, and no default cube reaches its bounds or FBX. An FBX with two materials of one name is
-  refused by name.
+  refused by name. A real `DefaultMaterial` slot exports under its own name, beside an added
+  `OpenDAMDefault`.
 - **AC6.** The animation fixture gets its model's transform, and an animation whose bones don't
   match is refused. An FBX whose only mesh is a `UCX_` hull plus a take exports as an
   animation. Changing the model's `facingQuarterTurns` and exporting again re-runs the
@@ -780,6 +799,7 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   asset renamed, or a role changed, between Check and Export makes Export refuse and ask for a
   new Check, and no bundle is written. So does a file added between them: a `conversion.json`
   above a texture, a `.meta` beside a pack file, or a new image matching a material by suffix.
+  Renaming the domain or the root collection between them does too.
 - **AC12.** CI's test job installs the pinned Blender and runs the Blender-backed tests, and
   fails when Blender is missing.
 - **AC13 (by hand, not an agent's).** The fixture bundle that OpenDAM writes passes dungeon-game's
