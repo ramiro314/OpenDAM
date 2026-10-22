@@ -27,6 +27,8 @@ pub struct Blender {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlenderStatus {
+    /// `BLENDER_SERIES`, so Settings names the accepted series without restating it
+    pub series: &'static str,
     /// The setting's path, or `blender` found on `PATH`
     pub path: Option<String>,
     pub version: Option<String>,
@@ -47,6 +49,7 @@ pub async fn gate(configured: Option<&str>) -> Result<Blender, String> {
 pub async fn status(configured: Option<&str>) -> BlenderStatus {
     let path = program(configured, std::env::var_os("PATH").as_deref());
     let mut status = BlenderStatus {
+        series: BLENDER_SERIES,
         path: path.as_ref().map(|p| p.display().to_string()),
         ..Default::default()
     };
@@ -66,7 +69,9 @@ pub async fn detect(configured: Option<&str>) -> Result<Blender, String> {
     let Some(program) = program(configured, std::env::var_os("PATH").as_deref()) else {
         return Err(match configured {
             Some(path) => format!("No Blender at {path}"),
-            None => "blender isn't on PATH: install Blender 5.2 or set its path".into(),
+            None => {
+                format!("blender isn't on PATH: install Blender {BLENDER_SERIES} or set its path")
+            }
         });
     };
     let output = tokio::time::timeout(
@@ -217,6 +222,7 @@ mod tests {
         assert_eq!(
             status(configured(&blender)).await,
             BlenderStatus {
+                series: BLENDER_SERIES,
                 path: Some(blender.display().to_string()),
                 version: Some("5.2.2".into()),
                 accepted: true,
@@ -234,6 +240,7 @@ mod tests {
         let status = status(configured(&blender)).await;
 
         assert!(error.contains("Blender 4.5.3 isn't 5.2.x"), "{error}");
+        assert_eq!(status.series, BLENDER_SERIES);
         assert_eq!(status.version.as_deref(), Some("4.5.3"));
         assert!(!status.accepted);
         assert_eq!(status.problem, Some(error));

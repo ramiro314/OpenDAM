@@ -596,12 +596,14 @@ interface BlenderFieldProps {
 
 /**
  * Blender's path, saved with the dialog, and the version found there, checked as the path
- * changes. Exports that run Blender accept only 5.2.x.
+ * changes. Exports that run Blender accept only the series the backend names (`status.series`).
  */
 function BlenderField({ path, onChange }: BlenderFieldProps) {
   const [status, setStatus] = useState<BlenderStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [checks, setChecks] = useState(0);
+  // Kept across checks, so the hint doesn't flicker while one runs
+  const [series, setSeries] = useState<string | null>(null);
 
   // Waits for typing to pause, and drops the answer for a path that has since changed
   useEffect(() => {
@@ -611,7 +613,11 @@ function BlenderField({ path, onChange }: BlenderFieldProps) {
     const timer = setTimeout(() => {
       api
         .getBlenderStatus(path?.trim() || null)
-        .then((s) => current && setStatus(s))
+        .then((s) => {
+          if (!current) return;
+          setStatus(s);
+          setSeries(s.series);
+        })
         .catch((e) => current && setError(String(e)));
     }, 400);
     return () => {
@@ -665,7 +671,8 @@ function BlenderField({ path, onChange }: BlenderFieldProps) {
       {status?.version && status.problem && <p className={styles.warning}>{status.problem}</p>}
       <p className={styles.keyStatus}>
         <span className={styles.hint}>
-          Exports run Blender 5.2.x for models and animations not already in the export cache
+          Exports run Blender{series && ` ${series}.x`} for models and animations not already in the
+          export cache
         </span>
       </p>
       {error && (

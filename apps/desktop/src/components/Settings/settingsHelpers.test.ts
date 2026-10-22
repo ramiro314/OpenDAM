@@ -123,13 +123,21 @@ describe('exportSettingsPatch', () => {
 
 describe('blenderLine', () => {
   test('names the version and path of a Blender that answered', () => {
-    const status = { path: '/usr/bin/blender', version: '4.5.3', accepted: false, problem: 'x' };
+    const status = {
+      series: '5.2',
+      path: '/usr/bin/blender',
+      version: '4.5.3',
+      accepted: false,
+      problem: 'x',
+    };
     expect(blenderLine(status)).toBe('Blender 4.5.3 at /usr/bin/blender');
   });
 
   test('says why when no Blender answered', () => {
     const problem = 'No Blender at /opt/blender/blender';
-    expect(blenderLine({ path: null, version: null, accepted: false, problem })).toBe(problem);
+    expect(
+      blenderLine({ series: '5.2', path: null, version: null, accepted: false, problem })
+    ).toBe(problem);
   });
 });
 

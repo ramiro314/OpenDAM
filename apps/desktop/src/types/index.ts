@@ -405,10 +405,12 @@ export interface ExportSettings {
 
 /** The Blender an export would run, read for Settings */
 export interface BlenderStatus {
+  /** The major.minor exports accept, "5.2" */
+  series: string;
   path: string | null;
   /** "5.2.2" */
   version: string | null;
-  /** Whether exports accept it: only Blender 5.2.x */
+  /** Whether exports accept it: only Blender `series`.x */
   accepted: boolean;
   /** Why exports can't use it, when they can't */
   problem: string | null;
