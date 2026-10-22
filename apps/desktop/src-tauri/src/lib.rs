@@ -1,6 +1,7 @@
 pub mod autotag;
 pub mod commands;
 pub mod db;
+pub mod model_preview_regen;
 pub mod models;
 pub mod preview;
 pub mod render;
@@ -33,6 +34,8 @@ pub struct AppState {
     /// The preview engine version the Python queue's worker process reported to `engine_info`,
     /// or `None` until a process answers (`preview::PreviewEngine`).
     pub engine_version: tokio::sync::watch::Sender<Option<i64>>,
+    /// The `worker.py` the Python queue runs, once `preview::start_preview_worker` has found it.
+    pub preview_worker: std::sync::OnceLock<std::path::PathBuf>,
 }
 
 /// The tagging providers runs can use, plus the fake ones in a debug build run with
@@ -154,6 +157,7 @@ pub fn run(render_choice: render::RenderChoice) {
                 autotag: autotag.clone(),
                 app_handle: app.handle().clone(),
                 engine_version: tokio::sync::watch::Sender::new(None),
+                preview_worker: std::sync::OnceLock::new(),
             });
 
             app.manage(state.clone());
@@ -163,6 +167,10 @@ pub fn run(render_choice: render::RenderChoice) {
 
             // Removes upscaled thumbnails once per library; `Database::new` already synced them
             thumb_cleanup::spawn(state.clone(), None);
+
+            // Requeues FBX/3DS previews an older engine made, now and whenever the queue's
+            // worker declares its version
+            model_preview_regen::start(state.clone());
 
             // Auto-tagging runs: replays writes left pending, then serves queued items
             tauri::async_runtime::spawn(async move { autotag.start().await });
