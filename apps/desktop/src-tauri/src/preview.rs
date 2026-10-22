@@ -277,6 +277,7 @@ pub fn start_preview_worker(state: Arc<AppState>) {
             .collect();
 
         let (py_exec, worker_py) = find_preview_worker(|k| std::env::var_os(k), &search_roots);
+        let _ = state.preview_worker.set(worker_py.clone());
 
         tracing::info!(
             "Preview worker using Python: {:?}, Script: {:?}",
@@ -320,10 +321,21 @@ fn stands_in() -> String {
     )
 }
 
+/// Whether the queue claims a job for asset `a` (`claim_jobs`): a main item or a file on its
+/// own that isn't pictured, or its group's stand-in. The model preview pass requeues by it too
+/// (`model_preview_regen`).
+pub(crate) fn claimable() -> String {
+    format!(
+        "(({MAIN_OR_SINGLE} AND NOT {}) OR {})",
+        pictured("a"),
+        stands_in()
+    )
+}
+
 /// The job states a worker can still claim a job from.
 pub(crate) const WAITING_JOBS: &str = "('pending', 'queued', 'fallback')";
 /// The job states of a job not yet finished: waiting, or running.
-const ACTIVE_JOBS: &str = "('pending', 'queued', 'processing', 'fallback')";
+pub(crate) const ACTIVE_JOBS: &str = "('pending', 'queued', 'processing', 'fallback')";
 
 /// The assets with a waiting job.
 pub(crate) async fn assets_waiting_for_jobs(
@@ -387,10 +399,8 @@ async fn claim_jobs(pool: &Pool<Sqlite>, filter: &str, limit: usize) -> Vec<Job>
         // by small-bundled-previews C4). The structure pass drops their waiting jobs; this skips
         // any queued since.
         "SELECT p.id, p.asset_id, a.file_path FROM preview_jobs p JOIN assets a ON p.asset_id = a.id
-         WHERE ({filter})
-           AND (({MAIN_OR_SINGLE} AND NOT {}) OR {}) LIMIT {limit}",
-        pictured("a"),
-        stands_in()
+         WHERE ({filter}) AND {} LIMIT {limit}",
+        claimable()
     ))
     .fetch_all(pool)
     .await

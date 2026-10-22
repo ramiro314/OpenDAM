@@ -442,7 +442,7 @@ pub(crate) fn pictured(item: &str) -> String {
 
 /// The support-file half of the grid's visibility rule: a pack's support files show only with
 /// "Show hidden files".
-const NOT_SUPPORT: &str = "a.support_role IS NULL";
+pub(crate) const NOT_SUPPORT: &str = "a.support_role IS NULL";
 
 impl SqlFilter {
     fn push(&mut self, condition: impl Into<String>, binds: impl IntoIterator<Item = String>) {
