@@ -24,7 +24,8 @@ uv and cargo-nextest; uv pins Python from `packages/preview-engine/.python-versi
 | `make install` | `make build`, then installs `~/.local/bin/opendam`, a desktop entry, an icon and the preview engine under `~/.local/share/opendam/preview-engine` |
 | `make uninstall` | Removes exactly what `make install` created, never the master DB or a library's `.opendam/` |
 
-CI runs `make deps check lint build` and, in a separate job, the same bun test, nextest and pytest runs as `make test`, as separate steps so failed TypeScript test files are rerun once to tell flakes from failures (`.github/actions/mission-flake-report`, settings in `.mission/testing.json`). Pull requests that change only Markdown, `docs/`, `.gitignore` or `LICENSE` skip both jobs, which still passes the required check. Formatting is enforced: run `bun run format`,
+CI runs `make deps check lint build` and, in a separate job, installs the Blender that
+`.github/blender.env` pins (`scripts/install-blender.sh`, sha256-checked and cached) and runs the same bun test, nextest and pytest runs as `make test`, as separate steps so failed TypeScript test files are rerun once to tell flakes from failures (`.github/actions/mission-flake-report`, settings in `.mission/testing.json`). Pull requests that change only Markdown, `docs/`, `.gitignore` or `LICENSE` skip both jobs, which still passes the required check. Formatting is enforced: run `bun run format`,
 `cargo fmt` (in `apps/desktop/src-tauri`) or `uv run ruff format` (in `packages/preview-engine`)
 before committing.
 
@@ -39,8 +40,9 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
     src/commands/             Tauri IPC commands (asset, autotag, collection, export, library, preview, settings, shell, tag)
     src/autotag/              AI auto-tagging: settings, keyring credentials, providers, run engine and run tables
     src/export/               Game export to Dungeon Game bundles: contract (schema validation), settings,
-                              the export cache, and check_outside_libraries, which refuses an export root
-                              equal to, inside or holding a library root, after resolving symlinks
+                              the export cache, check_outside_libraries, which refuses an export root
+                              equal to, inside or holding a library root, after resolving symlinks, and
+                              blender.rs, which finds Blender and gates it to BLENDER_SERIES (5.2)
     src/db.rs                 Master DB + per-library SQLite pools and pragmas
     src/watcher.rs            Directory indexing and change detection
     src/preview.rs            Rust raster thumbnails + the persistent Python worker bridge
@@ -302,6 +304,10 @@ bench's WebKit web process reached 15 to 20 GB in `checks` mode. The cause was t
   - Rust: `cd apps/desktop/src-tauri && cargo nextest run db::tests` (a test-name filter). Unit
     tests live in a `#[cfg(test)] mod tests` in the module they test; `db::memory_library_pool()`
     gives a test an in-memory SQLite database with the library schema.
+  - Blender-backed Rust tests find Blender through `OPENDAM_BLENDER`
+    (`export::blender::test_blender`): without it they skip with a message, and under `CI` they
+    fail. Run them with `OPENDAM_BLENDER=/usr/bin/blender cargo nextest run export::blender`.
+    `BLENDER_SERIES` and the pin in `.github/blender.env` move together, which a test checks.
   - Python: `cd packages/preview-engine && uv run --frozen pytest tests/test_fbx_scene.py` (or
     `-k '<name>'`). Tests live in `packages/preview-engine/tests/` and import `worker` directly.
   - JUnit: bun writes `apps/desktop/test-results/junit.xml`, whose `file` attribute names each

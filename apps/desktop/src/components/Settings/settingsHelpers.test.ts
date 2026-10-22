@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  blenderLine,
   claudePlanLines,
   exportSettingsPatch,
   ignoredOverridesNote,
@@ -107,7 +108,7 @@ describe('ignoredOverridesNote', () => {
 });
 
 describe('exportSettingsPatch', () => {
-  const exportSaved = { root: '/home/me/export', rootCollection: 'dg' };
+  const exportSaved = { root: '/home/me/export', rootCollection: 'dg', blenderPath: null };
 
   test('is null when nothing changed', () => {
     expect(exportSettingsPatch(exportSaved, { ...exportSaved })).toBeNull();
@@ -117,6 +118,26 @@ describe('exportSettingsPatch', () => {
     expect(exportSettingsPatch(exportSaved, { ...exportSaved, root: null })).toEqual({
       root: null,
     });
+  });
+});
+
+describe('blenderLine', () => {
+  test('names the version and path of a Blender that answered', () => {
+    const status = {
+      series: '5.2',
+      path: '/usr/bin/blender',
+      version: '4.5.3',
+      accepted: false,
+      problem: 'x',
+    };
+    expect(blenderLine(status)).toBe('Blender 4.5.3 at /usr/bin/blender');
+  });
+
+  test('says why when no Blender answered', () => {
+    const problem = 'No Blender at /opt/blender/blender';
+    expect(
+      blenderLine({ series: '5.2', path: null, version: null, accepted: false, problem })
+    ).toBe(problem);
   });
 });
 

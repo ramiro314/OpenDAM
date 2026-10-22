@@ -103,11 +103,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Tauri system dependencies
+      # The second line is what the Blender tarball links that the first doesn't promise
+      - name: Install Tauri and Blender system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            libvulkan1 libx11-6 libxrender1 libxfixes3 libxi6 libxkbcommon0
+      # The Blender-backed Rust tests run the pinned Blender (.github/blender.env), and fail
+      # without it under CI. Not apt's: Ubuntu's Blender is older than the series exports accept.
+      - name: Read the pinned Blender
+        run: grep -E '^BLENDER_(VERSION|SHA256)=' .github/blender.env >> "$GITHUB_ENV"
+      # Restored and saved apart, so a failing test doesn't stop the download being cached
+      - name: Restore Blender
+        id: blender-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/opendam-blender
+          key: blender-${{ env.BLENDER_VERSION }}-${{ env.BLENDER_SHA256 }}
+      - name: Install Blender
+        run: |
+          blender=$(scripts/install-blender.sh ~/.cache/opendam-blender)
+          echo "OPENDAM_BLENDER=$blender" >> "$GITHUB_ENV"
+      - name: Cache Blender
+        if: steps.blender-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/opendam-blender
+          key: ${{ steps.blender-cache.outputs.cache-primary-key }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: package.json

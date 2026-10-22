@@ -1,6 +1,7 @@
 import type {
   AiSettings,
   AiSettingsPatch,
+  BlenderStatus,
   ClaudePlanStatus,
   Collection,
   ExportSettings,
@@ -45,6 +46,12 @@ export function rootCollectionOptions(collections: Collection[]): Collection[] {
   return collections
     .filter((c) => !c.parentId && !c.isSmart)
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** What Settings says about Blender: "Blender 5.2.2 at /usr/bin/blender", or why there is none. */
+export function blenderLine(status: BlenderStatus): string {
+  if (status.path && status.version) return `Blender ${status.version} at ${status.path}`;
+  return status.problem ?? 'Blender not found';
 }
 
 /** What Settings says about Claude-plan access: where `claude` is, and which login it uses. */
