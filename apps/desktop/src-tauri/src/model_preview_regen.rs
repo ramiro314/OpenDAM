@@ -325,10 +325,13 @@ mod tests {
                 ("obj", "obj", None, "done", None),
                 ("current", "fbx", None, "done", Some(2)),
                 ("running", "fbx", None, "pending", None),
+                // A done preview whose re-generate already waits on the queue
+                ("rerun", "fbx", None, "done", None),
             ],
         )
         .await;
         add_job(&lib.pool, "running", "processing").await;
+        add_job(&lib.pool, "rerun", "fallback").await;
         // `pictured` shows a render that fits a card, a support file
         sqlx::query("UPDATE assets SET bundled_preview = 'Previews/p.png' WHERE id = 'pictured'")
             .execute(&lib.pool)
@@ -357,13 +360,15 @@ mod tests {
             };
             assert_eq!(status, expected, "{id}");
         }
-        // `running` keeps its one job, and the key waits for every job
-        let jobs: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM preview_jobs WHERE asset_id = 'running'")
-                .fetch_one(&lib.pool)
-                .await
-                .unwrap();
-        assert_eq!(jobs, 1);
+        // `running` and `rerun` keep their one job each, and the key waits for every job
+        let jobs: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT asset_id, count(*) FROM preview_jobs
+             WHERE asset_id IN ('running', 'rerun') GROUP BY asset_id ORDER BY asset_id",
+        )
+        .fetch_all(&lib.pool)
+        .await
+        .unwrap();
+        assert_eq!(jobs, [("rerun".into(), 1), ("running".into(), 1)]);
         assert_eq!(key(&lib).await, None);
     }
 
@@ -441,6 +446,24 @@ mod tests {
             run_libraries(libs, None, Some(1), Some(worker)).await,
             Run::default()
         );
+    }
+
+    #[tokio::test]
+    async fn an_added_library_gets_the_pass_alone() {
+        let rows = [("a", "fbx", None, "done", None)];
+        let libs = [library("one", &rows).await, library("two", &rows).await];
+
+        let run = run_libraries(&libs, Some("one"), Some(2), None).await;
+
+        assert_eq!(
+            run,
+            Run {
+                requeued_in: 1,
+                warning: None
+            }
+        );
+        assert_eq!(queue(&libs[0]).await.0, strings(&["a"]));
+        assert!(queue(&libs[1]).await.0.is_empty());
     }
 
     #[tokio::test]
