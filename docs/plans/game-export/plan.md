@@ -65,6 +65,16 @@ changed:
 - **An export root inside a library, or holding one, is refused,** so exported files never get
   indexed as new assets (C2, AC15).
 
+Revised a seventh time 2026-10-22 after GitHub Inspector's third review of PR #165. No decision
+changed:
+
+- **Models and animations are told apart by kept meshes.** An FBX whose only meshes are
+  collision hulls counts as having no mesh. One with neither a kept mesh nor a take is refused
+  with a named problem, rather than failing schema validation later (C3).
+- **One rule decides what a `conversion.json` covers.** Origin inference uses the same nearest
+  `conversion.json` walk, up to the library root, that C10 uses. A converter that writes its
+  `conversion.json` above the pack folder still makes the pack `unreal` (C6, A1).
+
 ## Goal
 
 The Dungeon Game takes its art only as **bundles** that OpenDAM exports and the game's importer
@@ -188,7 +198,7 @@ These are agent decisions, made while writing the plan. Each is reviewed at fina
 
 | # | Decision | Why |
 |---|---|---|
-| A1 | **Origin is inferred when a pack is read for export, not by the structure pass.** That happens when the Export view, the Game tab or the pack edit form asks, or at export. The check stats `<file>.meta` for the pack's indexed files and walks the pack for `conversion.json`. Your override lives in `pack_overrides`, as D12 says. | The watcher indexes neither `.meta` nor `conversion.json`, and the structure pass reads no file on a rerun (the "Structure is derived" invariant). Inferring at read time keeps both invariants. D12's intent is unchanged: the origin is inferred and editable on the pack. |
+| A1 | **Origin is inferred when a pack is read for export, not by the structure pass.** That happens when the Export view, the Game tab or the pack edit form asks, or at export. The check stats `<file>.meta` for the pack's indexed files, and resolves each indexed file's nearest `conversion.json` up to the library root, as C10 does. Your override lives in `pack_overrides`, as D12 says. | The watcher indexes neither `.meta` nor `conversion.json`, and the structure pass reads no file on a rerun (the "Structure is derived" invariant). Inferring at read time keeps both invariants. D12's intent is unchanged: the origin is inferred and editable on the pack. |
 | A2 | **The Blender script is embedded in the app** (`include_str!`) and written to a temp file per run. | `make install` and the installed app need no new file. Its version is `opendam-normalize/<N>`. |
 | A3 | **The UI reads model facts through the preview worker.** A new `fbx_facts` request (assimp) returns the kept meshes' material slots, texture references by type, mesh and bone names, and the takes that animate something, by the same rules as the Blender script (C9, C12). Blender's result at export is authoritative. A slot or take set that differs from the worker's is a problem that refuses the export, naming the model. | The Game tab needs facts in milliseconds, and Blender takes seconds per model. |
 | A4 | **Source sha256s are memoized** in a library DB table `file_hashes(file_path, size_bytes, modified_at, sha256)`. | The Export view shows "changed" without hashing a whole domain each time. |
@@ -277,8 +287,12 @@ cache". An export with the root or the root collection unset is refused.
   every library (D7). A smart collection can't be a domain or sit below one.
 - **How each member is read** (members are grid items: a main item or a file on its own):
   - a format group with an FBX member, or a lone FBX file (no copies in other formats, so
-    `group_id` is NULL), which is treated as a group of one, is a **model**, or an **animation**
-    when its FBX has no mesh and at least one take (D21);
+    `group_id` is NULL), which is treated as a group of one, is a **model** when its FBX has a
+    kept mesh (C9 step 2: a mesh the collision patterns don't drop), and an **animation** when it
+    has no kept mesh and at least one take (D21). So an FBX holding only a `UCX_` hull and a take
+    is an animation;
+  - an FBX with neither a kept mesh nor a take (an empty rig, or collision meshes only) is refused
+    with "FBX has no kept mesh and no take", since it has nothing to normalize or animate;
   - a format group with no FBX, or a lone OBJ, glTF, GLB or `.blend` file, is refused (D31);
   - an image is a standalone **texture**, with its role inferred from its suffix, else
     `BaseColor`;
@@ -335,8 +349,12 @@ that asset as removed before anything is written (C15).
   is an SPDX id, else null. `name` is the stated title, the override text or the kind's name, else
   `Unknown`. `url` is the licence's http(s) URL, when it has one.
 - **The origin** (D12, A1): your `pack_overrides.origin`, else `unity` when any indexed file in
-  the pack has a `<file>.meta` beside it, else `unreal` when a `conversion.json` in the pack has a
-  step with `from: "uasset"`, else `generic`.
+  the pack has a `<file>.meta` beside it, else `unreal` when the nearest `conversion.json` of any
+  indexed file in the pack has a step with `from: "uasset"`, else `generic`. "Nearest" is C10's
+  walk from the file's folder up to its library root, `export::conversion::nearest`, so a
+  `conversion.json` above the pack folder counts here exactly as it does in the manifest. That
+  walk lands in step 1, where the step-3 guard also uses it. An invalid `conversion.json` is
+  skipped here, and C10 refuses it at export.
 - **The normal-map convention** (D14): `pack_overrides.normal_convention` (`opengl` /
   `directx`), else `directx` for unreal and `opengl` otherwise.
 - **The pack edit form** gains Origin and Normal maps fields, each showing its inferred value.
@@ -551,7 +569,8 @@ answer per file's size and mtime for the session.
   brackets): each fixture lands in the first step whose tests use it.
   - a `datapackage.json` with a `LicenseRef-` licence, and plain PNG textures that pass through
     (step 1);
-  - a `conversion.json` in a folder, and a deeper one below it (step 3);
+  - a `conversion.json` in a folder, and a deeper one below it, and one above a pack folder
+    with a `from: "uasset"` step (step 3);
   - a centimetre, Z-up FBX with an asymmetric nose on its front, an Unreal-style FBX with
     `_LOD0`/`_LOD1`, two material slots and a `UCX_` hull with its own material, a second one
     whose `UCX_` hull has no material, a model with no material at all, a skinned model with
@@ -559,7 +578,8 @@ answer per file's size and mtime for the session.
     base color with a cut-out alpha, a JPG base color, an AORM PNG, a DirectX normal map, and a
     separate Roughness and Metallic pair (step 4, for `fbx_facts`, inference and the step-5
     guard's refusals; step 5 converts the same files);
-  - a mesh-less FBX with a take (step 7).
+  - an FBX with only a `UCX_` hull and no take, which must be refused (step 4);
+  - a mesh-less FBX with a take, and one whose only mesh is a `UCX_` hull plus a take (step 7).
 - **Rust tests (nextest), without Blender:** names, inference, the texture operations
   (pixel-exact on tiny images), `conversion.json` merging, packs and licences, cache keys,
   staging and swap (including a failed swap), and the schema pin. Every manifest or
@@ -586,8 +606,8 @@ Each one names the asset (or file) and the rule it broke, and the Export view li
   contains one (C2).
 - An uncached model or animation needs Blender, and Blender is missing or isn't 5.2.x (C2). A
   Blender job timed out or crashed.
-- A member is in no pack. A model's group has no FBX. A member is neither a model, an animation
-  nor an image.
+- A member is in no pack. A model's group has no FBX. An FBX has no kept mesh and no take (C3).
+  A member is neither a model, an animation nor an image.
 - Duplicate names (models and animations, textures with one role, materials within a model). A
   name that isn't PascalCase.
 - An unsupported or unconvertible texture (dds, exr, hdr, or a PSD needing work). A material
@@ -644,7 +664,7 @@ problem in the Export view, naming the asset, and the step that delivers the wor
 - **Until step 6,** a domain holding a format group with an FBX member or a lone FBX (a model,
   or an animation) is refused with "model export not built yet", so no bundle ever carries an
   unnormalized model.
-- **Until step 7,** a domain holding an animation (an FBX with no mesh and at least one take,
+- **Until step 7,** a domain holding an animation (an FBX with no kept mesh and at least one take,
   from `fbx_facts`) is refused with "animation export not built yet". Models that carry their own
   takes export from step 6, with their `clips`.
 
@@ -660,15 +680,17 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   `Mattress01`). A collision refuses the export, naming both assets, and an edit fixes it and
   survives a reindex.
 - **AC4.** On the fixtures, inference gives the expected materials, roles, layouts, surfaces and
-  conventions. `fbx_facts` lists no collision hull's material and no `DefaultMaterial`. Each
-  edit replaces its inferred value, and a reset restores it.
+  conventions. `fbx_facts` lists no collision hull's material and no `DefaultMaterial`. An FBX
+  with only a `UCX_` hull and no take is refused, naming C3's rule. Each edit replaces its
+  inferred value, and a reset restores it.
 - **AC5.** Normalized fixture models re-import with bounds within 0.1% of the expected metre
   sizes, `min.y` 0, the X and Z centre 0, and the nose toward +Z. The collision meshes are
   dropped, the LOD names are kept, and the take names are preserved. Both `UCX_` variants (a
   hull with its own material, and one with none) export, and so does a model with no material,
   with one added slot.
 - **AC6.** The animation fixture gets its model's transform, and an animation whose bones don't
-  match is refused. Changing the model's `facingQuarterTurns` and exporting again re-runs the
+  match is refused. An FBX whose only mesh is a `UCX_` hull plus a take exports as an
+  animation. Changing the model's `facingQuarterTurns` and exporting again re-runs the
   animation's Blender job, not a cache hit, and the new clip follows the new transform.
 - **AC7.** The texture operations are pixel-exact on test images: ORM split, roughness
   inversion, gloss pass-through, MaskMap split, green flip, and JPG to PNG. Each records C8's
@@ -676,7 +698,8 @@ problem in the Export view, naming the asset, and the step that delivers the wor
 - **AC8.** An asset's `conversion` holds its nearest `conversion.json`'s steps, then OpenDAM's.
   An invalid `conversion.json` refuses the export.
 - **AC9.** The pack id, licence (a `LicenseRef-` kept, Unknown with null), origin, sourcePath and
-  sha256 follow C6.
+  sha256 follow C6. From step 3, a pack whose files' nearest `conversion.json` lies above the
+  pack folder and has a `from: "uasset"` step is `unreal`.
 - **AC10.** A second export of the unchanged fixture domain runs no Blender job and writes
   byte-identical files.
 - **AC11.** A failed check leaves the previous bundle untouched. The diff lists added, changed
