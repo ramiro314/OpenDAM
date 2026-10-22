@@ -113,6 +113,19 @@ decision changed:
 - **Renaming the domain or the root collection forces a new Check.** Their names make the bundle
   path and the manifest's `domain`, so they are in the Check's fingerprint (C14, AC11).
 
+Revised a twelfth time 2026-10-22 after GitHub Inspector's eighth review of PR #165. No
+decision changed:
+
+- **Images become textures by set, not one by one.** Images in one folder whose stems match,
+  once the prefix and the role or layout suffix are dropped, form a texture set, and C8 converts
+  its sources together. So a standalone `T_Rock_R` and `T_Rock_M` export as one `Rock`
+  MetallicSmoothness, and an ORM member as an Occlusion and a MetallicSmoothness of one name. A
+  lone metallic map gets URP Lit's default smoothness, 0.5. A texture edit sets a source's layout,
+  and its role only when it passes through, and the name belongs to the set (C3, C4, C5, C8,
+  C13, C16, AC7).
+- **A pack id that slugifies to nothing becomes `pack`,** which the clash suffix then makes unique
+  like any other (C6, AC9).
+
 ## Goal
 
 The Dungeon Game takes its art only as **bundles** that OpenDAM exports and the game's importer
@@ -332,11 +345,12 @@ cache". An export with the root or the root collection unset is refused.
   - an FBX with neither a kept mesh nor a take (an empty rig, or collision meshes only) is refused
     with "FBX has no kept mesh and no take", since it has nothing to normalize or animate;
   - a format group with no FBX, or a lone OBJ, glTF, GLB or `.blend` file, is refused (D31);
-  - an image is a standalone **texture**, with its role inferred from its suffix, else
-    `BaseColor`;
+  - an image is a source of a standalone **texture set** (C8), with its role or layout
+    inferred from its suffix, else `BaseColor`;
   - anything else is refused (A6).
-- **Textures** reached through a model's materials join the domain without being members. A
-  texture that is both a member and used by a material is one asset.
+- **Textures** reached through a model's materials join the domain without being members, and
+  so do the other sources of a member's texture set. A texture that is both a member and used
+  by a material is one asset.
 
 **C4. Your edits.** A library DB table `export_edits(asset_id TEXT PRIMARY KEY, edits TEXT NOT
 NULL)` holds JSON, written to every member of the asset's group in one transaction
@@ -344,10 +358,15 @@ NULL)` holds JSON, written to every member of the asset's group in one transacti
 the main item's edits precedence when a group forms. It holds only what you set (D32):
 
 - **For a model:** `assetName`, `rig`, `facingQuarterTurns` (0-3), and `materials`, keyed by slot
-  name. Each slot can hold `name`, `surface` and `textures`, a map from role to texture asset id,
-  where `null` means "no texture in this role".
+  name. Each slot can hold `name`, `surface` and `textures`, a map from role to the asset id of a
+  source in a texture set (C8), where `null` means "no texture in this role".
 - **For an animation:** `assetName` and `avatarFrom`, the model's asset id.
-- **For a texture:** `assetName`, `role`, `layout` and `normalConvention`.
+- **For a texture:** per source image, its `layout` (C8) and `normalConvention`, and its `role`
+  only when its layout passes it through as one role. A layout with several outputs (ORM,
+  MaskMap), or one merged from several sources (Roughness plus Metallic), fixes its output
+  roles, so you change the layout, not a role. `assetName` belongs to the source's texture set:
+  it is written to every source in the set, and if they disagree after the set changes, the
+  first source by path wins.
 
 It is kept out of `metadata`, which `assets_fts` indexes. A file moved outside the app gets a new
 id and loses its edits and its membership, as for all metadata today. The export's diff shows
@@ -364,11 +383,11 @@ that asset as removed before anything is written (C15).
 - **A model's or animation's default** comes from its group's main item's stem (D31: the file is
   the FBX, the name is the main item's).
 - **A material's default** comes from its slot name.
-- **A texture's default** (D24): a texture used by one model takes that model's `assetName`, or
-  `<AssetName><MaterialName>` when that model has more than one texture in the role. A texture
-  used by several models in the domain, or by none (a standalone member), takes its own stem,
-  with prefix and role suffix dropped (`PolygonCity_Texture_01_A` becomes
-  `PolygonCityTexture01A`, and `T_Rune_N` becomes `Rune`).
+- **A texture's default** (D24) is its texture set's (C8): a set used by one model takes that
+  model's `assetName`, or `<AssetName><MaterialName>` when that model has more than one set in
+  the role. A set used by several models in the domain, or by none (standalone members), takes
+  its stem, with prefix and role or layout suffix dropped (`PolygonCity_Texture_01_A` becomes
+  `PolygonCityTexture01A`, and `T_Rune_N` and `T_Rock_R` become `Rune` and `Rock`).
 - **Uniqueness:** two models or animations with one name, two textures with one name and role,
   or two materials of one model with one name, are each a problem naming both assets. The export
   refuses (D10).
@@ -377,10 +396,11 @@ that asset as removed before anything is written (C15).
 
 - **Pack id** (D16): the `datapackage.json` `name` when it matches `^[a-z0-9][a-z0-9-]*$`, else
   the pack folder's name lowercased, with each run of other characters turned into `-` and
-  `-` trimmed from the ends. Every pack gets that natural id first. Then, on a clash, each later
-  pack by library order, then path, gets the lowest `-2`, `-3`, ... suffix whose id no other pack
-  in the manifest holds, natural or suffixed. So `foo`, `foo` and a pack named `foo-2` become
-  `foo`, `foo-3` and `foo-2`.
+  `-` trimmed from the ends, or `pack` when nothing is left (a folder named `日本語アセット` or
+  `---`). Every pack gets that natural id first. Then, on a clash, each later pack by library
+  order, then path, gets the lowest `-2`, `-3`, ... suffix whose id no other pack in the manifest
+  holds, natural or suffixed. So `foo`, `foo` and a pack named `foo-2` become `foo`, `foo-3` and
+  `foo-2`, and two packs that both fall back get `pack` and `pack-2`.
 - **The other pack fields:** `name` is the pack's shown name (`pack_holding`). `version`,
   `publisher` and `sourceUrl` come from `PackInfo` and your overrides, and are left out when
   absent.
@@ -440,11 +460,19 @@ For each slot, the first source with an answer wins (D11):
 the files its roles need, at source resolution and bit depth (8 or 16 bit), as PNG unless it
 passes through.
 
+**Texture sets.** Images are grouped before conversion. A texture set is the images in one
+folder whose stems match, ignoring case, once the type prefix (C5) and the role or layout suffix
+(C7 step 3) are dropped: `T_Rock_D`, `T_Rock_N`, `T_Rock_R` and `T_Rock_M` form the set `Rock`.
+A domain's member image brings in its whole set, and a material brings in the sources of the
+roles it uses. A set's sources go through the table below together, so it exports one texture
+asset per output role, all sharing the set's `assetName` (C5). An image whose suffix names no
+role or layout is a set of its own, as BaseColor.
+
 | Source layout | Inferred from | Output |
 |---|---|---|
 | URP-ready (BaseColor, Normal in OpenGL, MetallicSmoothness, Occlusion, Emission, Height) | Role suffix or a Unity material | The source file, byte for byte, when its format is png/tga/psd/tif. No step. |
 | ORM / AORM / ARM (AO R, roughness G, metallic B) | `_ORM _AORM _ARM` | Occlusion (AO in R, G and B), and MetallicSmoothness (metal in R, G and B, `1 - roughness` in A) |
-| Separate Roughness or Gloss, plus Metallic | `_R _Roughness` / `_G _Gloss _Smoothness`, plus `_M _Metallic` | MetallicSmoothness. Roughness is inverted, gloss is not, and a missing metallic map means metal 0. A lone AO map becomes Occlusion. |
+| Separate Roughness or Gloss, plus Metallic | `_R _Roughness` / `_G _Gloss _Smoothness`, plus `_M _Metallic` | MetallicSmoothness. Roughness is inverted, gloss is not, and a missing metallic map means metal 0. A lone metallic map gets smoothness 0.5, URP Lit's default, recorded in the step's settings (`smoothness: 0.5`). A lone AO map becomes Occlusion. |
 | HDRP MaskMap (metal R, AO G, detail B, smoothness A) | `_MaskMap _Mask`, or `_MaskMap` in a Unity material | MetallicSmoothness and Occlusion |
 | DirectX normal map | The pack convention, a `_DX`/`_GL` suffix, or your override (D14) | Normal with green flipped (`max - G`) |
 | jpg, jpeg, bmp, webp or gif in any role | Its extension | The same pixels as PNG (D25) |
@@ -581,7 +609,8 @@ answer per file's size and mtime for the session.
   with a +Z arrow and quarter-turn buttons. It also shows each material: slot, name, surface, and
   for each role, a texture picker limited to the pack's images or "none".
 - **An animation** shows `assetName`, `avatarFrom` and its takes.
-- **A texture** shows `assetName`, role, layout and normal convention.
+- **A texture** shows its set's `assetName`, sources and output roles, and its own layout,
+  normal convention and, when it passes through, role.
 - **Problems** for the selected asset are listed at the top of the tab.
 
 **C14. The Export view.** It opens from a domain collection's menu: "Export to game...".
@@ -655,6 +684,8 @@ answer per file's size and mtime for the session.
     base color with a cut-out alpha, a JPG base color, an AORM PNG, a DirectX normal map, and a
     separate Roughness and Metallic pair (step 4, for `fbx_facts`, inference and the step-5
     guard's refusals; step 5 converts the same files);
+  - standalone member images used by no model: a `T_Rock_R.png` and `T_Rock_M.png` pair, a lone
+    `_M` map and an ORM map (step 4 for the sets, step 5 for their outputs);
   - an FBX with only a `UCX_` hull and no take, which must be refused (step 4);
   - a model whose only material is named `Material`, which must keep that name, and one with two
     materials of one name, which must be refused (step 4);
@@ -784,13 +815,16 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   animation's Blender job, not a cache hit, and the new clip follows the new transform.
 - **AC7.** The texture operations are pixel-exact on test images: ORM split, roughness
   inversion, gloss pass-through, MaskMap split, green flip, and JPG to PNG. Each records C8's
-  steps.
+  steps. Standalone `T_Rock_R` and `T_Rock_M` members export as one `Rock` MetallicSmoothness, a
+  lone metallic map with smoothness 0.5, and an ORM member as an Occlusion and a
+  MetallicSmoothness of one name.
 - **AC8.** An asset's `conversion` holds its nearest `conversion.json`'s steps, then OpenDAM's.
   An invalid `conversion.json` refuses the export.
 - **AC9.** The pack id, licence (a `LicenseRef-` kept, Unknown with null), origin, sourcePath and
   sha256 follow C6. Two packs named `foo` and one named `foo-2` in one manifest get `foo`, `foo-3`
-  and `foo-2`. From step 3, a pack whose files' nearest `conversion.json` lies above the
-  pack folder and has a `from: "uasset"` step is `unreal`.
+  and `foo-2`. A pack folder named `---` with no `datapackage.json` name gets `pack`. From step
+  3, a pack whose files' nearest `conversion.json` lies above the pack folder and has a
+  `from: "uasset"` step is `unreal`.
 - **AC10.** A second export of the unchanged fixture domain runs no Blender job and writes
   byte-identical files.
 - **AC11.** A failed check leaves the previous bundle untouched. The diff lists added, changed
