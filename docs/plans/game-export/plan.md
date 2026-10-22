@@ -75,6 +75,16 @@ changed:
   `conversion.json` walk, up to the library root, that C10 uses. A converter that writes its
   `conversion.json` above the pack folder still makes the pack `unreal` (C6, A1).
 
+Revised an eighth time 2026-10-22 after GitHub Inspector's fourth review of PR #165. No decision
+changed:
+
+- **The Blender script starts from an empty scene,** so the default cube and its `Material`
+  never reach the bounds, the FBX or the slot names. An FBX with two materials of one name is
+  refused by name, because Blender would rename one (C9, C12).
+- **Export re-checks everything the Check read.** The Check keeps a fingerprint of the edits,
+  overrides, settings, membership and every file it opened. Export compares it and asks for a
+  new Check when anything changed, so a rename made after the Check never ships stale (C14).
+
 ## Goal
 
 The Dungeon Game takes its art only as **bundles** that OpenDAM exports and the game's importer
@@ -426,7 +436,14 @@ crash is a problem naming the asset (D30). The job names the input FBX, the outp
 kind, `facingQuarterTurns` and, for an animation, the transform of the model it follows. The
 script:
 
-1. **Imports** the FBX with Blender's importer (units and axes as the file states them).
+1. **Starts from an empty scene and imports** the FBX with Blender's importer (units and axes as
+   the file states them). Before importing, the script clears the scene `--factory-startup`
+   loads (`bpy.ops.wm.read_homefile(use_empty=True)`), so the default cube, camera, light and
+   their `Material` never count toward the bounds, reach the exported FBX, or make Blender rename
+   a source material to `Material.001`. With an empty scene, Blender renames a material only
+   when the FBX holds two of the same name. Such an FBX is refused before any Blender job
+   ("FBX has two materials named X", from `fbx_facts`, C12), since its slots couldn't be told
+   apart by name in C4's edits or in Unity's remap.
 2. **Drops collision meshes** whose names start with `UCX_ UBX_ USP_ UCP_` or end with
    `_Collision` or `_COL` (any case). LOD meshes keep Unity's `_LODn` names (D19). This rule is
    one list, `export::collision::PATTERNS`, passed to the script in the job and to `fbx_facts` in
@@ -503,7 +520,8 @@ hashes are memoized in `file_hashes` (A4). The cache is cleared only from Settin
 with `assimp_py`, as `model_meta` does. The request carries the collision patterns (C9 step 2),
 and the answer follows the script's rules:
 
-- the material slots used by kept meshes, in the scene's material order. assimp's synthetic
+- the material slots used by kept meshes, in the scene's material order, duplicates included,
+  so C9 step 1 can refuse an FBX with two materials of one name. assimp's synthetic
   `DefaultMaterial`, which it adds for a mesh with no material, is left out, since Blender adds
   its own named material for such a mesh (C9 step 2);
 - each slot's texture references by type;
@@ -533,9 +551,21 @@ answer per file's size and mtime for the session.
   It shows the problems, each linking to its asset's Game tab, and the diff against the previous
   `manifest.json` in the destination: added, changed (sha256 or entry) and removed, by kind and
   assetName, with renames shown as a removal plus an addition.
-- **"Export"** is enabled only when there are no problems. It re-checks that no source's size or
-  mtime changed since the check, then swaps the bundle in (D18, D27). One domain per export
-  (D28).
+- **"Export"** is enabled only when there are no problems. It swaps the bundle in (D18, D27)
+  only when nothing the Check read has changed since. One domain per export (D28).
+- **What "nothing changed" means:** the Check records a fingerprint of every input it read.
+  That covers:
+  - the domain's member list;
+  - the `export_edits` rows of its assets and textures;
+  - the `pack_overrides` rows of its packs;
+  - the export settings;
+  - the size and mtime of every file it opened: sources, `conversion.json`, Unity `.mat` and
+    `.meta`, `datapackage.json` and licence files.
+
+  Export recomputes the fingerprint first. If it differs, Export discards the staged bundle and
+  asks for a new Check. Any edit made in the Game tab or the pack form to a domain's asset or
+  pack also marks that domain's staged bundle stale at once, so the button changes to "Check
+  again".
 
 **C15. Writing a bundle.** For domain `D` under `<root>/<Root>/`:
 
@@ -579,6 +609,8 @@ answer per file's size and mtime for the session.
     separate Roughness and Metallic pair (step 4, for `fbx_facts`, inference and the step-5
     guard's refusals; step 5 converts the same files);
   - an FBX with only a `UCX_` hull and no take, which must be refused (step 4);
+  - a model whose only material is named `Material`, which must keep that name, and one with two
+    materials of one name, which must be refused (step 4);
   - a mesh-less FBX with a take, and one whose only mesh is a `UCX_` hull plus a take (step 7).
 - **Rust tests (nextest), without Blender:** names, inference, the texture operations
   (pixel-exact on tiny images), `conversion.json` merging, packs and licences, cache keys,
@@ -607,7 +639,8 @@ Each one names the asset (or file) and the rule it broke, and the Export view li
 - An uncached model or animation needs Blender, and Blender is missing or isn't 5.2.x (C2). A
   Blender job timed out or crashed.
 - A member is in no pack. A model's group has no FBX. An FBX has no kept mesh and no take (C3).
-  A member is neither a model, an animation nor an image.
+  An FBX has two materials of one name (C9). A member is neither a model, an animation nor an
+  image.
 - Duplicate names (models and animations, textures with one role, materials within a model). A
   name that isn't PascalCase.
 - An unsupported or unconvertible texture (dds, exr, hdr, or a PSD needing work). A material
@@ -687,7 +720,9 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   sizes, `min.y` 0, the X and Z centre 0, and the nose toward +Z. The collision meshes are
   dropped, the LOD names are kept, and the take names are preserved. Both `UCX_` variants (a
   hull with its own material, and one with none) export, and so does a model with no material,
-  with one added slot.
+  with one added slot. A model whose material is named `Material` keeps that slot name, and no
+  default cube reaches its bounds or FBX. An FBX with two materials of one name is refused by
+  name.
 - **AC6.** The animation fixture gets its model's transform, and an animation whose bones don't
   match is refused. An FBX whose only mesh is a `UCX_` hull plus a take exports as an
   animation. Changing the model's `facingQuarterTurns` and exporting again re-runs the
@@ -704,7 +739,9 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   byte-identical files.
 - **AC11.** A failed check leaves the previous bundle untouched. The diff lists added, changed
   and removed assets before "Export". A crash simulated between the swap's two renames is
-  recovered at the next check: `D/` is restored from `.D.old-*` with its files intact.
+  recovered at the next check: `D/` is restored from `.D.old-*` with its files intact. An
+  asset renamed, or a role changed, between Check and Export makes Export refuse and ask for a
+  new Check, and no bundle is written.
 - **AC12.** CI's test job installs the pinned Blender and runs the Blender-backed tests, and
   fails when Blender is missing.
 - **AC13 (by hand, not an agent's).** The fixture bundle that OpenDAM writes passes dungeon-game's
