@@ -115,7 +115,7 @@ def test_every_slot_is_checked_and_small_images_keep_their_encoding(tmp_path):
     assert max(over.baseColorTexture.size) == 1024
 
 
-def test_an_image_that_fails_to_shrink_is_kept(tmp_path, monkeypatch):
+def test_an_image_that_fails_to_shrink_is_kept_with_a_warning(monkeypatch, capsys):
     bad = Image.new("RGB", (2048, 2048))
     good = Image.new("RGB", (2048, 2048))
     first = PBRMaterial(baseColorTexture=bad, normalTexture=good)
@@ -128,10 +128,12 @@ def test_an_image_that_fails_to_shrink_is_kept(tmp_path, monkeypatch):
         return shrink(img)
 
     monkeypatch.setattr(textures, "shrink_image", failing)
-    worker.downscale_textures(trimesh.Scene([quad(first), quad(second, 2)]))
+    worker.downscale_textures(trimesh.Scene([quad(first), quad(second, 2)]), "pack/model.obj")
 
     assert first.baseColorTexture is bad and second.baseColorTexture is bad
     assert first.normalTexture.size == (1024, 1024)
+    warnings = capsys.readouterr().err.splitlines()
+    assert warnings == ["pack/model.obj: kept a 2048x2048 texture, shrink failed: truncated"]
 
 
 def test_an_image_with_any_alpha_below_255_stays_png():

@@ -245,11 +245,12 @@ PBR_TEXTURE_SLOTS = (
 )
 
 
-def downscale_textures(scene) -> None:
+def downscale_textures(scene, source: str = "") -> None:
     """
     Shrinks every image over 1024 px that a geometry's material holds, in `SimpleMaterial.image`
     and the five `PBRMaterial` texture slots (plan C6). An image shared by several slots or
-    materials is shrunk once, so the GLB stores it once. An image that fails to shrink is kept.
+    materials is shrunk once, so the GLB stores it once. An image that fails to shrink is kept,
+    with a warning on stderr naming `source`, which the app logs under `preview_worker`.
     """
     from trimesh.visual.material import PBRMaterial, SimpleMaterial
 
@@ -263,7 +264,11 @@ def downscale_textures(scene) -> None:
         if id(img) not in shrunk:
             try:
                 shrunk[id(img)] = (img, shrink_image(img))
-            except Exception:
+            except Exception as e:
+                print(
+                    f"{source}: kept a {img.size[0]}x{img.size[1]} texture, shrink failed: {e}",
+                    file=sys.stderr,
+                )
                 shrunk[id(img)] = (img, img)
         return shrunk[id(img)][1]
 
@@ -476,7 +481,7 @@ def model_meta(
             import trimesh
 
             scene = trimesh.load(source, force="scene")
-            downscale_textures(scene)
+            downscale_textures(scene, source)
 
             out_path = Path(output_dir) / f"{out_name}_preview.glb"
             scene.export(str(out_path), file_type="glb")
