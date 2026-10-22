@@ -789,6 +789,8 @@ mod tests {
             name: Some("My rocks".into()),
             license: None,
             source_url: None,
+            origin: None,
+            normal_convention: None,
         };
         set_pack_override_in(&db, "lib", "kits/Rock Kit", edit)
             .await

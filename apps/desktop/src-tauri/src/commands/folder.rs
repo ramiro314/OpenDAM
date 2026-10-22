@@ -6,6 +6,8 @@ use tauri::{Emitter, State};
 
 use crate::commands::asset::folder_range;
 use crate::db::{resolve_path, upsert_collection, upsert_tag, Database, LibraryHandle};
+use crate::export::packs::Origin;
+use crate::export::textures::Convention;
 use crate::structure::{self, LicenseKind, PackMark, PackOverride};
 use crate::AppState;
 
@@ -400,7 +402,8 @@ pub(crate) async fn pack_holding(
     let Some(row) = row else { return Ok(None) };
     let info = crate::structure::parse_pack(row.pack_json.as_deref()).unwrap_or_default();
     let edits: PackOverride = sqlx::query_as(
-        "SELECT mark, name, license, source_url, cover_path FROM pack_overrides WHERE path = ?",
+        "SELECT mark, name, license, source_url, cover_path, origin, normal_convention
+         FROM pack_overrides WHERE path = ?",
     )
     .bind(&row.path)
     .fetch_optional(&library.pool)
@@ -503,11 +506,14 @@ fn pack_license(info: &structure::PackInfo, root: &Path) -> Option<PackLicense> 
 pub enum PackEdit {
     /// "Mark as pack" or "Not a pack", or `None` to leave the folder to the pack rules
     Mark { mark: Option<PackMark> },
-    /// The edit form's fields. An empty one keeps what the structure pass derives.
+    /// The edit form's fields. An empty one keeps what the structure pass derives, and a `None`
+    /// origin or normal-map convention what the game export infers (plan game-export C6).
     Details {
         name: Option<String>,
         license: Option<String>,
         source_url: Option<String>,
+        origin: Option<Origin>,
+        normal_convention: Option<Convention>,
     },
     /// "Use as pack cover" with an image below the pack, or `None` for the cover the pass picks
     Cover { asset_id: Option<String> },
@@ -567,6 +573,8 @@ pub(crate) async fn set_pack_override_in(
             name,
             license,
             source_url,
+            origin,
+            normal_convention,
         } => {
             let source_url = field(source_url);
             if source_url
@@ -576,16 +584,20 @@ pub(crate) async fn set_pack_override_in(
                 return Err("The source URL must start with http:// or https://".into());
             }
             sqlx::query(
-                "INSERT INTO pack_overrides (path, name, license, source_url, updated_at)
-                 VALUES (?, ?, ?, ?, ?)
+                "INSERT INTO pack_overrides
+                     (path, name, license, source_url, origin, normal_convention, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(path) DO UPDATE SET name = excluded.name,
                      license = excluded.license, source_url = excluded.source_url,
+                     origin = excluded.origin, normal_convention = excluded.normal_convention,
                      updated_at = excluded.updated_at",
             )
             .bind(path)
             .bind(field(name))
             .bind(field(license))
             .bind(source_url)
+            .bind(origin)
+            .bind(normal_convention)
         }
         PackEdit::Cover { asset_id } => {
             let cover = match asset_id {
@@ -606,7 +618,8 @@ pub(crate) async fn set_pack_override_in(
         write.bind(now).execute(&mut *tx).await?;
         sqlx::query(
             "DELETE FROM pack_overrides WHERE path = ? AND mark IS NULL AND name IS NULL
-                 AND license IS NULL AND source_url IS NULL AND cover_path IS NULL",
+                 AND license IS NULL AND source_url IS NULL AND cover_path IS NULL
+                 AND origin IS NULL AND normal_convention IS NULL",
         )
         .bind(path)
         .execute(&mut *tx)
@@ -1769,6 +1782,8 @@ mod tests {
             name: Some("  My cars ".into()),
             license: Some("CC0, credit Kenney".into()),
             source_url: Some("https://kenney.nl/assets/car-kit".into()),
+            origin: Some(Origin::Unreal),
+            normal_convention: Some(Convention::OpenGl),
         };
         edit(car, details).await;
         let cover = PackEdit::Cover {
@@ -1788,6 +1803,8 @@ mod tests {
             name: Some("Hols".into()),
             license: None,
             source_url: None,
+            origin: None,
+            normal_convention: None,
         };
         edit(holiday, named).await;
         assert_eq!(tree_node(&lib, holiday).await.renamed, None);
@@ -1814,6 +1831,8 @@ mod tests {
                 license: Some("CC0, credit Kenney".into()),
                 source_url: Some("https://kenney.nl/assets/car-kit".into()),
                 cover_path: Some(SEDAN_RENDER.into()),
+                origin: Some(Origin::Unreal),
+                normal_convention: Some(Convention::OpenGl),
             }
         );
 
@@ -1828,6 +1847,8 @@ mod tests {
             name: Some(" ".into()),
             license: None,
             source_url: Some(String::new()),
+            origin: None,
+            normal_convention: None,
         };
         edit(car, clear).await;
         edit(car, PackEdit::Cover { asset_id: None }).await;
@@ -1839,6 +1860,8 @@ mod tests {
                 name: None,
                 license: None,
                 source_url: None,
+                origin: None,
+                normal_convention: None,
             },
         )
         .await;
@@ -1861,6 +1884,8 @@ mod tests {
             name: Some("x".into()),
             license: None,
             source_url: Some(url.into()),
+            origin: None,
+            normal_convention: None,
         };
         let cover = |id: &str| PackEdit::Cover {
             asset_id: Some(id.into()),

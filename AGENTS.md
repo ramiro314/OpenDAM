@@ -141,8 +141,8 @@ docs/plans                    Plans for this fork
   `structure::rebuild_library` before it returns, rather than patching rows, and that waits for
   any index run holding the lock. Searches hide support files (`support_role IS NOT NULL`) unless
   the filter's `showHidden` is set.
-  - Your pack edits ("Mark as pack", "Not a pack", a pack's name, license, source URL and cover)
-    live only in `pack_overrides`, keyed by the folder's relative path, so they outlive the
+  - Your pack edits ("Mark as pack", "Not a pack", a pack's name, license, source URL and cover,
+    and the game export's origin and normal-map convention) live only in `pack_overrides`, keyed by the folder's relative path, so they outlive the
     folder going away and coming back. The pass reads them (`structure::read_overrides`) and
     never writes or deletes them. `set_pack_override` writes one, then calls
     `structure::rebuild_library` before it emits `library:updated`, like the commands above.

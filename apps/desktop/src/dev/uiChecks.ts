@@ -2351,7 +2351,17 @@ export const UI_CHECKS: UiCheck[] = [
       for (const [path, edit] of [
         [modelsPath, { kind: 'mark', mark: null }],
         [naturePath, { kind: 'mark', mark: null }],
-        [kitPath, { kind: 'details', name: null, license: null, sourceUrl: null }],
+        [
+          kitPath,
+          {
+            kind: 'details',
+            name: null,
+            license: null,
+            sourceUrl: null,
+            origin: null,
+            normalConvention: null,
+          },
+        ],
         [kitPath, { kind: 'cover', assetId: null }],
       ] as const) {
         await api.setPackOverride(BENCH_LIBRARY, path, edit);

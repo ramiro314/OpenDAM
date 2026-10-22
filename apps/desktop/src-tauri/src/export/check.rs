@@ -86,8 +86,8 @@ pub struct CheckReport {
     pub manifest: Value,
 }
 
-/// A pack of the domain: its manifest entry, where it is, and its inferred normal-map
-/// convention.
+/// A pack of the domain: its manifest entry, where it is, and its normal-map convention, yours
+/// else its origin's default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DomainPack {
@@ -287,6 +287,58 @@ fn dir_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
+/// The indexed files of pack `pack`, at `path` among `packs`, without the files of the packs
+/// nested in it, which are their own.
+async fn files_of_pack(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    packs: &HashMap<&str, usize>,
+    pack: usize,
+    path: &str,
+) -> sqlx::Result<Vec<String>> {
+    let below: Vec<(String,)> = sqlx::query_as(
+        "SELECT file_path FROM assets
+         WHERE ?1 = '' OR (file_path >= ?1 || '/' AND file_path < ?1 || '0')",
+    )
+    .bind(path)
+    .fetch_all(pool)
+    .await?;
+    Ok(below
+        .into_iter()
+        .map(|(f,)| f)
+        .filter(|f| innermost_pack(packs, dir_of(f)) == Some(pack))
+        .collect())
+}
+
+/// The origin the pack at `path` has without your override (A1), for the pack edit form, or
+/// `None` when no pack is at `path`. It reads the pack's files as a check does.
+pub async fn inferred_origin(
+    library: &LibraryHandle,
+    path: &str,
+) -> Result<Option<packs::Origin>, String> {
+    let path = path.trim_matches('/');
+    let pack_paths: Vec<String> = sqlx::query_scalar("SELECT path FROM folders WHERE is_pack")
+        .fetch_all(&library.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let by_path: HashMap<&str, usize> = pack_paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.as_str(), i))
+        .collect();
+    let Some(&pack) = by_path.get(path) else {
+        return Ok(None);
+    };
+    let files = files_of_pack(&library.pool, &by_path, pack, path)
+        .await
+        .map_err(|e| e.to_string())?;
+    let root = library.root_path.clone();
+    tokio::task::spawn_blocking(move || {
+        Some(packs::infer_origin(&root, &files, &mut Walker::new(&root)))
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 async fn read_library(library: LibraryHandle, subtree: &[String]) -> sqlx::Result<LibraryInput> {
     let pool = &library.pool;
     let ids = serde_json::to_string(subtree).expect("ids serialize");
@@ -341,20 +393,7 @@ async fn read_library(library: LibraryHandle, subtree: &[String]) -> sqlx::Resul
 
     let mut pack_files = HashMap::new();
     for pack in item_packs.iter().flatten().collect::<HashSet<_>>() {
-        let path = &packs[*pack].path;
-        let below: Vec<(String,)> = sqlx::query_as(
-            "SELECT file_path FROM assets
-             WHERE ?1 = '' OR (file_path >= ?1 || '/' AND file_path < ?1 || '0')",
-        )
-        .bind(path)
-        .fetch_all(pool)
-        .await?;
-        // A nested pack's files are its own
-        let files = below
-            .into_iter()
-            .map(|(f,)| f)
-            .filter(|f| innermost_pack(&by_path, dir_of(f)) == Some(*pack))
-            .collect();
+        let files = files_of_pack(pool, &by_path, *pack, &packs[*pack].path).await?;
         pack_files.insert(*pack, files);
     }
 
@@ -423,7 +462,10 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                     .package
                     .as_ref()
                     .and_then(|f| packs::read_package_name(root, &f.path)),
-                origin: packs::infer_origin(root, files, &mut walkers[*l]),
+                origin: pack
+                    .edits
+                    .origin
+                    .unwrap_or_else(|| packs::infer_origin(root, files, &mut walkers[*l])),
                 info: pack.info.clone(),
                 edits: pack.edits.clone(),
             }
@@ -487,9 +529,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                     let stem_info = textures::read_stem(stem);
                     let layout = stem_info.layout.unwrap_or(Layout::Role(Role::BaseColor));
                     let convention = stem_info.convention.unwrap_or_else(|| {
-                        pack.map_or(Convention::OpenGl, |p| {
-                            export_packs[p].origin.normal_convention()
-                        })
+                        pack.map_or(Convention::OpenGl, |p| sources[p].normal_convention())
                     });
                     let name = pascal(&stem_info.base);
                     row.asset_name = Some(name.clone());
@@ -552,7 +592,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
         .into_iter()
         .zip(&sources)
         .map(|(pack, source)| DomainPack {
-            normal_convention: pack.origin.normal_convention(),
+            normal_convention: source.normal_convention(),
             library_id: source.library_id.clone(),
             path: source.path.clone(),
             pack,
@@ -1111,6 +1151,91 @@ mod tests {
         assert_eq!(ruins.pack.origin, packs::Origin::Unreal);
         assert_eq!(ruins.normal_convention, Convention::DirectX);
         assert_eq!(ruins.pack.licence.spdx.as_deref(), Some("CC-BY-4.0"));
+    }
+
+    /// Saves your origin and normal-map convention for the fixture's pack at `path`, as the pack
+    /// edit form does.
+    async fn override_pack(
+        f: &Fixture,
+        path: &str,
+        origin: Option<packs::Origin>,
+        normal_convention: Option<Convention>,
+    ) {
+        let edit = crate::commands::folder::PackEdit::Details {
+            name: None,
+            license: None,
+            source_url: None,
+            origin,
+            normal_convention,
+        };
+        crate::commands::folder::set_pack_override_in(&f.db, "fixture", path, edit)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn your_pack_origin_and_normal_convention_win_over_the_inferred_ones() {
+        let f = fixture().await;
+        override_pack(&f, "Dungeon Props", None, Some(Convention::DirectX)).await;
+        override_pack(&f, "Unity Moss", Some(packs::Origin::Unreal), None).await;
+        override_pack(&f, "Converted/Ruins", None, Some(Convention::OpenGl)).await;
+        let report = check_domain(
+            &f,
+            &[
+                "Converted/Ruins/T_Pillar_N.png",
+                "Dungeon Props/Textures/T_StoneFloor_N.png",
+                "Unity Moss/T_Moss_D.png",
+            ],
+        )
+        .await;
+
+        // Dungeon Props' normal maps are DirectX now, and Ruins' OpenGL, so only the conversion.json
+        // guard is left on the pillar
+        assert_eq!(
+            messages(&report),
+            [
+                "Converted/Ruins/T_Pillar_N.png: conversion.json support not built yet (Converted/conversion.json covers this file)",
+                "Dungeon Props/Textures/T_StoneFloor_N.png: texture conversion not built yet: it needs its DirectX normal map's green channel flipped",
+            ]
+        );
+        let packs: Vec<(&str, packs::Origin, Convention)> = report
+            .packs
+            .iter()
+            .map(|p| (p.path.as_str(), p.pack.origin, p.normal_convention))
+            .collect();
+        assert_eq!(
+            packs,
+            [
+                ("Converted/Ruins", packs::Origin::Unreal, Convention::OpenGl),
+                ("Dungeon Props", packs::Origin::Generic, Convention::DirectX),
+                // Your origin sets the convention's default
+                ("Unity Moss", packs::Origin::Unreal, Convention::DirectX),
+            ]
+        );
+        assert_eq!(report.manifest["packs"][0]["origin"], "unreal");
+        assert_valid(&report);
+
+        // The form shows the inferred origin beside yours
+        let inferred = |path: &'static str| inferred_origin(&f.library, path);
+        assert_eq!(inferred("Unity Moss").await, Ok(Some(packs::Origin::Unity)));
+        assert_eq!(
+            inferred("Converted/Ruins").await,
+            Ok(Some(packs::Origin::Unreal))
+        );
+        assert_eq!(
+            inferred("Dungeon Props").await,
+            Ok(Some(packs::Origin::Generic))
+        );
+        assert_eq!(inferred("Dungeon Props/Textures").await, Ok(None));
+
+        // Back to inferred
+        override_pack(&f, "Unity Moss", None, None).await;
+        let again = check(&f.db, "domain").await.unwrap();
+        let moss = again.packs.iter().find(|p| p.path == "Unity Moss").unwrap();
+        assert_eq!(
+            (moss.pack.origin, moss.normal_convention),
+            (packs::Origin::Unity, Convention::OpenGl)
+        );
     }
 
     #[tokio::test]
