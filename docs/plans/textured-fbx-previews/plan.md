@@ -32,6 +32,17 @@ Revised a third time 2026-10-21 after the feasibility review of revision 3. No d
 - **AC6 matches C6.** Only images the worker downscales are re-encoded, so AC6 no longer claims
   every opaque OBJ or GLB texture becomes JPEG.
 
+Revised a fourth time 2026-10-21 after GitHub Inspector's review of PR #145. No decision changed:
+
+- **The gate asks the running worker, not a file on disk.** Revision 3 read `PREVIEW_VERSION`
+  from the `worker.py` that `find_preview_worker` resolves. That function never reports "not
+  found", and its search roots live inside `start_preview_worker`. The file can also be newer than
+  the long-lived process that actually runs the jobs. Now the queue asks its own worker process
+  for its version (`engine_info`) each time it starts one, and C9 gates on that answer.
+- **The key waits for the work.** The pass records its key only once no stale FBX/3DS preview is
+  left, done or waiting. A run whose jobs an older process served is therefore redone on a later
+  start, instead of being lost.
+
 ## Problem
 
 FBX and 3DS models preview as plain gray. `model_meta` in `packages/preview-engine/worker.py`
@@ -289,7 +300,10 @@ reads no file outside `library_root` and follows no symlink out of it.
 holds an image larger than 1024 px gets that image replaced through `load_texture`'s downscale and
 encode. The rest of the branch is unchanged.
 
-**C7. Worker result.** `model_meta` adds two fields for every model it exports:
+**C7. Worker result.** A new `engine_info` method, on the same JSON-over-stdio protocol, returns
+`{"preview_version": PREVIEW_VERSION}` and loads nothing. An older worker answers it with
+`Unknown method`, which counts as version 1 (C9). `model_meta` adds two fields for every model it
+exports:
 
 - `preview_version`: the value of a module constant `PREVIEW_VERSION = 2` at the top of
   `worker.py`;
@@ -306,20 +320,24 @@ any earlier value out, so an old installed engine's result reads as version 1.
 
 **C9. Regenerating existing previews** (`model_preview_regen.rs`, modelled on `thumb_cleanup.rs`).
 
-- **Trigger:** it runs once per library, at startup and when a library is added, right after
-  `thumb_cleanup`. A Rust constant `MODEL_PREVIEW_VERSION = 2` is recorded under the
-  `library_meta` key `model_preview_version` when the pass completes. A library whose recorded
-  value is at least the constant is skipped.
-- **Engine gate.** An older engine would rerun the requeued jobs without textures and report no
-  version. The pass would still record its key and never run again. `AGENTS.md` notes that
-  `make dev` runs the installed engine after `make install`, so this is a real case. To prevent it:
-  - Before requeueing anything, the pass resolves the worker that the queue would start, through
-    `find_preview_worker` (so `OPENDAM_WORKER` and the installed engine count).
-  - It reads that `worker.py`'s `PREVIEW_VERSION = N` line as text. It starts no process, so there
-    is still one worker.
-  - If no worker is found, the line is missing, or `N` is below `MODEL_PREVIEW_VERSION`, the pass
-    requeues nothing. It records no key and logs one warning naming the engine path. The next
-    start with a current engine runs it.
+- **Trigger:** a Rust constant `MODEL_PREVIEW_VERSION = 2` and the `library_meta` key
+  `model_preview_version`. A library whose recorded value is at least the constant is skipped.
+  Every other open library gets the pass:
+  - at startup and when a library is added, right after `thumb_cleanup`;
+  - again each time the queue's worker declares a current version, as below.
+- **Engine gate.** An older engine would rerun the requeued jobs without textures. `AGENTS.md`
+  notes that `make dev` runs the installed engine after `make install`. An installed engine can
+  also change on disk while an older worker process keeps running. So the gate asks the process
+  that actually serves the queue, and never reads a file:
+  - `run_python_queue` starts its worker when the queue starts, rather than on the first job, and
+    again after every restart.
+  - Each new process first gets an `engine_info` request (C7), with a 10 s timeout. Its answer is
+    published in `AppState` as the running engine's version. A process that answers with an
+    error, or doesn't answer, publishes version 1. No running process publishes "none".
+  - The pass requeues only while the published version is at least `MODEL_PREVIEW_VERSION`.
+    Otherwise it requeues nothing, records no key, and logs one warning naming the worker path.
+  - Publishing a current version runs the pass again for every open library still below the
+    constant. A later restart onto a current engine therefore picks up what an older process left.
   - A Rust test reads the checkout's `worker.py` with `include_str!` and checks that its
     `PREVIEW_VERSION` equals `MODEL_PREVIEW_VERSION`, so the two can't drift apart.
 - **Candidates:**
@@ -332,8 +350,16 @@ any earlier value out, so an old installed engine's result reads as version 1.
     shared rather than copied.
   - Members, support files, pictured items and errored previews are never touched (D8).
 - **Requeue:** candidates go back on the queue through `preview::enqueue`, in 200-row
-  transactions, `ORDER BY rowid`. The pass records the key after the last batch, logs its count,
-  and emits `library:updated`. An interrupted pass redoes the uncommitted batch at the next open.
+  transactions, `ORDER BY rowid`. The pass logs its count and emits `library:updated`. An
+  interrupted pass redoes the uncommitted batch at the next run.
+- **Recording the key.** The pass records the key only when a run finds nothing left to do: no
+  FBX/3DS item the queue rules allow whose `preview_version` is below the constant, with its
+  preview `done` or a job waiting. Until then the next trigger runs the pass again, which is
+  cheap: one query and no requeues while jobs wait.
+  - A job an older process served stays stale, so a later pass under a current engine requeues
+    it.
+  - A brand-new FBX waiting for its first preview also holds the key back until it is done.
+    This is harmless.
 - **What the user sees:** each requeued FBX keeps its old thumbnail until the worker reruns it.
   Then, as today, the old `_thumb.png` is deleted, the card briefly shows no thumbnail, and the
   frontend captures the textured one.
@@ -378,9 +404,11 @@ GLB fresh and needs nothing.
     - the exported GLB, read back from its JSON chunk: an opaque texture is `image/jpeg`, a texture
       with alpha is `image/png` with `alphaMode` `MASK`, and each image's decoded size is at most
       1024 px.
-  - `test_worker_protocol.py`: one `model_meta` request over stdio, on a generated OBJ+MTL with a
-    2048 px opaque texture, returns `preview_version` equal to `PREVIEW_VERSION`. The GLB's image
-    is `image/jpeg` and at most 1024 px.
+  - `test_worker_protocol.py`:
+    - `engine_info` returns `PREVIEW_VERSION`;
+    - one `model_meta` request over stdio, on a generated OBJ+MTL with a 2048 px opaque texture,
+      returns `preview_version` equal to `PREVIEW_VERSION`, and the GLB's image is `image/jpeg`
+      and at most 1024 px.
 - **CI and make:** `make test` and the CI test job add `cd packages/preview-engine && uv run
   --frozen pytest`. `make install` also copies `textures.py`.
 - **Rust:**
@@ -389,10 +417,15 @@ GLB fresh and needs nothing.
     `preview_textures`.
   - `model_preview_regen.rs`: it requeues stale `done` FBX/3DS main items. It leaves members,
     support files, pictured items, errors, OBJ and current-version rows alone. It requeues a
-    stand-in. It records the key, and a second run is a no-op.
-  - The engine gate: a worker declaring version 1, a worker with no `PREVIEW_VERSION` line, and
-    no worker at all each requeue nothing and leave the key unset. A worker declaring 2 runs the
-    pass. The checkout's `worker.py` declares `MODEL_PREVIEW_VERSION`.
+    stand-in.
+  - **The key:** it is not recorded while requeued jobs wait. It is recorded on the run after
+    they complete at version 2. If they complete at version 1, as from an older process, the
+    next run requeues them again and records nothing.
+  - **The engine gate:** a published version of 1 requeues nothing and leaves the key unset.
+    Publishing 2 afterwards runs the pass for every open library still below the constant. The
+    checkout's `worker.py` declares `MODEL_PREVIEW_VERSION`.
+  - **Engine version:** `run_python_queue` publishes the version from `engine_info`, and 1 for a
+    worker that answers `Unknown method`. Tested with a stub worker script.
 - **TypeScript:** the `useGLTF.clear` call on `preview:done`.
 
 **C12. Measurement** (D10). Your three libraries are read only. Nothing in this section writes to
@@ -459,8 +492,9 @@ invariant. It covers:
 - a texture failure never fails a preview;
 - `metadata.preview_version` and the `model_preview_version` pass are how a preview change reaches
   existing libraries;
-- the pass runs only when the resolved worker declares a `PREVIEW_VERSION` of at least
-  `MODEL_PREVIEW_VERSION`.
+- the pass requeues only while the running worker process has declared, through `engine_info`, a
+  version of at least `MODEL_PREVIEW_VERSION`;
+- it records its key only once no stale FBX/3DS preview is left.
 
 ## Steps (one phase)
 
@@ -472,11 +506,12 @@ invariant. It covers:
    - `make install` copies `textures.py`.
    - Tests in `test_textures.py`, which this step's own setup runs by file and in CI.
 2. `worker.py`: the FBX/3DS scene from the node tree (C2) and materials (C4). The trimesh-branch
-   downscale (C6). The `PREVIEW_VERSION` constant and the result fields (C7). Tests in
+   downscale (C6). The `PREVIEW_VERSION` constant, `engine_info` and the result fields (C7). Tests in
    `test_fbx_scene.py` and `test_worker_protocol.py`, which run under step 1's setup.
 3. `preview.rs`: the `library_root` and `pack_root` params (C1), and storing the result (C8).
-4. `model_preview_regen.rs`, its engine gate, and its wiring in `lib.rs` and
-   `commands/library.rs` (C9).
+   The queue starts its worker eagerly and publishes the `engine_info` version (C9).
+4. `model_preview_regen.rs`, its engine gate and key rule, and its wiring in `lib.rs`,
+   `commands/library.rs` and the queue's version publication (C9).
 5. Frontend `useGLTF.clear` on `preview:done` (C10).
 6. `measure_textures.py` and the measurement run (C12). `AGENTS.md` invariant (C13).
 7. `uv run ruff format`, `bun run format`, `cargo fmt`, and `make lint`, before each commit.
@@ -492,8 +527,9 @@ invariant. It covers:
   texture file.
 - **AC4.** Multi-part and Z-up FBX are drawn with their node transforms, and LOD1+ and collision
   nodes are not drawn.
-- **AC5.** Existing libraries requeue only `done` FBX/3DS items the queue rules allow, once, and
-  only when the resolved worker declares a current `PREVIEW_VERSION`. Nothing else is reprocessed.
+- **AC5.** Existing libraries requeue only `done` FBX/3DS items the queue rules allow. They do so
+  only while the running worker process has declared a current version, and again only for
+  items an older process left stale. Nothing else is reprocessed.
 - **AC6.** New OBJ, glTF and GLB previews keep their textures, with each one at most 1024 px.
   - An image the worker downscales (C6) is stored as `image/jpeg` when opaque and as `image/png`
     with alpha.
