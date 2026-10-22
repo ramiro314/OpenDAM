@@ -43,6 +43,17 @@ Revised a fourth time 2026-10-21 after GitHub Inspector's review of PR #145. No 
   left, done or waiting. A run whose jobs an older process served is therefore redone on a later
   start, instead of being lost.
 
+Revised a fifth time 2026-10-22 after GitHub Inspector's second review of PR #145. No decision
+changed:
+
+- **Before the first answer, the pass waits silently.** The published engine version starts as
+  "none yet". A pass that sees it returns without requeueing, recording a key, or warning, and the
+  first publish runs it (C9).
+- **Extension precedence is explicit.** Within each tier, the exact extension comes first, but a
+  PSD is a last resort across the whole lookup. A non-PSD file anywhere in steps 1-3 beats any
+  PSD, and the nearer tier beats the exact extension (C3). This refines how D12's "exact extension
+  first" and D15's "psd last" combine.
+
 ## Problem
 
 FBX and 3DS models preview as plain gray. `model_meta` in `packages/preview-engine/worker.py`
@@ -257,6 +268,22 @@ each material, the reference is the first path in `TEXTURES[1]` (diffuse), else 
       `_LODn`, then drop trailing `_parts` the same way.
 5. **Nothing found:** no texture. The material keeps its color (C4).
 
+**Precedence across steps, tiers and extensions.**
+
+- **Non-PSD files first.** Steps 1-3 look for non-PSD files first, in step order, then tier
+  order within step 3. A nearer tier beats an exact extension further away.
+- **Within one tier,** the reference's own extension comes first unless it is `.psd`. The other
+  extensions follow in C5's order. Ties go to folder distance, then path ignoring case.
+- **A PSD is held, not used.** Steps 1 and 2 hitting an existing `.psd`, or step 3 finding one,
+  only remember it, the first in that same order. The lookup goes on.
+- **The held PSD is the last literal result.** It is used only when steps 1-3 find no non-PSD
+  file, and it still comes before the heuristics.
+- **The heuristics follow the same rule:** a non-PSD match in any tier first, then a PSD.
+
+For example, a reference to `..\Textures\X.psd` with both `X.psd` and `X.png` in that folder
+takes `X.png`. With only `X.psd` there, it takes `X.psd`. A `.tga` reference with an exact `.tga`
+only elsewhere in the pack, and a `.png` of the same stem next to the model, takes the `.png`.
+
 The worker builds each root's file list once and caches it in an LRU of 4 roots, valid 5 minutes,
 capped at 50,000 entries per root. A capped root is searched only as far as it got. Resolution
 reads no file outside `library_root` and follows no symlink out of it.
@@ -333,9 +360,13 @@ any earlier value out, so an old installed engine's result reads as version 1.
     again after every restart.
   - Each new process first gets an `engine_info` request (C7), with a 10 s timeout. Its answer is
     published in `AppState` as the running engine's version. A process that answers with an
-    error, or doesn't answer, publishes version 1. No running process publishes "none".
+    error, or doesn't answer, publishes version 1.
+  - **Before any answer** (at startup, or while a restarted process is starting, or when no
+    worker could be spawned) the published state is "none yet". A pass that sees it returns at
+    once. It does not requeue, record a key, or log a warning. The next publish runs it.
   - The pass requeues only while the published version is at least `MODEL_PREVIEW_VERSION`.
-    Otherwise it requeues nothing, records no key, and logs one warning naming the worker path.
+    With a published version below it, the pass requeues nothing, records no key, and logs one
+    warning naming the worker path.
   - Publishing a current version runs the pass again for every open library still below the
     constant. A later restart onto a current engine therefore picks up what an older process left.
   - A Rust test reads the checkout's `worker.py` with `include_str!` and checks that its
@@ -385,6 +416,10 @@ GLB fresh and needs nothing.
     - nearest-wins, including a Built-In vs URP tie;
     - `Previews/` excluded;
     - other extension, and psd last;
+    - a `.psd` reference with a `.png` sibling takes the `.png`, and one with only the `.psd`
+      takes the `.psd`;
+    - a nearer different-extension file beats an exact extension further away in the pack;
+    - a PSD found by a literal step beats a heuristic match;
     - each heuristic, a default material name skipped, and file-prefix refused with 2 materials;
     - not found;
     - no pack (2-level bound);
@@ -421,9 +456,12 @@ GLB fresh and needs nothing.
   - **The key:** it is not recorded while requeued jobs wait. It is recorded on the run after
     they complete at version 2. If they complete at version 1, as from an older process, the
     next run requeues them again and records nothing.
-  - **The engine gate:** a published version of 1 requeues nothing and leaves the key unset.
-    Publishing 2 afterwards runs the pass for every open library still below the constant. The
-    checkout's `worker.py` declares `MODEL_PREVIEW_VERSION`.
+  - **The engine gate:**
+    - "None yet" returns silently: nothing is requeued, no key is recorded, and no warning is
+      logged.
+    - A published version of 1 requeues nothing, leaves the key unset, and logs the warning.
+    - Publishing 2 afterwards runs the pass for every open library still below the constant.
+    - The checkout's `worker.py` declares `MODEL_PREVIEW_VERSION`.
   - **Engine version:** `run_python_queue` publishes the version from `engine_info`, and 1 for a
     worker that answers `Unknown method`. Tested with a stub worker script.
 - **TypeScript:** the `useGLTF.clear` call on `preview:done`.
