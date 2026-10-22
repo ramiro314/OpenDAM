@@ -30,6 +30,7 @@ import {
 import type { AutotagUpdate } from './types';
 import { api } from './api';
 import { startModelThumbnailer } from './preview/modelThumbnailer';
+import { onPreviewDone, type PreviewDone } from './preview/previewDone';
 import { isEditingText, isInControl } from './utils/keyboard';
 import { itemFileCount } from './utils/format';
 import { layoutVars } from './utils/panelSize';
@@ -64,25 +65,9 @@ export default function App() {
     Promise.all([fetchLibraries(), fetchTags(), fetchCollections()]).then(() => search());
 
     // Real-time preview updates from background engine
-    const unlistenDone = listen<{
-      assetId: string;
-      filePath?: string | null;
-      previousThumbnailPath?: string | null;
-      thumbnailPath: string | null;
-      previewModel?: string;
-    }>('preview:done', (event) => {
-      useAssetStore.getState().updateAssetPreview(
-        event.payload.assetId,
-        event.payload.thumbnailPath,
-        event.payload.previewModel,
-        event.payload.filePath
-          ? {
-              filePath: event.payload.filePath,
-              previousThumbnailPath: event.payload.previousThumbnailPath ?? undefined,
-            }
-          : undefined
-      );
-    });
+    const unlistenDone = listen<PreviewDone>('preview:done', (event) =>
+      onPreviewDone(event.payload)
+    );
 
     const unlistenError = listen<{ assetId: string }>('preview:error', (event) => {
       useAssetStore.getState().setPreviewStatus(event.payload.assetId, 'error');
