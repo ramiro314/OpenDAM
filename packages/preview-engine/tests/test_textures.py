@@ -420,6 +420,52 @@ def test_a_non_diffuse_map_is_never_a_reference_prefix_candidate(lib):
     assert guess("PolygonCity_Texture.psd", src, lib) is None
 
 
+def test_the_reference_prefix_takes_the_color_map_of_an_ambientcg_set(lib):
+    src = model(lib, "Pack/Models/rock.fbx")
+    for kind in ("AmbientOcclusion", "Cavity", "Color", "Displacement", "NormalDX", "NormalGL"):
+        touch(lib / f"Pack/Textures/Rock023_1K_{kind}.png")
+    for kind in ("Metalness", "Opacity", "Rough", "Gloss", "Spec", "Bump", "Alpha"):
+        touch(lib / f"Pack/Textures/Rock023_1K_{kind}.png")
+    # `Cavity` says nothing and sorts first by path: the recognised `Color` still wins.
+    assert guess("Rock023_Texture.png", src, lib) == (
+        "Pack/Textures/Rock023_1K_Color.png",
+        "ref_prefix",
+    )
+    (lib / "Pack/Textures/Rock023_1K_Color.png").unlink()
+    textures.clear_index_cache()
+    assert guess("Rock023_Texture.png", src, lib)[0] == "Pack/Textures/Rock023_1K_Cavity.png"
+
+
+def test_a_map_type_before_a_resolution_is_refused(lib):
+    src = model(lib, "Pack/Models/boulder.fbx")
+    for kind in ("arm", "disp", "nor_gl", "rough"):
+        touch(lib / f"Pack/Textures/rock_boulder_{kind}_1k.png")
+    assert guess("rock_boulder.tga", src, lib) is None
+    touch(lib / "Pack/Textures/rock_boulder_diff_1k.png")
+    textures.clear_index_cache()
+    assert guess("rock_boulder.tga", src, lib)[0] == "Pack/Textures/rock_boulder_diff_1k.png"
+
+
+def test_map_words_inside_the_reference_core_are_not_refused(lib):
+    # `Arm` is part of the reference itself, not a map type the candidate adds.
+    src = model(lib, "Pack/Models/arm.fbx")
+    touch(lib / "Pack/Textures/Robot_Arm_01.png")
+    assert guess("Robot_Arm_Texture.png", src, lib)[0] == "Pack/Textures/Robot_Arm_01.png"
+
+
+def test_the_heuristics_list_the_files_once_per_model(lib, monkeypatch):
+    src = model(lib, "Pack/Meshes/rock.fbx")
+    save(Image.new("RGB", (8, 8)), lib / "Pack/Textures/T_Rock_BC.png")
+    calls = []
+    real = textures._tier_files
+    monkeypatch.setattr(textures, "_tier_files", lambda tiers: calls.append(1) or real(tiers))
+    scene = textures.SceneTextures(src, str(lib), str(lib / "Pack"))
+    for name in ("MI_Rock", "MI_Wood", "MI_Metal_Panel"):
+        scene.texture({"NAME": name})
+    assert len(calls) == 1
+    assert scene.report["textured"] == 1
+
+
 def test_the_reference_prefix_drops_trailing_parts(lib):
     src = model(lib, "Pack/Models/barrel.fbx")
     touch(lib / "Pack/Textures/T_Barrel_Rusty_01.tga")

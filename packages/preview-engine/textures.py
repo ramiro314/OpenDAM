@@ -8,6 +8,7 @@ an image for the preview GLB: at most 1024 px, JPEG unless its alpha looks like 
 
 from __future__ import annotations
 
+import functools
 import io
 import os
 import re
@@ -89,6 +90,7 @@ def resolve_texture(
     where: Bounds | None,
     material_name: str | None = None,
     single_material: bool = False,
+    files_cache: dict | None = None,
 ) -> tuple[Path, str] | None:
     """
     The file a material's texture reference names, as `(path, via)`, or None.
@@ -99,7 +101,7 @@ def resolve_texture(
     beats every PSD, and the first PSD they find beats the heuristics. Only when they find
     nothing, or there is no reference, do the heuristics run (`_heuristics`), again preferring
     any non-PSD match to a PSD. An embedded (`*N`) reference counts as none. Without a root
-    (`where` is None) nothing is found.
+    (`where` is None) nothing is found. `files_cache` is `_heuristics`' per-request cache.
     """
     if where is None:
         return None
@@ -110,7 +112,11 @@ def resolve_texture(
         found = _first(_candidates(reference, model_dir, where))
         if found:
             return found
-    return _first(_heuristics(reference, material_name, single_material, source, model_dir, where))
+    return _first(
+        _heuristics(
+            reference, material_name, single_material, source, model_dir, where, files_cache
+        )
+    )
 
 
 def _first(found) -> tuple[Path, str] | None:
@@ -273,27 +279,24 @@ DIFFUSE_SUFFIXES = (
     "_diff",
 )
 PREFIXED_DIFFUSE_SUFFIXES = ("_b", "_c", "_d")
-NON_DIFFUSE_SUFFIXES = (
-    "_n",
-    "_normal",
-    "_normals",
-    "_nrm",
-    "_orm",
-    "_aorm",
-    "_r",
-    "_roughness",
-    "_m",
-    "_metallic",
-    "_metallicsmoothness",
-    "_mask",
-    "_maskmap",
-    "_e",
-    "_emission",
-    "_emissive",
-    "_ao",
-    "_height",
-    "_specular",
-    "_smmetao",
+# A stem whose last `_part` is one of these names another kind of map. All but the single
+# letters also count anywhere among the parts the reference-prefix guess adds, which catches
+# names with a resolution after the map type, such as Poly Haven's `rock_nor_gl_1k`.
+NON_DIFFUSE_WORDS = frozenset(
+    {
+        # Plan C3 step 4.
+        "n", "normal", "normals", "nrm", "orm", "aorm", "r", "roughness", "m", "metallic",
+        "metallicsmoothness", "mask", "maskmap", "e", "emission", "emissive", "ao", "height",
+        "specular", "smmetao",
+        # ambientCG, Poly Haven and other common names.
+        "normalgl", "normaldx", "nor", "ambientocclusion", "occlusion", "displacement", "disp",
+        "metalness", "rough", "arm", "gloss", "glossiness", "spec", "bump", "opacity", "alpha",
+    }
+)  # fmt: skip
+# Longest first, so `_base_color` isn't read as `_color`.
+_DIFFUSE_ORDER = tuple(sorted(DIFFUSE_SUFFIXES, key=len, reverse=True))
+_PREFIXED_DIFFUSE_ORDER = tuple(
+    sorted(DIFFUSE_SUFFIXES + PREFIXED_DIFFUSE_SUFFIXES, key=len, reverse=True)
 )
 TEXTURE_PREFIXES = ("t_", "tx_")
 CORE_PREFIXES = ("t_", "tx_", "sm_")
@@ -312,11 +315,13 @@ def _strip_prefix(stem: str, prefixes: tuple[str, ...]) -> str:
     return stem
 
 
+@functools.lru_cache(maxsize=1 << 16)
 def core_stem(stem: str) -> str:
     """A lowercase stem without a leading `T_`, `TX_` or `SM_`."""
     return _strip_prefix(stem.lower(), CORE_PREFIXES)
 
 
+@functools.lru_cache(maxsize=1 << 16)
 def diffuse_name(stem: str) -> str | None:
     """
     What a diffuse map's stem names: lowercase, without its diffuse suffix and a `T_` or
@@ -324,15 +329,21 @@ def diffuse_name(stem: str) -> str | None:
     """
     low = stem.lower()
     bare = _strip_prefix(low, TEXTURE_PREFIXES)
-    suffixes = DIFFUSE_SUFFIXES + (PREFIXED_DIFFUSE_SUFFIXES if bare != low else ())
-    for suffix in sorted(suffixes, key=len, reverse=True):
+    for suffix in _PREFIXED_DIFFUSE_ORDER if bare != low else _DIFFUSE_ORDER:
         if bare.endswith(suffix) and len(bare) > len(suffix):
             return bare[: -len(suffix)]
     return None
 
 
-def is_non_diffuse(stem: str) -> bool:
-    return stem.lower().endswith(NON_DIFFUSE_SUFFIXES)
+def is_non_diffuse(stem: str, added: list[str] | tuple[str, ...] = ()) -> bool:
+    """
+    Whether a stem names a map other than base color: its last `_part` is in
+    `NON_DIFFUSE_WORDS`, or one of the `added` parts is a word there of 2 letters or more.
+    """
+    parts = stem.lower().split("_")
+    if len(parts) > 1 and parts[-1] in NON_DIFFUSE_WORDS:
+        return True
+    return any(len(part) > 1 and part in NON_DIFFUSE_WORDS for part in added)
 
 
 def material_core(name: str | None) -> str | None:
@@ -372,20 +383,23 @@ def _heuristics(
     source: str,
     model_dir: Path,
     where: Bounds,
+    files_cache: dict | None = None,
 ):
     """
     Files a material's naming points at (C3 step 4), as `(path, via)` in order, over the
     by-name search's tiers:
 
     1. `material_name`: a diffuse map named after the material (`material_core`).
-    2. `ref_prefix`: any texture without a non-diffuse suffix whose core stem is the
-       reference's core, without a `_Texture` part, or starts with it and `_`, dropping the
-       reference's trailing `_parts` down to the floor until something matches (`core_tries`).
-       The fewest extra `_parts` win.
+    2. `ref_prefix`: any texture not named as another kind of map (`is_non_diffuse`) whose
+       core stem is the reference's core, without a `_Texture` part, or starts with it and
+       `_`, dropping the reference's trailing `_parts` down to the floor until something
+       matches (`core_tries`). A recognised diffuse map (`diffuse_name`) wins, then the fewest
+       extra `_parts`.
     3. `file_prefix`, for a model with a single material: a diffuse map named after the
        model's core stem without `_LODn`, dropping its `_parts` the same way.
 
-    Ties go to the nearest tier, then `_Tiers.key` order.
+    Ties go to the nearest tier, then `_Tiers.key` order. `files_cache`, kept for one
+    request, lists the tiers' files once for every material of the model.
     """
     name = material_core(material_name)
     ref_core = None
@@ -400,15 +414,11 @@ def _heuristics(
 
     tiers = _Tiers(model_dir, where)
     key = tiers.key(_ext(_stem_name(reference)) if reference else "")
-    # Every texture file once, in its nearest tier: (tier, lowercase stem, folder, name).
-    files, seen = [], set()
-    for tier, (prefix, index) in enumerate(tiers.indexes()):
-        for stem, entries in index.items():
-            for folder, filename in entries:
-                entry = ((*prefix, *folder), filename)
-                if entry not in seen:
-                    seen.add(entry)
-                    files.append((tier, stem, *entry))
+    files = files_cache.get((model_dir, where)) if files_cache is not None else None
+    if files is None:
+        files = _tier_files(tiers)
+        if files_cache is not None:
+            files_cache[(model_dir, where)] = files
 
     def ranked(matches):
         """`matches` of `(rank, tier, folder, name)` as paths, best first."""
@@ -416,7 +426,7 @@ def _heuristics(
         return [tiers.path(folder, filename) for _, _, folder, filename in matches]
 
     def named(want: str):
-        return ranked([(0, tier, f, n) for tier, stem, f, n in files if diffuse_name(stem) == want])
+        return ranked([(0, tier, f, n) for tier, _, diffuse, _, f, n in files if diffuse == want])
 
     if name:
         for path in named(name):
@@ -425,10 +435,14 @@ def _heuristics(
     if ref_core:
         for want in core_tries(ref_core):
             matches = []
-            for tier, stem, folder, filename in files:
-                core = core_stem(stem)
-                if (core == want or core.startswith(want + "_")) and not is_non_diffuse(stem):
-                    matches.append((core[len(want) :].count("_"), tier, folder, filename))
+            for tier, stem, diffuse, core, folder, filename in files:
+                if core != want and not core.startswith(want + "_"):
+                    continue
+                added = core[len(want) + 1 :].split("_") if core != want else []
+                # A known diffuse map is never refused, and beats a name that says nothing.
+                if diffuse is None and is_non_diffuse(stem, added):
+                    continue
+                matches.append(((diffuse is None, len(added)), tier, folder, filename))
             if matches:
                 for path in ranked(matches):
                     yield path, "ref_prefix"
@@ -441,6 +455,23 @@ def _heuristics(
                 for path in paths:
                     yield path, "file_prefix"
                 break
+
+
+def _tier_files(tiers: _Tiers) -> list[tuple]:
+    """
+    Every texture file of the tiers once, in its nearest tier, as `(tier, lowercase stem,
+    diffuse_name, core_stem, folder parts from top, name)`.
+    """
+    files, seen = [], set()
+    for tier, (prefix, index) in enumerate(tiers.indexes()):
+        for stem, entries in index.items():
+            diffuse, core = diffuse_name(stem), core_stem(stem)
+            for folder, filename in entries:
+                entry = ((*prefix, *folder), filename)
+                if entry not in seen:
+                    seen.add(entry)
+                    files.append((tier, stem, diffuse, core, *entry))
+    return files
 
 
 # (folder, library root) -> (built at, {stem: [(folder parts, file name)]}), for whole packs
@@ -627,6 +658,7 @@ class SceneTextures:
         # Only a model with one material may take a texture named after its file.
         self.single_material = single_material
         self.cache: dict[Path, Texture] = {}
+        self.files: dict = {}  # the heuristics' file lists, shared by the model's materials
         self.report = {
             "materials": 0,
             "textured": 0,
@@ -650,7 +682,9 @@ class SceneTextures:
         reference = diffuse_reference(ai_material)
         name = ai_material.get("NAME") or ""
         try:
-            found = resolve_texture(reference, self.source, self.where, name, self.single_material)
+            found = resolve_texture(
+                reference, self.source, self.where, name, self.single_material, self.files
+            )
         except OSError:
             found = None
         if found is None:
