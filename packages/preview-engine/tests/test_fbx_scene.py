@@ -318,6 +318,26 @@ def test_materials_are_pbr_in_the_diffuse_color_or_gray(tmp_path, monkeypatch):
     )
 
 
+def test_import_uses_c2_flags(tmp_path, monkeypatch):
+    # SortByPType keeps points and lines out of triangle meshes, which `_fbx_geometry`
+    # relies on to tell a triangle mesh by its index count.
+    import assimp_py
+
+    calls = []
+    scene = FakeScene(root_node=FakeNode("Root", (0,)), meshes=[triangle()])
+    monkeypatch.setattr(assimp_py, "import_file", lambda path, flags: calls.append(flags) or scene)
+    source = tmp_path / "model.fbx"
+    source.write_bytes(b"fake")
+    worker.model_meta(str(source), str(tmp_path / "thumbs"), "42")
+
+    assert calls == [
+        assimp_py.Process_Triangulate
+        | assimp_py.Process_GenNormals
+        | assimp_py.Process_JoinIdenticalVertices
+        | assimp_py.Process_SortByPType
+    ]
+
+
 def test_3ds_goes_through_the_same_scene(tmp_path, monkeypatch):
     scene = FakeScene(root_node=FakeNode("Root", (0,)), meshes=[triangle()])
     res = preview(tmp_path, monkeypatch, scene, ext=".3ds")
