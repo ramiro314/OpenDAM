@@ -18,9 +18,9 @@ from textures import Bounds, bounds, load_texture, resolve_texture
 
 @pytest.fixture(autouse=True)
 def fresh_index_cache():
-    textures._INDEXES.clear()
+    textures.clear_index_cache()
     yield
-    textures._INDEXES.clear()
+    textures.clear_index_cache()
 
 
 def touch(path: Path) -> Path:
@@ -143,7 +143,7 @@ def test_previews_and_other_render_folders_are_never_searched(lib):
         touch(lib / "Pack" / folder / "rock.png")
     assert resolve("rock.png", src, lib, lib / "Pack") is None
     touch(lib / "Pack/Textures/rock.jpg")
-    textures._INDEXES.clear()
+    textures.clear_index_cache()
     assert resolve("rock.png", src, lib, lib / "Pack")[0] == "Pack/Textures/rock.jpg"
 
 
@@ -168,12 +168,56 @@ def test_the_walk_up_never_leaves_the_library_root(lib, tmp_path):
 
 
 def test_a_capped_index_is_searched_as_far_as_it_got(lib, monkeypatch):
-    monkeypatch.setattr(textures, "INDEX_CAP", 1)
+    # The walk visits Pack, rock.fbx, a/, a/first.png, b/, b's ten .meta files, b/second.png:
+    # every folder and file counts toward the cap, textures or not.
     src = model(lib, "Pack/rock.fbx")
     touch(lib / "Pack/a/first.png")
+    for n in range(10):
+        touch(lib / f"Pack/b/a{n}.meta")
     touch(lib / "Pack/b/second.png")
+    monkeypatch.setattr(textures, "INDEX_CAP", 15)
     assert resolve("first.png", src, lib, lib / "Pack")[0] == "Pack/a/first.png"
     assert resolve("second.png", src, lib, lib / "Pack") is None
+    textures.clear_index_cache()
+    monkeypatch.setattr(textures, "INDEX_CAP", 16)
+    assert resolve("second.png", src, lib, lib / "Pack")[0] == "Pack/b/second.png"
+
+
+def walked(monkeypatch) -> list[Path]:
+    """Records each folder `os.walk` lists from here on."""
+    real, seen = textures.os.walk, []
+
+    def walk(top, *args, **kwargs):
+        for entry in real(top, *args, **kwargs):
+            seen.append(Path(entry[0]))
+            yield entry
+
+    monkeypatch.setattr(textures.os, "walk", walk)
+    return seen
+
+
+def test_without_a_pack_only_the_levels_and_their_texture_folders_are_walked(lib, monkeypatch):
+    src = model(lib, "Models/rock.fbx")
+    touch(lib / "Textures/Rock/stone.png")
+    for n in range(5):
+        touch(lib / f"Audio/Deep{n}/clip.png")
+    seen = walked(monkeypatch)
+
+    assert resolve("stone.png", src, lib) == ("Textures/Rock/stone.png", "name")
+    assert resolve("clip.png", src, lib) is None
+    assert set(seen) == {lib / "Models", lib, lib / "Textures", lib / "Textures/Rock"}
+
+
+def test_the_whole_pack_is_walked_only_when_no_level_matches(lib, monkeypatch):
+    src = model(lib, "Pack/Meshes/rock.fbx")
+    touch(lib / "Pack/Textures/stone.png")
+    touch(lib / "Pack/Art/Deep/far.png")
+    seen = walked(monkeypatch)
+
+    assert resolve("stone.png", src, lib, lib / "Pack")[0] == "Pack/Textures/stone.png"
+    assert lib / "Pack/Art" not in seen
+    assert resolve("far.png", src, lib, lib / "Pack")[0] == "Pack/Art/Deep/far.png"
+    assert lib / "Pack/Art/Deep" in seen
 
 
 def test_the_index_is_cached_per_root_for_five_minutes(lib, monkeypatch):
@@ -187,7 +231,7 @@ def test_the_index_is_cached_per_root_for_five_minutes(lib, monkeypatch):
     assert resolve("late.png", src, lib, lib / "Pack")[0] == "Pack/Textures/late.png"
 
 
-def test_the_index_cache_keeps_four_roots(lib):
+def test_the_index_cache_keeps_four_packs(lib):
     for n in range(6):
         src = model(lib, f"Pack{n}/rock.fbx")
         resolve("x.png", src, lib, lib / f"Pack{n}")
@@ -229,7 +273,7 @@ def test_a_psd_reference_takes_a_png_sibling(lib):
         "relative",
     )
     touch(lib / "Pack/Textures/X.png")
-    textures._INDEXES.clear()
+    textures.clear_index_cache()
     assert resolve("..\\Textures\\X.psd", src, lib, lib / "Pack") == (
         "Pack/Textures/X.png",
         "name",

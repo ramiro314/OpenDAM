@@ -28,8 +28,11 @@ MAX_SIDE = 1024  # longest side of a texture in the GLB
 MAX_SOURCE_SIDE = 8192  # a larger source is skipped as `too_large`, bounding one decode
 JPEG_QUALITY = 85
 
-# Root file index cache: at most 4 roots, each valid 5 minutes and capped at 50,000 files.
+# File index cache. Each index is valid 5 minutes, and its walk stops after 50,000 entries,
+# folders and files of any kind. At most 4 whole packs are kept, and 64 levels of the walk up
+# from a model (a folder's own files and its texture subfolders), which cost far less.
 INDEX_ROOTS = 4
+INDEX_LEVELS = 64
 INDEX_TTL = 300.0
 INDEX_CAP = 50_000
 
@@ -164,37 +167,24 @@ def _relative(model_dir: Path, parts: list[str], root: Path) -> Path | None:
     return current if current != model_dir and current.is_file() else None
 
 
-def _by_name(stem: str, ext: str, model_dir: Path, where: Bounds) -> list[Path]:
+def _by_name(stem: str, ext: str, model_dir: Path, where: Bounds):
     """
     Files with the stem, ignoring case, tier by tier. A tier is a level of the walk up from
     the model's folder: that folder and its texture subfolders, recursively. Then the whole
     pack. Within a tier the reference's own extension comes first, then the others in
-    `EXTENSIONS` order, then the nearest folder, then the path ignoring case.
+    `EXTENSIONS` order, then the nearest folder, then the path ignoring case. Each tier is
+    indexed only when the lookup reaches it, so the whole pack is walked only when no level
+    has a match, and without a pack nothing is walked beyond the levels.
     """
+    levels = [model_dir]
     if where.pack_root:
-        top = where.pack_root
+        while levels[-1] != where.pack_root:
+            levels.append(levels[-1].parent)
     else:
-        top = model_dir
-        for _ in range(NO_PACK_LEVELS):
-            if top == where.library_root:
-                break
-            top = top.parent
-    index = _index(top, where.library_root)
-    entries = index.get(stem, [])
-    if not entries:
-        return []
-
+        while len(levels) <= NO_PACK_LEVELS and levels[-1] != where.library_root:
+            levels.append(levels[-1].parent)
+    top = levels[-1]
     model_rel = model_dir.relative_to(top).parts
-    levels = [model_rel[:n] for n in range(len(model_rel), -1, -1)]
-
-    def in_level(folder: tuple[str, ...], level: tuple[str, ...]) -> bool:
-        return folder == level or (
-            folder[: len(level)] == level and folder[len(level)].lower() in TEXTURE_DIRS
-        )
-
-    tiers = [[e for e in entries if in_level(e[0], level)] for level in levels]
-    if where.pack_root:
-        tiers.append(entries)
 
     def key(entry: tuple[tuple[str, ...], str]):
         folder, name = entry
@@ -206,54 +196,80 @@ def _by_name(stem: str, ext: str, model_dir: Path, where: Bounds) -> list[Path]:
         distance = len(folder) + len(model_rel) - 2 * common
         return order, distance, "/".join((*folder, name)).lower()
 
-    out, seen = [], set()
-    for tier in tiers:
+    def tiers():
+        for level in levels:
+            prefix = level.relative_to(top).parts
+            entries = _index(level, where.library_root, recursive=False).get(stem, [])
+            yield [((*prefix, *folder), name) for folder, name in entries]
+        if where.pack_root:
+            yield _index(top, where.library_root, recursive=True).get(stem, [])
+
+    seen = set()
+    for tier in tiers():
         for folder, name in sorted(tier, key=key):
             if (folder, name) not in seen:
                 seen.add((folder, name))
-                out.append(top.joinpath(*folder, name))
-    return out
+                yield top.joinpath(*folder, name)
 
 
-# root -> (built at, {stem: [(folder parts, file name)]})
+# (folder, library root) -> (built at, {stem: [(folder parts, file name)]}), for whole packs
+# and for single levels.
 _INDEXES: OrderedDict[tuple[Path, Path], tuple[float, dict]] = OrderedDict()
+_LEVELS: OrderedDict[tuple[Path, Path], tuple[float, dict]] = OrderedDict()
 
 
-def _index(top: Path, library_root: Path) -> dict[str, list[tuple[tuple[str, ...], str]]]:
+def clear_index_cache() -> None:
+    _INDEXES.clear()
+    _LEVELS.clear()
+
+
+def _index(
+    top: Path, library_root: Path, recursive: bool
+) -> dict[str, list[tuple[tuple[str, ...], str]]]:
     """
-    The texture files under `top` by lowercase stem, skipping `EXCLUDED_DIRS`, symlinked
-    folders and symlinks out of the library. Built once per root and kept in a small LRU; a
-    root past `INDEX_CAP` files is searched only as far as the walk got.
+    The texture files below `top` by lowercase stem, as paths relative to it. `recursive`
+    walks the whole tree; otherwise only `top`'s own files and its texture subfolders. The
+    walk skips `EXCLUDED_DIRS`, symlinked folders and symlinks out of the library, and stops
+    after `INDEX_CAP` entries, counting every folder and file it visits, so a capped tree is
+    searched only as far as the walk got. Each index is cached for `INDEX_TTL` seconds.
     """
+    cache, size = (_INDEXES, INDEX_ROOTS) if recursive else (_LEVELS, INDEX_LEVELS)
     key = (top, library_root)
     now = time.monotonic()
-    cached = _INDEXES.get(key)
+    cached = cache.get(key)
     if cached and now - cached[0] < INDEX_TTL:
-        _INDEXES.move_to_end(key)
+        cache.move_to_end(key)
         return cached[1]
 
     index: dict[str, list[tuple[tuple[str, ...], str]]] = {}
-    count = 0
+    visited = 0
     for dirpath, dirnames, filenames in os.walk(top):
-        dirnames[:] = sorted(d for d in dirnames if d.lower() not in EXCLUDED_DIRS)
+        at_top = dirpath == str(top)
+        dirnames[:] = sorted(
+            d
+            for d in dirnames
+            if d.lower() not in EXCLUDED_DIRS
+            and (recursive or not at_top or d.lower() in TEXTURE_DIRS)
+        )
         folder = Path(dirpath).relative_to(top).parts
+        visited += 1
         for name in sorted(filenames):
+            if visited >= INDEX_CAP:
+                break
+            visited += 1
             if _ext(name) not in EXTENSIONS:
                 continue
             full = os.path.join(dirpath, name)
             if os.path.islink(full) and not _inside(Path(os.path.realpath(full)), library_root):
                 continue
             index.setdefault(name.rsplit(".", 1)[0].lower(), []).append((folder, name))
-            count += 1
-            if count >= INDEX_CAP:
-                break
-        if count >= INDEX_CAP:
+        if visited >= INDEX_CAP:
             break
 
-    _INDEXES[key] = (now, index)
-    _INDEXES.move_to_end(key)
-    while len(_INDEXES) > INDEX_ROOTS:
-        _INDEXES.popitem(last=False)
+    cache[key] = (now, index)
+    cache.move_to_end(key)
+    while len(cache) > size:
+        cache.popitem(last=False)
     return index
 
 

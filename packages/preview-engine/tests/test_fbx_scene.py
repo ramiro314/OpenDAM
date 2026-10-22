@@ -388,7 +388,7 @@ UV = {"texcoords": [[0, 0, 1, 0, 0, 1]], "num_uv_components": [2]}
 
 @pytest.fixture(autouse=True)
 def fresh_index_cache():
-    textures._INDEXES.clear()
+    textures.clear_index_cache()
 
 
 def textured_preview(tmp_path, monkeypatch, scene: FakeScene, images: dict[str, Image.Image]):
