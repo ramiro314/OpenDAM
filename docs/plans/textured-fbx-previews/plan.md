@@ -77,6 +77,16 @@ changed:
 - **`_B`, `_C` and `_D` count as diffuse only after a `T_` or `TX_` prefix**, the Unreal-style
   naming Stylarts uses. So the A/B/C atlas variants don't read as diffuse maps.
 
+Revised an eighth time 2026-10-22 after GitHub Inspector's fifth review of PR #145. No decision
+changed:
+
+- **Cutout only for alpha that looks like a cutout.** Alpha that is uniformly 0, or mostly
+  mid-range like a smoothness map, is ignored. The texture is treated as opaque, and
+  `preview_textures` says so (C4, C5).
+- **An `engine_info` timeout no longer stalls regeneration.** The queue restarts the worker at
+  once, with a capped backoff, instead of waiting for a job. "None yet" stays published until a
+  process actually answers (C9).
+
 ## Problem
 
 FBX and 3DS models preview as plain gray. `model_meta` in `packages/preview-engine/worker.py`
@@ -350,8 +360,17 @@ reads no file outside `library_root` and follows no symlink out of it.
 - **With a texture:** `baseColorTexture` is the image from C5, and `baseColorFactor` is white (D16).
 - **Without one:** `baseColorFactor` is `COLOR_DIFFUSE`, or 0.8 gray when absent, with `OPACITY` as
   its alpha.
-- **Cutout:** when the image has any pixel with alpha below 255, `alphaMode` is `MASK`,
-  `alphaCutoff` 0.5 and `doubleSided` true.
+- **Cutout:** `alphaMode` is `MASK`, `alphaCutoff` 0.5 and `doubleSided` true only when the
+  texture's alpha looks like a cutout. The check runs on the downscaled image:
+  - at least 1% of pixels have alpha below 128;
+  - at least 10% have alpha at 128 or above;
+  - fewer than 25% sit in the mid range 16-239.
+- **Ignored alpha.** Any other alpha below 255 is ignored, and the texture is treated as opaque.
+  This covers a channel that is uniformly 0, exported by some 32-bit TGA and PNG tools, and
+  Unity smoothness stored in the albedo alpha, which is mostly mid-range. Without the rule, the
+  first would hide the whole mesh and the second would punch holes in it.
+- **Recorded.** `preview_textures.alpha` counts each textured material as `cutout`, `ignored`
+  or `none`.
 - Otherwise `alphaMode` is `OPAQUE`.
 - A mesh with a texture but no UVs gets the color, not the texture.
 
@@ -363,13 +382,16 @@ reads no file outside `library_root` and follows no symlink out of it.
   8192 px on either side is skipped (`too_large`). That bounds one decode at 256 MB RGBA.
 - **Downscale:** decode with `draft` for JPEG, convert to RGB or RGBA, and shrink with LANCZOS to
   1024 px on the longest side.
-- **Encoding in the GLB:** JPEG when the image has no alpha below 255, otherwise PNG.
+- **Encoding in the GLB:** PNG for a texture C4 uses as a cutout, JPEG for everything else,
+  including a texture whose alpha C4 ignores, which drops that alpha. In the trimesh branch (C6),
+  any image with alpha below 255 stays PNG, because the source material decides how its alpha is
+  used.
   - trimesh 5.1.1's exporter (`trimesh.exchange.gltf._append_image`) writes an image as JPEG only
     when its Pillow `format` is `"JPEG"`, and as PNG otherwise, with a matching `mimeType`.
   - So `load_texture` saves an opaque image as JPEG at quality 85 into memory and reopens those
     bytes with Pillow. The exporter then writes it as `image/jpeg`. It saves it again at Pillow's
     default quality, a second lossy pass that is fine for a 1024 px preview.
-  - An image with alpha stays a plain Pillow image and is written as `image/png`.
+  - A cutout image stays a plain Pillow RGBA image and is written as `image/png`.
   - C11's tests read the exported GLB and fail if either rule breaks, for example after a trimesh
     upgrade.
 - **Caching:** textures are decoded one at a time, and one request caches the result by resolved
@@ -419,14 +441,20 @@ any earlier value out, so an old installed engine's result reads as version 1.
   - **An error reply** (an older worker's `Unknown method`) publishes version 1, and the process
     keeps serving jobs.
   - **A timeout** kills the process, exactly as a 60 s job timeout does (`worker.kill()`, then
-    `py_worker = None`), and publishes version 1. The next job starts a new process, which is
-    asked again. A late reply therefore never stays on a live process's stdout.
+    `py_worker = None`). A late reply therefore never stays on a live process's stdout.
+    - It publishes nothing: the state stays "none yet". A slow first start, with cold imports or
+      `.pyc` compiling, is not an old engine.
+    - The queue starts a new process at once, without waiting for a job. If that one also times
+      out, it backs off: 10 s, 30 s, 60 s, then every 5 minutes.
+    - Only a real reply, a version or an error, publishes. A library with no queued jobs
+      therefore still gets its pass once a process answers.
   - **Replies are matched by `id`.** `PythonWorker::execute` reads lines until one parses as JSON
     with the request's own `id`, and skips any other. A stray reply can never be taken as another
     request's result.
-  - **Before any answer** (at startup, or while a restarted process is starting, or when no
-    worker could be spawned) the published state is "none yet". A pass that sees it returns at
-    once. It does not requeue, record a key, or log a warning. The next publish runs it.
+  - **Before any answer** (at startup, while a restarted process is starting, after a timeout
+    until a new process answers, or when no worker could be spawned) the published state is
+    "none yet". A pass that sees it returns at once. It does not requeue, record a key, or log a
+    warning. The next publish runs it.
   - The pass requeues only while the published version is at least `MODEL_PREVIEW_VERSION`.
     With a published version below it, the pass requeues nothing, records no key, and logs one
     warning naming the worker path.
@@ -496,6 +524,9 @@ GLB fresh and needs nothing.
     - a `pack_root` outside `library_root` is ignored;
     - an `*0` embedded reference counted missing;
     - unreadable, too large, and alpha versus opaque encoding;
+    - the alpha classification: a TGA whose alpha is all 0 is `ignored` and encoded as JPEG; a
+      smooth gradient alpha (smoothness-like) is `ignored`; a binary foliage alpha is `cutout`
+      and stays PNG;
     - downscale to 1024.
   - `test_fbx_scene.py`:
     - node transforms applied, including a Z-up root rotation and a mesh instanced twice;
@@ -504,6 +535,8 @@ GLB fresh and needs nothing.
     - everything-skipped fallback;
     - UVs and normals kept;
     - textured versus colored material;
+    - a material whose texture alpha is all 0 is `OPAQUE`, and one with a foliage cutout is
+      `MASK`;
     - a missing texture leaving an untextured but valid GLB;
     - the exported GLB, read back from its JSON chunk: an opaque texture is `image/jpeg`, a texture
       with alpha is `image/png` with `alphaMode` `MASK`, and each image's decoded size is at most
@@ -534,8 +567,11 @@ GLB fresh and needs nothing.
   - **Engine version,** with a stub worker script:
     - `run_python_queue` publishes the version from `engine_info`, and 1 for a worker that
       answers `Unknown method`;
-    - a stub that answers `engine_info` after the timeout is killed, version 1 is published, and
-      the next job runs on a new process and gets its own result;
+    - a stub that answers `engine_info` after the timeout is killed, and "none yet" stays
+      published. With an empty queue, a new process starts at once, answers 2, and the pass
+      runs. The next job gets its own result;
+    - a stub that always times out is restarted on the 10 s, 30 s, 60 s, 5 min backoff and
+      never publishes 1;
     - `execute` given a stray line with another `id` before the real reply returns the real one.
 - **TypeScript:** the `useGLTF.clear` call on `preview:done`.
 
