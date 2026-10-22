@@ -327,6 +327,266 @@ def test_an_embedded_reference_finds_nothing(lib):
     assert resolve("*0", src, lib, lib / "Pack") is None
 
 
+# ── Step 4: heuristics ────────────────────────────────────────────────────
+
+
+def guess(reference, source, lib, material=None, single=False, pack="Pack"):
+    """Like `resolve`, with a material name and the single-material flag."""
+    where = bounds(source, str(lib), str(lib / pack) if pack else None)
+    found = resolve_texture(reference, source, where, material, single)
+    if found is None:
+        return None
+    path, via = found
+    return path.relative_to(lib.resolve()).as_posix(), via
+
+
+def test_the_material_name_matches_a_diffuse_map(lib):
+    src = model(lib, "Pack/Meshes/rock.fbx")
+    touch(lib / "Pack/Textures/T_Rock_Wall_N.png")
+    touch(lib / "Pack/Textures/Rock_Wall.png")  # no diffuse suffix
+    touch(lib / "Pack/Textures/T_Rock_Wall_BC.png")
+    expected = ("Pack/Textures/T_Rock_Wall_BC.png", "material_name")
+    assert guess(None, src, lib, "MI_Rock_Wall.001") == expected
+    # A reference that resolves to nothing falls through to the heuristics too.
+    assert guess("..\\Textures\\gone.png", src, lib, "M_rock_wall") == expected
+    assert guess("*0", src, lib, "MAT_Rock_Wall") == expected
+
+
+def test_a_single_letter_suffix_is_diffuse_only_after_a_t_prefix(lib):
+    src = model(lib, "Pack/Meshes/trim.fbx")
+    touch(lib / "Pack/Textures/T_Stone_Trim_B.png")
+    assert guess(None, src, lib, "MI_Stone_Trim") == (
+        "Pack/Textures/T_Stone_Trim_B.png",
+        "material_name",
+    )
+    src = model(lib, "Other/Meshes/trim.fbx")
+    touch(lib / "Other/Textures/Stone_Trim_B.png")
+    assert guess(None, src, lib, "MI_Stone_Trim", pack="Other") is None
+
+
+def test_default_material_names_are_skipped(lib):
+    src = model(lib, "Pack/rock.fbx")
+    defaults = ("lambert3", "phong1", "blinn2", "DefaultMaterial", "Material", "Material.002")
+    for name in (*defaults, "No Name", "skin", "ab"):
+        touch(lib / f"Pack/Textures/{name.split('.')[0]}_BC.png")
+        assert guess(None, src, lib, name) is None, name
+    touch(lib / "Pack/Textures/Wood_BC.png")
+    textures.clear_index_cache()
+    assert guess(None, src, lib, "M_Wood")[1] == "material_name"
+
+
+def test_the_synty_reference_prefix_takes_the_plain_atlas(lib):
+    src = model(lib, "Pack/Models/SM_Bld_House_01.fbx")
+    for stem in ("PolygonCity_01_A", "PolygonCity_01_B", "PolygonCity_01_C"):
+        touch(lib / f"Pack/Textures/{stem}.png")
+    touch(lib / "Pack/Textures/PolygonCity_01_Normal.png")
+    reference = "U:\\Dropbox\\SyntyStudios\\PolygonCity\\PolygonCity_Texture.psd"
+    # A non-diffuse map is never a candidate.
+    assert guess(reference, src, lib, "lambert2") == (
+        "Pack/Textures/PolygonCity_01_A.png",
+        "ref_prefix",
+    )
+    touch(lib / "Pack/Textures/PolygonCity_01.png")
+    textures.clear_index_cache()
+    assert guess(reference, src, lib, "lambert2") == (
+        "Pack/Textures/PolygonCity_01.png",
+        "ref_prefix",
+    )
+    # `PolygonCity_B` and `_C` have one extra part, like `PolygonCity_01`: the path breaks the tie.
+    touch(lib / "Pack/Textures/PolygonCity_B.png")
+    touch(lib / "Pack/Textures/PolygonCity_C.png")
+    textures.clear_index_cache()
+    assert guess(reference, src, lib, "lambert2") == (
+        "Pack/Textures/PolygonCity_01.png",
+        "ref_prefix",
+    )
+
+
+def test_the_reference_prefix_prefers_the_fewest_extra_parts(lib):
+    # `PolygonCity_01_A` sorts first by path, so only the part count picks `PolygonCity_Atlas`.
+    src = model(lib, "Pack/Models/house.fbx")
+    touch(lib / "Pack/Textures/PolygonCity_01_A.png")
+    touch(lib / "Pack/Textures/PolygonCity_Atlas.png")
+    assert guess("PolygonCity_Texture.psd", src, lib) == (
+        "Pack/Textures/PolygonCity_Atlas.png",
+        "ref_prefix",
+    )
+
+
+def test_a_non_diffuse_map_is_never_a_reference_prefix_candidate(lib):
+    src = model(lib, "Pack/Models/house.fbx")
+    touch(lib / "Pack/Textures/PolygonCity_01_Normal.png")
+    touch(lib / "Pack/Textures/PolygonCity_01_AO.png")
+    assert guess("PolygonCity_Texture.psd", src, lib) is None
+
+
+def test_the_reference_prefix_takes_the_color_map_of_an_ambientcg_set(lib):
+    src = model(lib, "Pack/Models/rock.fbx")
+    for kind in ("AmbientOcclusion", "Cavity", "Color", "Displacement", "NormalDX", "NormalGL"):
+        touch(lib / f"Pack/Textures/Rock023_1K_{kind}.png")
+    for kind in ("Metalness", "Opacity", "Rough", "Gloss", "Spec", "Bump", "Alpha"):
+        touch(lib / f"Pack/Textures/Rock023_1K_{kind}.png")
+    # `Cavity` says nothing and sorts first by path: the recognised `Color` still wins.
+    assert guess("Rock023_Texture.png", src, lib) == (
+        "Pack/Textures/Rock023_1K_Color.png",
+        "ref_prefix",
+    )
+    (lib / "Pack/Textures/Rock023_1K_Color.png").unlink()
+    textures.clear_index_cache()
+    assert guess("Rock023_Texture.png", src, lib)[0] == "Pack/Textures/Rock023_1K_Cavity.png"
+
+
+def test_a_map_type_before_a_resolution_is_refused(lib):
+    src = model(lib, "Pack/Models/boulder.fbx")
+    for kind in ("arm", "disp", "nor_gl", "rough"):
+        touch(lib / f"Pack/Textures/rock_boulder_{kind}_1k.png")
+    assert guess("rock_boulder.tga", src, lib) is None
+    touch(lib / "Pack/Textures/rock_boulder_diff_1k.png")
+    textures.clear_index_cache()
+    assert guess("rock_boulder.tga", src, lib)[0] == "Pack/Textures/rock_boulder_diff_1k.png"
+
+
+def test_map_words_inside_the_reference_core_are_not_refused(lib):
+    # `Arm` is part of the reference itself, not a map type the candidate adds.
+    src = model(lib, "Pack/Models/arm.fbx")
+    touch(lib / "Pack/Textures/Robot_Arm_01.png")
+    assert guess("Robot_Arm_Texture.png", src, lib)[0] == "Pack/Textures/Robot_Arm_01.png"
+
+
+def test_the_heuristics_list_the_files_once_per_model(lib, monkeypatch):
+    src = model(lib, "Pack/Meshes/rock.fbx")
+    save(Image.new("RGB", (8, 8)), lib / "Pack/Textures/T_Rock_BC.png")
+    calls = []
+    real = textures._tier_files
+    monkeypatch.setattr(textures, "_tier_files", lambda tiers: calls.append(1) or real(tiers))
+    scene = textures.SceneTextures(src, str(lib), str(lib / "Pack"))
+    for name in ("MI_Rock", "MI_Wood", "MI_Metal_Panel"):
+        scene.texture({"NAME": name})
+    assert len(calls) == 1
+    assert scene.report["textured"] == 1
+
+
+def test_the_reference_prefix_drops_trailing_parts(lib):
+    src = model(lib, "Pack/Models/barrel.fbx")
+    touch(lib / "Pack/Textures/T_Barrel_Rusty_01.tga")
+    assert guess("C:\\T_Barrel_Rusty_Old.png", src, lib) == (
+        "Pack/Textures/T_Barrel_Rusty_01.tga",
+        "ref_prefix",
+    )
+
+
+def test_a_placeholder_reference_stays_missing_at_the_floor(lib):
+    src = model(lib, "Pack/Meshes/wall.fbx")
+    for stem in ("T_Rock_BC", "T_Fill_Wall_N", "T_Fill_Wall_BC", "T_Fill", "T_Brick_B"):
+        touch(lib / f"Pack/Textures/{stem}.png")
+    # `Fill_B` may not shrink to `Fill`, under 6 characters, which `T_Fill_Wall_BC` starts with.
+    assert guess("..\\Textures\\T_Fill_B.png", src, lib, "lambert1") is None
+
+
+def test_core_tries_stop_at_the_floor():
+    assert list(textures.core_tries("barrel_rusty_old_01")) == [
+        "barrel_rusty_old_01",
+        "barrel_rusty_old",
+        "barrel_rusty",
+        "barrel",
+    ]
+    assert list(textures.core_tries("fill_b")) == ["fill_b"]
+    assert list(textures.core_tries("stone_01")) == ["stone_01"]  # `stone` is 5 characters
+    assert list(textures.core_tries("123456_7_x")) == ["123456_7_x"]
+    assert list(textures.core_tries("")) == []
+    assert textures.core_stem("SM_Rock") == textures.core_stem("TX_Rock") == "rock"
+
+
+def test_the_file_name_prefix_for_a_single_material(lib):
+    src = model(lib, "Pack/Meshes/SM_Crate_Large_02_LOD0.fbx")
+    touch(lib / "Pack/Textures/T_Crate_Large_Albedo.png")
+    touch(lib / "Pack/Textures/T_Crate_Large_N.png")
+    assert guess(None, src, lib, "lambert1", single=True) == (
+        "Pack/Textures/T_Crate_Large_Albedo.png",
+        "file_prefix",
+    )
+
+
+def test_the_file_name_prefix_is_refused_with_two_materials(lib):
+    src = model(lib, "Pack/Meshes/SM_Crate_Large.fbx")
+    touch(lib / "Pack/Textures/T_Crate_Large_Albedo.png")
+    scene = textures.SceneTextures(src, str(lib), str(lib / "Pack"), single_material=False)
+    assert scene.texture({"NAME": "lambert1"}) is None
+    assert scene.texture({"NAME": "lambert2"}) is None
+    assert scene.report["missing"] == ["material:lambert1", "material:lambert2"]
+
+
+def test_a_short_file_name_stays_missing_at_the_floor(lib):
+    src = model(lib, "Pack/Meshes/SM_A_01.fbx")
+    for stem in ("T_A_BC", "T_Rock_BC", "T_Fill_Wall_N", "T_Fill_B"):
+        touch(lib / f"Pack/Textures/{stem}.png")
+    assert guess(None, src, lib, "lambert1", single=True) is None
+
+
+def test_the_heuristics_run_in_order(lib):
+    src = model(lib, "Pack/Meshes/SM_Boulder_Big_02.fbx")
+    touch(lib / "Pack/Textures/Boulder_Big_01.png")
+    touch(lib / "Pack/Textures/T_Rock_BC.png")
+    touch(lib / "Pack/Textures/Boulder_Big_Diffuse.png")
+    ref = "Boulder_Big_Texture.png"
+    assert guess(ref, src, lib, "MI_Rock", True) == ("Pack/Textures/T_Rock_BC.png", "material_name")
+    assert guess(ref, src, lib, "lambert1", True)[1] == "ref_prefix"
+    assert guess(None, src, lib, "lambert1", True) == (
+        "Pack/Textures/Boulder_Big_Diffuse.png",
+        "file_prefix",
+    )
+
+
+def test_a_psd_found_by_a_literal_step_beats_a_heuristic_match(lib):
+    src = model(lib, "Pack/Meshes/rock.fbx")
+    touch(lib / "Pack/Textures/X.psd")
+    touch(lib / "Pack/Textures/T_Rock_BC.png")
+    assert guess("C:\\X.psd", src, lib, "MI_Rock") == ("Pack/Textures/X.psd", "name")
+
+
+def test_within_the_heuristics_a_non_psd_beats_a_psd(lib):
+    src = model(lib, "Pack/Meshes/rock.fbx")
+    touch(lib / "Pack/Meshes/T_Rock_BC.psd")
+    touch(lib / "Pack/Art/Far/T_Rock_BC.jpg")
+    assert guess(None, src, lib, "MI_Rock") == ("Pack/Art/Far/T_Rock_BC.jpg", "material_name")
+    # A PSD from an earlier heuristic loses to a later heuristic's non-PSD as well.
+    touch(lib / "Pack/Textures/PolygonRock_01.png")
+    (lib / "Pack/Art/Far/T_Rock_BC.jpg").unlink()
+    textures.clear_index_cache()
+    assert guess("PolygonRock_Texture.png", src, lib, "MI_Rock") == (
+        "Pack/Textures/PolygonRock_01.png",
+        "ref_prefix",
+    )
+    # With no other match, the PSD is used.
+    assert guess(None, src, lib, "MI_Rock") == ("Pack/Meshes/T_Rock_BC.psd", "material_name")
+
+
+def test_the_heuristics_search_the_same_tiers(lib):
+    # Without a pack: at most 2 levels up, and the nearest tier wins.
+    src = model(lib, "a/b/c/rock.fbx")
+    touch(lib / "T_Rock_BC.png")  # three levels up
+    assert guess(None, src, lib, "MI_Rock", pack=None) is None
+    touch(lib / "a/Textures/T_Rock_BC.png")
+    touch(lib / "a/b/c/Textures/T_Rock_Albedo.png")
+    textures.clear_index_cache()
+    assert guess(None, src, lib, "MI_Rock", pack=None) == (
+        "a/b/c/Textures/T_Rock_Albedo.png",
+        "material_name",
+    )
+
+
+def test_the_report_counts_heuristic_matches(lib):
+    src = model(lib, "Pack/Meshes/rock.fbx")
+    save(Image.new("RGB", (8, 8)), lib / "Pack/Textures/T_Rock_BC.png")
+    save(Image.new("RGB", (8, 8)), lib / "Pack/Textures/PolygonCity_01.png")
+    scene = textures.SceneTextures(src, str(lib), str(lib / "Pack"))
+    assert scene.texture({"NAME": "MI_Rock"}) is not None
+    assert scene.texture({"NAME": "x", "TEXTURES": {1: ["PolygonCity_Texture.psd"]}})
+    assert scene.texture({"NAME": "lambert1"}) is None
+    assert scene.report["via"] == {"material_name": 1, "ref_prefix": 1}
+    assert scene.report["missing"] == ["material:lambert1"]
+
+
 # ── Loading ───────────────────────────────────────────────────────────────
 
 

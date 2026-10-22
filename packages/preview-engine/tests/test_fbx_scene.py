@@ -487,6 +487,20 @@ def test_all_zero_alpha_is_opaque_and_jpeg(tmp_path, monkeypatch):
     assert res["preview_textures"]["alpha"] == {"cutout": 0, "ignored": 1, "none": 0}
 
 
+def test_a_single_material_model_takes_a_texture_named_after_its_file(tmp_path, monkeypatch):
+    texture = {"Textures/T_Model_BC.png": Image.new("RGB", (8, 8))}
+    res = textured_preview(tmp_path, monkeypatch, one_material({"NAME": "lambert1"}, **UV), texture)
+    assert res["preview_textures"]["via"] == {"file_prefix": 1}
+
+    two = FakeScene(
+        root_node=FakeNode("Root", (0,)),
+        meshes=[triangle(**UV)],
+        materials=[{"NAME": "lambert1"}, {"NAME": "lambert2"}],
+    )
+    res = textured_preview(tmp_path, monkeypatch, two, texture)
+    assert res["preview_textures"]["missing"] == ["material:lambert1"]
+
+
 def test_a_missing_texture_leaves_a_valid_colored_preview(tmp_path, monkeypatch):
     scene = one_material(
         {"NAME": "Red", "COLOR_DIFFUSE": [1, 0, 0], "TEXTURES": {1: ["..\\T_Fill_B.png"]}},
