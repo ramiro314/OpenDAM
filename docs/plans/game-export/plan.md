@@ -32,6 +32,20 @@ Revised a third time 2026-10-22 after the workflow's third review. No decision c
   all cached, exports without Blender. The Blender path setting, the gate and the test against
   CI's pin land in step 6, with the CI install, instead of step 1.
 
+Revised a fourth time 2026-10-22 after the workflow's fourth review. No decision changed:
+
+- **The slot and take checks compare like with like.** One collision rule (C9) now decides the
+  kept meshes for both `fbx_facts` and the Blender script. Both list only the materials of kept
+  meshes, without assimp's synthetic `DefaultMaterial`, and only takes that animate something.
+  The script reports its source's kept slots and takes as well as what it wrote, so a lossy round
+  trip is caught in the same run, and the worker's lists are compared as sets.
+- **A kept mesh with no material gets one.** The script gives it a material named after the
+  model, so every exported model has at least one slot, as the schema requires.
+- **New fixtures:** a `UCX_` hull with its own material, one with no material, and a model with
+  no material at all. All three must export.
+- **A cached export needs no Blender.** Cache keys use `BLENDER_SERIES` (`5.2`) rather than the
+  exact Blender version, and each entry keeps the exact version it was made with, for its step.
+
 ## Goal
 
 The Dungeon Game takes its art only as **bundles** that OpenDAM exports and the game's importer
@@ -157,7 +171,7 @@ These are agent decisions, made while writing the plan. Each is reviewed at fina
 |---|---|---|
 | A1 | **Origin is inferred when a pack is read for export, not by the structure pass.** That happens when the Export view, the Game tab or the pack edit form asks, or at export. The check stats `<file>.meta` for the pack's indexed files and walks the pack for `conversion.json`. Your override lives in `pack_overrides`, as D12 says. | The watcher indexes neither `.meta` nor `conversion.json`, and the structure pass reads no file on a rerun (the "Structure is derived" invariant). Inferring at read time keeps both invariants. D12's intent is unchanged: the origin is inferred and editable on the pack. |
 | A2 | **The Blender script is embedded in the app** (`include_str!`) and written to a temp file per run. | `make install` and the installed app need no new file. Its version is `opendam-normalize/<N>`. |
-| A3 | **The UI reads model facts through the preview worker.** A new `fbx_facts` request (assimp) returns material slots in order, texture references by type, mesh and bone names, and take names. Blender's result at export is authoritative. A slot list that differs from the worker's is a problem that refuses the export, naming the model. | The Game tab needs facts in milliseconds, and Blender takes seconds per model. |
+| A3 | **The UI reads model facts through the preview worker.** A new `fbx_facts` request (assimp) returns the kept meshes' material slots, texture references by type, mesh and bone names, and the takes that animate something, by the same rules as the Blender script (C9, C12). Blender's result at export is authoritative. A slot or take set that differs from the worker's is a problem that refuses the export, naming the model. | The Game tab needs facts in milliseconds, and Blender takes seconds per model. |
 | A4 | **Source sha256s are memoized** in a library DB table `file_hashes(file_path, size_bytes, modified_at, sha256)`. | The Export view shows "changed" without hashing a whole domain each time. |
 | A5 | **The exported FBX is the group's first FBX member**, preferring one in an `fbx(unity)` format folder, then by path ignoring case. | D31 says the group's FBX, but a group can hold two. |
 | A6 | **A domain member that is neither a model, an animation nor an image is a problem that refuses the export** (audio, documents). | "What the manifest doesn't list leaves the game." Skipping members silently would drop them from the game without a word. |
@@ -223,7 +237,8 @@ cache". An export with the root or the root collection unset is refused.
 - **The Blender gate** (D29) applies only to an export that has at least one uncached model or
   animation job (C9, C11). Such an export is refused when Blender is missing or isn't 5.2.x. An
   export of textures only, or one whose models and animations all hit the cache, never starts
-  Blender and never checks for it.
+  Blender and never checks for it: cache keys use `BLENDER_SERIES`, not the installed version
+  (C11).
 - **The accepted series** is the constant `BLENDER_SERIES = "5.2"`, and a test checks that CI's
   pinned version starts with it.
 - **When they land:** `export.root`, `export.rootCollection` and the cache button come in step 1.
@@ -305,8 +320,11 @@ that asset as removed before anything is written (C15).
 - **An asset in no pack** is refused, with "mark its folder as a pack" (D16).
 
 **C7. Materials and roles.** `export::infer` builds each model's materials. The slot list comes
-from `fbx_facts` for the UI and from Blender at export (A3). For each slot, the first source with
-an answer wins (D11):
+from `fbx_facts` for the UI and from Blender at export (A3). Both list only the kept meshes'
+slots (C9 step 2), so the Game tab never shows a collision hull's material. When a kept mesh
+has no material, the tab also shows the slot the script will add, named after the model's
+stem and marked as added at export, so its roles can be inferred and edited like any other.
+For each slot, the first source with an answer wins (D11):
 
 1. **The FBX's texture references** for the slot (diffuse/base color, normal, metalness,
    roughness, AO, emissive, height), resolved as `textures.py` resolves them (given path, then
@@ -365,7 +383,15 @@ script:
 
 1. **Imports** the FBX with Blender's importer (units and axes as the file states them).
 2. **Drops collision meshes** whose names start with `UCX_ UBX_ USP_ UCP_` or end with
-   `_Collision` or `_COL` (any case). LOD meshes keep Unity's `_LODn` names (D19).
+   `_Collision` or `_COL` (any case). LOD meshes keep Unity's `_LODn` names (D19). This rule is
+   one list, `export::collision::PATTERNS`, passed to the script in the job and to `fbx_facts` in
+   its request, so both sides keep the same meshes. A material used only by dropped meshes goes
+   with them.
+   - **A kept mesh with no material** gets one material named after the model's stem, created
+     in the script, so every exported model has at least one slot (the schema's `materials`
+     needs `minItems` 1). The step records it (`addedMaterial`).
+   - **The source's kept slots and takes** are recorded here, before any change: the materials
+     of the kept meshes in Blender's slot order, and the takes that animate something.
 3. **For a model, applies one root transform:**
    - the origin's facing default (unreal: +X turned to +Z), then your quarter turns about Y (D13);
    - then a translation that puts the bounds' `min.y` at 0 and the X and Z centre at 0, measured
@@ -379,11 +405,18 @@ script:
    `<Armature>|<Take>`, and only takes with animation curves are written.
 6. **Re-imports the written file** and reports, in Unity's axes, its `bounds`, its material slots
    in order, its takes, its bone names, the dropped meshes, whether it has a mesh and an
-   armature, and the transform it applied.
+   armature, and the transform it applied, together with the source's kept slots and takes from
+   step 2.
 
 - **The result's checks:** its bounds must have `min.y` within 0.1% of the largest dimension
-  from 0, and the X and Z centre likewise. Its takes must equal the source's take names from
-  `fbx_facts`, and its slots the worker's slots (A3). Any mismatch is a problem naming the asset.
+  from 0, and the X and Z centre likewise.
+  - **Round trip, same run:** the written slots equal the source's kept slots plus any added
+    material, in order, and the written takes equal the source's kept takes. A difference means
+    Blender lost or renamed something.
+  - **Against the worker, as sets:** the source's kept slots and takes equal `fbx_facts`'s, which
+    the user saw and edited. Order isn't compared, since assimp and Blender may order materials
+    differently. The manifest uses Blender's order.
+  - Any mismatch is a problem naming the asset and the differing names.
 - **The manifest's model entry** takes `bounds` from the result. `rig` is `none` without an
   armature, else `generic`, unless you set `humanoid` (D20). `clips` are the takes, left out when
   there are none, and `materials` come from C7 in the result's slot order.
@@ -393,8 +426,9 @@ script:
   animation (D21).
 - **The step** (D33) is `{tool: "Blender", toolVersion: "<x.y.z>", by: "opendam-normalize/<N>",
   from: "fbx", settings}`, with flat settings: `facingQuarterTurns`, `originFacing`, `pivotX`,
-  `pivotY`, `pivotZ`, `droppedMeshes` (a count), and, for an animation, `followed` (the model's
-  assetName).
+  `pivotY`, `pivotZ`, `droppedMeshes` (a count), `addedMaterial` (its name, when one was added),
+  and, for an animation, `followed` (the model's assetName). `toolVersion` is the exact version
+  that made the file, kept in the cache entry (C11).
 
 **C10. conversion.json.** For each source file, `export::conversion` walks from the file's folder
 up to its library root and takes the nearest `conversion.json`. A deeper one replaces a shallower
@@ -407,20 +441,26 @@ settings (D17).
 
 **C11. The export cache.** Each library has `.opendam/export-cache/`. An entry is keyed by the
 sha256 of the source's sha256 (every input's, in order), the operation's settings as canonical
-JSON, the tool and its version, and the script or texture constant `<N>` (D3, D33). The entry
-holds the output file and, for Blender, the result JSON. A hit skips Blender and the pixel work,
-so re-exporting an unchanged domain writes byte-identical files: only `exportedAt` changes in the
-manifest. Source hashes are memoized in `file_hashes` (A4). The cache is cleared only from
-Settings (A9).
+JSON, the tool and its version, and the script or texture constant `<N>` (D3, D33). For Blender
+the tool version in the key is `BLENDER_SERIES` (`5.2`), the only versions the gate accepts, so a
+lookup needs no Blender. The entry holds the output file and, for Blender, the result JSON,
+which records the exact version that made it (`5.2.2`) for the step's `toolVersion`. A hit
+skips Blender and the pixel work, so re-exporting an unchanged domain writes byte-identical
+files: only `exportedAt` changes in the manifest. Source hashes are memoized in `file_hashes`
+(A4). The cache is cleared only from Settings (A9).
 
 **C12. The worker's `fbx_facts`.** `worker.py` gains an `fbx_facts` request, which loads the FBX
-with `assimp_py`, as `model_meta` does, and returns:
+with `assimp_py`, as `model_meta` does. The request carries the collision patterns (C9 step 2),
+and the answer follows the script's rules:
 
-- the material slots, in the scene's material order;
+- the material slots used by kept meshes, in the scene's material order. assimp's synthetic
+  `DefaultMaterial`, which it adds for a mesh with no material, is left out, since Blender adds
+  its own named material for such a mesh (C9 step 2);
 - each slot's texture references by type;
-- the mesh names, and whether the file has any mesh;
+- the mesh names, kept and dropped, whether any kept mesh exists, and whether any kept mesh has
+  no material (so the Game tab can show the slot the script will add);
 - the bone names;
-- the animation (take) names.
+- the takes that animate something (at least one channel), by their FBX take names.
 
 It reads no texture file, and follows the existing `library_root` rule. The Rust side caches the
 answer per file's size and mtime for the session.
@@ -473,12 +513,13 @@ answer per file's size and mtime for the session.
   - a `datapackage.json` with a `LicenseRef-` licence, and plain PNG textures that pass through
     (step 1);
   - a `conversion.json` in a folder, and a deeper one below it (step 3);
-  - a centimetre, Z-up FBX with an asymmetric nose on its front, an Unreal-style FBX with a
-    `UCX_` mesh, `_LOD0`/`_LOD1` and two material slots, a skinned model with one take, a
-    Unity-style `.mat` and `.meta` pair, and the textures inference reads: a PNG base color
-    with a cut-out alpha, a JPG base color, an AORM PNG, a DirectX normal map, and a separate
-    Roughness and Metallic pair (step 4, for `fbx_facts`, inference and the step-5 guard's
-    refusals; step 5 converts the same files);
+  - a centimetre, Z-up FBX with an asymmetric nose on its front, an Unreal-style FBX with
+    `_LOD0`/`_LOD1`, two material slots and a `UCX_` hull with its own material, a second one
+    whose `UCX_` hull has no material, a model with no material at all, a skinned model with
+    one take, a Unity-style `.mat` and `.meta` pair, and the textures inference reads: a PNG
+    base color with a cut-out alpha, a JPG base color, an AORM PNG, a DirectX normal map, and a
+    separate Roughness and Metallic pair (step 4, for `fbx_facts`, inference and the step-5
+    guard's refusals; step 5 converts the same files);
   - a mesh-less FBX with a take (step 7).
 - **Rust tests (nextest), without Blender:** names, inference, the texture operations
   (pixel-exact on tiny images), `conversion.json` merging, packs and licences, cache keys,
@@ -487,7 +528,8 @@ answer per file's size and mtime for the session.
 - **Blender-backed Rust tests:** they export the fixture domain end to end and re-import every
   model. They check:
   - bounds, pivot, and that the nose is at +Z;
-  - that the collision mesh is gone and the LOD names are kept;
+  - that the collision meshes are gone and the LOD names are kept, that both `UCX_` variants
+    and the material-less model export, and that the material-less model gets one added slot;
   - take names, and (from step 7) that the animation follows its model;
   - a second export reusing the cache, byte-identical.
   They find Blender through `OPENDAM_BLENDER`. Locally they skip with a message when it is
@@ -512,7 +554,8 @@ Each one names the asset (or file) and the rule it broke, and the Export view li
   texture that resolves to no file.
 - An animation with no avatarFrom, an avatarFrom with no rig, or bones not a subset of its
   model's.
-- Blender's slots or takes differ from `fbx_facts`. The normalized bounds miss the pivot rule.
+- Blender's written slots or takes differ from its source's kept ones, or those differ from
+  `fbx_facts` as sets (C9). The normalized bounds miss the pivot rule.
 - An invalid `conversion.json`. A manifest that fails the schema or C1's checks. A staged file
   whose sha256 differs.
 
@@ -575,10 +618,13 @@ problem in the Export view, naming the asset, and the step that delivers the wor
 - **AC3.** Default names follow C5. A collision refuses the export, naming both assets, and an
   edit fixes it and survives a reindex.
 - **AC4.** On the fixtures, inference gives the expected materials, roles, layouts, surfaces and
-  conventions. Each edit replaces its inferred value, and a reset restores it.
+  conventions. `fbx_facts` lists no collision hull's material and no `DefaultMaterial`. Each
+  edit replaces its inferred value, and a reset restores it.
 - **AC5.** Normalized fixture models re-import with bounds within 0.1% of the expected metre
-  sizes, `min.y` 0, the X and Z centre 0, and the nose toward +Z. The collision mesh is dropped,
-  the LOD names are kept, and the take names are preserved.
+  sizes, `min.y` 0, the X and Z centre 0, and the nose toward +Z. The collision meshes are
+  dropped, the LOD names are kept, and the take names are preserved. Both `UCX_` variants (a
+  hull with its own material, and one with none) export, and so does a model with no material,
+  with one added slot.
 - **AC6.** The animation fixture gets its model's transform, and an animation whose bones don't
   match is refused.
 - **AC7.** The texture operations are pixel-exact on test images: ORM split, roughness
