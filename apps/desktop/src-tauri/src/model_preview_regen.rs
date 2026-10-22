@@ -84,7 +84,8 @@ async fn run(state: &AppState, library_id: Option<&str>) {
     let version = *state.engine_version.borrow();
     let worker = state.preview_worker.get().map(|p| p.as_path());
     let libs = state.db.get_all_libraries().await;
-    let run = run_libraries(&libs, library_id, version, worker).await;
+    let index_lock = |id: &str| state.db.index_lock(id);
+    let run = run_libraries(&libs, library_id, version, worker, index_lock).await;
     if let Some(warning) = run.warning {
         tracing::warn!("{warning}");
     }
@@ -94,12 +95,14 @@ async fn run(state: &AppState, library_id: Option<&str>) {
 }
 
 /// Runs the pass over each of `libs`, or only `library_id`, under the published engine
-/// `version` of the `worker` serving the queue.
+/// `version` of the `worker` serving the queue. `index_lock` gives a library's
+/// `Database::index_lock`.
 async fn run_libraries(
     libs: &[LibraryHandle],
     library_id: Option<&str>,
     version: Option<i64>,
     worker: Option<&Path>,
+    index_lock: impl Fn(&str) -> Arc<Mutex<()>>,
 ) -> Run {
     let mut run = Run::default();
     let mut old_engine = false;
@@ -107,7 +110,7 @@ async fn run_libraries(
         if library_id.is_some_and(|id| id != lib.id) {
             continue;
         }
-        match run_pass(lib, version, BATCH_SIZE).await {
+        match run_pass(lib, version, BATCH_SIZE, &index_lock(&lib.id)).await {
             Ok(Pass::Waiting(n)) if n > 0 => run.requeued_in += 1,
             Ok(Pass::OldEngine) => old_engine = true,
             Ok(_) => {}
@@ -147,10 +150,15 @@ fn active_job() -> String {
 /// Runs the pass over `lib` under the published engine `version`: requeues each stale `done`
 /// preview with no active job, `batch_size` to a transaction in rowid order, then records the
 /// key only when no stale preview is left, done or waiting. Errored previews are left alone.
+///
+/// Past the gate it holds the library's `index_lock`, so no structure pass commits between
+/// reading the candidates and requeueing them: one could make a candidate a group member or
+/// pictured, which the queue never claims, and only the structure pass takes those off it.
 pub(crate) async fn run_pass(
     lib: &LibraryHandle,
     version: Option<i64>,
     batch_size: usize,
+    index_lock: &Mutex<()>,
 ) -> Result<Pass> {
     let Some(version) = version else {
         return Ok(Pass::NoEngineYet);
@@ -166,6 +174,7 @@ pub(crate) async fn run_pass(
     if version < MODEL_PREVIEW_VERSION {
         return Ok(Pass::OldEngine);
     }
+    let _index_guard = index_lock.lock().await;
 
     let candidates: Vec<String> = sqlx::query_scalar(&format!(
         "SELECT a.id FROM assets a
@@ -302,6 +311,11 @@ mod tests {
         }
     }
 
+    /// A fresh index lock for each library, which nothing else holds.
+    fn no_lock(_: &str) -> Arc<Mutex<()>> {
+        Arc::default()
+    }
+
     fn strings(ids: &[&str]) -> Vec<String> {
         ids.iter().map(|s| s.to_string()).collect()
     }
@@ -347,7 +361,10 @@ mod tests {
         let before = queue(&lib).await.1;
 
         // Batches of 2
-        assert_eq!(run_pass(&lib, Some(2), 2).await.unwrap(), Pass::Waiting(4));
+        assert_eq!(
+            run_pass(&lib, Some(2), 2, &Mutex::new(())).await.unwrap(),
+            Pass::Waiting(4)
+        );
 
         let (waiting, statuses) = queue(&lib).await;
         let requeued = ["fbx", "stand", "tds", "upper"];
@@ -384,13 +401,13 @@ mod tests {
         .await;
 
         assert_eq!(
-            run_pass(&lib, Some(2), 200).await.unwrap(),
+            run_pass(&lib, Some(2), 200, &Mutex::new(())).await.unwrap(),
             Pass::Waiting(2)
         );
         assert_eq!(key(&lib).await, None);
         // The jobs still wait: nothing more is queued and nothing recorded
         assert_eq!(
-            run_pass(&lib, Some(2), 200).await.unwrap(),
+            run_pass(&lib, Some(2), 200, &Mutex::new(())).await.unwrap(),
             Pass::Waiting(0)
         );
         assert_eq!(key(&lib).await, None);
@@ -398,17 +415,20 @@ mod tests {
         // An older process served them: they are stale again
         complete_waiting(&lib, None).await;
         assert_eq!(
-            run_pass(&lib, Some(2), 200).await.unwrap(),
+            run_pass(&lib, Some(2), 200, &Mutex::new(())).await.unwrap(),
             Pass::Waiting(2)
         );
         assert_eq!(queue(&lib).await.0, strings(&["a", "b"]));
         assert_eq!(key(&lib).await, None);
 
         complete_waiting(&lib, Some(2)).await;
-        assert_eq!(run_pass(&lib, Some(2), 200).await.unwrap(), Pass::Recorded);
+        assert_eq!(
+            run_pass(&lib, Some(2), 200, &Mutex::new(())).await.unwrap(),
+            Pass::Recorded
+        );
         assert_eq!(key(&lib).await.as_deref(), Some("2"));
         assert_eq!(
-            run_pass(&lib, Some(2), 200).await.unwrap(),
+            run_pass(&lib, Some(2), 200, &Mutex::new(())).await.unwrap(),
             Pass::AlreadyDone
         );
     }
@@ -422,15 +442,18 @@ mod tests {
 
         // None yet: no requeue, no key, no warning
         assert_eq!(
-            run_libraries(libs, None, None, Some(worker)).await,
+            run_libraries(libs, None, None, Some(worker), no_lock).await,
             Run::default()
         );
-        assert_eq!(run_pass(&lib, None, 200).await.unwrap(), Pass::NoEngineYet);
+        assert_eq!(
+            run_pass(&lib, None, 200, &Mutex::new(())).await.unwrap(),
+            Pass::NoEngineYet
+        );
         assert_eq!(queue(&lib).await, untouched);
         assert_eq!(key(&lib).await, None);
 
         // An older engine: no requeue, no key, one warning naming the worker
-        let run = run_libraries(libs, None, Some(1), Some(worker)).await;
+        let run = run_libraries(libs, None, Some(1), Some(worker), no_lock).await;
         assert_eq!(run.requeued_in, 0);
         let warning = run.warning.expect("a warning");
         assert!(warning.contains("/opt/engine/worker.py"), "{warning}");
@@ -443,9 +466,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            run_libraries(libs, None, Some(1), Some(worker)).await,
+            run_libraries(libs, None, Some(1), Some(worker), no_lock).await,
             Run::default()
         );
+    }
+
+    #[tokio::test]
+    async fn requeues_only_once_the_librarys_index_run_lets_go() {
+        let lib = library("lib", &[("a", "fbx", None, "done", None)]).await;
+        let index_lock = Mutex::new(());
+        let index_run = index_lock.lock().await;
+
+        let pass = run_pass(&lib, Some(2), 200, &index_lock);
+        tokio::pin!(pass);
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(50), &mut pass).await;
+        assert!(waited.is_err(), "the pass ran under an index run");
+        assert!(queue(&lib).await.0.is_empty());
+
+        drop(index_run);
+        assert_eq!(pass.await.unwrap(), Pass::Waiting(1));
+        assert_eq!(queue(&lib).await.0, strings(&["a"]));
     }
 
     #[tokio::test]
@@ -453,7 +493,7 @@ mod tests {
         let rows = [("a", "fbx", None, "done", None)];
         let libs = [library("one", &rows).await, library("two", &rows).await];
 
-        let run = run_libraries(&libs, Some("one"), Some(2), None).await;
+        let run = run_libraries(&libs, Some("one"), Some(2), None, no_lock).await;
 
         assert_eq!(
             run,
@@ -486,7 +526,7 @@ mod tests {
                 let runs_tx = runs_tx.clone();
                 async move {
                     let version = *published.borrow();
-                    let run = run_libraries(libs, None, version, None).await;
+                    let run = run_libraries(libs, None, version, None, no_lock).await;
                     runs_tx.send(run).unwrap();
                 }
             })
