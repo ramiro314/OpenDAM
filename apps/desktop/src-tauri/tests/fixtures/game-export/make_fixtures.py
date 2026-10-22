@@ -12,8 +12,9 @@ Step 1 (domains, default names, packs and licences, and the build-order guards):
 - `Dungeon Props/`: a `datapackage.json` with a `LicenseRef-` licence, pass-through PNG
   textures, and one file for each guard and refusal: an ORM map, a DirectX normal map, a JPG, an
   EXR, a format group of an FBX and an OBJ, a lone OBJ and a Markdown note.
-- `Kenney Crates/`: a CC0 Kenney license file, and a `banner.png` whose default name and role
-  collide with `Dungeon Props/Textures/T_Banner_BaseColor.png`.
+- `Kenney Crates/`: a CC0 Kenney license file, a `banner.png` whose default name and role
+  collide with `Dungeon Props/Textures/T_Banner_BaseColor.png`, and a `___.png` whose stem gives
+  no PascalCase name.
 - `Unity Moss/`: an MIT license file and a texture with a Unity `.meta` beside it (origin unity).
 - `Converted/conversion.json` with a `from: "uasset"` step, above the pack `Converted/Ruins/`
   (origin unreal, so its normal map is DirectX, and its textures refused until conversion chains
@@ -151,6 +152,8 @@ def main() -> None:
     write("Kenney Crates/License.txt", KENNEY_LICENSE)
     png("Kenney Crates/crate_wood.png", (150, 100, 50, 255))
     png("Kenney Crates/banner.png", (20, 20, 160, 255))
+    # A stem with no letter or digit gives no default name
+    png("Kenney Crates/___.png", (60, 60, 60, 255))
 
     write("Unity Moss/License.txt", MIT_LICENSE)
     png("Unity Moss/T_Moss_D.png", (40, 120, 40, 255))

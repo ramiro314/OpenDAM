@@ -753,7 +753,7 @@ mod tests {
         db: Database,
         library: LibraryHandle,
         export_root: PathBuf,
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
     }
 
     async fn fixture() -> Fixture {
@@ -799,8 +799,33 @@ mod tests {
             db,
             library,
             export_root,
-            _dir: dir,
+            dir,
         }
+    }
+
+    /// Opens, registers and indexes a second library `id` at `root`, beside the fixture.
+    async fn add_library(f: &Fixture, id: &str, root: &Path) -> LibraryHandle {
+        let library = LibraryHandle {
+            id: id.into(),
+            name: id.into(),
+            root_path: root.to_path_buf(),
+            pool: memory_library_pool().await,
+        };
+        f.db.libraries
+            .write()
+            .await
+            .insert(id.into(), library.clone());
+        sqlx::query("INSERT INTO libraries (id, name, root_paths, created_at) VALUES (?, ?, ?, 0)")
+            .bind(id)
+            .bind(id)
+            .bind(json!([root]).to_string())
+            .execute(&f.db.master_pool)
+            .await
+            .unwrap();
+        crate::watcher::index_paths(&f.db, id, &[root.display().to_string()])
+            .await
+            .unwrap();
+        library
     }
 
     async fn id_of(pool: &Pool, path: &str) -> String {
@@ -813,14 +838,19 @@ mod tests {
 
     type Pool = sqlx::Pool<sqlx::Sqlite>;
 
-    /// Adds collection `id` named `name` under `parent`, holding the files at `paths`.
+    /// Adds collection `id` named `name` under `parent`, holding the fixture's files at `paths`.
     async fn collection(f: &Fixture, id: &str, name: &str, parent: &str, paths: &[&str]) {
         insert_collection(&f.db.master_pool, id, name, Some(parent)).await;
+        add_members(&f.library, id, paths).await;
+    }
+
+    /// Puts the files at `paths` of `library` in collection `id`.
+    async fn add_members(library: &LibraryHandle, id: &str, paths: &[&str]) {
         for path in paths {
             sqlx::query("INSERT INTO collection_assets (collection_id, asset_id) VALUES (?, ?)")
                 .bind(id)
-                .bind(id_of(&f.library.pool, path).await)
-                .execute(&f.library.pool)
+                .bind(id_of(&library.pool, path).await)
+                .execute(&library.pool)
                 .await
                 .unwrap();
         }
@@ -1243,5 +1273,200 @@ mod tests {
             "{:?}",
             messages(&report)
         );
+    }
+
+    #[tokio::test]
+    async fn a_domain_spanning_two_libraries_reads_each_with_its_own_packs_and_files() {
+        let f = fixture().await;
+        // A second library: a pack also named `foo`, and a pack under its own conversion.json
+        let root = f.dir.path().join("second");
+        let write = |path: &str, bytes: &[u8]| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        let png = std::fs::read(Path::new(FIXTURE).join("Foo B/tile_b.png")).unwrap();
+        write(
+            "Foo Copy/datapackage.json",
+            br#"{"name": "foo", "title": "Foo Copy"}"#,
+        );
+        write("Foo Copy/tile_c.png", &png);
+        write(
+            "Unreal/conversion.json",
+            br#"{"contractVersion": 1, "steps": [{"tool": "UE", "toolVersion": "5.4", "from": "uasset"}]}"#,
+        );
+        write("Unreal/Rocks/datapackage.json", br#"{"name": "rocks"}"#);
+        write("Unreal/Rocks/T_Rock_D.png", &png);
+        let second = add_library(&f, "second", &root).await;
+
+        collection(&f, "domain", "Props", "dg", &["Foo A/tile_a.png"]).await;
+        add_members(
+            &second,
+            "domain",
+            &["Foo Copy/tile_c.png", "Unreal/Rocks/T_Rock_D.png"],
+        )
+        .await;
+        let report = check(&f.db, "domain").await.unwrap();
+
+        assert_eq!(
+            messages(&report),
+            ["Unreal/Rocks/T_Rock_D.png: conversion.json support not built yet (Unreal/conversion.json covers this file)"]
+        );
+        assert_eq!(report.problems[0].assets[0].library_id, "second");
+        let rows: Vec<(&str, &str, Option<&str>, Status)> = report
+            .assets
+            .iter()
+            .map(|a| {
+                let library = a.asset.library_id.as_str();
+                (
+                    library,
+                    a.asset.file_path.as_str(),
+                    a.pack.as_deref(),
+                    a.status,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "second",
+                    "Unreal/Rocks/T_Rock_D.png",
+                    Some("rocks"),
+                    Status::Problem
+                ),
+                ("fixture", "Foo A/tile_a.png", Some("foo"), Status::Ready),
+                (
+                    "second",
+                    "Foo Copy/tile_c.png",
+                    Some("foo-2"),
+                    Status::Ready
+                ),
+            ]
+        );
+        // Packs in library order, then path, each origin read in its own library
+        let packs: Vec<(&str, &str, &str, packs::Origin)> = report
+            .packs
+            .iter()
+            .map(|p| {
+                let pack = &p.pack;
+                (
+                    p.library_id.as_str(),
+                    p.path.as_str(),
+                    pack.id.as_str(),
+                    pack.origin,
+                )
+            })
+            .collect();
+        assert_eq!(
+            packs,
+            [
+                ("fixture", "Foo A", "foo", packs::Origin::Generic),
+                ("second", "Foo Copy", "foo-2", packs::Origin::Generic),
+                ("second", "Unreal/Rocks", "rocks", packs::Origin::Unreal),
+            ]
+        );
+
+        assert_valid(&report);
+        let manifest_packs: Vec<&str> = report.manifest["packs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(manifest_packs, ["foo", "foo-2"]);
+        let assets = report.manifest["assets"].as_array().unwrap();
+        let entries: Vec<(&str, &str, &str)> = assets
+            .iter()
+            .map(|a| {
+                let text = |k: &str| a[k].as_str().unwrap();
+                (text("assetName"), text("pack"), text("sourcePath"))
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("TileA", "foo", "tile_a.png"),
+                ("TileC", "foo-2", "tile_c.png")
+            ]
+        );
+        assert_eq!(
+            assets[1]["sha256"],
+            hashes::sha256_file(&root.join("Foo Copy/tile_c.png")).unwrap()
+        );
+        // Each library memoizes its own file's hash
+        for library in [&f.library, &second] {
+            let memo: Vec<String> = sqlx::query_scalar("SELECT file_path FROM file_hashes")
+                .fetch_all(&library.pool)
+                .await
+                .unwrap();
+            let expected = if library.id == "second" {
+                "Foo Copy/tile_c.png"
+            } else {
+                "Foo A/tile_a.png"
+            };
+            assert_eq!(memo, [expected], "{}", library.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_name_that_gives_no_pascal_case_name_is_a_problem() {
+        let f = fixture().await;
+        let report = check_domain(
+            &f,
+            &["Kenney Crates/___.png", "Kenney Crates/crate_wood.png"],
+        )
+        .await;
+
+        assert_eq!(
+            messages(&report),
+            ["Kenney Crates/___.png: its file name gives no PascalCase name (a capital letter, then letters and digits)"]
+        );
+        assert_eq!(
+            report.problems[0].assets[0].file_path,
+            "Kenney Crates/___.png"
+        );
+        let blank = report
+            .assets
+            .iter()
+            .find(|a| a.asset.file_path == "Kenney Crates/___.png")
+            .unwrap();
+        assert_eq!(
+            (blank.asset_name.as_deref(), blank.status),
+            (Some(""), Status::Problem)
+        );
+        assert_eq!(
+            texture_entries(&report),
+            [(
+                "CrateWood".to_string(),
+                "BaseColor".to_string(),
+                "Textures/CrateWood_BaseColor.png".to_string()
+            )]
+        );
+        assert_valid(&report);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_root_collection_is_a_problem() {
+        let f = fixture().await;
+        collection(
+            &f,
+            "props",
+            "Props",
+            "dg",
+            &["Kenney Crates/crate_wood.png"],
+        )
+        .await;
+        sqlx::query("DELETE FROM collections WHERE id = 'dg'")
+            .execute(&f.db.master_pool)
+            .await
+            .unwrap();
+
+        let report = check(&f.db, "props").await.unwrap();
+        assert_eq!(
+            messages(&report),
+            ["The root collection dg set in Settings no longer exists"]
+        );
+        assert_eq!(report.bundle_path, None);
     }
 }
