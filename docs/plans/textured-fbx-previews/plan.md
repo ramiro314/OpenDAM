@@ -9,6 +9,20 @@ Revised 2026-10-21 after the plan validation workflow's review. No decision chan
   and the `make test` and CI hooks, so its `test_textures.py` runs by file and in CI. Step 2 only
   adds its own two test files.
 
+Revised again 2026-10-21 after the plan validation workflow's feasibility review. No decision
+changed:
+
+- **No app run touches your libraries.** C12's before-and-after screenshots come from a scratch
+  library of copied packs, opened under a throwaway `XDG_DATA_HOME`. The measurement script reads
+  library DBs read-only.
+- **The regeneration pass waits for a current engine.** C9 runs only when the worker that would
+  serve the queue declares `PREVIEW_VERSION` of at least `MODEL_PREVIEW_VERSION`. Otherwise it
+  leaves the key unset, so an old installed engine can't spend the pass.
+- **JPEG and PNG in the GLB are settled and tested.** C5 now says how the format survives
+  trimesh's exporter, and C11 checks each exported image's `mimeType` and size.
+- **The largest files are measured.** C12 also runs the 3 largest FBX of each library and reports
+  their time and peak RSS against the 60 s job timeout.
+
 ## Problem
 
 FBX and 3DS models preview as plain gray. `model_meta` in `packages/preview-engine/worker.py`
@@ -127,7 +141,7 @@ memory cap, and each job has a 60 s timeout in `run_python_queue`.
 | D7 | Regenerating existing previews | A **per-asset preview version** in `metadata.preview_version`. A **one-time library pass** keyed in `library_meta` requeues FBX/3DS items whose `done` preview predates it, under the normal queue rules. A future bump reuses the pass. |
 | D8 | Errored previews | Not retried by the pass. **Only `done` previews** are. |
 | D9 | Worker memory | **In-process limits.** Read a texture's size from its header first, skip it past a pixel cap, decode one at a time, and cache per request. No rlimit and no systemd scope. |
-| D10 | Measurement | A **script runs the worker on sampled FBX into a scratch folder** and reports textured or not, and why. Plus before-and-after app screenshots under `scripts/memory-cap.sh`. |
+| D10 | Measurement | A **script runs the worker on sampled FBX into a scratch folder** and reports textured or not, and why. Plus before-and-after app screenshots under `scripts/memory-cap.sh`, from a scratch library of copied packs (C12). |
 | D11 | `.3dm` | Out of scope. |
 | D12 | Literal lookups | All three, in order: the **path as given** (absolute, inside the library root), then **relative to the model** (`\` as `/`, case-insensitive per component, inside the library root), then **by file name** (case-insensitive, same stem with any texture extension, exact extension first, nearest folder first). |
 | D13 | By-name scope | **Walk up from the model's folder to its pack root.** At each level, check the folder and its `textures`/`materials`/`maps` subfolders recursively. **Then the whole pack.** The nearest by folder distance wins, ties by path ignoring case. Without a pack, walk up at most 2 levels and skip the whole-pack step. Never go above the library root. Skip `Previews`, `Preview`, `Renders`, `Isometric` and `Sprites`. |
@@ -235,9 +249,15 @@ reads no file outside `library_root` and follows no symlink out of it.
   8192 px on either side is skipped (`too_large`). That bounds one decode at 256 MB RGBA.
 - **Downscale:** decode with `draft` for JPEG, convert to RGB or RGBA, and shrink with LANCZOS to
   1024 px on the longest side.
-- **Encoding in the GLB:** JPEG at quality 85 when the image has no alpha below 255, otherwise PNG.
-  If trimesh's exporter re-encodes as PNG regardless, embed the encoded bytes so the chosen format
-  is kept.
+- **Encoding in the GLB:** JPEG when the image has no alpha below 255, otherwise PNG.
+  - trimesh 5.1.1's exporter (`trimesh.exchange.gltf._append_image`) writes an image as JPEG only
+    when its Pillow `format` is `"JPEG"`, and as PNG otherwise, with a matching `mimeType`.
+  - So `load_texture` saves an opaque image as JPEG at quality 85 into memory and reopens those
+    bytes with Pillow. The exporter then writes it as `image/jpeg`. It saves it again at Pillow's
+    default quality, a second lossy pass that is fine for a 1024 px preview.
+  - An image with alpha stays a plain Pillow image and is written as `image/png`.
+  - C11's tests read the exported GLB and fail if either rule breaks, for example after a trimesh
+    upgrade.
 - **Caching:** textures are decoded one at a time, and one request caches the result by resolved
   path, so an atlas shared by many materials is decoded once. The cache is cleared when the
   request ends.
@@ -251,7 +271,8 @@ encode. The rest of the branch is unchanged.
 
 **C7. Worker result.** `model_meta` adds two fields for every model it exports:
 
-- `preview_version: 2`;
+- `preview_version`: the value of a module constant `PREVIEW_VERSION = 2` at the top of
+  `worker.py`;
 - `preview_textures`, for FBX/3DS only. For example:
   `{"materials": 3, "textured": 2, "via": {"relative": 1, "name": 1}, "missing": ["T_Fill_B"], "unreadable": [], "too_large": [], "no_uv": 0, "drawn_nodes": 4, "skipped_nodes": 6}`.
   - `via` counts the step that found each texture: `given`, `relative`, `name`, `material_name`,
@@ -269,6 +290,18 @@ any earlier value out, so an old installed engine's result reads as version 1.
   `thumb_cleanup`. A Rust constant `MODEL_PREVIEW_VERSION = 2` is recorded under the
   `library_meta` key `model_preview_version` when the pass completes. A library whose recorded
   value is at least the constant is skipped.
+- **Engine gate.** An older engine would rerun the requeued jobs without textures and report no
+  version. The pass would still record its key and never run again. `AGENTS.md` notes that
+  `make dev` runs the installed engine after `make install`, so this is a real case. To prevent it:
+  - Before requeueing anything, the pass resolves the worker that the queue would start, through
+    `find_preview_worker` (so `OPENDAM_WORKER` and the installed engine count).
+  - It reads that `worker.py`'s `PREVIEW_VERSION = N` line as text. It starts no process, so there
+    is still one worker.
+  - If no worker is found, the line is missing, or `N` is below `MODEL_PREVIEW_VERSION`, the pass
+    requeues nothing. It records no key and logs one warning naming the engine path. The next
+    start with a current engine runs it.
+  - A Rust test reads the checkout's `worker.py` with `include_str!` and checks that its
+    `PREVIEW_VERSION` equals `MODEL_PREVIEW_VERSION`, so the two can't drift apart.
 - **Candidates:**
   - `lower(extension) IN ('fbx', '3ds')`;
   - `preview_status = 'done'`;
@@ -318,9 +351,13 @@ GLB fresh and needs nothing.
     - everything-skipped fallback;
     - UVs and normals kept;
     - textured versus colored material;
-    - a missing texture leaving an untextured but valid GLB.
-  - `test_worker_protocol.py`: one `model_meta` request over stdio, on a generated OBJ+MTL, returns
-    `preview_version`, and the GLB's texture is no larger than 1024 px.
+    - a missing texture leaving an untextured but valid GLB;
+    - the exported GLB, read back from its JSON chunk: an opaque texture is `image/jpeg`, a texture
+      with alpha is `image/png` with `alphaMode` `MASK`, and each image's decoded size is at most
+      1024 px.
+  - `test_worker_protocol.py`: one `model_meta` request over stdio, on a generated OBJ+MTL with a
+    2048 px opaque texture, returns `preview_version` equal to `PREVIEW_VERSION`. The GLB's image
+    is `image/jpeg` and at most 1024 px.
 - **CI and make:** `make test` and the CI test job add `cd packages/preview-engine && uv run
   --frozen pytest`. `make install` also copies `textures.py`.
 - **Rust:**
@@ -330,25 +367,66 @@ GLB fresh and needs nothing.
   - `model_preview_regen.rs`: it requeues stale `done` FBX/3DS main items. It leaves members,
     support files, pictured items, errors, OBJ and current-version rows alone. It requeues a
     stand-in. It records the key, and a second run is a no-op.
+  - The engine gate: a worker declaring version 1, a worker with no `PREVIEW_VERSION` line, and
+    no worker at all each requeue nothing and leave the key unset. A worker declaring 2 runs the
+    pass. The checkout's `worker.py` declares `MODEL_PREVIEW_VERSION`.
 - **TypeScript:** the `useGLTF.clear` call on `preview:done`.
 
-**C12. Measurement** (D10). `packages/preview-engine/tools/measure_textures.py` takes a library
-root, pack folders and a sample size. For each sampled FBX it runs `model_meta`, with the same
-`library_root` and `pack_root` the app would send, into a scratch output folder, and never writes
-under the library. It prints one row per pack:
+**C12. Measurement** (D10). Your three libraries are read only. Nothing in this section writes to
+them or to their `.opendam/` folders.
 
-- sampled, loaded and textured, all materials or some;
-- color only;
-- `via` counts;
-- untextured reasons: no reference, missing, unreadable, too large, or no UVs;
-- the top missing names;
-- per-file time and peak RSS.
+**The script.** `packages/preview-engine/tools/measure_textures.py` takes a library root, pack
+folders and a sample size.
 
-The implementation PR reports the counts for 3 packs from each of Kenney, Unity and Stylarts, 40
-FBX each at most. It explains each untextured class against this plan's survey and includes
-before-and-after screenshots of a few cards and the 3D view, from an app run under
-`scripts/memory-cap.sh`. The Stylarts `.glb` packs are spot-checked to confirm they still preview
-textured.
+- It finds each FBX's `pack_root` the way the app would, from the library's `folders` table,
+  opened read-only (`file:...?mode=ro`).
+- It runs `model_meta` on each sampled FBX with the same `library_root` and `pack_root` the app
+  would send. One persistent worker process serves every request, as in the app. Output goes to
+  a scratch folder under the session's scratchpad.
+- It runs under `scripts/memory-cap.sh`. A run the cap kills is reported as a finding and not
+  rerun.
+- It prints one row per pack:
+  - sampled, loaded and textured, all materials or some;
+  - color only;
+  - `via` counts;
+  - untextured reasons: no reference, missing, unreadable, too large, or no UVs;
+  - the top missing names;
+  - per-file time and the worker's peak RSS.
+
+**Large files.** The script also runs the 3 largest FBX of each library by size, wherever they
+sit; Stylarts' include the 98 MB `Stylized Elven Valley/Meshes/SM_Railing_2.fbx`. For each
+it reports:
+
+- the time, against the app's 60 s job timeout;
+- the worker's peak RSS;
+- whether the preview was textured.
+
+**What the PR reports.** The implementation PR reports:
+
+- the counts for 3 packs from each of Kenney, Unity and Stylarts, 40 FBX each at most;
+- the large-file rows;
+- an explanation of each untextured class against this plan's survey.
+
+**App screenshots.** Before-and-after screenshots of a few cards and the 3D view come from a
+scratch library, never from your registered libraries:
+
+1. Copy one sampled pack from each library into a folder in the session's scratchpad, keeping
+   each pack's folder layout.
+2. Follow `docs/agents/running-the-app.md` ("Fresh data" and "Scratch library"): point
+   `XDG_DATA_HOME` at a new temp dir, and register only the scratch folder in that throwaway
+   master DB. The app then never opens `~/.local/share/com.opendam.desktop/opendam.sqlite` or
+   any library it lists.
+3. **Before:** start a build of the base commit (`origin/main` in a temporary worktree) with
+   `OPENDAM_WORKER` and `OPENDAM_PYTHON` pointing at that worktree's worker. Let it index the
+   scratch library and capture its thumbnails, then take the shots.
+4. **After:** start the new build on the same `XDG_DATA_HOME`, with the two variables pointing at
+   this branch's worker. Its regeneration pass (C9) requeues the scratch copies' FBX previews.
+   Take the same shots once they are recaptured.
+5. Every app run goes through `scripts/memory-cap.sh`. The temp dir and copies are deleted
+   afterwards.
+
+The Stylarts `.glb` packs are spot-checked the same way, in the scratch library, to confirm they
+still preview textured.
 
 **C13. Invariants.** `AGENTS.md` (which `CLAUDE.md` links to) gains a "Textured model previews"
 invariant. It covers:
@@ -357,7 +435,9 @@ invariant. It covers:
 - textures are downscaled to 1024 px;
 - a texture failure never fails a preview;
 - `metadata.preview_version` and the `model_preview_version` pass are how a preview change reaches
-  existing libraries.
+  existing libraries;
+- the pass runs only when the resolved worker declares a `PREVIEW_VERSION` of at least
+  `MODEL_PREVIEW_VERSION`.
 
 ## Steps (one phase)
 
@@ -369,10 +449,11 @@ invariant. It covers:
    - `make install` copies `textures.py`.
    - Tests in `test_textures.py`, which this step's own setup runs by file and in CI.
 2. `worker.py`: the FBX/3DS scene from the node tree (C2) and materials (C4). The trimesh-branch
-   downscale (C6). Result fields (C7). Tests in `test_fbx_scene.py` and
-   `test_worker_protocol.py`, which run under step 1's setup.
+   downscale (C6). The `PREVIEW_VERSION` constant and the result fields (C7). Tests in
+   `test_fbx_scene.py` and `test_worker_protocol.py`, which run under step 1's setup.
 3. `preview.rs`: the `library_root` and `pack_root` params (C1), and storing the result (C8).
-4. `model_preview_regen.rs` and its wiring in `lib.rs` and `commands/library.rs` (C9).
+4. `model_preview_regen.rs`, its engine gate, and its wiring in `lib.rs` and
+   `commands/library.rs` (C9).
 5. Frontend `useGLTF.clear` on `preview:done` (C10).
 6. `measure_textures.py` and the measurement run (C12). `AGENTS.md` invariant (C13).
 7. `uv run ruff format`, `bun run format`, `cargo fmt`, and `make lint`, before each commit.
@@ -387,12 +468,15 @@ invariant. It covers:
   2 levels up without one.
 - **AC4.** Multi-part and Z-up FBX are drawn with their node transforms, and LOD1+ and collision
   nodes are not drawn.
-- **AC5.** Existing libraries requeue only `done` FBX/3DS items the queue rules allow, once.
-  Nothing else is reprocessed.
+- **AC5.** Existing libraries requeue only `done` FBX/3DS items the queue rules allow, once, and
+  only when the resolved worker declares a current `PREVIEW_VERSION`. Nothing else is reprocessed.
 - **AC6.** New OBJ, glTF and GLB previews keep their textures, with each one at most 1024 px.
-- **AC7.** The worker stays one process speaking the same protocol, and its peak RSS on the
-  largest sampled FBX is reported.
+  Opaque textures are stored as `image/jpeg` and textures with alpha as `image/png`.
+- **AC7.** The worker stays one process speaking the same protocol. The time and peak RSS on the
+  3 largest FBX of each library are reported, against the 60 s job timeout.
 - **AC8.** The PR reports textured counts per sampled pack and why the others aren't.
+- **AC9.** No validation step writes to your three libraries or their `.opendam/` folders. App
+  screenshots come from a scratch library under a throwaway `XDG_DATA_HOME`.
 
 ## Known gaps
 
