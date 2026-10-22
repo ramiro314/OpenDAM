@@ -25,6 +25,13 @@ Revised again 2026-10-22 after the workflow's second review. No decision changed
   The sha256 memo (A4) comes in step 1.
 - **A texture used by no model** defaults to its own stem, as a shared texture does (C5).
 
+Revised a third time 2026-10-22 after the workflow's third review. No decision changed:
+
+- **Blender is needed only when Blender runs.** The 5.2.x gate (D29) refuses an export only when
+  it has an uncached model or animation job, so a texture-only domain, or one whose models are
+  all cached, exports without Blender. The Blender path setting, the gate and the test against
+  CI's pin land in step 6, with the CI install, instead of step 1.
+
 ## Goal
 
 The Dungeon Game takes its art only as **bundles** that OpenDAM exports and the game's importer
@@ -211,9 +218,17 @@ sha256.
 
 The Settings dialog gains a **Game export** section with a folder picker, a picker for a
 top-level, non-smart collection, Blender's path with its detected version, and "Clear export
-cache". An export with the root or the root collection unset is refused, and so is one whose
-Blender isn't 5.2.x (D29). The accepted series is the constant `BLENDER_SERIES = "5.2"`, and a
-test checks that CI's pinned version starts with it.
+cache". An export with the root or the root collection unset is refused.
+
+- **The Blender gate** (D29) applies only to an export that has at least one uncached model or
+  animation job (C9, C11). Such an export is refused when Blender is missing or isn't 5.2.x. An
+  export of textures only, or one whose models and animations all hit the cache, never starts
+  Blender and never checks for it.
+- **The accepted series** is the constant `BLENDER_SERIES = "5.2"`, and a test checks that CI's
+  pinned version starts with it.
+- **When they land:** `export.root`, `export.rootCollection` and the cache button come in step 1.
+  `export.blenderPath`, the gate, `BLENDER_SERIES` and its CI-pin test come in step 6, together
+  with the CI install they check.
 
 **C3. Domains.** A domain is a direct child of the root collection.
 
@@ -487,7 +502,8 @@ Each one names the asset (or file) and the rule it broke, and the Export view li
 
 - The root or root collection is unset, a domain or root name isn't PascalCase, or the domain or
   one of its subcollections is smart.
-- Blender is missing or isn't 5.2.x. A Blender job timed out or crashed.
+- An uncached model or animation needs Blender, and Blender is missing or isn't 5.2.x (C2). A
+  Blender job timed out or crashed.
 - A member is in no pack. A model's group has no FBX. A member is neither a model, an animation
   nor an image.
 - Duplicate names (models and animations, textures with one role, materials within a model). A
@@ -505,12 +521,12 @@ Each one names the asset (or file) and the rule it broke, and the Export view li
 Mission Control slices this into tickets after the plan merges. The natural order, each step
 shippable on its own:
 
-1. **Contract and skeleton:** C1 (schema copy, pin test, sync script, validation), C2 settings,
-   C3 domains, C5's default names, C6 packs and provenance (with the pack form's Origin and
-   Normal maps fields), A4's `file_hashes`, and C15's staging and swap. These export standalone
-   pass-through textures with their default names, sha256, provenance and `conversion: []`,
-   plus the Export view's list, problems and diff (C14). `make_fixtures.py` lands here with the
-   step-1 fixtures (C16), for AC9.
+1. **Contract and skeleton:** C1 (schema copy, pin test, sync script, validation), C2's root,
+   root collection and cache settings, C3 domains, C5's default names, C6 packs and provenance
+   (with the pack form's Origin and Normal maps fields), A4's `file_hashes`, and C15's staging
+   and swap. These export standalone pass-through textures with their default names, sha256,
+   provenance and `conversion: []`, plus the Export view's list, problems and diff (C14).
+   `make_fixtures.py` lands here with the step-1 fixtures (C16), for AC9.
 2. **Edits:** C4, and the Game tab (C13) with its name fields and the inferred-or-yours marks and
    reset, so a default name can be changed.
 3. **conversion.json:** C10, with the nested `conversion.json` fixtures, for AC8.
@@ -521,10 +537,11 @@ shippable on its own:
 5. **Texture conversion:** C8 and C11 for textures, on the step-4 texture fixtures, for AC7 and
    the step-5 guard's AC14 case (the same textures now exporting).
 6. **Blender normalization of models:** C9 for models (steps 1-3, 5 and 6 of the script), C11
-   for models, the Game tab's rig picker (none or generic) and facing control ("Show as
-   exported", the +Z arrow and quarter turns), the CI Blender install, and the Blender-backed
-   tests on the fixtures already committed. Models enter the export here, with AC2 (without its
-   animation), AC5 and AC10.
+   for models, C2's Blender path setting, version gate, `BLENDER_SERIES` and its CI-pin test, the
+   Game tab's rig picker (none or generic) and facing control ("Show as exported", the +Z arrow
+   and quarter turns), the CI Blender install, and the Blender-backed tests on the fixtures
+   already committed. Models enter the export here, with AC2 (without its animation), AC5 and
+   AC10.
 7. **Animations and rigs:** the rest of C9 (script step 4, avatarFrom, the follow transform and
    the humanoid suggestion), the Game tab's humanoid option, avatarFrom field and takes, the
    mesh-less animation fixture, the Blender-backed animation assertions, AC6, and AC2 with its
