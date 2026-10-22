@@ -576,7 +576,9 @@ fn relative_to(pack_path: &str, file_path: &str) -> String {
 
 /// Names that aren't PascalCase, and names that collide (C5): two models or animations with one
 /// name, or two textures with one name and role. Each collision is one problem naming every
-/// asset in it.
+/// asset in it. A source whose layout isn't one role (ORM, MaskMap, Roughness, Gloss, Metallic)
+/// has no output role until texture conversion makes one, so it collides with nothing: a set's
+/// `_R` and `_M` maps share a name because they merge into one MetallicSmoothness.
 fn names(reads: &[Read], problems: &mut Vec<Problem>) {
     let mut by_key: BTreeMap<(bool, String, Option<Role>), Vec<&CheckedAsset>> = BTreeMap::new();
     for read in reads {
@@ -594,28 +596,25 @@ fn names(reads: &[Read], problems: &mut Vec<Problem>) {
             });
             continue;
         }
-        match row.kind {
-            Kind::Texture => by_key
-                .entry((true, name.clone(), row.role))
+        match (row.kind, row.role) {
+            (Kind::Texture, Some(role)) => by_key
+                .entry((true, name.clone(), Some(role)))
                 .or_default()
                 .push(row),
-            Kind::Model | Kind::Animation => by_key
+            (Kind::Model | Kind::Animation, _) => by_key
                 .entry((false, name.clone(), None))
                 .or_default()
                 .push(row),
-            Kind::Other => {}
+            (Kind::Texture | Kind::Other, _) => {}
         }
     }
     for ((texture, name, role), rows) in by_key {
         if rows.len() < 2 {
             continue;
         }
-        let what = match (texture, role) {
-            (true, Some(role)) => {
-                format!("textures are named {name} with the role {}", role.as_str())
-            }
-            (true, None) => format!("textures are named {name} in the same layout"),
-            (false, _) => format!("models or animations are named {name}"),
+        let what = match role.filter(|_| texture) {
+            Some(role) => format!("textures are named {name} with the role {}", role.as_str()),
+            None => format!("models or animations are named {name}"),
         };
         let paths: Vec<&str> = rows.iter().map(|r| r.asset.file_path.as_str()).collect();
         problems.push(Problem {
@@ -1468,5 +1467,44 @@ mod tests {
             ["The root collection dg set in Settings no longer exists"]
         );
         assert_eq!(report.bundle_path, None);
+    }
+
+    #[tokio::test]
+    async fn maps_that_merge_into_one_role_are_no_name_collision() {
+        let f = fixture().await;
+        let textures = f.library.root_path.join("Dungeon Props/Textures");
+        let png = std::fs::read(textures.join("T_StoneFloor_D.png")).unwrap();
+        for name in [
+            "Bricks_Roughness.png",
+            "Bricks_Metallic.png",
+            "Bricks_MaskMap.png",
+        ] {
+            std::fs::write(textures.join(name), &png).unwrap();
+        }
+        let root = f.library.root_path.display().to_string();
+        crate::watcher::index_paths(&f.db, "fixture", &[root])
+            .await
+            .unwrap();
+
+        let report = check_domain(
+            &f,
+            &[
+                "Dungeon Props/Textures/Bricks_Roughness.png",
+                "Dungeon Props/Textures/Bricks_Metallic.png",
+                "Dungeon Props/Textures/Bricks_MaskMap.png",
+            ],
+        )
+        .await;
+
+        // Each waits for texture conversion, and none is reported as sharing a name
+        assert_eq!(
+            messages(&report),
+            [
+                "Dungeon Props/Textures/Bricks_MaskMap.png: texture conversion not built yet: it needs its MaskMap channels split into URP roles",
+                "Dungeon Props/Textures/Bricks_Metallic.png: texture conversion not built yet: it needs its Metallic map merged into a MetallicSmoothness",
+                "Dungeon Props/Textures/Bricks_Roughness.png: texture conversion not built yet: it needs its Roughness map merged into a MetallicSmoothness",
+            ]
+        );
+        assert_valid(&report);
     }
 }

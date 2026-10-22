@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::export::conversion::Walker;
 use crate::export::textures::Convention;
-use crate::structure::{spdx_kind, LicenseKind, PackInfo, PackOverride};
+use crate::structure::{spdx_kind, LicenseKind, PackInfo, PackOverride, PackageLicense};
 
 /// A pack as the export reads it, before it has an id.
 #[derive(Debug, Clone)]
@@ -204,11 +204,13 @@ fn kind_name(kind: LicenseKind) -> Option<&'static str> {
     }
 }
 
-/// A pack's licence (D15, A8). `spdx` is the first `datapackage.json` licence `name` that is an
-/// SPDX id or a `LicenseRef-` (as written), else the id of the kind the pack's licence names, else
-/// your licence text when it is an SPDX id, else null. `name` is the `datapackage.json` licence's
-/// title, else your text, else its `name`, else the kind's name, else `Unknown`. `url` is the
-/// `datapackage.json` licence's http(s) URL.
+/// A pack's licence (D15, A8). `spdx` is the first SPDX id these give, in this order: a
+/// `datapackage.json` licence `name` that is an SPDX id or a `LicenseRef-` (as written), the id of
+/// the kind the pack's licence names, and your licence text. `name` and `url` come from the same
+/// source, so the two never describe different licences: that entry's title, else its `name`, and
+/// its http(s) URL; the kind's name; or your text. With no SPDX id, `spdx` is null and `name` is
+/// the `datapackage.json` licence's title or `name`, else your text, else the kind's name, else
+/// `Unknown`.
 pub fn licence(info: &PackInfo, edits: &PackOverride) -> Licence {
     let package = info.package.as_ref();
     let shown = package.and_then(|p| p.license.as_ref());
@@ -221,25 +223,43 @@ pub fn licence(info: &PackInfo, edits: &PackOverride) -> Licence {
         .as_deref()
         .map(str::trim)
         .filter(|l| !l.is_empty());
-    let spdx = package
+    let entry_name = |l: &PackageLicense| l.title.clone().or_else(|| l.id.clone());
+
+    let stated = package
         .into_iter()
         .flat_map(|p| &p.meta.licenses)
-        .filter_map(|l| l.id.as_deref())
-        .find(|id| is_spdx_id(id))
-        .or_else(|| kind_spdx(kind))
-        .or_else(|| yours.filter(|y| is_spdx_id(y)))
-        .map(str::to_string);
-    let name = shown
-        .and_then(|l| l.title.as_deref())
-        .or(yours)
-        .or_else(|| shown.and_then(|l| l.id.as_deref()))
-        .or_else(|| kind_name(kind))
-        .unwrap_or("Unknown")
-        .to_string();
+        .find(|l| l.id.as_deref().is_some_and(is_spdx_id));
+    if let Some(entry) = stated {
+        return Licence {
+            spdx: entry.id.clone(),
+            name: entry_name(entry).expect("an entry with an id has a name"),
+            url: entry.url.clone(),
+        };
+    }
+    if let (Some(spdx), Some(name)) = (kind_spdx(kind), kind_name(kind)) {
+        return Licence {
+            spdx: Some(spdx.into()),
+            name: name.into(),
+            url: None,
+        };
+    }
+    if let Some(yours) = yours.filter(|y| is_spdx_id(y)) {
+        return Licence {
+            spdx: Some(yours.into()),
+            name: yours.into(),
+            url: None,
+        };
+    }
+    let stated_name = shown.and_then(entry_name);
     Licence {
-        spdx,
-        name,
-        url: shown.and_then(|l| l.url.clone()),
+        spdx: None,
+        url: shown
+            .and_then(|l| l.url.clone())
+            .filter(|_| stated_name.is_some()),
+        name: stated_name
+            .or_else(|| yours.map(str::to_string))
+            .or_else(|| kind_name(kind).map(str::to_string))
+            .unwrap_or_else(|| "Unknown".into()),
     }
 }
 
@@ -440,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn your_text_names_the_licence_and_is_its_id_only_when_it_is_one() {
+    fn your_text_is_the_licence_only_when_the_pack_states_no_spdx_id() {
         let none = PackInfo::default();
         let mit = licence(&none, &yours("MIT"));
         assert_eq!(
@@ -452,16 +472,54 @@ mod tests {
             (free.spdx, free.name.as_str()),
             (None, "Bought on the store")
         );
-        // A stated SPDX id comes first (D15)
+        // A CC-BY license file names no version, so an SPDX id you give is the licence
+        let by = licence(&license_file(LicenseKind::CcBy), &yours("CC-BY-4.0"));
+        assert_eq!(
+            (by.spdx.as_deref(), by.name.as_str()),
+            (Some("CC-BY-4.0"), "CC-BY-4.0")
+        );
+        let shown = licence(&license_file(LicenseKind::CcBy), &yours("Store licence"));
+        assert_eq!((shown.spdx, shown.name.as_str()), (None, "Store licence"));
+    }
+
+    #[test]
+    fn spdx_and_name_always_come_from_one_source() {
+        // A stated SPDX id comes first (D15), with its own name and URL, never your text's
         let stated = package(vec![PackageLicense {
             kind: LicenseKind::Cc0,
             id: Some("CC0-1.0".into()),
             ..Default::default()
         }]);
-        let both = licence(&stated, &yours("MIT"));
         assert_eq!(
-            (both.spdx.as_deref(), both.name.as_str()),
-            (Some("CC0-1.0"), "MIT")
+            licence(&stated, &yours("MIT")),
+            Licence {
+                spdx: Some("CC0-1.0".into()),
+                name: "CC0-1.0".into(),
+                url: None
+            }
+        );
+        // Then the license file's kind, named by the kind
+        let cc0 = licence(
+            &license_file(LicenseKind::Cc0),
+            &yours("Bought on the store"),
+        );
+        assert_eq!(
+            (cc0.spdx.as_deref(), cc0.name.as_str()),
+            (Some("CC0-1.0"), "CC0")
+        );
+        // A datapackage licence with no id keeps its title and URL, and has no SPDX id
+        let titled = package(vec![PackageLicense {
+            title: Some("Store EULA".into()),
+            url: Some("https://example.com/eula".into()),
+            ..Default::default()
+        }]);
+        assert_eq!(
+            licence(&titled, &yours("Bought on the store")),
+            Licence {
+                spdx: None,
+                name: "Store EULA".into(),
+                url: Some("https://example.com/eula".into())
+            }
         );
     }
 
