@@ -101,6 +101,15 @@ changed:
 - **C6 names every image slot it downscales**, so AC6 holds for glTF and GLB sources with normal,
   metallic/roughness, emissive or occlusion maps, not only base color.
 
+Revised an eleventh time 2026-10-22 after GitHub Inspector's eighth review of PR #145. No decision
+changed:
+
+- **The version and the texture report get their own columns.** `assets.metadata` is indexed by
+  `assets_fts`, so a report stored there would make searches for `name`, `none`, `rock` or `fill`
+  match nearly every FBX. They now go in two new `assets` columns, `preview_version` and
+  `preview_textures`, which search doesn't index (C8). D7 and D17 said "in `metadata`". The
+  values are the same, only their place changes.
+
 ## Problem
 
 FBX and 3DS models preview as plain gray. `model_meta` in `packages/preview-engine/worker.py`
@@ -241,7 +250,7 @@ flowchart LR
   L[(library files: FBX, textures)] -- "read inside library_root, bounded by pack" --> W
   W -- "textured <id>_preview.glb, textures at most 1024 px" --> T[(.opendam/thumbs)]
   W -- "{ok, preview_model, preview_version, preview_textures}" --> Q
-  Q -- "thumbnail_path = .glb, metadata" --> DB[(library.sqlite)]
+  Q -- "thumbnail_path = .glb, preview_version, preview_textures" --> DB[(library.sqlite)]
   F[modelThumbnailer.ts] -- "captures textured 512 px thumbnail" --> DB
 ```
 
@@ -453,9 +462,16 @@ exports:
   - `missing` lists at most 10 reference stems, or `material:<name>` for a material with no
     reference that no heuristic matched.
 
-**C8. Storing the result.** `complete_job` stores `preview_version` and `preview_textures` in
-`metadata`, with `json_set`, beside `preview_model`. A job without them stores neither and leaves
-any earlier value out, so an old installed engine's result reads as version 1.
+**C8. Storing the result.** `complete_job` stores the two fields in two new `assets` columns:
+`preview_version INTEGER` and `preview_textures TEXT` (the JSON summary).
+
+- **Not in `metadata`.** That column is indexed by `assets_fts` (`003_assets_fts.sql`), and the
+  report's words and missing texture names would otherwise match searches.
+- **Existing libraries.** `db::add_preview_columns` adds the two columns when a library opens,
+  the way `add_structure_columns` adds its own. Older rows read as `NULL`.
+- **Old engines.** A job without these fields sets both columns to `NULL`, so an old installed
+  engine's result reads as version 1.
+- **Search untouched.** No FTS trigger or `search_assets` query changes.
 
 **C9. Regenerating existing previews** (`model_preview_regen.rs`, modelled on `thumb_cleanup.rs`).
 
@@ -499,7 +515,7 @@ any earlier value out, so an old installed engine's result reads as version 1.
 - **Candidates:**
   - `lower(extension) IN ('fbx', '3ds')`;
   - `preview_status = 'done'`;
-  - `coalesce(json_extract(metadata, '$.preview_version'), 1) < MODEL_PREVIEW_VERSION`;
+  - `coalesce(preview_version, 1) < MODEL_PREVIEW_VERSION`;
   - no active job;
   - **queueable under the queue rules:** a main item or file on its own (`MAIN_OR_SINGLE`) that is
     not `pictured`, or a group's preview stand-in. These are the predicates `claim_jobs` uses,
@@ -589,8 +605,13 @@ GLB fresh and needs nothing.
   --frozen pytest`. `make install` also copies `textures.py`.
 - **Rust:**
   - `preview.rs`: `pack_root` picks the innermost pack, survives `_` and `%` in names, and is
-    absent outside a pack. `complete_job` stores and clears `preview_version` and
-    `preview_textures`.
+    absent outside a pack. `complete_job` stores and clears the `preview_version` and
+    `preview_textures` columns.
+  - **Search stays clean.** An FBX row carrying a `preview_textures` report with
+    `missing: ["T_Rock_BC"]` is not returned by a search for `rock`, `none`, `name` or
+    `textured`. Folder and facet counts for those searches don't include it.
+  - `db::add_preview_columns` adds the columns to a library made before them, and running it
+    twice is a no-op.
   - `model_preview_regen.rs`: it requeues stale `done` FBX/3DS main items. It leaves members,
     support files, pictured items, errors, OBJ and current-version rows alone. It requeues a
     stand-in.
@@ -676,8 +697,10 @@ invariant. It covers:
 - the worker resolves textures only inside the library root, bounded by the pack;
 - textures are downscaled to 1024 px;
 - a texture failure never fails a preview;
-- `metadata.preview_version` and the `model_preview_version` pass are how a preview change reaches
-  existing libraries;
+- the `assets.preview_version` column and the `model_preview_version` pass are how a preview change
+  reaches existing libraries;
+- preview bookkeeping (`preview_version`, `preview_textures`) stays out of `metadata`, so search
+  never matches it;
 - the pass requeues only while the running worker process has declared, through `engine_info`, a
   version of at least `MODEL_PREVIEW_VERSION`;
 - it records its key only once no stale FBX/3DS preview is left.
@@ -694,7 +717,8 @@ invariant. It covers:
 2. `worker.py`: the FBX/3DS scene from the node tree (C2) and materials (C4). The trimesh-branch
    downscale (C6). The `PREVIEW_VERSION` constant, `engine_info` and the result fields (C7). Tests in
    `test_fbx_scene.py` and `test_worker_protocol.py`, which run under step 1's setup.
-3. `preview.rs`: the `library_root` and `pack_root` params (C1), and storing the result (C8).
+3. `preview.rs`: the `library_root` and `pack_root` params (C1), and storing the result in the
+   new columns, with `db::add_preview_columns` (C8).
    The queue starts its worker eagerly and publishes the `engine_info` version (C9).
 4. `model_preview_regen.rs`, its engine gate and key rule, and its wiring in `lib.rs`,
    `commands/library.rs` and the queue's version publication (C9).
