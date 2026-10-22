@@ -4,5 +4,10 @@
   "trailingComma": "es5",
   "printWidth": 100,
   "sortPackageJson": false,
-  "ignorePatterns": ["**/*.md", "docs/**", ".github/actions/mission-flake-report/**"]
+  "ignorePatterns": [
+    "**/*.md",
+    "docs/**",
+    ".github/actions/mission-flake-report/**",
+    "apps/desktop/src-tauri/contract/**"
+  ]
 }

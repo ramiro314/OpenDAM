@@ -38,13 +38,15 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
   src-tauri/
     src/commands/             Tauri IPC commands (asset, autotag, collection, export, library, preview, settings, shell, tag)
     src/autotag/              AI auto-tagging: settings, keyring credentials, providers, run engine and run tables
-    src/export/               Game export (docs/plans/game-export/plan.md): settings, the export cache, and
-                              check_outside_libraries, which refuses an export root equal to, inside or
-                              holding a library root, after resolving symlinks
+    src/export/               Game export to Dungeon Game bundles: contract (schema validation), settings,
+                              the export cache, and check_outside_libraries, which refuses an export root
+                              equal to, inside or holding a library root, after resolving symlinks
     src/db.rs                 Master DB + per-library SQLite pools and pragmas
     src/watcher.rs            Directory indexing and change detection
     src/preview.rs            Rust raster thumbnails + the persistent Python worker bridge
     migrations/               Library DB schema
+    contract/                 Pinned copy of dungeon-game's asset contract schema, never edited by hand:
+                              SOURCE.md pins it, scripts/sync-asset-contract.sh re-copies it
 packages/preview-engine/      Python worker (worker.py), uv project, dev venv in .venv/
 docs/adr, docs/specs          Upstream design records, kept as history
 docs/plans                    Plans for this fork
