@@ -1,15 +1,16 @@
 """
 Texture lookup and loading for FBX/3DS previews (plan textured-fbx-previews, C3 and C5).
 
-`resolve_texture` finds the file a material's texture reference names, reading nothing outside
-the library root, and `load_texture` turns it into an image for the preview GLB: at most
-1024 px, JPEG unless its alpha looks like a cutout.
+`resolve_texture` finds the file a material's texture reference names, or failing that the one
+its naming points at, reading nothing outside the library root, and `load_texture` turns it into
+an image for the preview GLB: at most 1024 px, JPEG unless its alpha looks like a cutout.
 """
 
 from __future__ import annotations
 
 import io
 import os
+import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -83,24 +84,42 @@ def reference_parts(reference: str) -> list[str]:
 
 
 def resolve_texture(
-    reference: str | None, source: str, where: Bounds | None
+    reference: str | None,
+    source: str,
+    where: Bounds | None,
+    material_name: str | None = None,
+    single_material: bool = False,
 ) -> tuple[Path, str] | None:
     """
     The file a material's texture reference names, as `(path, via)`, or None.
 
     `via` is the step that found it: `given` (an absolute path), `relative` (the path joined
     to the model's folder, each component ignoring case) or `name` (the file name, ignoring
-    case and extension, nearest first). A non-PSD file found by any step beats every PSD; the
-    first PSD found is used only when no step finds anything else. An embedded (`*N`)
-    reference, or one without a root (`where` is None), finds nothing.
+    case and extension, nearest first). A non-PSD file found by any of these literal steps
+    beats every PSD, and the first PSD they find beats the heuristics. Only when they find
+    nothing, or there is no reference, do the heuristics run (`_heuristics`), again preferring
+    any non-PSD match to a PSD. An embedded (`*N`) reference counts as none. Without a root
+    (`where` is None) nothing is found.
     """
-    if not reference or reference.startswith("*") or where is None:
+    if where is None:
         return None
-    held = None
-    for found in _candidates(reference, Path(os.path.realpath(source)).parent, where):
-        if not _is_psd(found[0]):
+    model_dir = Path(os.path.realpath(source)).parent
+    if reference and reference.startswith("*"):
+        reference = None
+    if reference:
+        found = _first(_candidates(reference, model_dir, where))
+        if found:
             return found
-        held = held or found
+    return _first(_heuristics(reference, material_name, single_material, source, model_dir, where))
+
+
+def _first(found) -> tuple[Path, str] | None:
+    """The first non-PSD file of `found`, else its first PSD."""
+    held = None
+    for item in found:
+        if not _is_psd(item[0]):
+            return item
+        held = held or item
     return held
 
 
@@ -167,49 +186,261 @@ def _relative(model_dir: Path, parts: list[str], root: Path) -> Path | None:
     return current if current != model_dir and current.is_file() else None
 
 
+class _Tiers:
+    """
+    Where the by-name search and the heuristics look, tier by tier. A tier is a level of the
+    walk up from the model's folder: that folder and its texture subfolders, recursively.
+    Then the whole pack. Without a pack the walk goes at most `NO_PACK_LEVELS` up and there is
+    no whole-pack tier. Paths are folder parts relative to `top`, the walk's last level.
+    """
+
+    def __init__(self, model_dir: Path, where: Bounds):
+        levels = [model_dir]
+        if where.pack_root:
+            while levels[-1] != where.pack_root:
+                levels.append(levels[-1].parent)
+        else:
+            while len(levels) <= NO_PACK_LEVELS and levels[-1] != where.library_root:
+                levels.append(levels[-1].parent)
+        self.levels = levels
+        self.top = levels[-1]
+        self.model_rel = model_dir.relative_to(self.top).parts
+        self.where = where
+
+    def indexes(self):
+        """
+        Each tier's index, nearest first, as `(folder parts from top, index)`. A tier is
+        indexed only when the caller reaches it.
+        """
+        root = self.where.library_root
+        for level in self.levels:
+            yield level.relative_to(self.top).parts, _index(level, root, recursive=False)
+        if self.where.pack_root:
+            yield (), _index(self.top, root, recursive=True)
+
+    def key(self, ext: str):
+        """
+        The order within a tier: the reference's own extension `ext` first unless it is a
+        PSD, then the others in `EXTENSIONS` order, then the nearest folder, then the path
+        ignoring case.
+        """
+        model_rel = self.model_rel
+
+        def key(folder: tuple[str, ...], name: str):
+            e = _ext(name)
+            order = 0 if e == ext and ext != "psd" else 1 + EXTENSIONS.index(e)
+            common = 0
+            while common < min(len(folder), len(model_rel)) and folder[common] == model_rel[common]:
+                common += 1
+            distance = len(folder) + len(model_rel) - 2 * common
+            return order, distance, "/".join((*folder, name)).lower()
+
+        return key
+
+    def path(self, folder: tuple[str, ...], name: str) -> Path:
+        return self.top.joinpath(*folder, name)
+
+
 def _by_name(stem: str, ext: str, model_dir: Path, where: Bounds):
     """
-    Files with the stem, ignoring case, tier by tier. A tier is a level of the walk up from
-    the model's folder: that folder and its texture subfolders, recursively. Then the whole
-    pack. Within a tier the reference's own extension comes first, then the others in
-    `EXTENSIONS` order, then the nearest folder, then the path ignoring case. Each tier is
-    indexed only when the lookup reaches it, so the whole pack is walked only when no level
-    has a match, and without a pack nothing is walked beyond the levels.
+    Files with the stem, ignoring case, tier by tier (`_Tiers`), each tier in `_Tiers.key`
+    order. The whole pack is indexed only when no level has a match.
     """
-    levels = [model_dir]
-    if where.pack_root:
-        while levels[-1] != where.pack_root:
-            levels.append(levels[-1].parent)
-    else:
-        while len(levels) <= NO_PACK_LEVELS and levels[-1] != where.library_root:
-            levels.append(levels[-1].parent)
-    top = levels[-1]
-    model_rel = model_dir.relative_to(top).parts
-
-    def key(entry: tuple[tuple[str, ...], str]):
-        folder, name = entry
-        e = _ext(name)
-        order = 0 if e == ext and ext != "psd" else 1 + EXTENSIONS.index(e)
-        common = 0
-        while common < min(len(folder), len(model_rel)) and folder[common] == model_rel[common]:
-            common += 1
-        distance = len(folder) + len(model_rel) - 2 * common
-        return order, distance, "/".join((*folder, name)).lower()
-
-    def tiers():
-        for level in levels:
-            prefix = level.relative_to(top).parts
-            entries = _index(level, where.library_root, recursive=False).get(stem, [])
-            yield [((*prefix, *folder), name) for folder, name in entries]
-        if where.pack_root:
-            yield _index(top, where.library_root, recursive=True).get(stem, [])
-
+    tiers = _Tiers(model_dir, where)
+    key = tiers.key(ext)
     seen = set()
-    for tier in tiers():
-        for folder, name in sorted(tier, key=key):
+    for prefix, index in tiers.indexes():
+        tier = [((*prefix, *folder), name) for folder, name in index.get(stem, [])]
+        for folder, name in sorted(tier, key=lambda entry: key(*entry)):
             if (folder, name) not in seen:
                 seen.add((folder, name))
-                yield top.joinpath(*folder, name)
+                yield tiers.path(folder, name)
+
+
+# ── Step 4: heuristics ────────────────────────────────────────────────────
+
+# Stem suffixes, compared ignoring case. The single letters mean base color only after a
+# `T_` or `TX_` prefix; elsewhere they are atlas variants.
+DIFFUSE_SUFFIXES = (
+    "_bc",
+    "_basecolor",
+    "_base_color",
+    "_albedo",
+    "_albedotransparency",
+    "_color",
+    "_colour",
+    "_diffuse",
+    "_diff",
+)
+PREFIXED_DIFFUSE_SUFFIXES = ("_b", "_c", "_d")
+NON_DIFFUSE_SUFFIXES = (
+    "_n",
+    "_normal",
+    "_normals",
+    "_nrm",
+    "_orm",
+    "_aorm",
+    "_r",
+    "_roughness",
+    "_m",
+    "_metallic",
+    "_metallicsmoothness",
+    "_mask",
+    "_maskmap",
+    "_e",
+    "_emission",
+    "_emissive",
+    "_ao",
+    "_height",
+    "_specular",
+    "_smmetao",
+)
+TEXTURE_PREFIXES = ("t_", "tx_")
+CORE_PREFIXES = ("t_", "tx_", "sm_")
+MATERIAL_PREFIXES = ("mi_", "mat_", "m_")
+DEFAULT_MATERIAL_PREFIXES = ("lambert", "phong", "blinn")
+DEFAULT_MATERIALS = frozenset({"defaultmaterial", "material", "no name", "skin"})
+# The prefix heuristics never drop a `_part` that would leave a shorter core than this.
+CORE_FLOOR = 6
+_LOD_SUFFIX = re.compile(r"_lod\d+$")
+
+
+def _strip_prefix(stem: str, prefixes: tuple[str, ...]) -> str:
+    for prefix in prefixes:
+        if stem.startswith(prefix):
+            return stem[len(prefix) :]
+    return stem
+
+
+def core_stem(stem: str) -> str:
+    """A lowercase stem without a leading `T_`, `TX_` or `SM_`."""
+    return _strip_prefix(stem.lower(), CORE_PREFIXES)
+
+
+def diffuse_name(stem: str) -> str | None:
+    """
+    What a diffuse map's stem names: lowercase, without its diffuse suffix and a `T_` or
+    `TX_` prefix. None when the stem doesn't end in a diffuse suffix.
+    """
+    low = stem.lower()
+    bare = _strip_prefix(low, TEXTURE_PREFIXES)
+    suffixes = DIFFUSE_SUFFIXES + (PREFIXED_DIFFUSE_SUFFIXES if bare != low else ())
+    for suffix in sorted(suffixes, key=len, reverse=True):
+        if bare.endswith(suffix) and len(bare) > len(suffix):
+            return bare[: -len(suffix)]
+    return None
+
+
+def is_non_diffuse(stem: str) -> bool:
+    return stem.lower().endswith(NON_DIFFUSE_SUFFIXES)
+
+
+def material_core(name: str | None) -> str | None:
+    """
+    A material name as the material-name heuristic compares it: lowercase, without an `MI_`,
+    `M_` or `MAT_` prefix and a trailing `.NNN`. None for a default name or one under 3
+    characters.
+    """
+    low = re.sub(r"\.\d{3}$", "", (name or "").strip().lower())
+    low = _strip_prefix(low, MATERIAL_PREFIXES)
+    if len(low) < 3 or low.startswith(DEFAULT_MATERIAL_PREFIXES) or low in DEFAULT_MATERIALS:
+        return None
+    return low
+
+
+def core_tries(core: str):
+    """
+    `core`, then `core` with its trailing `_parts` dropped one at a time, stopping before a
+    drop would leave under `CORE_FLOOR` characters or only digits and `_`.
+    """
+    if not core:
+        return
+    parts = core.split("_")
+    yield core
+    while len(parts) > 1:
+        parts = parts[:-1]
+        shorter = "_".join(parts)
+        if len(shorter) < CORE_FLOOR or not shorter.strip("_0123456789"):
+            return
+        yield shorter
+
+
+def _heuristics(
+    reference: str | None,
+    material_name: str | None,
+    single_material: bool,
+    source: str,
+    model_dir: Path,
+    where: Bounds,
+):
+    """
+    Files a material's naming points at (C3 step 4), as `(path, via)` in order, over the
+    by-name search's tiers:
+
+    1. `material_name`: a diffuse map named after the material (`material_core`).
+    2. `ref_prefix`: any texture without a non-diffuse suffix whose core stem is the
+       reference's core, without a `_Texture` part, or starts with it and `_`, dropping the
+       reference's trailing `_parts` down to the floor until something matches (`core_tries`).
+       The fewest extra `_parts` win.
+    3. `file_prefix`, for a model with a single material: a diffuse map named after the
+       model's core stem without `_LODn`, dropping its `_parts` the same way.
+
+    Ties go to the nearest tier, then `_Tiers.key` order.
+    """
+    name = material_core(material_name)
+    ref_core = None
+    if reference:
+        parts = core_stem(_stem(reference)).split("_")
+        ref_core = "_".join(p for p in parts if p != "texture") or "_".join(parts)
+    file_core = None
+    if single_material:
+        file_core = _LOD_SUFFIX.sub("", core_stem(Path(source).stem))
+    if not (name or ref_core or file_core):
+        return
+
+    tiers = _Tiers(model_dir, where)
+    key = tiers.key(_ext(_stem_name(reference)) if reference else "")
+    # Every texture file once, in its nearest tier: (tier, lowercase stem, folder, name).
+    files, seen = [], set()
+    for tier, (prefix, index) in enumerate(tiers.indexes()):
+        for stem, entries in index.items():
+            for folder, filename in entries:
+                entry = ((*prefix, *folder), filename)
+                if entry not in seen:
+                    seen.add(entry)
+                    files.append((tier, stem, *entry))
+
+    def ranked(matches):
+        """`matches` of `(rank, tier, folder, name)` as paths, best first."""
+        matches.sort(key=lambda m: (m[0], m[1], *key(m[2], m[3])))
+        return [tiers.path(folder, filename) for _, _, folder, filename in matches]
+
+    def named(want: str):
+        return ranked([(0, tier, f, n) for tier, stem, f, n in files if diffuse_name(stem) == want])
+
+    if name:
+        for path in named(name):
+            yield path, "material_name"
+
+    if ref_core:
+        for want in core_tries(ref_core):
+            matches = []
+            for tier, stem, folder, filename in files:
+                core = core_stem(stem)
+                if (core == want or core.startswith(want + "_")) and not is_non_diffuse(stem):
+                    matches.append((core[len(want) :].count("_"), tier, folder, filename))
+            if matches:
+                for path in ranked(matches):
+                    yield path, "ref_prefix"
+                break
+
+    if file_core:
+        for want in core_tries(file_core):
+            paths = named(want)
+            if paths:
+                for path in paths:
+                    yield path, "file_prefix"
+                break
 
 
 # (folder, library root) -> (built at, {stem: [(folder parts, file name)]}), for whole packs
@@ -367,9 +598,14 @@ def diffuse_reference(ai_material: dict) -> str | None:
     return None
 
 
-def _stem(reference: str) -> str:
+def _stem_name(reference: str) -> str:
+    """A reference's file name."""
     parts = reference_parts(reference)
-    name = parts[-1] if parts else reference
+    return parts[-1] if parts else reference
+
+
+def _stem(reference: str) -> str:
+    name = _stem_name(reference)
     return name.rsplit(".", 1)[0] if "." in name else name
 
 
@@ -379,9 +615,17 @@ class SceneTextures:
     (plan C7). Decoded images are cached for the model, so a shared atlas is decoded once.
     """
 
-    def __init__(self, source: str, library_root: str | None, pack_root: str | None):
+    def __init__(
+        self,
+        source: str,
+        library_root: str | None,
+        pack_root: str | None,
+        single_material: bool = False,
+    ):
         self.source = source
         self.where = bounds(source, library_root, pack_root)
+        # Only a model with one material may take a texture named after its file.
+        self.single_material = single_material
         self.cache: dict[Path, Texture] = {}
         self.report = {
             "materials": 0,
@@ -404,15 +648,13 @@ class SceneTextures:
         if self.where is None:
             return None
         reference = diffuse_reference(ai_material)
-        if reference is None:
-            self._list("missing", f"material:{ai_material.get('NAME') or ''}")
-            return None
+        name = ai_material.get("NAME") or ""
         try:
-            found = resolve_texture(reference, self.source, self.where)
+            found = resolve_texture(reference, self.source, self.where, name, self.single_material)
         except OSError:
             found = None
         if found is None:
-            self._list("missing", _stem(reference))
+            self._list("missing", _stem(reference) if reference else f"material:{name}")
             return None
         path, via = found
         texture = load_texture(path, self.cache)

@@ -470,7 +470,7 @@ def model_meta(
             )
             from textures import SceneTextures
 
-            textures = SceneTextures(source, library_root, pack_root)
+            textures = SceneTextures(source, library_root, pack_root, len(ai_scene.materials) == 1)
             t_scene, poly_count, object_count = fbx_scene(ai_scene, textures)
 
             if object_count:
