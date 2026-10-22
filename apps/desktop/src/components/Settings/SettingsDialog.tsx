@@ -1,12 +1,15 @@
 import { useEffect, useState } from 'react';
 import clsx from 'clsx';
+import { open } from '@tauri-apps/plugin-dialog';
 import { api } from '../../api';
+import { useCollectionStore } from '../../store';
 import type {
   AiProvider,
   AiSettings,
   AnthropicAccess,
   ClaudePlanStatus,
   ConnectionTest,
+  ExportSettings,
   ProviderStatus,
 } from '../../types';
 import { formatCost } from '../../utils/autotag';
@@ -14,9 +17,11 @@ import { IconSettings, IconX } from '../Icons';
 import {
   ANTHROPIC_MODELS,
   claudePlanLines,
+  exportSettingsPatch,
   ignoredOverridesNote,
   isKnownModel,
   parseNumberInput,
+  rootCollectionOptions,
   settingsPatch,
 } from './settingsHelpers';
 import styles from './SettingsDialog.module.css';
@@ -35,6 +40,9 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
   const [claudeStatus, setClaudeStatus] = useState<ClaudePlanStatus | null>(null);
   const [claudeError, setClaudeError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [exportSaved, setExportSaved] = useState<ExportSettings | null>(null);
+  const [exportDraft, setExportDraft] = useState<ExportSettings | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -46,6 +54,13 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
         setStatuses(status);
       })
       .catch((e) => setError(String(e)));
+    api
+      .getExportSettings()
+      .then((settings) => {
+        setExportSaved(settings);
+        setExportDraft(settings);
+      })
+      .catch((e) => setExportError(String(e)));
   }, []);
 
   // Runs `claude` twice, so it doesn't hold up the rest of the dialog
@@ -76,21 +91,37 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
   const setJev = (patch: Partial<AiSettings['jev']>) =>
     setDraft((d) => d && { ...d, jev: { ...d.jev, ...patch } });
 
+  // Each side saves only once it has loaded, so one failing to load doesn't block the other
   const handleSave = async () => {
-    if (!saved || !draft) return;
-    const trimmed = {
-      ...draft,
-      anthropic: { ...draft.anthropic, model: draft.anthropic.model.trim() },
-    };
-    const patch = settingsPatch(saved, trimmed);
-    if (!patch) {
+    const patch =
+      saved && draft
+        ? settingsPatch(saved, {
+            ...draft,
+            anthropic: { ...draft.anthropic, model: draft.anthropic.model.trim() },
+          })
+        : null;
+    const exportPatch =
+      exportSaved && exportDraft ? exportSettingsPatch(exportSaved, exportDraft) : null;
+    if (!patch && !exportPatch) {
       onClose();
       return;
     }
     setSaving(true);
-    setError(null);
+    // Keep a load error on the side that has nothing to save
+    if (patch) setError(null);
+    if (exportPatch) setExportError(null);
+    // The export root can be refused, so it saves first and keeps the dialog open when it is
+    if (exportPatch) {
+      try {
+        setExportSaved(await api.setExportSettings(exportPatch));
+      } catch (e) {
+        setExportError(String(e));
+        setSaving(false);
+        return;
+      }
+    }
     try {
-      await api.setAiSettings(patch);
+      if (patch) await api.setAiSettings(patch);
       onClose();
     } catch (e) {
       setError(String(e));
@@ -268,6 +299,9 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
               {error}
             </p>
           )}
+
+          <h4 className={styles.sectionTitle}>Game export</h4>
+          <ExportSection draft={exportDraft} onChange={setExportDraft} error={exportError} />
         </div>
 
         <div className={styles.actions}>
@@ -278,7 +312,7 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
             id="settings-save"
             type="button"
             className={clsx(styles.btn, styles.primaryBtn)}
-            disabled={!draft || saving}
+            disabled={(!draft && !exportDraft) || saving}
             onClick={handleSave}
           >
             Save
@@ -286,6 +320,139 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
         </div>
       </div>
     </div>
+  );
+}
+
+interface ExportSectionProps {
+  draft: ExportSettings | null;
+  onChange: (draft: ExportSettings) => void;
+  error: string | null;
+}
+
+/**
+ * The export root and root collection, saved with the dialog, and "Clear export cache", which
+ * acts at once. The root is checked against every library when it is saved.
+ */
+function ExportSection({ draft, onChange, error }: ExportSectionProps) {
+  const collections = useCollectionStore((s) => s.collections);
+  const options = rootCollectionOptions(collections);
+  const [clearing, setClearing] = useState(false);
+  const [cleared, setCleared] = useState<string | null>(null);
+  const [clearError, setClearError] = useState<string | null>(null);
+
+  const chooseRoot = async () => {
+    const picked = await open({ directory: true, multiple: false, title: 'Select Export Root' });
+    if (draft && typeof picked === 'string') onChange({ ...draft, root: picked });
+  };
+
+  const clearCache = async () => {
+    setClearing(true);
+    setCleared(null);
+    setClearError(null);
+    try {
+      const count = await api.clearExportCache();
+      setCleared(
+        count === 0
+          ? 'No library had an export cache'
+          : `Cleared the export cache of ${count} ${count === 1 ? 'library' : 'libraries'}`
+      );
+    } catch (e) {
+      setClearError(String(e));
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  const missing =
+    draft?.rootCollection != null && !options.some((c) => c.id === draft.rootCollection);
+
+  return (
+    <section className={styles.provider} id="settings-export">
+      {draft && (
+        <>
+          <div className={styles.row}>
+            <span className={styles.label}>Export root</span>
+            <input
+              id="settings-export-root"
+              className={styles.input}
+              value={draft.root ?? ''}
+              placeholder="No folder chosen"
+              readOnly
+            />
+            <button
+              type="button"
+              className={clsx(styles.btn, styles.secondaryBtn)}
+              onClick={chooseRoot}
+            >
+              Choose…
+            </button>
+            <button
+              type="button"
+              className={clsx(styles.btn, styles.secondaryBtn)}
+              disabled={!draft.root}
+              onClick={() => onChange({ ...draft, root: null })}
+            >
+              Clear
+            </button>
+          </div>
+          <p className={styles.keyStatus}>
+            <span className={styles.hint}>A folder outside every library</span>
+          </p>
+          <label className={styles.row}>
+            <span className={styles.label}>Root collection</span>
+            <select
+              id="settings-export-root-collection"
+              className={styles.input}
+              value={draft.rootCollection ?? ''}
+              onChange={(e) => onChange({ ...draft, rootCollection: e.target.value || null })}
+            >
+              <option value="">None</option>
+              {missing && <option value={draft.rootCollection ?? ''}>Missing collection</option>}
+              {options.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className={styles.keyStatus}>
+            <span className={styles.hint}>
+              A top-level collection whose subcollections are the export domains
+            </span>
+          </p>
+        </>
+      )}
+      {error && (
+        <p className={styles.error} role="alert">
+          {error}
+        </p>
+      )}
+      <div className={styles.keyBlock}>
+        <div className={styles.row}>
+          <span className={styles.label} />
+          <button
+            id="settings-export-clear-cache"
+            type="button"
+            className={clsx(styles.btn, styles.secondaryBtn)}
+            disabled={clearing}
+            onClick={clearCache}
+            title="Delete every library's .opendam/export-cache folder"
+          >
+            {clearing ? 'Clearing…' : 'Clear export cache'}
+          </button>
+        </div>
+        {cleared && (
+          <p className={styles.keyStatus} role="status">
+            {cleared}
+          </p>
+        )}
+        {clearError && (
+          <p className={styles.error} role="alert">
+            {clearError}
+          </p>
+        )}
+      </div>
+    </section>
   );
 }
 

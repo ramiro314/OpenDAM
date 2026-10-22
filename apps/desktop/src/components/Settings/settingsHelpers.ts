@@ -1,4 +1,11 @@
-import type { AiSettings, AiSettingsPatch, ClaudePlanStatus } from '../../types';
+import type {
+  AiSettings,
+  AiSettingsPatch,
+  ClaudePlanStatus,
+  Collection,
+  ExportSettings,
+  ExportSettingsPatch,
+} from '../../types';
 
 /** The Claude models Settings offers by name. Any other id is a custom model. */
 export const ANTHROPIC_MODELS = [
@@ -23,6 +30,21 @@ export function settingsPatch(saved: AiSettings, draft: AiSettings): AiSettingsP
   const jev = changedFields(saved.jev, draft.jev);
   if (!anthropic && !jev) return null;
   return { ...(anthropic && { anthropic }), ...(jev && { jev }) };
+}
+
+/** The export settings fields of `draft` that differ from `saved`, or null when nothing changed. */
+export function exportSettingsPatch(
+  saved: ExportSettings,
+  draft: ExportSettings
+): ExportSettingsPatch | null {
+  return changedFields(saved, draft) ?? null;
+}
+
+/** The collections the root collection picker offers: top-level, non-smart ones, by name. */
+export function rootCollectionOptions(collections: Collection[]): Collection[] {
+  return collections
+    .filter((c) => !c.parentId && !c.isSmart)
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** What Settings says about Claude-plan access: where `claude` is, and which login it uses. */
