@@ -54,6 +54,17 @@ changed:
   PSD, and the nearer tier beats the exact extension (C3). This refines how D12's "exact extension
   first" and D15's "psd last" combine.
 
+Revised a sixth time 2026-10-22 after GitHub Inspector's third review of PR #145. No decision
+changed:
+
+- **A late `engine_info` reply can't land on a job.** `PythonWorker::execute` returns the first
+  JSON line it reads. So C9 now kills the process when `engine_info` times out, as the queue
+  already does after a job timeout. `execute` also skips any reply whose `id` doesn't match its
+  request.
+- **The LOD rule matches the names your packs use.** A scan of 1,200 sampled FBX found
+  NatureManufacture's `MapleSpringTree04LOD3`, with no separator, which the old rule missed. C2's
+  rule now also takes leading zeros, an optional `_`, and assimp's `$AssimpFbx$` helper suffixes.
+
 ## Problem
 
 FBX and 3DS models preview as plain gray. `model_meta` in `packages/preview-engine/worker.py`
@@ -226,10 +237,21 @@ each node's `transformation` into its parent's.
   transform. A mesh used by several nodes is drawn at each of them.
 - Each geometry carries vertices, triangle faces, normals, UV channel 0 when present, and the
   material from C4. Meshes without triangles (points, lines) are skipped.
-- **Skip a node and its subtree** when its name, ignoring case, matches any of:
-  - `_LOD[1-9]\d*$` or `^LOD[1-9]\d*$`;
-  - a `UCX_`, `UBX_`, `USP_` or `UCP_` prefix;
-  - `ConvexHull`.
+- **Skip a node and its subtree** when its name matches any of the following, after a trailing
+  `_$AssimpFbx$_...` helper suffix is removed:
+  - **An LOD number of 1 or more at the end:** `LOD`, then an optional `_`, optional zeros, and a
+    number from 1. The `LOD` is any case at the start of the name or after a non-letter, and
+    uppercase after a letter.
+    - Skipped: `Tree_LOD1`, `Tree_LOD01`, `Tree_LOD_2`, `MapleSpringTree04LOD3` and `TreeLOD2`.
+    - Drawn: `Tree_LOD0`, `Tree_LOD00`, `SH_Shield_E_LOD` (no number) and `Ballod2` (`lod` inside
+      a word).
+  - a `UCX_`, `UBX_`, `USP_` or `UCP_` prefix, any case;
+  - `ConvexHull`, any case.
+- **LOD names in your libraries.** A scan of 1,200 sampled FBX found:
+  - 1,214 Stylarts nodes named `_LODn`;
+  - Unity `_LODn`, plus NatureManufacture's `MapleSpringTree04LOD3`;
+  - one `SH_Shield_E_LOD` with no number, and assimp `$AssimpFbx$` helper nodes;
+  - no zero-padded names, which the rule accepts anyway.
 - **If skipping leaves nothing**, for example a file holding only `LOD1`, draw everything instead.
 - `poly_count` and `object_count` count what is drawn.
 - An import error or a scene with no drawable mesh fails as today, with `preview_error`.
@@ -359,8 +381,15 @@ any earlier value out, so an old installed engine's result reads as version 1.
   - `run_python_queue` starts its worker when the queue starts, rather than on the first job, and
     again after every restart.
   - Each new process first gets an `engine_info` request (C7), with a 10 s timeout. Its answer is
-    published in `AppState` as the running engine's version. A process that answers with an
-    error, or doesn't answer, publishes version 1.
+    published in `AppState` as the running engine's version.
+  - **An error reply** (an older worker's `Unknown method`) publishes version 1, and the process
+    keeps serving jobs.
+  - **A timeout** kills the process, exactly as a 60 s job timeout does (`worker.kill()`, then
+    `py_worker = None`), and publishes version 1. The next job starts a new process, which is
+    asked again. A late reply therefore never stays on a live process's stdout.
+  - **Replies are matched by `id`.** `PythonWorker::execute` reads lines until one parses as JSON
+    with the request's own `id`, and skips any other. A stray reply can never be taken as another
+    request's result.
   - **Before any answer** (at startup, or while a restarted process is starting, or when no
     worker could be spawned) the published state is "none yet". A pass that sees it returns at
     once. It does not requeue, record a key, or log a warning. The next publish runs it.
@@ -431,7 +460,8 @@ GLB fresh and needs nothing.
     - downscale to 1024.
   - `test_fbx_scene.py`:
     - node transforms applied, including a Z-up root rotation and a mesh instanced twice;
-    - LOD1+ and `UCX_`/`ConvexHull` skipped;
+    - LOD1+ and `UCX_`/`ConvexHull` skipped, with each name in C2's skipped and drawn lists,
+      including one carrying a `_$AssimpFbx$_PreRotation` suffix;
     - everything-skipped fallback;
     - UVs and normals kept;
     - textured versus colored material;
@@ -462,8 +492,12 @@ GLB fresh and needs nothing.
     - A published version of 1 requeues nothing, leaves the key unset, and logs the warning.
     - Publishing 2 afterwards runs the pass for every open library still below the constant.
     - The checkout's `worker.py` declares `MODEL_PREVIEW_VERSION`.
-  - **Engine version:** `run_python_queue` publishes the version from `engine_info`, and 1 for a
-    worker that answers `Unknown method`. Tested with a stub worker script.
+  - **Engine version,** with a stub worker script:
+    - `run_python_queue` publishes the version from `engine_info`, and 1 for a worker that
+      answers `Unknown method`;
+    - a stub that answers `engine_info` after the timeout is killed, version 1 is published, and
+      the next job runs on a new process and gets its own result;
+    - `execute` given a stray line with another `id` before the real reply returns the real one.
 - **TypeScript:** the `useGLTF.clear` call on `preview:done`.
 
 **C12. Measurement** (D10). Your three libraries are read only. Nothing in this section writes to
