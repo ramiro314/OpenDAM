@@ -1,7 +1,13 @@
 # Textured FBX previews
 
-Status: shaped 2026-10-21 in a two-round interview (D1-D18 below), pending final review. Once
-this plan merges, Mission Control slices it into tickets. One phase.
+Status: shaped 2026-10-21 in a two-round interview (D1-D18 below) and approved at final review.
+Once this plan merges, Mission Control slices it into tickets. One phase.
+
+Revised 2026-10-21 after the plan validation workflow's review. No decision changed:
+
+- **pytest arrives with the first Python tests.** Step 1 now adds pytest, the `tests/` folder,
+  and the `make test` and CI hooks, so its `test_textures.py` runs by file and in CI. Step 2 only
+  adds its own two test files.
 
 ## Problem
 
@@ -355,12 +361,16 @@ invariant. It covers:
 
 ## Steps (one phase)
 
-1. `textures.py`: resolver (C3), image loading and encoding (C5), the root index cache. Tests in
-   `test_textures.py`.
+1. Python test setup, then `textures.py`.
+   - `pytest` added to the dev group through `uv add --dev pytest`, with the lockfile committed.
+   - The `packages/preview-engine/tests/` folder.
+   - `uv run --frozen pytest` in `make test` and in CI's test job.
+   - `textures.py`: the resolver (C3), image loading and encoding (C5), and the root index cache.
+   - `make install` copies `textures.py`.
+   - Tests in `test_textures.py`, which this step's own setup runs by file and in CI.
 2. `worker.py`: the FBX/3DS scene from the node tree (C2) and materials (C4). The trimesh-branch
    downscale (C6). Result fields (C7). Tests in `test_fbx_scene.py` and
-   `test_worker_protocol.py`. `pytest` added through `uv add --dev`, lockfile committed, and
-   `make test`, CI and `make install` updated.
+   `test_worker_protocol.py`, which run under step 1's setup.
 3. `preview.rs`: the `library_root` and `pack_root` params (C1), and storing the result (C8).
 4. `model_preview_regen.rs` and its wiring in `lib.rs` and `commands/library.rs` (C9).
 5. Frontend `useGLTF.clear` on `preview:done` (C10).
