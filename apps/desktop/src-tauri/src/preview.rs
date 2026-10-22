@@ -409,6 +409,47 @@ fn resolve_source(root_path: &Path, file_path: &str) -> PathBuf {
     }
 }
 
+/// The pack holding the asset at `file_path`, relative to the library root: the innermost
+/// folder marked as a pack that is the asset's own folder or one of its ancestors, or `None`
+/// outside a pack (plan textured-fbx-previews, C1). Matched with `substr`, not `LIKE`, since
+/// folder names hold `_` and `%`.
+async fn pack_root(pool: &Pool<Sqlite>, file_path: &str) -> Option<String> {
+    let folder = file_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+    sqlx::query_scalar(
+        "SELECT path FROM folders
+         WHERE is_pack AND (path = '' OR path = ?1 OR substr(?1, 1, length(path) + 1) = path || '/')
+         ORDER BY length(path) DESC LIMIT 1",
+    )
+    .bind(folder)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("Failed to read the pack of {}: {}", file_path, e);
+        None
+    })
+}
+
+/// The worker's `model_meta` request for job `job_id`. `library_root` and, inside a pack,
+/// `pack_root` bound where the worker may look for an FBX/3DS model's textures.
+async fn model_meta_request(
+    lib: &LibraryHandle,
+    job_id: &str,
+    asset_id: &str,
+    file_path: &str,
+) -> serde_json::Value {
+    let root_path = &lib.root_path;
+    let mut params = json!({
+        "source": resolve_source(root_path, file_path).to_string_lossy(),
+        "output_dir": root_path.join(".opendam").join("thumbs").to_string_lossy(),
+        "name": asset_id,
+        "library_root": root_path.to_string_lossy(),
+    });
+    if let Some(pack) = pack_root(&lib.pool, file_path).await {
+        params["pack_root"] = json!(resolve_path(root_path, &pack));
+    }
+    json!({"id": job_id, "method": "model_meta", "params": params})
+}
+
 /// A finished preview job, as `preview:done` reports it. Every path is absolute; a `None`
 /// `thumb_path` means the asset has no thumbnail. `file_path` is the asset's own file and
 /// `previous_thumb_path` the thumbnail it had before the job, so a card showing either as a
@@ -711,15 +752,7 @@ async fn run_python_queue(state: Arc<AppState>, py_exec: PathBuf, worker_py: Pat
                     }
                 }
 
-                let req = json!({
-                    "id": &job_id,
-                    "method": "model_meta",
-                    "params": {
-                        "source": full_source.to_string_lossy().to_string(),
-                        "output_dir": thumb_dir.to_string_lossy().to_string(),
-                        "name": &asset_id
-                    }
-                });
+                let req = model_meta_request(&lib, &job_id, &asset_id, &file_path).await;
 
                 let py_resp = if let Some(ref mut worker) = py_worker {
                     match tokio::time::timeout(
@@ -1031,6 +1064,94 @@ mod tests {
             .await
             .unwrap();
         (thumb, status, job)
+    }
+
+    /// A library at `/lib` holding `folders` rows, each `(path, is_pack)`.
+    async fn library_with_folders(folders: &[(&str, bool)]) -> LibraryHandle {
+        let pool = crate::db::memory_library_pool().await;
+        for (path, is_pack) in folders {
+            sqlx::query("INSERT INTO folders (path, name, is_pack) VALUES (?, ?, ?)")
+                .bind(path)
+                .bind(path.rsplit('/').next().unwrap())
+                .bind(is_pack)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        LibraryHandle {
+            id: "lib".into(),
+            name: "lib".into(),
+            root_path: PathBuf::from("/lib"),
+            pool,
+        }
+    }
+
+    #[tokio::test]
+    async fn pack_root_is_the_innermost_pack_above_the_asset() {
+        let lib = library_with_folders(&[
+            ("", false),
+            ("Assets", true),
+            ("Assets/100%_Pack", true),
+            ("Assets/100%_Pack/Meshes", false),
+            // `LIKE 'Assets/100%_Pack/%'` would take this folder's assets as the pack's.
+            ("Assets/100xyPack", false),
+            ("Assets/100xyPack/Meshes", false),
+            ("AssetsX", false),
+            ("Loose", false),
+        ])
+        .await;
+        let pack = |file: &'static str| pack_root(&lib.pool, file);
+
+        assert_eq!(
+            pack("Assets/100%_Pack/Meshes/rock.fbx").await.as_deref(),
+            Some("Assets/100%_Pack")
+        );
+        assert_eq!(
+            pack("Assets/100%_Pack/rock.fbx").await.as_deref(),
+            Some("Assets/100%_Pack")
+        );
+        assert_eq!(
+            pack("Assets/100xyPack/Meshes/rock.fbx").await.as_deref(),
+            Some("Assets")
+        );
+        assert_eq!(pack("AssetsX/rock.fbx").await, None);
+        assert_eq!(pack("Loose/rock.fbx").await, None);
+        assert_eq!(pack("rock.fbx").await, None);
+    }
+
+    #[tokio::test]
+    async fn pack_root_takes_a_library_root_marked_as_a_pack() {
+        let lib = library_with_folders(&[("", true), ("Meshes", false)]).await;
+        assert_eq!(
+            pack_root(&lib.pool, "Meshes/rock.fbx").await.as_deref(),
+            Some("")
+        );
+        assert_eq!(pack_root(&lib.pool, "rock.fbx").await.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn model_meta_sends_the_library_and_pack_roots() {
+        let lib = library_with_folders(&[("Kit", true), ("Loose", false)]).await;
+
+        let req = model_meta_request(&lib, "j1", "a1", "Kit/Models/crate.fbx").await;
+        assert_eq!(
+            req,
+            json!({
+                "id": "j1",
+                "method": "model_meta",
+                "params": {
+                    "source": "/lib/Kit/Models/crate.fbx",
+                    "output_dir": "/lib/.opendam/thumbs",
+                    "name": "a1",
+                    "library_root": "/lib",
+                    "pack_root": "/lib/Kit",
+                }
+            })
+        );
+
+        let req = model_meta_request(&lib, "j2", "a2", "Loose/crate.fbx").await;
+        assert_eq!(req["params"]["library_root"], "/lib");
+        assert!(req["params"].get("pack_root").is_none());
     }
 
     #[tokio::test]
