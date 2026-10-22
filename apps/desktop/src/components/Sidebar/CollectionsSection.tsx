@@ -1,8 +1,20 @@
 import { useState } from 'react';
 import clsx from 'clsx';
+import { api } from '../../api';
 import { useCollectionStore, useUIStore, useAssetStore, cachedAssets } from '../../store';
-import { IconCollection, IconChevronDown, IconChevronRight, IconPlus, IconTrash } from '../Icons';
+import type { Collection, ExportSettings } from '../../types';
+import { exportMenuReason } from '../../utils/exportView';
+import {
+  IconCollection,
+  IconChevronDown,
+  IconChevronRight,
+  IconExternal,
+  IconPlus,
+  IconTrash,
+} from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
+import { ContextMenu } from '../ContextMenu/ContextMenu';
+import { ExportDialog } from '../Export/ExportDialog';
 import { SidebarSection } from './SidebarSection';
 import { InlineCreateForm } from './InlineCreateForm';
 import { isNameTaken, resolveDroppedAssetId } from './sidebarHelpers';
@@ -36,6 +48,21 @@ export function CollectionsSection({ clearSmartFilter }: CollectionsSectionProps
   const [expandedColIds, setExpandedColIds] = useState<Record<string, boolean>>({});
 
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
+
+  // The right-click menu, with the export settings it reads to tell a domain (plan C3)
+  const [menu, setMenu] = useState<{ x: number; y: number; collection: Collection } | null>(null);
+  const [exportSettings, setExportSettings] = useState<ExportSettings | null>(null);
+  const [exportDomain, setExportDomain] = useState<Collection | null>(null);
+
+  const openMenu = (e: React.MouseEvent, collection: Collection) => {
+    e.preventDefault();
+    setMenu({ x: e.clientX, y: e.clientY, collection });
+    setExportSettings(null);
+    api
+      .getExportSettings()
+      .then(setExportSettings)
+      .catch((err) => console.error('Failed to load the export settings:', err));
+  };
 
   const toggleCollectionExpanded = (id: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
@@ -163,6 +190,7 @@ export function CollectionsSection({ clearSmartFilter }: CollectionsSectionProps
                   e.dataTransfer.dropEffect = 'copy';
                 }}
                 onDrop={(e) => handleDropOnCollection(e, col.id)}
+                onContextMenu={(e) => openMenu(e, col)}
                 title="Click to view; drag assets here to add"
                 role="button"
                 tabIndex={0}
@@ -263,6 +291,25 @@ export function CollectionsSection({ clearSmartFilter }: CollectionsSectionProps
 
         {renderCollectionTree(null)}
       </SidebarSection>
+
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          onClose={() => setMenu(null)}
+          items={[
+            {
+              id: 'collection-menu-export',
+              label: 'Export to game…',
+              icon: <IconExternal size={12} />,
+              disabledReason: exportMenuReason(menu.collection, exportSettings, collections),
+              onSelect: () => setExportDomain(menu.collection),
+            },
+          ]}
+        />
+      )}
+
+      {exportDomain && <ExportDialog domain={exportDomain} onClose={() => setExportDomain(null)} />}
 
       <ConfirmDeleteDialog
         isOpen={Boolean(deleteTarget)}

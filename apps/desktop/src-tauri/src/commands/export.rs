@@ -2,8 +2,8 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::export::blender::{self, BlenderStatus};
-use crate::export::cache;
 use crate::export::settings::{self, ExportSettings};
+use crate::export::{cache, check};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -37,4 +37,15 @@ pub async fn clear_export_cache(state: State<'_, Arc<AppState>>) -> Result<usize
 pub async fn get_blender_status(path: Option<String>) -> Result<BlenderStatus> {
     let path = path.filter(|p| !p.trim().is_empty());
     Ok(blender::status(path.as_deref().map(str::trim)).await)
+}
+
+/// Checks the domain collection `domain_id` for export (plan C14): every asset with its kind,
+/// default name, pack and status, every problem that refuses the export, and the manifest it
+/// would write.
+#[tauri::command]
+pub async fn check_export(
+    domain_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<check::CheckReport> {
+    check::check(&state.db, &domain_id).await
 }

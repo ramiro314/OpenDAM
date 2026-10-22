@@ -279,6 +279,7 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::export::set_export_settings,
             commands::export::clear_export_cache,
             commands::export::get_blender_status,
+            commands::export::check_export,
             commands::autotag::list_autotag_providers,
             commands::autotag::estimate_autotag_run,
             commands::autotag::start_autotag_run,

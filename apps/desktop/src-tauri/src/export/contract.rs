@@ -3,6 +3,7 @@
 //! `scripts/sync-asset-contract.sh`. Manifests are validated against its root and
 //! `conversion.json` files against `$defs/conversionFile`, as Draft 2020-12 with `format` checked.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use jsonschema::error::ValidationErrorKind;
@@ -28,7 +29,31 @@ fn validator(def: &str) -> Validator {
         .expect("the pinned schema compiles")
 }
 
-/// Each error as `<JSON pointer>: <message>`, the pointer `/` for the document itself.
+/// An error as both validators write it: `<JSON pointer>: <message>`, the pointer `/` for the
+/// document itself. `pointer_of`, `asset_index` and `is_domain_error` read it back, so callers
+/// never parse the text themselves.
+fn at(pointer: &str, message: impl std::fmt::Display) -> String {
+    format!("{pointer}: {message}")
+}
+
+/// The JSON pointer an error of `validate_manifest` or `check_rules` is about.
+pub fn pointer_of(error: &str) -> &str {
+    error.split_once(": ").map_or(error, |(pointer, _)| pointer)
+}
+
+/// The index in the manifest's `assets` of the asset an error is about, when it is about one:
+/// its pointer is `/assets/<i>` or lies below it.
+pub fn asset_index(error: &str) -> Option<usize> {
+    let rest = pointer_of(error).strip_prefix("/assets/")?;
+    rest.split('/').next()?.parse().ok()
+}
+
+/// Whether an error is about the manifest's `domain`.
+pub fn is_domain_error(error: &str) -> bool {
+    pointer_of(error) == "/domain"
+}
+
+/// Each error as `at` writes it.
 fn errors(validator: &Validator, instance: &Value) -> Result<(), Vec<String>> {
     let found: Vec<ValidationError> = validator.iter_errors(instance).collect();
     let mut errors = Vec::new();
@@ -71,17 +96,130 @@ fn describe(errors: &[ValidationError], out: &mut Vec<String>) {
             }
             _ => {}
         }
-        out.push(format!(
-            "{}: {error}",
-            if path.is_empty() { "/" } else { path }
-        ));
+        out.push(at(if path.is_empty() { "/" } else { path }, error));
     }
 }
 
 /// Checks a `manifest.json` against the schema. Only the schema: the importer's other checks
-/// (unique names, known packs, the listed files) are not here.
+/// are `check_rules`, and the listed files are checked where the bundle is written.
 pub fn validate_manifest(manifest: &Value) -> Result<(), Vec<String>> {
     errors(&MANIFEST, manifest)
+}
+
+/// The importer's manifest checks that the schema can't express (plan C1): unique pack ids, no
+/// two models or animations with one `assetName`, no two textures with one `assetName` and
+/// role, no two assets with one `file`, a known pack for every asset, every material texture
+/// naming a texture asset with that role, and every `avatarFrom` naming a rigged model. Each
+/// error names the asset by its JSON pointer. Run it beside `validate_manifest`: it skips what
+/// the schema already refuses, such as an asset without a `kind`.
+pub fn check_rules(manifest: &Value) -> Result<(), Vec<String>> {
+    let empty = Vec::new();
+    let list = |key: &str| manifest[key].as_array().unwrap_or(&empty);
+    let text = |value: &Value| value.as_str().map(str::to_string);
+    let mut errors = Vec::new();
+
+    let mut packs = HashSet::new();
+    for (i, pack) in list("packs").iter().enumerate() {
+        if let Some(id) = text(&pack["id"]) {
+            if !packs.insert(id.clone()) {
+                errors.push(at(
+                    &format!("/packs/{i}/id"),
+                    format!("another pack has the id {id}"),
+                ));
+            }
+        }
+    }
+
+    // The first asset holding each key, by its index
+    let mut names: HashMap<(bool, String, String), usize> = HashMap::new();
+    let mut files: HashMap<String, usize> = HashMap::new();
+    let mut textures = HashSet::new();
+    let mut rigged = HashSet::new();
+    let assets = list("assets");
+    for (i, asset) in assets.iter().enumerate() {
+        let (Some(kind), Some(name)) = (text(&asset["kind"]), text(&asset["assetName"])) else {
+            continue;
+        };
+        let is_texture = kind == "texture";
+        let role = text(&asset["role"]).unwrap_or_default();
+        if is_texture {
+            textures.insert((name.clone(), role.clone()));
+        } else if kind == "model" && asset["rig"].as_str().is_some_and(|r| r != "none") {
+            rigged.insert(name.clone());
+        }
+        let key = (
+            is_texture,
+            name.clone(),
+            if is_texture {
+                role.clone()
+            } else {
+                String::new()
+            },
+        );
+        if let Some(first) = names.get(&key) {
+            let what = if is_texture {
+                format!("texture {name} with role {role}")
+            } else {
+                format!("model or animation named {name}")
+            };
+            errors.push(at(
+                &format!("/assets/{i}"),
+                format!("/assets/{first} is already a {what}"),
+            ));
+        } else {
+            names.insert(key, i);
+        }
+        if let Some(file) = text(&asset["file"]) {
+            if let Some(first) = files.get(&file) {
+                errors.push(at(
+                    &format!("/assets/{i}/file"),
+                    format!("/assets/{first} is already {file}"),
+                ));
+            } else {
+                files.insert(file, i);
+            }
+        }
+        if let Some(pack) = text(&asset["pack"]) {
+            if !packs.contains(&pack) {
+                errors.push(at(
+                    &format!("/assets/{i}/pack"),
+                    format!("no pack has the id {pack}"),
+                ));
+            }
+        }
+    }
+
+    for (i, asset) in assets.iter().enumerate() {
+        let materials = asset["materials"].as_array().unwrap_or(&empty);
+        for (m, material) in materials.iter().enumerate() {
+            let Some(map) = material["textures"].as_object() else {
+                continue;
+            };
+            for (role, name) in map {
+                let Some(name) = name.as_str() else { continue };
+                if !textures.contains(&(name.to_string(), role.clone())) {
+                    errors.push(at(
+                        &format!("/assets/{i}/materials/{m}/textures/{role}"),
+                        format!("no texture {name} has the role {role}"),
+                    ));
+                }
+            }
+        }
+        if let Some(avatar) = text(&asset["avatarFrom"]) {
+            if !rigged.contains(&avatar) {
+                errors.push(at(
+                    &format!("/assets/{i}/avatarFrom"),
+                    format!("no rigged model is named {avatar}"),
+                ));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// Checks a `conversion.json` against `$defs/conversionFile`.
@@ -285,5 +423,138 @@ mod tests {
         );
         // A manifest is not a conversion file.
         assert!(validate_conversion_file(&manifest()).is_err());
+    }
+
+    #[test]
+    fn a_valid_manifest_passes_the_importers_rules() {
+        assert_eq!(check_rules(&manifest()), Ok(()));
+        let mut animated = manifest();
+        animated["assets"][0]["rig"] = json!("generic");
+        animated["assets"].as_array_mut().unwrap().push(json!({
+            "kind": "animation", "assetName": "RockWobble", "file": "Animations/RockWobble.fbx",
+            "avatarFrom": "Rock", "clips": ["Wobble"]
+        }));
+        assert_eq!(check_rules(&animated), Ok(()));
+    }
+
+    /// The rule errors for a manifest changed by `edit`, which must break a rule.
+    fn rule_errors(edit: impl FnOnce(&mut Value)) -> Vec<String> {
+        let mut m = manifest();
+        edit(&mut m);
+        check_rules(&m).expect_err("the manifest should break a rule")
+    }
+
+    #[test]
+    fn duplicate_names_and_files_break_the_rules() {
+        let assets = |m: &mut Value| m["assets"].as_array_mut().unwrap().clone();
+        let errors = rule_errors(|m| {
+            let mut copy = assets(m)[1].clone();
+            copy["file"] = json!("Textures/Rock_BaseColor.tga");
+            m["assets"].as_array_mut().unwrap().push(copy);
+        });
+        assert_eq!(
+            errors,
+            ["/assets/2: /assets/1 is already a texture Rock with role BaseColor"]
+        );
+
+        let errors = rule_errors(|m| {
+            let copy = assets(m)[0].clone();
+            m["assets"].as_array_mut().unwrap().push(copy);
+        });
+        assert_eq!(
+            errors,
+            [
+                "/assets/2: /assets/0 is already a model or animation named Rock",
+                "/assets/2/file: /assets/0 is already Models/Rock.fbx"
+            ]
+        );
+
+        // A model and its own textures share a name on purpose, and roles tell textures apart
+        let mut ok = manifest();
+        let mut normal = assets(&mut ok)[1].clone();
+        normal["role"] = json!("Normal");
+        normal["file"] = json!("Textures/Rock_Normal.png");
+        ok["assets"].as_array_mut().unwrap().push(normal);
+        assert_eq!(check_rules(&ok), Ok(()));
+    }
+
+    #[test]
+    fn unknown_packs_and_textures_break_the_rules() {
+        let errors = rule_errors(|m| m["assets"][1]["pack"] = json!("nope"));
+        assert_eq!(errors, ["/assets/1/pack: no pack has the id nope"]);
+
+        let errors = rule_errors(|m| {
+            let pack = m["packs"][0].clone();
+            m["packs"].as_array_mut().unwrap().push(pack);
+        });
+        assert_eq!(
+            errors,
+            ["/packs/1/id: another pack has the id stylarts-props"]
+        );
+
+        let errors = rule_errors(|m| m["assets"][1]["role"] = json!("Normal"));
+        assert_eq!(
+            errors,
+            ["/assets/0/materials/0/textures/BaseColor: no texture Rock has the role BaseColor"]
+        );
+    }
+
+    #[test]
+    fn avatar_from_must_name_a_rigged_model() {
+        let errors = rule_errors(|m| {
+            m["assets"].as_array_mut().unwrap().push(json!({
+                "kind": "animation", "assetName": "RockWobble", "file": "Animations/RockWobble.fbx",
+                "avatarFrom": "Rock", "clips": ["Wobble"]
+            }));
+        });
+        assert_eq!(
+            errors,
+            ["/assets/2/avatarFrom: no rigged model is named Rock"]
+        );
+    }
+
+    #[test]
+    fn errors_are_read_back_to_their_asset_and_the_domain() {
+        // Schema errors, a whole asset's and one below it
+        let errors = manifest_errors(|m| {
+            m["domain"] = json!("dungeon");
+            m["assets"][1]["sha256"] = json!("ABC");
+            m["assets"][0].as_object_mut().unwrap().remove("bounds");
+        });
+        let read: Vec<(Option<usize>, bool)> = errors
+            .iter()
+            .map(|e| (asset_index(e), is_domain_error(e)))
+            .collect();
+        assert!(read.contains(&(None, true)), "{errors:?}");
+        assert!(read.contains(&(Some(0), false)), "{errors:?}");
+        assert!(read.contains(&(Some(1), false)), "{errors:?}");
+        assert_eq!(read.len(), 3, "{errors:?}");
+
+        // Rule errors, at an asset, below one, and at a pack
+        let errors = rule_errors(|m| {
+            let mut copy = m["assets"][1].clone();
+            copy["pack"] = json!("nope");
+            m["assets"].as_array_mut().unwrap().push(copy);
+            let pack = m["packs"][0].clone();
+            m["packs"].as_array_mut().unwrap().push(pack);
+        });
+        let read: Vec<(&str, Option<usize>)> = errors
+            .iter()
+            .map(|e| (pointer_of(e), asset_index(e)))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("/packs/1/id", None),
+                ("/assets/2", Some(2)),
+                ("/assets/2/file", Some(2)),
+                ("/assets/2/pack", Some(2)),
+            ],
+            "{errors:?}"
+        );
+        assert!(errors.iter().all(|e| !is_domain_error(e)));
+        // A pointer's tail never reads as an index, and a message never reads as a pointer
+        assert_eq!(asset_index("/assets/x: bad"), None);
+        assert_eq!(asset_index("/packs/0/id: like /assets/3: here"), None);
     }
 }

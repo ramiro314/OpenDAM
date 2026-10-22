@@ -128,6 +128,15 @@ CREATE TABLE IF NOT EXISTS pack_overrides (
     updated_at  INTEGER NOT NULL
 );
 
+-- ── File hashes: source sha256s memoized for the game export (export/hashes.rs) ──────
+-- A row holds while the file keeps the size and mtime (nanoseconds) it was hashed at.
+CREATE TABLE IF NOT EXISTS file_hashes (
+    file_path    TEXT PRIMARY KEY,  -- relative to library root
+    size_bytes   INTEGER NOT NULL,
+    modified_at  INTEGER NOT NULL,
+    sha256       TEXT NOT NULL
+);
+
 -- The full-text table and its triggers are in 003_assets_fts.sql, so a library made before
 -- `file_path` was indexed can recreate them inside a transaction (db::index_file_paths).
 

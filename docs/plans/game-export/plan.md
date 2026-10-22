@@ -813,6 +813,44 @@ problem in the Export view, naming the asset, and the step that delivers the wor
   from `fbx_facts`) is refused with "animation export not built yet". Models that carry their own
   takes export from step 6, with their `clips`.
 
+### What step 1's Check built differently
+
+The Check (`export::check`, the Export view's list and problems) landed without staging, the
+swap, the diff or the Export button, which the bundle-writing ticket carries. Where it differs
+from the contracts above:
+
+- **One FBX guard until `fbx_facts` lands.** Telling a model from an animation needs
+  `fbx_facts` (step 4). Until then every FBX member, and every format group holding one, is
+  refused with one message, "model export not built yet (an FBX exports as a model or an
+  animation, and neither is built yet)". The `fbx_facts` ticket splits it into the step-6 and
+  step-7 guards.
+- **The `datapackage.json` `name`** (C6's pack id) is read from the file when the Check runs. The
+  structure pass doesn't keep it, so adding it there would mean bumping `PACKAGE_PARSER` and
+  re-reading every library's packs.
+- **The licence comes from one source** (C6, D15). `spdx` keeps D15's order (a stated SPDX id or
+  `LicenseRef-`, then the licence kind's id, then your text when it is an SPDX id), and `name` and
+  `url` come from the same source, so a manifest never pairs one licence's id with another's
+  name. Your text names the licence only when the pack states no SPDX id. With none, `spdx` is
+  null and `name` is the stated title or `name`, else your text, else the kind's name, else
+  `Unknown`.
+- **CC-BY, CC-BY-SA and OFL kinds give a null `spdx`.** A license file names no version, so no
+  exact SPDX id follows from it. CC0, MIT and Apache-2.0 have one version and give theirs.
+  "Is an SPDX id" is a curated recognizer (`packs::is_spdx_id`), not the full SPDX list.
+- **Only role textures collide by name** (C5). A source whose layout isn't one role (ORM,
+  MaskMap, Roughness, Gloss, Metallic) has no output role until texture conversion makes one, so
+  it takes part in no collision: a set's `_R` and `_M` maps share a name on purpose.
+- **Texture sets wait for step 4.** Each member image is its own texture until then. For sources
+  that pass through, that gives what the set would: one texture per role, all under the set's
+  name (`T_Rock_D` and `T_Rock_N` export as `Rock` BaseColor and `Rock` Normal). Every other
+  source is refused by the step-5 guard.
+- **The `conversion.json` fixtures land in step 1,** not step 3: `Converted/conversion.json`
+  above the `Converted/Ruins` pack, since the step-3 guard and unreal-origin inference are tested
+  now. Step 3 adds the nested pair.
+- **The origin and normal-map overrides** (`pack_overrides.origin`, `normal_convention`) and the
+  pack form's fields come with the "Pack form Origin and Normal maps fields" ticket. Step 1 only
+  infers them.
+- **Problems don't link to a Game tab yet,** which arrives with step 2.
+
 ## Acceptance criteria
 
 - **AC1.** The copied schema matches `SOURCE.md`'s sha256 (a test). `sync-asset-contract.sh`

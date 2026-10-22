@@ -103,7 +103,9 @@ pub async fn update(pool: &Pool<Sqlite>, patch: Value) -> Result<ExportSettings,
     load(pool).await.map_err(|e| e.to_string())
 }
 
-async fn check_root(pool: &Pool<Sqlite>, root: &str) -> Result<(), String> {
+/// Refuses an export root that isn't an absolute folder outside every library: on save, and at
+/// each export check (plan C2).
+pub async fn check_root(pool: &Pool<Sqlite>, root: &str) -> Result<(), String> {
     let path = PathBuf::from(root);
     if !path.is_absolute() {
         return Err(format!("The export root {root} is not an absolute path"));

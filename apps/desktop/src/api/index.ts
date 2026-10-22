@@ -26,6 +26,7 @@ import type {
   ClaudePlanStatus,
   AiSettingsPatch,
   BlenderStatus,
+  ExportCheck,
   ExportSettings,
   ExportSettingsPatch,
   ProviderStatus,
@@ -158,6 +159,8 @@ export const api = {
   clearExportCache: () => invoke<number>('clear_export_cache'),
   /** The Blender at `path` (null is `blender` on PATH), its version, and whether exports accept it */
   getBlenderStatus: (path: string | null) => invoke<BlenderStatus>('get_blender_status', { path }),
+  /** Reads a domain collection and lists its assets and the problems that refuse its export */
+  checkExport: (domainId: string) => invoke<ExportCheck>('check_export', { domainId }),
 
   // Auto-tagging runs. Progress arrives as `autotag:updated` events.
   listAutotagProviders: () => invoke<AutotagProviderOption[]>('list_autotag_providers'),
