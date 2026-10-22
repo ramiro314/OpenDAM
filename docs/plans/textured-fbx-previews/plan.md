@@ -120,6 +120,14 @@ changed:
   `convertFileSrc(previewModel)`, and remounts the viewer's model through a per-path revision
   bumped on `preview:done`. C11 tests the reload, and C12 checks it in the app.
 
+Revised a thirteenth time 2026-10-22 after GitHub Inspector's tenth review of PR #145. No decision
+changed:
+
+- **Cutout alpha is classified at source size.** Shrinking a 2K or 4K foliage atlas with LANCZOS
+  turns thin binary blades into mid-range alpha, which could push it past the 25% line and save
+  it as an opaque JPEG. C4 now reads one histogram of the source's alpha channel before C5
+  resizes it. C11 tests a thin-blade atlas, and C12 measures a real 2K-plus foliage texture.
+
 ## Problem
 
 FBX and 3DS models preview as plain gray. `model_meta` in `packages/preview-engine/worker.py`
@@ -406,10 +414,15 @@ reads no file outside `library_root` and follows no symlink out of it.
 - **Without one:** `baseColorFactor` is `COLOR_DIFFUSE`, or 0.8 gray when absent, with `OPACITY` as
   its alpha.
 - **Cutout:** `alphaMode` is `MASK`, `alphaCutoff` 0.5 and `doubleSided` true only when the
-  texture's alpha looks like a cutout. The check runs on the downscaled image:
+  texture's alpha looks like a cutout. The check runs on the source image at full size, before
+  C5 downscales it, from one histogram of its alpha channel:
   - at least 1% of pixels have alpha below 128;
   - at least 10% have alpha at 128 or above;
   - fewer than 25% sit in the mid range 16-239.
+- **Why at source size.** Shrinking a 2K or 4K atlas 2-4x with LANCZOS blurs blades 2-4 source
+  pixels wide, and their edges, into mid-range alpha. On a dense grass or foliage atlas that alone
+  could cross the 25% line, and the texture would turn into opaque quads. The histogram costs one
+  pass over pixels already decoded, within C5's 8192 px cap.
 - **Ignored alpha.** Any other alpha below 255 is ignored, and the texture is treated as opaque.
   This covers a channel that is uniformly 0, exported by some 32-bit TGA and PNG tools, and
   Unity smoothness stored in the albedo alpha, which is mostly mid-range. Without the rule, the
@@ -425,8 +438,8 @@ reads no file outside `library_root` and follows no symlink out of it.
   A PSD is used only when no other format has the stem, and read as Pillow's flattened composite.
 - **Size check first.** Open with Pillow and read the size from the header. A texture over
   8192 px on either side is skipped (`too_large`). That bounds one decode at 256 MB RGBA.
-- **Downscale:** decode with `draft` for JPEG, convert to RGB or RGBA, and shrink with LANCZOS to
-  1024 px on the longest side.
+- **Downscale:** decode with `draft` for JPEG, and convert to RGB or RGBA. An RGBA source gets its
+  alpha classified first (C4). Then shrink with LANCZOS to 1024 px on the longest side.
 - **Encoding in the GLB:** PNG for a texture C4 uses as a cutout, JPEG for everything else,
   including a texture whose alpha C4 ignores, which drops that alpha. In the trimesh branch (C6),
   any image with alpha below 255 stays PNG, because the source material decides how its alpha is
@@ -602,6 +615,9 @@ nothing.
     - the alpha classification: a TGA whose alpha is all 0 is `ignored` and encoded as JPEG; a
       smooth gradient alpha (smoothness-like) is `ignored`; a binary foliage alpha is `cutout`
       and stays PNG;
+    - a 2048 px atlas of binary blades 2 px wide is `cutout`, although its 1024 px LANCZOS copy
+      has more than 25% mid-range alpha, which the test asserts too, so it would fail if the
+      classification ran after the resize;
     - downscale to 1024.
   - `test_fbx_scene.py`:
     - node transforms applied, including a Z-up root rotation and a mesh instanced twice;
@@ -681,7 +697,11 @@ folders and a sample size.
   - `via` counts;
   - untextured reasons: no reference, missing, unreadable, too large, or no UVs;
   - the top missing names;
+  - `alpha` counts: cutout, ignored and none;
   - per-file time and the worker's peak RSS.
+- **Foliage.** At least one sampled pack holds foliage or grass with an alpha texture of 2K or more,
+  and its row shows that texture as `cutout`. If it comes out `ignored`, that is a finding to
+  report, not a threshold to tune until it passes.
 
 **Large files.** The script also runs the 3 largest FBX of each library by size, wherever they
 sit; Stylarts' include the 98 MB `Stylized Elven Valley/Meshes/SM_Railing_2.fbx`. For each
