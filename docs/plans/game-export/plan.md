@@ -14,6 +14,17 @@ Revised 2026-10-22 after the plan validation workflow's review. No decision chan
   consumes nothing that step 7 makes.
 - **Default names come in step 1,** with the first export, and step 2 adds editing them.
 
+Revised again 2026-10-22 after the workflow's second review. No decision changed:
+
+- **Fixtures grow with the steps that use them.** `make_fixtures.py` and the fixture library land
+  in step 1 and gain each fixture in the first step that tests it. Step 6 adds only the CI
+  Blender install and the Blender-backed tests. The cut-out base color is now a PNG, since a
+  JPG has no alpha.
+- **Every part of the Game tab has a step.** Material, texture role, layout and convention editors
+  come in step 4, rig and facing in step 6, and the humanoid suggestion and avatarFrom in step 7.
+  The sha256 memo (A4) comes in step 1.
+- **A texture used by no model** defaults to its own stem, as a shared texture does (C5).
+
 ## Goal
 
 The Dungeon Game takes its art only as **bundles** that OpenDAM exports and the game's importer
@@ -246,8 +257,9 @@ that asset as removed before anything is written (C15).
 - **A material's default** comes from its slot name.
 - **A texture's default** (D24): a texture used by one model takes that model's `assetName`, or
   `<AssetName><MaterialName>` when that model has more than one texture in the role. A texture
-  used by several models in the domain takes its own stem, with prefix and role suffix dropped
-  (`PolygonCity_Texture_01_A` becomes `PolygonCityTexture01A`).
+  used by several models in the domain, or by none (a standalone member), takes its own stem,
+  with prefix and role suffix dropped (`PolygonCity_Texture_01_A` becomes
+  `PolygonCityTexture01A`, and `T_Rune_N` becomes `Rune`).
 - **Uniqueness:** two models or animations with one name, two textures with one name and role,
   or two materials of one model with one name, are each a problem naming both assets. The export
   refuses (D10).
@@ -440,15 +452,19 @@ answer per file's size and mtime for the session.
 **C16. Tests and CI** (D34).
 
 - **Fixtures:** `apps/desktop/src-tauri/tests/fixtures/game-export/make_fixtures.py`, run with
-  `blender -b -P`, writes a small library that is committed with its output:
-  - a centimetre, Z-up FBX with an asymmetric nose on its front;
-  - an Unreal-style FBX with a `UCX_` mesh, `_LOD0`/`_LOD1` and two material slots;
-  - a skinned model with one take, and (from step 7) a mesh-less FBX with a take;
-  - textures: an AORM PNG, a DirectX normal map, a JPG base color with a cut-out alpha, and a
-    separate Roughness and Metallic pair;
-  - a `conversion.json` in a folder, and a deeper one below it;
-  - a Unity-style `.mat` and `.meta` pair;
-  - a `datapackage.json` with a `LicenseRef-` licence.
+  `blender -b -P` on the author's machine, writes a small library that is committed with its
+  output, so no test needs Blender to read it. It grows with the build order (step N in
+  brackets): each fixture lands in the first step whose tests use it.
+  - a `datapackage.json` with a `LicenseRef-` licence, and plain PNG textures that pass through
+    (step 1);
+  - a `conversion.json` in a folder, and a deeper one below it (step 3);
+  - a centimetre, Z-up FBX with an asymmetric nose on its front, an Unreal-style FBX with a
+    `UCX_` mesh, `_LOD0`/`_LOD1` and two material slots, a skinned model with one take, a
+    Unity-style `.mat` and `.meta` pair, and the textures inference reads: a PNG base color
+    with a cut-out alpha, a JPG base color, an AORM PNG, a DirectX normal map, and a separate
+    Roughness and Metallic pair (step 4, for `fbx_facts`, inference and the step-5 guard's
+    refusals; step 5 converts the same files);
+  - a mesh-less FBX with a take (step 7).
 - **Rust tests (nextest), without Blender:** names, inference, the texture operations
   (pixel-exact on tiny images), `conversion.json` merging, packs and licences, cache keys,
   staging and swap (including a failed swap), and the schema pin. Every manifest or
@@ -490,19 +506,29 @@ Mission Control slices this into tickets after the plan merges. The natural orde
 shippable on its own:
 
 1. **Contract and skeleton:** C1 (schema copy, pin test, sync script, validation), C2 settings,
-   C3 domains, C5's default names, C6 packs and provenance, and C15's staging and swap. These
-   export standalone pass-through textures with their default names, sha256, provenance and
-   `conversion: []`, plus the Export view's list, problems and diff (C14).
-2. **Edits:** C4, and the Game tab's name fields (C13), so a default name can be changed.
-3. **conversion.json:** C10.
-4. **Materials and roles:** C12 `fbx_facts`, C7 inference, and the Game tab's material editor.
-5. **Texture conversion:** C8 and C11 for textures.
+   C3 domains, C5's default names, C6 packs and provenance (with the pack form's Origin and
+   Normal maps fields), A4's `file_hashes`, and C15's staging and swap. These export standalone
+   pass-through textures with their default names, sha256, provenance and `conversion: []`,
+   plus the Export view's list, problems and diff (C14). `make_fixtures.py` lands here with the
+   step-1 fixtures (C16), for AC9.
+2. **Edits:** C4, and the Game tab (C13) with its name fields and the inferred-or-yours marks and
+   reset, so a default name can be changed.
+3. **conversion.json:** C10, with the nested `conversion.json` fixtures, for AC8.
+4. **Materials and roles:** C12 `fbx_facts`, C7 inference, and the Game tab's material editor
+   (slot, name, surface and the texture pickers) and texture editor (role, layout and normal
+   convention). The FBX, Unity material and texture fixtures land here, for AC4, the `fbx_facts`
+   pytest, and the step-5 guard refusing the textures that need conversion.
+5. **Texture conversion:** C8 and C11 for textures, on the step-4 texture fixtures, for AC7 and
+   the step-5 guard's AC14 case (the same textures now exporting).
 6. **Blender normalization of models:** C9 for models (steps 1-3, 5 and 6 of the script), C11
-   for models, the CI Blender install, and the fixtures (C16) except the mesh-less animation FBX.
-   Models enter the export here, with AC2 (without its animation), AC5 and AC10.
+   for models, the Game tab's rig picker (none or generic) and facing control ("Show as
+   exported", the +Z arrow and quarter turns), the CI Blender install, and the Blender-backed
+   tests on the fixtures already committed. Models enter the export here, with AC2 (without its
+   animation), AC5 and AC10.
 7. **Animations and rigs:** the rest of C9 (script step 4, avatarFrom, the follow transform and
-   the humanoid suggestion), the mesh-less animation fixture, the Blender-backed animation
-   assertions, AC6, and AC2 with its animation.
+   the humanoid suggestion), the Game tab's humanoid option, avatarFrom field and takes, the
+   mesh-less animation fixture, the Blender-backed animation assertions, AC6, and AC2 with its
+   animation.
 
 **Guards between steps.** Each step refuses what a later step has yet to make right, so no
 intermediate build ever writes a bundle that breaks the contract. Each guard is an ordinary
