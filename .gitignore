@@ -81,6 +81,8 @@ scratch/
 *.mat
 *.vrmat
 *.sbsar
+# The game export's fixture library is committed, with its FBX, OBJ and EXR files (plan C16)
+!apps/desktop/src-tauri/tests/fixtures/game-export/library/**
 
 # ── Scratch / Local Test Scripts ───────────────────────────────────────────
 check_db.py

@@ -404,6 +404,68 @@ export interface ExportSettings {
 /** The fields to change, where null clears one */
 export type ExportSettingsPatch = Partial<ExportSettings>;
 
+/** A URP Lit texture role, as the game's asset contract names it */
+export type TextureRole =
+  | 'BaseColor'
+  | 'Normal'
+  | 'MetallicSmoothness'
+  | 'Occlusion'
+  | 'Emission'
+  | 'Height';
+
+/** An asset file an export check names */
+export interface ExportAssetRef {
+  libraryId: string;
+  assetId: string;
+  /** Relative to the library root */
+  filePath: string;
+}
+
+/** Something that refuses the export, with the assets it is about */
+export interface ExportProblem {
+  message: string;
+  assets: ExportAssetRef[];
+}
+
+/** One row of the Export view (plan C14) */
+export interface ExportCheckAsset extends ExportAssetRef {
+  /** `other` is a member the game can't take, such as a document */
+  kind: 'model' | 'texture' | 'animation' | 'other';
+  /** Its default name, or null when its file name gives none */
+  assetName: string | null;
+  role: TextureRole | null;
+  /** Its pack's id, or null when it is in no pack */
+  pack: string | null;
+  status: 'ready' | 'problem';
+}
+
+/** A pack of the domain, as the manifest names it (plan C6) */
+export interface ExportPack {
+  id: string;
+  name: string;
+  version?: string;
+  publisher?: string;
+  sourceUrl?: string;
+  licence: { spdx: string | null; name: string; url?: string };
+  origin: 'unity' | 'unreal' | 'generic';
+  libraryId: string;
+  /** The pack folder, relative to the library root */
+  path: string;
+  normalConvention: 'opengl' | 'directx';
+}
+
+/** What a domain's export Check found */
+export interface ExportCheck {
+  domain: string;
+  /** Where the bundle goes, once the export root and root collection are set */
+  bundlePath: string | null;
+  assets: ExportCheckAsset[];
+  packs: ExportPack[];
+  problems: ExportProblem[];
+  /** The manifest of the ready assets, as the bundle would hold it */
+  manifest: unknown;
+}
+
 /** Where a provider's key comes from. It never carries the key. */
 export interface ProviderStatus {
   provider: AiProvider;

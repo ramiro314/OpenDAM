@@ -1,0 +1,26 @@
+{
+  "name": "dungeon-props",
+  "title": "Dungeon Props",
+  "version": "1.2.0",
+  "contributors": [
+    {
+      "title": "Stylarts",
+      "roles": [
+        "publisher"
+      ]
+    }
+  ],
+  "sources": [
+    {
+      "title": "Store page",
+      "path": "https://example.com/dungeon-props"
+    }
+  ],
+  "licenses": [
+    {
+      "name": "LicenseRef-Stylarts-EULA",
+      "title": "Stylarts Standard EULA",
+      "path": "https://example.com/stylarts-eula"
+    }
+  ]
+}

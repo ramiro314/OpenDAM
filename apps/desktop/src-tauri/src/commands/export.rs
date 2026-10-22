@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use tauri::State;
 
-use crate::export::cache;
 use crate::export::settings::{self, ExportSettings};
+use crate::export::{cache, check};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -28,4 +28,15 @@ pub async fn set_export_settings(
 #[tauri::command]
 pub async fn clear_export_cache(state: State<'_, Arc<AppState>>) -> Result<usize> {
     cache::clear(&state.db.get_all_libraries().await).await
+}
+
+/// Checks the domain collection `domain_id` for export (plan C14): every asset with its kind,
+/// default name, pack and status, every problem that refuses the export, and the manifest it
+/// would write.
+#[tauri::command]
+pub async fn check_export(
+    domain_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<check::CheckReport> {
+    check::check(&state.db, &domain_id).await
 }

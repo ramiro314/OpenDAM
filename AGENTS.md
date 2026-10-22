@@ -38,9 +38,13 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
   src-tauri/
     src/commands/             Tauri IPC commands (asset, autotag, collection, export, library, preview, settings, shell, tag)
     src/autotag/              AI auto-tagging: settings, keyring credentials, providers, run engine and run tables
-    src/export/               Game export to Dungeon Game bundles: contract (schema validation), settings,
-                              the export cache, and check_outside_libraries, which refuses an export root
-                              equal to, inside or holding a library root, after resolving symlinks
+    src/export/               Game export to Dungeon Game bundles: contract (schema validation and the
+                              importer's other rules), settings, the export cache, check_outside_libraries,
+                              which refuses an export root equal to, inside or holding a library root,
+                              after resolving symlinks, and check, the Export view's Check over a domain
+                              (names, packs, textures, conversion and hashes, memoized in file_hashes)
+    tests/fixtures/game-export/  The export's fixture library, made by make_fixtures.py under Blender and
+                              committed with its output
     src/db.rs                 Master DB + per-library SQLite pools and pragmas
     src/watcher.rs            Directory indexing and change detection
     src/preview.rs            Rust raster thumbnails + the persistent Python worker bridge

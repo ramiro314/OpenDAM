@@ -1,0 +1,10 @@
+{
+  "contractVersion": 1,
+  "steps": [
+    {
+      "tool": "UE Asset Exporter",
+      "toolVersion": "5.4",
+      "from": "uasset"
+    }
+  ]
+}

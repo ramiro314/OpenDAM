@@ -25,6 +25,7 @@ import type {
   AnthropicAccess,
   ClaudePlanStatus,
   AiSettingsPatch,
+  ExportCheck,
   ExportSettings,
   ExportSettingsPatch,
   ProviderStatus,
@@ -155,6 +156,8 @@ export const api = {
     invoke<ExportSettings>('set_export_settings', { patch }),
   /** Deletes every open library's export cache, returning how many it deleted */
   clearExportCache: () => invoke<number>('clear_export_cache'),
+  /** Reads a domain collection and lists its assets and the problems that refuse its export */
+  checkExport: (domainId: string) => invoke<ExportCheck>('check_export', { domainId }),
 
   // Auto-tagging runs. Progress arrives as `autotag:updated` events.
   listAutotagProviders: () => invoke<AutotagProviderOption[]>('list_autotag_providers'),
