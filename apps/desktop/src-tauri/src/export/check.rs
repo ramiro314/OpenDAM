@@ -5034,6 +5034,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_blender_job_that_leaves_no_result_is_a_problem_naming_its_model() {
+        let f = fixture().await;
+        let stool = "Dungeon Props/Models/SM_Stool.fbx";
+        let totem = "Dungeon Props/Models/SM_Totem.fbx";
+        collection(&f, "domain", "Props", "dg", &[stool, totem]).await;
+        let paths = |problem: &Problem| -> Vec<String> {
+            problem.assets.iter().map(|a| a.file_path.clone()).collect()
+        };
+
+        // Refused by the gate, both models are named in one problem
+        let refused = tempfile::tempdir().unwrap();
+        set_blender(&f, &stub_blender(refused.path(), "4.5.3 LTS")).await;
+        let (inspection, progress) = normalize_domain(&f, &Facts::fixture()).await;
+        let report = &inspection.report;
+        assert_eq!(
+            messages(report),
+            [format!(
+                "{stool}, {totem}: the export cache doesn't hold their normalized FBX files, so \
+                 Blender must make them: Blender 4.5.3 isn't 5.2.x, the only version exports \
+                 accept"
+            )]
+        );
+        assert_eq!(paths(&report.problems[0]), [stool, totem]);
+        assert_eq!(progress, []);
+
+        // A Blender of the series runs each job, which exits without writing a result
+        let dir = tempfile::tempdir().unwrap();
+        set_blender(&f, &stub_blender(dir.path(), "5.2.2")).await;
+        let (inspection, progress) = normalize_domain(&f, &Facts::fixture()).await;
+        let report = &inspection.report;
+        assert_eq!(
+            messages(report),
+            [stool, totem]
+                .map(|path| format!("{path}: Blender exited without a result: Blender 5.2.2"))
+        );
+        assert_eq!(paths(&report.problems[0]), [stool]);
+        assert_eq!(paths(&report.problems[1]), [totem]);
+        for path in [stool, totem] {
+            let row = report
+                .assets
+                .iter()
+                .find(|a| a.asset.file_path == path)
+                .unwrap();
+            assert_eq!(row.status, Status::Problem, "{path}");
+        }
+        assert_eq!(model_entries(report), Vec::<&Value>::new());
+        assert_valid(report);
+        let entries: Vec<_> =
+            std::fs::read_dir(cache::cache_dir(&f.library.root_path).join("models"))
+                .map(|dir| dir.map(|e| e.unwrap().file_name()).collect())
+                .unwrap_or_default();
+        assert_eq!(
+            entries,
+            Vec::<std::ffi::OsString>::new(),
+            "a failed job left a cache entry"
+        );
+        // Each job's end is reported, failed or not
+        assert_eq!(
+            progress[0],
+            Progress {
+                done: 0,
+                total: 2,
+                asset: None
+            }
+        );
+        let dones: Vec<usize> = progress[1..].iter().map(|p| p.done).collect();
+        assert_eq!(dones, [1, 2]);
+        let mut ended: Vec<String> = progress[1..]
+            .iter()
+            .map(|p| p.asset.clone().unwrap())
+            .collect();
+        ended.sort();
+        assert_eq!(ended, [stool, totem]);
+    }
+
+    #[tokio::test]
+    async fn an_fbx_rewritten_at_the_same_size_and_mtime_misses_its_old_cache_entry() {
+        let f = fixture().await;
+        let stool = "Dungeon Props/Models/SM_Stool.fbx";
+        collection(&f, "domain", "Props", "dg", &[stool]).await;
+        cache_model(
+            &f,
+            stool,
+            Origin::Generic,
+            &["Material"],
+            blender::test_normalized(&["Material"], None, &[], &[]),
+        );
+        let memo_row = || async {
+            sqlx::query_scalar::<_, String>("SELECT sha256 FROM file_hashes WHERE file_path = ?")
+                .bind(stool)
+                .fetch_one(&f.library.pool)
+                .await
+                .unwrap()
+        };
+        let source = f.library.root_path.join(stool);
+        let original = std::fs::read(&source).unwrap();
+
+        // The first Check is served the entry, and memoizes the FBX's hash
+        let report = inspect_domain_cached(&f).await;
+        assert_eq!(model_entries(&report).len(), 1);
+        assert_eq!(memo_row().await, hashes::sha256_bytes(&original));
+
+        // Rewritten within its mtime's resolution: same size, same mtime, other bytes
+        let mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
+        let mut rewritten = original.clone();
+        let last = rewritten.len() - 1;
+        rewritten[last] ^= 0xff;
+        std::fs::write(&source, &rewritten).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().len(),
+            original.len() as u64
+        );
+
+        let report = inspect_domain_cached(&f).await;
+        assert_eq!(messages(&report), Vec::<&str>::new());
+        assert_eq!(
+            model_entries(&report),
+            Vec::<&Value>::new(),
+            "the rewritten FBX was served its old entry"
+        );
+        assert_eq!(memo_row().await, hashes::sha256_bytes(&rewritten));
+    }
+
+    /// Inspects the domain from the export cache alone, as the Game tab does.
+    async fn inspect_domain_cached(f: &Fixture) -> CheckReport {
+        inspect(
+            &f.db,
+            "domain",
+            &Facts::fixture(),
+            &fresh_memo(),
+            Models::Cached,
+        )
+        .await
+        .unwrap()
+        .report
+    }
+
+    #[tokio::test]
     async fn slots_blender_and_the_worker_read_differently_are_a_problem_naming_the_model() {
         let f = fixture().await;
         let dir = tempfile::tempdir().unwrap();
