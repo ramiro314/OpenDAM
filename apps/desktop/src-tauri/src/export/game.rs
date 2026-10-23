@@ -547,13 +547,13 @@ mod tests {
         );
     }
 
-    /// A Blender at `dir/blender` that answers 5.2.2 and leaves `dir/ran` behind when anything
-    /// runs it.
-    fn recording_blender(dir: &Path) -> std::path::PathBuf {
+    /// A Blender at `dir/blender` that answers `version` and adds a line to `dir/ran` each time
+    /// anything runs it.
+    fn recording_blender(dir: &Path, version: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("blender");
         let script = format!(
-            "#!/bin/sh\necho run >> '{}'\nprintf 'Blender 5.2.2\\n'\n",
+            "#!/bin/sh\necho run >> '{}'\nprintf 'Blender {version}\\n'\n",
             dir.join("ran").display()
         );
         std::fs::write(&path, script).unwrap();
@@ -568,12 +568,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_the_tab_never_starts_blender_and_a_missing_one_says_why() {
+    async fn opening_the_tab_never_starts_blender_and_a_missing_or_wrong_one_says_why() {
         let f = fixture().await;
         let stool = "Dungeon Props/Models/SM_Stool.fbx";
         collection(&f, "props", "Props", "dg", &[stool]).await;
         let dir = tempfile::tempdir().unwrap();
-        set_blender(&f, &recording_blender(dir.path())).await;
+        set_blender(&f, &recording_blender(dir.path(), "5.2.2")).await;
         let shown = detail_of(&f, stool).await.unwrap();
         assert_eq!(shown.domains, ["Props"]);
         assert!(!dir.path().join("ran").exists(), "Blender ran");
@@ -589,6 +589,21 @@ mod tests {
             ))
         );
         let models = cache::cache_dir(&f.library.root_path).join("models");
+        assert!(!models.exists(), "nothing was written");
+
+        // A Blender of another series is asked only its version, and the reason names it
+        let wrong = tempfile::tempdir().unwrap();
+        set_blender(&f, &recording_blender(wrong.path(), "4.5.3 LTS")).await;
+        let shown = exported_view(&f.db, &id, &Snapshot::fixture()).await;
+        assert_eq!(
+            shown,
+            Err(format!(
+                "Blender can't show {stool} as exported: Blender 4.5.3 isn't 5.2.x, the only \
+                 version exports accept"
+            ))
+        );
+        let runs = std::fs::read_to_string(wrong.path().join("ran")).unwrap();
+        assert_eq!(runs.lines().count(), 1, "only --version ran");
         assert!(!models.exists(), "nothing was written");
 
         let image = id_of(&f.library.pool, "Kenney Crates/crate_wood.png").await;
