@@ -22,13 +22,22 @@ use crate::preview::is_native_image;
 /// batch writes that would corrupt the asset catalogue.
 pub struct IndexLock(PathBuf);
 
+/// Seconds after which another holder's `index.lock` counts as stale. Every holder judges a lock
+/// by this one window, so none takes over a lock another still treats as live.
+const STALE_AFTER_SECS: u64 = 120;
+
 impl IndexLock {
-    /// Try to acquire the lock.
+    /// The lock file of the library rooted at `root`.
+    fn path(root: &Path) -> PathBuf {
+        root.join(".opendam").join("index.lock")
+    }
+
+    /// Try to acquire the advisory lock of the library rooted at `root`.
     ///
     /// Returns `None` if another instance acquired the lock within the last
-    /// `stale_after` seconds (default: 120s). Returns `Some(guard)` on success.
-    pub fn try_acquire(opendam_dir: &Path, stale_after: u64) -> Option<Self> {
-        let lock_path = opendam_dir.join("index.lock");
+    /// `STALE_AFTER_SECS` seconds. Returns `Some(guard)` on success.
+    pub fn try_acquire(root: &Path) -> Option<Self> {
+        let lock_path = Self::path(root);
 
         // If the lock file exists and is recent, another indexer is running.
         if let Ok(meta) = std::fs::metadata(&lock_path) {
@@ -43,7 +52,7 @@ impl IndexLock {
                         now.saturating_sub(t.as_secs())
                     })
                     .unwrap_or(u64::MAX);
-                if age < stale_after {
+                if age < STALE_AFTER_SECS {
                     tracing::info!(
                         "index.lock is {}s old — another machine is indexing, skipping.",
                         age
@@ -189,7 +198,7 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
     let index_guard = index_lock.lock().await;
 
     // ── Advisory lock: skip if another machine is already indexing ────────
-    let Some(lock) = IndexLock::try_acquire(&library.root_path.join(".opendam"), 120) else {
+    let Some(lock) = IndexLock::try_acquire(&library.root_path) else {
         return Ok(()); // another instance is indexing — yield
     };
 
@@ -217,7 +226,7 @@ pub async fn index_paths_locked(
     else {
         return Ok(());
     };
-    debug_assert!(lock.0 == root_path.join(".opendam").join("index.lock"));
+    debug_assert!(lock.0 == IndexLock::path(&root_path));
 
     index_pool(&pool, &root_path, paths, prune).await?;
 
@@ -1260,7 +1269,7 @@ mod tests {
         let pack = [dir.path().join("Pub/Pack").to_string_lossy().to_string()];
         let lock = db.index_lock(&lib.id);
         let index_guard = lock.lock().await;
-        let advisory = IndexLock::try_acquire(&dir.path().join(".opendam"), 120).unwrap();
+        let advisory = IndexLock::try_acquire(dir.path()).unwrap();
 
         let failing = TestJournal { fail: true };
         let failed = index_paths_locked(
@@ -1328,7 +1337,7 @@ mod tests {
         let root = [dir.path().to_string_lossy().to_string()];
         let lock = db.index_lock(&lib.id);
         let index_guard = lock.lock().await;
-        let advisory = IndexLock::try_acquire(&dir.path().join(".opendam"), 120).unwrap();
+        let advisory = IndexLock::try_acquire(dir.path()).unwrap();
 
         tokio::time::timeout(Duration::from_secs(10), async {
             index_paths_locked(&db, &lib.id, &root, Prune::Now, &index_guard, &advisory)

@@ -2309,7 +2309,7 @@ pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassR
 pub async fn rebuild_library(db: &Database, library: &LibraryHandle) {
     let lock = db.index_lock(&library.id);
     let index_guard = lock.lock().await;
-    match IndexLock::try_acquire(&library.root_path.join(".opendam"), 120) {
+    match IndexLock::try_acquire(&library.root_path) {
         Some(advisory) => rebuild_library_locked(db, library, &index_guard, &advisory).await,
         // Another machine is indexing. The pass runs anyway, as it always has: holding off and
         // catching up later is the pack import's advisory lock work (plan pack-import).
