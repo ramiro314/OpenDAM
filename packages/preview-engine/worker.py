@@ -8,6 +8,7 @@ Supported operations (Phase 1):
   - image_thumb   → generate thumbnail for common image formats
   - video_thumb   → extract a frame from a video (requires ffmpeg)
   - model_meta    → extract metadata from 3D model files (stub → Phase 2)
+  - fbx_facts     → an FBX's materials, meshes, bones and takes, for the game export
   - engine_info   → the engine's `preview_version`
 
 Phase 2 will add:
@@ -1087,6 +1088,178 @@ def model_meta(
     return res
 
 
+# ── Game export facts ─────────────────────────────────────────────────────
+# FBX material properties a texture connects to, by the texture type `fbx_facts` reports.
+# Blender writes metallic to ReflectionFactor and roughness to ShininessExponent.
+FBX_TEXTURE_TYPES = {
+    "DiffuseColor": "baseColor",
+    "Maya|baseColor": "baseColor",
+    "Maya|TEX_color_map": "baseColor",
+    "NormalMap": "normal",
+    "Bump": "normal",
+    "Maya|normalCamera": "normal",
+    "Maya|TEX_normal_map": "normal",
+    "ReflectionFactor": "metalness",
+    "Maya|metalness": "metalness",
+    "Maya|TEX_metallic_map": "metalness",
+    "ShininessExponent": "roughness",
+    "Maya|specularRoughness": "roughness",
+    "Maya|TEX_roughness_map": "roughness",
+    "Maya|TEX_ao_map": "occlusion",
+    "EmissiveColor": "emissive",
+    "Maya|emissionColor": "emissive",
+    "Maya|TEX_emissive_map": "emissive",
+    "DisplacementColor": "height",
+    "Maya|TEX_height_map": "height",
+}
+
+_BONE_TYPES = ("LimbNode", "Limb", "Root")
+
+
+def _object_name(raw) -> str:
+    """An object's name without its class: binary `Cube\\x00\\x01Model`, ASCII `Model::Cube`."""
+    raw = raw if isinstance(raw, str) else ""
+    if "\x00\x01" in raw:
+        return raw.split("\x00\x01", 1)[0]
+    return raw.split("::", 1)[1] if "::" in raw else raw
+
+
+def is_collision(name: str, patterns: dict) -> bool:
+    """Whether a mesh named `name` is a collision mesh by `patterns` (`prefixes` and
+    `suffixes`, matched ignoring case), which the export drops."""
+    lower = name.lower()
+    return any(lower.startswith(p.lower()) for p in patterns.get("prefixes", ())) or any(
+        lower.endswith(s.lower()) for s in patterns.get("suffixes", ())
+    )
+
+
+def fbx_facts(source: str, patterns: dict, library_root: str | None = None) -> dict:
+    """
+    What the game export needs to know about the FBX at `source` (plan game-export C12), read
+    from its node tree by `fbx_nodes`, so only materials the file declares count:
+
+    - `slots`: the materials of kept meshes, in the file's material order, a material with the
+      same name as another listed again, each with its `textures` by type, each texture as the
+      `file` and `relative` paths the FBX gives;
+    - `kept_meshes` and `dropped_meshes`, by name, a mesh being dropped when `patterns` match it
+      (`is_collision`), `has_kept_mesh`, and `kept_mesh_without_material`;
+    - `bones`, and `takes`: the takes that animate something, by name.
+
+    It reads no texture file, and reads the FBX only when it lies inside `library_root`, with
+    symlinks resolved.
+    """
+    import os
+
+    import fbx_nodes
+
+    if not library_root:
+        return {"ok": False, "error": "no library root was given"}
+    root = Path(os.path.realpath(library_root))
+    model = Path(os.path.realpath(source))
+    if model != root and root not in model.parents:
+        return {"ok": False, "error": f"{source} is outside the library root {library_root}"}
+    try:
+        doc = fbx_nodes.read(model)
+    except (OSError, fbx_nodes.FbxError) as e:
+        return {"ok": False, "error": f"can't read the FBX: {e}"}
+    if doc.version < 7000:
+        return {"ok": False, "error": f"FBX version {doc.version} is older than FBX 7"}
+
+    section = doc.sections.get("Objects")
+    objects = {o.props[0]: o for o in (section.children if section else []) if o.props}
+    # child id -> [(parent id, property)], and parent id -> [(child id, property)]
+    up: dict = {}
+    down: dict = {}
+    section = doc.sections.get("Connections")
+    for c in section.children if section else []:
+        if c.name == "C" and len(c.props) >= 3:
+            prop = c.props[3] if len(c.props) > 3 else None
+            up.setdefault(c.props[1], []).append((c.props[2], prop))
+            down.setdefault(c.props[2], []).append((c.props[1], prop))
+
+    def kind(oid) -> str | None:
+        found = objects.get(oid)
+        return found.name if found else None
+
+    def name(oid) -> str:
+        return _object_name(objects[oid].props[1] if len(objects[oid].props) > 1 else "")
+
+    def subtype(obj) -> str:
+        return obj.props[2] if len(obj.props) > 2 and isinstance(obj.props[2], str) else ""
+
+    meshes = [o for o in objects.values() if o.name == "Model" and subtype(o) == "Mesh"]
+    kept, dropped = [], []
+    for mesh in meshes:
+        (dropped if is_collision(name(mesh.props[0]), patterns) else kept).append(mesh.props[0])
+    kept_set = set(kept)
+
+    def materials_of(model_id) -> list:
+        return [c for c, _ in down.get(model_id, []) if kind(c) == "Material"]
+
+    used = {m for model_id in kept for m in materials_of(model_id)}
+
+    def texture_ref(tid) -> dict:
+        obj = objects[tid]
+        file, relative = obj.child("FileName"), obj.child("RelativeFilename")
+        return {
+            "file": file.props[0] if file and file.props else None,
+            "relative": relative.props[0] if relative and relative.props else None,
+        }
+
+    slots = []
+    for oid, obj in objects.items():
+        if obj.name != "Material" or oid not in used:
+            continue
+        textures: dict[str, list] = {}
+        for child, prop in down.get(oid, []):
+            texture_type = FBX_TEXTURE_TYPES.get(prop or "")
+            if texture_type is None:
+                continue
+            # A layered texture holds its layers below it
+            if kind(child) == "LayeredTexture":
+                layers = [c for c, _ in down.get(child, []) if kind(c) == "Texture"]
+            else:
+                layers = [child] if kind(child) == "Texture" else []
+            textures.setdefault(texture_type, []).extend(texture_ref(t) for t in layers)
+        slots.append({"name": name(oid), "textures": textures})
+
+    def has_keys(curve_id) -> bool:
+        key_time = objects[curve_id].child("KeyTime")
+        if not key_time or not key_time.props:
+            return False
+        value = key_time.props[0]
+        return getattr(value, "count", len(key_time.props)) > 0
+
+    def animates(curve_node) -> bool:
+        targets = [p for p, _ in up.get(curve_node, []) if kind(p) not in (None, "AnimationLayer")]
+        curves = [c for c, _ in down.get(curve_node, []) if kind(c) == "AnimationCurve"]
+        return bool(targets) and any(has_keys(c) for c in curves)
+
+    takes = []
+    for oid, obj in objects.items():
+        if obj.name != "AnimationStack":
+            continue
+        layers = [c for c, _ in down.get(oid, []) if kind(c) == "AnimationLayer"]
+        nodes = [c for layer in layers for c, _ in down.get(layer, [])]
+        if any(kind(n) == "AnimationCurveNode" and animates(n) for n in nodes):
+            takes.append(name(oid))
+
+    return {
+        "ok": True,
+        "slots": slots,
+        "kept_meshes": [name(m) for m in kept],
+        "dropped_meshes": [name(m) for m in dropped],
+        "has_kept_mesh": bool(kept),
+        "kept_mesh_without_material": any(not materials_of(m) for m in kept_set),
+        "bones": [
+            name(o.props[0])
+            for o in objects.values()
+            if o.name == "Model" and subtype(o) in _BONE_TYPES
+        ],
+        "takes": takes,
+    }
+
+
 # ── JSON-RPC loop ─────────────────────────────────────────────────────────
 def engine_info() -> dict:
     """The engine's version, which the app asks each new worker process. Loads nothing."""
@@ -1104,6 +1277,7 @@ DISPATCH = {
         p.get("library_root"),
         p.get("pack_root"),
     ),
+    "fbx_facts": lambda p: fbx_facts(p["source"], p["patterns"], p.get("library_root")),
 }
 
 

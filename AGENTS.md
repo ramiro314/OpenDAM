@@ -44,18 +44,22 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               which refuses an export root equal to, inside or holding a library root,
                               after resolving symlinks, blender.rs, which finds Blender and gates it to
                               BLENDER_SERIES (5.2), check, the Export view's Check over a domain
-                              (names, packs, textures, conversion and hashes, memoized in file_hashes),
-                              fingerprint, what a Check read, and bundle, which stages the bundle
-                              beside the domain's folder, diffs it and swaps it in by renaming
+                              (names, packs, textures, conversion and hashes, memoized in file_hashes,
+                              and FBX models and animations by fbx_facts, which asks the preview
+                              worker and caches its answers, with collision::PATTERNS, the one list
+                              of collision meshes the export drops), fingerprint, what a Check
+                              read, and bundle, which stages the bundle beside the domain's folder,
+                              diffs it and swaps it in by renaming
     tests/fixtures/game-export/  The export's fixture library, made by make_fixtures.py under Blender and
-                              committed with its output
+                              committed with its output, and fbx_facts.json, its FBX files' facts,
+                              which test_fbx_facts.py checks and the Check's tests read
     src/db.rs                 Master DB + per-library SQLite pools and pragmas
     src/watcher.rs            Directory indexing and change detection
     src/preview.rs            Rust raster thumbnails + the persistent Python worker bridge
     migrations/               Library DB schema
     contract/                 Pinned copy of dungeon-game's asset contract schema, never edited by hand:
                               SOURCE.md pins it, scripts/sync-asset-contract.sh re-copies it
-packages/preview-engine/      Python worker (worker.py), uv project, dev venv in .venv/
+packages/preview-engine/      Python worker (worker.py, fbx_nodes.py: an FBX node-tree reader), uv project, dev venv in .venv/
 docs/adr, docs/specs          Upstream design records, kept as history
 docs/plans                    Plans for this fork
 .github/                      CI workflow, Dependabot, Tauri version check script
@@ -82,6 +86,8 @@ docs/plans                    Plans for this fork
   requests over the existing stream; one process serves every file. The queue starts it eagerly
   and asks each new process its `engine_info`, publishing the answer in
   `AppState::engine_version` (`preview::PreviewEngine`). Replies are matched to requests by `id`.
+  Other parts of the app, such as the game export's `fbx_facts`, send a `preview::WorkerRequest`
+  to the queue, which serves it on that process between jobs.
 - **Zero telemetry.** The app makes no network calls to analytics or tracking services. The only
   outbound calls are AI tagging requests to the provider you configured (the Anthropic API, your
   local `claude` CLI, or TypeSafe's Jev). They are made only for runs you start, and nothing is

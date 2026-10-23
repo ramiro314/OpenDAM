@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::db::Database;
 use crate::export::check::{self, BundleFile, CheckReport, Inspection, Problem, Status};
+use crate::export::fbx_facts;
 use crate::export::fingerprint::Fingerprint;
 use crate::export::{contract, hashes};
 
@@ -443,10 +444,15 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 }
 
 impl Exports {
-    /// Checks the domain `domain_id` (C14): recovers its folder after a crash, diffs the bundle
-    /// against the previous one, and, when nothing refuses the export, stages it. A domain's
-    /// earlier staged bundle is discarded first.
-    pub async fn check(&self, db: &Database, domain_id: &str) -> Result<CheckReport, String> {
+    /// Checks the domain `domain_id` (C14), reading FBX facts with `facts`: recovers its folder
+    /// after a crash, diffs the bundle against the previous one, and, when nothing refuses the
+    /// export, stages it. A domain's earlier staged bundle is discarded first.
+    pub async fn check(
+        &self,
+        db: &Database,
+        domain_id: &str,
+        facts: &impl fbx_facts::Reader,
+    ) -> Result<CheckReport, String> {
         let mut staged = self.staged.lock().await;
         if let Some(earlier) = staged.remove(domain_id) {
             blocking(move || discard(&earlier.staging)).await?;
@@ -455,7 +461,7 @@ impl Exports {
             mut report,
             files,
             fingerprint,
-        } = check::inspect(db, domain_id).await?;
+        } = check::inspect(db, domain_id, facts).await?;
         let Some(bundle) = report.bundle_path.clone().map(PathBuf::from) else {
             return Ok(report);
         };
@@ -505,14 +511,19 @@ impl Exports {
     /// Swaps the domain's staged bundle in (C15 step 3), once a fresh read of everything the
     /// Check read finds no change (C14). On a change, the staged bundle is discarded and nothing
     /// is written.
-    pub async fn export(&self, db: &Database, domain_id: &str) -> Result<ExportOutcome, String> {
+    pub async fn export(
+        &self,
+        db: &Database,
+        domain_id: &str,
+        facts: &impl fbx_facts::Reader,
+    ) -> Result<ExportOutcome, String> {
         let mut staged = self.staged.lock().await;
         let Some(checked) = staged.remove(domain_id) else {
             return Ok(ExportOutcome::Stale {
                 changes: vec!["nothing is checked: the Check was discarded or never run".into()],
             });
         };
-        let now = check::inspect(db, domain_id).await;
+        let now = check::inspect(db, domain_id, facts).await;
         let mut changes = match &now {
             Ok(now) => checked.fingerprint.changes(&now.fingerprint),
             Err(e) => vec![e.clone()],
@@ -567,6 +578,15 @@ mod tests {
     use crate::db::insert_collection;
     use crate::export::test_fixture::*;
     use serde_json::json;
+
+    /// FBX facts for these tests' domains, which hold no FBX.
+    struct NoFbx;
+
+    impl fbx_facts::Reader for NoFbx {
+        async fn read(&self, source: &Path, _: &Path) -> Result<fbx_facts::FbxFacts, String> {
+            panic!("read {} for its facts", source.display())
+        }
+    }
 
     const TEXTURES: [&str; 4] = [
         "Dungeon Props/Textures/T_StoneFloor_D.png",
@@ -641,7 +661,7 @@ mod tests {
     }
 
     async fn export(f: &Fixture, exports: &Exports) -> ExportOutcome {
-        exports.export(&f.db, "props").await.unwrap()
+        exports.export(&f.db, "props", &NoFbx).await.unwrap()
     }
 
     #[tokio::test]
@@ -650,7 +670,7 @@ mod tests {
         domain(&f, &TEXTURES).await;
         let exports = Exports::default();
 
-        let report = exports.check(&f.db, "props").await.unwrap();
+        let report = exports.check(&f.db, "props", &NoFbx).await.unwrap();
         assert_eq!(report.problems, []);
         assert!(report.staged);
         let diff = report.diff.as_ref().unwrap();
@@ -718,7 +738,7 @@ mod tests {
         assert_eq!(leftovers(&f), Vec::<String>::new());
 
         // A second export of the unchanged domain replaces the first with the same files
-        let again = exports.check(&f.db, "props").await.unwrap();
+        let again = exports.check(&f.db, "props", &NoFbx).await.unwrap();
         let diff = again.diff.as_ref().unwrap();
         assert_eq!(diff.previous_exported_at.as_deref(), Some(exported_at));
         assert!(diff.added.is_empty() && diff.changed.is_empty() && diff.removed.is_empty());
@@ -736,7 +756,7 @@ mod tests {
         let f = fixture().await;
         domain(&f, &TEXTURES[..3]).await;
         let exports = Exports::default();
-        exports.check(&f.db, "props").await.unwrap();
+        exports.check(&f.db, "props", &NoFbx).await.unwrap();
         assert!(matches!(
             export(&f, &exports).await,
             ExportOutcome::Exported { .. }
@@ -755,7 +775,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = exports.check(&f.db, "props").await.unwrap();
+        let report = exports.check(&f.db, "props", &NoFbx).await.unwrap();
         let diff = report.diff.as_ref().unwrap();
         assert_eq!(names(&diff.added), [("Moss", Some("BaseColor"))]);
         assert_eq!(names(&diff.changed), [("CrateWood", Some("BaseColor"))]);
@@ -779,7 +799,7 @@ mod tests {
         let f = fixture().await;
         domain(&f, &TEXTURES).await;
         let exports = Exports::default();
-        exports.check(&f.db, "props").await.unwrap();
+        exports.check(&f.db, "props", &NoFbx).await.unwrap();
         export(&f, &exports).await;
         let before = std::fs::read(bundle_dir(&f).join(MANIFEST)).unwrap();
 
@@ -790,7 +810,7 @@ mod tests {
             &["Dungeon Props/Textures/T_Sky.exr"],
         )
         .await;
-        let report = exports.check(&f.db, "props").await.unwrap();
+        let report = exports.check(&f.db, "props", &NoFbx).await.unwrap();
 
         assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
         assert!(!report.staged);
@@ -828,7 +848,7 @@ mod tests {
         let f = fixture().await;
         domain(&f, &TEXTURES).await;
         let exports = Exports::default();
-        exports.check(&f.db, "props").await.unwrap();
+        exports.check(&f.db, "props", &NoFbx).await.unwrap();
         export(&f, &exports).await;
         let files = listing(&bundle_dir(&f));
 
@@ -838,7 +858,7 @@ mod tests {
         std::fs::create_dir_all(parent.join(".Props.staging-crashed/Textures")).unwrap();
         std::fs::write(parent.join(".Props.staging-crashed/Textures/x.png"), "x").unwrap();
 
-        let report = exports.check(&f.db, "props").await.unwrap();
+        let report = exports.check(&f.db, "props", &NoFbx).await.unwrap();
         assert_eq!(report.problems, []);
         assert_eq!(listing(&bundle_dir(&f)), files);
         assert_bundle(&bundle_dir(&f));
@@ -855,7 +875,7 @@ mod tests {
         let f = fixture().await;
         domain(&f, &TEXTURES).await;
         let exports = Exports::default();
-        exports.check(&f.db, "props").await.unwrap();
+        exports.check(&f.db, "props", &NoFbx).await.unwrap();
         export(&f, &exports).await;
         let parent = f.export_root.join("DungeonGame");
         // Another domain's folders are never touched
@@ -863,14 +883,14 @@ mod tests {
             std::fs::create_dir(parent.join(name)).unwrap();
         }
 
-        exports.check(&f.db, "props").await.unwrap();
+        exports.check(&f.db, "props", &NoFbx).await.unwrap();
         exports.discard("props").await.unwrap();
         assert_eq!(leftovers(&f), [".PropsTwo.old-b", ".PropsTwo.staging-c"]);
         assert!(bundle_dir(&f).is_dir());
 
         std::fs::rename(bundle_dir(&f), parent.join(".Props.old-a")).unwrap();
         std::fs::create_dir(parent.join(".Props.old-b")).unwrap();
-        let report = exports.check(&f.db, "props").await.unwrap();
+        let report = exports.check(&f.db, "props", &NoFbx).await.unwrap();
         assert!(!report.staged);
         assert_eq!(report.problems.len(), 1);
         assert!(
@@ -901,7 +921,7 @@ mod tests {
         std::fs::write(bundle_dir(&f).join("notes.txt"), "mine").unwrap();
         let exports = Exports::default();
 
-        let report = exports.check(&f.db, "props").await.unwrap();
+        let report = exports.check(&f.db, "props", &NoFbx).await.unwrap();
         assert!(!report.staged);
         assert_eq!(report.problems.len(), 1);
         assert!(report.problems[0]
@@ -916,7 +936,7 @@ mod tests {
         let f = fixture().await;
         domain(&f, &TEXTURES).await;
         let exports = Exports::default();
-        assert!(exports.check(&f.db, "props").await.unwrap().staged);
+        assert!(exports.check(&f.db, "props", &NoFbx).await.unwrap().staged);
         assert_eq!(leftovers(&f).len(), 1);
 
         exports.discard("props").await.unwrap();
@@ -1029,7 +1049,7 @@ mod tests {
             domain(&f, &TEXTURES).await;
             let exports = Exports::default();
             assert!(
-                exports.check(&f.db, "props").await.unwrap().staged,
+                exports.check(&f.db, "props", &NoFbx).await.unwrap().staged,
                 "{case}"
             );
 

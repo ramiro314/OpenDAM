@@ -73,6 +73,11 @@ impl Probes {
         &self.root
     }
 
+    /// Records `stamp`, taken where the file at `path` was read, such as by a concurrent read.
+    pub fn record(&mut self, path: &str, stamp: Stamp) {
+        self.seen.insert(path.to_string(), stamp);
+    }
+
     /// Stamps the file at `path` (relative to the library root) and records it.
     pub fn probe(&mut self, path: &str) -> Stamp {
         let stamp = Stamp::of(&self.root.join(path));

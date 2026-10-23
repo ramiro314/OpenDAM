@@ -51,9 +51,14 @@ pub struct Walker {
 
 impl Walker {
     pub fn new(root: &Path) -> Self {
+        Walker::with_probes(Probes::new(root))
+    }
+
+    /// A walker that goes on recording in `probes`, which hold the files already read.
+    pub fn with_probes(probes: Probes) -> Self {
         Walker {
             folders: HashMap::new(),
-            probes: Probes::new(root),
+            probes,
         }
     }
 
