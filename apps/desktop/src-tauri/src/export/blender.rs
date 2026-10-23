@@ -407,29 +407,42 @@ impl Runner {
 
     /// Runs `<blender> -b --factory-startup -P <script> -- <job.json> <result.json>`, with the
     /// script writing into the job's temporary folder, then checks the result and publishes
-    /// the FBX.
+    /// the FBX. Its file work runs off the async threads, since the FBX can be large.
     async fn normalize(&self, job: &Job) -> Result<Normalized, String> {
         let _permit = self
             .permits
             .acquire()
             .await
             .map_err(|_| "the Blender jobs were stopped".to_string())?;
-        let dir = tempfile::Builder::new()
-            .prefix("opendam-normalize-")
-            .tempdir()
-            .map_err(|e| format!("Could not make a folder for Blender's job: {e}"))?;
-        let script = dir.path().join("normalize.py");
-        let job_file = dir.path().join("job.json");
-        let result_file = dir.path().join("result.json");
-        let staged = dir.path().join("output.fbx");
+        let dir = tokio::task::spawn_blocking(|| {
+            tempfile::Builder::new()
+                .prefix("opendam-normalize-")
+                .tempdir()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("Could not make a folder for Blender's job: {e}"))?;
+        let normalized = self.normalize_in(dir.path(), job).await;
+        // Removing the folder deletes the staged FBX too
+        let _ = tokio::task::spawn_blocking(move || drop(dir)).await;
+        normalized
+    }
+
+    async fn normalize_in(&self, dir: &Path, job: &Job) -> Result<Normalized, String> {
+        let script = dir.join("normalize.py");
+        let job_file = dir.join("job.json");
+        let result_file = dir.join("result.json");
+        let staged = dir.join("output.fbx");
         let sent = Job {
             output: staged.clone(),
             ..job.clone()
         };
         let job_json = serde_json::to_vec(&sent).map_err(|e| e.to_string())?;
-        std::fs::write(&script, NORMALIZE_SCRIPT)
-            .and_then(|()| std::fs::write(&job_file, job_json))
-            .map_err(|e| format!("Could not write Blender's job: {e}"))?;
+        let written = match tokio::fs::write(&script, NORMALIZE_SCRIPT).await {
+            Ok(()) => tokio::fs::write(&job_file, job_json).await,
+            error => error,
+        };
+        written.map_err(|e| format!("Could not write Blender's job: {e}"))?;
 
         let child = tokio::process::Command::new(&self.blender.program)
             .args(["-b", "--factory-startup", "-P"])
@@ -453,33 +466,39 @@ impl Runner {
                 )
             })?
             .map_err(|e| format!("Blender's job failed: {e}"))?;
-        let normalized = match std::fs::read_to_string(&result_file) {
+        let normalized = match tokio::fs::read_to_string(&result_file).await {
             Ok(text) if output.status.success() => parse_result(&text)?,
             _ => return Err(crashed(&output)),
         };
         check(job, &normalized)?;
-        publish(&staged, &job.output)?;
+        publish(&staged, &job.output).await?;
         Ok(normalized)
     }
 }
 
 /// Puts the checked FBX at `staged` at `output`: copied beside it, then renamed over it, so
 /// `output` is only ever the old file or the whole new one.
-fn publish(staged: &Path, output: &Path) -> Result<(), String> {
+/// The staged FBX sits in the system's temporary folder, often another filesystem, so it is
+/// copied rather than renamed there.
+async fn publish(staged: &Path, output: &Path) -> Result<(), String> {
     let name = output
         .file_name()
         .ok_or("the job's output has no file name")?
         .to_string_lossy();
     let partial = output.with_file_name(format!(".{name}.{}.partial", uuid::Uuid::new_v4()));
-    let written = output
-        .parent()
-        .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| std::fs::copy(staged, &partial))
-        .and_then(|_| std::fs::rename(&partial, output));
-    written.map_err(|e| {
-        let _ = std::fs::remove_file(&partial);
-        format!("Could not write {}: {e}", output.display())
-    })
+    let written = async {
+        if let Some(parent) = output.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::copy(staged, &partial).await?;
+        tokio::fs::rename(&partial, output).await
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(format!("Could not write {}: {e}", output.display()));
+    }
+    Ok(())
 }
 
 /// Why a Blender job left no result: its status and the last lines it printed.
