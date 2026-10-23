@@ -1,6 +1,6 @@
 //! Materials and texture sets (plan game-export C7, C8). A pack's images are grouped into
 //! texture sets, and each slot of a model's kept meshes is given a name, a surface and a texture
-//! set per role, from the first source with an answer for that role (D11):
+//! set per role, every role from the first source with an answer for the slot (D11):
 //!
 //! 1. the FBX's own texture references, resolved inside the pack;
 //! 2. in a Unity pack, the slot's `.mat`, found through the model's `.fbx.meta` remap or by its
@@ -491,10 +491,20 @@ struct Answers {
 }
 
 impl Answers {
-    /// Takes `set` for the roles `layout` gives that no earlier source answered.
+    /// Takes `set` for the roles `layout` gives (D11): a slot takes every role from the first
+    /// source with an answer, so once one source has answered, a later one adds nothing.
     fn answer(&mut self, layout: Layout, set: usize, via: Via) {
         for role in layout.outputs() {
-            self.textures.entry(*role).or_insert((set, via));
+            self.answer_role(*role, set, via);
+        }
+    }
+
+    /// Takes `set` for `role`, unless an earlier source answered the slot or this one already
+    /// answered the role.
+    fn answer_role(&mut self, role: Role, set: usize, via: Via) {
+        let earlier = self.textures.values().any(|(_, v)| *v != via);
+        if !earlier {
+            self.textures.entry(role).or_insert((set, via));
         }
     }
 }
@@ -599,12 +609,12 @@ pub fn materials(
                 }
             }
             for (role, (_, set)) in best {
-                answers.textures.entry(role).or_insert((set, Via::Suffix));
+                answers.answer_role(role, set, Via::Suffix);
             }
         }
 
-        // 4. An image beside the model with its stem
-        if !answers.textures.contains_key(&Role::BaseColor) {
+        // 4. An image beside the model with its stem, when no other source answered
+        if answers.textures.is_empty() {
             let beside = [model.item_path, model.fbx_path];
             let same_stem = (0..images.images.len())
                 .filter(|i| {
@@ -1246,9 +1256,9 @@ mod tests {
     }
 
     #[test]
-    fn each_role_falls_through_to_the_next_source_on_its_own() {
-        // The FBX names only a base color: it wins over the slot's suffixed T_StoneFloor_D,
-        // and the normal map still comes from the suffix lookup
+    fn a_slot_takes_every_role_from_its_first_source_with_an_answer() {
+        // The FBX names only a base color: it wins over the slot's suffixed T_StoneFloor_D, and
+        // the slot takes nothing from a later source, not even T_StoneFloor_N's normal map
         let (images, floor) = infer_slot(
             "Dungeon Props",
             "Dungeon Props/Models/SM_Floor.fbx",
@@ -1257,22 +1267,14 @@ mod tests {
         );
         assert_eq!(
             textures(&images, &floor[0]),
-            [
-                (
-                    Role::BaseColor,
-                    paths(&["Dungeon Props/Textures/T_Wall_D.jpg"]),
-                    Via::Fbx
-                ),
-                (
-                    Role::Normal,
-                    paths(&["Dungeon Props/Textures/T_StoneFloor_N.png"]),
-                    Via::Suffix
-                ),
-            ]
+            [(
+                Role::BaseColor,
+                paths(&["Dungeon Props/Textures/T_Wall_D.jpg"]),
+                Via::Fbx
+            )]
         );
 
-        // The FBX's reference wins over the Unity material's base color, and the material
-        // still gives the normal map
+        // The FBX's reference wins over the Unity material, which then gives no normal map
         let (images, log) = infer_slot(
             "Unity Moss",
             "Unity Moss/Models/SM_Log.fbx",
@@ -1281,16 +1283,32 @@ mod tests {
         );
         assert_eq!(
             textures(&images, &log[0]),
+            [(
+                Role::BaseColor,
+                paths(&["Unity Moss/Models/T_Bark_D.png"]),
+                Via::Fbx
+            )]
+        );
+
+        // Without a reference, the slot takes its every role from suffixes
+        let (images, floor) = infer_slot(
+            "Dungeon Props",
+            "Dungeon Props/Models/SM_Floor.fbx",
+            "StoneFloor",
+            &[],
+        );
+        assert_eq!(
+            textures(&images, &floor[0]),
             [
                 (
                     Role::BaseColor,
-                    paths(&["Unity Moss/Models/T_Bark_D.png"]),
-                    Via::Fbx
+                    paths(&["Dungeon Props/Textures/T_StoneFloor_D.png"]),
+                    Via::Suffix
                 ),
                 (
                     Role::Normal,
-                    paths(&["Unity Moss/Textures/T_Bark_Normal.png"]),
-                    Via::Unity
+                    paths(&["Dungeon Props/Textures/T_StoneFloor_N.png"]),
+                    Via::Suffix
                 ),
             ]
         );

@@ -878,8 +878,13 @@ from the contracts above:
 
 ### What the material inference ticket built differently
 
-- **Each role takes the first source that answers it** (D11), not each slot. So a slot whose FBX
-  references only its base color still finds its normal map by suffix. A role never mixes sets.
+- **A slot takes every role from the first source that answers any** (D11, C7), so a material
+  never mixes maps that different sources found. An FBX that wires only a base color gives a
+  material with only a base color, until the Game tab's texture pickers fill the rest. The
+  suffix lookup is one source: the slot's name, then the model's, may each fill roles. A Unity
+  material's alpha clip sets the surface even when an earlier source gave the textures.
+- **A binding is dropped when, once every model is read, its set no longer gives its role** (a
+  later Unity material relabelled the image). The slot doesn't fall through to a later source.
 - **FBX references resolve against the pack's indexed images,** never the file system: the given
   path under the library root, the relative path with each component ignoring case, then the
   file name ignoring case and extension, by C7's folder rule and then the reference's own
