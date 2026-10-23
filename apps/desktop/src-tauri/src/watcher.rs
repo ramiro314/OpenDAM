@@ -121,7 +121,7 @@ fn local_id_of(machine: &str, boot: &str, pid_ns: &str) -> String {
 
 /// A process's start time in clock ticks since boot, field 22 of `/proc/<pid>/stat`, counted
 /// after the last `)`, since `(comm)` may hold spaces or parentheses.
-fn process_start_time(pid: u32) -> Option<u64> {
+pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     stat[stat.rfind(')')? + 1..]
         .split_whitespace()

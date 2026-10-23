@@ -611,16 +611,16 @@ fn file_stamp(path: &Path) -> std::io::Result<(u64, i64)> {
     Ok((meta.len(), mtime.as_nanos() as i64))
 }
 
-/// Takes the advisory lock, waiting up to `lock_wait` for another holder. Cancel still works
-/// while it waits.
+/// Takes the advisory lock, waiting up to `lock_wait` for another holder. Cancel still stops the
+/// wait. A lock taken at once is returned even when cancelled: `RunControl::lock` decides then.
 async fn advisory_lock(env: &BuildEnv<'_>, root: &Path) -> Result<IndexLock, Stop> {
     let deadline = tokio::time::Instant::now() + env.lock_wait;
     loop {
-        if env.control.cancelled() {
-            return Err(Stop::Cancelled);
-        }
         if let Some(lock) = IndexLock::try_acquire(root).await {
             return Ok(lock);
+        }
+        if env.control.cancelled() {
+            return Err(Stop::Cancelled);
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(Stop::Failed(

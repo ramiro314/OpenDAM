@@ -608,6 +608,42 @@ mod tests {
                 .unwrap()
         }
 
+        /// Waits for the build to report `step`.
+        async fn wait_for_step(&self, step: &str) {
+            for _ in 0..1500 {
+                let reached = self
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e, ImportEvent::Progress(p) if p.step == step));
+                if reached {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the build never reported {step}");
+        }
+
+        /// A Cancel left the library as `setup` made it.
+        async fn unchanged_after_cancel(&self, run_id: &str, assets: &[String]) {
+            self.wait_for(run_id, "cancelled").await;
+            self.no_leftovers();
+            assert!(!self.dir.path().join("Pub").exists());
+            assert_eq!(
+                self.strings("SELECT id FROM assets ORDER BY id").await,
+                assets
+            );
+            assert_eq!(self.count("SELECT COUNT(*) FROM import_outputs").await, 0);
+            assert_eq!(self.pack().await, ("never_built".into(), None, None));
+            self.other_asset_untouched().await;
+            assert!(!self
+                .events
+                .lock()
+                .unwrap()
+                .contains(&ImportEvent::LibraryUpdated));
+        }
+
         /// No staging, previous or failed folder is left beside the target.
         fn no_leftovers(&self) {
             for tag in ["import", "prev", "failed"] {
@@ -631,6 +667,11 @@ mod tests {
     /// A library holding `Other/Tree.png`, indexed, with the row given the id `tree` and a tag,
     /// and an engine started over it.
     async fn setup() -> Setup {
+        setup_with(true).await
+    }
+
+    /// `setup`, with the engine started only when `start` is set.
+    async fn setup_with(start: bool) -> Setup {
         let dir = tempfile::Builder::new()
             .prefix("opendam-lib-")
             .tempdir()
@@ -662,7 +703,9 @@ mod tests {
             Arc::new(move |event| sink.lock().unwrap().push(event)),
             Duration::from_secs(2),
         );
-        tokio::spawn(engine.clone().start());
+        if start {
+            tokio::spawn(engine.clone().start());
+        }
         Setup {
             dir,
             lib,
@@ -996,5 +1039,138 @@ mod tests {
             // Without a machine id, a run is judged by its heartbeat alone.
             assert_eq!(interrupted, ["silent_there"]);
         }
+    }
+
+    #[tokio::test]
+    async fn cancel_while_waiting_for_the_index_lock_stops_the_build_once_it_has_the_lock() {
+        let s = setup().await;
+        let assets = s.strings("SELECT id FROM assets ORDER BY id").await;
+        let index_lock = s.engine.db.index_lock("lib");
+        let held = index_lock.lock().await;
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        s.wait_for_step("waiting for the library").await;
+
+        s.engine.cancel_run("lib", &run.id).await.unwrap();
+        drop(held);
+
+        // The build takes both locks at once, so only `RunControl::lock` can stop it.
+        s.unchanged_after_cancel(&run.id, &assets).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_while_another_holder_has_the_advisory_lock_stops_the_wait() {
+        let s = setup().await;
+        let assets = s.strings("SELECT id FROM assets ORDER BY id").await;
+        let other = crate::watcher::IndexLock::try_acquire(s.dir.path())
+            .await
+            .unwrap();
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        s.wait_for_step("waiting for the library").await;
+
+        s.engine.cancel_run("lib", &run.id).await.unwrap();
+
+        s.unchanged_after_cancel(&run.id, &assets).await;
+        drop(other);
+    }
+
+    #[tokio::test]
+    async fn a_queued_run_is_cancelled_before_it_starts_and_only_once() {
+        let s = setup().await;
+        let pause = s.engine.hooks().pause(Point::Staged);
+        let first = s.engine.start_import(s.golden_request()).await.unwrap();
+        pause.reached.notified().await;
+        let mut second = s.golden_request();
+        second.target = "Second/Pack".into();
+        let second = s.engine.start_import(second).await.unwrap();
+
+        s.engine.cancel_run("lib", &second.id).await.unwrap();
+        assert_eq!(
+            s.engine.cancel_run("lib", &second.id).await,
+            Err("The run is neither queued nor running".into())
+        );
+        pause.release.notify_one();
+        s.wait_for(&first.id, "done").await;
+
+        let second = records::run(&s.lib.pool, "lib", &second.id).await.unwrap();
+        assert_eq!(
+            (second.status.as_str(), second.started_at),
+            ("cancelled", None)
+        );
+        assert!(!s.dir.path().join("Second").exists());
+    }
+
+    #[tokio::test]
+    async fn an_engine_claims_its_own_runs_and_a_dead_local_process_s_but_no_other_owner_s() {
+        let s = setup_with(false).await;
+        let me = s.engine.owner.clone();
+        // Another live process on this machine: the test's parent.
+        let parent = std::os::unix::process::parent_id();
+        let parent_started = crate::watcher::process_start_time(parent).unwrap() as i64;
+        let runs: [(&str, Option<&str>, i64, i64); 3] = [
+            ("live_elsewhere", Some("elsewhere"), 1, 1),
+            (
+                "live_here",
+                me.machine.as_deref(),
+                parent as i64,
+                parent_started,
+            ),
+            ("orphan", me.machine.as_deref(), i32::MAX as i64, 1),
+        ];
+        for (created, (id, machine, pid, started)) in runs.into_iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO import_runs (id, kind, packs, status, created_at, owner_machine,
+                 owner_pid, owner_started) VALUES (?, 'import', '[]', 'queued', ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(created as i64)
+            .bind(machine)
+            .bind(pid)
+            .bind(started)
+            .execute(&s.lib.pool)
+            .await
+            .unwrap();
+        }
+        let claimed = s.engine.next_run().await.map(|(_, run)| run.id);
+        if me.machine.is_some() {
+            assert_eq!(claimed.as_deref(), Some("orphan"));
+        } else {
+            assert_eq!(claimed, None, "without a machine id no orphan is adopted");
+        }
+
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        sqlx::query("DELETE FROM import_runs WHERE id = 'orphan'")
+            .execute(&s.lib.pool)
+            .await
+            .unwrap();
+        let claimed = s.engine.next_run().await.map(|(_, run)| run.id);
+        assert_eq!(claimed, Some(run.id), "its own run, never another owner's");
+    }
+
+    #[tokio::test]
+    async fn an_original_that_changed_since_it_was_recorded_fails_the_build() {
+        let s = setup_with(false).await;
+        let originals = tempfile::tempdir().unwrap();
+        let original = originals.path().join("synthetic.unitypackage");
+        std::fs::copy(fixture("synthetic.unitypackage"), &original).unwrap();
+        let mut request = s.golden_request();
+        request.original_path = original.to_string_lossy().into_owned();
+        let run = s.engine.start_import(request).await.unwrap();
+        let mut bytes = std::fs::read(&original).unwrap();
+        bytes.push(0);
+        std::fs::write(&original, bytes).unwrap();
+
+        tokio::spawn(s.engine.clone().start());
+        let failed = s.wait_for(&run.id, "failed").await;
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .unwrap()
+                .ends_with("changed since it was imported"),
+            "{failed:?}"
+        );
+        assert!(!s.dir.path().join("Pub").exists());
+        s.no_leftovers();
+        assert_eq!(s.count("SELECT COUNT(*) FROM import_outputs").await, 0);
     }
 }
