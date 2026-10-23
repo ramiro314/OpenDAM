@@ -1067,6 +1067,43 @@ mod tests {
     }
 
     #[test]
+    fn a_set_with_two_metallic_maps_merges_neither() {
+        let (outputs, refused) = plan(&[
+            gl("T_Rock_R.png", Layout::Roughness),
+            gl("T_Rock_M.png", Layout::Metallic),
+            gl("T_Rock_Metallic.png", Layout::Metallic),
+        ]);
+        assert!(outputs.iter().all(|o| o.role != Role::MetallicSmoothness));
+        assert_eq!(
+            refused,
+            [Refused {
+                sources: vec![1, 2],
+                message: "its texture set has 2 metallic maps, T_Rock_M.png and T_Rock_Metallic.png, and merges one into its MetallicSmoothness: remove or rename the others".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_tga_is_decoded_by_its_name_and_converted() {
+        let normal = rgba8(&[[128, 127, 255, 255], [0, 0, 10, 99]]);
+        let mut tga = Vec::new();
+        normal
+            .write_to(&mut Cursor::new(&mut tga), ImageFormat::Tga)
+            .unwrap();
+        // TGA bytes start with no magic number, so only the name tells the format
+        assert!(image::guess_format(&tga).is_err());
+
+        let png = convert(
+            Recipe::Same { flip_green: true },
+            &[("T_Wall_N_DX.tga", &tga)],
+        )
+        .unwrap();
+        let output = image::load_from_memory_with_format(&png, ImageFormat::Png).unwrap();
+        assert_eq!(output.color(), image::ColorType::Rgba8);
+        assert_eq!(output.as_bytes(), [128, 128, 255, 255, 0, 255, 10, 99]);
+    }
+
+    #[test]
     fn an_undecodable_input_is_an_error_naming_it() {
         let broken: &[u8] = b"not a png";
         let error = convert(

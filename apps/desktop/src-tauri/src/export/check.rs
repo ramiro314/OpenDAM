@@ -3807,6 +3807,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_source_whose_memoized_hash_is_stale_never_fills_the_cache() {
+        let f = fixture().await;
+        let path = "Dungeon Props/Textures/T_Slab_D.bmp";
+        // A BMP of one size whatever its pixels, so a rewrite keeps the size its hash was taken at
+        let bmp = |pixel: [u8; 3]| {
+            let image = image::RgbImage::from_pixel(4, 4, image::Rgb(pixel));
+            let mut bytes = Vec::new();
+            image
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Bmp,
+                )
+                .unwrap();
+            bytes
+        };
+        add_file(&f, path, &bmp([10, 20, 30])).await;
+        let first = inspect_domain(&f, &[path]).await;
+        assert_eq!(messages(&first.report), Vec::<&str>::new());
+
+        // The file changes, keeping its size and mtime, so the saved hash is stale
+        let source = f.library.root_path.join(path);
+        let mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
+        let changed = bmp([200, 100, 50]);
+        assert_eq!(
+            changed.len(),
+            std::fs::metadata(&source).unwrap().len() as usize
+        );
+        std::fs::write(&source, &changed).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let cache = cache::cache_dir(&f.library.root_path).join("textures");
+        std::fs::remove_dir_all(&cache).unwrap();
+
+        let report = check(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
+        assert_eq!(
+            messages(&report),
+            [format!("{path}: it changed while it was read: check again")]
+        );
+        assert_eq!(report.manifest["assets"], json!([]));
+        let entries = std::fs::read_dir(&cache).map_or(0, |d| d.count());
+        assert_eq!(entries, 0, "nothing is cached under the stale key");
+    }
+
+    #[tokio::test]
     async fn maps_that_cant_be_converted_together_are_one_problem_naming_them() {
         let f = fixture().await;
         let rocks = "Dungeon Props/Rocks";
