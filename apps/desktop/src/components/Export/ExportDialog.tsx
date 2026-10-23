@@ -2,7 +2,13 @@ import { useEffect, useState } from 'react';
 import clsx from 'clsx';
 import { api } from '../../api';
 import type { Collection, ExportCheck, ExportDiffEntry } from '../../types';
-import { checkSummary, diffLabel, diffSummary, staleMessage } from '../../utils/exportView';
+import {
+  checkSummary,
+  diffLabel,
+  diffSummary,
+  materialLine,
+  staleMessage,
+} from '../../utils/exportView';
 import { IconExternal, IconX } from '../Icons';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './ExportDialog.module.css';
@@ -185,7 +191,7 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
                       <tr>
                         <th>Kind</th>
                         <th>Name</th>
-                        <th>Role</th>
+                        <th>Layout</th>
                         <th>Pack</th>
                         <th>Status</th>
                       </tr>
@@ -193,9 +199,24 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
                     <tbody>
                       {check.assets.map((a) => (
                         <tr key={`${a.libraryId}/${a.assetId}`} title={a.filePath}>
-                          <td>{a.kind}</td>
-                          <td className={styles.name}>{a.assetName ?? '-'}</td>
-                          <td>{a.role ?? '-'}</td>
+                          <td>
+                            {a.kind}
+                            {!a.member && <span className={styles.joined}> (joined)</span>}
+                          </td>
+                          <td className={styles.name}>
+                            {a.assetName ?? '-'}
+                            {a.materials && a.materials.length > 0 && (
+                              <ul className={styles.materials}>
+                                {a.materials.map((m) => (
+                                  <li key={m.slot}>{materialLine(m)}</li>
+                                ))}
+                              </ul>
+                            )}
+                          </td>
+                          <td>
+                            {a.layout ?? a.role ?? '-'}
+                            {a.normalConvention === 'directx' && ', DirectX'}
+                          </td>
                           <td>{a.pack ?? 'none'}</td>
                           <td className={clsx(styles.status, statusClass[a.status])}>{a.status}</td>
                         </tr>

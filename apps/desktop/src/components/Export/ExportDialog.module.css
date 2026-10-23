@@ -59,6 +59,17 @@
   color: var(--color-text-primary);
 }
 
+.materials {
+  margin: 2px 0 0;
+  padding-left: var(--space-4);
+  font-family: var(--font-sans);
+  color: var(--color-text-secondary);
+}
+
+.joined {
+  color: var(--color-text-muted);
+}
+
 .status {
   font-weight: 500;
 }

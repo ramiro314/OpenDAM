@@ -54,6 +54,22 @@ impl Layout {
             Layout::Metallic => "Metallic",
         }
     }
+
+    /// The roles a source of this layout gives once converted (C8): an ORM or MaskMap map
+    /// splits into Occlusion and MetallicSmoothness, and a Roughness, Gloss or Metallic map
+    /// merges into its set's MetallicSmoothness.
+    pub fn outputs(self) -> &'static [Role] {
+        match self {
+            Layout::Role(Role::BaseColor) => &[Role::BaseColor],
+            Layout::Role(Role::Normal) => &[Role::Normal],
+            Layout::Role(Role::MetallicSmoothness) => &[Role::MetallicSmoothness],
+            Layout::Role(Role::Occlusion) => &[Role::Occlusion],
+            Layout::Role(Role::Emission) => &[Role::Emission],
+            Layout::Role(Role::Height) => &[Role::Height],
+            Layout::Orm | Layout::MaskMap => &[Role::Occlusion, Role::MetallicSmoothness],
+            Layout::Roughness | Layout::Gloss | Layout::Metallic => &[Role::MetallicSmoothness],
+        }
+    }
 }
 
 /// A normal map's green channel convention (plan D14). URP wants OpenGL, green up.
