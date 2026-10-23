@@ -261,6 +261,16 @@ decision changed:
   frees. Every holder also runs a pending pass before it releases the lock. The weaker guarantee
   is stated in the invariants and the Known gaps (Flow, A11).
 
+Revised again 2026-10-23 (revision 19) after GitHub Inspector's tenth review of PR #199. No
+decision changed:
+
+- **R42 - A file kept at drift is still the same file.** The carry joined builds on
+  `(source_path, origin)`, so a file whose origin changed from `extracted` to `kept` ("keep
+  yours") in a rebuild that also moved it found no match, and step 7 pruned its row with its
+  tags. The carry now joins on the **file key**, `source_path` plus whether the file is
+  generated, so `extracted` and `kept` count as the same file and only a generated GLB stays apart
+  from its model. The manifest's uniqueness uses the same key (Flow, Steps, Records, A2, A4).
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -440,8 +450,11 @@ id while staging, in 200-row transactions. Those rows mean nothing until the com
      `.prev-<build id>` back to the live name when `swap_prev` is set, deletes the build's rows,
      clears `swap_state` and fails the run.
 5. **Carry moved rows, then index without pruning.**
-   - **Carry.** It joins the previous build's manifest with the new one on `(source_path, origin)`.
-     Matching by `origin` too means a GLB follows its own row, not its model's. A file the new build
+   - **Carry.** It joins the previous build's manifest with the new one on the **file key**:
+     `source_path` plus whether the file is generated (`origin = 'generated'`). So a GLB follows its
+     own row, not its model's, while an `extracted` file and the `kept` copy that replaces it at
+     drift count as the same file, whichever build holds which. A kept file added outside OpenDAM
+     has no `source_path` and is never carried: it keeps its path. A file the new build
      places at another path has its asset row moved there in place, with its id and metadata. The
      move uses the update `rename_asset` uses (`file_name`, `file_path`, `extension`;
      `commands/asset.rs:1734`), so the FTS update trigger follows it. It runs in two passes, so
@@ -714,8 +727,10 @@ they run in recipe order. Each step has `enabled` and JSON `options`.
     collide with one. Such an entry is skipped and reported as a duplicate.
   - **Zip entries.** A `.meta` in a zip is just another entry, with its own path.
 
-  A generated GLB has its source model's source path with origin `generated`. So
-  `(source_path, origin)` is unique within a build, and the manifest enforces it.
+  A generated GLB has its source model's source path with origin `generated`. So the **file
+  key**, `source_path` plus whether the file is generated, is unique within a build, and the
+  manifest enforces it. A kept copy that replaces an extracted file takes that file's key, and
+  the extracted file isn't in the build.
 
 - **Clashes stop the build.** These fail the build with the step and path named:
   - a step that would overwrite a file;
@@ -885,8 +900,9 @@ open):
   `mtime_ns`, `sha256`, `origin` (`extracted`, `generated`, `kept`), `source_path` (Steps:
   a JSON array; for a generated file, its source model's; for a kept file that replaced a recipe
   file, that file's; `NULL` for a kept file added outside OpenDAM). It is
-  `UNIQUE (pack_id, build_id, source_path, origin)` and `UNIQUE (pack_id, build_id, path)`. A
-  pack's manifest is its rows with `build_id = current_build`.
+  unique on `(pack_id, build_id, source_path, origin = 'generated')`, the file key (a unique
+  index on that expression), and on `(pack_id, build_id, path)`. A pack's manifest is its rows
+  with `build_id = current_build`.
 - `import_moves`: `pack_id`, `build_id`, `seq`, `kind` (`moved` or `inserted`), `asset_id`,
   `from_path` (`NULL` for `inserted`) and `to_path`. These are the asset rows a build carried to
   new paths, and the rows its index inserted (Flow, step 5). A rollback deletes the inserted rows
@@ -1069,7 +1085,8 @@ files go with their tags, ratings and collections, as on any delete (D27).
   between its swap and its commit. Every
   other index run prunes as today.
 - **Rows follow their files.** A rebuild carries each moved file's asset row to the file's new
-  path, matched by `source_path` and `origin`, and journals the move in `import_moves`, along
+  path, matched by its file key (`source_path` and whether it is generated), and journals the
+  move in `import_moves`, along
   with every row its index inserts. A rollback deletes the inserted rows, then reverses the moves,
   so neither a rebuild nor its rollback loses metadata (D31).
 - **No pruning index reaches a pack mid-swap.** Cancel takes effect only before a build takes the
@@ -1154,7 +1171,7 @@ files go with their tags, ratings and collections, as on any delete (D27).
   - Its two `T_Rock.png` files (outer and nested) get distinct source paths.
   - Every `.meta` row in the manifest has a source path distinct from its asset's: the asset's
     with `.meta` appended. The build inserts the manifest with
-    `UNIQUE (pack_id, build_id, source_path, origin)` in force and doesn't fail.
+    its file-key uniqueness in force and doesn't fail.
   - On `escape.unitypackage`:
     - the escaping, absolute, duplicate and hardlink entries are skipped, no link is created, and
       nothing is written outside the target;
@@ -1176,6 +1193,10 @@ files go with their tags, ratings and collections, as on any delete (D27).
   - When the new path holds the row of a previous-only file (here, an excluded file at that
     path), that row is moved aside and deleted at step 7, and the carried file keeps its own id
     and tags at the path. No tag of the excluded file appears on it.
+  - Tag `Art/T_Rock.png`, change it outside OpenDAM, and Rebuild with **keep yours** chosen while
+    also turning `hoist Art` off. The kept copy lands at `T_Rock.png` with the same asset id and
+    tag, and nothing is pruned at step 7 for it. The same holds when the move is a `rename`
+    step instead of the hoist.
   - A rebuild that only toggles `hoist` leaves every file's `preview_status` and thumbnail as they
     were: no preview job is queued for an unchanged file, moved or not. Files whose path didn't
     change keep their `file_hashes` row valid; a moved file is hashed again at the next Check.
