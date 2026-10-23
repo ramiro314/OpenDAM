@@ -77,6 +77,10 @@ pub enum Point {
     Indexed,
     /// Step 4's rename of the staging folder to the live name (failure only).
     MoveIn,
+    /// The engine's claim of a queued run, before its `UPDATE`.
+    Claim,
+    /// `Engine::cancel_run`, after it found the run isn't the active one.
+    CancelLookup,
 }
 
 /// Test hooks, as autotag undo's `Crashes`. They do nothing outside tests.
@@ -91,6 +95,8 @@ pub struct Hooks {
 enum Hook {
     Pause(Arc<Pause>),
     Fail,
+    /// Fails the first time only.
+    FailOnce,
 }
 
 /// A paused build: it notifies `reached` and waits for `release`.
@@ -118,6 +124,11 @@ impl Hooks {
     }
 
     #[cfg(test)]
+    pub fn fail_once(&self, point: Point) {
+        self.points.lock().unwrap().push((point, Hook::FailOnce));
+    }
+
+    #[cfg(test)]
     fn hooks(&self, point: Point) -> Vec<Hook> {
         let points = self.points.lock().unwrap();
         points
@@ -127,16 +138,29 @@ impl Hooks {
             .collect()
     }
 
-    fn fails(&self, _point: Point) -> bool {
+    pub(crate) fn fails(&self, _point: Point) -> bool {
         #[cfg(test)]
-        if self.hooks(_point).iter().any(|h| matches!(h, Hook::Fail)) {
-            return true;
+        {
+            let mut points = self.points.lock().unwrap();
+            let once = points
+                .iter()
+                .position(|(p, h)| *p == _point && matches!(h, Hook::FailOnce));
+            if let Some(once) = once {
+                points.remove(once);
+                return true;
+            }
+            if points
+                .iter()
+                .any(|(p, h)| *p == _point && matches!(h, Hook::Fail))
+            {
+                return true;
+            }
         }
         false
     }
 
     /// Pauses at `point` if a test asked to, then fails if it asked to.
-    async fn at(&self, point: Point) -> Result<(), String> {
+    pub(crate) async fn at(&self, point: Point) -> Result<(), String> {
         #[cfg(test)]
         for hook in self.hooks(point) {
             if let Hook::Pause(pause) = hook {

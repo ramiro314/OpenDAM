@@ -15,6 +15,7 @@
 //! Progress arrives as `import:progress` events and status changes as `import:updated`. Cancel
 //! takes effect only before a build takes the library's lock (`build::RunControl`).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,7 +25,7 @@ use serde_json::json;
 use sqlx::{Pool, Sqlite};
 use tokio::sync::Notify;
 
-use super::build::{self, BuildEnv, Hooks, Progress, RunControl, Stop};
+use super::build::{self, BuildEnv, Hooks, Point, Progress, RunControl, Stop};
 use super::place::PlaceStep;
 use super::records::{self, NewImport, Owner, QueuedPack, RunSummary, StepRecord};
 use crate::db::{Database, LibraryHandle};
@@ -33,7 +34,11 @@ const HEARTBEAT: Duration = Duration::from_secs(30);
 /// Another machine's run whose heartbeat is this old is gone.
 const DEAD_AFTER: Duration = Duration::from_secs(10 * 60);
 /// How long the engine waits before retrying a run it couldn't claim.
-const CLAIM_RETRY: Duration = Duration::from_secs(5);
+const CLAIM_RETRY: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(5)
+};
 /// How long a build waits for another machine's advisory lock.
 const LOCK_WAIT: Duration = Duration::from_secs(5 * 60);
 
@@ -84,6 +89,9 @@ pub struct Engine {
     owner: Owner,
     hooks: Hooks,
     lock_wait: Duration,
+    /// Runs whose Cancel was accepted while their claim failed. Their next attempt starts
+    /// cancelled, so the build stops before it changes anything.
+    pending_cancels: Mutex<HashSet<String>>,
 }
 
 impl Engine {
@@ -97,6 +105,7 @@ impl Engine {
             events,
             wake: Notify::new(),
             active: Mutex::new(None),
+            pending_cancels: Mutex::new(HashSet::new()),
             owner: crate::watcher::this_process(),
             hooks: Hooks::default(),
             lock_wait,
@@ -250,21 +259,33 @@ impl Engine {
 
     async fn execute(&self, library: &LibraryHandle, run: Queued) {
         let control = Arc::new(RunControl::default());
+        let cancelled_before = self
+            .pending_cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run.id);
+        if cancelled_before {
+            let _ = control.cancel();
+        }
         self.set_active(Some((run.id.clone(), control.clone())));
-        let claimed = sqlx::query(
-            "UPDATE import_runs SET status = 'running', started_at = ?, heartbeat_at = ?,
+        let claimed =
+            match self.hooks.at(Point::Claim).await {
+                Err(injected) => Err(sqlx::Error::Protocol(injected)),
+                Ok(()) => sqlx::query(
+                    "UPDATE import_runs SET status = 'running', started_at = ?, heartbeat_at = ?,
              owner_machine = ?, owner_boot = ?, owner_pid = ?, owner_started = ?
              WHERE id = ? AND status = 'queued'",
-        )
-        .bind(now_ms())
-        .bind(now_ms())
-        .bind(&self.owner.machine)
-        .bind(&self.owner.boot)
-        .bind(self.owner.pid as i64)
-        .bind(self.owner.started as i64)
-        .bind(&run.id)
-        .execute(&library.pool)
-        .await;
+                )
+                .bind(now_ms())
+                .bind(now_ms())
+                .bind(&self.owner.machine)
+                .bind(&self.owner.boot)
+                .bind(self.owner.pid as i64)
+                .bind(self.owner.started as i64)
+                .bind(&run.id)
+                .execute(&library.pool)
+                .await,
+            };
         match claimed {
             Ok(done) if done.rows_affected() == 1 => {}
             // Cancelled while queued, or claimed by another engine: no longer queued.
@@ -273,8 +294,15 @@ impl Engine {
                 return;
             }
             Err(e) => {
-                // Still queued: wait before the loop finds it again.
+                // Still queued: wait before the loop finds it again. A Cancel already accepted
+                // carries over to that attempt.
                 tracing::error!("Could not claim import run {}: {e}", run.id);
+                if control.cancelled() {
+                    self.pending_cancels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(run.id.clone());
+                }
                 self.set_active(None);
                 tokio::time::sleep(CLAIM_RETRY).await;
                 return;
@@ -388,16 +416,10 @@ impl Engine {
     /// Cancels a queued run, or the running one while its build hasn't taken the library's lock.
     /// After that it answers "Finishing, can't cancel now", and the build completes.
     pub async fn cancel_run(&self, library_id: &str, run_id: &str) -> Result<(), String> {
-        let active = self
-            .active
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Some((id, control)) = active {
-            if id == run_id {
-                return control.cancel();
-            }
+        if let Some(control) = self.active_control(run_id) {
+            return control.cancel();
         }
+        self.hooks.at(Point::CancelLookup).await?;
         let library = self.library(library_id).await?;
         let cancelled = sqlx::query(
             "UPDATE import_runs SET status = 'cancelled', finished_at = ?
@@ -409,10 +431,23 @@ impl Engine {
         .await
         .map_err(|e| e.to_string())?;
         if cancelled.rows_affected() == 0 {
-            return Err("The run is neither queued nor running".into());
+            // The engine may have claimed it meanwhile: it sets the active run first.
+            return match self.active_control(run_id) {
+                Some(control) => control.cancel(),
+                None => Err("The run is neither queued nor running".into()),
+            };
         }
         self.updated(&library, run_id).await;
         Ok(())
+    }
+
+    /// The Cancel of run `run_id` while it is the one being executed.
+    fn active_control(&self, run_id: &str) -> Option<Arc<RunControl>> {
+        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        active
+            .as_ref()
+            .filter(|(id, _)| id == run_id)
+            .map(|(_, control)| control.clone())
     }
 
     pub async fn list_runs(&self, library_id: &str) -> Result<Vec<RunSummary>, String> {
@@ -605,7 +640,7 @@ mod tests {
     use super::*;
     use crate::db::{memory_database, memory_library_pool};
     use crate::fs_swap;
-    use crate::import::build::{Point, FINISHING};
+    use crate::import::build::FINISHING;
     use crate::import::unitypackage::tests::{fixture, golden, on_disk};
 
     const TARGET: &str = "Pub/Synthetic";
@@ -1515,5 +1550,48 @@ mod tests {
             ended.status, "cancelled",
             "an end left in no other state is kept"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_accepted_while_a_claim_fails_holds_at_the_next_attempt() {
+        let s = setup().await;
+        let assets = s.strings("SELECT id FROM assets ORDER BY id").await;
+        let pause = s.engine.hooks().pause(Point::Claim);
+        s.engine.hooks().fail_once(Point::Claim);
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        pause.reached.notified().await;
+
+        s.engine.cancel_run("lib", &run.id).await.unwrap();
+        pause.release.notify_one();
+        // The failed claim leaves it queued; the retry claims it, and its build stops at once.
+        pause.reached.notified().await;
+        pause.release.notify_one();
+
+        s.unchanged_after_cancel(&run.id, &assets).await;
+        let ended = records::run(&s.lib.pool, "lib", &run.id).await.unwrap();
+        assert!(ended.started_at.is_some(), "the second attempt claimed it");
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_finds_its_run_just_claimed_cancels_it_there() {
+        let s = setup_with(false).await;
+        let assets = s.strings("SELECT id FROM assets ORDER BY id").await;
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        let lookup = s.engine.hooks().pause(Point::CancelLookup);
+        let staged = s.engine.hooks().pause(Point::Staged);
+        let cancel = tokio::spawn({
+            let (engine, id) = (s.engine.clone(), run.id.clone());
+            async move { engine.cancel_run("lib", &id).await }
+        });
+        // The cancel found no active run; the engine then claims and stages it.
+        lookup.reached.notified().await;
+        tokio::spawn(s.engine.clone().start());
+        staged.reached.notified().await;
+
+        lookup.release.notify_one();
+        assert_eq!(cancel.await.unwrap(), Ok(()));
+        staged.release.notify_one();
+
+        s.unchanged_after_cancel(&run.id, &assets).await;
     }
 }
