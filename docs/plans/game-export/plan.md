@@ -932,9 +932,11 @@ from the contracts above:
   written beside its place and renamed in, and the bundle copies it from there. The key is the
   sha256 of the canonical JSON of the inputs' sha256s in order, the output's steps (tool, tool
   version, `by`, `from` and settings), the tool and `textures::VERSION` (`<N>`). The entry's own
-  sha256 is taken from the file on each Check, with no sidecar. Before converting, each input's
-  bytes are checked against the hash its key is made of, so a file that changes mid-Check never
-  fills an entry under its old key.
+  sha256 is taken from the file on each Check, with no sidecar. An entry is synced to disk
+  before its rename, and one that doesn't start with the PNG signature (left empty by an OS
+  crash) is made again. Before converting, each input's bytes are checked against the hash its
+  key is made of, so a file that changes mid-Check never fills an entry under its old key. On a
+  mismatch the `file_hashes` row takes the bytes' own hash, so the next Check succeeds.
 - **A set is planned as a whole** (`textures::plan`): each one-role source gives its role, an ORM
   or MaskMap map an Occlusion and a MetallicSmoothness, and the set's Roughness, Gloss and
   Metallic maps one merged MetallicSmoothness, whose inputs are the smoothness map first (D17).

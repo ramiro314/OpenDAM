@@ -1226,18 +1226,24 @@ fn texture_file(
         return Ok((root.join(&paths[0]), sha256s.swap_remove(0)));
     };
     let key = cache::texture_key(&sha256s, steps);
+    // Inputs whose bytes don't hash to their memoized sha256, with the hash they do
+    let mut stale: Vec<(usize, String)> = Vec::new();
     let cached = cache::texture(&root, &key, || {
         let mut bytes = Vec::with_capacity(paths.len());
         for (i, path) in paths.iter().enumerate() {
             let read = std::fs::read(root.join(path))
                 .map_err(|e| format!("{} can't be read: {e}", what(i)))?;
-            if hashes::sha256_bytes(&read) != sha256s[i] {
-                return Err(format!(
-                    "{} changed while it was read: check again",
-                    what(i)
-                ));
+            let sha256 = hashes::sha256_bytes(&read);
+            if sha256 != sha256s[i] {
+                stale.push((i, sha256));
             }
             bytes.push(read);
+        }
+        if let Some((i, _)) = stale.first() {
+            return Err(format!(
+                "{} changed while it was read: check again",
+                what(*i)
+            ));
         }
         let named: Vec<(&str, &[u8])> = paths
             .iter()
@@ -1245,7 +1251,12 @@ fn texture_file(
             .map(|(p, b)| (p.as_str(), b.as_slice()))
             .collect();
         textures::convert(*recipe, &named)
-    })?;
+    });
+    // The next check keys the texture by the bytes it read, so checking again is enough
+    for (i, sha256) in stale {
+        input.memo.correct(&paths[i], sha256);
+    }
+    let cached = cached?;
     let sha256 = hashes::sha256_file(&cached)
         .map_err(|e| format!("its export cache entry can't be read: {e}"))?;
     Ok((cached, sha256))
@@ -3779,12 +3790,16 @@ mod tests {
             .iter()
             .find(|b| b.file == "Textures/Rock_MetallicSmoothness.png")
             .unwrap();
-        std::fs::write(&rock.source, b"cached").unwrap();
+        let marker = textures::encode_png(&image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 4])),
+        ))
+        .unwrap();
+        std::fs::write(&rock.source, &marker).unwrap();
         let hit = inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
             .await
             .unwrap();
         let rock_entry = entry(&hit.report, "Rock", "MetallicSmoothness");
-        assert_eq!(rock_entry["sha256"], hashes::sha256_bytes(b"cached"));
+        assert_eq!(rock_entry["sha256"], hashes::sha256_bytes(&marker));
 
         // With the cache cleared, conversion makes the same bytes again
         std::fs::remove_dir_all(&cache).unwrap();
@@ -3807,7 +3822,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_source_whose_memoized_hash_is_stale_never_fills_the_cache() {
+    async fn a_stale_memoized_hash_never_fills_the_cache_and_checking_again_recovers() {
         let f = fixture().await;
         let path = "Dungeon Props/Textures/T_Slab_D.bmp";
         // A BMP of one size whatever its pixels, so a rewrite keeps the size its hash was taken at
@@ -3854,6 +3869,20 @@ mod tests {
         assert_eq!(report.manifest["assets"], json!([]));
         let entries = std::fs::read_dir(&cache).map_or(0, |d| d.count());
         assert_eq!(entries, 0, "nothing is cached under the stale key");
+
+        // The memo now holds the bytes' own hash, so checking again exports the new pixels
+        let again = inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
+        assert_eq!(messages(&again.report), Vec::<&str>::new());
+        let pixels = bundle_pixels(&again, "Textures/Slab_BaseColor.png");
+        assert_eq!(pixels.as_bytes(), sixteen(&[200, 100, 50]));
+        let memo: String = sqlx::query_scalar("SELECT sha256 FROM file_hashes WHERE file_path = ?")
+            .bind(path)
+            .fetch_one(&f.library.pool)
+            .await
+            .unwrap();
+        assert_eq!(memo, hashes::sha256_bytes(&changed));
     }
 
     #[tokio::test]

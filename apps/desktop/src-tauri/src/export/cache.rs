@@ -2,6 +2,7 @@
 //! C11), so re-exporting an unchanged domain skips the work and writes byte-identical files. It
 //! is never pruned automatically in v1 (A9), so Settings offers "Clear export cache".
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -48,9 +49,22 @@ pub fn texture_key(inputs: &[String], steps: &[Value]) -> String {
     hashes::sha256_bytes(canonical(&material).as_bytes())
 }
 
+/// The first bytes of every PNG file.
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+
+/// Whether the file at `path` starts like a PNG, so an empty or truncated entry left by an OS
+/// crash isn't taken for a hit.
+fn starts_like_png(path: &Path) -> bool {
+    let mut head = [0; 8];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok_and(|()| head == PNG_SIGNATURE)
+}
+
 /// The cached texture of key `key` in the library at `root`, made by `make` and saved first when
-/// the cache doesn't hold it. A file is written beside its place and renamed into it, so a
-/// crash never leaves a partial entry.
+/// the cache doesn't hold it. A file is written beside its place, synced to disk and renamed
+/// into it, so neither a process crash nor an OS crash leaves a partial entry under the key, and
+/// an entry that doesn't start like a PNG is made again.
 pub fn texture(
     root: &Path,
     key: &str,
@@ -58,17 +72,29 @@ pub fn texture(
 ) -> Result<PathBuf, String> {
     let dir = cache_dir(root).join("textures");
     let path = dir.join(format!("{key}.png"));
-    if path.is_file() {
+    if starts_like_png(&path) {
         return Ok(path);
     }
     let bytes = make()?;
     let write = || -> std::io::Result<()> {
         std::fs::create_dir_all(&dir)?;
         let partial = dir.join(format!(".{key}.{}.partial", uuid::Uuid::new_v4()));
-        std::fs::write(&partial, &bytes)?;
-        std::fs::rename(&partial, &path).inspect_err(|_| {
+        let saved = std::fs::File::create(&partial)
+            .and_then(|mut file| {
+                file.write_all(&bytes)?;
+                file.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&partial, &path));
+        if saved.is_err() {
             let _ = std::fs::remove_file(&partial);
-        })
+        }
+        saved?;
+        // The rename is durable once the folder is: best effort, since some file systems can't
+        // sync a folder
+        if let Ok(folder) = std::fs::File::open(&dir) {
+            let _ = folder.sync_all();
+        }
+        Ok(())
     };
     write().map_err(|e| format!("its converted file can't be saved in the export cache: {e}"))?;
     Ok(path)
@@ -138,13 +164,14 @@ mod tests {
     fn a_cached_texture_is_made_once_and_then_read_back() {
         let dir = tempfile::tempdir().unwrap();
         let made = std::cell::Cell::new(0);
+        let png = [&PNG_SIGNATURE[..], b"pixels"].concat();
         let make = || {
             made.set(made.get() + 1);
-            Ok(b"png".to_vec())
+            Ok(png.clone())
         };
         let path = texture(dir.path(), "k", make).unwrap();
         assert_eq!(path, cache_dir(dir.path()).join("textures/k.png"));
-        assert_eq!(std::fs::read(&path).unwrap(), b"png");
+        assert_eq!(std::fs::read(&path).unwrap(), png);
         let again = texture(dir.path(), "k", || panic!("a hit does no work")).unwrap();
         assert_eq!(again, path);
         assert_eq!(made.get(), 1);
@@ -154,6 +181,24 @@ mod tests {
         let failed = texture(dir.path(), "other", || Err("broken".into()));
         assert_eq!(failed, Err("broken".into()));
         assert!(!cache_dir(dir.path()).join("textures/other.png").exists());
+    }
+
+    #[test]
+    fn an_empty_or_truncated_entry_is_made_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = [&PNG_SIGNATURE[..], b"pixels"].concat();
+        let textures = cache_dir(dir.path()).join("textures");
+        std::fs::create_dir_all(&textures).unwrap();
+        // What an OS crash can leave after a rename whose data never reached the disk
+        for (key, left) in [("empty", &b""[..]), ("truncated", &PNG_SIGNATURE[..4])] {
+            std::fs::write(textures.join(format!("{key}.png")), left).unwrap();
+            let path = texture(dir.path(), key, || Ok(png.clone())).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), png, "{key}");
+            let hit = texture(dir.path(), key, || panic!("a whole entry is a hit")).unwrap();
+            assert_eq!(hit, path);
+        }
+        let entries = std::fs::read_dir(&textures).unwrap().count();
+        assert_eq!(entries, 2, "no partial file is left");
     }
 
     #[tokio::test]
