@@ -1,4 +1,31 @@
 {
+  "Dungeon Props/Animations/A_GuardIdle.fbx": {
+    "slots": [],
+    "kept_meshes": [],
+    "dropped_meshes": [],
+    "has_kept_mesh": false,
+    "kept_mesh_without_material": false,
+    "bones": ["Hips", "Spine", "Head", "Head_end"],
+    "takes": ["Idle"]
+  },
+  "Dungeon Props/Animations/A_GuardNod.fbx": {
+    "slots": [],
+    "kept_meshes": [],
+    "dropped_meshes": ["UCX_A_GuardNod_00"],
+    "has_kept_mesh": false,
+    "kept_mesh_without_material": false,
+    "bones": ["Hips", "Spine", "Head", "Head_end"],
+    "takes": ["Nod"]
+  },
+  "Dungeon Props/Animations/A_Wag.fbx": {
+    "slots": [],
+    "kept_meshes": [],
+    "dropped_meshes": [],
+    "has_kept_mesh": false,
+    "kept_mesh_without_material": false,
+    "bones": ["Hips", "Tail", "Tail_end"],
+    "takes": ["Wag"]
+  },
   "Dungeon Props/Models/SK_Guard.fbx": {
     "slots": [
       {

@@ -57,15 +57,32 @@ pub fn texture_key(inputs: &[String], steps: &[Value]) -> String {
 /// lookup needs no Blender, and `NORMALIZE_VERSION`. Neither the file's path nor its name is in
 /// it, so renaming a file keeps its entry.
 pub fn model_key(source: &str, job: &Job) -> String {
+    job_key(source, job, None)
+}
+
+/// The cache key of an animation that `job` normalizes from a source whose sha256 is `source`,
+/// following the model whose cache key is `followed` (C11): `model_key`'s, with the model's key
+/// in its settings. That key covers everything the job's `follow` is read from (the model's
+/// source, origin, facing and the rest of its job), so a change to any of them re-runs the
+/// animation, and a lookup needs neither the model's result nor Blender.
+pub fn animation_key(source: &str, job: &Job, followed: &str) -> String {
+    job_key(source, job, Some(followed))
+}
+
+fn job_key(source: &str, job: &Job, followed: Option<&str>) -> String {
+    let mut settings = json!({
+        "kind": job.kind,
+        "originFacing": job.origin_facing,
+        "facingQuarterTurns": job.facing_quarter_turns,
+        "patterns": job.patterns,
+        "addedMaterial": job.added_material,
+    });
+    if let Some(followed) = followed {
+        settings["follows"] = followed.into();
+    }
     let material = json!({
         "inputs": [source],
-        "settings": {
-            "kind": job.kind,
-            "originFacing": job.origin_facing,
-            "facingQuarterTurns": job.facing_quarter_turns,
-            "patterns": job.patterns,
-            "addedMaterial": job.added_material,
-        },
+        "settings": settings,
         "tool": "Blender",
         "toolVersion": blender::BLENDER_SERIES,
         "version": blender::NORMALIZE_VERSION,
@@ -271,6 +288,7 @@ mod tests {
             facing_quarter_turns: 1,
             patterns: &PATTERNS,
             added_material: "OpenDAMDefault".into(),
+            follow: None,
         }
     }
 
@@ -326,6 +344,60 @@ mod tests {
             ),
         ];
         for (i, other) in changed.iter().enumerate() {
+            assert_ne!(*other, key, "change {i}");
+        }
+    }
+
+    /// C11: an animation's key holds its followed model's, so any change to that model's job
+    /// (its source, origin or your quarter turns) re-runs the animation, and the animation's own
+    /// source and kind count too.
+    #[test]
+    fn an_animation_key_covers_its_source_and_the_key_of_the_model_it_follows() {
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let idle = Job {
+            asset: "Dungeon Props/Animations/A_GuardIdle.fbx".into(),
+            kind: blender::JobKind::Animation,
+            input: "/lib/Dungeon Props/Animations/A_GuardIdle.fbx".into(),
+            ..lamp_job()
+        };
+        let guard = model_key(&b, &lamp_job());
+        let key = animation_key(&a, &idle, &guard);
+        assert_eq!(key.len(), 64);
+        assert_eq!(key, animation_key(&a, &idle, &guard));
+        // A follow read from the model's result isn't in it: the model's key stands for it
+        let following = Job {
+            follow: Some(blender::Follow {
+                transform: blender::test_normalized(&[], None, &[], &[]).transform,
+                bones: vec!["Hips".into()],
+            }),
+            ..idle.clone()
+        };
+        assert_eq!(animation_key(&a, &following, &guard), key);
+
+        let turned = model_key(
+            &b,
+            &Job {
+                facing_quarter_turns: 2,
+                ..lamp_job()
+            },
+        );
+        let moved = model_key(
+            &"c".repeat(64),
+            &Job {
+                origin_facing: Origin::Generic,
+                ..lamp_job()
+            },
+        );
+        for (i, other) in [
+            animation_key(&a, &idle, &turned),
+            animation_key(&a, &idle, &moved),
+            animation_key(&b, &idle, &guard),
+            // Not a model's key, whatever it follows
+            model_key(&a, &idle),
+        ]
+        .iter()
+        .enumerate()
+        {
             assert_ne!(*other, key, "change {i}");
         }
     }

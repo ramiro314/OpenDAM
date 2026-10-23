@@ -9,8 +9,9 @@
 //! texture set (C8): a source that is ready passes through byte for byte, and every other one is
 //! converted into the export cache (C11), with its nearest `conversion.json`'s steps, then
 //! OpenDAM's own (C10). A model is normalized by headless Blender (C9) into the export cache, or
-//! taken from it, and lists its bounds, rig, clips and materials. Until animations land (build
-//! order step 7), a guard refuses every animation.
+//! taken from it, and lists its bounds, rig, clips and materials. An animation follows a rigged
+//! model of the domain, its avatarFrom (D21): it is normalized with that model's transform, after
+//! it, and lists its avatarFrom and clips.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -20,7 +21,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::db::{Database, LibraryHandle};
-use crate::export::blender::{self, Job, JobKind, Runner};
+use crate::export::blender::{self, Follow, Job, JobKind, Runner};
 use crate::export::bundle::Diff;
 use crate::export::cache::CachedModel;
 use crate::export::conversion::{Invalid, Walker};
@@ -30,7 +31,7 @@ use crate::export::infer::{self, PackImages, UnityPack};
 use crate::export::names::{added_material, is_pascal, pascal};
 use crate::export::packs::{self, Origin, PackSource};
 use crate::export::textures::{self, Convention, Layout, LayoutEdit, Role, SourceEdits, Work};
-use crate::export::{cache, collision, contract, edits, hashes, settings};
+use crate::export::{animation, cache, collision, contract, edits, hashes, settings};
 use crate::models::AssetKind;
 use crate::structure::{self, PackOverride};
 
@@ -166,6 +167,34 @@ pub struct Inspection {
     pub models: HashMap<String, ModelGame>,
     /// What the Game tab shows of each texture source, by asset id
     pub textures: HashMap<String, TextureGame>,
+    /// What the Game tab shows of each animation, by asset id
+    pub animations: HashMap<String, AnimationGame>,
+}
+
+/// What the Game tab shows of an animation (C13): the model it follows, inferred and yours, the
+/// domain's rigged models it may follow, and its takes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationGame {
+    /// Its avatarFrom, by the model's asset id: inferred, the rigged model of the domain sharing
+    /// the most bone names with it (D21), `None` when none shares one, and yours
+    pub avatar_from: Field<Option<String>>,
+    /// The domain's rigged models, which it may follow, in the Check's order
+    pub models: Vec<AvatarModel>,
+    /// Its takes, which the manifest lists as its clips
+    pub takes: Vec<String>,
+}
+
+/// A rigged model an animation may follow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvatarModel {
+    pub asset_id: String,
+    /// Relative to the library root
+    pub file_path: String,
+    pub asset_name: Option<String>,
+    /// How many bone names it shares with the animation
+    pub shared_bones: usize,
 }
 
 /// An image as the Game tab offers or shows it: its layout and the roles it gives.
@@ -575,6 +604,7 @@ pub async fn inspect(
         export_packs,
         model_games,
         texture_games,
+        animation_games,
         packs,
         problems: mut found,
         models: planned,
@@ -599,7 +629,17 @@ pub async fn inspect(
     )
     .await?;
     for (model, cached) in normalized {
-        match model_entry(&model, &reads[model.read], &export_packs, &cached) {
+        let entry = match model.follows {
+            None => model_entry(&model, &reads[model.read], &export_packs, &cached),
+            Some(m) => Ok(animation_entry(
+                &model,
+                &reads[model.read],
+                reads[m].row.asset_name.as_deref().unwrap_or_default(),
+                &export_packs,
+                &cached,
+            )),
+        };
+        match entry {
             Ok(entry) => {
                 reads[model.read].model = Some(ReadyModel {
                     entry,
@@ -640,6 +680,7 @@ pub async fn inspect(
         names,
         models: model_games,
         textures: texture_games,
+        animations: animation_games,
     })
 }
 
@@ -679,6 +720,7 @@ pub async fn inspect_alone(
         names: evaluated.names,
         models: evaluated.model_games,
         textures: evaluated.texture_games,
+        animations: evaluated.animation_games,
     })
 }
 
@@ -1032,8 +1074,8 @@ struct ReadyTexture {
     source: PathBuf,
 }
 
-/// A model the check normalized, or took from the export cache: its manifest entry and the
-/// cached FBX the bundle copies.
+/// A model or animation the check normalized, or took from the export cache: its manifest entry
+/// and the cached FBX the bundle copies.
 struct ReadyModel {
     entry: Value,
     source: PathBuf,
@@ -1049,11 +1091,14 @@ struct Read {
     model: Option<ReadyModel>,
 }
 
-/// A model no problem names, ready for its Blender job (C9): what the job and the manifest
-/// entry need.
+/// A model or animation no problem names, ready for its Blender job (C9): what the job and the
+/// manifest entry need.
 struct PlannedModel {
     /// Its index in the check's reads
     read: usize,
+    /// For an animation, the read of the model it follows, its avatarFrom (D21), whose job runs
+    /// first and whose key its own includes (C11)
+    follows: Option<usize>,
     library: usize,
     /// Its exported FBX (A5), relative to the library root
     fbx: String,
@@ -1092,6 +1137,8 @@ struct Evaluated {
     model_games: HashMap<String, ModelGame>,
     /// What the Game tab shows of each texture source, by asset id
     texture_games: HashMap<String, TextureGame>,
+    /// What the Game tab shows of each animation, by asset id
+    animation_games: HashMap<String, AnimationGame>,
     packs: Vec<DomainPack>,
     problems: Vec<Problem>,
     models: Vec<PlannedModel>,
@@ -1194,8 +1241,10 @@ fn evaluate(inputs: &mut [LibraryInput], memo: &infer::Memo) -> Evaluated {
     let mut unity_packs: HashMap<PackKey, UnityPack> = HashMap::new();
 
     // Each model with materials, as (its index in `reads`, its pack, its library and its item),
-    // and each member image in a pack, as (its pack, its index in the pack's images)
+    // each animation, as (its index in `reads`, its library and its item), and each member image
+    // in a pack, as (its pack, its index in the pack's images)
     let mut models: Vec<(usize, PackKey, usize, usize)> = Vec::new();
+    let mut animations: Vec<(usize, usize, usize)> = Vec::new();
     let mut members: Vec<(PackKey, usize)> = Vec::new();
     let mut jobs: Vec<TextureJob> = Vec::new();
     let mut seen = HashSet::new();
@@ -1260,6 +1309,8 @@ fn evaluate(inputs: &mut [LibraryInput], memo: &infer::Memo) -> Evaluated {
                                     .entry(key)
                                     .or_insert_with(|| PackImages::new(Vec::new()));
                                 models.push((reads.len(), key, l, i));
+                            } else if facts.reading() == Some(Reading::Animation) {
+                                animations.push((reads.len(), l, i));
                             }
                         }
                     }
@@ -1400,6 +1451,102 @@ fn evaluate(inputs: &mut [LibraryInput], memo: &infer::Memo) -> Evaluated {
             },
         );
         row.materials = materials;
+    }
+
+    // The model each animation follows (D21): yours, else the rigged model of the domain sharing
+    // the most bone names with it. A model is rigged when its rig, yours else inferred from its
+    // bones, isn't none (C1: avatarFrom names a rigged model)
+    let model_facts = |l: usize, i: usize| {
+        let input = &inputs[l];
+        let item = &input.items[i];
+        (
+            item,
+            input.fbx[&item.id].facts.as_ref().expect("a model's facts"),
+        )
+    };
+    let rigged: Vec<(usize, &str, &[String])> = models
+        .iter()
+        .filter_map(|(r, _, l, i)| {
+            let (item, facts) = model_facts(*l, *i);
+            let yours = edits::rig(&edits::of(&inputs[*l].edits, &item.id));
+            let rig = yours.unwrap_or(edits::Rig::inferred(!facts.bones.is_empty()));
+            (rig != edits::Rig::None).then_some((*r, item.id.as_str(), facts.bones.as_slice()))
+        })
+        .collect();
+    let mut follows: HashMap<usize, usize> = HashMap::new();
+    let mut animation_games: HashMap<String, AnimationGame> = HashMap::new();
+    for (r, l, i) in &animations {
+        let input = &inputs[*l];
+        let item = &input.items[*i];
+        let facts = input.fbx[&item.id]
+            .facts
+            .as_ref()
+            .expect("an animation's facts");
+        let inferred = animation::default_avatar(
+            &facts.bones,
+            rigged.iter().map(|(_, id, bones)| (*id, *bones)),
+        );
+        let yours = edits::avatar_from(&edits::of(&input.edits, &item.id));
+        let asset = reads[*r].row.asset.clone();
+        let mut issue = |message: String| {
+            problems.push(Problem {
+                message: format!("{}: {message}", asset.file_path),
+                assets: vec![asset.clone()],
+            })
+        };
+        let chosen = yours.as_deref().or(inferred);
+        let model = chosen.map(|id| models.iter().find(|m| reads[m.0].row.asset.asset_id == id));
+        match model {
+            None => issue(
+                "it has no avatarFrom: no rigged model of the domain shares a bone name with it. \
+                 Add the model it animates to the domain, or choose one in its Game tab"
+                    .into(),
+            ),
+            Some(None) => issue(
+                "the model chosen as its avatarFrom isn't a model of the domain: choose another \
+                 in its Game tab, or reset it"
+                    .into(),
+            ),
+            Some(Some((m, _, ml, mi))) => {
+                let path = &reads[*m].row.asset.file_path;
+                let missing =
+                    animation::missing_bones(&facts.bones, &model_facts(*ml, *mi).1.bones);
+                if !rigged.iter().any(|(rigged, ..)| rigged == m) {
+                    issue(format!(
+                        "its avatarFrom {path} has no rig: give that model a rig in its Game tab, \
+                         or choose another model"
+                    ))
+                } else if !missing.is_empty() {
+                    issue(format!(
+                        "its bones {} aren't bones of its avatarFrom {path}, so its clips can't \
+                         play on that model",
+                        missing.join(", ")
+                    ))
+                } else {
+                    follows.insert(*r, *m);
+                }
+            }
+        }
+        let models = rigged
+            .iter()
+            .map(|(m, id, bones)| AvatarModel {
+                asset_id: id.to_string(),
+                file_path: reads[*m].row.asset.file_path.clone(),
+                asset_name: reads[*m].row.asset_name.clone(),
+                shared_bones: animation::shared(&facts.bones, bones),
+            })
+            .collect();
+        animation_games.insert(
+            item.id.clone(),
+            AnimationGame {
+                avatar_from: Field {
+                    inferred: inferred.map(str::to_string),
+                    yours: yours.map(Some),
+                },
+                models,
+                takes: facts.takes.clone(),
+            },
+        );
     }
 
     // A member image brings in its whole set, and a material the sources of the roles it uses
@@ -1649,24 +1796,43 @@ fn evaluate(inputs: &mut [LibraryInput], memo: &infer::Memo) -> Evaluated {
         }
     }
 
-    // Each model no problem names goes on to its Blender job, with its FBX's sha256
+    // Each model no problem names goes on to its Blender job, with its FBX's sha256, then each
+    // animation, which goes with the model it follows: the models come first
+    let jobs: Vec<(usize, usize, usize, Option<usize>)> = (models.iter())
+        .map(|(r, _, l, i)| (*r, *l, *i, None))
+        .chain(
+            (animations.iter()).filter_map(|(r, l, i)| Some((*r, *l, *i, Some(*follows.get(r)?)))),
+        )
+        .collect();
     let mut planned_models = Vec::new();
-    for (r, _, l, i) in &models {
-        let read = &reads[*r];
+    for (r, l, i, follows) in jobs {
+        let read = &reads[r];
         let (Some(pack), Some(name)) = (read.pack, &read.row.asset_name) else {
             continue;
         };
         if !is_pascal(name) || refused.contains(&read.row.asset.asset_id) {
             continue;
         }
-        let input = &mut inputs[*l];
-        let item = &input.items[*i];
+        if let Some(model) = follows.map(|m| &reads[m].row.asset) {
+            if refused.contains(&model.asset_id) {
+                problems.push(Problem {
+                    message: format!(
+                        "{}: the model it follows, {}, can't be exported, so neither can it",
+                        read.row.asset.file_path, model.file_path
+                    ),
+                    assets: vec![read.row.asset.clone()],
+                });
+                continue;
+            }
+        }
+        let input = &mut inputs[l];
+        let item = &input.items[i];
         let fbx = &input.fbx[&item.id];
         let (fbx_path, facts) = (
             fbx.path.clone(),
             fbx.facts.clone().expect("a model's facts"),
         );
-        let walker = &mut walkers[*l];
+        let walker = &mut walkers[l];
         // An invalid conversion.json is a problem already
         let Ok(conversion) = walker.chain(&[&fbx_path], Vec::new()) else {
             continue;
@@ -1674,8 +1840,9 @@ fn evaluate(inputs: &mut [LibraryInput], memo: &infer::Memo) -> Evaluated {
         let yours = edits::of(&input.edits, &item.id);
         match fbx_sha256(input, &mut walker.probes, &fbx_path) {
             Ok(sha256) => planned_models.push(PlannedModel {
-                read: *r,
-                library: *l,
+                read: r,
+                follows,
+                library: l,
                 source_path: relative_to(&sources[pack].path, &fbx_path),
                 fbx: fbx_path,
                 sha256,
@@ -1714,6 +1881,7 @@ fn evaluate(inputs: &mut [LibraryInput], memo: &infer::Memo) -> Evaluated {
         models: planned_models,
         model_games,
         texture_games,
+        animation_games,
         probes: walkers.into_iter().map(|w| w.probes).collect(),
         names: asset_names,
     }
@@ -1758,17 +1926,52 @@ pub(crate) fn model_job(
         facing_quarter_turns,
         patterns: &collision::PATTERNS,
         added_material: added_material(facts.slots.iter().map(|s| s.name.as_str())),
+        follow: None,
     };
     let key = cache::model_key(sha256, &job);
     job.output = cache::model_fbx(root, &key);
     (job, key)
 }
 
-/// Normalizes each planned model with headless Blender (C9), or takes it from its library's
-/// export cache (C11), as `models` says, and checks the source's kept slots and takes, as
-/// Blender read them, against the facts the Check showed. Blender is looked for (C2) only when a
-/// model's entry is missing, and a timeout, a crash, a refusal or a mismatch is a problem naming
-/// the model. Returns each model that is ready, with its cache entry.
+/// The Blender job that normalizes the animation `asset` of the library at `root` (C9 step 4),
+/// from its exported FBX `fbx` (relative to the root), whose bytes' sha256 is `sha256` and whose
+/// facts are `facts`, following the model whose job is `model` and whose cache key is
+/// `model_key`, and the job's cache key, which holds the model's (C11). Its origin and turns are
+/// the model's. The transform it follows is read from the model's result once Blender made it,
+/// so the job has no `follow` yet.
+pub(crate) fn animation_job(
+    asset: String,
+    root: &Path,
+    fbx: &str,
+    sha256: &str,
+    model: &Job,
+    model_key: &str,
+    facts: &FbxFacts,
+) -> (Job, String) {
+    let mut job = Job {
+        asset,
+        kind: JobKind::Animation,
+        input: root.join(fbx),
+        output: PathBuf::new(),
+        origin_facing: model.origin_facing,
+        facing_quarter_turns: model.facing_quarter_turns,
+        patterns: &collision::PATTERNS,
+        added_material: added_material(facts.slots.iter().map(|s| s.name.as_str())),
+        follow: None,
+    };
+    let key = cache::animation_key(sha256, &job, model_key);
+    job.output = cache::model_fbx(root, &key);
+    (job, key)
+}
+
+/// Normalizes each planned model and animation with headless Blender (C9), or takes it from its
+/// library's export cache (C11), as `models` says, and checks the source's kept slots and takes,
+/// as Blender read them, against the facts the Check showed. `planned` holds the models first,
+/// then the animations. An animation's job runs after its model's, since it follows the
+/// transform that model's result records, and an animation is ready only with its model.
+/// Blender is looked for (C2) only when an entry is missing, and a timeout, a crash, a refusal
+/// or a mismatch is a problem naming the model or animation. Returns each one that is ready,
+/// with its cache entry.
 async fn normalize(
     planned: Vec<PlannedModel>,
     roots: &[PathBuf],
@@ -1778,37 +1981,90 @@ async fn normalize(
     problems: &mut Vec<Problem>,
 ) -> Result<Vec<(PlannedModel, CachedModel)>, String> {
     let asset = |model: &PlannedModel| reads[model.read].row.asset.clone();
-    // Each model's job, writing into its cache entry, and the entry's key
-    let jobs: Vec<(Job, String)> = planned
+    let named = |model: &PlannedModel, message: String| Problem {
+        message: format!("{}: {message}", asset(model).file_path),
+        assets: vec![asset(model)],
+    };
+    let not_ready = |animation: &PlannedModel| {
+        let model = animation.follows.expect("an animation's model");
+        named(
+            animation,
+            format!(
+                "the model it follows, {}, isn't ready to export, so neither is it",
+                reads[model].row.asset.file_path
+            ),
+        )
+    };
+    // The model each animation follows, by its index in `planned`
+    let followed: Vec<Option<usize>> = planned
         .iter()
-        .map(|model| {
-            model_job(
-                asset(model).file_path,
-                &roots[model.library],
-                &model.fbx,
-                &model.sha256,
-                model.origin,
-                model.facing_quarter_turns,
-                &model.facts,
-            )
+        .map(|p| {
+            let read = p.follows?;
+            planned
+                .iter()
+                .position(|m| m.follows.is_none() && m.read == read)
         })
         .collect();
-    let lookups: Vec<(PathBuf, String)> = planned
+    // Each model's job, writing into its cache entry, and the entry's key, then each animation's,
+    // keyed by its model's key. An animation whose model has no job has none either
+    let mut jobs: Vec<Option<(Job, String)>> = planned
+        .iter()
+        .map(|model| {
+            model.follows.is_none().then(|| {
+                model_job(
+                    asset(model).file_path,
+                    &roots[model.library],
+                    &model.fbx,
+                    &model.sha256,
+                    model.origin,
+                    model.facing_quarter_turns,
+                    &model.facts,
+                )
+            })
+        })
+        .collect();
+    for (i, animation) in planned.iter().enumerate() {
+        if animation.follows.is_none() {
+            continue;
+        }
+        match followed[i] {
+            Some(m) => {
+                let (model_job, model_key) = jobs[m].clone().expect("a model's job");
+                jobs[i] = Some(animation_job(
+                    asset(animation).file_path,
+                    &roots[animation.library],
+                    &animation.fbx,
+                    &animation.sha256,
+                    &model_job,
+                    &model_key,
+                    &animation.facts,
+                ));
+            }
+            None => problems.push(not_ready(animation)),
+        }
+    }
+    let lookups: Vec<Option<(PathBuf, String)>> = planned
         .iter()
         .zip(&jobs)
-        .map(|(model, (_, key))| (roots[model.library].clone(), key.clone()))
+        .map(|(model, job)| {
+            let (_, key) = job.as_ref()?;
+            Some((roots[model.library].clone(), key.clone()))
+        })
         .collect();
     let mut cached: Vec<Option<CachedModel>> = tokio::task::spawn_blocking(move || {
         lookups
             .iter()
-            .map(|(root, key)| cache::cached_model(root, key))
+            .map(|lookup| {
+                let (root, key) = lookup.as_ref()?;
+                cache::cached_model(root, key)
+            })
             .collect()
     })
     .await
     .map_err(|e| e.to_string())?;
 
     let misses: Vec<usize> = (0..planned.len())
-        .filter(|i| cached[*i].is_none())
+        .filter(|i| jobs[*i].is_some() && cached[*i].is_none())
         .collect();
     if let (Models::Normalize(progress), false) = (models, misses.is_empty()) {
         match blender::gate(blender_path).await {
@@ -1828,92 +2084,138 @@ async fn normalize(
             Ok(blender) => {
                 // One job per entry: models whose jobs share a key (identical FBX files with
                 // the same settings in one library) share its output file, so they share the
-                // job, which names them all
-                let mut shared: Vec<Vec<usize>> = Vec::new();
-                for i in &misses {
-                    let entry = (planned[*i].library, &jobs[*i].1);
-                    match shared
-                        .iter_mut()
-                        .find(|g| (planned[g[0]].library, &jobs[g[0]].1) == entry)
+                // job, which names them all. The models' jobs run first, then the animations'
+                let shared = |animations: bool| {
+                    let mut shared: Vec<Vec<usize>> = Vec::new();
+                    let job = |i: usize| jobs[i].as_ref().map(|(_, key)| key);
+                    for i in misses
+                        .iter()
+                        .filter(|i| planned[**i].follows.is_some() == animations)
                     {
-                        Some(group) => group.push(*i),
-                        None => shared.push(vec![*i]),
+                        let entry = (planned[*i].library, job(*i));
+                        match shared
+                            .iter_mut()
+                            .find(|g| (planned[g[0]].library, job(g[0])) == entry)
+                        {
+                            Some(group) => group.push(*i),
+                            None => shared.push(vec![*i]),
+                        }
                     }
-                }
+                    shared
+                };
+                let phases = [shared(false), shared(true)];
                 let runner = Runner::new(blender);
-                let total = shared.len();
+                let total = phases.iter().map(Vec::len).sum();
                 let done = std::sync::atomic::AtomicUsize::new(0);
                 progress(Progress {
                     done: 0,
                     total,
                     asset: None,
                 });
-                let runs = shared.iter().map(|group| {
-                    let (job, key) = &jobs[group[0]];
-                    let names: Vec<String> = group
+                for groups in &phases {
+                    // An animation follows what its model's result records
+                    let follow: Vec<Option<Follow>> = groups
                         .iter()
-                        .map(|i| asset(&planned[*i]).file_path)
+                        .map(|group| {
+                            let model = followed[group[0]]?;
+                            cached[model].as_ref().map(|c| Follow::of(&c.normalized))
+                        })
                         .collect();
-                    let job = Job {
-                        asset: names.join(", "),
-                        ..job.clone()
-                    };
-                    let root = roots[planned[group[0]].library].clone();
-                    let (runner, done) = (&runner, &done);
-                    async move {
-                        let result = match runner.run(&job).await {
-                            Ok(normalized) => {
-                                let key = key.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    cache::save_model(&root, &key, normalized)
-                                })
-                                .await
-                                .map_err(|e| e.to_string())
-                                .and_then(|saved| saved)
-                                .map_err(|e| format!("{}: {e}", job.asset))
-                            }
-                            Err(e) => Err(e),
+                    let runs = groups.iter().zip(follow).map(|(group, follow)| {
+                        let (job, key) = jobs[group[0]].clone().expect("a missing entry's job");
+                        let names: Vec<String> = group
+                            .iter()
+                            .map(|i| asset(&planned[*i]).file_path)
+                            .collect();
+                        let animation = job.kind == JobKind::Animation;
+                        let job = Job {
+                            asset: names.join(", "),
+                            follow,
+                            ..job
                         };
-                        let done = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                        progress(Progress {
-                            done,
-                            total,
-                            asset: Some(job.asset.clone()),
-                        });
-                        (group, result)
-                    }
-                });
-                for (group, result) in futures_util::future::join_all(runs).await {
-                    match result {
-                        Ok(entry) => {
-                            for i in group {
-                                cached[*i] = Some(entry.clone());
-                            }
+                        let root = roots[planned[group[0]].library].clone();
+                        let (runner, done) = (&runner, &done);
+                        let unfollowed = animation && job.follow.is_none();
+                        let model = followed[group[0]].map(|m| asset(&planned[m]).file_path);
+                        async move {
+                            let result = if unfollowed {
+                                Err(format!(
+                                    "{}: the model it follows, {}, wasn't normalized, so it \
+                                     can't follow it",
+                                    job.asset,
+                                    model.unwrap_or_default()
+                                ))
+                            } else {
+                                run_job(runner, &job, key, root).await
+                            };
+                            let done = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            progress(Progress {
+                                done,
+                                total,
+                                asset: Some(job.asset.clone()),
+                            });
+                            (group, result)
                         }
-                        Err(message) => problems.push(Problem {
-                            message,
-                            assets: group.iter().map(|i| asset(&planned[*i])).collect(),
-                        }),
+                    });
+                    for (group, result) in futures_util::future::join_all(runs).await {
+                        match result {
+                            Ok(entry) => {
+                                for i in group {
+                                    cached[*i] = Some(entry.clone());
+                                }
+                            }
+                            Err(message) => problems.push(Problem {
+                                message,
+                                assets: group.iter().map(|i| asset(&planned[*i])).collect(),
+                            }),
+                        }
                     }
                 }
             }
         }
     }
 
+    let normalizing = matches!(models, Models::Normalize(_));
     let mut ready = Vec::new();
+    // The models come first, so each animation's model is known to be ready or not
+    let mut ready_reads = HashSet::new();
     for (model, cached) in planned.into_iter().zip(cached) {
         let Some(cached) = cached else {
             continue;
         };
+        if model.follows.is_some_and(|m| !ready_reads.contains(&m)) {
+            // Taking models only from the cache, a model it doesn't hold is left out quietly,
+            // and so is an animation that follows it
+            if normalizing {
+                problems.push(not_ready(&model));
+            }
+            continue;
+        }
         match blender::check_facts(&cached.normalized, &model.facts) {
-            Ok(()) => ready.push((model, cached)),
-            Err(e) => problems.push(Problem {
-                message: format!("{}: {e}", asset(&model).file_path),
-                assets: vec![asset(&model)],
-            }),
+            Ok(()) => {
+                ready_reads.insert(model.read);
+                ready.push((model, cached));
+            }
+            Err(e) => problems.push(named(&model, e)),
         }
     }
     Ok(ready)
+}
+
+/// Runs `job`, which writes the export cache entry of key `key` in the library at `root`, and
+/// saves the entry.
+async fn run_job(
+    runner: &Runner,
+    job: &Job,
+    key: String,
+    root: PathBuf,
+) -> Result<CachedModel, String> {
+    let normalized = runner.run(job).await?;
+    tokio::task::spawn_blocking(move || cache::save_model(&root, &key, normalized))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|saved| saved)
+        .map_err(|e| format!("{}: {e}", job.asset))
 }
 
 /// The manifest entry of `model`, read as `read`, from its normalized FBX `cached` (C9): its
@@ -1954,7 +2256,7 @@ fn model_entry(
         }));
     }
     let mut conversion = model.conversion.clone();
-    conversion.push(blender::step(normalized));
+    conversion.push(blender::step(normalized, None));
     let mut entry = json!({
         "kind": "model",
         "assetName": name,
@@ -1971,6 +2273,35 @@ fn model_entry(
         entry["clips"] = json!(normalized.takes);
     }
     Ok(entry)
+}
+
+/// The manifest entry of `animation`, read as `read`, from its normalized FBX `cached` (C9 step
+/// 4): `avatarFrom` names the model it follows, `followed`, and `clips` are its takes. Its
+/// `conversion` is its nearest `conversion.json`'s steps, then Blender's, which records the model
+/// it followed (C10).
+fn animation_entry(
+    animation: &PlannedModel,
+    read: &Read,
+    followed: &str,
+    export_packs: &[packs::ExportPack],
+    cached: &CachedModel,
+) -> Value {
+    let normalized = &cached.normalized;
+    let name = read.row.asset_name.as_deref().unwrap_or_default();
+    let pack = read.pack.expect("a planned animation's pack");
+    let mut conversion = animation.conversion.clone();
+    conversion.push(blender::step(normalized, Some(followed)));
+    json!({
+        "kind": "animation",
+        "assetName": name,
+        "file": format!("Animations/{name}.fbx"),
+        "sha256": cached.sha256,
+        "pack": export_packs[pack].id,
+        "sourcePath": animation.source_path,
+        "conversion": conversion,
+        "avatarFrom": followed,
+        "clips": normalized.takes,
+    })
 }
 
 /// The manifest of `reads`, the problems its validation adds, the manifest's files and the
@@ -2080,8 +2411,8 @@ fn material_names(materials: &[infer::Material], issue: &mut impl FnMut(String))
 }
 
 /// What refuses a model item exporting from `fbx` (C3): an FBX that can't be read, has two
-/// materials of one name, or has no kept mesh and no take, and the build-order guard on
-/// animations. `exported_kind` says which of the two it is.
+/// materials of one name, or has no kept mesh and no take. `exported_kind` says whether it is a
+/// model or an animation.
 fn read_fbx(fbx: &ItemFbx, item_path: &str, issue: &mut impl FnMut(String)) {
     let what = if fbx.path == item_path {
         "FBX".to_string()
@@ -2103,10 +2434,8 @@ fn read_fbx(fbx: &ItemFbx, item_path: &str, issue: &mut impl FnMut(String)) {
         };
         issue(format!("{what} has {count} materials named {name}"));
     }
-    match facts.reading() {
-        Some(Reading::Model) => {}
-        Some(Reading::Animation) => issue("animation export not built yet (an FBX with no kept mesh and a take exports as an animation)".into()),
-        None => issue(format!("{what} has no kept mesh and no take")),
+    if facts.reading().is_none() {
+        issue(format!("{what} has no kept mesh and no take"));
     }
 }
 
@@ -3825,17 +4154,9 @@ mod tests {
     #[tokio::test]
     async fn fbx_groups_and_lone_fbx_files_are_models_or_animations_by_their_facts() {
         let f = fixture().await;
-        // The mesh-less animation fixture comes with animation export; a copy stands in for it
-        let idle = "Dungeon Props/Animations/A_Idle.fbx";
-        add_file(&f, idle, &fixture_bytes("Dungeon Props/Models/SM_Hull.fbx")).await;
-        let facts = Facts::fixture().with(
-            idle,
-            Ok(FbxFacts {
-                bones: vec!["Hips".into()],
-                takes: vec!["Idle".into()],
-                ..FbxFacts::default()
-            }),
-        );
+        // A take and no mesh
+        let idle = "Dungeon Props/Animations/A_GuardIdle.fbx";
+        let facts = Facts::fixture();
         collection(
             &f,
             "domain",
@@ -3857,7 +4178,6 @@ mod tests {
         assert_eq!(
             messages(&report),
             [
-                "Dungeon Props/Animations/A_Idle.fbx: animation export not built yet (an FBX with no kept mesh and a take exports as an animation)",
                 "Dungeon Props/Models/SM_Barrel.obj: it has no FBX file: a model exports from its group's FBX",
             ]
         );
@@ -3869,7 +4189,7 @@ mod tests {
         assert_eq!(
             kinds_of(&models),
             [
-                (idle, Kind::Animation, Status::Problem),
+                (idle, Kind::Animation, Status::Ready),
                 (
                     "Dungeon Props/Models/SK_Guard.fbx",
                     Kind::Model,
@@ -3902,7 +4222,7 @@ mod tests {
             .iter()
             .find(|a| a.kind == Kind::Animation)
             .unwrap();
-        assert_eq!(idle_row.asset_name.as_deref(), Some("Idle"));
+        assert_eq!(idle_row.asset_name.as_deref(), Some("GuardIdle"));
         // Only FBX files are read, and no OBJ
         assert_eq!(
             facts.read_files(),
@@ -3914,7 +4234,7 @@ mod tests {
                 "Dungeon Props/Models/SM_Pillar.fbx",
             ]
         );
-        // No model exports yet, but the textures their materials bring in do
+        // The cache holds no model or animation, but the textures the materials bring in export
         let names: Vec<(String, String)> = texture_entries(&report)
             .into_iter()
             .map(|(name, role, _)| (name, role))
@@ -5390,6 +5710,7 @@ mod tests {
             facing_quarter_turns: facing,
             patterns: &collision::PATTERNS,
             added_material: added_material(slots.iter().copied()),
+            follow: None,
         };
         let key = cache::model_key(&sha256, &job);
         let fbx = cache::model_fbx(root, &key);
@@ -5951,6 +6272,420 @@ mod tests {
         assert_eq!(model_entries(report), Vec::<&Value>::new());
     }
 
+    const GUARD: &str = "Dungeon Props/Models/SK_Guard.fbx";
+    const IDLE: &str = "Dungeon Props/Animations/A_GuardIdle.fbx";
+    const NOD: &str = "Dungeon Props/Animations/A_GuardNod.fbx";
+    const WAG: &str = "Dungeon Props/Animations/A_Wag.fbx";
+
+    async fn write_edit(f: &Fixture, path: &str, value: Value) {
+        let id = id_of(&f.library.pool, path).await;
+        edits::write(&f.library.pool, &id, value.as_object().unwrap())
+            .await
+            .unwrap();
+    }
+
+    async fn inspect_cached(f: &Fixture) -> Inspection {
+        inspect(
+            &f.db,
+            "domain",
+            &Facts::fixture(),
+            &fresh_memo(),
+            Models::Cached,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_animation_follows_the_rigged_model_sharing_the_most_bones_or_yours() {
+        let f = fixture().await;
+        let stool = "Dungeon Props/Models/SM_Stool.fbx";
+        collection(&f, "domain", "Props", "dg", &[IDLE, NOD, WAG, stool]).await;
+
+        // No rigged model in the domain: the stool has no bones
+        let report = inspect_cached(&f).await.report;
+        let none = "it has no avatarFrom: no rigged model of the domain shares a bone name with \
+                    it. Add the model it animates to the domain, or choose one in its Game tab";
+        assert_eq!(
+            messages(&report),
+            [IDLE, NOD, WAG].map(|path| format!("{path}: {none}"))
+        );
+
+        // The guard shares all of the idle's and the nod's bones, and only Hips with the wag
+        add_members(&f.db, &f.library, "domain", &[GUARD]).await;
+        let inspection = inspect_cached(&f).await;
+        let not_guard_s = |path: &str, bones: &str, model: &str| {
+            format!(
+                "{path}: its bones {bones} aren't bones of its avatarFrom {model}, so its clips \
+                 can't play on that model"
+            )
+        };
+        assert_eq!(
+            messages(&inspection.report),
+            [not_guard_s(WAG, "Tail, Tail_end", GUARD)]
+        );
+        let rows = kinds_of(&inspection.report.assets.iter().collect::<Vec<_>>());
+        assert!(
+            rows.contains(&(IDLE, Kind::Animation, Status::Ready)),
+            "{rows:?}"
+        );
+        assert!(
+            rows.contains(&(WAG, Kind::Animation, Status::Problem)),
+            "{rows:?}"
+        );
+        let guard = id_of(&f.library.pool, GUARD).await;
+        let idle = id_of(&f.library.pool, IDLE).await;
+        let game = &inspection.animations[&idle];
+        assert_eq!(
+            game.avatar_from,
+            Field {
+                inferred: Some(guard.clone()),
+                yours: None
+            }
+        );
+        assert_eq!(game.takes, ["Idle"]);
+        assert_eq!(
+            game.models,
+            [AvatarModel {
+                asset_id: guard.clone(),
+                file_path: GUARD.into(),
+                asset_name: Some("Guard".into()),
+                shared_bones: 4,
+            }]
+        );
+        let wag = id_of(&f.library.pool, WAG).await;
+        assert_eq!(inspection.animations[&wag].models[0].shared_bones, 1);
+
+        // Yours wins: a model with no rig is refused, and once you rig it, its bones are
+        let stool_id = id_of(&f.library.pool, stool).await;
+        write_edit(&f, IDLE, json!({ "avatarFrom": stool_id })).await;
+        let inspection = inspect_cached(&f).await;
+        assert_eq!(
+            messages(&inspection.report),
+            [
+                format!(
+                    "{IDLE}: its avatarFrom {stool} has no rig: give that model a rig in its \
+                     Game tab, or choose another model"
+                ),
+                not_guard_s(WAG, "Tail, Tail_end", GUARD),
+            ]
+        );
+        assert_eq!(
+            inspection.animations[&idle].avatar_from.yours,
+            Some(Some(stool_id.clone()))
+        );
+        write_edit(&f, stool, json!({"rig": "generic"})).await;
+        let inspection = inspect_cached(&f).await;
+        assert_eq!(
+            messages(&inspection.report)[0],
+            not_guard_s(IDLE, "Hips, Spine, Head, Head_end", stool)
+        );
+        let offered: Vec<(&str, usize)> = (inspection.animations[&idle].models.iter())
+            .map(|m| (m.file_path.as_str(), m.shared_bones))
+            .collect();
+        assert_eq!(offered, [(GUARD, 4), (stool, 0)]);
+
+        // A model outside the domain
+        let pillar = id_of(&f.library.pool, "Dungeon Props/Models/SM_Pillar.fbx").await;
+        write_edit(&f, IDLE, json!({ "avatarFrom": pillar })).await;
+        assert_eq!(
+            messages(&inspect_cached(&f).await.report)[0],
+            format!(
+                "{IDLE}: the model chosen as its avatarFrom isn't a model of the domain: choose \
+                 another in its Game tab, or reset it"
+            )
+        );
+
+        // Reset, it follows the guard again
+        write_edit(&f, IDLE, json!({"avatarFrom": null})).await;
+        assert_eq!(
+            messages(&inspect_cached(&f).await.report),
+            [not_guard_s(WAG, "Tail, Tail_end", GUARD)]
+        );
+
+        // A model that can't export takes the animations following it along
+        write_edit(&f, stool, json!({"assetName": "Guard"})).await;
+        let report = inspect_cached(&f).await.report;
+        let follows_refused = |path: &str| {
+            format!("{path}: the model it follows, {GUARD}, can't be exported, so neither can it")
+        };
+        assert_eq!(
+            messages(&report),
+            [
+                not_guard_s(WAG, "Tail, Tail_end", GUARD),
+                format!(
+                    "2 models or animations are named Guard: {GUARD} and {stool}. Give one \
+                     another name in its Game tab"
+                ),
+                // Each model's base color takes its name
+                "2 textures are named Guard with the role BaseColor: Dungeon Props/Textures/\
+                 T_Guard_D.png and Dungeon Props/Textures/T_Stool_D.jpg. Give one another name \
+                 in its Game tab"
+                    .into(),
+                follows_refused(IDLE),
+                follows_refused(NOD),
+            ]
+        );
+    }
+
+    /// What the script reports for an animation, for tests without Blender: no mesh, an
+    /// armature of `bones`, the take `take`, and the transform of the model it followed.
+    fn test_animation(
+        take: &str,
+        bones: &[&str],
+        model: &blender::Normalized,
+    ) -> blender::Normalized {
+        let mut normalized = blender::test_normalized(&[], None, &[take], bones);
+        normalized.bounds = None;
+        normalized.meshes = Vec::new();
+        normalized.has_mesh = false;
+        normalized.transform = model.transform.clone();
+        normalized
+    }
+
+    /// Puts `normalized` in the fixture library's export cache as what the animation at `path`
+    /// normalizes to, following the model at `model` in a pack of origin `origin`, turned by
+    /// your `facing` quarter turns, keyed as a Check keys it.
+    fn cache_animation(
+        f: &Fixture,
+        path: &str,
+        model: &str,
+        origin: Origin,
+        facing: u8,
+        normalized: blender::Normalized,
+    ) -> CachedModel {
+        let root = &f.library.root_path;
+        let facts = Facts::fixture();
+        let fact = |path: &str| facts.by_path[path].clone().unwrap();
+        let model_sha256 = hashes::sha256_file(&root.join(model)).unwrap();
+        let (model_job, model_key) = model_job(
+            model.into(),
+            root,
+            model,
+            &model_sha256,
+            origin,
+            facing,
+            &fact(model),
+        );
+        let sha256 = hashes::sha256_file(&root.join(path)).unwrap();
+        let (job, key) = animation_job(
+            path.into(),
+            root,
+            path,
+            &sha256,
+            &model_job,
+            &model_key,
+            &fact(path),
+        );
+        std::fs::create_dir_all(job.output.parent().unwrap()).unwrap();
+        std::fs::write(&job.output, format!("{path}, normalized")).unwrap();
+        cache::save_model(root, &key, normalized).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_animation_entry_follows_its_model_whose_key_its_own_holds() {
+        let f = fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let no_blender = dir.path().join("no-blender");
+        set_blender(&f, &no_blender).await;
+        collection(&f, "domain", "Props", "dg", &[GUARD, IDLE]).await;
+        let bones = ["Hips", "Spine", "Head", "Head_end"];
+        let guard = blender::test_normalized(&["Cloth"], None, &["Wave"], &bones);
+        cache_model(&f, GUARD, Origin::Generic, &["Cloth"], guard.clone());
+        let idle = cache_animation(
+            &f,
+            IDLE,
+            GUARD,
+            Origin::Generic,
+            0,
+            test_animation("Idle", &bones, &guard),
+        );
+
+        let (inspection, progress) = normalize_domain(&f, &Facts::fixture()).await;
+        let report = &inspection.report;
+        assert_eq!(messages(report), Vec::<&str>::new());
+        assert_eq!(progress, [], "a Blender job ran");
+        assert_valid(report);
+        let assets = report.manifest["assets"].as_array().unwrap();
+        // Animations come last in the manifest
+        assert_eq!(
+            *assets.last().unwrap(),
+            json!({
+                "kind": "animation",
+                "assetName": "GuardIdle",
+                "file": "Animations/GuardIdle.fbx",
+                "sha256": idle.sha256,
+                "pack": "dungeon-props",
+                "sourcePath": "Animations/A_GuardIdle.fbx",
+                "conversion": [{
+                    "tool": "Blender",
+                    "toolVersion": "5.2.2",
+                    "by": blender::NORMALIZE_VERSION,
+                    "from": "fbx",
+                    "settings": {
+                        "facingQuarterTurns": 0,
+                        "originFacing": "generic",
+                        "pivotX": 0.0,
+                        "pivotY": 0.25,
+                        "pivotZ": 0.0,
+                        "droppedMeshes": 0,
+                        "followed": "Guard",
+                    },
+                }],
+                "avatarFrom": "Guard",
+                "clips": ["Idle"],
+            })
+        );
+        let file = inspection
+            .files
+            .iter()
+            .find(|f| f.file == "Animations/GuardIdle.fbx")
+            .unwrap();
+        assert_eq!(file.source, idle.fbx);
+
+        // C11: turning the guard changes its key, and so the key of the animation following it
+        write_edit(&f, GUARD, json!({"facingQuarterTurns": 1})).await;
+        let (inspection, _) = normalize_domain(&f, &Facts::fixture()).await;
+        assert_eq!(
+            messages(&inspection.report),
+            [format!(
+                "{GUARD}, {IDLE}: the export cache doesn't hold their normalized FBX files, so \
+                 Blender must make them: No Blender at {}",
+                no_blender.display()
+            )]
+        );
+
+        // An animation the cache holds, following a model it doesn't, waits for the model
+        let mut turned = guard.clone();
+        turned.transform.facing_quarter_turns = 1;
+        cache_animation(
+            &f,
+            IDLE,
+            GUARD,
+            Origin::Generic,
+            1,
+            test_animation("Idle", &bones, &turned),
+        );
+        let (inspection, _) = normalize_domain(&f, &Facts::fixture()).await;
+        assert_eq!(
+            messages(&inspection.report),
+            [
+                format!(
+                    "{GUARD}: the export cache doesn't hold its normalized FBX, so Blender must \
+                     make it: No Blender at {}",
+                    no_blender.display()
+                ),
+                format!(
+                    "{IDLE}: the model it follows, {GUARD}, isn't ready to export, so neither is it"
+                ),
+            ]
+        );
+        // Taking models only from the cache, as the Game tab does, both are left out quietly
+        let report = inspect_cached(&f).await.report;
+        assert_eq!(messages(&report), Vec::<&str>::new());
+        let kinds: Vec<&Value> = report.manifest["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| &a["kind"])
+            .filter(|k| *k != "texture")
+            .collect();
+        assert_eq!(kinds, Vec::<&Value>::new());
+    }
+
+    /// AC6 with the Blender in `OPENDAM_BLENDER`: the fixture's animations export following their
+    /// model, the one whose bones don't match is refused, the FBX whose only mesh is a `UCX_` hull
+    /// exports as an animation, and turning the model re-runs the animations' jobs, whose clips
+    /// then follow the turned model.
+    #[tokio::test]
+    async fn animations_follow_their_model_and_run_again_when_it_turns() {
+        use crate::export::blender::tests::armatures;
+        use crate::export::bundle::{ExportOutcome, Exports};
+        let Some(program) = blender::test_blender() else {
+            return;
+        };
+        let f = fixture().await;
+        set_blender(&f, &program).await;
+        collection(&f, "domain", "Props", "dg", &[GUARD, IDLE, NOD]).await;
+        collection(&f, "pets", "Pets", "dg", &[GUARD, WAG]).await;
+        let exports = Exports::default();
+        let facts = Facts::fixture();
+
+        // The wag's Tail isn't the guard's
+        let report = exports.check(&f.db, "pets", &facts, &|_| {}).await.unwrap();
+        assert_eq!(
+            messages(&report),
+            [format!(
+                "{WAG}: its bones Tail, Tail_end aren't bones of its avatarFrom {GUARD}, so its \
+                 clips can't play on that model"
+            )]
+        );
+        assert!(!report.manifest["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["kind"] == "animation"));
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let progress = |p: Progress| seen.lock().unwrap().push(p);
+        let ended = || {
+            let reported = std::mem::take(&mut *seen.lock().unwrap());
+            let mut ended: Vec<String> =
+                (reported.iter()).filter_map(|p| p.asset.clone()).collect();
+            ended.sort();
+            (reported[0].total, ended)
+        };
+        let animations = vec![IDLE.to_string(), NOD.into()];
+        let all = vec![IDLE.to_string(), NOD.into(), GUARD.into()];
+
+        let mut turns_seen = Vec::new();
+        for turns in [0, 1] {
+            if turns > 0 {
+                write_edit(&f, GUARD, json!({ "facingQuarterTurns": turns })).await;
+            }
+            let report = exports
+                .check(&f.db, "domain", &facts, &progress)
+                .await
+                .unwrap();
+            assert_eq!(messages(&report), Vec::<&str>::new());
+            // The Pets check made the guard's entry, so only the animations' jobs run, and all
+            // three run again once the guard turns
+            let jobs = if turns == 0 { &animations } else { &all };
+            assert_eq!(ended(), (jobs.len(), jobs.clone()), "{turns}");
+            let ExportOutcome::Exported { bundle_path, .. } =
+                exports.export(&f.db, "domain", &facts).await.unwrap()
+            else {
+                panic!("the export was refused");
+            };
+            let bundle = PathBuf::from(&bundle_path);
+            assert_eq!(crate::export::bundle::verify(&bundle, &[]), Ok(()));
+            let manifest: Value =
+                serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap())
+                    .unwrap();
+            assert_eq!(contract::validate_manifest(&manifest), Ok(()));
+            let model = armatures(&program, &bundle.join("Models/Guard.fbx")).await;
+            for (name, clip) in [("GuardIdle", "Idle"), ("GuardNod", "Nod")] {
+                let entry = (manifest["assets"].as_array().unwrap().iter())
+                    .find(|a| a["assetName"] == name)
+                    .unwrap();
+                assert_eq!(entry["kind"], "animation");
+                assert_eq!(entry["avatarFrom"], "Guard");
+                assert_eq!(entry["clips"], json!([clip]));
+                let settings = &entry["conversion"][0]["settings"];
+                assert_eq!(settings["followed"], "Guard");
+                assert_eq!(settings["facingQuarterTurns"], turns);
+                let file = bundle.join(format!("Animations/{name}.fbx"));
+                assert_eq!(armatures(&program, &file).await, model, "{name} {turns}");
+            }
+            let nod = (manifest["assets"].as_array().unwrap().iter())
+                .find(|a| a["assetName"] == "GuardNod")
+                .unwrap();
+            assert_eq!(nod["conversion"][0]["settings"]["droppedMeshes"], 1);
+            turns_seen.push(model);
+        }
+        assert_ne!(turns_seen[0], turns_seen[1], "the turn moved no armature");
+    }
+
     /// Every file below `dir`, by its path relative to it.
     fn bundle_contents(dir: &Path) -> BTreeMap<String, Vec<u8>> {
         walkdir::WalkDir::new(dir)
@@ -5993,7 +6728,7 @@ print('OPENDAM_REIMPORT', json.dumps({'meshes': sorted(o.name for o in meshes), 
         )
     }
 
-    /// AC2 for models, AC5 and AC10, with the Blender in `OPENDAM_BLENDER`: the fixture's models
+    /// AC2, AC5 and AC10, with the Blender in `OPENDAM_BLENDER`: the fixture's models, animations
     /// and textures export end to end, normalized, and export again from the export cache
     /// without Blender, byte for byte, even once a model's file is renamed.
     #[tokio::test]
@@ -6021,7 +6756,7 @@ print('OPENDAM_REIMPORT', json.dumps({'meshes': sorted(o.name for o in meshes), 
             .map(|n| format!("Dungeon Props/Models/{n}.fbx"))
             .collect();
         let mut members: Vec<&str> = models.iter().map(String::as_str).collect();
-        members.push("Dungeon Props/Rocks/T_Rock_R.png");
+        members.extend([IDLE, NOD, "Dungeon Props/Rocks/T_Rock_R.png"]);
         collection(&f, "domain", "Props", "dg", &members).await;
         let exports = Exports::default();
         let mut facts = Facts::fixture();
@@ -6037,22 +6772,26 @@ print('OPENDAM_REIMPORT', json.dumps({'meshes': sorted(o.name for o in meshes), 
         assert!(report.staged);
         // Once before the jobs, then once as each ends
         let reported = std::mem::take(&mut *seen.lock().unwrap());
+        let jobs = names.len() + 2;
         assert_eq!(
             reported[0],
             Progress {
                 done: 0,
-                total: names.len(),
+                total: jobs,
                 asset: None
             }
         );
         let dones: Vec<usize> = reported[1..].iter().map(|p| p.done).collect();
-        assert_eq!(dones, (1..=names.len()).collect::<Vec<_>>());
+        assert_eq!(dones, (1..=jobs).collect::<Vec<_>>());
         let mut ended: Vec<String> = reported[1..]
             .iter()
             .map(|p| p.asset.clone().unwrap())
             .collect();
         ended.sort();
-        assert_eq!(ended, models);
+        let mut expected: Vec<String> = models.clone();
+        expected.extend([IDLE.to_string(), NOD.to_string()]);
+        expected.sort();
+        assert_eq!(ended, expected);
 
         let ExportOutcome::Exported { bundle_path, .. } =
             exports.export(&f.db, "domain", &facts).await.unwrap()
@@ -6175,6 +6914,27 @@ print('OPENDAM_REIMPORT', json.dumps({'meshes': sorted(o.name for o in meshes), 
         }
         assert_eq!(model("Guard")["rig"], "generic");
         assert_eq!(model("Guard")["clips"], json!(["Wave"]));
+        // The animations follow the guard, in the bundle beside it
+        let animations: Vec<(&Value, &Value, &Value)> = (manifest["assets"].as_array().unwrap())
+            .iter()
+            .filter(|a| a["kind"] == "animation")
+            .map(|a| (&a["file"], &a["avatarFrom"], &a["clips"]))
+            .collect();
+        assert_eq!(
+            animations,
+            [
+                (
+                    &json!("Animations/GuardIdle.fbx"),
+                    &json!("Guard"),
+                    &json!(["Idle"])
+                ),
+                (
+                    &json!("Animations/GuardNod.fbx"),
+                    &json!("Guard"),
+                    &json!(["Nod"])
+                ),
+            ]
+        );
         for name in ["Boulder", "Pillar", "Stool", "Totem"] {
             assert_eq!(model(name)["rig"], "none", "{name}");
             assert_eq!(model(name).get("clips"), None, "{name}");

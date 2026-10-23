@@ -8,7 +8,9 @@
 //! The edits are `assetName` for every asset, `materials` for a model (each slot's `name`,
 //! `surface` and `textures`, keyed by slot name), and `layout`, `role` and `normalConvention`
 //! for an image, which reach the image's own group but not the rest of its set. A model also
-//! takes `rig` and `facingQuarterTurns`.
+//! takes `rig` and `facingQuarterTurns`, and an animation `avatarFrom`, the model it follows.
+//! Whether an FBX is a model or an animation takes its facts (C3), so every model item takes
+//! all four, and the Check reads each where it applies.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,19 +35,22 @@ pub const ROLE: &str = "role";
 pub const NORMAL_CONVENTION: &str = "normalConvention";
 pub const RIG: &str = "rig";
 pub const FACING_QUARTER_TURNS: &str = "facingQuarterTurns";
+pub const AVATAR_FROM: &str = "avatarFrom";
 
 /// A model's rig as the manifest lists it (D20). The export infers none without an armature,
-/// else generic. Humanoid, which only you set, comes with animation export (build order step 7).
+/// else generic. Humanoid is only ever yours: the Game tab suggests it when the bones follow a
+/// humanoid naming (`animation::humanoid_naming`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Rig {
     None,
     Generic,
+    Humanoid,
 }
 
 impl Rig {
     /// Every rig an edit can hold
-    pub const ALL: [Rig; 2] = [Rig::None, Rig::Generic];
+    pub const ALL: [Rig; 3] = [Rig::None, Rig::Generic, Rig::Humanoid];
 
     /// What the export infers for a model: generic when it has an armature
     pub fn inferred(has_armature: bool) -> Self {
@@ -101,6 +106,16 @@ pub fn rig(edits: &Edits) -> Option<Rig> {
 /// `value` as a rig, the one reading of a stored or sent `rig`.
 fn parse_rig(value: &Value) -> Option<Rig> {
     serde_json::from_value(value.clone()).ok()
+}
+
+/// The model you chose for an animation to follow in `edits` (D21), by its grid item's asset id,
+/// if any.
+pub fn avatar_from(edits: &Edits) -> Option<String> {
+    edits
+        .get(AVATAR_FROM)
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 /// The most quarter turns an edit holds: four make a whole turn.
@@ -322,7 +337,8 @@ fn validate_materials(materials: &Value) -> Result<(), String> {
 /// Refuses a `patch` holding a key that isn't an edit of an asset of `kind`, or a value an edit
 /// can't take: an `assetName` must be a PascalCase string, `materials` (a model's) slots of
 /// `validate_materials`, a model's `rig` a `Rig` and `facingQuarterTurns` 0 to
-/// `MAX_QUARTER_TURNS`, read by the same parsers as the readers, and an image's `layout`, `role`
+/// `MAX_QUARTER_TURNS`, read by the same parsers as the readers, an animation's `avatarFrom` an
+/// asset id, which the Check resolves among its domain's models, and an image's `layout`, `role`
 /// and `normalConvention` one of their names. Null resets any of them.
 fn validate(kind: &str, patch: &Edits) -> Result<(), String> {
     let model = AssetKind::from_str(kind) == AssetKind::Model3d;
@@ -333,7 +349,7 @@ fn validate(kind: &str, patch: &Edits) -> Result<(), String> {
             ASSET_NAME if value.is_null() => {}
             ASSET_NAME => validate_name(value, "An assetName")?,
             MATERIALS if model => validate_materials(value)?,
-            RIG | FACING_QUARTER_TURNS if model && value.is_null() => {}
+            RIG | FACING_QUARTER_TURNS | AVATAR_FROM if model && value.is_null() => {}
             RIG if model && parse_rig(value).is_some() => {}
             RIG if model => {
                 let names: Vec<String> = Rig::ALL
@@ -345,7 +361,12 @@ fn validate(kind: &str, patch: &Edits) -> Result<(), String> {
                     })
                     .map(|name| name.trim_matches('"').to_string())
                     .collect();
-                return Err(format!("A rig must be {}", names.join(" or ")));
+                let (last, rest) = names.split_last().expect("a rig");
+                return Err(format!("A rig must be {} or {last}", rest.join(", ")));
+            }
+            AVATAR_FROM if model && text.is_some_and(|id| !id.is_empty()) => {}
+            AVATAR_FROM if model => {
+                return Err("avatarFrom is the asset id of the model an animation follows".into())
             }
             FACING_QUARTER_TURNS if model && parse_turns(value).is_some() => {}
             FACING_QUARTER_TURNS if model => {
@@ -778,7 +799,18 @@ mod tests {
                 "\"sedan car\" isn't PascalCase: a game name starts with a capital letter, then only letters and digits",
             ),
             (json!({"assetName": 3}), "An assetName must be text"),
-            (json!({"rig": "humanoid"}), "A rig must be none or generic"),
+            (
+                json!({"rig": "biped"}),
+                "A rig must be none, generic or humanoid",
+            ),
+            (
+                json!({"avatarFrom": ""}),
+                "avatarFrom is the asset id of the model an animation follows",
+            ),
+            (
+                json!({"avatarFrom": 3}),
+                "avatarFrom is the asset id of the model an animation follows",
+            ),
             (
                 json!({"facingQuarterTurns": 4}),
                 "facingQuarterTurns must be a whole number from 0 to 3",
@@ -1166,11 +1198,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_image_has_no_rig_or_facing() {
+    async fn an_avatar_from_reaches_the_group_and_resets() {
+        let pool = car_kit().await;
+        write(&pool, SEDAN[1], &patch(json!({"avatarFrom": "guard-id"})))
+            .await
+            .unwrap();
+        let all = read_all(&pool).await.unwrap();
+        for id in SEDAN {
+            assert_eq!(
+                avatar_from(&of(&all, id)).as_deref(),
+                Some("guard-id"),
+                "{id}"
+            );
+        }
+        write(&pool, SEDAN[2], &patch(json!({"avatarFrom": null})))
+            .await
+            .unwrap();
+        assert_eq!(rows(&pool).await, []);
+    }
+
+    #[tokio::test]
+    async fn an_image_has_no_rig_facing_or_avatar_from() {
         let pool = memory_library_pool().await;
         insert_path(&pool, "Pack/T_Rock_D.png").await;
         structure::rebuild(&pool, unmounted()).await.unwrap();
-        for value in [json!({"rig": "none"}), json!({"facingQuarterTurns": 1})] {
+        for value in [
+            json!({"rig": "none"}),
+            json!({"facingQuarterTurns": 1}),
+            json!({"avatarFrom": "guard"}),
+        ] {
             let key = value.as_object().unwrap().keys().next().unwrap().clone();
             assert_eq!(
                 write(&pool, "Pack/T_Rock_D.png", &patch(value)).await,

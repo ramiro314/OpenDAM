@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import type { GameImage, GameMaterial, GameRoleTexture, TextureRole } from '../types';
 import {
+  avatarLabel,
+  avatarOptions,
+  avatarPatch,
   domainsLine,
   exportedView,
   facingLine,
@@ -9,6 +12,7 @@ import {
   materialNameError,
   namePatch,
   pickerOptions,
+  rigOptions,
   rigPatch,
   roleEditable,
   shortPaths,
@@ -96,6 +100,51 @@ describe('rigPatch', () => {
     expect(rigPatch({ inferred: 'generic', yours: 'none' }, 'generic')).toEqual({ rig: null });
     expect(rigPatch(inferredNone, 'none')).toBeNull();
     expect(rigPatch({ inferred: 'generic', yours: 'none' }, 'none')).toBeNull();
+  });
+});
+
+describe('rigOptions', () => {
+  const none = { inferred: 'none' as const, yours: null };
+  test('offers humanoid only where the bones suggest it, or once you chose it', () => {
+    expect(rigOptions({ rig: none, humanoid: null })).toEqual(['none', 'generic']);
+    expect(rigOptions({ rig: none, humanoid: 'Mixamo' })).toEqual(['none', 'generic', 'humanoid']);
+    expect(rigOptions({ rig: { inferred: 'generic', yours: 'humanoid' }, humanoid: null })).toEqual(
+      ['none', 'generic', 'humanoid']
+    );
+  });
+});
+
+describe('avatarPatch', () => {
+  test('writes another model, resets to the inferred one, and keeps the one shown', () => {
+    const inferredGuard = { inferred: 'guard', yours: null };
+    expect(avatarPatch(inferredGuard, 'knight')).toEqual({ avatarFrom: 'knight' });
+    expect(avatarPatch(inferredGuard, 'guard')).toBeNull();
+    expect(avatarPatch({ inferred: 'guard', yours: 'knight' }, 'guard')).toEqual({
+      avatarFrom: null,
+    });
+    expect(avatarPatch({ inferred: null, yours: null }, 'guard')).toEqual({ avatarFrom: 'guard' });
+  });
+});
+
+describe('avatarOptions', () => {
+  const guard = {
+    assetId: 'guard',
+    filePath: 'P/SK_Guard.fbx',
+    assetName: 'Guard',
+    sharedBones: 4,
+  };
+  const animation = { avatarFrom: { inferred: 'guard', yours: null }, models: [guard], takes: [] };
+  test('offers the rigged models, and a model chosen outside them first', () => {
+    expect(avatarOptions(animation, 'guard')).toEqual([guard]);
+    expect(avatarOptions(animation, null)).toEqual([guard]);
+    expect(avatarOptions(animation, 'gone')).toEqual([{ assetId: 'gone', missing: true }, guard]);
+  });
+
+  test('names a model by its game name and the bones it shares', () => {
+    expect(avatarLabel(guard)).toBe('Guard (4 shared bones)');
+    expect(avatarLabel({ ...guard, assetName: null, sharedBones: 1 })).toBe(
+      'P/SK_Guard.fbx (1 shared bone)'
+    );
   });
 });
 
@@ -280,6 +329,7 @@ describe('withPatch', () => {
     rig: { inferred: 'none' as const, yours: null },
     facingQuarterTurns: { inferred: 0, yours: null },
     origin: 'generic' as const,
+    humanoid: null,
   };
 
   test('shows the saved rig and turns as yours, and a reset as inferred', () => {
