@@ -140,8 +140,9 @@ struct HeldLock {
     path: PathBuf,
     token: String,
     lost: AtomicBool,
-    /// Set by the release, under the mutex, so a heartbeat in flight never rewrites a released
-    /// lock.
+    /// Set by the release. Every read and write of the file goes under this mutex too: a heartbeat
+    /// in flight never rewrites a released lock, and a re-read never sees a beat's rewrite half
+    /// done (`File::create` empties the file before the token is written back).
     released: Mutex<bool>,
 }
 
@@ -309,9 +310,10 @@ impl IndexLock {
     /// heartbeat, which may be 30 s old or, after a suspend, older than the lock's staleness. True
     /// while the file still holds this guard's token, or when the file couldn't be written at all.
     fn still_held(&self) -> bool {
-        self.held
-            .as_ref()
-            .is_none_or(|h| h.reread() == Reread::Held)
+        self.held.as_ref().is_none_or(|h| {
+            let _beat = h.released.lock().unwrap_or_else(|e| e.into_inner());
+            h.reread() == Reread::Held
+        })
     }
 }
 
@@ -1575,6 +1577,32 @@ mod tests {
         std::fs::create_dir(dir.path().join("index.lock")).unwrap();
         held(&lock).beat(&t.env);
 
+        assert!(!lock.is_lost());
+    }
+
+    #[tokio::test]
+    async fn a_reread_waits_for_a_heartbeat_rewriting_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = TestEnv::new(|_, _| true);
+        let lock = acquire(dir.path(), &t.env).await.unwrap();
+        let path = dir.path().join("index.lock");
+        let token = held(&lock).token.clone();
+
+        std::thread::scope(|scope| {
+            // A beat midway through its rewrite: it holds the mutex, and the file is empty.
+            let beat = held(&lock).released.lock().unwrap();
+            std::fs::write(&path, "").unwrap();
+            let reread = scope.spawn(|| lock.still_held());
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !reread.is_finished(),
+                "the re-read didn't wait for the beat"
+            );
+            std::fs::write(&path, format!("{token}\n0\n")).unwrap();
+            drop(beat);
+
+            assert!(reread.join().unwrap());
+        });
         assert!(!lock.is_lost());
     }
 
