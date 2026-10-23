@@ -222,7 +222,10 @@ function MaterialSlot({
         </div>
       )}
       {m.textures.map((t) => {
-        const current = t.value?.assetId ?? null;
+        const current = t.value?.assetId ?? t.picked;
+        const options = pickerOptions(images, t.role, current);
+        // A pick the export can't use: its image left the pack
+        const missing = current !== null && !options.some((o) => o.assetId === current);
         return (
           <Row
             key={t.role}
@@ -245,7 +248,8 @@ function MaterialSlot({
               }
             >
               <option value="">None</option>
-              {pickerOptions(images, t.role, current).map((o) => (
+              {missing && <option value={current}>Missing image: pick another</option>}
+              {options.map((o) => (
                 <option key={o.assetId} value={o.assetId}>
                   {paths.get(o.assetId) ?? o.filePath}
                 </option>

@@ -169,8 +169,8 @@ impl PackImage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelGame {
     pub materials: Vec<infer::Material>,
-    /// By path
-    pub images: Vec<PackImage>,
+    /// By path, shared by every model of the pack
+    pub images: Arc<Vec<PackImage>>,
 }
 
 /// What the Game tab shows of a texture source (C13): its own layout, role and normal-map
@@ -1213,6 +1213,8 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
         )
     };
     let mut model_games: HashMap<String, ModelGame> = HashMap::new();
+    // Each pack's images as the pickers offer them, built once for all its models
+    let mut pack_images: HashMap<PackKey, Arc<Vec<PackImage>>> = HashMap::new();
     for ((r, key, ..), mut materials) in models.iter().zip(materials) {
         let bindings = (materials.iter_mut()).flat_map(|m| {
             m.textures
@@ -1236,14 +1238,19 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
         for message in materials.iter().flat_map(|m| &m.unfilled) {
             issue(message.clone());
         }
-        let images = &catalogs[key];
+        let images = pack_images.entry(*key).or_insert_with(|| {
+            let images = &catalogs[key];
+            Arc::new(
+                (0..images.images.len())
+                    .map(|i| PackImage::of(images, i))
+                    .collect(),
+            )
+        });
         model_games.insert(
             asset.asset_id.clone(),
             ModelGame {
                 materials: materials.clone(),
-                images: (0..images.images.len())
-                    .map(|i| PackImage::of(images, i))
-                    .collect(),
+                images: Arc::clone(images),
             },
         );
         row.materials = materials;

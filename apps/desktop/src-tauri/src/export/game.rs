@@ -31,7 +31,7 @@ pub struct GameDetail {
     /// A model's materials (C7), in slot order
     pub materials: Vec<MaterialDetail>,
     /// A model's pack's images, by path, which its texture pickers offer
-    pub images: Vec<PackImage>,
+    pub images: Arc<Vec<PackImage>>,
     /// A texture's own layout, role and normal-map convention, and its texture set
     pub texture: Option<TextureGame>,
 }
@@ -59,6 +59,9 @@ pub struct RoleTexture {
     pub inferred: Option<TexturePick>,
     /// Whether you chose this role's texture, or none: `value` is then yours
     pub yours: bool,
+    /// The image you picked, by asset id, even when the export can't use it (it left the pack,
+    /// or its layout no longer gives the role), so a write of the slot keeps it
+    pub picked: Option<String>,
     /// What the export uses, `None` for no texture
     pub value: Option<TexturePick>,
 }
@@ -93,6 +96,7 @@ impl From<&infer::Material> for MaterialDetail {
                 role,
                 inferred: material.inferred.textures.get(&role).map(TexturePick::from),
                 yours: material.yours.textures.contains_key(&role),
+                picked: material.yours.textures.get(&role).cloned().flatten(),
                 value: material.textures.get(&role).map(TexturePick::from),
             })
             .collect();
@@ -267,7 +271,7 @@ pub async fn detail(
             model.materials.iter().map(MaterialDetail::from).collect(),
             model.images.clone(),
         ),
-        None => (Vec::new(), Vec::new()),
+        None => (Vec::new(), Arc::default()),
     };
     Ok(Some(GameDetail {
         asset_id: item.id.clone(),
@@ -671,5 +675,30 @@ mod tests {
             texture.outputs,
             [Role::BaseColor, Role::Normal, Role::MetallicSmoothness]
         );
+    }
+
+    #[tokio::test]
+    async fn a_pick_the_export_cant_use_still_shows_as_yours() {
+        let f = fixture().await;
+        let model = "Dungeon Props/Models/SM_Crate.fbx";
+        let id = id_of(&f.library.pool, model).await;
+        let normal = id_of(&f.library.pool, "Dungeon Props/Textures/4K/T_Crate_N.png").await;
+        let edit = json!({"materials": {"Planks": {"textures": {"Normal": normal}}}});
+        edits::write(&f.library.pool, &id, edit.as_object().unwrap())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM assets WHERE id = ?")
+            .bind(&normal)
+            .execute(&f.library.pool)
+            .await
+            .unwrap();
+        let shown = detail_of(&f, model).await.unwrap();
+        let role = &shown.materials[0].textures[1];
+        assert_eq!(role.role, Role::Normal);
+        assert!(role.yours);
+        assert_eq!(role.picked.as_deref(), Some(normal.as_str()));
+        assert_eq!(role.value, None, "the export binds nothing");
+        // A role you set to none has no pick
+        assert_eq!(shown.materials[0].textures[0].picked, None);
     }
 }

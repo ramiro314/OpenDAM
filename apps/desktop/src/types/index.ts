@@ -573,6 +573,11 @@ export interface GameRoleTexture {
   inferred: GameTexturePick | null;
   /** Whether you chose this role's texture, or none: `value` is then yours */
   yours: boolean;
+  /**
+   * The image you picked, even when the export can't use it (it left the pack, or its layout no
+   * longer gives the role); null when you chose none or nothing
+   */
+  picked: string | null;
   /** What the export uses, null for no texture */
   value: GameTexturePick | null;
 }

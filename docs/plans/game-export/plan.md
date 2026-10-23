@@ -1007,7 +1007,10 @@ later. Where they differ from C9:
 - **A pick must give its role.** The picker offers the pack's images whose layout gives the
   role, plus the one bound now. The write refuses an image outside the model's pack. A pick
   whose image no longer gives the role (its layout changed) or is no longer in the pack is a
-  problem naming the slot, which refuses the export, rather than a binding with no file.
+  problem naming the slot, which refuses the export, rather than a binding with no file. The
+  tab still shows such a pick as yours (`picked`), and an edit to another field of its slot
+  writes it back unchanged, which the write accepts, so the problem stays until you pick
+  another or reset the role.
 - **Your edits feed inference, not only its output.** Layout and convention edits apply before
   the slots are answered, and texture picks before the sets are named, so D24's names and the
   textures that join the domain follow your choices. `<AssetName><MaterialName>` uses your

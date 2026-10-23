@@ -289,15 +289,28 @@ fn validate(kind: &str, patch: &Edits) -> Result<(), String> {
 }
 
 /// Refuses a texture picked in `materials` for the model at `model_path` that isn't an image of
-/// the model's pack (C13).
+/// the model's pack (C13). A pick already in `stored`, the model's slot edits, passes as it is:
+/// a slot is written whole, so an edit to another of its fields re-sends a pick whose image may
+/// have left the pack since, which the Check reports until you pick another or reset it.
 async fn validate_picks(
     conn: &mut sqlx::SqliteConnection,
     model_path: &str,
     materials: &Value,
+    stored: &BTreeMap<String, SlotEdits>,
 ) -> Result<(), String> {
-    let picks: Vec<&str> = (materials.as_object().into_iter().flat_map(|s| s.values()))
-        .filter_map(|slot| slot.get(TEXTURES)?.as_object())
-        .flat_map(|textures| textures.values().filter_map(Value::as_str))
+    let kept = |slot: &str, role: &str, id: &str| {
+        let role = Role::parse(role);
+        (stored.get(slot)).is_some_and(|s| {
+            role.is_some_and(|r| s.textures.get(&r) == Some(&Some(id.to_string())))
+        })
+    };
+    let picks: Vec<&str> = (materials.as_object().into_iter().flatten())
+        .filter_map(|(slot, edits)| Some((slot, edits.get(TEXTURES)?.as_object()?)))
+        .flat_map(|(slot, textures)| {
+            (textures.iter()).filter_map(move |(role, pick)| Some((slot, role, pick.as_str()?)))
+        })
+        .filter(|(slot, role, id)| !kept(slot, role, id))
+        .map(|(_, _, id)| id)
         .collect();
     if picks.is_empty() {
         return Ok(());
@@ -406,7 +419,14 @@ pub async fn write(
     .ok_or_else(|| format!("No asset has the id {asset_id}"))?;
     validate(&kind, patch)?;
     if let Some(materials) = patch.get(MATERIALS) {
-        validate_picks(&mut tx, &file_path, materials).await?;
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT edits FROM export_edits WHERE asset_id = ?")
+                .bind(&item_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        let stored = slot_edits(&stored.as_deref().map(parse).unwrap_or_default());
+        validate_picks(&mut tx, &file_path, materials, &stored).await?;
     }
     let own: BTreeSet<String> = structure::group_members(&mut *tx, &item_id)
         .await
@@ -848,5 +868,42 @@ mod tests {
             )
         );
         assert_eq!(rows(&pool).await, []);
+    }
+
+    #[tokio::test]
+    async fn a_stored_pick_rewritten_with_its_slot_passes_though_its_image_left() {
+        use crate::export::test_fixture::{fixture, id_of};
+        let f = fixture().await;
+        let pool = &f.library.pool;
+        let model = id_of(pool, "Dungeon Props/Models/SM_Crate.fbx").await;
+        let normal = id_of(pool, "Dungeon Props/Textures/4K/T_Crate_N.png").await;
+        let slot = |extra: Value| {
+            let mut planks = json!({"textures": {"Normal": normal}});
+            planks
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            patch(json!({"materials": {"Planks": planks}}))
+        };
+        write(pool, &model, &slot(json!({}))).await.unwrap();
+        sqlx::query("DELETE FROM assets WHERE id = ?")
+            .bind(&normal)
+            .execute(pool)
+            .await
+            .unwrap();
+        // Accepting cutout re-sends the slot, its stale pick included, which is kept
+        write(pool, &model, &slot(json!({"surface": "cutout"})))
+            .await
+            .unwrap();
+        let all = read_all(pool).await.unwrap();
+        let stored = &slot_edits(&all[0].parsed())["Planks"];
+        assert_eq!(stored.textures[&Role::Normal], Some(normal.clone()));
+        assert_eq!(stored.surface, Some(Surface::Cutout));
+        // A new pick of a missing image is still refused
+        let other = patch(json!({"materials": {"Planks": {"textures": {"BaseColor": "gone"}}}}));
+        assert_eq!(
+            write(pool, &model, &other).await,
+            Err("No asset has the id gone".into())
+        );
     }
 }

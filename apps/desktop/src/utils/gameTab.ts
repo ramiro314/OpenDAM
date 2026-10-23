@@ -115,8 +115,9 @@ export function slotEdits(m: GameMaterial): MaterialEdits {
   const edits: MaterialEdits = {};
   if (m.name.yours !== null) edits.name = m.name.yours;
   if (m.surface.yours !== null) edits.surface = m.surface.yours;
+  // Your pick as stored, so another edit to the slot keeps one the export can't use
   const textures = Object.fromEntries(
-    m.textures.filter((t) => t.yours).map((t) => [t.role, t.value?.assetId ?? null])
+    m.textures.filter((t) => t.yours).map((t) => [t.role, t.picked])
   );
   if (Object.keys(textures).length > 0) edits.textures = textures;
   return edits;

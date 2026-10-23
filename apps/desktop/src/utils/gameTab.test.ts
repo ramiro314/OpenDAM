@@ -136,6 +136,7 @@ const role = (r: TextureRole, inferred: string | null, yours?: string | null): G
     role: r,
     inferred: inferred === null ? null : pick(inferred),
     yours: yours !== undefined,
+    picked: yours ?? null,
     value: shown === null ? null : pick(shown),
   };
 };
@@ -172,6 +173,17 @@ describe('slotPatch', () => {
     });
     expect(slotPatch(planks([], 'Boards'), { field: 'name', value: 'Planks' })).toEqual({
       materials: { Planks: null },
+    });
+  });
+});
+
+describe('slotPatch with a pick the export can’t use', () => {
+  test('keeps your pick when another field of the slot changes', () => {
+    // Normal's picked image left the pack: the export binds nothing, but the pick is yours
+    const stale: GameRoleTexture = { ...role('Normal', 'n1k', 'n4k'), value: null };
+    const m = planks([role('BaseColor', 'd'), stale]);
+    expect(slotPatch(m, { field: 'surface', value: 'cutout' })).toEqual({
+      materials: { Planks: { surface: 'cutout', textures: { Normal: 'n4k' } } },
     });
   });
 });
