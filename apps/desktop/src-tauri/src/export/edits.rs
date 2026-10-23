@@ -505,6 +505,53 @@ pub async fn write(
     Ok(targets.into_iter().collect())
 }
 
+/// The assets an Export view should count as edited after `patch` wrote `written` to asset
+/// `asset_id`: those ids, and for an image's layout, role or normal-map convention, the models
+/// of its pack. Those edits feed the inference of the whole pack (C7), so they can bind the
+/// image to a model's material, or unbind it, while the image itself isn't in the view's Check.
+pub async fn touched(
+    pool: &Pool<Sqlite>,
+    asset_id: &str,
+    patch: &Edits,
+    written: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let mut ids = written;
+    if ![LAYOUT, ROLE, NORMAL_CONVENTION]
+        .iter()
+        .any(|key| patch.contains_key(*key))
+    {
+        return Ok(ids);
+    }
+    let file_path: String = sqlx::query_scalar("SELECT file_path FROM assets WHERE id = ?")
+        .bind(asset_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let packs: Vec<String> = sqlx::query_scalar("SELECT path FROM folders WHERE is_pack")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(pack) = check::pack_at(&packs, &file_path) else {
+        return Ok(ids);
+    };
+    // Each model as its grid item, which is what a Check lists
+    let models: Vec<(String, String)> = sqlx::query_as(
+        "SELECT COALESCE(group_id, id), file_path FROM assets
+         WHERE kind = ?2 AND (?1 = '' OR (file_path >= ?1 || '/' AND file_path < ?1 || '0'))",
+    )
+    .bind(pack)
+    .bind(AssetKind::Model3d.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (item, path) in models {
+        if check::pack_at(&packs, &path) == Some(pack) && !ids.contains(&item) {
+            ids.push(item);
+        }
+    }
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -937,5 +984,39 @@ mod tests {
             .unwrap();
         let left = r#"{"normalConvention":"directx"}"#.to_string();
         assert_eq!(rows(&pool).await, [(id.to_string(), left)]);
+    }
+
+    #[tokio::test]
+    async fn a_source_edit_touches_the_models_of_its_pack() {
+        use crate::export::test_fixture::{fixture, id_of};
+        let f = fixture().await;
+        let pool = &f.library.pool;
+        let metallic = id_of(pool, "Dungeon Props/Textures/T_Iron_M.png").await;
+        let one_role = patch(json!({"layout": "passThrough", "role": "BaseColor"}));
+        let written = write(pool, &metallic, &one_role).await.unwrap();
+        let ids = touched(pool, &metallic, &one_role, written.clone())
+            .await
+            .unwrap();
+        assert!(ids.starts_with(&written));
+        // SM_Gate's materials may now bind it; SM_Chest is listed as its group's main item
+        let gate = id_of(pool, "Dungeon Props/Models/SM_Gate.fbx").await;
+        let chest = id_of(pool, "Dungeon Props/Models/SM_Chest.fbx").await;
+        let chest_obj = id_of(pool, "Dungeon Props/Models/SM_Chest.obj").await;
+        assert!(ids.contains(&gate));
+        assert!(ids.contains(&chest));
+        assert!(!ids.contains(&chest_obj), "a member is never a Check's row");
+        // Models of another pack are untouched
+        let log = id_of(pool, "Unity Moss/Models/SM_Log.fbx").await;
+        assert!(!ids.contains(&log));
+
+        // A name reaches only what it wrote
+        let name = patch(json!({"assetName": "Iron"}));
+        let written = write(pool, &metallic, &name).await.unwrap();
+        assert_eq!(
+            touched(pool, &metallic, &name, written.clone())
+                .await
+                .unwrap(),
+            written
+        );
     }
 }

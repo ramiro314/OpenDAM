@@ -108,7 +108,8 @@ pub async fn get_game_detail(
 /// Writes your export edit `patch` to asset `asset_id` (plan C4), for example
 /// `{"assetName": "Crate"}`, where null resets a value to inferred. It reaches every member of
 /// the asset's group and, for an image, every source of its texture set. Returns the ids it
-/// wrote, so an Export view whose Check holds one asks for a new Check.
+/// wrote, and for an image's layout, role or convention the models of its pack
+/// (`edits::touched`), so an Export view whose Check holds one asks for a new Check.
 #[tauri::command]
 pub async fn set_export_edit(
     asset_id: String,
@@ -121,5 +122,6 @@ pub async fn set_export_edit(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("No asset has the id {asset_id}"))?;
-    edits::write(&library.pool, &asset_id, &patch).await
+    let written = edits::write(&library.pool, &asset_id, &patch).await?;
+    edits::touched(&library.pool, &asset_id, &patch, written).await
 }
