@@ -52,7 +52,7 @@ impl LockEnv {
             .clone();
         LockEnv {
             now: Arc::new(SystemTime::now),
-            alive: Arc::new(|pid, started| process_start_time(pid) == Some(started)),
+            alive: Arc::new(process_alive),
             machine,
             pid: std::process::id(),
             started,
@@ -79,6 +79,18 @@ impl LockEnv {
         };
         self.machine.as_deref() == Some(machine) && !(self.alive)(pid, started)
     }
+}
+
+/// This process as the lock's token names it: its machine, boot and pid namespace (`local_id`,
+/// `None` when unknown), pid and start time. An import run records it as its owner.
+pub(crate) fn this_process() -> (Option<String>, u32, u64) {
+    let env = LockEnv::system();
+    (env.machine, env.pid, env.started)
+}
+
+/// Whether this machine runs a process with this pid and start time.
+pub(crate) fn process_alive(pid: u32, started: u64) -> bool {
+    process_start_time(pid) == Some(started)
 }
 
 /// The space a pid and start time are comparable in, as the lock names it: this machine, this
@@ -309,7 +321,7 @@ impl IndexLock {
     /// Re-reads the file right before a change the lock guards, rather than trusting the last
     /// heartbeat, which may be 30 s old or, after a suspend, older than the lock's staleness. True
     /// while the file still holds this guard's token, or when the file couldn't be written at all.
-    fn still_held(&self) -> bool {
+    pub(crate) fn still_held(&self) -> bool {
         self.held.as_ref().is_none_or(|h| {
             let _beat = h.released.lock().unwrap_or_else(|e| e.into_inner());
             h.reread() == Reread::Held

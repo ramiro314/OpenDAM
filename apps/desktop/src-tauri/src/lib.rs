@@ -2,6 +2,7 @@ pub mod autotag;
 pub mod commands;
 pub mod db;
 pub mod export;
+pub mod fs_swap;
 pub mod import;
 pub mod model_preview_regen;
 pub mod models;
@@ -42,6 +43,7 @@ pub struct AppState {
     pub exports: crate::export::bundle::Exports,
     /// FBX facts for the game export, from the Python queue's worker, cached for the session
     pub fbx_facts: export::fbx_facts::Cached<export::fbx_facts::Worker>,
+    pub imports: Arc<import::engine::Engine>,
 }
 
 /// The tagging providers runs can use, plus the fake ones in a debug build run with
@@ -154,6 +156,20 @@ pub fn run(render_choice: render::RenderChoice) {
                     }
                 }),
             );
+            let import_events = app.handle().clone();
+            let imports = import::engine::Engine::new(
+                db.clone(),
+                Arc::new(move |event| {
+                    use import::engine::ImportEvent;
+                    let _ = match event {
+                        ImportEvent::Progress(progress) => {
+                            import_events.emit("import:progress", progress)
+                        }
+                        ImportEvent::Updated(run) => import_events.emit("import:updated", run),
+                        ImportEvent::LibraryUpdated => import_events.emit("library:updated", ()),
+                    };
+                }),
+            );
             let (worker_requests, requests) = tokio::sync::mpsc::channel(64);
             let state = Arc::new(AppState {
                 db,
@@ -169,6 +185,7 @@ pub fn run(render_choice: render::RenderChoice) {
                 fbx_facts: export::fbx_facts::Cached::new(export::fbx_facts::Worker::new(
                     worker_requests,
                 )),
+                imports: imports.clone(),
             });
 
             app.manage(state.clone());
@@ -185,6 +202,8 @@ pub fn run(render_choice: render::RenderChoice) {
 
             // Auto-tagging runs: replays writes left pending, then serves queued items
             tauri::async_runtime::spawn(async move { autotag.start().await });
+
+            tauri::async_runtime::spawn(imports.start());
 
             // Re-index all existing libraries on startup in background
             let startup_state = state.clone();
@@ -296,6 +315,9 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::export::get_game_detail,
             commands::export::set_export_edit,
             commands::export::show_as_exported,
+            commands::import::start_import,
+            commands::import::cancel_import_run,
+            commands::import::list_import_runs,
             commands::autotag::list_autotag_providers,
             commands::autotag::estimate_autotag_run,
             commands::autotag::start_autotag_run,

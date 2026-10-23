@@ -156,3 +156,103 @@ CREATE TABLE IF NOT EXISTS library_meta (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
 );
+
+-- ── Pack imports: packs built from their originals (docs/plans/pack-import/plan.md, Records) ──
+-- An original lives outside every library, so `original_path` is absolute: the one exception to
+-- relative paths in a library DB. Every other path here is relative to the library root.
+CREATE TABLE IF NOT EXISTS imports (
+    id                 TEXT PRIMARY KEY,
+    original_path      TEXT NOT NULL,
+    original_size      INTEGER NOT NULL,
+    original_mtime_ns  INTEGER NOT NULL,
+    original_sha256    TEXT NOT NULL,
+    kind               TEXT NOT NULL CHECK (kind IN ('unitypackage', 'zip')),
+    created_at         INTEGER NOT NULL
+);
+
+-- One pack of an import. `current_build` names the committed build (its `import_outputs` rows are
+-- the pack's manifest), NULL before the first. `recipe_rev` grows with every change to its steps.
+-- `swap_state` journals a swap in progress: 'swapping' with `swap_build` and `swap_prev`, whether
+-- the swap moved a live folder aside, or 'removing'.
+CREATE TABLE IF NOT EXISTS import_packs (
+    id             TEXT PRIMARY KEY,
+    import_id      TEXT NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
+    source         TEXT NOT NULL DEFAULT '',
+    target         TEXT NOT NULL UNIQUE,
+    preset         TEXT NOT NULL,
+    built_at       INTEGER,
+    status         TEXT NOT NULL DEFAULT 'never_built'
+                   CHECK (status IN ('built', 'failed', 'never_built')),
+    current_build  TEXT,
+    recipe_rev     INTEGER NOT NULL DEFAULT 0,
+    store_page     TEXT,
+    swap_state     TEXT CHECK (swap_state IN ('swapping', 'removing')),
+    swap_build     TEXT,
+    swap_prev      INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS import_steps (
+    pack_id   TEXT NOT NULL REFERENCES import_packs(id) ON DELETE CASCADE,
+    position  INTEGER NOT NULL,
+    kind      TEXT NOT NULL,
+    enabled   INTEGER NOT NULL DEFAULT 1,
+    options   TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (pack_id, position)
+);
+
+-- Every file a build wrote into its pack. `source_path` is a JSON array, NULL for a kept file
+-- added outside OpenDAM. The file key, `source_path` and whether the file is generated, is unique
+-- within a build.
+CREATE TABLE IF NOT EXISTS import_outputs (
+    pack_id      TEXT NOT NULL,
+    build_id     TEXT NOT NULL,
+    path         TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    mtime_ns     INTEGER NOT NULL,
+    sha256       TEXT NOT NULL,
+    origin       TEXT NOT NULL CHECK (origin IN ('extracted', 'generated', 'kept')),
+    source_path  TEXT,
+    PRIMARY KEY (pack_id, build_id, path)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_import_outputs_file_key
+    ON import_outputs(pack_id, build_id, source_path, origin = 'generated')
+    WHERE source_path IS NOT NULL;
+
+-- The asset rows a build carried to new paths ('moved') and the rows its index inserted
+-- ('inserted', `from_path` NULL), so a rollback can undo them. Deleted once the build settles.
+CREATE TABLE IF NOT EXISTS import_moves (
+    pack_id    TEXT NOT NULL,
+    build_id   TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    kind       TEXT NOT NULL CHECK (kind IN ('moved', 'inserted')),
+    asset_id   TEXT NOT NULL,
+    from_path  TEXT,
+    to_path    TEXT NOT NULL,
+    PRIMARY KEY (pack_id, build_id, seq)
+);
+
+-- Import runs, a durable queue (import/engine.rs). `packs` is a JSON array of
+-- {"packId", "recipeRev"}, each pack's `recipe_rev` when it was queued, and `warnings` a JSON
+-- array of the entries a build skipped. A run belongs to the process that queued it: its owner
+-- (`watcher` names a machine, boot and pid namespace) and a heartbeat its task rewrites.
+CREATE TABLE IF NOT EXISTS import_runs (
+    id              TEXT PRIMARY KEY,
+    kind            TEXT NOT NULL CHECK (kind IN ('import', 'rebuild', 'remove')),
+    packs           TEXT NOT NULL,
+    drift           TEXT NOT NULL DEFAULT '{}',
+    status          TEXT NOT NULL CHECK (status IN
+                    ('queued', 'running', 'done', 'failed', 'cancelled', 'interrupted')),
+    phase           TEXT,
+    progress_done   INTEGER NOT NULL DEFAULT 0,
+    progress_total  INTEGER NOT NULL DEFAULT 0,
+    error           TEXT,
+    warnings        TEXT NOT NULL DEFAULT '[]',
+    created_at      INTEGER NOT NULL,
+    started_at      INTEGER,
+    finished_at     INTEGER,
+    owner_machine   TEXT,
+    owner_pid       INTEGER NOT NULL,
+    owner_started   INTEGER NOT NULL,
+    heartbeat_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_import_runs_status ON import_runs(status, created_at);
