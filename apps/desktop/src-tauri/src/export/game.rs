@@ -1,8 +1,10 @@
 //! What the detail panel's Game tab shows for an asset (plan game-export C13): what it exports
 //! as, its `assetName`, inferred and yours (C4, C5), and the problems the Checks of the domains
-//! holding it find with it. So far the tab edits only the name.
+//! holding it find with it. A model's rig and facing are edits too, and "Show as exported" has
+//! Blender write the normalized model as a GLB for the tab's viewer.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -10,8 +12,10 @@ use serde::Serialize;
 use crate::db::Database;
 pub use crate::export::check::Field;
 use crate::export::check::{self, ItemRow, Kind, Problem};
-use crate::export::fbx_facts;
-use crate::export::{edits, infer, settings};
+use crate::export::edits::Rig;
+use crate::export::fbx_facts::{self, Reading};
+use crate::export::packs::Origin;
+use crate::export::{blender, cache, edits, hashes, infer, settings};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,10 +24,25 @@ pub struct GameDetail {
     pub asset_id: String,
     pub kind: Kind,
     pub asset_name: Field<String>,
+    /// A model's rig and facing, `None` for anything else
+    pub model: Option<ModelDetail>,
     /// The domains holding the item, by name
     pub domains: Vec<String>,
     /// The problems of those domains' Checks that name the item, each once
     pub problems: Vec<Problem>,
+}
+
+/// A model's rig and facing, inferred and yours (C13, D13, D20).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDetail {
+    /// Inferred from its FBX's facts: none without bones, else generic. At export, Blender's
+    /// result says whether it has an armature (A3).
+    pub rig: Field<Rig>,
+    /// Your quarter turns about Y after the origin's facing, inferred 0: the origin's default
+    pub facing_quarter_turns: Field<u8>,
+    /// The origin of its pack, whose default facing comes first, `None` in no pack
+    pub origin: Option<Origin>,
 }
 
 /// The Game tab of asset `asset_id`, reading FBX facts with `facts`, or `None` when it exports
@@ -67,6 +86,23 @@ pub async fn detail(
         None => None,
     };
     let kind = check::exported_kind(&item, item_facts.as_ref());
+    let model = if kind == Kind::Model {
+        let yours = edits::of(&rows, &item.id);
+        let has_bones = matches!(&item_facts, Some(Ok(facts)) if !facts.bones.is_empty());
+        Some(ModelDetail {
+            rig: Field {
+                inferred: Rig::inferred(has_bones),
+                yours: edits::rig(&yours),
+            },
+            facing_quarter_turns: Field {
+                inferred: 0,
+                yours: edits::facing_quarter_turns(&yours),
+            },
+            origin: check::origin_at(&library, &item.file_path).await?,
+        })
+    } else {
+        None
+    };
 
     // The domains that may hold the item: each collection it is in counts for the root
     // collection's child above it, and an image may join a domain through a material or its set
@@ -172,9 +208,98 @@ pub async fn detail(
         asset_id: item.id,
         kind,
         asset_name,
+        model,
         domains: holding,
         problems,
     }))
+}
+
+/// The GLB that shows model `asset_id` as the next export writes it (C13): its normalized FBX,
+/// with your facing and the origin's, written as a GLB beside its export cache entry, reading
+/// FBX facts with `facts`. A group's member stands for its main item. Blender runs only when the
+/// cache holds no GLB for the model's key, so it never runs unless you ask, and a missing or
+/// refused Blender is the error. When the cache doesn't hold the normalized FBX either, Blender
+/// makes it first, into the entry the next Check reads.
+pub async fn exported_view(
+    db: &Database,
+    asset_id: &str,
+    facts: &impl fbx_facts::Reader,
+) -> Result<PathBuf, String> {
+    let library = db
+        .library_of_asset(asset_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("No asset has the id {asset_id}"))?;
+    let pool = &library.pool;
+    let root = library.root_path.clone();
+    let item: ItemRow = sqlx::query_as(
+        "SELECT id, file_path, file_name, extension, kind FROM assets
+         WHERE id = (SELECT COALESCE(group_id, id) FROM assets WHERE id = ?)",
+    )
+    .bind(asset_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let path = item.file_path.clone();
+    let fbx = check::exported_fbx_of(pool, std::slice::from_ref(&item))
+        .await
+        .map_err(|e| e.to_string())?
+        .remove(&item.id)
+        .ok_or_else(|| {
+            format!("{path}: it has no FBX file: a model exports from its group's FBX")
+        })?;
+    let item_facts = facts
+        .read(&root.join(&fbx), &root)
+        .await
+        .map_err(|e| format!("{fbx}: the preview engine can't read it: {e}"))?;
+    if item_facts.reading() != Some(Reading::Model) {
+        return Err(format!(
+            "{path}: it doesn't export as a model, so it has no normalized model to show"
+        ));
+    }
+    let origin = check::origin_at(&library, &path)
+        .await?
+        .ok_or_else(|| format!("{path}: it is in no pack: mark its folder as a pack"))?;
+    let rows = edits::read_all(pool).await.map_err(|e| e.to_string())?;
+    let facing = edits::facing_quarter_turns(&edits::of(&rows, &item.id)).unwrap_or(0);
+    let source = root.join(&fbx);
+    let sha256 = tokio::task::spawn_blocking(move || hashes::sha256_file(&source))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{fbx} can't be read: {e}"))?;
+    let (job, key) = check::model_job(path, &root, &fbx, &sha256, origin, facing, &item_facts);
+    let glb = cache::model_view(&root, &key);
+    if tokio::fs::try_exists(&glb).await.unwrap_or(false) {
+        return Ok(glb);
+    }
+
+    let settings = settings::load(&db.master_pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let blender = blender::gate(settings.blender_path.as_deref())
+        .await
+        .map_err(|e| format!("Blender can't show {} as exported: {e}", job.asset))?;
+    let runner = blender::Runner::new(blender);
+    let (lookup_root, lookup_key) = (root.clone(), key.clone());
+    let cached =
+        tokio::task::spawn_blocking(move || cache::cached_model(&lookup_root, &lookup_key))
+            .await
+            .map_err(|e| e.to_string())?;
+    let cached = match cached {
+        Some(cached) => cached,
+        None => {
+            let normalized = runner.run(&job).await?;
+            let (save_root, save_key) = (root.clone(), key.clone());
+            tokio::task::spawn_blocking(move || {
+                cache::save_model(&save_root, &save_key, normalized)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{}: {e}", job.asset))?
+        }
+    };
+    runner.view(&job.asset, &cached.fbx, &glb).await?;
+    Ok(glb)
 }
 
 /// Collection `id` and every collection below it.
@@ -378,5 +503,151 @@ mod tests {
             .unwrap();
         assert_eq!(shown.kind, Kind::Animation);
         assert_eq!(shown.asset_name.inferred, "Guard");
+    }
+
+    #[tokio::test]
+    async fn a_model_shows_its_rig_and_facing_inferred_and_yours() {
+        let f = fixture().await;
+        let stool = detail_of(&f, "Dungeon Props/Models/SM_Stool.fbx")
+            .await
+            .unwrap();
+        assert_eq!(
+            stool.model,
+            Some(ModelDetail {
+                rig: Field {
+                    inferred: Rig::None,
+                    yours: None
+                },
+                facing_quarter_turns: Field {
+                    inferred: 0,
+                    yours: None
+                },
+                origin: Some(Origin::Generic),
+            })
+        );
+        let guard = "Dungeon Props/Models/SK_Guard.fbx";
+        let shown = detail_of(&f, guard).await.unwrap().model.unwrap();
+        assert_eq!(shown.rig.inferred, Rig::Generic, "it has bones");
+
+        let id = id_of(&f.library.pool, guard).await;
+        let edit = json!({"rig": "none", "facingQuarterTurns": 2});
+        edits::write(&f.library.pool, &id, edit.as_object().unwrap())
+            .await
+            .unwrap();
+        let shown = detail_of(&f, guard).await.unwrap().model.unwrap();
+        assert_eq!(shown.rig.yours, Some(Rig::None));
+        assert_eq!(shown.facing_quarter_turns.yours, Some(2));
+        assert_eq!(
+            detail_of(&f, "Kenney Crates/crate_wood.png")
+                .await
+                .unwrap()
+                .model,
+            None
+        );
+    }
+
+    /// A Blender at `dir/blender` that answers 5.2.2 and leaves `dir/ran` behind when anything
+    /// runs it.
+    fn recording_blender(dir: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("blender");
+        let script = format!(
+            "#!/bin/sh\necho run >> '{}'\nprintf 'Blender 5.2.2\\n'\n",
+            dir.join("ran").display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    async fn set_blender(f: &Fixture, path: &Path) {
+        settings::update(&f.db.master_pool, json!({ "blenderPath": path }))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn opening_the_tab_never_starts_blender_and_a_missing_one_says_why() {
+        let f = fixture().await;
+        let stool = "Dungeon Props/Models/SM_Stool.fbx";
+        collection(&f, "props", "Props", "dg", &[stool]).await;
+        let dir = tempfile::tempdir().unwrap();
+        set_blender(&f, &recording_blender(dir.path())).await;
+        let shown = detail_of(&f, stool).await.unwrap();
+        assert_eq!(shown.domains, ["Props"]);
+        assert!(!dir.path().join("ran").exists(), "Blender ran");
+
+        set_blender(&f, &dir.path().join("no-blender")).await;
+        let id = id_of(&f.library.pool, stool).await;
+        let shown = exported_view(&f.db, &id, &Snapshot::fixture()).await;
+        assert_eq!(
+            shown,
+            Err(format!(
+                "Blender can't show {stool} as exported: No Blender at {}",
+                dir.path().join("no-blender").display()
+            ))
+        );
+        let models = cache::cache_dir(&f.library.root_path).join("models");
+        assert!(!models.exists(), "nothing was written");
+
+        let image = id_of(&f.library.pool, "Kenney Crates/crate_wood.png").await;
+        let shown = exported_view(&f.db, &image, &Snapshot::fixture()).await;
+        assert_eq!(
+            shown,
+            Err("Kenney Crates/crate_wood.png: it has no FBX file: a model exports from its group's FBX".into())
+        );
+    }
+
+    /// With the Blender in `OPENDAM_BLENDER`: "Show as exported" writes the normalized model as a
+    /// GLB beside its cache entry, facing glTF's +Z, which the viewer's arrow points along, and
+    /// your quarter turn makes a new one.
+    #[tokio::test]
+    async fn show_as_exported_writes_a_glb_of_the_normalized_model_that_turns_with_your_facing() {
+        use crate::export::blender::tests::{glb_vertices, nose};
+        let Some(program) = blender::test_blender() else {
+            return;
+        };
+        let f = fixture().await;
+        set_blender(&f, &program).await;
+        let root = &f.library.root_path;
+        let totem = "Dungeon Props/Models/SM_Totem.fbx";
+        let id = id_of(&f.library.pool, totem).await;
+
+        let glb = exported_view(&f.db, &id, &Snapshot::fixture())
+            .await
+            .unwrap();
+        let bytes = std::fs::read(&glb).unwrap();
+        assert_eq!(&bytes[..4], b"glTF");
+        assert_eq!(
+            glb.parent(),
+            Some(cache::cache_dir(root).join("models").as_path())
+        );
+        assert_eq!(nose(&glb_vertices(&program, &glb).await), ["+Z"]);
+        // The normalized FBX it showed is the entry the next Check reads
+        let key = glb.file_stem().unwrap().to_str().unwrap();
+        assert!(cache::cached_model(root, key).is_some());
+
+        // Asked again, the GLB comes from the cache, with no Blender to run
+        set_blender(&f, &f.dir.path().join("no-blender")).await;
+        assert_eq!(
+            exported_view(&f.db, &id, &Snapshot::fixture()).await,
+            Ok(glb.clone())
+        );
+
+        // A quarter turn is another model, which Blender makes
+        let edit = json!({"facingQuarterTurns": 1});
+        edits::write(&f.library.pool, &id, edit.as_object().unwrap())
+            .await
+            .unwrap();
+        assert!(exported_view(&f.db, &id, &Snapshot::fixture())
+            .await
+            .unwrap_err()
+            .starts_with("Blender can't show"));
+        set_blender(&f, &program).await;
+        let turned = exported_view(&f.db, &id, &Snapshot::fixture())
+            .await
+            .unwrap();
+        assert_ne!(turned, glb);
+        assert_eq!(nose(&glb_vertices(&program, &turned).await), ["+X"]);
     }
 }

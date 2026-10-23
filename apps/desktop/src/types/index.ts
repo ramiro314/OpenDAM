@@ -560,15 +560,32 @@ export interface GameDetail {
   assetId: string;
   kind: 'model' | 'texture' | 'animation';
   assetName: GameField<string>;
+  /** A model's rig and facing, null for anything else */
+  model: GameModelDetail | null;
   /** The domains holding it, by name */
   domains: string[];
   /** The problems naming it in its domains' Checks */
   problems: ExportProblem[];
 }
 
+/** A model's rig as the manifest lists it (plan D20). Humanoid comes with animations. */
+export type GameRig = 'none' | 'generic';
+
+/** A model's rig and facing in the Game tab (plan C13, D13, D20) */
+export interface GameModelDetail {
+  /** Inferred none without bones, else generic */
+  rig: GameField<GameRig>;
+  /** Your quarter turns about Y, clockwise seen from above, after the origin's facing: 0 to 3 */
+  facingQuarterTurns: GameField<number>;
+  /** Its pack's origin, whose default facing comes first; null in no pack */
+  origin: PackOrigin | null;
+}
+
 /** Your export edits to an asset: a value sets it, null resets it to inferred */
 export interface ExportEditPatch {
   assetName?: string | null;
+  rig?: GameRig | null;
+  facingQuarterTurns?: number | null;
 }
 
 /**

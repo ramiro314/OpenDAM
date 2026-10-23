@@ -79,6 +79,12 @@ pub fn model_fbx(root: &Path, key: &str) -> PathBuf {
     cache_dir(root).join("models").join(format!("{key}.fbx"))
 }
 
+/// Where the Game tab's "Show as exported" keeps the GLB Blender writes of the cached model of
+/// key `key` in the library at `root`, beside its entry (C13). It is only ever viewed.
+pub fn model_view(root: &Path, key: &str) -> PathBuf {
+    cache_dir(root).join("models").join(format!("{key}.glb"))
+}
+
 fn model_result(root: &Path, key: &str) -> PathBuf {
     cache_dir(root).join("models").join(format!("{key}.json"))
 }

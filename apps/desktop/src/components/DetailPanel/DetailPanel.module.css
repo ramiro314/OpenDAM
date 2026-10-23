@@ -956,3 +956,12 @@
   border-color: var(--color-brand-500);
   color: var(--color-brand-400);
 }
+.gameWide {
+  grid-column: 1 / -1;
+}
+.gameViewer {
+  height: 240px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}

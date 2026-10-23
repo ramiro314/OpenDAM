@@ -1,7 +1,7 @@
 import { Canvas, useThree } from '@react-three/fiber';
 import { useGLTF, Stage, PresentationControls, Environment } from '@react-three/drei';
-import { Suspense, Component, useEffect, useState, type ReactNode } from 'react';
-import { PMREMGenerator, type Texture } from 'three';
+import { Suspense, Component, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { ArrowHelper, Box3, PMREMGenerator, Vector3, type Texture } from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { useAssetStore } from '../../store';
@@ -45,6 +45,25 @@ export function Model({ url }: { url: string }) {
 }
 
 /**
+ * An arrow along the model's +Z, its forward once normalized for the game (plan game-export
+ * C13), from the front of its bounds, as long as half its largest side.
+ */
+function ForwardArrow({ url }: { url: string }) {
+  const { scene } = useGLTF(convertFileSrc(url), false, false);
+  const arrow = useMemo(() => {
+    // In the scene's own space, whatever Stage has moved it by
+    scene.updateMatrixWorld(true);
+    const box = new Box3().setFromObject(scene).applyMatrix4(scene.matrixWorld.clone().invert());
+    const size = box.isEmpty() ? 1 : Math.max(...box.getSize(new Vector3()).toArray()) || 1;
+    const length = size / 2;
+    const front = new Vector3(0, 0, box.isEmpty() ? 0 : box.max.z);
+    return new ArrowHelper(new Vector3(0, 0, 1), front, length, 0x3b82f6, length / 3, length / 6);
+  }, [scene]);
+  useEffect(() => () => arrow.dispose(), [arrow]);
+  return <primitive object={arrow} />;
+}
+
+/**
  * Shows a rerun preview model: a rerun overwrites the same `<id>_preview.glb`, so this drops
  * drei's cached copy, under the converted URL `Model` loads it by, and bumps the path's
  * revision, which remounts every open viewer of it so it loads the new file.
@@ -75,7 +94,17 @@ function RoomLighting() {
   return map ? <Environment map={map} /> : null;
 }
 
-export function ThreeViewer({ modelPath }: { modelPath: string }) {
+/**
+ * A 3D view of the GLB at `modelPath`. With `forwardArrow`, an arrow marks its +Z and the camera
+ * starts at a three-quarter view from the front, so the way it faces shows.
+ */
+export function ThreeViewer({
+  modelPath,
+  forwardArrow = false,
+}: {
+  modelPath: string;
+  forwardArrow?: boolean;
+}) {
   // Each rerun remounts the whole viewer, canvas included, as reopening it would. Remounting only
   // `Model` inside the live canvas loads the new GLB but leaves it out of the scene.
   const revision = useAssetStore((s) => s.modelRevisions[modelPath] ?? 0);
@@ -97,12 +126,17 @@ export function ThreeViewer({ modelPath }: { modelPath: string }) {
         </div>
       }
     >
-      <Canvas shadows dpr={[1, 2]} camera={{ fov: 50 }}>
+      <Canvas
+        shadows
+        dpr={[1, 2]}
+        camera={forwardArrow ? { fov: 50, position: [3, 2, 4] } : { fov: 50 }}
+      >
         <RoomLighting />
         <Suspense fallback={null}>
           <PresentationControls speed={1.5} global zoom={0.5} polar={[-0.1, Math.PI / 4]}>
             <Stage environment={null} intensity={0.5}>
               <Model url={modelPath} />
+              {forwardArrow && <ForwardArrow url={modelPath} />}
             </Stage>
           </PresentationControls>
         </Suspense>

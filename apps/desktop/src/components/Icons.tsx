@@ -36,6 +36,10 @@ export const IconPanel = icon('M3 3h18v18H3zM15 3v18');
 export const IconRefresh = icon(
   'M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15'
 );
+/** A turn clockwise */
+export const IconRotateCw = icon('M23 4v6h-6M20.49 15a9 9 0 1 1-2.12-9.36L23 10');
+/** A turn counterclockwise */
+export const IconRotateCcw = icon('M1 4v6h6M3.51 15a9 9 0 1 0 2.13-9.36L1 10');
 export const IconPlus = icon('M12 5v14M5 12h14');
 /** A stair-stepped edge, for pixelated image scaling */
 export const IconPixelated = icon('M4 20v-4h4v-4h4V8h4V4h4');

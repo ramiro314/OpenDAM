@@ -268,13 +268,19 @@ pub struct Source {
 
 /// The script's result file: the report, or why it refused.
 pub fn parse_result(text: &str) -> Result<Normalized, String> {
+    serde_json::from_value(script_result(text)?)
+        .map_err(|e| format!("Blender's result is malformed: {e}"))
+}
+
+/// The script's result file as JSON when it says `ok`, else why it refused.
+fn script_result(text: &str) -> Result<serde_json::Value, String> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("Blender's result isn't JSON: {e}"))?;
     if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
         let error = value.get("error").and_then(serde_json::Value::as_str);
         return Err(error.unwrap_or("Blender gave no reason").to_string());
     }
-    serde_json::from_value(value).map_err(|e| format!("Blender's result is malformed: {e}"))
+    Ok(value)
 }
 
 /// Checks what the script wrote (C9): the pivot rule, and that the written slots and takes are
@@ -433,10 +439,28 @@ impl Runner {
             .map_err(|e| format!("{}: {e}", job.asset))
     }
 
-    /// Runs `<blender> -b --factory-startup -P <script> -- <job.json> <result.json>`, with the
-    /// script writing into the job's temporary folder, then checks the result and publishes
-    /// the FBX. Its file work runs off the async threads, since the FBX can be large.
-    async fn normalize(&self, job: &Job) -> Result<Normalized, String> {
+    /// Writes the normalized FBX at `fbx` as a GLB at `glb`, for the Game tab's "Show as
+    /// exported" (C13): Blender re-imports it and exports it Y up, so the viewer's +Z is the
+    /// model's forward. Only a whole GLB reaches `glb`. Errors name `asset`.
+    pub async fn view(&self, asset: &str, fbx: &Path, glb: &Path) -> Result<(), String> {
+        self.in_temp_dir(|dir| async move {
+            let staged = dir.join("view.glb");
+            let job = serde_json::json!({ "kind": "view", "input": fbx, "output": staged });
+            self.run_script(&dir, &job, "showing it as exported")
+                .await?;
+            publish(&staged, glb).await
+        })
+        .await
+        .map_err(|e| format!("{asset}: {e}"))
+    }
+
+    /// Runs `with` on a temporary folder of its own once a job permit is free, then deletes
+    /// the folder and anything staged in it. Its file work runs off the async threads, since
+    /// the files can be large.
+    async fn in_temp_dir<T, F>(&self, with: impl FnOnce(PathBuf) -> F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, String>>,
+    {
         let _permit = self
             .permits
             .acquire()
@@ -450,22 +474,41 @@ impl Runner {
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("Could not make a folder for Blender's job: {e}"))?;
-        let normalized = self.normalize_in(dir.path(), job).await;
-        // Removing the folder deletes the staged FBX too
+        let done = with(dir.path().to_path_buf()).await;
         let _ = tokio::task::spawn_blocking(move || drop(dir)).await;
-        normalized
+        done
     }
 
-    async fn normalize_in(&self, dir: &Path, job: &Job) -> Result<Normalized, String> {
+    /// Runs `<blender> -b --factory-startup -P <script> -- <job.json> <result.json>` in `dir`,
+    /// then checks the result and publishes the FBX.
+    async fn normalize(&self, job: &Job) -> Result<Normalized, String> {
+        self.in_temp_dir(|dir| async move {
+            let staged = dir.join("output.fbx");
+            let sent = Job {
+                output: staged.clone(),
+                ..job.clone()
+            };
+            let text = self.run_script(&dir, &sent, "normalizing it").await?;
+            let normalized = parse_result(&text)?;
+            check(job, &normalized)?;
+            publish(&staged, &job.output).await?;
+            Ok(normalized)
+        })
+        .await
+    }
+
+    /// Runs the script on `job` in `dir` within the timeout, `doing` what a timeout names, and
+    /// returns its result file when it says `ok`.
+    async fn run_script(
+        &self,
+        dir: &Path,
+        job: &impl Serialize,
+        doing: &str,
+    ) -> Result<String, String> {
         let script = dir.join("normalize.py");
         let job_file = dir.join("job.json");
         let result_file = dir.join("result.json");
-        let staged = dir.join("output.fbx");
-        let sent = Job {
-            output: staged.clone(),
-            ..job.clone()
-        };
-        let job_json = serde_json::to_vec(&sent).map_err(|e| e.to_string())?;
+        let job_json = serde_json::to_vec(job).map_err(|e| e.to_string())?;
         let written = match tokio::fs::write(&script, NORMALIZE_SCRIPT).await {
             Ok(()) => tokio::fs::write(&job_file, job_json).await,
             error => error,
@@ -489,24 +532,21 @@ impl Runner {
             .await
             .map_err(|_| {
                 format!(
-                    "Blender didn't finish normalizing it in {} s",
+                    "Blender didn't finish {doing} in {} s",
                     self.timeout.as_secs()
                 )
             })?
             .map_err(|e| format!("Blender's job failed: {e}"))?;
-        let normalized = match tokio::fs::read_to_string(&result_file).await {
-            Ok(text) if output.status.success() => parse_result(&text)?,
-            _ => return Err(crashed(&output)),
-        };
-        check(job, &normalized)?;
-        publish(&staged, &job.output).await?;
-        Ok(normalized)
+        match tokio::fs::read_to_string(&result_file).await {
+            Ok(text) if output.status.success() => script_result(&text).map(|_| text),
+            _ => Err(crashed(&output)),
+        }
     }
 }
 
-/// Puts the checked FBX at `staged` at `output`: copied beside it, then renamed over it, so
+/// Puts the checked file at `staged` at `output`: copied beside it, then renamed over it, so
 /// `output` is only ever the old file or the whole new one.
-/// The staged FBX sits in the system's temporary folder, often another filesystem, so it is
+/// The staged file sits in the system's temporary folder, often another filesystem, so it is
 /// copied rather than renamed there.
 async fn publish(staged: &Path, output: &Path) -> Result<(), String> {
     let name = output
@@ -1339,15 +1379,27 @@ pub(crate) mod tests {
 
     /// The vertices of the FBX at `fbx`, in Unity's axes, as Blender imports them.
     pub(crate) async fn vertices(blender: &Path, fbx: &Path) -> Vec<[f64; 3]> {
-        const READ: &str = "import bpy, json, sys
+        imported_vertices(blender, fbx, "fbx").await
+    }
+
+    /// The vertices of the GLB at `glb`, in glTF's axes with X mirrored, which are Unity's, as
+    /// Blender imports them: its importer turns glTF's (x, y, z) into Blender's (x, -z, y).
+    pub(crate) async fn glb_vertices(blender: &Path, glb: &Path) -> Vec<[f64; 3]> {
+        imported_vertices(blender, glb, "gltf").await
+    }
+
+    async fn imported_vertices(blender: &Path, file: &Path, importer: &str) -> Vec<[f64; 3]> {
+        let read = format!(
+            "import bpy, json, sys
 bpy.ops.wm.read_homefile(use_empty=True)
-bpy.ops.import_scene.fbx(filepath=sys.argv[-1])
+bpy.ops.import_scene.{importer}(filepath=sys.argv[-1])
 points = [o.matrix_world @ v.co for o in bpy.data.objects if o.type == 'MESH' for v in o.data.vertices]
-print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))";
+print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))"
+        );
         let output = tokio::process::Command::new(blender)
             .args(["-b", "--factory-startup", "--python-exit-code", "1"])
-            .args(["--python-expr", READ, "--"])
-            .arg(fbx)
+            .args(["--python-expr", &read, "--"])
+            .arg(file)
             .output()
             .await
             .unwrap();

@@ -1,4 +1,11 @@
-import type { AssetKind, ExportEditPatch, GameDetail, GameField } from '../types';
+import type {
+  AssetKind,
+  ExportEditPatch,
+  GameDetail,
+  GameField,
+  GameModelDetail,
+  GameRig,
+} from '../types';
 
 /** Whether `name` is a contract `pascalName`: a capital letter, then letters and digits */
 export function isPascal(name: string): boolean {
@@ -36,6 +43,70 @@ export function namePatch(
     };
   }
   return { patch: { assetName: name } };
+}
+
+/**
+ * What choosing `rig` writes, or null when it changes nothing. Choosing the inferred rig resets
+ * yours, so only real edits are stored (plan D32).
+ */
+export function rigPatch(field: GameField<GameRig>, rig: GameRig): ExportEditPatch | null {
+  if (rig === shownValue(field).value) return null;
+  return { rig: rig === field.inferred ? null : rig };
+}
+
+/**
+ * What a quarter turn writes: `by` 1 turns the model clockwise seen from above (taking its +Z to
+ * +X), -1 back. Turned back to the origin's default, yours resets (plan D13, D32).
+ */
+export function turnPatch(field: GameField<number>, by: 1 | -1): ExportEditPatch {
+  const turns = (shownValue(field).value + by + 4) % 4;
+  return { facingQuarterTurns: turns === field.inferred ? null : turns };
+}
+
+/** The line saying which way a model faces: its origin's default, then your turns */
+export function facingLine(model: Pick<GameModelDetail, 'facingQuarterTurns' | 'origin'>): string {
+  const turns = shownValue(model.facingQuarterTurns).value;
+  const base =
+    model.origin === 'unreal'
+      ? 'Its pack is from Unreal, so its +X is turned to face +Z'
+      : model.origin
+        ? `Its pack’s origin is ${model.origin}, so it faces as its file does`
+        : 'It is in no pack yet';
+  return turns === 0 ? base : `${base}, then turned ${turns * 90}° clockwise seen from above`;
+}
+
+/** A "Show as exported" answer: the GLB's path or why Blender can't make it, for `key` */
+export type ViewResult = { key: string } & ({ path: string } | { error: string });
+
+/** What the Game tab's viewer shows */
+export type ExportedView =
+  | { status: 'hidden' }
+  | { status: 'loading' }
+  | { status: 'shown'; path: string }
+  | { status: 'failed'; error: string };
+
+/**
+ * The key of a model's "Show as exported" view: a new facing is another normalized model, so
+ * the view asks for it again.
+ */
+export function viewKey(assetId: string, model: Pick<GameModelDetail, 'facingQuarterTurns'>) {
+  return `${assetId}:${shownValue(model.facingQuarterTurns).value}`;
+}
+
+/**
+ * What the viewer shows once you asked (`showing`), given the last answer: loading until the
+ * answer is for the model's current `key`.
+ */
+export function exportedView(
+  showing: boolean,
+  result: ViewResult | null,
+  key: string
+): ExportedView {
+  if (!showing) return { status: 'hidden' };
+  if (result?.key !== key) return { status: 'loading' };
+  return 'path' in result
+    ? { status: 'shown', path: result.path }
+    : { status: 'failed', error: result.error };
 }
 
 /** The line saying what the asset exports as */

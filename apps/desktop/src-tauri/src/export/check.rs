@@ -700,6 +700,28 @@ pub async fn inferred_origin(
         .map_err(|e| e.to_string())
 }
 
+/// The origin of the pack holding the file at `path` as a Check gives it (C6, A1): your override,
+/// else inferred from the pack's files. `None` for a file in no pack.
+pub(crate) async fn origin_at(
+    library: &LibraryHandle,
+    path: &str,
+) -> Result<Option<packs::Origin>, String> {
+    let pack_paths: Vec<String> = sqlx::query_scalar("SELECT path FROM folders WHERE is_pack")
+        .fetch_all(&library.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(pack) = pack_at(&pack_paths, path) else {
+        return Ok(None);
+    };
+    let overrides = structure::read_overrides(&library.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    match overrides.get(pack).and_then(|o| o.origin) {
+        Some(origin) => Ok(Some(origin)),
+        None => inferred_origin(library, pack).await,
+    }
+}
+
 /// Whether `path` lies in a Unity FBX format folder, `fbx(unity)` or `fbx (unity)` in any case.
 fn in_unity_fbx_folder(path: &str) -> bool {
     let mut folders = path.split('/').rev().skip(1);
@@ -885,6 +907,10 @@ struct PlannedModel {
     sha256: String,
     facts: FbxFacts,
     origin: Origin,
+    /// Your quarter turns after the origin's facing (D13), 0 when you set none
+    facing_quarter_turns: u8,
+    /// Your rig (D20), which wins over the one Blender's result implies
+    rig: Option<edits::Rig>,
     /// The FBX relative to its pack folder
     source_path: String,
     /// Its nearest `conversion.json`'s steps, which Blender's step follows (C10)
@@ -1427,6 +1453,7 @@ fn evaluate(inputs: &mut [LibraryInput], memo: &infer::Memo) -> Evaluated {
         let Ok(conversion) = walker.chain(&[&fbx_path], Vec::new()) else {
             continue;
         };
+        let yours = edits::of(&input.edits, &item.id);
         match fbx_sha256(input, &mut walker.probes, &fbx_path) {
             Ok(sha256) => planned_models.push(PlannedModel {
                 read: *r,
@@ -1436,6 +1463,8 @@ fn evaluate(inputs: &mut [LibraryInput], memo: &infer::Memo) -> Evaluated {
                 sha256,
                 facts,
                 origin: sources[pack].origin,
+                facing_quarter_turns: edits::facing_quarter_turns(&yours).unwrap_or(0),
+                rig: edits::rig(&yours),
                 conversion,
             }),
             Err(e) => problems.push(Problem {
@@ -1486,6 +1515,35 @@ fn fbx_sha256(
     Ok(sha256)
 }
 
+/// The Blender job that normalizes the model `asset` of the library at `root` (C9), from its
+/// exported FBX `fbx` (relative to the root), whose bytes' sha256 is `sha256` and whose facts
+/// are `facts`, in a pack of origin `origin`, turned by your `facing_quarter_turns`, and the job's
+/// cache key (C11). The job writes into its cache entry. The Check and the Game tab's "Show as
+/// exported" both make it here, so they share an entry.
+pub(crate) fn model_job(
+    asset: String,
+    root: &Path,
+    fbx: &str,
+    sha256: &str,
+    origin: Origin,
+    facing_quarter_turns: u8,
+    facts: &FbxFacts,
+) -> (Job, String) {
+    let mut job = Job {
+        asset,
+        kind: JobKind::Model,
+        input: root.join(fbx),
+        output: PathBuf::new(),
+        origin_facing: origin,
+        facing_quarter_turns,
+        patterns: &collision::PATTERNS,
+        added_material: added_material(facts.slots.iter().map(|s| s.name.as_str())),
+    };
+    let key = cache::model_key(sha256, &job);
+    job.output = cache::model_fbx(root, &key);
+    (job, key)
+}
+
 /// Normalizes each planned model with headless Blender (C9), or takes it from its library's
 /// export cache (C11), as `models` says, and checks the source's kept slots and takes, as
 /// Blender read them, against the facts the Check showed. Blender is looked for (C2) only when a
@@ -1504,21 +1562,15 @@ async fn normalize(
     let jobs: Vec<(Job, String)> = planned
         .iter()
         .map(|model| {
-            let root = &roots[model.library];
-            let mut job = Job {
-                asset: asset(model).file_path,
-                kind: JobKind::Model,
-                input: root.join(&model.fbx),
-                output: PathBuf::new(),
-                origin_facing: model.origin,
-                // Your quarter turns come with the Game tab's facing control
-                facing_quarter_turns: 0,
-                patterns: &collision::PATTERNS,
-                added_material: added_material(model.facts.slots.iter().map(|s| s.name.as_str())),
-            };
-            let key = cache::model_key(&model.sha256, &job);
-            job.output = cache::model_fbx(root, &key);
-            (job, key)
+            model_job(
+                asset(model).file_path,
+                &roots[model.library],
+                &model.fbx,
+                &model.sha256,
+                model.origin,
+                model.facing_quarter_turns,
+                &model.facts,
+            )
         })
         .collect();
     let lookups: Vec<(PathBuf, String)> = planned
@@ -1645,7 +1697,8 @@ async fn normalize(
 }
 
 /// The manifest entry of `model`, read as `read`, from its normalized FBX `cached` (C9): its
-/// bounds from Blender's result, `rig` none without an armature, else generic, its takes as
+/// bounds from Blender's result, `rig` yours, else none without an armature, else generic, its
+/// takes as
 /// `clips`, left out when there are none, and its materials as inference gives them (C7), in
 /// Blender's slot order. Its `conversion` is its nearest `conversion.json`'s steps, then
 /// Blender's (C10).
@@ -1691,7 +1744,7 @@ fn model_entry(
         "sourcePath": model.source_path,
         "conversion": conversion,
         "bounds": normalized.bounds,
-        "rig": if normalized.has_armature { "generic" } else { "none" },
+        "rig": model.rig.unwrap_or(edits::Rig::inferred(normalized.has_armature)),
         "materials": materials,
     });
     if !normalized.takes.is_empty() {
@@ -4859,6 +4912,18 @@ mod tests {
         slots: &[&str],
         normalized: blender::Normalized,
     ) -> CachedModel {
+        cache_turned_model(f, path, origin, 0, slots, normalized)
+    }
+
+    /// `cache_model`, turned by your `facing` quarter turns.
+    fn cache_turned_model(
+        f: &Fixture,
+        path: &str,
+        origin: Origin,
+        facing: u8,
+        slots: &[&str],
+        normalized: blender::Normalized,
+    ) -> CachedModel {
         let root = &f.library.root_path;
         let sha256 = hashes::sha256_file(&root.join(path)).unwrap();
         let job = Job {
@@ -4867,7 +4932,7 @@ mod tests {
             input: root.join(path),
             output: PathBuf::new(),
             origin_facing: origin,
-            facing_quarter_turns: 0,
+            facing_quarter_turns: facing,
             patterns: &collision::PATTERNS,
             added_material: added_material(slots.iter().copied()),
         };
@@ -5057,6 +5122,92 @@ mod tests {
         let file = |name: &str| inspection.files.iter().find(|f| f.file == name).unwrap();
         assert_eq!(file("Models/Guard.fbx").source, cached_guard.fbx);
         assert_eq!(file("Models/Ruin.fbx").source, cached_ruin.fbx);
+    }
+
+    #[tokio::test]
+    async fn your_facing_is_in_a_models_job_and_cache_key_and_your_rig_in_its_entry() {
+        let f = fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        set_blender(&f, &dir.path().join("no-blender")).await;
+        let stool = "Dungeon Props/Models/SM_Stool.fbx";
+        collection(&f, "domain", "Props", "dg", &[stool]).await;
+        let id = id_of(&f.library.pool, stool).await;
+        let facts = Facts::fixture();
+
+        // Each quarter turn is its own job, writing its own cache entry
+        let root = &f.library.root_path;
+        let sha256 = hashes::sha256_file(&root.join(stool)).unwrap();
+        let stool_facts = facts.by_path[stool].clone().unwrap();
+        let jobs: Vec<(Job, String)> = (0..4)
+            .map(|turns| {
+                let (job, key) = model_job(
+                    stool.into(),
+                    root,
+                    stool,
+                    &sha256,
+                    Origin::Generic,
+                    turns,
+                    &stool_facts,
+                );
+                assert_eq!(job.facing_quarter_turns, turns);
+                assert_eq!(job.output, cache::model_fbx(root, &key));
+                (job, key)
+            })
+            .collect();
+        let keys: HashSet<&String> = jobs.iter().map(|(_, key)| key).collect();
+        assert_eq!(keys.len(), 4, "{keys:?}");
+
+        cache_model(
+            &f,
+            stool,
+            Origin::Generic,
+            &["Material"],
+            blender::test_normalized(&["Material"], None, &[], &[]),
+        );
+        let (inspection, _) = normalize_domain(&f, &facts).await;
+        assert_eq!(messages(&inspection.report), Vec::<&str>::new());
+        let models = model_entries(&inspection.report);
+        assert_eq!(models[0]["rig"], "none");
+        assert_eq!(
+            models[0]["conversion"][0]["settings"]["facingQuarterTurns"],
+            0
+        );
+
+        // Turned, the unturned entry is no hit, so Blender must make the turned one, and your
+        // edits change the fingerprint Export compares
+        let edit = json!({"facingQuarterTurns": 1, "rig": "generic"});
+        edits::write(&f.library.pool, &id, edit.as_object().unwrap())
+            .await
+            .unwrap();
+        let (turned, _) = normalize_domain(&f, &facts).await;
+        let message = messages(&turned.report).join("\n");
+        assert!(
+            message.starts_with(&format!(
+                "{stool}: the export cache doesn't hold its normalized FBX"
+            )),
+            "{message}"
+        );
+        assert_eq!(
+            inspection.fingerprint.changes(&turned.fingerprint),
+            ["your export edits in Fixture"]
+        );
+
+        let mut normalized = blender::test_normalized(&["Material"], None, &[], &[]);
+        normalized.transform.facing_quarter_turns = 1;
+        let cached = cache_turned_model(&f, stool, Origin::Generic, 1, &["Material"], normalized);
+        let (inspection, _) = normalize_domain(&f, &facts).await;
+        assert_eq!(messages(&inspection.report), Vec::<&str>::new());
+        assert_valid(&inspection.report);
+        let models = model_entries(&inspection.report);
+        assert_eq!(models[0]["sha256"], cached.sha256);
+        assert_eq!(
+            models[0]["rig"], "generic",
+            "yours, though it has no armature"
+        );
+        assert_eq!(
+            models[0]["conversion"][0]["settings"]["facingQuarterTurns"],
+            1
+        );
     }
 
     #[tokio::test]

@@ -5,10 +5,11 @@
 //! texture set (C8), in one transaction. When a group forms, the structure pass gives every
 //! member the main item's edits (A7, `structure::apply_unions`).
 //!
-//! So far the only edit is `assetName`.
+//! So far the edits are `assetName`, and a model's `rig` and `facingQuarterTurns`.
 
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::{Pool, Sqlite};
 
@@ -22,6 +23,28 @@ use crate::structure;
 pub type Edits = Map<String, Value>;
 
 pub const ASSET_NAME: &str = "assetName";
+pub const RIG: &str = "rig";
+pub const FACING_QUARTER_TURNS: &str = "facingQuarterTurns";
+
+/// A model's rig as the manifest lists it (D20). The export infers none without an armature,
+/// else generic. Humanoid, which only you set, comes with animation export (build order step 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Rig {
+    None,
+    Generic,
+}
+
+impl Rig {
+    /// What the export infers for a model: generic when it has an armature
+    pub fn inferred(has_armature: bool) -> Self {
+        if has_armature {
+            Rig::Generic
+        } else {
+            Rig::None
+        }
+    }
+}
 
 /// One `export_edits` row, with the file it is on.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -53,6 +76,31 @@ pub fn asset_name(edits: &Edits) -> Option<String> {
         .get(ASSET_NAME)
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// The `rig` you set in `edits`, if any.
+pub fn rig(edits: &Edits) -> Option<Rig> {
+    edits
+        .get(RIG)
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+/// The quarter turns about Y you set in `edits` (D13), if any: 0 to 3, each clockwise seen from
+/// above, after the pack origin's default facing.
+pub fn facing_quarter_turns(edits: &Edits) -> Option<u8> {
+    edits
+        .get(FACING_QUARTER_TURNS)
+        .and_then(Value::as_u64)
+        .filter(|turns| *turns <= 3)
+        .map(|turns| turns as u8)
+}
+
+/// The edits of asset `asset_id` among `rows`, empty when it has none.
+pub fn of(rows: &[Row], asset_id: &str) -> Edits {
+    rows.iter()
+        .find(|row| row.asset_id == asset_id)
+        .map(Row::parsed)
+        .unwrap_or_default()
 }
 
 /// Whether an asset of `kind` (as `assets.kind` holds it) is an image, which exports as a
@@ -136,10 +184,23 @@ where
 }
 
 /// Refuses a `patch` holding a key that isn't an edit, or a value an edit can't take: an
-/// `assetName` must be a PascalCase string (the contract's `pascalName`), or null to reset it.
-fn validate(patch: &Edits) -> Result<(), String> {
+/// `assetName` must be a PascalCase string (the contract's `pascalName`), a `rig` none or
+/// generic, and `facingQuarterTurns` 0 to 3, or each null to reset it. Only a model, never an
+/// image, has a rig or a facing.
+fn validate(patch: &Edits, image: bool) -> Result<(), String> {
     for (key, value) in patch {
         match (key.as_str(), value) {
+            (RIG | FACING_QUARTER_TURNS, _) if image => {
+                return Err(format!("{key} is a model's edit, and this is an image"))
+            }
+            (RIG | FACING_QUARTER_TURNS, Value::Null) => {}
+            (RIG, Value::String(rig)) if matches!(rig.as_str(), "none" | "generic") => {}
+            (RIG, _) => return Err("A rig must be none or generic".into()),
+            (FACING_QUARTER_TURNS, Value::Number(turns))
+                if turns.as_u64().is_some_and(|t| t <= 3) => {}
+            (FACING_QUARTER_TURNS, _) => {
+                return Err("facingQuarterTurns must be a whole number from 0 to 3".into())
+            }
             (ASSET_NAME, Value::Null) => {}
             (ASSET_NAME, Value::String(name)) if is_pascal(name) => {}
             (ASSET_NAME, Value::String(name)) => {
@@ -175,7 +236,6 @@ pub async fn write(
     asset_id: &str,
     patch: &Edits,
 ) -> Result<Vec<String>, String> {
-    validate(patch)?;
     // Immediate, so the read-then-write waits out the preview queue's writes on its busy
     // timeout, rather than failing to upgrade its read lock
     let mut tx = pool
@@ -192,6 +252,7 @@ pub async fn write(
     .await
     .map_err(|e| e.to_string())?
     .ok_or_else(|| format!("No asset has the id {asset_id}"))?;
+    validate(patch, is_image(&kind))?;
     let sources: Vec<String> = if is_image(&kind) {
         let folder = match dir_of(&file_path) {
             "" => String::new(),
@@ -390,7 +451,16 @@ mod tests {
                 "\"sedan car\" isn't PascalCase: a game name starts with a capital letter, then only letters and digits",
             ),
             (json!({"assetName": 3}), "An assetName must be text"),
-            (json!({"rig": "generic"}), "rig isn't an export edit"),
+            (json!({"rig": "humanoid"}), "A rig must be none or generic"),
+            (
+                json!({"facingQuarterTurns": 4}),
+                "facingQuarterTurns must be a whole number from 0 to 3",
+            ),
+            (
+                json!({"facingQuarterTurns": 1.5}),
+                "facingQuarterTurns must be a whole number from 0 to 3",
+            ),
+            (json!({"surface": "cutout"}), "surface isn't an export edit"),
         ] {
             assert_eq!(
                 write(&pool, SEDAN[0], &patch(value)).await,
@@ -401,6 +471,52 @@ mod tests {
             write(&pool, "gone", &patch(json!({"assetName": "Gone"}))).await,
             Err("No asset has the id gone".to_string())
         );
+        assert_eq!(rows(&pool).await, []);
+    }
+
+    #[tokio::test]
+    async fn a_models_rig_and_facing_reach_its_group_and_reset_on_their_own() {
+        let pool = car_kit().await;
+        write(
+            &pool,
+            SEDAN[1],
+            &patch(json!({"rig": "generic", "facingQuarterTurns": 3})),
+        )
+        .await
+        .unwrap();
+        write(&pool, SEDAN[0], &patch(json!({"assetName": "Sedan"})))
+            .await
+            .unwrap();
+        let all = read_all(&pool).await.unwrap();
+        for id in SEDAN {
+            let edits = of(&all, id);
+            assert_eq!(rig(&edits), Some(Rig::Generic), "{id}");
+            assert_eq!(facing_quarter_turns(&edits), Some(3), "{id}");
+        }
+
+        write(&pool, SEDAN[2], &patch(json!({"facingQuarterTurns": null})))
+            .await
+            .unwrap();
+        let all = read_all(&pool).await.unwrap();
+        let edits = of(&all, SEDAN[0]);
+        assert_eq!(facing_quarter_turns(&edits), None);
+        assert_eq!(rig(&edits), Some(Rig::Generic));
+        assert_eq!(asset_name(&edits).as_deref(), Some("Sedan"));
+        assert_eq!(of(&all, "gone"), Edits::new());
+    }
+
+    #[tokio::test]
+    async fn an_image_has_no_rig_or_facing() {
+        let pool = memory_library_pool().await;
+        insert_path(&pool, "Pack/T_Rock_D.png").await;
+        structure::rebuild(&pool, unmounted()).await.unwrap();
+        for value in [json!({"rig": "none"}), json!({"facingQuarterTurns": 1})] {
+            let key = value.as_object().unwrap().keys().next().unwrap().clone();
+            assert_eq!(
+                write(&pool, "Pack/T_Rock_D.png", &patch(value)).await,
+                Err(format!("{key} is a model's edit, and this is an image"))
+            );
+        }
         assert_eq!(rows(&pool).await, []);
     }
 }

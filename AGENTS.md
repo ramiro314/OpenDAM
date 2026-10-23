@@ -59,7 +59,8 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               merge, green flip, to PNG) as PNG cached by cache::texture_key, unity,
                               which reads a Unity pack's .meta and .mat files, edits, your
                               corrections in export_edits, and game, what the detail panel's Game
-                              tab shows
+                              tab shows, with a model's rig and facing, and the GLB of
+                              "Show as exported" (exported_view)
     tests/fixtures/game-export/  The export's fixture library, made by make_fixtures.py under Blender and
                               committed with its output, and fbx_facts.json, its FBX files' facts,
                               which test_fbx_facts.py checks and the Check's tests read
