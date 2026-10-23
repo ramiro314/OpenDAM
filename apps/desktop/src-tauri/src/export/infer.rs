@@ -8,6 +8,9 @@
 //! 3. images in the pack whose stem, without prefix and suffixes, is the slot's or the model's;
 //! 4. images beside the model with its stem, as BaseColor.
 //!
+//! Your edits (C4) then replace what was inferred: a source image's layout, role and normal-map
+//! convention, and a slot's name, surface and texture per role.
+//!
 //! Nothing here is stored: inferred values are recomputed at every check (D32).
 
 use std::collections::{BTreeMap, HashMap};
@@ -20,7 +23,7 @@ use serde::Serialize;
 use crate::export::fbx_facts::FbxFacts;
 use crate::export::fingerprint::{Probes, Stamp};
 use crate::export::names::{added_material, pascal};
-use crate::export::textures::{read_stem, Convention, Layout, Role, StemInfo};
+use crate::export::textures::{read_stem, Convention, Layout, Role, SourceEdits, StemInfo};
 use crate::export::unity;
 
 /// An indexed image of a pack.
@@ -193,6 +196,8 @@ pub struct PackImages {
     /// Each image's set
     pub set_of: Vec<usize>,
     hints: HashMap<usize, Hint>,
+    /// Your edits to each image that has any (C4)
+    edits: HashMap<usize, SourceEdits>,
 }
 
 impl PackImages {
@@ -229,7 +234,21 @@ impl PackImages {
             sets,
             set_of,
             hints: HashMap::new(),
+            edits: HashMap::new(),
         }
+    }
+
+    /// Takes your edits to each image, by its asset id (C4), so they replace what is inferred.
+    pub fn with_edits(mut self, edits: &HashMap<String, SourceEdits>) -> Self {
+        self.edits = (self.images.iter().enumerate())
+            .filter_map(|(i, image)| Some((i, *edits.get(&image.id)?)))
+            .collect();
+        self
+    }
+
+    /// Your edits to `image`.
+    pub fn edits(&self, image: usize) -> SourceEdits {
+        self.edits.get(&image).copied().unwrap_or_default()
     }
 
     /// The image at `path`, matched exactly.
@@ -250,9 +269,14 @@ impl PackImages {
         })
     }
 
-    /// An image's layout: a Unity material's word for it, else its suffix's, else an FBX
-    /// reference's, else BaseColor (C3).
+    /// An image's layout: yours (C4), else the inferred one.
     pub fn layout(&self, image: usize) -> Layout {
+        self.edits(image).layout(self.inferred_layout(image))
+    }
+
+    /// An image's inferred layout: a Unity material's word for it, else its suffix's, else an
+    /// FBX reference's, else BaseColor (C3).
+    pub fn inferred_layout(&self, image: usize) -> Layout {
         let hint = self.hints.get(&image);
         hint.filter(|h| h.strong)
             .map(|h| h.layout)
@@ -261,8 +285,15 @@ impl PackImages {
             .unwrap_or(Layout::Role(Role::BaseColor))
     }
 
-    /// An image's normal-map convention: its `_DX`/`_GL` suffix's, else the pack's (D14).
+    /// An image's normal-map convention: yours, else its `_DX`/`_GL` suffix's, else the pack's
+    /// (D14).
     pub fn convention(&self, image: usize, pack: Convention) -> Convention {
+        let inferred = self.inferred_convention(image, pack);
+        self.edits(image).convention.unwrap_or(inferred)
+    }
+
+    /// An image's inferred normal-map convention: its suffix's, else the pack's.
+    pub fn inferred_convention(&self, image: usize, pack: Convention) -> Convention {
         self.stems[image].convention.unwrap_or(pack)
     }
 
@@ -384,6 +415,8 @@ pub enum Via {
     Suffix,
     /// An image with the model's stem, as BaseColor
     Stem,
+    /// Your pick in the Game tab (C4)
+    Yours,
 }
 
 /// A material's texture in one role: the texture set that fills it.
@@ -394,7 +427,9 @@ pub struct Binding {
     #[serde(skip)]
     pub set: usize,
     pub via: Via,
-    /// The set's default name (D24, C5)
+    /// The source the role is bound by: the image you picked, else the first of `files`
+    pub source: String,
+    /// The set's default name (D24, C5), or yours
     pub asset_name: String,
     /// The set's sources that give the role, relative to the library root, never empty
     pub files: Vec<String>,
@@ -407,20 +442,45 @@ pub enum Surface {
     Cutout,
 }
 
-/// One material of a model, as inferred (C7).
+/// Your edits to one material slot (C4): its name, its surface, and a texture per role, where
+/// `None` is "no texture in this role" and a value is the asset id of a source of a texture set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SlotEdits {
+    pub name: Option<String>,
+    pub surface: Option<Surface>,
+    pub textures: BTreeMap<Role, Option<String>>,
+}
+
+/// What inference alone gives a material, before your edits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Inferred {
+    /// The slot's default name (D22)
+    pub name: String,
+    pub surface: Surface,
+    pub textures: BTreeMap<Role, Binding>,
+}
+
+/// One material of a model (C7), as the export uses it: what was inferred, with your edits
+/// (C4) in its place.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Material {
     pub slot: String,
-    /// The slot's default name (D22)
     pub name: String,
     pub surface: Surface,
-    /// Its BaseColor has alpha below 0.5 and nothing said cutout: a suggestion, which exports
-    /// opaque until you accept it (D23)
+    /// Its BaseColor has alpha below 0.5, and neither a Unity material nor you set the surface:
+    /// a suggestion, which exports opaque until you accept it (D23)
     pub cutout_suggested: bool,
     /// The slot the export adds for a kept mesh with no material (C9 step 2)
     pub added: bool,
     pub textures: BTreeMap<Role, Binding>,
+    #[serde(skip)]
+    pub inferred: Inferred,
+    #[serde(skip)]
+    pub yours: SlotEdits,
+    /// Why a texture you picked can't be used, each a problem that refuses the export
+    #[serde(skip)]
+    pub unfilled: Vec<String>,
 }
 
 /// FBX texture reference types, in the order their answers are taken, with the layout each
@@ -555,6 +615,8 @@ pub struct DomainModel<'a, K> {
     pub facts: &'a FbxFacts,
     /// Its `assetName`, after which the sets only it uses are named (D24)
     pub asset_name: String,
+    /// Your edits to its slots, by slot name (C4)
+    pub edits: BTreeMap<String, SlotEdits>,
 }
 
 impl<K> DomainModel<'_, K> {
@@ -641,7 +703,7 @@ pub fn domain<K: Copy + Eq + Hash>(
                 roles.entry(*set).or_default().push(*role);
             }
             for (set, roles) in roles {
-                let name = pascal(&draft.slot);
+                let name = draft.name();
                 users
                     .entry((model.pack, set))
                     .or_default()
@@ -665,54 +727,67 @@ pub fn domain<K: Copy + Eq + Hash>(
         })
         .collect();
 
+    let set_names = SetNames { names };
     let materials = models
         .iter()
         .zip(drafts)
         .map(|(model, drafts)| {
             let images = &catalogs[&model.pack];
+            // Answered from final layouts, a role always has a file, and a pick that gives none
+            // is unfilled; the filter keeps the invariant should that ever change
+            let bind = |role: Role, set: usize, via: Via, source: Option<usize>| {
+                let files = images.role_sources(set, role);
+                let source = source.or(files.first().copied())?;
+                Some(Binding {
+                    set,
+                    via,
+                    source: images.images[source].id.clone(),
+                    asset_name: set_names.name(catalogs, model.pack, set),
+                    files: files
+                        .iter()
+                        .map(|i| images.images[*i].path.clone())
+                        .collect(),
+                })
+            };
             drafts
                 .into_iter()
                 .map(|draft| {
-                    let textures = draft
-                        .textures
-                        .into_iter()
+                    let textures = (draft.textures.iter())
                         .filter_map(|(role, (set, via))| {
-                            let files: Vec<String> = images
-                                .role_sources(set, role)
-                                .into_iter()
-                                .map(|i| images.images[i].path.clone())
-                                .collect();
-                            let asset_name = names[&(model.pack, set)].clone();
-                            // Answered from final layouts, a role always has a file; the filter
-                            // keeps the invariant should that ever change
-                            (!files.is_empty()).then_some((
-                                role,
-                                Binding {
-                                    set,
-                                    via,
-                                    asset_name,
-                                    files,
-                                },
-                            ))
+                            let picked = draft.picked.get(role).copied();
+                            Some((*role, bind(*role, *set, *via, picked)?))
                         })
                         .collect();
+                    let inferred_textures = (draft.inferred.iter())
+                        .filter_map(|(role, (set, via))| {
+                            Some((*role, bind(*role, *set, *via, None)?))
+                        })
+                        .collect();
+                    let inferred_surface = if draft.cutout {
+                        Surface::Cutout
+                    } else {
+                        Surface::Opaque
+                    };
                     Material {
-                        name: pascal(&draft.slot),
-                        surface: if draft.cutout {
-                            Surface::Cutout
-                        } else {
-                            Surface::Opaque
-                        },
+                        name: draft.name(),
+                        surface: draft.edits.surface.unwrap_or(inferred_surface),
                         cutout_suggested: draft.cutout_suggested,
                         added: draft.added,
                         textures,
+                        inferred: Inferred {
+                            name: pascal(&draft.slot),
+                            surface: inferred_surface,
+                            textures: inferred_textures,
+                        },
+                        yours: draft.edits,
+                        unfilled: draft.unfilled,
                         slot: draft.slot,
                     }
                 })
                 .collect()
         })
         .collect();
-    (materials, SetNames { names })
+    (materials, set_names)
 }
 
 /// Records what `model`'s FBX references and Unity materials say each image they name holds
@@ -768,14 +843,28 @@ fn hint<K>(
     }
 }
 
-/// One slot, answered, before the domain's sets are named.
+/// One slot, answered and with your edits, before the domain's sets are named.
 struct Draft {
     slot: String,
     added: bool,
+    /// Whether a Unity material said cutout
     cutout: bool,
     cutout_suggested: bool,
-    /// The set and source of each role
+    /// The set and source of each role, as inferred
+    inferred: BTreeMap<Role, (usize, Via)>,
+    /// The set and source of each role, your picks in place of the inferred ones
     textures: BTreeMap<Role, (usize, Via)>,
+    /// The image you picked for each role you picked one for
+    picked: BTreeMap<Role, usize>,
+    unfilled: Vec<String>,
+    edits: SlotEdits,
+}
+
+impl Draft {
+    /// The material's name: yours, else the slot's default (D22)
+    fn name(&self) -> String {
+        (self.edits.name.clone()).unwrap_or_else(|| pascal(&self.slot))
+    }
 }
 
 /// Answers each slot of `model` from the first source with an answer (D11), reading each
@@ -871,22 +960,52 @@ fn draft<K>(
             }
         }
 
-        let cutout_suggested = !answers.cutout
-            && answers
-                .textures
-                .get(&Role::BaseColor)
-                .is_some_and(|(set, _)| {
-                    images
-                        .role_sources(*set, Role::BaseColor)
-                        .into_iter()
-                        .any(|i| images.has_cut_alpha(probes, i, memo))
-                });
+        // 5. Your edits (C4): each role you picked a texture for, or none, in place of the
+        // inferred one
+        let edits = model.edits.get(&slot).cloned().unwrap_or_default();
+        let inferred = answers.textures.clone();
+        let mut textures = answers.textures;
+        let mut picked = BTreeMap::new();
+        let mut unfilled = Vec::new();
+        for (role, pick) in &edits.textures {
+            textures.remove(role);
+            let Some(id) = pick else { continue };
+            let role_name = role.as_str();
+            match images.images.iter().position(|i| &i.id == id) {
+                None => unfilled.push(format!(
+                    "its material {slot} has a {role_name} you picked that is no longer an image of its pack: pick another in its Game tab, or reset it"
+                )),
+                Some(image) if !images.layout(image).outputs().contains(role) => {
+                    unfilled.push(format!(
+                        "its material {slot} has {} picked as its {role_name}, but that image's layout gives no {role_name}: change its layout in its Game tab, or pick another",
+                        images.images[image].path
+                    ))
+                }
+                Some(image) => {
+                    textures.insert(*role, (images.set_of[image], Via::Yours));
+                    picked.insert(*role, image);
+                }
+            }
+        }
+
+        let cutout_suggested = edits.surface.is_none()
+            && !answers.cutout
+            && textures.get(&Role::BaseColor).is_some_and(|(set, _)| {
+                images
+                    .role_sources(*set, Role::BaseColor)
+                    .into_iter()
+                    .any(|i| images.has_cut_alpha(probes, i, memo))
+            });
         drafts.push(Draft {
             slot,
             added,
             cutout: answers.cutout,
             cutout_suggested,
-            textures: answers.textures,
+            inferred,
+            textures,
+            picked,
+            unfilled,
+            edits,
         });
     }
     drafts
@@ -1023,6 +1142,7 @@ mod tests {
             fbx_path: path,
             facts,
             asset_name: pascal(stem_of(path)),
+            edits: BTreeMap::new(),
         };
         let (mut materials, _) = domain(
             &mut catalogs,
@@ -1499,6 +1619,7 @@ mod tests {
             fbx_path: path,
             facts,
             asset_name: pascal(stem_of(path)),
+            edits: BTreeMap::new(),
         };
         let leaf = model("Unity Moss/Models/SM_Leaf.fbx", &leaf_facts);
         let log = model("Unity Moss/Models/SM_Log.fbx", &log_facts);
@@ -1509,6 +1630,7 @@ mod tests {
                 .map(|m| DomainModel {
                     unity: m.unity,
                     asset_name: m.asset_name.clone(),
+                    edits: m.edits.clone(),
                     ..**m
                 })
                 .collect();
@@ -1701,6 +1823,7 @@ mod tests {
             fbx_path: guard,
             facts: &facts,
             asset_name: "Guard".into(),
+            edits: BTreeMap::new(),
         };
         let read = |memo: &Memo| {
             let mut catalogs = HashMap::from([(0, pack_images("Dungeon Props"))]);

@@ -1342,6 +1342,14 @@ mod tests {
                     .unwrap();
                 "your export edits in Fixture"
             }
+            "a role changed in its Game tab" => {
+                let id = id_of(&f.library.pool, "Unity Moss/T_Moss_D.png").await;
+                let role = json!({"role": "Emission"});
+                crate::export::edits::write(&f.library.pool, &id, role.as_object().unwrap())
+                    .await
+                    .unwrap();
+                "your export edits in Fixture"
+            }
             "a pack override" => {
                 sqlx::query(
                     "INSERT INTO pack_overrides (path, name, updated_at) VALUES ('Kenney Crates', 'Crates', 0)",
@@ -1391,6 +1399,7 @@ mod tests {
             "a source touched",
             "a member renamed",
             "an asset renamed in its Game tab",
+            "a role changed in its Game tab",
             "a pack override",
             "the domain renamed",
             "the root collection renamed",

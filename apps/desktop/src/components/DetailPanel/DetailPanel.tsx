@@ -23,8 +23,6 @@ import type {
   Cover,
   ExportEditPatch,
   GameDetail,
-  GameModelDetail,
-  GameRig,
   GroupMember,
   NormalConvention,
   PackDetail,
@@ -39,8 +37,6 @@ import {
   IconCopy,
   IconCheck,
   IconRefresh,
-  IconRotateCcw,
-  IconRotateCw,
   IconEdit,
   IconTrash,
   IconHeart,
@@ -67,19 +63,8 @@ import {
   type PackForm,
 } from '../../utils/packEdits';
 import { KIND_LABEL } from '../../utils/scrubKey';
-import {
-  domainsLine,
-  exportedView,
-  exportsAs,
-  facingLine,
-  hasGameTab,
-  namePatch,
-  rigPatch,
-  shownValue,
-  turnPatch,
-  viewKey,
-  type ViewResult,
-} from '../../utils/gameTab';
+import { domainsLine, exportsAs, hasGameTab, namePatch, shownValue } from '../../utils/gameTab';
+import { MaterialEditor, ModelEditor, TextureEditor } from './GameEditors';
 import { ThreeViewer } from './ThreeViewer';
 import { SuggestTags } from './SuggestTags';
 import styles from './DetailPanel.module.css';
@@ -1124,9 +1109,10 @@ function CollectionsTab({
 // ── Game Tab ──────────────────────────────────────────────────────────────
 /**
  * What the game export makes of the asset (plan game-export C13): the problems the Checks of
- * its domains find with it, what it exports as, and its `assetName`, marked inferred or yours,
- * with a reset to inferred. A save writes to the asset's group, or to an image's texture set,
- * and makes an open Export view holding the asset ask for a new Check.
+ * its domains find with it, what it exports as, its `assetName`, a model's materials and a
+ * texture's layout, role and convention, each marked inferred or yours, with a reset to
+ * inferred. A save writes to the asset's group (a name to an image's whole texture set), and
+ * makes an open Export view holding the asset ask for a new Check.
  */
 function GameTab({ asset }: { asset: Asset }) {
   const [loaded, setLoaded] = useState<{ id: string; detail: GameDetail | null } | null>(null);
@@ -1258,180 +1244,29 @@ function GameTab({ asset }: { asset: Asset }) {
         </div>
       </form>
       {detail.model && (
-        <ModelControls
+        <ModelEditor
           key={detail.assetId}
           assetId={detail.assetId}
           model={detail.model}
           revision={reload}
           saving={saving}
-          onSave={save}
+          save={(patch) => void save(patch)}
         />
       )}
-    </div>
-  );
-}
-
-/**
- * A model's rig and facing (plan game-export C13, D13, D20): a rig picker and quarter turns
- * about Y, each marked inferred or yours with a reset, and "Show as exported", which has Blender
- * write the normalized model for the viewer only when you ask. Once shown, the view asks again
- * after each edit, so it follows each turn. Each save makes an open Export view holding the model ask for a new Check.
- */
-function ModelControls({
-  assetId,
-  model,
-  revision,
-  saving,
-  onSave,
-}: {
-  assetId: string;
-  model: GameModelDetail;
-  /** Counts the tab's saved edits: each makes an open view ask again */
-  revision: number;
-  saving: boolean;
-  onSave: (patch: ExportEditPatch) => Promise<void>;
-}) {
-  const rig = shownValue(model.rig);
-  const facing = shownValue(model.facingQuarterTurns);
-  const [showing, setShowing] = useState(false);
-  const [result, setResult] = useState<ViewResult | null>(null);
-  const key = viewKey(assetId, revision);
-  const view = exportedView(showing, result, key);
-  useEffect(() => {
-    if (!showing || result?.key === key) return;
-    let current = true;
-    api
-      .showAsExported(assetId)
-      .then((path) => current && setResult({ key, path }))
-      .catch((err) => current && setResult({ key, error: String(err) }));
-    return () => {
-      current = false;
-    };
-  }, [showing, result, key, assetId]);
-
-  return (
-    <div className={styles.gameForm} id="detail-game-model">
-      <label className={styles.infoLabel} htmlFor="detail-game-rig">
-        Rig
-      </label>
-      <div className={styles.gameValue}>
-        <select
-          id="detail-game-rig"
-          className={clsx(styles.packFormInput, styles.packFormSelect)}
-          value={rig.value}
-          disabled={saving}
-          onChange={(e) => {
-            const patch = rigPatch(model.rig, e.target.value as GameRig);
-            if (patch) void onSave(patch);
-          }}
-        >
-          <option value="none">None</option>
-          <option value="generic">Generic</option>
-        </select>
-        <span
-          id="detail-game-rig-mark"
-          className={clsx(styles.gameMark, rig.mark === 'yours' && styles.gameMarkYours)}
-          title={
-            rig.mark === 'yours'
-              ? 'You set this rig'
-              : 'Inferred: none without an armature, else generic'
-          }
-        >
-          {rig.mark}
-        </span>
-        <button
-          type="button"
-          id="detail-game-rig-reset"
-          className={styles.openLicenseBtn}
-          onClick={() => void onSave({ rig: null })}
-          disabled={saving || rig.mark === 'inferred'}
-          title={`Go back to the inferred rig, ${model.rig.inferred}`}
-        >
-          Reset
-        </button>
-      </div>
-      <span className={styles.infoLabel}>Facing</span>
-      <div className={styles.gameValue}>
-        <button
-          type="button"
-          id="detail-game-turn-left"
-          className={styles.openLicenseBtn}
-          onClick={() => void onSave(turnPatch(model.facingQuarterTurns, -1))}
-          disabled={saving}
-          title="A quarter turn counterclockwise, seen from above"
-          aria-label="A quarter turn counterclockwise, seen from above"
-        >
-          <IconRotateCcw size={12} />
-        </button>
-        <button
-          type="button"
-          id="detail-game-turn-right"
-          className={styles.openLicenseBtn}
-          onClick={() => void onSave(turnPatch(model.facingQuarterTurns, 1))}
-          disabled={saving}
-          title="A quarter turn clockwise, seen from above: +Z to +X"
-          aria-label="A quarter turn clockwise, seen from above: +Z to +X"
-        >
-          <IconRotateCw size={12} />
-        </button>
-        <span
-          id="detail-game-facing-mark"
-          className={clsx(styles.gameMark, facing.mark === 'yours' && styles.gameMarkYours)}
-          title={
-            facing.mark === 'yours'
-              ? 'You turned it'
-              : 'Inferred: the default facing of its pack’s origin'
-          }
-        >
-          {facing.mark}
-        </span>
-        <button
-          type="button"
-          id="detail-game-facing-reset"
-          className={styles.openLicenseBtn}
-          onClick={() => void onSave({ facingQuarterTurns: null })}
-          disabled={saving || facing.mark === 'inferred'}
-          title="Go back to the default facing of its pack’s origin"
-        >
-          Reset
-        </button>
-      </div>
-      <div className={styles.packFormActions}>
-        <span className={styles.packFormHint} id="detail-game-facing">
-          {facingLine(model)}.
-        </span>
-        <button
-          type="button"
-          id="detail-game-show-exported"
-          className={clsx(styles.openLicenseBtn, showing && styles.actionBtnActive)}
-          onClick={() => {
-            // Asking again retries a failure, as after setting Blender's path in Settings
-            if (!showing && result && 'error' in result) setResult(null);
-            setShowing(!showing);
-          }}
-          title="Blender writes the model as the next export does, facing the blue arrow's +Z"
-        >
-          {showing ? 'Hide' : 'Show as exported'}
-        </button>
-      </div>
-      {view.status === 'loading' && (
-        <p className={clsx(styles.gameHint, styles.gameWide)}>
-          Normalizing it in Blender as the export will…
-        </p>
+      {detail.materials.length > 0 && (
+        <MaterialEditor
+          materials={detail.materials}
+          images={detail.images}
+          saving={saving}
+          save={(patch) => void save(patch)}
+        />
       )}
-      {view.status === 'failed' && (
-        <p
-          className={clsx(styles.packFormError, styles.gameWide)}
-          role="alert"
-          id="detail-game-view-error"
-        >
-          {view.error}
-        </p>
-      )}
-      {view.status === 'shown' && (
-        <div className={clsx(styles.gameViewer, styles.gameWide)} id="detail-game-viewer">
-          <ThreeViewer modelPath={view.path} forwardArrow />
-        </div>
+      {detail.texture && (
+        <TextureEditor
+          texture={detail.texture}
+          saving={saving}
+          save={(patch) => void save(patch)}
+        />
       )}
     </div>
   );
