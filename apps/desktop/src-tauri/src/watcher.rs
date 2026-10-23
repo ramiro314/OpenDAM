@@ -1,5 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
+use futures_util::future::BoxFuture;
+use sqlx::{Pool, Sqlite, SqliteConnection};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -195,26 +197,36 @@ impl HeldLock {
 /// The file holds a token naming its holder's machine (with its boot and pid namespace), process
 /// and process start time, and a timestamp that a heartbeat rewrites every 30 s, so a hold of any
 /// length stays fresh. A lock is stale once its mtime is 120 s old, or at once when its token
-/// names a process in this machine, boot and pid namespace that is gone. Dropping the guard stops the heartbeat and deletes the file only while it still
-/// holds the guard's token.
-struct IndexLock {
+/// names a process in this machine, boot and pid namespace that is gone. Dropping the guard stops
+/// the heartbeat and deletes the file only while it still holds the guard's token.
+///
+/// Holding one, with the library's `index_lock`, is the proof the `_locked` variants
+/// (`index_paths_locked`, `structure::rebuild_library_locked`) take instead of locking.
+pub struct IndexLock {
+    path: PathBuf,
     /// `None` when the file couldn't be written: the run goes on unlocked, as it always has.
     held: Option<Arc<HeldLock>>,
     heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl IndexLock {
-    /// Try to acquire the lock. Returns `None` while another holder has it.
-    async fn try_acquire(opendam_dir: &Path) -> Option<Self> {
-        Self::try_acquire_with(opendam_dir, STALE_AFTER, &LockEnv::system()).await
+    /// The lock file of the library rooted at `root`.
+    fn path(root: &Path) -> PathBuf {
+        root.join(".opendam").join("index.lock")
+    }
+
+    /// Try to acquire the advisory lock of the library rooted at `root`. Returns `None` while
+    /// another holder has it.
+    pub async fn try_acquire(root: &Path) -> Option<Self> {
+        Self::try_acquire_with(&Self::path(root), STALE_AFTER, &LockEnv::system()).await
     }
 
     async fn try_acquire_with(
-        opendam_dir: &Path,
+        lock_path: &Path,
         stale_after: Duration,
         env: &LockEnv,
     ) -> Option<Self> {
-        let lock_path = opendam_dir.join("index.lock");
+        let lock_path = lock_path.to_path_buf();
 
         if let Ok(meta) = std::fs::metadata(&lock_path) {
             let token = read_token(&lock_path).unwrap_or_default();
@@ -243,6 +255,7 @@ impl IndexLock {
                 e
             );
             return Some(IndexLock {
+                path: lock_path,
                 held: None,
                 heartbeat: None,
             });
@@ -259,7 +272,7 @@ impl IndexLock {
         }
 
         let held = Arc::new(HeldLock {
-            path: lock_path,
+            path: lock_path.clone(),
             token,
             lost: AtomicBool::new(false),
             released: Mutex::new(false),
@@ -278,6 +291,7 @@ impl IndexLock {
             }
         });
         Some(IndexLock {
+            path: lock_path,
             held: Some(held),
             heartbeat: Some(heartbeat),
         })
@@ -372,53 +386,189 @@ struct PendingAsset {
     is_update: bool,
 }
 
-/// Walk `paths` and index all found files as Assets into the database.
-/// Highly optimized for NAS:
-/// 1. Single initial query loads existing assets into RAM (0 queries during walk).
-/// 2. Skips `.opendam` directory.
-/// 3. Reuses each asset's existing thumbnail from the DB to never re-render previews across network.
-/// 4. Groups writes into chunks of 200 inside single transactions (cutting NAS I/O by 99%).
-/// 5. Advisory index.lock prevents two machines from indexing the same library simultaneously,
-///    and a run that loses it prunes nothing.
-/// 6. Ends with the structure pass (`structure::rebuild`), under the same locks.
-pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> Result<()> {
-    // An offline library is skipped: walking a missing root finds nothing, and the
-    // deleted-file pass below would then remove every asset row.
-    let Some(LibraryHandle {
-        pool, root_path, ..
-    }) = db.get_library_handle(library_id).await
-    else {
+/// How an index run treats the rows in its scope whose files it didn't find (`index_pool`).
+#[derive(Clone, Copy)]
+pub enum Prune<'a> {
+    /// Delete them, then run the structure pass. Every run but an import build's.
+    Now,
+    /// Delete no row and run no structure pass, and report each row the run inserts to the
+    /// journal, inside the transaction that inserts it. An import build runs this between its
+    /// swap and its commit (plan pack-import, "Pruning waits for the commit").
+    Defer(&'a dyn InsertJournal),
+}
+
+/// Records the rows a `Prune::Defer` run inserts.
+pub trait InsertJournal: Sync {
+    /// Called once per write batch that inserts rows, inside that batch's transaction, with each
+    /// inserted row's `(id, file_path)`. An error rolls the batch back and fails the run.
+    fn record<'a>(
+        &'a self,
+        tx: &'a mut SqliteConnection,
+        inserted: &'a [(&'a str, &'a str)],
+    ) -> BoxFuture<'a, sqlx::Result<()>>;
+}
+
+/// Library `library_id`'s handle while it is open and its root is mounted. An offline library is
+/// skipped: walking a missing root finds nothing, and the prune would then remove every row.
+async fn mounted(db: &Database, library_id: &str) -> Option<LibraryHandle> {
+    let Some(library) = db.get_library_handle(library_id).await else {
         tracing::info!("Library {} is not open, skipping indexing", library_id);
-        return Ok(());
+        return None;
     };
-    if !root_path.exists() {
+    if !library.root_path.exists() {
         tracing::info!(
             "Library {} root {:?} is missing, skipping indexing",
             library_id,
-            root_path
+            library.root_path
         );
-        return Ok(());
+        return None;
     }
+    Some(library)
+}
+
+/// Takes library `library_id`'s `index_lock`, then the advisory lock, and runs
+/// `index_paths_locked` with `Prune::Now`. Yields when another machine holds the advisory lock.
+pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> Result<()> {
+    let Some(library) = mounted(db, library_id).await else {
+        return Ok(());
+    };
 
     // ── This app's lock: a command's structure pass waits for the run's own ──
     let index_lock = db.index_lock(library_id);
-    let _index_guard = index_lock.lock().await;
+    let index_guard = index_lock.lock().await;
 
     // ── Advisory lock: skip if another machine is already indexing ────────
-    let opendam_dir = root_path.join(".opendam");
-    let lock = match IndexLock::try_acquire(&opendam_dir).await {
-        Some(guard) => guard,
-        None => return Ok(()), // another instance is indexing — yield
+    let Some(lock) = IndexLock::try_acquire(&library.root_path).await else {
+        return Ok(()); // another instance is indexing — yield
     };
 
+    index_paths_locked(db, library_id, paths, Prune::Now, &index_guard, &lock).await
+}
+
+/// `index_paths` for a caller that holds library `library_id`'s `index_lock` and advisory lock,
+/// passed as proof: it never locks either again. Runs `index_pool` on the library, then stores
+/// its asset count.
+pub async fn index_paths_locked(
+    db: &Database,
+    library_id: &str,
+    paths: &[String],
+    prune: Prune<'_>,
+    index_guard: &tokio::sync::MutexGuard<'_, ()>,
+    lock: &IndexLock,
+) -> Result<()> {
+    debug_assert!(std::ptr::eq(
+        tokio::sync::MutexGuard::mutex(index_guard),
+        &*db.index_lock(library_id)
+    ));
+    let Some(LibraryHandle {
+        pool, root_path, ..
+    }) = mounted(db, library_id).await
+    else {
+        return Ok(());
+    };
+    debug_assert!(lock.path == IndexLock::path(&root_path));
+
+    index_pool(&pool, &root_path, paths, prune, Some(lock)).await?;
+
+    // ── Update asset count ──────────────────────────────────────────────
+    let count_row: Option<(i64,)> = sqlx::query_as("SELECT COUNT(*) FROM assets")
+        .fetch_optional(&pool)
+        .await?;
+    let total_count = count_row.map(|(c,)| c).unwrap_or(0);
+
+    let _ = sqlx::query("UPDATE libraries SET asset_count = ? WHERE id = ?")
+        .bind(total_count)
+        .bind(library_id)
+        .execute(&pool)
+        .await;
+
+    let _ = sqlx::query("UPDATE libraries SET asset_count = ? WHERE id = ?")
+        .bind(total_count)
+        .bind(library_id)
+        .execute(&db.master_pool)
+        .await;
+
+    tracing::info!(
+        "NAS-efficient indexing complete for library {}: {} total assets",
+        library_id,
+        total_count
+    );
+    Ok(())
+}
+
+/// The library-relative paths whose rows a run over `paths` reads and may prune, or `None` when
+/// one of them is the library root itself, which covers every row.
+fn scopes(root: &Path, paths: &[String]) -> Option<Vec<String>> {
+    paths
+        .iter()
+        .map(|p| make_relative_path(root, Path::new(p)))
+        .map(|rel| (!rel.is_empty()).then_some(rel))
+        .collect()
+}
+
+/// The rows of the library DB at `pool` that a run over `paths` reads: every row for a run over
+/// the root, else those at or under a walked path, on whole path components (`Pub/Pack` holds
+/// `Pub/Pack/Rock.fbx` but not `Pub/Package/Rock.fbx`).
+async fn rows_in_scope(
+    pool: &Pool<Sqlite>,
+    root: &Path,
+    paths: &[String],
+) -> sqlx::Result<Vec<(String, String, i64, i64, Option<String>)>> {
+    const COLUMNS: &str =
+        "SELECT id, file_path, modified_at, size_bytes, thumbnail_path FROM assets";
+    let Some(scopes) = scopes(root, paths) else {
+        return sqlx::query_as(COLUMNS).fetch_all(pool).await;
+    };
+    let mut rows = Vec::new();
+    for scope in scopes {
+        // Every path below `scope` sorts between `scope/` and `scope0`, '0' being '/' + 1, and
+        // `file_path` compares bytewise (BINARY), so this is an index range, not a scan.
+        rows.extend(
+            sqlx::query_as(&format!(
+                "{COLUMNS} WHERE file_path = ? OR (file_path >= ? AND file_path < ?)"
+            ))
+            .bind(&scope)
+            .bind(format!("{scope}/"))
+            .bind(format!("{scope}0"))
+            .fetch_all(pool)
+            .await?,
+        );
+    }
+    Ok(rows)
+}
+
+/// Walk `paths` and index all found files as Assets into the library DB at `pool`, whose files
+/// lie below `root`. The lock-free core of `index_paths`: the caller holds the library's locks,
+/// passing the advisory one as `advisory`, or owns a pool no one else can reach yet.
+/// Highly optimized for NAS:
+/// 1. Single initial query loads the existing assets under `paths` into RAM (0 queries during
+///    walk). Rows elsewhere in the library are never read, so never pruned.
+/// 2. Skips `.opendam` directory.
+/// 3. Reuses each asset's existing thumbnail from the DB to never re-render previews across network.
+/// 4. Groups writes into chunks of 200 inside single transactions (cutting NAS I/O by 99%).
+/// 5. With `Prune::Now`, deletes the rows of files it didn't find, unless `advisory` no longer
+///    holds its token, then ends with the structure pass (`structure::rebuild`).
+pub async fn index_pool(
+    pool: &Pool<Sqlite>,
+    root_path: &Path,
+    paths: &[String],
+    prune: Prune<'_>,
+    advisory: Option<&IndexLock>,
+) -> Result<()> {
+    if !root_path.exists() {
+        tracing::info!("Library root {:?} is missing, skipping indexing", root_path);
+        return Ok(());
+    }
+    let journal = match prune {
+        Prune::Now => None,
+        Prune::Defer(journal) => Some(journal),
+    };
     let now = Utc::now().timestamp_millis();
 
-    // ── 1. Load existing assets in ONE single query into memory ──────────
-    let existing_rows: Vec<(String, String, i64, i64, Option<String>)> =
-        sqlx::query_as("SELECT id, file_path, modified_at, size_bytes, thumbnail_path FROM assets")
-            .fetch_all(&pool)
-            .await
-            .unwrap_or_default();
+    // ── 1. Load existing assets in scope in ONE query per walked path ────
+    let existing_rows = rows_in_scope(pool, root_path, paths)
+        .await
+        .unwrap_or_default();
 
     let mut existing_map: HashMap<String, (String, i64, i64, Option<String>)> =
         HashMap::with_capacity(existing_rows.len());
@@ -471,7 +621,7 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
                 continue;
             }
 
-            let rel_path = make_relative_path(&root_path, path);
+            let rel_path = make_relative_path(root_path, path);
             seen_paths.insert(rel_path.clone());
 
             let meta = match entry.metadata() {
@@ -537,7 +687,7 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
 
             // Flush chunk if batch reaches 200 items
             if pending_batch.len() >= 200 {
-                commit_asset_batch(&pool, &pending_batch).await?;
+                commit_asset_batch(pool, &pending_batch, journal).await?;
                 pending_batch.clear();
             }
         }
@@ -545,8 +695,12 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
 
     // Flush any remaining assets
     if !pending_batch.is_empty() {
-        commit_asset_batch(&pool, &pending_batch).await?;
+        commit_asset_batch(pool, &pending_batch, journal).await?;
         pending_batch.clear();
+    }
+
+    if journal.is_some() {
+        return Ok(());
     }
 
     // ── 3. Detect and remove deleted files in batch ───────────────────────
@@ -555,45 +709,21 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
         .filter(|(rel, _)| !seen_paths.contains(rel))
         .map(|(_, (id, _, _, _))| id)
         .collect();
-    prune_missing(&pool, &to_delete, &lock).await;
+    prune_missing(pool, &to_delete, advisory).await;
 
-    // ── 4. Update asset count ───────────────────────────────────────────
-    let count_row: Option<(i64,)> = sqlx::query_as("SELECT COUNT(*) FROM assets")
-        .fetch_optional(&pool)
-        .await?;
-    let total_count = count_row.map(|(c,)| c).unwrap_or(0);
-
-    let _ = sqlx::query("UPDATE libraries SET asset_count = ? WHERE id = ?")
-        .bind(total_count)
-        .bind(library_id)
-        .execute(&pool)
-        .await;
-
-    let _ = sqlx::query("UPDATE libraries SET asset_count = ? WHERE id = ?")
-        .bind(total_count)
-        .bind(library_id)
-        .execute(&db.master_pool)
-        .await;
-
-    // ── 5. Derive the folder tree, still under both locks ─────────────────
+    // ── 4. Derive the folder tree, still under the caller's locks ─────────
     // A failed pass is logged, not returned: the run's writes went through, so the caller still
     // emits `library:updated`, and the next pass derives the folders again.
-    if let Err(e) = crate::structure::rebuild(&pool, &root_path).await {
-        tracing::error!(target: "structure", "Structure pass failed for library {library_id}: {e}");
+    if let Err(e) = crate::structure::rebuild(pool, root_path).await {
+        tracing::error!(target: "structure", "Structure pass failed for library at {root_path:?}: {e}");
     }
-
-    tracing::info!(
-        "NAS-efficient indexing complete for library {}: {} total assets",
-        library_id,
-        total_count
-    );
     Ok(())
 }
 
 /// Deletes the rows of files the run didn't find, unless the run lost its lock (or can't read it
 /// now): another holder may be mid-change, so a file this run missed may only be moving.
-async fn prune_missing(pool: &sqlx::Pool<sqlx::Sqlite>, ids: &[String], lock: &IndexLock) {
-    if !lock.still_held() {
+async fn prune_missing(pool: &sqlx::Pool<sqlx::Sqlite>, ids: &[String], lock: Option<&IndexLock>) {
+    if lock.is_some_and(|lock| !lock.still_held()) {
         tracing::warn!(
             "This index run doesn't hold its index.lock, so it prunes none of {} missing files",
             ids.len()
@@ -611,8 +741,13 @@ async fn prune_missing(pool: &sqlx::Pool<sqlx::Sqlite>, ids: &[String], lock: &I
     }
 }
 
-/// Helper to execute a batch of assets inside a single database transaction
-async fn commit_asset_batch(pool: &sqlx::Pool<sqlx::Sqlite>, batch: &[PendingAsset]) -> Result<()> {
+/// Helper to execute a batch of assets inside a single database transaction, reporting the rows
+/// it inserts to `journal` inside it.
+async fn commit_asset_batch(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    batch: &[PendingAsset],
+    journal: Option<&dyn InsertJournal>,
+) -> Result<()> {
     let mut tx = pool.begin().await?;
 
     for item in batch {
@@ -678,6 +813,17 @@ async fn commit_asset_batch(pool: &sqlx::Pool<sqlx::Sqlite>, batch: &[PendingAss
             .bind(item.preview_status)
             .execute(&mut *tx)
             .await?;
+        }
+    }
+
+    if let Some(journal) = journal {
+        let inserted: Vec<(&str, &str)> = batch
+            .iter()
+            .filter(|item| !item.is_update)
+            .map(|item| (item.id.as_str(), item.file_path.as_str()))
+            .collect();
+        if !inserted.is_empty() {
+            journal.record(&mut tx, &inserted).await?;
         }
     }
 
@@ -1229,7 +1375,7 @@ mod tests {
     }
 
     async fn acquire(dir: &Path, env: &LockEnv) -> Option<IndexLock> {
-        IndexLock::try_acquire_with(dir, STALE_AFTER, env).await
+        IndexLock::try_acquire_with(&dir.join("index.lock"), STALE_AFTER, env).await
     }
 
     fn write_lock_file(dir: &Path, token: &str, mtime: SystemTime) {
@@ -1456,7 +1602,7 @@ mod tests {
         let lock = acquire(dir.path(), &t.env).await.unwrap();
         write_lock_file(dir.path(), "other-machine 7 7 theirs", t.now());
         held(&lock).beat(&t.env);
-        prune_missing(&lib.pool, &ids, &lock).await;
+        prune_missing(&lib.pool, &ids, Some(&lock)).await;
         assert_eq!(asset_count(&lib.pool).await, 1);
         drop(lock);
 
@@ -1465,7 +1611,7 @@ mod tests {
         std::fs::remove_file(dir.path().join("index.lock")).unwrap();
         let lock = acquire(dir.path(), &t.env).await.unwrap();
         write_lock_file(dir.path(), "other-machine 7 7 theirs", t.now());
-        prune_missing(&lib.pool, &ids, &lock).await;
+        prune_missing(&lib.pool, &ids, Some(&lock)).await;
         assert_eq!(asset_count(&lib.pool).await, 1);
         assert!(lock.is_lost());
         drop(lock);
@@ -1475,7 +1621,7 @@ mod tests {
         let lock = acquire(dir.path(), &t.env).await.unwrap();
         std::fs::remove_file(dir.path().join("index.lock")).unwrap();
         std::fs::create_dir(dir.path().join("index.lock")).unwrap();
-        prune_missing(&lib.pool, &ids, &lock).await;
+        prune_missing(&lib.pool, &ids, Some(&lock)).await;
         assert_eq!(asset_count(&lib.pool).await, 1);
         assert!(!lock.is_lost());
         drop(lock);
@@ -1483,7 +1629,7 @@ mod tests {
         // A held lock prunes.
         std::fs::remove_dir(dir.path().join("index.lock")).unwrap();
         let lock = acquire(dir.path(), &t.env).await.unwrap();
-        prune_missing(&lib.pool, &ids, &lock).await;
+        prune_missing(&lib.pool, &ids, Some(&lock)).await;
         assert_eq!(asset_count(&lib.pool).await, 0);
     }
 
@@ -1505,5 +1651,287 @@ mod tests {
             .unwrap();
         assert_eq!(here.len(), 32);
         assert_ne!(here, raw.trim());
+    }
+
+    // ── A scoped index, `Prune` and the locked variants ──────────────────
+
+    /// Seeds a 1-byte asset row at `path` with no file behind it, tagged "keep".
+    async fn seed_tagged(pool: &Pool<Sqlite>, path: &str) {
+        sqlx::query("INSERT OR IGNORE INTO tags (id, name) VALUES ('t1', 'keep')")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
+             VALUES (?, ?, 'x', 'fbx', 'model', 1, 0, 0)",
+        )
+        .bind(path)
+        .bind(path)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO asset_tags (asset_id, tag_id) VALUES (?, 't1')")
+            .bind(path)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn paths_of(pool: &Pool<Sqlite>, sql: &str) -> Vec<String> {
+        sqlx::query_scalar(sql).fetch_all(pool).await.unwrap()
+    }
+
+    /// `temp_library` on a pool that enforces foreign keys, so a pruned row takes its tags along.
+    async fn temp_library_enforcing() -> (tempfile::TempDir, Database, LibraryHandle) {
+        let (dir, _, mut lib) = temp_library().await;
+        lib.pool = crate::db::memory_library_pool_enforcing_foreign_keys().await;
+        let db = memory_database(vec![lib.clone()]).await;
+        (dir, db, lib)
+    }
+
+    #[tokio::test]
+    async fn a_run_over_a_pack_reads_only_rows_under_it_on_whole_components() {
+        let pool = memory_library_pool().await;
+        for path in [
+            "Pub/Pack",
+            "Pub/Pack/Rock.fbx",
+            "Pub/Pack/Sub/Tree.fbx",
+            "Pub/Package/Rock.fbx",
+            "Pub/Pack.fbx",
+            "Pub/Pack0/Rock.fbx",
+            "Pub/pack/Rock.fbx",
+            "Other/Rock.fbx",
+        ] {
+            seed_tagged(&pool, path).await;
+        }
+        let root = Path::new("/lib");
+        let read = |paths: &'static [&'static str]| {
+            let pool = pool.clone();
+            async move {
+                let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+                let mut rows: Vec<String> = rows_in_scope(&pool, root, &paths)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.1)
+                    .collect();
+                rows.sort();
+                rows
+            }
+        };
+
+        assert_eq!(
+            read(&["/lib/Pub/Pack"]).await,
+            ["Pub/Pack", "Pub/Pack/Rock.fbx", "Pub/Pack/Sub/Tree.fbx"]
+        );
+        assert_eq!(
+            read(&["/lib/Pub/Pack/", "/lib/Other"]).await,
+            [
+                "Other/Rock.fbx",
+                "Pub/Pack",
+                "Pub/Pack/Rock.fbx",
+                "Pub/Pack/Sub/Tree.fbx"
+            ]
+        );
+        assert_eq!(read(&["/lib"]).await.len(), 8, "the root covers every row");
+        assert_eq!(read(&["/lib/Pub/Pack", "/lib/"]).await.len(), 8);
+        assert!(read(&["/elsewhere/Pub/Pack"]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_run_over_a_pack_prunes_only_the_pack() {
+        let (dir, db, lib) = temp_library_enforcing().await;
+        std::fs::create_dir_all(dir.path().join("Pub/Pack")).unwrap();
+        std::fs::write(dir.path().join("Pub/Pack/Rock.txt"), "rock").unwrap();
+        for path in [
+            "Pub/Pack/Gone.fbx",
+            "Pub/Package/Rock.fbx",
+            "Other/Tree.fbx",
+        ] {
+            seed_tagged(&lib.pool, path).await;
+        }
+
+        let pack = dir.path().join("Pub/Pack").to_string_lossy().to_string();
+        index_paths(&db, &lib.id, &[pack]).await.unwrap();
+
+        assert_eq!(
+            paths_of(&lib.pool, "SELECT file_path FROM assets ORDER BY file_path").await,
+            [
+                "Other/Tree.fbx",
+                "Pub/Pack/Rock.txt",
+                "Pub/Package/Rock.fbx"
+            ]
+        );
+        assert_eq!(
+            paths_of(
+                &lib.pool,
+                "SELECT asset_id FROM asset_tags ORDER BY asset_id"
+            )
+            .await,
+            ["Other/Tree.fbx", "Pub/Package/Rock.fbx"],
+            "the rows outside the pack keep their tags"
+        );
+
+        // A run over the library root covers every row, as it always has.
+        reindex(&db, &lib).await;
+        assert_eq!(
+            paths_of(&lib.pool, "SELECT file_path FROM assets").await,
+            ["Pub/Pack/Rock.txt"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lock_free_core_indexes_a_pool_no_database_holds() {
+        let dir = tempfile::Builder::new()
+            .prefix("opendam-lib-")
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join("kits/rocks")).unwrap();
+        std::fs::write(dir.path().join("kits/rocks/rock.glb"), "glTF").unwrap();
+        let pool = memory_library_pool().await;
+
+        let root = dir.path().to_string_lossy().to_string();
+        index_pool(&pool, dir.path(), &[root], Prune::Now, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::structure::tests::derived_rows(&pool).await,
+            crate::structure::tests::fresh_pass(&["kits/rocks/rock.glb"]).await,
+            "the run indexed the file and ended with the structure pass"
+        );
+    }
+
+    /// Writes each reported row to `journal`, through the inserting transaction, or fails.
+    struct TestJournal {
+        fail: bool,
+    }
+
+    impl InsertJournal for TestJournal {
+        fn record<'a>(
+            &'a self,
+            tx: &'a mut SqliteConnection,
+            inserted: &'a [(&'a str, &'a str)],
+        ) -> BoxFuture<'a, sqlx::Result<()>> {
+            Box::pin(async move {
+                if self.fail {
+                    return Err(sqlx::Error::Protocol("journal failed".into()));
+                }
+                for (id, path) in inserted {
+                    sqlx::query("INSERT INTO journal (asset_id, file_path) VALUES (?, ?)")
+                        .bind(id)
+                        .bind(path)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deferred_run_prunes_nothing_and_journals_each_insert_in_its_transaction() {
+        let (dir, db, lib) = temp_library().await;
+        sqlx::query("CREATE TABLE journal (asset_id TEXT, file_path TEXT)")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join("Pub/Pack")).unwrap();
+        std::fs::write(dir.path().join("Pub/Pack/Kept.txt"), "kept").unwrap();
+        reindex(&db, &lib).await;
+        let folders = crate::structure::tests::derived_rows(&lib.pool)
+            .await
+            .folders;
+        seed_tagged(&lib.pool, "Pub/Pack/Previous.fbx").await;
+        std::fs::write(dir.path().join("Pub/Pack/Kept.txt"), "kept, changed").unwrap();
+        std::fs::write(dir.path().join("Pub/Pack/New.txt"), "new").unwrap();
+        std::fs::write(dir.path().join("Pub/Pack/Newer.txt"), "newer").unwrap();
+        let pack = [dir.path().join("Pub/Pack").to_string_lossy().to_string()];
+        let lock = db.index_lock(&lib.id);
+        let index_guard = lock.lock().await;
+        let advisory = IndexLock::try_acquire(dir.path()).await.unwrap();
+
+        let failing = TestJournal { fail: true };
+        let failed = index_paths_locked(
+            &db,
+            &lib.id,
+            &pack,
+            Prune::Defer(&failing),
+            &index_guard,
+            &advisory,
+        )
+        .await;
+        assert!(failed.is_err());
+        assert_eq!(
+            paths_of(&lib.pool, "SELECT file_path FROM assets ORDER BY file_path").await,
+            ["Pub/Pack/Kept.txt", "Pub/Pack/Previous.fbx"],
+            "a failed journal rolls back the inserts it was told of"
+        );
+
+        let journal = TestJournal { fail: false };
+        index_paths_locked(
+            &db,
+            &lib.id,
+            &pack,
+            Prune::Defer(&journal),
+            &index_guard,
+            &advisory,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            paths_of(&lib.pool, "SELECT file_path FROM assets ORDER BY file_path").await,
+            [
+                "Pub/Pack/Kept.txt",
+                "Pub/Pack/New.txt",
+                "Pub/Pack/Newer.txt",
+                "Pub/Pack/Previous.fbx"
+            ],
+            "the row of a file no longer on disk stays"
+        );
+        assert_eq!(
+            paths_of(
+                &lib.pool,
+                "SELECT j.file_path FROM journal j JOIN assets a ON a.id = j.asset_id
+                 AND a.file_path = j.file_path ORDER BY j.file_path"
+            )
+            .await,
+            ["Pub/Pack/New.txt", "Pub/Pack/Newer.txt"],
+            "only inserted rows are journaled, an updated one is not"
+        );
+        assert_eq!(
+            crate::structure::tests::derived_rows(&lib.pool)
+                .await
+                .folders,
+            folders,
+            "no structure pass ran: the pack still counts one item"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_locked_index_and_structure_pass_never_lock_again() {
+        let (dir, db, lib) = temp_library().await;
+        std::fs::create_dir_all(dir.path().join("kits/rocks")).unwrap();
+        std::fs::write(dir.path().join("kits/rocks/rock.glb"), "glTF").unwrap();
+        let root = [dir.path().to_string_lossy().to_string()];
+        let lock = db.index_lock(&lib.id);
+        let index_guard = lock.lock().await;
+        let advisory = IndexLock::try_acquire(dir.path()).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            index_paths_locked(&db, &lib.id, &root, Prune::Now, &index_guard, &advisory)
+                .await
+                .unwrap();
+            crate::structure::rebuild_library_locked(&db, &lib, &index_guard, &advisory).await;
+        })
+        .await
+        .expect("a locked variant waited for a lock its caller holds");
+
+        // It indexed rather than yielding to its own caller's advisory lock.
+        assert_eq!(
+            crate::structure::tests::derived_rows(&lib.pool).await,
+            crate::structure::tests::fresh_pass(&["kits/rocks/rock.glb"]).await
+        );
     }
 }

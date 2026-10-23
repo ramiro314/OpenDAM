@@ -137,6 +137,28 @@ docs/plans                    Plans for this fork
   `db::upsert_collection`), never `REPLACE`, which cascade-deletes memberships and child
   collections.
 
+- **An index reads and prunes only what it walks.** Every index run (`watcher::index_pool`) loads,
+  and may delete, only the asset rows at or under the paths it walks, compared on whole path
+  components (`Pub/Pack` holds `Pub/Pack/Rock.fbx` but not `Pub/Package/Rock.fbx`). A run over
+  the library root covers every row, as it always has.
+- **Locked variants.** `watcher::index_paths_locked` and `structure::rebuild_library_locked` take
+  the held `index_lock` guard and the held advisory `watcher::IndexLock` guard as proof and never
+  lock again. Code that holds the locks calls these, never `index_paths` or `rebuild_library`
+  (`index_lock` isn't re-entrant). `index_paths` takes both locks and calls `index_paths_locked`
+  with `Prune::Now`. `rebuild_library` takes only `index_lock`: another machine's index run that
+  finds the advisory lock held skips its run instead of waiting, so a command must not hold it. Under both sit lock-free cores,
+  `watcher::index_pool` and `structure::rebuild`, for a pool that isn't registered yet. An index
+  run takes a `watcher::Prune`: `Now` deletes the rows of files it didn't find and ends with the
+  structure pass, and `Defer` deletes no row, runs no pass, and reports each row it inserts to an
+  `InsertJournal` inside the inserting transaction. Every run but a pack import build's is `Now`.
+- **The advisory lock keeps itself fresh.** `watcher::IndexLock` writes a token naming its holder
+  (a keyed hash of the machine id, boot id and pid namespace, then pid, process start time and a
+  nonce), re-reads it after 100 ms, and rewrites its timestamp every 30 s while held. A lock is
+  stale once its mtime is 120 s old, or at once when its token names a gone process in this
+  machine, boot and pid namespace. A guard deletes the file on drop only while the file holds its
+  token. `index_pool` re-reads the token (its `advisory` argument) right before it prunes, and
+  prunes nothing once the lock is lost.
+
 - **Structure is derived.** `folders` (each folder's path, parent, name, `is_pack`, and its
   recursive `item_count`, `hidden_count` and `split_groups`, the root being `path = ''`, and a
   pack's name, cover, gallery, license, `datapackage.json` and files by kind in `pack_json`) and
