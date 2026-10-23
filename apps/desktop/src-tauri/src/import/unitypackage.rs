@@ -73,7 +73,8 @@ pub struct Extraction {
 
 /// Extracts `package` into `target`, which must be empty or missing. With a `subpath` (a folder
 /// of the extracted layout, such as a render pipeline's), only the files below it are written,
-/// relative to it. A clash, a file that would land on another, fails the extraction.
+/// relative to it. A clash, a file that would land on another, fails the extraction. A failed
+/// extraction leaves the target as it found it: empty, or missing.
 pub fn extract_unitypackage(
     package: &Path,
     target: &Path,
@@ -86,10 +87,25 @@ pub fn extract_unitypackage(
         },
         None => None,
     };
+    let missing = !target.exists();
     fs::create_dir_all(target).with_context(|| format!("creating {}", target.display()))?;
     if fs::read_dir(target)?.next().is_some() {
         bail!("{} is not empty", target.display());
     }
+    let result = extract_into(package, target, subpath.as_deref());
+    if result.is_err() {
+        // The target held nothing before, so everything in it is this call's.
+        if let Err(err) = clear(target, missing) {
+            tracing::warn!(
+                "clearing {} after a failed extraction: {err}",
+                target.display()
+            );
+        }
+    }
+    result
+}
+
+fn extract_into(package: &Path, target: &Path, subpath: Option<&str>) -> Result<Extraction> {
     // Entries are staged here, by number, until the pathnames are known, then renamed into place.
     let scratch = tempfile::Builder::new()
         .prefix(".extract-")
@@ -107,14 +123,30 @@ pub fn extract_unitypackage(
         out: Extraction::default(),
     };
     let original = File::open(package).with_context(|| format!("opening {}", package.display()))?;
-    unpack(&mut job, original, &[], subpath.as_deref(), "")?;
+    unpack(&mut job, original, &[], subpath, "")?;
     let mut out = job.out;
     scratch.close()?;
-    if let (Some(subpath), true) = (&subpath, out.files.is_empty()) {
+    if let (Some(subpath), true) = (subpath, out.files.is_empty()) {
         bail!("the package holds no file under {subpath}");
     }
     out.files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// Empties `target`, or removes it when `remove` is set.
+fn clear(target: &Path, remove: bool) -> io::Result<()> {
+    if remove {
+        return fs::remove_dir_all(target);
+    }
+    for entry in fs::read_dir(target)? {
+        let path = entry?.path();
+        if path.symlink_metadata()?.is_dir() {
+            fs::remove_dir_all(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
 }
 
 struct Job<'a> {
@@ -197,7 +229,8 @@ fn unpack(
         if !matches!(part, "pathname" | "asset" | "asset.meta") {
             continue; // `preview.png` and the like
         }
-        if !members.insert(name.clone()) {
+        // Keyed by GUID and part, so `./g/asset` repeats `g/asset`.
+        if !members.insert((guid.to_string(), part.to_string())) {
             odd.push((name, SkipReason::Duplicate));
             continue;
         }
@@ -642,7 +675,10 @@ mod tests {
             header.set_entry_type(*kind);
             header.set_size(data.len() as u64);
             header.set_mode(0o644);
-            tar.append_data(&mut header, name, *data).unwrap();
+            // The raw name, which `append_data` would normalize.
+            header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+            header.set_cksum();
+            tar.append(&header, *data).unwrap();
         }
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         io::Write::write_all(&mut gz, &tar.into_inner().unwrap()).unwrap();
@@ -681,8 +717,48 @@ mod tests {
             ]),
         )
         .unwrap();
-        let err = extract_unitypackage(&original, &tmp.path().join("u"), None).unwrap_err();
+        let missing = tmp.path().join("u");
+        let err = extract_unitypackage(&original, &missing, None).unwrap_err();
         assert!(err.to_string().contains("x.txt would overwrite"), "{err}");
+
+        // A failed extraction leaves the target as it found it, so it can be retried.
+        assert!(!missing.exists());
+        let empty = tmp.path().join("v");
+        fs::create_dir(&empty).unwrap();
+        extract_unitypackage(&original, &empty, None).unwrap_err();
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_repeated_member_is_skipped_however_it_is_spelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("repeat.unitypackage");
+        fs::write(
+            &original,
+            package(&[
+                ("g1/asset", EntryType::Regular, b"first"),
+                ("g1/pathname", EntryType::Regular, b"Assets/P/x.txt"),
+                ("./g1/asset", EntryType::Regular, b"second"),
+                ("g1//pathname", EntryType::Regular, b"Assets/P/moved.txt"),
+            ]),
+        )
+        .unwrap();
+        let target = tmp.path().join("t");
+        let extraction = extract_unitypackage(&original, &target, None).unwrap();
+        assert_eq!(paths(&extraction), ["x.txt"]);
+        assert_eq!(fs::read(target.join("x.txt")).unwrap(), b"first");
+        let skipped: Vec<_> = extraction
+            .skipped
+            .iter()
+            .map(|s| (s.source_path.clone(), s.reason))
+            .collect();
+        assert_eq!(
+            skipped,
+            [
+                (vec!["Assets/P/x.txt".to_string()], SkipReason::Duplicate),
+                (vec!["g1//pathname".to_string()], SkipReason::Duplicate),
+            ]
+        );
     }
 
     #[test]
