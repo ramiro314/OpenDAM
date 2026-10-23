@@ -180,11 +180,12 @@ docs/plans                    Plans for this fork
 - **A command's structure pass can be late, never lost.** `delete_asset`, `delete_assets`,
   `rename_asset` and `set_pack_override` call `rebuild_library` before they return. When another
   holder keeps the advisory lock past its 5 s wait, it sets `structure_pending` in
-  `library_meta`, returns, and leaves a follow-up task that runs the pass once both locks free
-  and announces it on `Database::late_passes`, which the app turns into `library:updated`. A
-  library open that finds the lock held sets the flag too. The holder's release, the follow-up
-  task, or the next open or index run, whichever comes first, runs it. Each pass clears the flag
-  as it starts, so a flag set during a pass is caught at the release. Known gap: until then
+  `library_meta`, returns, and leaves the library's one follow-up task (`Database::follow_ups`),
+  which runs the pass once both locks free if it is still pending and announces it on
+  `Database::late_passes`, which the app turns into `library:updated`. A library open that finds
+  the lock held sets the flag too. The holder's release, the follow-up task, or the next open or
+  index run, whichever comes first, runs it. Each pass clears the flag as it starts, so a flag set
+  during a pass is caught at the release, and sets it again when it fails. Known gap: until then
   `group_id`, `folders` and support roles lag the indexed paths, a few seconds behind another
   machine's refresh and as long as a build's swap behind a build, and a machine running an older
   OpenDAM never runs a pending pass.

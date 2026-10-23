@@ -28,6 +28,9 @@ pub struct Database {
     /// Names each library whose late structure pass a command's follow-up task ran
     /// (`structure::rebuild_library`), so the app can emit `library:updated`.
     pub late_passes: tokio::sync::broadcast::Sender<String>,
+    /// The libraries with a follow-up task waiting to run their late structure pass, at most one
+    /// each (`structure::rebuild_library`).
+    pub follow_ups: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// A collection definition as stored: id, name, description, parent_id, is_smart, filter_spec,
@@ -510,6 +513,7 @@ impl Database {
             index_locks: Default::default(),
             catalog_lock: Default::default(),
             late_passes: tokio::sync::broadcast::channel(16).0,
+            follow_ups: Default::default(),
         };
 
         // Load all registered libraries and open their per-library SQLite pools
@@ -877,6 +881,7 @@ pub(crate) async fn memory_database(libraries: Vec<LibraryHandle>) -> Database {
         index_locks: Default::default(),
         catalog_lock: Default::default(),
         late_passes: tokio::sync::broadcast::channel(16).0,
+        follow_ups: Default::default(),
     }
 }
 
