@@ -1873,7 +1873,8 @@ struct Metadata {
 
 /// Unions the metadata of every group that forms or grows (plan C14), or of every group once per
 /// library (`GROUP_UNION_KEY`), in transactions of `BATCH` groups. Each member gets every tag and
-/// collection a member has, and the main item's rating, color label, favorite and description.
+/// collection a member has, and the main item's rating, color label, favorite, description and
+/// game export edits (`export_edits`, plan game-export A7).
 /// A field the main item leaves unset takes the first member's that is set, by path, so a GLB
 /// that joins a rated FBX doesn't drop its rating. It runs before `apply_groups` and reads the
 /// groups from `groups`, so a pass interrupted between the two unions again. A dissolved group's
@@ -1951,6 +1952,32 @@ async fn apply_unions(
             .bind(&ids)
             .execute(&mut *tx)
             .await?;
+
+            // Your game export edits (plan game-export A7): the main item's win, and each one it
+            // leaves unset takes the first member's that has it, by path, as the fields above do
+            let texts: Vec<String> = sqlx::query_scalar(
+                "SELECT e.edits FROM json_each(?) m JOIN export_edits e ON e.asset_id = m.value
+                 ORDER BY m.key",
+            )
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            let mut edits = crate::export::edits::Edits::new();
+            for text in &texts {
+                for (key, value) in crate::export::edits::parse(text) {
+                    edits.entry(key).or_insert(value);
+                }
+            }
+            if !edits.is_empty() {
+                sqlx::query(
+                    "INSERT INTO export_edits (asset_id, edits) SELECT value, ?2 FROM json_each(?1)
+                     WHERE true ON CONFLICT(asset_id) DO UPDATE SET edits = excluded.edits",
+                )
+                .bind(&ids)
+                .bind(serde_json::Value::Object(edits).to_string())
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         tx.commit().await?;
     }
@@ -6167,6 +6194,33 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_group_that_forms_gives_every_member_its_main_items_export_edits() {
+        let pool = memory_library_pool().await;
+        for path in SEDAN {
+            insert_path(&pool, path).await;
+        }
+        // Edited while each was on its own, as the group's folders were named otherwise
+        run(
+            &pool,
+            r#"INSERT INTO export_edits (asset_id, edits) VALUES
+                 ('3D assets/Car Kit/Models/FBX format/sedan.fbx', '{"assetName":"Old","rig":"generic"}'),
+                 ('3D assets/Car Kit/Models/GLB format/sedan.glb', '{"assetName":"Sedan"}'),
+                 ('3D assets/Car Kit/Models/OBJ format/sedan.obj', '{"rig":"none","facingQuarterTurns":1}')"#,
+        )
+        .await;
+
+        rebuild(&pool, unmounted()).await.unwrap();
+
+        // The GLB is the main item: its name wins, and the FBX, first by path, fills the rest
+        let edits = r#"{"assetName":"Sedan","facingQuarterTurns":1,"rig":"generic"}"#;
+        assert_eq!(
+            rows(&pool, "SELECT asset_id, edits FROM export_edits").await,
+            each(&SEDAN, edits)
+        );
+        assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn a_dissolved_groups_files_keep_what_they_have() {
         let pool = car_kit().await;
         run(
@@ -6225,7 +6279,7 @@ pub(crate) mod tests {
     }
 
     /// Statements that write one asset's metadata.
-    const METADATA_WRITES: [&str; 8] = [
+    const METADATA_WRITES: [&str; 10] = [
         "UPDATE assets SET rating",
         "UPDATE assets SET color_label",
         "UPDATE assets SET is_favorite",
@@ -6234,6 +6288,8 @@ pub(crate) mod tests {
         "INTO collection_assets",
         "DELETE FROM asset_tags WHERE asset_id = ? AND",
         "DELETE FROM collection_assets WHERE collection_id = ? AND asset_id",
+        "INTO export_edits",
+        "DELETE FROM export_edits",
     ];
 
     /// Every function outside tests that holds one of `METADATA_WRITES`, by file, and whether it
@@ -6304,6 +6360,7 @@ pub(crate) mod tests {
                 ),
                 ("commands/folder.rs", "tag_folder_in", true),
                 ("commands/folder.rs", "collect_folder_in", true),
+                ("export/edits.rs", "write", true),
                 // The union itself, which writes to a group's members by their ids.
                 ("structure.rs", "apply_unions", false),
             ],

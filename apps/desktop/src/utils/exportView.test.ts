@@ -1,6 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import type { ExportCheck, ExportCheckAsset, ExportDiff } from '../types';
-import { checkSummary, diffLabel, diffSummary, exportMenuReason, staleMessage } from './exportView';
+import {
+  checkSummary,
+  diffLabel,
+  diffSummary,
+  editedAsset,
+  editedMessage,
+  exportMenuReason,
+  staleMessage,
+} from './exportView';
 
 const settings = { rootCollection: 'dg' };
 const collections = [{ id: 'dg', name: 'DungeonGame' }];
@@ -116,5 +124,25 @@ describe('staleMessage', () => {
     expect(staleMessage(['a', 'b', 'c', 'd', 'e'])).toBe(
       'Nothing was exported: since the Check, this changed: a; b; c and 2 more. Check again'
     );
+  });
+});
+
+describe('editedAsset', () => {
+  const listed = [
+    { ...asset('ready'), assetId: 'crate', filePath: 'Kit/crate.png' },
+    { ...asset('problem'), assetId: 'rock', filePath: 'Kit/T_Rock_D.png' },
+  ];
+
+  test('finds the checked asset an edit wrote, which makes the Check stale', () => {
+    // An image's name reaches its texture set, so the ids hold sources the Check doesn't list
+    const found = editedAsset({ assets: listed }, ['rock-normal', 'rock']);
+    expect(found?.assetId).toBe('rock');
+    expect(editedMessage(found!)).toBe(
+      'You edited Kit/T_Rock_D.png since the Check. Check again to export it'
+    );
+  });
+
+  test('an edit to an asset the Check doesn’t hold leaves it as it is', () => {
+    expect(editedAsset({ assets: listed }, ['elsewhere'])).toBeNull();
   });
 });

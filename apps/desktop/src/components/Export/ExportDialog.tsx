@@ -1,8 +1,16 @@
 import { useEffect, useState } from 'react';
 import clsx from 'clsx';
 import { api } from '../../api';
-import type { Collection, ExportCheck, ExportDiffEntry } from '../../types';
-import { checkSummary, diffLabel, diffSummary, staleMessage } from '../../utils/exportView';
+import { openGameTab, useExportEditStore } from '../../store';
+import type { Collection, ExportAssetRef, ExportCheck, ExportDiffEntry } from '../../types';
+import {
+  checkSummary,
+  diffLabel,
+  diffSummary,
+  editedAsset,
+  editedMessage,
+  staleMessage,
+} from '../../utils/exportView';
 import { IconExternal, IconX } from '../Icons';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './ExportDialog.module.css';
@@ -25,6 +33,9 @@ const statusClass = {
  * then lists every asset with its kind, default name, pack and status, every problem that would
  * refuse the export, and the diff against the previous bundle. "Export" swaps the staged bundle
  * in, unless anything the Check read has changed since. Closing the view discards it.
+ *
+ * Each problem links to its assets' Game tab: the view shrinks to a bar while you edit there,
+ * keeping its Check, and an edit to an asset the Check holds makes it ask to "Check again".
  */
 export function ExportDialog({ domain, onClose }: ExportDialogProps) {
   const [check, setCheck] = useState<ExportCheck | null>(null);
@@ -32,6 +43,19 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
   const [exporting, setExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  /** Shrunk to a bar while you edit an asset in the detail panel */
+  const [minimized, setMinimized] = useState(false);
+  /** An edit since the Check changed an asset it holds */
+  const [edited, setEdited] = useState(false);
+
+  const lastEdit = useExportEditStore((s) => s.last);
+  useEffect(() => {
+    const asset = lastEdit && check ? editedAsset(check, lastEdit.ids) : null;
+    if (!asset) return;
+    setEdited(true);
+    setNotice(editedMessage(asset));
+    // Only a new edit counts: a Check run after it already holds it
+  }, [lastEdit]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const id = domain.id;
@@ -41,17 +65,19 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
   }, [domain.id]);
 
   useEffect(() => {
+    if (minimized) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onClose]);
+  }, [onClose, minimized]);
 
   const runCheck = async () => {
     setChecking(true);
     setError(null);
     setNotice(null);
+    setEdited(false);
     try {
       setCheck(await api.checkExport(domain.id));
     } catch (e) {
@@ -84,7 +110,38 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
     }
   };
 
-  const canExport = !!check?.staged && check.problems.length === 0 && !checking && !exporting;
+  const canExport =
+    !!check?.staged && check.problems.length === 0 && !edited && !checking && !exporting;
+
+  const showInGameTab = (asset: ExportAssetRef) => {
+    setMinimized(true);
+    openGameTab(asset.assetId).catch((e) => {
+      setMinimized(false);
+      setError(`Could not show ${asset.filePath}: ${String(e)}`);
+    });
+  };
+
+  if (minimized) {
+    return (
+      <div id="export-minimized" className={styles.minimized} role="status">
+        <IconExternal size={14} />
+        <span className={styles.minimizedText}>
+          Export {domain.name}:{' '}
+          {edited ? 'edited since the Check' : check ? checkSummary(check) : 'not checked'}
+        </span>
+        <button
+          id="export-restore"
+          className={clsx(dialog.btn, dialog.primaryBtn)}
+          onClick={() => setMinimized(false)}
+        >
+          {edited ? 'Back to Check again' : 'Back to Export'}
+        </button>
+        <button className={dialog.closeBtn} onClick={onClose} title="Close">
+          <IconX size={14} />
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className={dialog.overlay} onClick={onClose}>
@@ -139,6 +196,16 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
                     {check.problems.map((p, i) => (
                       <li key={i} className={styles.problem}>
                         {p.message}
+                        {p.assets.map((a) => (
+                          <button
+                            key={`${a.libraryId}/${a.assetId}`}
+                            className={styles.gameLink}
+                            onClick={() => showInGameTab(a)}
+                            title={`Show ${a.filePath} in the detail panel's Game tab`}
+                          >
+                            Game tab: {a.filePath.split('/').pop()}
+                          </button>
+                        ))}
                       </li>
                     ))}
                   </ul>
@@ -214,7 +281,10 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
           </button>
           <button
             id="export-check"
-            className={clsx(dialog.btn, check?.staged ? dialog.secondaryBtn : dialog.primaryBtn)}
+            className={clsx(
+              dialog.btn,
+              check?.staged && !edited ? dialog.secondaryBtn : dialog.primaryBtn
+            )}
             onClick={runCheck}
             disabled={checking}
           >

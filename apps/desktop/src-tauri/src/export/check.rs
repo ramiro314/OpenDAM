@@ -24,7 +24,7 @@ use crate::export::fingerprint::{Fingerprint, Probes, Stamp};
 use crate::export::names::{is_pascal, pascal};
 use crate::export::packs::{self, PackSource};
 use crate::export::textures::{self, Convention, Layout, Refusal, Role};
-use crate::export::{contract, hashes, settings};
+use crate::export::{contract, edits, hashes, settings};
 use crate::models::AssetKind;
 use crate::structure::{self, PackOverride};
 
@@ -73,7 +73,7 @@ pub struct CheckedAsset {
     #[serde(flatten)]
     pub asset: AssetRef,
     pub kind: Kind,
-    /// Its default name (C5), `None` when it has none
+    /// Its name: yours (C4), else its default (C5), `None` when it has none
     pub asset_name: Option<String>,
     pub role: Option<Role>,
     /// Its pack's id, `None` for an asset in no pack
@@ -176,6 +176,8 @@ struct LibraryInput {
     pack_files: HashMap<usize, Vec<String>>,
     /// The same files with their indexed sizes and mtimes, as the fingerprint holds them
     pack_listings: HashMap<usize, String>,
+    /// Your edits (C4) to the items and to the other sources of their texture sets
+    edits: Vec<edits::Row>,
     memo: hashes::Memo,
 }
 
@@ -413,6 +415,16 @@ fn input_fingerprint(input: &LibraryInput, fingerprint: &mut Fingerprint) {
         );
         fingerprint.put(scope, label("the indexed files of the pack"), listing);
     }
+    let edits: Vec<_> = input
+        .edits
+        .iter()
+        .map(|e| (&e.file_path, &e.edits))
+        .collect();
+    fingerprint.put(
+        scope,
+        format!("your export edits in {}", library.name),
+        format!("{edits:?}"),
+    );
 }
 
 /// The pack at or above `dir` among `packs`, the innermost first.
@@ -499,7 +511,7 @@ fn in_unity_fbx_folder(path: &str) -> bool {
 
 /// The FBX a group exports from (A5): its first FBX member in a Unity FBX format folder, else
 /// its first, by path ignoring case.
-fn exported_fbx<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+pub(crate) fn exported_fbx<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     paths
         .into_iter()
         .min_by_key(|p| (!in_unity_fbx_folder(p), p.to_lowercase(), *p))
@@ -602,9 +614,23 @@ async fn read_library(
         pack_files.insert(*pack, own.into_iter().map(|(f, _, _)| f).collect());
     }
 
+    // An item's own edits, and for an image, those of its texture set's sources too
+    let edits = edits::read_all(pool)
+        .await?
+        .into_iter()
+        .filter(|row| {
+            items.iter().any(|item| {
+                row.asset_id == item.id
+                    || (edits::is_image(&item.kind)
+                        && edits::in_set_of(row, &item.file_path, &item.file_name))
+            })
+        })
+        .collect();
+
     let paths: Vec<String> = items.iter().map(|i| i.file_path.clone()).collect();
     let memo = hashes::load(pool, &paths).await?;
     Ok(LibraryInput {
+        edits,
         fbx,
         probes,
         library,
@@ -743,7 +769,12 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
             match AssetKind::from_str(&item.kind) {
                 AssetKind::Model3d => {
                     row.kind = Kind::Model;
-                    row.asset_name = Some(pascal(stem));
+                    let yours = input
+                        .edits
+                        .iter()
+                        .find(|e| e.asset_id == item.id)
+                        .and_then(|e| edits::asset_name(&e.parsed()));
+                    row.asset_name = Some(yours.unwrap_or_else(|| pascal(stem)));
                     match input.fbx.get(&item.id) {
                         None => {
                             issue("it has no FBX file: a model exports from its group's FBX".into())
@@ -760,7 +791,8 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                     let convention = stem_info.convention.unwrap_or_else(|| {
                         pack.map_or(Convention::OpenGl, |p| sources[p].normal_convention())
                     });
-                    let name = pascal(&stem_info.base);
+                    let name = edits::set_name(&input.edits, &item.file_path, &item.file_name)
+                        .unwrap_or_else(|| pascal(&stem_info.base));
                     row.asset_name = Some(name.clone());
                     if let Layout::Role(role) = layout {
                         row.role = Some(role);
@@ -953,7 +985,7 @@ fn names(reads: &[Read], problems: &mut Vec<Problem>) {
         let paths: Vec<&str> = rows.iter().map(|r| r.asset.file_path.as_str()).collect();
         problems.push(Problem {
             message: format!(
-                "{} {what}: {}. Rename one so each name is unique",
+                "{} {what}: {}. Give one another name in its Game tab",
                 rows.len(),
                 paths.join(" and ")
             ),
@@ -1722,7 +1754,7 @@ mod tests {
 
         assert_eq!(
             messages(&report),
-            ["2 textures are named Banner with the role BaseColor: Dungeon Props/Textures/T_Banner_BaseColor.png and Kenney Crates/banner.png. Rename one so each name is unique"]
+            ["2 textures are named Banner with the role BaseColor: Dungeon Props/Textures/T_Banner_BaseColor.png and Kenney Crates/banner.png. Give one another name in its Game tab"]
         );
         let named: Vec<&str> = report.problems[0]
             .assets
@@ -1745,6 +1777,102 @@ mod tests {
             )]
         );
         assert_valid(&report);
+    }
+
+    fn name_edit(name: &str) -> edits::Edits {
+        json!({ "assetName": name }).as_object().unwrap().clone()
+    }
+
+    /// AC3: an edit fixes a name collision, and keeps fixing it once the file is reindexed.
+    #[tokio::test]
+    async fn an_edit_fixes_a_name_collision_and_survives_a_reindex() {
+        let f = fixture().await;
+        let banner = "Kenney Crates/banner.png";
+        let report = check_domain(
+            &f,
+            &["Dungeon Props/Textures/T_Banner_BaseColor.png", banner],
+        )
+        .await;
+        assert_eq!(report.problems.len(), 1);
+        assert_eq!(report.problems[0].assets.len(), 2);
+
+        let id = id_of(&f.library.pool, banner).await;
+        edits::write(&f.library.pool, &id, &name_edit("KenneyBanner"))
+            .await
+            .unwrap();
+        // The file changes and is indexed again, keeping its id and so its edit
+        std::fs::write(f.library.root_path.join(banner), fixture_bytes(banner)).unwrap();
+        let root = f.library.root_path.display().to_string();
+        crate::watcher::index_paths(&f.db, "fixture", &[root])
+            .await
+            .unwrap();
+        assert_eq!(id_of(&f.library.pool, banner).await, id);
+
+        let report = check(&f.db, "domain", &Facts::fixture()).await.unwrap();
+        assert_eq!(messages(&report), Vec::<&str>::new());
+        assert_valid(&report);
+        let names: Vec<(String, String)> = texture_entries(&report)
+            .into_iter()
+            .map(|(name, _, file)| (name, file))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Banner", "Textures/Banner_BaseColor.png"),
+                ("KenneyBanner", "Textures/KenneyBanner_BaseColor.png"),
+            ]
+            .map(|(n, p)| (n.to_string(), p.to_string()))
+        );
+
+        // A reset gives the collision back
+        edits::write(
+            &f.library.pool,
+            &id,
+            json!({ "assetName": null }).as_object().unwrap(),
+        )
+        .await
+        .unwrap();
+        let report = check(&f.db, "domain", &Facts::fixture()).await.unwrap();
+        assert_eq!(report.problems.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_name_written_to_any_member_names_the_group_and_its_texture_set() {
+        let f = fixture().await;
+        let pool = &f.library.pool;
+        let obj = id_of(pool, "Dungeon Props/Models/SM_Chest.obj").await;
+        edits::write(pool, &obj, &name_edit("TreasureChest"))
+            .await
+            .unwrap();
+        // The set's Normal is no member, but its name is the set's
+        let normal = id_of(pool, "Dungeon Props/Textures/T_StoneFloor_N.png").await;
+        edits::write(pool, &normal, &name_edit("Flagstones"))
+            .await
+            .unwrap();
+
+        let report = check_domain(
+            &f,
+            &[
+                "Dungeon Props/Models/SM_Chest.fbx",
+                "Dungeon Props/Textures/T_StoneFloor_D.png",
+            ],
+        )
+        .await;
+        let names: Vec<(&str, Option<&str>)> = report
+            .assets
+            .iter()
+            .map(|a| (a.asset.file_path.as_str(), a.asset_name.as_deref()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Dungeon Props/Models/SM_Chest.fbx", Some("TreasureChest")),
+                (
+                    "Dungeon Props/Textures/T_StoneFloor_D.png",
+                    Some("Flagstones")
+                ),
+            ]
+        );
     }
 
     #[tokio::test]

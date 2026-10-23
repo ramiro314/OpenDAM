@@ -28,9 +28,11 @@ import type {
   AiSettingsPatch,
   BlenderStatus,
   ExportCheck,
+  ExportEditPatch,
   ExportOutcome,
   ExportSettings,
   ExportSettingsPatch,
+  GameDetail,
   ProviderStatus,
   AutotagMode,
   ConnectionTest,
@@ -173,6 +175,14 @@ export const api = {
   exportBundle: (domainId: string) => invoke<ExportOutcome>('export_bundle', { domainId }),
   /** Deletes the bundle the domain's last Check staged */
   discardExport: (domainId: string) => invoke<void>('discard_export', { domainId }),
+  /**
+   * What the Game tab shows for an asset: what it exports as, its name inferred and yours, and
+   * the problems naming it in its domains' Checks. Null when it doesn't export.
+   */
+  getGameDetail: (assetId: string) => invoke<GameDetail | null>('get_game_detail', { assetId }),
+  /** Writes your export edits to the asset's group (an image's to its texture set), returning the ids written */
+  setExportEdit: (assetId: string, patch: ExportEditPatch) =>
+    invoke<string[]>('set_export_edit', { assetId, patch }),
 
   // Auto-tagging runs. Progress arrives as `autotag:updated` events.
   listAutotagProviders: () => invoke<AutotagProviderOption[]>('list_autotag_providers'),

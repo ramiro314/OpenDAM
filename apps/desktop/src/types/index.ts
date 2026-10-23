@@ -463,7 +463,7 @@ export interface ExportProblem {
 export interface ExportCheckAsset extends ExportAssetRef {
   /** `other` is a member the game can't take, such as a document */
   kind: 'model' | 'texture' | 'animation' | 'other';
-  /** Its default name, or null when its file name gives none */
+  /** Its name: yours, else its default, or null when its file name gives none */
   assetName: string | null;
   role: TextureRole | null;
   /** Its pack's id, or null when it is in no pack */
@@ -523,6 +523,29 @@ export interface ExportCheck {
   diff: ExportDiff | null;
   /** Whether the bundle is staged, so Export can swap it in */
   staged: boolean;
+}
+
+/** A value the game export infers, and yours when you set one, which wins (plan C4) */
+export interface GameField<T> {
+  inferred: T;
+  yours: T | null;
+}
+
+/** What the detail panel's Game tab shows for an asset (plan C13) */
+export interface GameDetail {
+  /** The grid item the tab is about: a group's main item */
+  assetId: string;
+  kind: 'model' | 'texture' | 'animation';
+  assetName: GameField<string>;
+  /** The domains holding it, by name */
+  domains: string[];
+  /** The problems naming it in its domains' Checks */
+  problems: ExportProblem[];
+}
+
+/** Your export edits to an asset: a value sets it, null resets it to inferred */
+export interface ExportEditPatch {
+  assetName?: string | null;
 }
 
 /** What Export did: swapped the bundle in, or found that something the Check read changed */

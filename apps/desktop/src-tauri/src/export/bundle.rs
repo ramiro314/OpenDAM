@@ -1138,6 +1138,14 @@ mod tests {
                 reindex().await.unwrap();
                 "the domain's members in Fixture"
             }
+            "an asset renamed in its Game tab" => {
+                let id = id_of(&f.library.pool, "Unity Moss/T_Moss_D.png").await;
+                let rename = json!({"assetName": "Lichen"});
+                crate::export::edits::write(&f.library.pool, &id, rename.as_object().unwrap())
+                    .await
+                    .unwrap();
+                "your export edits in Fixture"
+            }
             "a pack override" => {
                 sqlx::query(
                     "INSERT INTO pack_overrides (path, name, updated_at) VALUES ('Kenney Crates', 'Crates', 0)",
@@ -1186,6 +1194,7 @@ mod tests {
             "a source's bytes",
             "a source touched",
             "a member renamed",
+            "an asset renamed in its Game tab",
             "a pack override",
             "the domain renamed",
             "the root collection renamed",

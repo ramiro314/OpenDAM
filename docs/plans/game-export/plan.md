@@ -876,6 +876,26 @@ from the contracts above:
   which reads them. `fbx_facts.json` beside the library holds the facts the worker reads from
   each FBX, so the Check's Rust tests read them without Python.
 
+### What the edits ticket built differently
+
+- **Only `assetName` is an edit so far** (C4). `export::edits::write` refuses any other key, and a
+  name that isn't PascalCase, so the Check's "no PascalCase name" problem comes only from file
+  names. Typing the inferred name back resets yours, so the table holds only real edits (D32).
+- **A texture's set is C8's stem rule,** applied when the name is written: the images in the
+  image's folder whose stems match once the prefix, `_DX`/`_GL` and role or layout suffix are
+  dropped. Each source's group gets it too.
+- **When a set disagrees, the first source by path that holds a name wins,** not the first source
+  by path, so a file that joins the set later can't drop your name.
+- **A7 merges per key.** When a group forms, the main item's edits win, and a key it leaves unset
+  takes the first member's that has it, by path, as `apply_unions` already does for the main
+  item's fields.
+- **The Game tab's problems are live.** The tab runs the Check of each domain holding the asset,
+  without staging, when it opens and after each save, and lists the problems naming it.
+- **Problems link to the Game tab.** A link shrinks the Export view to a bar, keeping its Check,
+  and shows the asset in the Game tab. An edit to an asset the Check holds makes the view ask to
+  "Check again" at once. The pack form doesn't mark the view stale yet, but Export still refuses
+  through the fingerprint.
+
 ## Acceptance criteria
 
 - **AC1.** The copied schema matches `SOURCE.md`'s sha256 (a test). `sync-asset-contract.sh`
