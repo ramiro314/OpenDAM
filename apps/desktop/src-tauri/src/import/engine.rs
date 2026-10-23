@@ -137,6 +137,18 @@ impl Engine {
         }
     }
 
+    /// A library opened after the engine started (added, re-added, or back online): marks its
+    /// runs whose owner is gone `interrupted`, as startup does for the libraries open then, and
+    /// wakes the queue for any of its queued runs this engine may claim.
+    pub async fn library_opened(&self, library_id: &str) {
+        if let Some(library) = self.db.get_library_handle(library_id).await {
+            if let Err(e) = self.interrupt_dead_runs(&library).await {
+                tracing::error!("Could not check the import runs of {library_id}: {e}");
+            }
+        }
+        self.wake.notify_one();
+    }
+
     async fn interrupt_dead_runs(&self, library: &LibraryHandle) -> sqlx::Result<()> {
         #[allow(clippy::type_complexity)]
         let running: Vec<(
@@ -1378,5 +1390,68 @@ mod tests {
             "{error}"
         );
         assert_eq!(s.count("SELECT COUNT(*) FROM import_packs").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_library_opened_later_has_its_dead_runs_interrupted_and_its_orphans_claimed() {
+        let s = setup().await;
+        let later = tempfile::Builder::new()
+            .prefix("opendam-later-")
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir_all(later.path().join(".opendam")).unwrap();
+        let pool = crate::db::open_library_db(&Default::default(), later.path())
+            .await
+            .unwrap();
+        let me = s.engine.owner.clone();
+        let (here, boot) = (me.machine.as_deref(), me.boot.as_deref());
+        let gone = i32::MAX as i64;
+        for (id, status) in [("dead_running", "running"), ("orphan_queued", "queued")] {
+            sqlx::query(
+                "INSERT INTO import_runs (id, kind, packs, status, created_at, owner_machine,
+                 owner_boot, owner_pid, owner_started, heartbeat_at)
+                 VALUES (?, 'import', '[]', ?, 0, ?, ?, ?, 1, ?)",
+            )
+            .bind(id)
+            .bind(status)
+            .bind(here)
+            .bind(boot)
+            .bind(gone)
+            .bind(now_ms())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+
+        let lib = s
+            .engine
+            .db
+            .register_library("later", "later", later.path())
+            .await
+            .unwrap();
+        s.engine.library_opened("later").await;
+
+        if me.machine.is_none() {
+            return; // Without a machine id a local owner can't be judged gone.
+        }
+        let status = |id: &'static str| {
+            let pool = lib.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT status FROM import_runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(status("dead_running").await, "interrupted");
+        for _ in 0..500 {
+            if status("orphan_queued").await == "done" {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the orphaned queued run was never claimed");
     }
 }
