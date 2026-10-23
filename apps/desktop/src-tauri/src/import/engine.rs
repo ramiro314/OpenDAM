@@ -727,7 +727,9 @@ mod tests {
         let original = fixture("synthetic.unitypackage");
         let before = stamp(&original);
 
-        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        let mut request = s.golden_request();
+        request.publisher = "  Synthetic Studio ".into();
+        let run = s.engine.start_import(request).await.unwrap();
         assert_eq!(run.status, "queued");
         s.wait_for(&run.id, "done").await;
 
@@ -786,6 +788,15 @@ mod tests {
         s.no_leftovers();
         s.other_asset_untouched().await;
         assert_eq!(stamp(&original), before, "the original is unchanged");
+        assert_eq!(
+            s.strings(
+                "SELECT json_extract(options, '$.publisher') FROM import_steps
+                 WHERE kind = 'metadata'"
+            )
+            .await,
+            ["Synthetic Studio"],
+            "the explicit publisher is recorded, trimmed"
+        );
         let recorded = s.strings("SELECT original_path FROM imports").await;
         assert_eq!(
             recorded,
@@ -969,8 +980,23 @@ mod tests {
         for target in ["", "../Escape", "/abs", "Pub/.hidden", "Pub\\Pack"] {
             assert!(refused(target).await.is_err(), "{target:?} was accepted");
         }
-        request.original_path = s.dir.path().join("Other/Tree.png").to_string_lossy().into();
-        assert!(s.engine.start_import(request).await.is_err());
+        let not_a_package = s.dir.path().join("Other/Tree.png");
+        request.original_path = not_a_package.to_string_lossy().into();
+        let error = s.engine.start_import(request).await.unwrap_err();
+        assert!(error.ends_with("isn't a .unitypackage"), "{error}");
+        let inside = s.dir.path().join("Other/In.unitypackage");
+        std::fs::copy(fixture("synthetic.unitypackage"), &inside).unwrap();
+        let mut request = s.golden_request();
+        request.original_path = inside.to_string_lossy().into();
+        let error = s.engine.start_import(request).await.unwrap_err();
+        assert!(
+            error.ends_with("is inside the library: an original stays outside it"),
+            "{error}"
+        );
+        let mut request = s.golden_request();
+        request.publisher = " \t ".into();
+        let error = s.engine.start_import(request).await.unwrap_err();
+        assert_eq!(error, "Name the pack's publisher");
         assert_eq!(s.count("SELECT COUNT(*) FROM imports").await, 0);
 
         // A pack recorded at Kits/Rock, with nothing on disk yet.
