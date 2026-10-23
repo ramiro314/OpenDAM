@@ -1,6 +1,8 @@
 import type {
   AssetKind,
   ExportEditPatch,
+  GameAnimationDetail,
+  GameAvatarModel,
   GameDetail,
   GameField,
   GameModelDetail,
@@ -58,6 +60,44 @@ export function namePatch(
 export function rigPatch(field: GameField<GameRig>, rig: GameRig): ExportEditPatch | null {
   if (rig === shownValue(field).value) return null;
   return { rig: rig === field.inferred ? null : rig };
+}
+
+/**
+ * The rigs a model's picker offers: none and generic, and humanoid where its bone names suggest
+ * it, or when you already chose it (plan D20).
+ */
+export function rigOptions(model: Pick<GameModelDetail, 'rig' | 'humanoid'>): GameRig[] {
+  const humanoid = model.humanoid !== null || model.rig.yours === 'humanoid';
+  return humanoid ? ['none', 'generic', 'humanoid'] : ['none', 'generic'];
+}
+
+/**
+ * What choosing `id` as the model an animation follows writes, or null when it changes nothing.
+ * Choosing the inferred model resets yours, so only real edits are stored (plan D32).
+ */
+export function avatarPatch(field: GameField<string | null>, id: string): ExportEditPatch | null {
+  if (id === shownValue(field).value) return null;
+  return { avatarFrom: id === field.inferred ? null : id };
+}
+
+/**
+ * The models an animation's picker offers: the domain's rigged models, and the one it follows now
+ * (`current`) even when it isn't one of them, as a model you chose that left the domain.
+ */
+export function avatarOptions(
+  animation: GameAnimationDetail,
+  current: string | null
+): (GameAvatarModel | { assetId: string; missing: true })[] {
+  const listed = animation.models.some((m) => m.assetId === current);
+  return current === null || listed
+    ? animation.models
+    : [{ assetId: current, missing: true }, ...animation.models];
+}
+
+/** A rigged model as an animation's picker names it */
+export function avatarLabel(model: GameAvatarModel): string {
+  const bones = model.sharedBones === 1 ? '1 shared bone' : `${model.sharedBones} shared bones`;
+  return `${model.assetName ?? model.filePath} (${bones})`;
 }
 
 /**

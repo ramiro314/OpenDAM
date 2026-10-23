@@ -1117,6 +1117,47 @@ later. Where they differ from C9:
   fingerprint covers, so Export refuses after a change, and the tab tells an open Export view to
   ask for a new Check, as for names.
 
+### What the animation ticket built differently
+
+- **avatarFrom is a grid item's asset id** (C4), resolved among the domain's models. Yours may
+  name any id, and one that isn't a model of the domain is a problem. A model is rigged when its
+  rig, yours else inferred from `fbx_facts`' bones (A3, as the Game tab infers it), isn't none.
+  The manifest's rig still comes from Blender's result, and C1's check refuses an animation
+  whose model ends up with none.
+- **The default** (D21) is the rigged model sharing the most bone names, the first in the
+  Check's order (library, then path) on a tie. A model sharing no bone name is never the default,
+  so with none the animation has no avatarFrom, which is a problem.
+- **Bones are checked twice.** The Check refuses an animation whose bones aren't a subset of its
+  model's from `fbx_facts`, before any Blender job. The script refuses again from Blender's own
+  bone names (C9 step 4). Names are compared exactly, as Blender binds them, and Blender's leaf
+  bones (`Head_end`) count like any other.
+- **What the job follows is the model's result,** not a matrix: its `transform` (the yaw and the
+  pivot in Unity's axes) and its bones, as `follow`. The script undoes Unity's axes and applies
+  the same turn and translation to the animation's root objects. The animation's result reports
+  that transform, so its step's settings are the model's plus `followed`. The job's
+  `originFacing` and `facingQuarterTurns` are the model's.
+- **The cache key holds the model's key** under `settings.follows` (`cache::animation_key`). A
+  model's key has no `follows`, so existing entries stay valid, and `NORMALIZE_VERSION` isn't
+  bumped, since no model's output changed.
+- **Jobs run in two phases,** the models, then the animations, whose `follow` needs their
+  model's result. Progress counts both in one total. An animation the cache holds whose model it
+  doesn't hold is a problem in the Export view's Check, and is left out quietly where models come
+  only from the cache (the Game tab, and Export's re-read). An animation whose model a problem
+  names is refused, naming the model.
+- **The script refuses an animation** with a kept mesh, with no take that animates something, or
+  with a take that moves its root object, as for models. Blender's result has no `bounds` for an
+  animation.
+- **Humanoid** is suggested when all 15 of Unity's required humanoid bones are there in one
+  naming (Mixamo, Unity's own names, or the UE mannequin's), ignoring case and a namespace before
+  `:` (`mixamorig1:`). The rig picker offers it only then, or once it is yours, with a "Use
+  humanoid" button beside the suggestion.
+- **Fixtures** (C16, step 7): `Dungeon Props/Animations/A_GuardIdle.fbx` (no mesh),
+  `A_GuardNod.fbx` (a `UCX_` hull) and `A_Wag.fbx`, whose `Tail` makes it the mismatched one.
+  `make_fixtures.py`'s step-6 models moved into a function of their own, since they named the
+  `models` function where they meant its folder.
+- **AC6 has its own Blender-backed test,** with `A_Wag` in a second domain, since Export needs a
+  domain with no problem. AC2's test adds `A_GuardIdle` and `A_GuardNod`.
+
 ## Acceptance criteria
 
 - **AC1.** The copied schema matches `SOURCE.md`'s sha256 (a test). `sync-asset-contract.sh`

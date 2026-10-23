@@ -644,19 +644,49 @@ export interface GameDetail {
   images: GameImage[];
   /** A texture's own layout, role and convention, and its set */
   texture: GameTexture | null;
+  /** An animation's avatarFrom and takes, null for anything else */
+  animation: GameAnimationDetail | null;
 }
 
-/** A model's rig as the manifest lists it (plan D20). Humanoid comes with animations. */
-export type GameRig = 'none' | 'generic';
+/** A model's rig as the manifest lists it (plan D20). Humanoid is only ever yours. */
+export type GameRig = 'none' | 'generic' | 'humanoid';
 
 /** A model's rig and facing in the Game tab (plan C13, D13, D20) */
 export interface GameModelDetail {
   /** Inferred none without bones, else generic */
   rig: GameField<GameRig>;
+  /**
+   * The naming whose humanoid skeleton its bones hold ("Mixamo", "Unity humanoid" or "UE
+   * mannequin"), which suggests the humanoid rig; null when they hold none
+   */
+  humanoid: string | null;
   /** Your quarter turns about Y, clockwise seen from above, after the origin's facing: 0 to 3 */
   facingQuarterTurns: GameField<number>;
   /** Its pack's origin, whose default facing comes first; null in no pack */
   origin: PackOrigin | null;
+}
+
+/** A rigged model of the domain an animation may follow */
+export interface GameAvatarModel {
+  assetId: string;
+  /** Relative to the library root */
+  filePath: string;
+  assetName: string | null;
+  /** How many bone names it shares with the animation */
+  sharedBones: number;
+}
+
+/** An animation in the Game tab (plan C13, D21) */
+export interface GameAnimationDetail {
+  /**
+   * The model it follows, by asset id: inferred, the rigged model of the domain sharing the most
+   * bone names with it (null when none does), and yours
+   */
+  avatarFrom: GameField<string | null>;
+  /** The domain's rigged models it may follow */
+  models: GameAvatarModel[];
+  /** Its takes, the manifest's clips */
+  takes: string[];
 }
 
 /** Your edits to one material slot: a texture is an image's id, or null for none */
@@ -678,6 +708,8 @@ export interface ExportEditPatch {
   normalConvention?: NormalConvention | null;
   rig?: GameRig | null;
   facingQuarterTurns?: number | null;
+  /** The asset id of the model an animation follows */
+  avatarFrom?: string | null;
 }
 
 /**

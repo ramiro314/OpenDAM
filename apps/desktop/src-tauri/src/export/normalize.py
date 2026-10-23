@@ -1,10 +1,12 @@
 """OpenDAM's model normalization (plan game-export C9). The app embeds this script and runs it
-with headless Blender, once per model:
+with headless Blender, once per model or animation:
 
     blender -b --factory-startup -P normalize.py -- <job.json> <result.json>
 
 It rewrites the job's FBX to metres, Y up and facing +Z, with its pivot at the bottom centre,
-collision meshes dropped and LODs kept, then re-imports what it wrote and reports it. A `view`
+collision meshes dropped and LODs kept, then re-imports what it wrote and reports it. An
+animation, which has no mesh to measure, gets the transform recorded for the model it follows
+instead, and only when its bones are all that model's (step 4). A `view`
 job instead re-imports a normalized FBX and writes it as a GLB, for the Game tab's "Show as
 exported": glTF's +Y up and +Z forward are then Unity's, with X mirrored. The
 result is `{"ok": true, ...}` or `{"ok": false, "error": "..."}`, and `export::blender` checks
@@ -276,6 +278,16 @@ def to_unity(v) -> list[float]:
     return [clean(-v[0]), clean(v[2]), clean(-v[1])]
 
 
+def from_unity(v) -> Vector:
+    """Unity's (x, y, z) in Blender's axes: `to_unity` undone."""
+    return Vector((-v[0], -v[2], v[1]))
+
+
+def rotation(yaw: float) -> Matrix:
+    """Unity's clockwise yaw, in degrees, as Blender's turn about Z, which is negative."""
+    return Matrix.Rotation(math.radians(-yaw), 4, "Z")
+
+
 def clean(value: float) -> float:
     # Rounded to a micrometre, and never -0.0
     return round(value, 6) + 0.0
@@ -322,8 +334,9 @@ def report(path: str, patterns: dict) -> dict:
 
 
 def normalize(job: dict) -> dict:
-    if job["kind"] != "model":
-        raise Refused(f"normalizing a {job['kind']} isn't built yet")
+    kind = job["kind"]
+    if kind not in ("model", "animation"):
+        raise Refused(f"normalizing a {kind} isn't built")
     origin = job["originFacing"]
     if origin not in ORIGIN_YAW:
         raise Refused(f"unknown origin {origin}")
@@ -333,15 +346,16 @@ def normalize(job: dict) -> dict:
     load(job["input"])
     dropped = drop_collision(patterns)
     kept = meshes()
-    if not kept:
+    if kind == "model" and not kept:
         raise Refused("it has no mesh to keep")
+    if kind == "animation" and kept:
+        raise Refused("it has a mesh to keep, so it exports as a model, not an animation")
     source_slots = slots(kept)
     source_takes = takes(job["input"], dropped)
+    if kind == "animation" and not source_takes:
+        raise Refused("it has no take that animates something")
     added = add_material(kept, job["addedMaterial"])
 
-    # Step 3: one root transform, the facing turn then the pivot translation, on each root
-    # object (the armature, when there is one), never on bones
-    yaw = (ORIGIN_YAW[origin] + 90 * job["facingQuarterTurns"]) % 360
     roots = [o for o in bpy.data.objects if o.parent is None]
     for owner, take, action in source_takes:
         if owner in roots and any(
@@ -352,11 +366,29 @@ def normalize(job: dict) -> dict:
             for curve in bag.fcurves
         ):
             raise Refused(f"its take {take} moves its root object {owner.name}")
-    # Unity's clockwise yaw is a clockwise turn about Blender's Z, which is negative
-    turn = Matrix.Rotation(math.radians(-yaw), 4, "Z")
-    low, high = bounds(kept, turn)
-    shift = Vector((-(low.x + high.x) / 2, -(low.y + high.y) / 2, -low.z))
-    transform = Matrix.Translation(shift) @ turn
+    if kind == "model":
+        # Step 3: one root transform, the facing turn then the pivot translation, on each root
+        # object (the armature, when there is one), never on bones
+        yaw = (ORIGIN_YAW[origin] + 90 * job["facingQuarterTurns"]) % 360
+        low, high = bounds(kept, rotation(yaw))
+        shift = Vector((-(low.x + high.x) / 2, -(low.y + high.y) / 2, -low.z))
+        applied = {
+            "originFacing": origin,
+            "facingQuarterTurns": job["facingQuarterTurns"],
+            "yaw": yaw,
+            "pivot": to_unity(shift),
+        }
+    else:
+        # Step 4: the transform recorded for the model it follows, on the same root objects, so
+        # its clips play on that model as it was normalized
+        follow = job["follow"]
+        bones = [b.name for o in bpy.data.objects if o.type == "ARMATURE" for b in o.data.bones]
+        missing = [b for b in bones if b not in set(follow["bones"])]
+        if missing:
+            raise Refused(f"its bones {', '.join(missing)} aren't bones of the model it follows")
+        applied = dict(follow["transform"])
+        yaw, shift = applied["yaw"], from_unity(applied["pivot"])
+    transform = Matrix.Translation(shift) @ rotation(yaw)
     for obj in roots:
         obj.matrix_world = transform @ obj.matrix_world
 
@@ -378,12 +410,7 @@ def normalize(job: dict) -> dict:
         "blenderVersion": ".".join(map(str, bpy.app.version)),
         "droppedMeshes": dropped,
         "addedMaterial": added,
-        "transform": {
-            "originFacing": origin,
-            "facingQuarterTurns": job["facingQuarterTurns"],
-            "yaw": yaw,
-            "pivot": to_unity(shift),
-        },
+        "transform": applied,
         "source": {"slots": source_slots, "takes": sorted(file_takes(job["input"], set(dropped)))},
     }
 

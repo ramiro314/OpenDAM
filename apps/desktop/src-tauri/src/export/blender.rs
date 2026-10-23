@@ -1,5 +1,6 @@
 //! Which Blender a game export would run, and whether it is accepted (plan C2, D29), and the
-//! jobs it runs: the embedded normalization script, one headless process per model (C9, D30).
+//! jobs it runs: the embedded normalization script, one headless process per model or animation
+//! (C9, D30).
 //! Only an export with an uncached model or animation job calls `gate`: a texture-only or fully
 //! cached export never looks for Blender.
 
@@ -181,11 +182,14 @@ pub fn job_limit() -> usize {
     (cores / 4).max(1)
 }
 
-/// What a job normalizes. Animations come with plan step 7.
+/// What a job normalizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobKind {
+    /// Turned by its origin and your quarter turns, and moved onto its pivot (C9 step 3)
     Model,
+    /// Given the transform recorded for the model it follows (C9 step 4)
+    Animation,
 }
 
 /// One Blender job, the JSON the script reads (C9).
@@ -208,6 +212,30 @@ pub struct Job {
     /// The material a kept mesh with none gets (`names::added_material`). The script refuses
     /// the job when a material already holds it.
     pub added_material: String,
+    /// For an animation, what the script reads of the model it follows (its avatarFrom), from
+    /// that model's normalized result. The animation's cache key holds the model's key instead,
+    /// which covers it (`cache::animation_key`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow: Option<Follow>,
+}
+
+/// The model an animation follows (C9 step 4, D21), as the script reads it: the root transform
+/// its normalization applied, which the animation's root objects get too, and its bones, of
+/// which the animation's must be a subset.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Follow {
+    pub transform: Transform,
+    pub bones: Vec<String>,
+}
+
+impl Follow {
+    /// What `normalized`, the followed model's result, gives an animation to follow.
+    pub fn of(normalized: &Normalized) -> Self {
+        Follow {
+            transform: normalized.transform.clone(),
+            bones: normalized.bones.clone(),
+        }
+    }
 }
 
 /// What the script wrote, re-imported (C9 step 6), with what it read from the source. The export
@@ -215,7 +243,8 @@ pub struct Job {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Normalized {
-    pub bounds: Bounds,
+    /// The kept meshes' bounds, `None` for an animation, which has none
+    pub bounds: Option<Bounds>,
     /// The written meshes, by name
     pub meshes: Vec<String>,
     /// The written material slots, in Blender's order: each kept mesh's by name, then by slot
@@ -245,7 +274,8 @@ pub struct Bounds {
     pub max: [f64; 3],
 }
 
-/// The root transform the script applied (C9 step 3).
+/// The root transform the script applied (C9 step 3): for an animation, the one recorded for the
+/// model it follows (step 4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Transform {
@@ -283,26 +313,11 @@ fn script_result(text: &str) -> Result<serde_json::Value, String> {
     Ok(value)
 }
 
-/// Checks what the script wrote (C9): the pivot rule, and that the written slots and takes are
-/// the source's kept ones, plus the added material.
+/// Checks what the script wrote (C9): a model's pivot rule, and that the written slots and
+/// takes are the source's kept ones, plus the added material.
 pub fn check(job: &Job, normalized: &Normalized) -> Result<(), String> {
-    let Bounds { min, max } = normalized.bounds;
-    let largest = (0..3).map(|i| max[i] - min[i]).fold(0.0, f64::max);
-    if largest <= 0.0 {
-        return Err("the normalized model has no size".into());
-    }
-    let tolerance = largest * PIVOT_TOLERANCE;
-    for (what, offset) in [
-        ("min.y", min[1]),
-        ("the X centre", (min[0] + max[0]) / 2.0),
-        ("the Z centre", (min[2] + max[2]) / 2.0),
-    ] {
-        if offset.abs() > tolerance {
-            return Err(format!(
-                "the normalized pivot is off: {what} is {offset} m from 0, more than 0.1% of \
-                 the largest dimension, {largest} m"
-            ));
-        }
+    if job.kind == JobKind::Model {
+        check_pivot(normalized.bounds)?;
     }
 
     let added = normalized.added_material.as_deref();
@@ -340,6 +355,32 @@ pub fn check(job: &Job, normalized: &Normalized) -> Result<(), String> {
     Ok(())
 }
 
+/// The pivot rule: `min.y` and the X and Z centre within `PIVOT_TOLERANCE` of the largest
+/// dimension from 0.
+fn check_pivot(bounds: Option<Bounds>) -> Result<(), String> {
+    let Some(Bounds { min, max }) = bounds else {
+        return Err("the normalized model has no mesh".into());
+    };
+    let largest = (0..3).map(|i| max[i] - min[i]).fold(0.0, f64::max);
+    if largest <= 0.0 {
+        return Err("the normalized model has no size".into());
+    }
+    let tolerance = largest * PIVOT_TOLERANCE;
+    for (what, offset) in [
+        ("min.y", min[1]),
+        ("the X centre", (min[0] + max[0]) / 2.0),
+        ("the Z centre", (min[2] + max[2]) / 2.0),
+    ] {
+        if offset.abs() > tolerance {
+            return Err(format!(
+                "the normalized pivot is off: {what} is {offset} m from 0, more than 0.1% of \
+                 the largest dimension, {largest} m"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Checks the source's kept slots and takes, as Blender read them, against the preview
 /// worker's `fbx_facts`, which the Check showed and your edits name (C9). They are compared as
 /// sets, since Blender and the worker may order them differently: a difference means the two
@@ -370,11 +411,12 @@ pub fn check_facts(normalized: &Normalized, facts: &FbxFacts) -> Result<(), Stri
     Ok(())
 }
 
-/// The conversion step a normalized model records (C9, D33): Blender at the exact version that
-/// wrote the file, by `NORMALIZE_VERSION`, with flat settings: your quarter turns, the origin
-/// whose facing came first, the pivot's translation, how many collision meshes were dropped, and
-/// the added material's name, when one was added.
-pub fn step(normalized: &Normalized) -> serde_json::Value {
+/// The conversion step a normalized model or animation records (C9, D33): Blender at the exact
+/// version that wrote the file, by `NORMALIZE_VERSION`, with flat settings: your quarter turns,
+/// the origin whose facing came first, the pivot's translation, how many collision meshes were
+/// dropped, the added material's name, when one was added, and for an animation the `assetName`
+/// of the model it `followed`, whose transform those are.
+pub fn step(normalized: &Normalized, followed: Option<&str>) -> serde_json::Value {
     let transform = &normalized.transform;
     let [x, y, z] = transform.pivot;
     let mut settings = serde_json::json!({
@@ -387,6 +429,9 @@ pub fn step(normalized: &Normalized) -> serde_json::Value {
     });
     if let Some(added) = &normalized.added_material {
         settings["addedMaterial"] = added.as_str().into();
+    }
+    if let Some(followed) = followed {
+        settings["followed"] = followed.into();
     }
     serde_json::json!({
         "tool": "Blender",
@@ -853,6 +898,7 @@ pub(crate) mod tests {
             facing_quarter_turns: 1,
             patterns: &crate::export::collision::PATTERNS,
             added_material: "OpenDAMDefault".into(),
+            follow: None,
         }
     }
 
@@ -909,10 +955,10 @@ pub(crate) mod tests {
         let normalized = lamp();
         assert_eq!(
             normalized.bounds,
-            Bounds {
+            Some(Bounds {
                 min: [-0.2, 0.0, -0.2],
                 max: [0.2, 0.7, 0.2]
-            }
+            })
         );
         assert_eq!(normalized.added_material.as_deref(), Some("OpenDAMDefault"));
         assert_eq!(normalized.transform.origin_facing, Origin::Unreal);
@@ -947,7 +993,7 @@ pub(crate) mod tests {
             ([-0.2, 0.0, -0.2], [0.2, 0.7, 0.2016], false),
         ] {
             let mut normalized = lamp();
-            normalized.bounds = Bounds { min, max };
+            normalized.bounds = Some(Bounds { min, max });
             let checked = check(&job, &normalized);
             assert_eq!(checked.is_ok(), ok, "{min:?} {max:?}: {checked:?}");
             if !ok {
@@ -960,10 +1006,10 @@ pub(crate) mod tests {
             }
         }
         let mut flat = lamp();
-        flat.bounds = Bounds {
+        flat.bounds = Some(Bounds {
             min: [0.0; 3],
             max: [0.0; 3],
-        };
+        });
         assert_eq!(
             check(&job, &flat),
             Err("the normalized model has no size".into())
@@ -1359,6 +1405,7 @@ pub(crate) mod tests {
             facing_quarter_turns: 0,
             patterns: &crate::export::collision::PATTERNS,
             added_material: added,
+            follow: None,
         }
     }
 
@@ -1411,6 +1458,29 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))"
         serde_json::from_str(line).unwrap()
     }
 
+    /// The world matrix of each armature object in the FBX at `fbx`, row by row, as Blender
+    /// imports it, rounded to a micrometre.
+    pub(crate) async fn armatures(blender: &Path, fbx: &Path) -> Vec<Vec<f64>> {
+        const READ: &str = "import bpy, json, sys
+bpy.ops.wm.read_homefile(use_empty=True)
+bpy.ops.import_scene.fbx(filepath=sys.argv[-1])
+rigs = [o for o in bpy.data.objects if o.type == 'ARMATURE']
+print('OPENDAM_ARMATURES', json.dumps([[round(v, 6) + 0.0 for row in o.matrix_world for v in row] for o in rigs]))";
+        let output = tokio::process::Command::new(blender)
+            .args(["-b", "--factory-startup", "--python-exit-code", "1"])
+            .args(["--python-expr", READ, "--"])
+            .arg(fbx)
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("OPENDAM_ARMATURES "))
+            .unwrap_or_else(|| panic!("{stdout}"));
+        serde_json::from_str(line).unwrap()
+    }
+
     /// Which way `SM_Totem`'s nose points, in Unity's axes: the side whose outermost vertices
     /// are all the nose's, 1.45 to 1.55 m up.
     pub(crate) fn nose(vertices: &[[f64; 3]]) -> Vec<&'static str> {
@@ -1447,7 +1517,7 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))"
         let totem = runner.run(&job).await.unwrap();
 
         // 40 x 180 x 30 cm in the source, with a 10 cm nose on its front
-        assert_size(totem.bounds, [0.4, 1.8, 0.4]);
+        assert_size(totem.bounds.unwrap(), [0.4, 1.8, 0.4]);
         assert_eq!(totem.meshes, ["SM_Totem"]);
         assert_eq!(totem.slots, ["Stone"]);
         assert_eq!(totem.version, NORMALIZE_VERSION);
@@ -1471,7 +1541,7 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))"
                 ..fixture_job("SM_Totem", out.path())
             };
             let turned = runner.run(&job).await.unwrap();
-            assert_size(turned.bounds, [0.4, 1.8, 0.4]);
+            assert_size(turned.bounds.unwrap(), [0.4, 1.8, 0.4]);
             assert_eq!(turned.transform.yaw, yaw, "{origin:?} {turns}");
             assert_eq!(
                 nose(&vertices(&blender, &job.output).await),
@@ -1497,7 +1567,7 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))"
         assert_eq!(pillar.dropped_meshes, ["UCX_SM_Pillar_00"]);
         assert_eq!(pillar.slots, ["Stone", "Moss"]);
         assert_eq!(pillar.added_material, None);
-        assert_size(pillar.bounds, [0.6, 3.0, 0.6]);
+        assert_size(pillar.bounds.unwrap(), [0.6, 3.0, 0.6]);
 
         // Its hull has no material
         let gate = runner
@@ -1508,7 +1578,7 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))"
         assert_eq!(gate.dropped_meshes, ["UCX_SM_Gate_00"]);
         assert_eq!(gate.slots, ["Iron"]);
         assert_eq!(gate.added_material, None);
-        assert_size(gate.bounds, [2.0, 2.5, 0.2]);
+        assert_size(gate.bounds.unwrap(), [2.0, 2.5, 0.2]);
 
         // Nothing is left once its hull goes
         let hull = runner.run(&fixture_job("SM_Hull", out.path())).await;
@@ -1535,7 +1605,7 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))"
         assert_eq!(boulder.slots, ["OpenDAMDefault"]);
         assert_eq!(boulder.added_material.as_deref(), Some("OpenDAMDefault"));
         assert_eq!(boulder.source.slots, Vec::<String>::new());
-        assert_size(boulder.bounds, [1.2, 0.8, 1.0]);
+        assert_size(boulder.bounds.unwrap(), [1.2, 0.8, 1.0]);
 
         // A real DefaultMaterial keeps its name beside the added slot
         let lamp = run("SM_Lamp").await;
@@ -1567,7 +1637,7 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))"
         assert_eq!(stool.meshes, ["SM_Stool"]);
         assert_eq!(stool.slots, ["Material"]);
         assert_eq!(stool.added_material, None);
-        assert_size(stool.bounds, [0.4, 0.5, 0.4]);
+        assert_size(stool.bounds.unwrap(), [0.4, 0.5, 0.4]);
     }
 
     #[tokio::test]
@@ -1665,6 +1735,99 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))"
         }
     }
 
+    /// The job for the fixture animation `name`, written into `out`, following the model whose
+    /// result is `model`, as the export makes it.
+    fn animation_fixture_job(name: &str, out: &Path, model: &Normalized) -> Job {
+        let asset = format!("Dungeon Props/Animations/{name}.fbx");
+        Job {
+            input: Path::new(LIBRARY).join(&asset),
+            output: out.join(format!("{name}.fbx")),
+            asset,
+            kind: JobKind::Animation,
+            origin_facing: model.transform.origin_facing,
+            facing_quarter_turns: model.transform.facing_quarter_turns,
+            patterns: &crate::export::collision::PATTERNS,
+            added_material: "OpenDAMDefault".into(),
+            follow: Some(Follow::of(model)),
+        }
+    }
+
+    /// AC6's script half: an animation gets its model's transform on its armature, keeps its
+    /// take, drops a `UCX_` hull, and is refused when its bones aren't all the model's.
+    #[tokio::test]
+    async fn an_animation_gets_its_model_s_transform_and_other_bones_are_refused() {
+        let Some(runner) = fixture_runner().await else {
+            return;
+        };
+        let out = tempfile::tempdir().unwrap();
+        let blender = runner.blender().program.clone();
+
+        let mut rigs = Vec::new();
+        for turns in [0, 1] {
+            let guard_job = Job {
+                facing_quarter_turns: turns,
+                ..fixture_job("SK_Guard", out.path())
+            };
+            let guard = runner.run(&guard_job).await.unwrap();
+            let rig = armatures(&blender, &guard_job.output).await;
+            assert_eq!(rig.len(), 1);
+
+            for (name, take, dropped) in [
+                ("A_GuardIdle", "Idle", &[][..]),
+                ("A_GuardNod", "Nod", &["UCX_A_GuardNod_00"][..]),
+            ] {
+                let job = animation_fixture_job(name, out.path(), &guard);
+                let idle = runner.run(&job).await.unwrap();
+                assert_eq!(idle.transform, guard.transform, "{name} {turns}");
+                assert_eq!(idle.takes, [take]);
+                assert_eq!(idle.source.takes, [take]);
+                assert_eq!(idle.dropped_meshes, dropped);
+                assert_eq!((idle.has_mesh, idle.has_armature), (false, true));
+                assert_eq!(idle.bounds, None);
+                assert_eq!(idle.slots, Vec::<String>::new());
+                assert_eq!(idle.added_material, None);
+                // Its armature lands where the model's did, turned with it
+                assert_eq!(
+                    armatures(&blender, &job.output).await,
+                    rig,
+                    "{name} {turns}"
+                );
+                let step = step(&idle, Some("Guard"));
+                assert_eq!(step["settings"]["followed"], "Guard");
+                assert_eq!(step["settings"]["facingQuarterTurns"], turns);
+            }
+            rigs.push(rig);
+        }
+        assert_ne!(rigs[0], rigs[1], "the quarter turn moved no armature");
+
+        // Its Tail isn't the guard's
+        let guard = runner
+            .run(&fixture_job("SK_Guard", out.path()))
+            .await
+            .unwrap();
+        let wag = runner
+            .run(&animation_fixture_job("A_Wag", out.path(), &guard))
+            .await;
+        assert_eq!(
+            wag,
+            Err(
+                "Dungeon Props/Animations/A_Wag.fbx: its bones Tail, Tail_end aren't bones of the \
+                 model it follows"
+                    .into()
+            )
+        );
+        // A model isn't normalized as an animation
+        let as_animation = Job {
+            input: Path::new(LIBRARY).join("Dungeon Props/Models/SK_Guard.fbx"),
+            ..animation_fixture_job("A_GuardIdle", out.path(), &guard)
+        };
+        assert!(runner
+            .run(&as_animation)
+            .await
+            .unwrap_err()
+            .ends_with("it has a mesh to keep, so it exports as a model, not an animation"));
+    }
+
     #[tokio::test]
     async fn takes_keep_their_source_names() {
         let Some(runner) = fixture_runner().await else {
@@ -1684,6 +1847,6 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))"
         assert!(guard.has_armature);
         assert_eq!(guard.bones, ["Hips", "Spine", "Head", "Head_end"]);
         assert_eq!(guard.slots, ["Cloth"]);
-        assert_size(guard.bounds, [0.5, 1.8, 0.3]);
+        assert_size(guard.bounds.unwrap(), [0.5, 1.8, 0.3]);
     }
 }

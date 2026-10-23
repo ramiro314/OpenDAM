@@ -44,9 +44,12 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               which refuses an export root equal to, inside or holding a library root,
                               after resolving symlinks, blender.rs, which finds Blender, gates it to
                               BLENDER_SERIES (5.2) and runs normalize.py (embedded, versioned by
-                              NORMALIZE_VERSION) as one headless job per model and checks its result, which
-                              the Check runs for each model the export cache doesn't hold
-                              (cache::model_key),
+                              NORMALIZE_VERSION) as one headless job per model or animation and checks its
+                              result, which the Check runs for each one the export cache doesn't hold
+                              (cache::model_key, and cache::animation_key, which holds the key of the
+                              model the animation follows, so its job runs after that model's),
+                              animation, an animation's default avatarFrom (the rigged model sharing
+                              the most bone names), its bones-subset rule and the humanoid suggestion,
                               check, the Export view's Check over a domain
                               (names, packs, textures, conversion and hashes, memoized in file_hashes,
                               and FBX models and animations by fbx_facts, which asks the preview
@@ -59,8 +62,8 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               merge, green flip, to PNG) as PNG cached by cache::texture_key, unity,
                               which reads a Unity pack's .meta and .mat files, edits, your
                               corrections in export_edits, and game, what the detail panel's Game
-                              tab shows, with a model's rig and facing, and the GLB of
-                              "Show as exported" (exported_view)
+                              tab shows, with a model's rig and facing, an animation's avatarFrom
+                              and takes, and the GLB of "Show as exported" (exported_view)
     tests/fixtures/game-export/  The export's fixture library, made by make_fixtures.py under Blender and
                               committed with its output, and fbx_facts.json, its FBX files' facts,
                               which test_fbx_facts.py checks and the Check's tests read

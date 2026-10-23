@@ -86,6 +86,28 @@ def test_a_skinned_model_lists_its_bones_and_its_take():
     assert result["takes"] == ["Wave"]
 
 
+@pytest.mark.parametrize(
+    ("name", "dropped", "bones", "takes"),
+    [
+        # No mesh at all
+        ("A_GuardIdle.fbx", [], ["Hips", "Spine", "Head", "Head_end"], ["Idle"]),
+        # Its only mesh is a hull, which the export drops
+        ("A_GuardNod.fbx", ["UCX_A_GuardNod_00"], ["Hips", "Spine", "Head", "Head_end"], ["Nod"]),
+        ("A_Wag.fbx", [], ["Hips", "Tail", "Tail_end"], ["Wag"]),
+    ],
+)
+def test_an_animation_has_takes_and_bones_and_no_kept_mesh(name, dropped, bones, takes):
+    result = worker.fbx_facts(
+        str(LIBRARY / "Dungeon Props/Animations" / name), PATTERNS, str(LIBRARY)
+    )
+    assert result["ok"], result
+    assert result["kept_meshes"] == [] and not result["has_kept_mesh"]
+    assert result["dropped_meshes"] == dropped
+    assert result["slots"] == []
+    assert result["bones"] == bones
+    assert result["takes"] == takes
+
+
 def test_an_fbx_holding_only_a_hull_has_no_kept_mesh_slot_or_take():
     result = facts("SM_Hull.fbx")
     assert result["kept_meshes"] == [] and not result["has_kept_mesh"]

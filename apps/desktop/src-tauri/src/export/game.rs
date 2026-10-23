@@ -3,8 +3,9 @@
 //! holding it find with it. A model shows each material slot's name, surface and texture per
 //! role, and its pack's images for the texture pickers. A texture shows its own layout, role and
 //! normal-map convention, and its texture set. Each value is inferred, or yours when you set it.
-//! A model's rig and facing are edits too, and "Show as exported" has Blender write the
-//! normalized model as a GLB for the tab's viewer.
+//! A model's rig and facing are edits too, with humanoid suggested by its bone names, and "Show as
+//! exported" has Blender write the normalized model as a GLB for the tab's viewer. An animation
+//! shows the model it follows, its avatarFrom, inferred and yours, and its takes.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -14,13 +15,15 @@ use serde::Serialize;
 
 use crate::db::Database;
 pub use crate::export::check::Field;
-use crate::export::check::{self, Inspection, ItemRow, Kind, PackImage, Problem, TextureGame};
+use crate::export::check::{
+    self, AnimationGame, Inspection, ItemRow, Kind, PackImage, Problem, TextureGame,
+};
 use crate::export::edits::Rig;
 use crate::export::fbx_facts;
 use crate::export::infer::{Binding, Surface};
 use crate::export::packs::Origin;
 use crate::export::textures::Role;
-use crate::export::{blender, cache, edits, hashes, infer, settings};
+use crate::export::{animation, blender, cache, edits, hashes, infer, settings};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +44,8 @@ pub struct GameDetail {
     pub images: Arc<Vec<PackImage>>,
     /// A texture's own layout, role and normal-map convention, and its texture set
     pub texture: Option<TextureGame>,
+    /// An animation's avatarFrom and takes
+    pub animation: Option<AnimationGame>,
 }
 
 /// A model's rig and facing, inferred and yours (C13, D13, D20).
@@ -50,6 +55,9 @@ pub struct ModelDetail {
     /// Inferred from its FBX's facts: none without bones, else generic. At export, Blender's
     /// result says whether it has an armature (A3).
     pub rig: Field<Rig>,
+    /// The naming whose humanoid skeleton its bones hold (`animation::humanoid_naming`), which
+    /// suggests the humanoid rig, only ever yours (D20)
+    pub humanoid: Option<&'static str>,
     /// Your quarter turns about Y after the origin's facing, inferred 0: the origin's default
     pub facing_quarter_turns: Field<u8>,
     /// The origin of its pack, whose default facing comes first, `None` in no pack
@@ -181,12 +189,16 @@ pub async fn detail(
     let kind = check::exported_kind(&item, item_facts.as_ref());
     let model = if kind == Kind::Model {
         let yours = edits::of(&rows, &item.id);
-        let has_bones = matches!(&item_facts, Some(Ok(facts)) if !facts.bones.is_empty());
+        let bones = match &item_facts {
+            Some(Ok(facts)) => facts.bones.as_slice(),
+            _ => &[],
+        };
         Some(ModelDetail {
             rig: Field {
-                inferred: Rig::inferred(has_bones),
+                inferred: Rig::inferred(!bones.is_empty()),
                 yours: edits::rig(&yours),
             },
+            humanoid: animation::humanoid_naming(bones),
             facing_quarter_turns: Field {
                 inferred: 0,
                 yours: edits::facing_quarter_turns(&yours),
@@ -320,6 +332,7 @@ pub async fn detail(
         materials,
         images,
         texture: shown.textures.get(&item.id).cloned(),
+        animation: shown.animations.get(&item.id).cloned(),
     }))
 }
 
@@ -599,21 +612,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_fbx_with_no_kept_mesh_and_a_take_shows_as_an_animation() {
+    async fn an_animation_shows_the_model_it_follows_inferred_and_yours_and_its_takes() {
+        let f = fixture().await;
+        let idle = "Dungeon Props/Animations/A_GuardIdle.fbx";
+        let guard = "Dungeon Props/Models/SK_Guard.fbx";
+
+        // In no domain, no model to follow
+        let shown = detail_of(&f, idle).await.unwrap();
+        assert_eq!(shown.kind, Kind::Animation);
+        assert_eq!(shown.asset_name.inferred, "GuardIdle");
+        assert_eq!(shown.model, None);
+        assert!(shown.materials.is_empty());
+        let animation = shown.animation.unwrap();
+        assert_eq!(animation.takes, ["Idle"]);
+        assert_eq!(
+            animation.avatar_from,
+            Field {
+                inferred: None,
+                yours: None
+            }
+        );
+        assert_eq!(animation.models, []);
+
+        // In a domain with the guard, which shares its bones, it follows the guard
+        collection(&f, "props", "Props", "dg", &[idle, guard]).await;
+        let guard_id = id_of(&f.library.pool, guard).await;
+        let shown = detail_of(&f, idle).await.unwrap();
+        assert_eq!(shown.domains, ["Props"]);
+        assert_eq!(shown.problems, []);
+        let animation = shown.animation.unwrap();
+        assert_eq!(animation.avatar_from.inferred, Some(guard_id.clone()));
+        let offered: Vec<(&str, Option<&str>, usize)> = (animation.models.iter())
+            .map(|m| (m.asset_id.as_str(), m.asset_name.as_deref(), m.shared_bones))
+            .collect();
+        assert_eq!(offered, [(guard_id.as_str(), Some("Guard"), 4)]);
+
+        // Yours names another model, which the domain doesn't hold: a problem the tab lists
+        let id = id_of(&f.library.pool, idle).await;
+        let stool = id_of(&f.library.pool, "Dungeon Props/Models/SM_Stool.fbx").await;
+        let edit = json!({ "avatarFrom": stool });
+        edits::write(&f.library.pool, &id, edit.as_object().unwrap())
+            .await
+            .unwrap();
+        let shown = detail_of(&f, idle).await.unwrap();
+        assert_eq!(
+            shown.animation.unwrap().avatar_from.yours,
+            Some(Some(stool))
+        );
+        assert_eq!(shown.problems.len(), 1);
+        assert!(shown.problems[0]
+            .message
+            .contains("the model chosen as its avatarFrom isn't a model of the domain"));
+    }
+
+    #[tokio::test]
+    async fn a_model_whose_bones_name_a_humanoid_skeleton_suggests_humanoid() {
         let f = fixture().await;
         let guard = "Dungeon Props/Models/SK_Guard.fbx";
-        let mut snapshot = Snapshot::fixture();
-        // The fixture's animation lands with animation export, so its guard stands in for one
-        let facts = snapshot.0.get_mut(guard).unwrap();
-        facts.has_kept_mesh = false;
-        facts.kept_meshes.clear();
         let id = id_of(&f.library.pool, guard).await;
+        let shown = detail_of(&f, guard).await.unwrap().model.unwrap();
+        assert_eq!(
+            shown.humanoid, None,
+            "a hips, spine and head are no humanoid"
+        );
+
+        let mut snapshot = Snapshot::fixture();
+        snapshot.0.get_mut(guard).unwrap().bones = [
+            "Hips",
+            "Spine",
+            "Head",
+            "LeftArm",
+            "LeftForeArm",
+            "LeftHand",
+            "RightArm",
+            "RightForeArm",
+            "RightHand",
+            "LeftUpLeg",
+            "LeftLeg",
+            "LeftFoot",
+            "RightUpLeg",
+            "RightLeg",
+            "RightFoot",
+        ]
+        .map(|b| format!("mixamorig:{b}"))
+        .to_vec();
+        let shown = detail(&f.db, &id, &snapshot, &memo())
+            .await
+            .unwrap()
+            .unwrap()
+            .model
+            .unwrap();
+        assert_eq!(shown.humanoid, Some("Mixamo"));
+        // Suggested, never inferred: only you set it
+        assert_eq!(shown.rig.inferred, Rig::Generic);
+        let edit = json!({"rig": "humanoid"});
+        edits::write(&f.library.pool, &id, edit.as_object().unwrap())
+            .await
+            .unwrap();
         let shown = detail(&f.db, &id, &snapshot, &memo())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(shown.kind, Kind::Animation);
-        assert_eq!(shown.asset_name.inferred, "Guard");
+        assert_eq!(shown.model.unwrap().rig.yours, Some(Rig::Humanoid));
     }
 
     fn pick_files(pick: &Option<TexturePick>) -> Vec<&str> {
@@ -842,6 +942,7 @@ mod tests {
                     inferred: Rig::None,
                     yours: None
                 },
+                humanoid: None,
                 facing_quarter_turns: Field {
                     inferred: 0,
                     yours: None

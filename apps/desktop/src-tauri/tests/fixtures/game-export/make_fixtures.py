@@ -66,6 +66,14 @@ Step 6 (Blender normalization of models), in `Dungeon Props/Models/`:
   imports as `...|SwingA.001`. The script refuses it rather than write that take under a name the
   file doesn't give.
 
+Step 7 (animations), in `Dungeon Props/Animations/`, each an armature with one take and no kept
+mesh:
+
+- `A_GuardIdle.fbx`: `SK_Guard`'s bones and the take `Idle`, and no mesh at all.
+- `A_GuardNod.fbx`: the same bones and the take `Nod`, with a `UCX_` hull as its only mesh.
+- `A_Wag.fbx`: the bones `Hips` and `Tail` and the take `Wag`. It shares `Hips` with `SK_Guard`,
+  which it follows by default, but its `Tail` isn't `SK_Guard`'s, so it is refused.
+
 After a rerun, refresh `fbx_facts.json` beside the library, as `test_fbx_facts.py` says. Only
 the FBX files this script changes on purpose are committed: each rerun stamps new times in them.
 """
@@ -210,14 +218,13 @@ def renamed_material(target: Path, old: str, new: str) -> None:
     target.write_bytes(data.replace(old_name, new_name))
 
 
-def skinned(name: str, bones: list[str], take: str, mat) -> None:
-    """A mesh `name` skinned to an armature with a chain of `bones`, and one action `take`
-    turning the second bone."""
+def armature(bones: list[str]):
+    """An armature object `Armature` with a chain of `bones`, each 0.6 m up from the last."""
     bpy.ops.object.armature_add(location=(0, 0, 0))
-    armature = bpy.context.active_object
-    armature.name = armature.data.name = "Armature"
+    rig = bpy.context.active_object
+    rig.name = rig.data.name = "Armature"
     bpy.ops.object.mode_set(mode="EDIT")
-    edit_bones = armature.data.edit_bones
+    edit_bones = rig.data.edit_bones
     edit_bones.remove(edit_bones[0])
     parent = None
     for i, bone_name in enumerate(bones):
@@ -226,19 +233,14 @@ def skinned(name: str, bones: list[str], take: str, mat) -> None:
         bone.parent = parent
         parent = bone
     bpy.ops.object.mode_set(mode="OBJECT")
+    return rig
 
-    height = 0.6 * len(bones)
-    mesh = box(name, size=(0.5, 0.3, height), location=(0, 0, height / 2), materials=[mat])
-    # The bottom vertices follow the first bone and the top ones the last
-    for bone_name, low in [(bones[0], True), (bones[-1], False)]:
-        group = mesh.vertex_groups.new(name=bone_name)
-        group.add([v.index for v in mesh.data.vertices if (v.co.z < 0) == low], 1.0, "REPLACE")
-    mesh.parent = armature
-    mesh.modifiers.new("Armature", "ARMATURE").object = armature
 
+def animate(rig, bones: list[str], take: str) -> None:
+    """One action `take` on `rig`, turning its second bone, as the scene's one take."""
     action = bpy.data.actions.new(take)
-    armature.animation_data_create().action = action
-    bone = armature.pose.bones[bones[1]]
+    rig.animation_data_create().action = action
+    bone = rig.pose.bones[bones[1]]
     bone.rotation_mode = "XYZ"
     for frame, angle in [(1, 0.0), (10, 0.6), (20, 0.0)]:
         bone.rotation_euler = (angle, 0, 0)
@@ -247,6 +249,50 @@ def skinned(name: str, bones: list[str], take: str, mat) -> None:
     scene.frame_start, scene.frame_end = 1, 20
     # Without all actions, Blender writes the scene's animation as one take named after it
     scene.name = take
+
+
+def skinned(name: str, bones: list[str], take: str, mat) -> None:
+    """A mesh `name` skinned to an armature with a chain of `bones`, and one action `take`
+    turning the second bone."""
+    rig = armature(bones)
+    height = 0.6 * len(bones)
+    mesh = box(name, size=(0.5, 0.3, height), location=(0, 0, height / 2), materials=[mat])
+    # The bottom vertices follow the first bone and the top ones the last
+    for bone_name, low in [(bones[0], True), (bones[-1], False)]:
+        group = mesh.vertex_groups.new(name=bone_name)
+        group.add([v.index for v in mesh.data.vertices if (v.co.z < 0) == low], 1.0, "REPLACE")
+    mesh.parent = rig
+    mesh.modifiers.new("Armature", "ARMATURE").object = rig
+    animate(rig, bones, take)
+
+
+def export_take(path: str) -> Path:
+    """Exports the scene's one take to `path`, under the take's name."""
+    return export_fbx(
+        path, bake_anim=True, bake_anim_use_all_actions=False, bake_anim_use_nla_strips=False
+    )
+
+
+def animations() -> None:
+    """The animations (step 7), in `Dungeon Props/Animations/`: FBX files with takes and no kept
+    mesh, each on an armature like `SK_Guard`'s."""
+    animations = "Dungeon Props/Animations"
+
+    # A take and no mesh at all, on SK_Guard's bones
+    bpy.ops.wm.read_homefile(use_empty=True)
+    animate(armature(["Hips", "Spine", "Head"]), ["Hips", "Spine", "Head"], "Idle")
+    export_take(f"{animations}/A_GuardIdle.fbx")
+
+    # Its only mesh is a UCX_ hull, which the export drops: still an animation
+    bpy.ops.wm.read_homefile(use_empty=True)
+    box("UCX_A_GuardNod_00", size=(0.6, 0.4, 1.8), location=(0, 0, 0.9))
+    animate(armature(["Hips", "Spine", "Head"]), ["Hips", "Spine", "Head"], "Nod")
+    export_take(f"{animations}/A_GuardNod.fbx")
+
+    # It shares Hips with SK_Guard, which it follows by default, but its Tail isn't SK_Guard's
+    bpy.ops.wm.read_homefile(use_empty=True)
+    animate(armature(["Hips", "Tail"]), ["Hips", "Tail"], "Wag")
+    export_take(f"{animations}/A_Wag.fbx")
 
 
 def models() -> None:
@@ -407,6 +453,11 @@ def unity_log() -> None:
         f"      name: Bark\n    second: {{fileID: 2100000, guid: {mat_bark}, type: 2}}\n"
         "  materials:\n    materialImportMode: 2\n",
     )
+
+
+def refused_takes() -> None:
+    """Models whose takes the normalization script refuses (step 6), in `Dungeon Props/Models/`."""
+    models = "Dungeon Props/Models"
 
     # A take that turns the model's own object, which would undo its normalization
     bpy.ops.wm.read_homefile(use_empty=True)
@@ -640,6 +691,8 @@ def main() -> None:
     png("Scans/Cliffs/T_Cliff_D.png", (95, 90, 85, 255))
 
     models()
+    refused_takes()
+    animations()
 
 
 main()

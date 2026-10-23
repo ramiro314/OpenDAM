@@ -3,6 +3,7 @@ import clsx from 'clsx';
 import { api } from '../../api';
 import type {
   ExportEditPatch,
+  GameAnimationDetail,
   GameImage,
   GameMaterial,
   GameModelDetail,
@@ -14,10 +15,14 @@ import type {
   TextureRole,
 } from '../../types';
 import {
+  avatarLabel,
+  avatarOptions,
+  avatarPatch,
   exportedView,
   facingLine,
   materialNameError,
   pickerOptions,
+  rigOptions,
   rigPatch,
   roleEditable,
   shortPaths,
@@ -50,6 +55,12 @@ const LAYOUTS: [TextureLayoutEdit, string][] = [
   ['Gloss', 'Gloss / smoothness'],
   ['Metallic', 'Metallic'],
 ];
+
+const RIGS: Record<GameRig, string> = {
+  none: 'None',
+  generic: 'Generic',
+  humanoid: 'Humanoid',
+};
 
 const CONVENTIONS: [NormalConvention, string][] = [
   ['opengl', 'OpenGL (green up)'],
@@ -109,8 +120,9 @@ function Row({
 }
 
 /**
- * A model's rig and facing (plan game-export C13, D13, D20): a rig picker and quarter turns
- * about Y, each marked inferred or yours with a reset, and "Show as exported", which has Blender
+ * A model's rig and facing (plan game-export C13, D13, D20): a rig picker, offering humanoid
+ * where the bone names suggest it, and quarter turns about Y, each marked inferred or yours with
+ * a reset, and "Show as exported", which has Blender
  * write the normalized model for the viewer only when you ask. Once shown, the view asks again
  * after each edit (`revision`), so it follows each turn. A turn is computed from the value the
  * last save wrote, so the controls wait while the tab reads that save back (`stale`), showing
@@ -175,16 +187,35 @@ export function ModelEditor({
           className={SELECT}
           value={rig.value}
           disabled={busy}
-          title="Inferred: none without an armature, else generic"
+          title="Inferred: none without an armature, else generic. Only you set humanoid"
           onChange={(e) => {
             const patch = rigPatch(model.rig, e.target.value as GameRig);
             if (patch) apply(patch);
           }}
         >
-          <option value="none">None</option>
-          <option value="generic">Generic</option>
+          {rigOptions(model).map((r) => (
+            <option key={r} value={r}>
+              {RIGS[r]}
+            </option>
+          ))}
         </select>
       </Row>
+      {model.humanoid && rig.value !== 'humanoid' && (
+        <div className={styles.gameSuggestion}>
+          <span className={styles.gameHint} id="detail-game-humanoid">
+            Its bones follow {model.humanoid} naming, so it can be a humanoid.
+          </span>
+          <button
+            type="button"
+            id="detail-game-use-humanoid"
+            className={styles.openLicenseBtn}
+            disabled={busy}
+            onClick={() => apply({ rig: 'humanoid' })}
+          >
+            Use humanoid
+          </button>
+        </div>
+      )}
       <Row
         label="Facing"
         id="detail-game-facing"
@@ -246,6 +277,68 @@ export function ModelEditor({
           <ThreeViewer modelPath={view.path} forwardArrow />
         </div>
       )}
+    </section>
+  );
+}
+
+/**
+ * An animation (plan C9 step 4, C13, D21): the model it follows, its avatarFrom, marked inferred
+ * or yours with a reset, chosen among the domain's rigged models, and its takes. It exports with
+ * that model's facing and pivot, so its clips play on the model as the bundle ships it.
+ */
+export function AnimationEditor({
+  animation,
+  saving,
+  save,
+}: EditorProps & { animation: GameAnimationDetail }) {
+  const follows = shownValue(animation.avatarFrom);
+  const options = avatarOptions(animation, follows.value);
+  return (
+    <section className={styles.gameSection} id="detail-game-animation">
+      <h4 className={styles.gameHeading}>Animation</h4>
+      <Row
+        label="Follows"
+        id="detail-game-avatar"
+        yours={follows.mark === 'yours'}
+        saving={saving}
+        onReset={() => save({ avatarFrom: null })}
+      >
+        <select
+          id="detail-game-avatar"
+          className={SELECT}
+          value={follows.value ?? ''}
+          disabled={saving || options.length === 0}
+          title="Inferred: the rigged model of the domain sharing the most bone names with it"
+          onChange={(e) => {
+            const patch = avatarPatch(animation.avatarFrom, e.target.value);
+            if (patch) save(patch);
+          }}
+        >
+          {follows.value === null && (
+            <option value="">
+              {options.length === 0 ? 'No rigged model in its domain' : 'Choose a model'}
+            </option>
+          )}
+          {options.map((m) => (
+            <option key={m.assetId} value={m.assetId}>
+              {'missing' in m ? 'A model outside its domain: choose another' : avatarLabel(m)}
+            </option>
+          ))}
+        </select>
+      </Row>
+      <p className={styles.gameHint} id="detail-game-avatar-line">
+        It exports with that model’s facing and pivot, so its clips play on the model as exported.
+      </p>
+      <div className={styles.gameRow}>
+        <span className={styles.infoLabel}>Takes</span>
+        <ul className={styles.gameSources} id="detail-game-takes">
+          {animation.takes.map((take) => (
+            <li key={take}>
+              <span className={styles.gameSourcePath}>{take}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
     </section>
   );
 }
