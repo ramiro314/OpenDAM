@@ -571,7 +571,6 @@ export interface ExportEditPatch {
   assetName?: string | null;
 }
 
-/** What Export did: swapped the bundle in, or found that something the Check read changed */
 /**
  * An `export:progress` event: how a Check's Blender jobs are going, sent once before they start
  * and once as each ends. `asset` is the file whose job just ended.
@@ -583,6 +582,7 @@ export interface ExportProgress {
   asset: string | null;
 }
 
+/** What Export did: swapped the bundle in, or found that something the Check read changed */
 export type ExportOutcome =
   | { status: 'exported'; bundlePath: string; assets: number }
   | { status: 'stale'; changes: string[] };

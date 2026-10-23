@@ -458,12 +458,16 @@ pub enum ExportOutcome {
     Stale { changes: Vec<String> },
 }
 
-/// The staged bundles of the open Export views, by domain id. Its lock serializes every Check
-/// and Export, so no two touch one domain's folder at once. It owns what material inference has
-/// read from files for the session, which every Check and Export's re-read go through.
+/// The staged bundles of the open Export views, by domain id. Its lock serializes the file work
+/// of every Check and Export, so no two touch one domain's folder at once, and is never held
+/// while Blender runs. It owns what material inference has read from files for the session,
+/// which every Check and Export's re-read go through.
 #[derive(Default)]
 pub struct Exports {
     staged: Mutex<HashMap<String, Staged>>,
+    /// Held by a Check while it reads its domain and runs its Blender jobs, so two Checks never
+    /// write one export cache entry at once, while Export and Discard of any domain go on
+    normalizing: Mutex<()>,
     memo: Arc<infer::Memo>,
 }
 
@@ -492,6 +496,19 @@ impl Exports {
         facts: &impl fbx_facts::Reader,
         progress: &(dyn Fn(Progress) + Sync),
     ) -> Result<CheckReport, String> {
+        // Blender may run for minutes, so only other Checks wait for it. Anything that changes
+        // between this read and the staging below is in the fingerprint Export compares.
+        let inspection = {
+            let _normalizing = self.normalizing.lock().await;
+            check::inspect(
+                db,
+                domain_id,
+                facts,
+                &self.memo,
+                Models::Normalize(progress),
+            )
+            .await
+        };
         let mut staged = self.staged.lock().await;
         if let Some(earlier) = staged.remove(domain_id) {
             blocking(move || discard(&earlier.staging)).await?;
@@ -501,14 +518,7 @@ impl Exports {
             files,
             fingerprint,
             ..
-        } = check::inspect(
-            db,
-            domain_id,
-            facts,
-            &self.memo,
-            Models::Normalize(progress),
-        )
-        .await?;
+        } = inspection?;
         let Some(bundle) = report.bundle_path.clone().map(PathBuf::from) else {
             return Ok(report);
         };

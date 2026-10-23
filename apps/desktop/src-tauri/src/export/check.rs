@@ -5182,6 +5182,72 @@ mod tests {
         );
     }
 
+    /// Export and Discard of one domain don't wait for another domain's Check while its
+    /// Blender jobs run.
+    #[tokio::test]
+    async fn export_goes_on_while_another_domain_s_check_runs_blender() {
+        use crate::export::bundle::{ExportOutcome, Exports};
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        // Answers its version at once, and takes 6 s over each job, leaving no result
+        let slow = dir.path().join("blender");
+        std::fs::write(
+            &slow,
+            "#!/bin/sh\ncase \"$1\" in --version) printf 'Blender 5.2.2\\n';; *) sleep 6;; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        set_blender(&f, &slow).await;
+        let stool = "Dungeon Props/Models/SM_Stool.fbx";
+        collection(&f, "domain", "Props", "dg", &[stool]).await;
+        collection(
+            &f,
+            "other",
+            "Rocks",
+            "dg",
+            &["Dungeon Props/Rocks/T_Rock_R.png"],
+        )
+        .await;
+        let facts = Facts::fixture();
+        let exports = Exports::default();
+        let staged = exports
+            .check(&f.db, "other", &facts, &|_| {})
+            .await
+            .unwrap();
+        assert!(staged.staged);
+
+        let (started, jobs_started) = tokio::sync::oneshot::channel();
+        let started = std::sync::Mutex::new(Some(started));
+        let progress = |p: Progress| {
+            if p.done == 0 {
+                let _ = started.lock().unwrap().take().unwrap().send(());
+            }
+        };
+        let check = exports.check(&f.db, "domain", &facts, &progress);
+        let export = async {
+            jobs_started.await.unwrap();
+            let start = std::time::Instant::now();
+            let outcome = exports.export(&f.db, "other", &facts).await.unwrap();
+            exports.discard("domain").await.unwrap();
+            (start.elapsed(), outcome)
+        };
+        let (report, (waited, outcome)) = tokio::join!(check, export);
+
+        assert!(
+            matches!(outcome, ExportOutcome::Exported { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(4),
+            "Export waited {waited:?} for the other domain's Blender job"
+        );
+        assert_eq!(
+            messages(&report.unwrap()),
+            [format!("{stool}: Blender exited without a result")]
+        );
+    }
+
     #[tokio::test]
     async fn an_fbx_rewritten_at_the_same_size_and_mtime_misses_its_old_cache_entry() {
         let f = fixture().await;

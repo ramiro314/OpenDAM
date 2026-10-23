@@ -1048,6 +1048,10 @@ later. Where they differ from C9:
 - **Models whose jobs share a cache key share one job.** The key holds no path, so identical FBX
   files in one library with the same settings would write one output file. They get one Blender
   job, whose problem or entry belongs to all of them, and progress counts jobs, not models.
+- **Blender runs outside the staged bundles' lock.** A Check reads its domain and runs its
+  Blender jobs under a lock of their own, which only other Checks wait for, then takes the
+  staged bundles' lock to stage. Export and Discard of any domain go on meanwhile, and anything
+  that changes between the read and the staging is in the fingerprint Export compares.
 - **Progress is sent once before the jobs and once as each ends** (`export:progress`, with the
   domain's id), not as each starts, since jobs queue for the runner's `job_limit` permits. The
   Export view shows "Normalizing models in Blender: 2 of 5 models done, last SM_Chest.fbx".
