@@ -5,10 +5,11 @@
 //!
 //! A domain is a direct child of the root collection (C3). Its assets are the grid items in it
 //! and all its subcollections, across every library, each once. A format group with an FBX, or
-//! a lone FBX, is a model or an animation by its FBX's facts (`fbx_facts`). Until later steps of
-//! the plan's build order land, only standalone textures that pass through byte for byte export,
-//! each with its nearest `conversion.json`'s steps (C10): the guards refuse a texture that needs
-//! converting, every model and every animation.
+//! a lone FBX, is a model or an animation by its FBX's facts (`fbx_facts`). Textures export by
+//! texture set (C8): a source that is ready passes through byte for byte, and every other one is
+//! converted into the export cache (C11), with its nearest `conversion.json`'s steps, then
+//! OpenDAM's own (C10). Until later steps of the plan's build order land, the guards refuse every
+//! model and every animation.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -25,8 +26,8 @@ use crate::export::fingerprint::{Fingerprint, Probes, Stamp};
 use crate::export::infer::{self, PackImages, UnityPack};
 use crate::export::names::{is_pascal, pascal};
 use crate::export::packs::{self, Origin, PackSource};
-use crate::export::textures::{self, Convention, Layout, LayoutEdit, Refusal, Role, SourceEdits};
-use crate::export::{contract, edits, hashes, settings};
+use crate::export::textures::{self, Convention, Layout, LayoutEdit, Role, SourceEdits, Work};
+use crate::export::{cache, contract, edits, hashes, settings};
 use crate::models::AssetKind;
 use crate::structure::{self, PackOverride};
 
@@ -929,7 +930,7 @@ struct ReadyTexture {
     sha256: String,
     source_path: String,
     conversion: Vec<Value>,
-    /// The file to copy into the bundle
+    /// The file to copy into the bundle: the source itself, or its export cache entry
     source: PathBuf,
 }
 
@@ -938,7 +939,20 @@ struct Read {
     row: CheckedAsset,
     /// Index of its pack in the domain's packs
     pack: Option<usize>,
-    ready: Option<ReadyTexture>,
+    /// The textures it is the first input of (D17)
+    ready: Vec<ReadyTexture>,
+}
+
+/// One texture a set exports (C8), before its file is made.
+struct PlannedTexture {
+    /// Its set's name
+    name: String,
+    output: textures::Output,
+    /// Its inputs' indices in the check's reads, in the output's order
+    reads: Vec<usize>,
+    library: usize,
+    /// Index of its pack in the domain's packs
+    pack: Option<usize>,
 }
 
 /// What `evaluate` found, with the files each library's check stats, in library order.
@@ -972,6 +986,9 @@ struct TextureJob {
     layout: Layout,
     convention: Convention,
     member: bool,
+    /// Its texture set, by its pack and its index in the pack's `PackImages`; `None` for an
+    /// image in no pack, a set of its own
+    set: Option<(PackKey, usize)>,
     game: TextureGame,
 }
 
@@ -1150,6 +1167,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
                                 layout,
                                 convention: edits.convention.unwrap_or(convention),
                                 member: true,
+                                set: None,
                                 game: TextureGame::new(inferred, convention, edits, vec![alone]),
                             });
                         }
@@ -1168,7 +1186,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
             reads.push(Read {
                 row,
                 pack,
-                ready: None,
+                ready: Vec::new(),
             });
         }
     }
@@ -1306,6 +1324,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
             layout: images.layout(image),
             convention: images.convention(image, sources[pack].normal_convention()),
             member: member_images.contains(&(key, image)),
+            set: Some((key, images.set_of[image])),
             game: TextureGame::new(
                 images.inferred_layout(image),
                 images.inferred_convention(image, sources[pack].normal_convention()),
@@ -1321,15 +1340,10 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
     let mut invalid_conversions: BTreeMap<(usize, String), (Invalid, Vec<AssetRef>)> =
         BTreeMap::new();
     let mut texture_games: HashMap<String, TextureGame> = HashMap::new();
-    for job in jobs {
+    // Job `j` is read `first_texture + j`
+    let first_texture = reads.len();
+    for job in &jobs {
         texture_games.insert(job.asset.asset_id.clone(), job.game.clone());
-        let input = &mut inputs[job.library];
-        let mut issue = |message: String| {
-            problems.push(Problem {
-                message: format!("{}: {message}", job.asset.file_path),
-                assets: vec![job.asset.clone()],
-            })
-        };
         let mut row = CheckedAsset {
             asset: job.asset.clone(),
             kind: Kind::Texture,
@@ -1348,51 +1362,82 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
                 row.normal_convention = Some(job.convention);
             }
         }
-        // A pass-through texture has no step of OpenDAM's own
-        let path = &job.asset.file_path;
-        let conversion = match walkers[job.library].chain(&[path], Vec::new()) {
-            Ok(chain) => Some(chain),
-            Err(invalid) => {
-                invalid_conversions
-                    .entry((job.library, invalid.path.clone()))
-                    .or_insert_with(|| (invalid, Vec::new()))
-                    .1
-                    .push(job.asset.clone());
-                None
-            }
-        };
-        let mut ready = None;
-        match (
-            textures::pass_through(&job.extension, job.layout, job.convention),
-            job.pack,
-            conversion,
-        ) {
-            (Err(Refusal::NeedsConversion(m) | Refusal::Unsupported(m)), _, _) => issue(m),
-            (Ok(pass), Some(pack), Some(conversion)) if is_pascal(&job.name.value()) => {
-                match input.memo.sha256(&mut walkers[job.library].probes, path) {
-                    Ok(sha256) => {
-                        ready = Some(ReadyTexture {
-                            name: job.name.value(),
-                            role: pass.role,
-                            extension: pass.extension,
-                            sha256,
-                            source_path: relative_to(&sources[pack].path, path),
-                            conversion,
-                            source: input.library.root_path.join(path),
-                        })
-                    }
-                    Err(e) => issue(format!("it can't be read: {e}")),
-                }
-            }
-            _ => {}
+        if let Err(invalid) = walkers[job.library].chain(&[&job.asset.file_path], Vec::new()) {
+            invalid_conversions
+                .entry((job.library, invalid.path.clone()))
+                .or_insert_with(|| (invalid, Vec::new()))
+                .1
+                .push(job.asset.clone());
         }
         asset_names.insert(job.asset.asset_id.clone(), job.name.clone());
         reads.push(Read {
             row,
             pack: job.pack,
-            ready,
+            ready: Vec::new(),
         });
     }
+
+    // Each texture set's sources go through C8's table together, by path
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of: HashMap<(PackKey, usize), usize> = HashMap::new();
+    for (j, job) in jobs.iter().enumerate() {
+        match job.set {
+            Some(set) => {
+                let g = *group_of.entry(set).or_insert_with(|| {
+                    groups.push(Vec::new());
+                    groups.len() - 1
+                });
+                groups[g].push(j);
+            }
+            None => groups.push(vec![j]),
+        }
+    }
+    let mut planned: Vec<PlannedTexture> = Vec::new();
+    for mut group in groups {
+        group.sort_by(|a, b| jobs[*a].asset.file_path.cmp(&jobs[*b].asset.file_path));
+        let set_sources: Vec<textures::Source> = group
+            .iter()
+            .map(|j| {
+                let job = &jobs[*j];
+                let path = &job.asset.file_path;
+                textures::Source {
+                    source_path: job
+                        .pack
+                        .map_or_else(|| path.clone(), |p| relative_to(&sources[p].path, path)),
+                    extension: job.extension.clone(),
+                    layout: job.layout,
+                    convention: job.convention,
+                }
+            })
+            .collect();
+        let (outputs, refused) = textures::plan(&set_sources);
+        for refusal in refused {
+            let assets: Vec<AssetRef> = refusal
+                .sources
+                .iter()
+                .map(|i| jobs[group[*i]].asset.clone())
+                .collect();
+            problems.push(Problem {
+                message: format!("{}: {}", assets[0].file_path, refusal.message),
+                assets,
+            });
+        }
+        for output in outputs {
+            let first = &jobs[group[output.inputs[0]]];
+            planned.push(PlannedTexture {
+                name: first.name.value(),
+                reads: output
+                    .inputs
+                    .iter()
+                    .map(|i| first_texture + group[*i])
+                    .collect(),
+                library: first.library,
+                pack: first.pack,
+                output,
+            });
+        }
+    }
+
     // Each asset's problems together, in library order, then by path, as the items are
     let library_order: HashMap<&str, usize> = inputs
         .iter()
@@ -1414,7 +1459,54 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
         });
     }
 
-    names(&reads, &mut problems);
+    names(&reads, &planned, &mut problems);
+
+    // Each texture no problem names gets its file: its source, or the export cache's entry
+    let refused: HashSet<String> = problems
+        .iter()
+        .flat_map(|p| &p.assets)
+        .map(|a| a.asset_id.clone())
+        .collect();
+    for texture in &planned {
+        let assets: Vec<AssetRef> = texture
+            .reads
+            .iter()
+            .map(|r| reads[*r].row.asset.clone())
+            .collect();
+        let (Some(pack), true) = (texture.pack, is_pascal(&texture.name)) else {
+            continue;
+        };
+        if assets.iter().any(|a| refused.contains(&a.asset_id)) {
+            continue;
+        }
+        let paths: Vec<String> = assets.iter().map(|a| a.file_path.clone()).collect();
+        let own = match &texture.output.work {
+            Work::PassThrough { .. } => Vec::new(),
+            Work::Convert { steps, .. } => steps.clone(),
+        };
+        let walker = &mut walkers[texture.library];
+        // An invalid conversion.json is a problem already
+        let Ok(conversion) = walker.chain(&[&paths[0]], own) else {
+            continue;
+        };
+        let input = &mut inputs[texture.library];
+        match texture_file(input, &mut walker.probes, &texture.output, &paths) {
+            Ok((source, sha256)) => reads[texture.reads[0]].ready.push(ReadyTexture {
+                name: texture.name.clone(),
+                role: texture.output.role,
+                extension: texture.output.extension(),
+                sha256,
+                source_path: relative_to(&sources[pack].path, &paths[0]),
+                conversion,
+                source,
+            }),
+            Err(e) => problems.push(Problem {
+                message: format!("{}: {e}", paths[0]),
+                assets,
+            }),
+        }
+    }
+
     let (manifest, mut invalid, files) = manifest(domain, &reads, &export_packs, &problems);
     problems.append(&mut invalid);
     let mut rows: Vec<CheckedAsset> = reads.into_iter().map(|r| r.row).collect();
@@ -1447,6 +1539,62 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
         models: model_games,
         textures: texture_games,
     }
+}
+
+/// The file a bundle copies for `output`, made from the files `paths` (relative to the library
+/// root of `input`, in the output's order), and its sha256: the source itself when it passes
+/// through, else the export cache's entry (C11), converted first on a miss. A converted
+/// texture's inputs are read and keyed by their bytes' own sha256s, never by the memo alone, so a
+/// file rewritten at the same size and mtime can't be served its old entry; the memo row is
+/// corrected for the next check.
+fn texture_file(
+    input: &mut LibraryInput,
+    probes: &mut Probes,
+    output: &textures::Output,
+    paths: &[String],
+) -> Result<(PathBuf, String), String> {
+    let root = input.library.root_path.clone();
+    let what = |i: usize| {
+        if i == 0 {
+            "it".to_string()
+        } else {
+            paths[i].clone()
+        }
+    };
+    let mut sha256s = Vec::with_capacity(paths.len());
+    for (i, path) in paths.iter().enumerate() {
+        let sha256 = input
+            .memo
+            .sha256(probes, path)
+            .map_err(|e| format!("{} can't be read: {e}", what(i)))?;
+        sha256s.push(sha256);
+    }
+    let Work::Convert { recipe, steps } = &output.work else {
+        return Ok((root.join(&paths[0]), sha256s.swap_remove(0)));
+    };
+    let mut bytes = Vec::with_capacity(paths.len());
+    for (i, path) in paths.iter().enumerate() {
+        let read = std::fs::read(root.join(path))
+            .map_err(|e| format!("{} can't be read: {e}", what(i)))?;
+        let sha256 = hashes::sha256_bytes(&read);
+        if sha256 != sha256s[i] {
+            input.memo.correct(path, sha256.clone());
+            sha256s[i] = sha256;
+        }
+        bytes.push(read);
+    }
+    let key = cache::texture_key(&sha256s, steps);
+    let cached = cache::texture(&root, &key, || {
+        let named: Vec<(&str, &[u8])> = paths
+            .iter()
+            .zip(&bytes)
+            .map(|(p, b)| (p.as_str(), b.as_slice()))
+            .collect();
+        textures::convert(*recipe, &named)
+    })?;
+    let sha256 = hashes::sha256_file(&cached)
+        .map_err(|e| format!("its export cache entry can't be read: {e}"))?;
+    Ok((cached, sha256))
 }
 
 /// The problems of a model's material names (D22, C5): a slot whose name gives no PascalCase
@@ -1524,12 +1672,14 @@ fn relative_to(pack_path: &str, file_path: &str) -> String {
 }
 
 /// Names that aren't PascalCase, and names that collide (C5): two models or animations with one
-/// name, or two textures with one name and role. Each collision is one problem naming every
-/// asset in it. A source whose layout isn't one role (ORM, MaskMap, Roughness, Gloss, Metallic)
-/// has no output role until texture conversion makes one, so it collides with nothing: a set's
-/// `_R` and `_M` maps share a name because they merge into one MetallicSmoothness.
-fn names(reads: &[Read], problems: &mut Vec<Problem>) {
-    let mut by_key: BTreeMap<(bool, String, Option<Role>), Vec<&CheckedAsset>> = BTreeMap::new();
+/// name, or two textures (`textures`, a set's outputs) with one name and role. Each collision is
+/// one problem naming every asset in it, a texture by all its sources. Sources collide only
+/// through their outputs: a set's `_R` and `_M` maps share a name because they merge into one
+/// MetallicSmoothness.
+fn names(reads: &[Read], textures: &[PlannedTexture], problems: &mut Vec<Problem>) {
+    // Each name and role's assets, each a model's row or a texture's sources
+    type Named<'a> = BTreeMap<(bool, String, Option<Role>), Vec<Vec<&'a CheckedAsset>>>;
+    let mut by_key: Named = BTreeMap::new();
     for read in reads {
         let row = &read.row;
         let Some(name) = &row.asset_name else {
@@ -1545,34 +1695,38 @@ fn names(reads: &[Read], problems: &mut Vec<Problem>) {
             });
             continue;
         }
-        match (row.kind, row.role) {
-            (Kind::Texture, Some(role)) => by_key
-                .entry((true, name.clone(), Some(role)))
-                .or_default()
-                .push(row),
-            (Kind::Model | Kind::Animation, _) => by_key
+        if matches!(row.kind, Kind::Model | Kind::Animation) {
+            by_key
                 .entry((false, name.clone(), None))
                 .or_default()
-                .push(row),
-            (Kind::Texture | Kind::Other, _) => {}
+                .push(vec![row]);
         }
     }
-    for ((texture, name, role), rows) in by_key {
-        if rows.len() < 2 {
+    for texture in textures.iter().filter(|t| is_pascal(&t.name)) {
+        by_key
+            .entry((true, texture.name.clone(), Some(texture.output.role)))
+            .or_default()
+            .push(texture.reads.iter().map(|r| &reads[*r].row).collect());
+    }
+    for ((texture, name, role), assets) in by_key {
+        if assets.len() < 2 {
             continue;
         }
         let what = match role.filter(|_| texture) {
             Some(role) => format!("textures are named {name} with the role {}", role.as_str()),
             None => format!("models or animations are named {name}"),
         };
-        let paths: Vec<&str> = rows.iter().map(|r| r.asset.file_path.as_str()).collect();
+        let paths: Vec<&str> = assets
+            .iter()
+            .map(|rows| rows[0].asset.file_path.as_str())
+            .collect();
         problems.push(Problem {
             message: format!(
                 "{} {what}: {}. Give one another name in its Game tab",
-                rows.len(),
+                assets.len(),
                 paths.join(" and ")
             ),
-            assets: rows.iter().map(|r| r.asset.clone()).collect(),
+            assets: assets.iter().flatten().map(|r| r.asset.clone()).collect(),
         });
     }
 }
@@ -1601,28 +1755,30 @@ fn manifest(
         .collect();
     let mut entries: Vec<Entry> = Vec::new();
     for read in reads {
-        let (Some(texture), Some(pack)) = (&read.ready, read.pack) else {
+        let Some(pack) = read.pack else {
             continue;
         };
         if refused.contains(read.row.asset.asset_id.as_str()) {
             continue;
         }
-        let role = texture.role.as_str();
-        entries.push(Entry {
-            value: json!({
-                "kind": "texture",
-                "assetName": texture.name,
-                "file": format!("Textures/{}_{role}.{}", texture.name, texture.extension),
-                "sha256": texture.sha256,
-                "pack": export_packs[pack].id,
-                "sourcePath": texture.source_path,
-                "conversion": texture.conversion,
-                "role": role,
-            }),
-            asset: &read.row.asset,
-            pack,
-            source: texture.source.clone(),
-        });
+        for texture in &read.ready {
+            let role = texture.role.as_str();
+            entries.push(Entry {
+                value: json!({
+                    "kind": "texture",
+                    "assetName": texture.name,
+                    "file": format!("Textures/{}_{role}.{}", texture.name, texture.extension),
+                    "sha256": texture.sha256,
+                    "pack": export_packs[pack].id,
+                    "sourcePath": texture.source_path,
+                    "conversion": texture.conversion,
+                    "role": role,
+                }),
+                asset: &read.row.asset,
+                pack,
+                source: texture.source.clone(),
+            });
+        }
     }
     let kind_rank = |v: &Value| match v["kind"].as_str() {
         Some("model") => 0,
@@ -1989,10 +2145,56 @@ mod tests {
         assert_eq!(packs, ["foo", "foo-2", "foo-3", "pack"]);
     }
 
+    /// Inspects a new domain holding `paths`, as a Check does before staging.
+    async fn inspect_domain(f: &Fixture, paths: &[&str]) -> Inspection {
+        collection(f, "domain", "Props", "dg", paths).await;
+        inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap()
+    }
+
+    /// The manifest entry of the texture `name` in the role `role`.
+    fn entry<'a>(report: &'a CheckReport, name: &str, role: &str) -> &'a Value {
+        report.manifest["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["assetName"] == name && a["role"] == role)
+            .unwrap_or_else(|| panic!("no {name} {role} in the manifest"))
+    }
+
+    /// The bundle file `file` of `inspection`, checked against its sha256, and the file it is
+    /// copied from.
+    fn bundle_file<'a>(inspection: &'a Inspection, file: &str) -> (Vec<u8>, &'a Path) {
+        let found = inspection
+            .files
+            .iter()
+            .find(|b| b.file == file)
+            .unwrap_or_else(|| panic!("no bundle file {file}"));
+        let bytes = std::fs::read(&found.source).unwrap();
+        assert_eq!(hashes::sha256_bytes(&bytes), found.sha256, "{file}");
+        (bytes, &found.source)
+    }
+
+    /// The pixels of the bundle file `file`, which is a PNG.
+    fn bundle_pixels(inspection: &Inspection, file: &str) -> image::DynamicImage {
+        let (bytes, _) = bundle_file(inspection, file);
+        image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).unwrap()
+    }
+
+    /// `pixel` repeated over a 4 by 4 fixture image.
+    fn sixteen(pixel: &[u8]) -> Vec<u8> {
+        pixel.repeat(16)
+    }
+
+    fn opendam_step(by: &str, from: &str, settings: Value) -> Value {
+        json!({"tool": "OpenDAM", "toolVersion": "opendam-textures/1", "by": by, "from": from, "settings": settings})
+    }
+
     #[tokio::test]
-    async fn guards_refuse_conversions_and_fbx_naming_the_asset() {
+    async fn textures_that_need_work_are_converted_and_only_models_wait() {
         let f = fixture().await;
-        let report = check_domain(
+        let inspection = inspect_domain(
             &f,
             &[
                 "Converted/Ruins/T_Pillar_N.png",
@@ -2003,39 +2205,114 @@ mod tests {
             ],
         )
         .await;
+        let report = &inspection.report;
 
+        // The step-5 guard's cases export, and the model guard still refuses
         assert_eq!(
-            messages(&report),
+            messages(report),
+            ["Dungeon Props/Models/SM_Chest.fbx: model export not built yet (an FBX with a kept mesh exports as a model)"]
+        );
+        assert_valid(report);
+        assert_eq!(
+            texture_entries(report),
             [
-                "Converted/Ruins/T_Pillar_N.png: texture conversion not built yet: it needs its DirectX normal map's green channel flipped",
-                "Dungeon Props/Models/SM_Chest.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
-                "Dungeon Props/Rocks/T_Slate_ORM.png: texture conversion not built yet: it needs its ORM channels split into URP roles",
-                "Dungeon Props/Textures/T_Wall_D.jpg: texture conversion not built yet: it needs its .jpg format to PNG",
-                "Dungeon Props/Textures/T_Wall_N_DX.png: texture conversion not built yet: it needs its DirectX normal map's green channel flipped",
+                ("Pillar", "BaseColor", "Textures/Pillar_BaseColor.png"),
+                ("Pillar", "Normal", "Textures/Pillar_Normal.png"),
+                (
+                    "Slate",
+                    "MetallicSmoothness",
+                    "Textures/Slate_MetallicSmoothness.png"
+                ),
+                ("Slate", "Occlusion", "Textures/Slate_Occlusion.png"),
+                ("Wall", "BaseColor", "Textures/Wall_BaseColor.png"),
+                ("Wall", "Normal", "Textures/Wall_Normal.png"),
             ]
+            .map(|(n, r, p)| (n.to_string(), r.to_string(), p.to_string()))
         );
-        for problem in &report.problems {
-            let path = problem.message.split(':').next().unwrap();
-            assert_eq!(problem.assets.len(), 1);
-            assert_eq!(problem.assets[0].file_path, path);
-        }
-        let members = report.assets.iter().filter(|a| a.member);
-        assert!(members.clone().all(|a| a.status == Status::Problem));
-        assert_eq!(members.count(), 5);
-        // T_Pillar_N brings in its set's base color, which passes through
-        assert_eq!(
-            texture_entries(&report),
-            [(
-                "Pillar".to_string(),
-                "BaseColor".to_string(),
-                "Textures/Pillar_BaseColor.png".to_string()
-            )]
-        );
-        assert_valid(&report);
+
+        // The Ruins pack is unreal, so its normal maps are DirectX: its steps follow the
+        // conversion.json above the pack
         let ruins = report.packs.iter().find(|p| p.pack.id == "ruins").unwrap();
         assert_eq!(ruins.pack.origin, packs::Origin::Unreal);
         assert_eq!(ruins.normal_convention, Convention::DirectX);
-        assert_eq!(ruins.pack.licence.spdx.as_deref(), Some("CC-BY-4.0"));
+        let normal = json!({"layout": "Normal", "role": "Normal"});
+        let pillar = entry(report, "Pillar", "Normal");
+        assert_eq!(pillar["sourcePath"], "T_Pillar_N.png");
+        assert_eq!(
+            pillar["conversion"],
+            json!([
+                {"tool": "UE Asset Exporter", "toolVersion": "5.4", "from": "uasset"},
+                opendam_step("flip-normal-green", "png", normal.clone()),
+            ])
+        );
+        assert_eq!(
+            bundle_pixels(&inspection, "Textures/Pillar_Normal.png").as_bytes(),
+            sixteen(&[128, 128, 255, 255])
+        );
+        assert_eq!(
+            entry(report, "Wall", "Normal")["conversion"],
+            json!([opendam_step("flip-normal-green", "png", normal)])
+        );
+        assert_eq!(
+            bundle_pixels(&inspection, "Textures/Wall_Normal.png").as_bytes(),
+            sixteen(&[128, 127, 255, 255])
+        );
+
+        // An ORM map is an Occlusion and a MetallicSmoothness of one name
+        let orm = |role: &str| json!({"layout": "ORM", "role": role});
+        assert_eq!(
+            entry(report, "Slate", "Occlusion")["conversion"],
+            json!([opendam_step("repack-orm", "png", orm("Occlusion"))])
+        );
+        assert_eq!(
+            entry(report, "Slate", "MetallicSmoothness")["conversion"],
+            json!([
+                opendam_step("repack-orm", "png", orm("MetallicSmoothness")),
+                opendam_step("invert-roughness", "png", orm("MetallicSmoothness")),
+            ])
+        );
+        // T_Slate_ORM is (255, 128, 0)
+        assert_eq!(
+            bundle_pixels(&inspection, "Textures/Slate_Occlusion.png").as_bytes(),
+            sixteen(&[255, 255, 255])
+        );
+        assert_eq!(
+            bundle_pixels(&inspection, "Textures/Slate_MetallicSmoothness.png").as_bytes(),
+            sixteen(&[0, 0, 0, 127])
+        );
+
+        // A JPG becomes a PNG of the same pixels, from the export cache
+        let wall = entry(report, "Wall", "BaseColor");
+        assert_eq!(wall["sourcePath"], "Textures/T_Wall_D.jpg");
+        assert_eq!(
+            wall["conversion"],
+            json!([opendam_step(
+                "to-png",
+                "jpg",
+                json!({"layout": "BaseColor", "role": "BaseColor"})
+            )])
+        );
+        let jpg = image::open(
+            f.library
+                .root_path
+                .join("Dungeon Props/Textures/T_Wall_D.jpg"),
+        )
+        .unwrap();
+        let png = bundle_pixels(&inspection, "Textures/Wall_BaseColor.png");
+        assert_eq!(png.color(), jpg.color());
+        assert_eq!(png.as_bytes(), jpg.as_bytes());
+        let (_, source) = bundle_file(&inspection, "Textures/Wall_BaseColor.png");
+        assert!(source.starts_with(cache::cache_dir(&f.library.root_path)));
+        // A texture that passes through is copied from its source
+        let (_, source) = bundle_file(&inspection, "Textures/Pillar_BaseColor.png");
+        assert_eq!(
+            source,
+            f.library.root_path.join("Converted/Ruins/T_Pillar_D.png")
+        );
+        assert_eq!(
+            entry(report, "Pillar", "BaseColor")["conversion"],
+            json!([{"tool": "UE Asset Exporter", "toolVersion": "5.4", "from": "uasset"}])
+        );
     }
 
     /// Saves your origin and normal-map convention for the fixture's pack at `path`, as the pack
@@ -2075,10 +2352,20 @@ mod tests {
         .await;
 
         // Dungeon Props' normal maps are DirectX now, and Ruins' OpenGL, so the pillar's normal
-        // map passes through, with its conversion.json's steps
+        // map passes through, with its conversion.json's steps, and the stone floor's has its
+        // green flipped
+        assert_eq!(messages(&report), Vec::<&str>::new());
         assert_eq!(
-            messages(&report),
-            ["Dungeon Props/Textures/T_StoneFloor_N.png: texture conversion not built yet: it needs its DirectX normal map's green channel flipped"]
+            entry(&report, "Pillar", "Normal")["conversion"],
+            json!([{"tool": "UE Asset Exporter", "toolVersion": "5.4", "from": "uasset"}])
+        );
+        assert_eq!(
+            entry(&report, "StoneFloor", "Normal")["conversion"],
+            json!([opendam_step(
+                "flip-normal-green",
+                "png",
+                json!({"layout": "Normal", "role": "Normal"})
+            )])
         );
         assert!(
             texture_entries(&report).contains(&(
@@ -2152,11 +2439,8 @@ mod tests {
         .await;
 
         // The step-3 guard's case now exports (AC14). T_Pillar_D brings in its set's normal map,
-        // which is DirectX in an unreal pack and waits for texture conversion
-        assert_eq!(
-            messages(&report),
-            ["Converted/Ruins/T_Pillar_N.png: texture conversion not built yet: it needs its DirectX normal map's green channel flipped"]
-        );
+        // which is DirectX in an unreal pack, so it has its green flipped after the pack's steps
+        assert_eq!(messages(&report), Vec::<&str>::new());
         assert_valid(&report);
         let assets = report.manifest["assets"].as_array().unwrap();
         let chains: Vec<(&str, &Value)> = assets
@@ -2168,6 +2452,10 @@ mod tests {
             "tool": "Substance 3D Sampler", "toolVersion": "4.2", "from": "jpg",
             "settings": {"resolution": 2048}
         }]);
+        let pillar_normal = json!([
+            {"tool": "UE Asset Exporter", "toolVersion": "5.4", "from": "uasset"},
+            opendam_step("flip-normal-green", "png", json!({"layout": "Normal", "role": "Normal"})),
+        ]);
         // The deeper Scans/Cliffs/conversion.json replaces the pack's, in its own order
         let cliffs = json!([
             {"tool": "RealityScan", "toolVersion": "2.0", "from": "jpg"},
@@ -2183,6 +2471,7 @@ mod tests {
                 ("Cliff", &cliffs),
                 ("CrateWood", &json!([])),
                 ("Pillar", &uasset),
+                ("Pillar", &pillar_normal),
             ]
         );
         assert_eq!(assets[1]["sourcePath"], "Cliffs/T_Cliff_D.png");
@@ -2344,7 +2633,7 @@ mod tests {
             [
                 "Dungeon Props/Docs/notes.md: it is neither a model, an animation nor an image, so it can't be exported",
                 "Dungeon Props/Models/SM_Barrel.obj: it has no FBX file: a model exports from its group's FBX",
-                "Dungeon Props/Textures/T_Sky.exr: a .exr texture can't be exported: use png, tga, psd or tif",
+                "Dungeon Props/Textures/T_Sky.exr: a .exr texture can't be exported: use png, tga, psd or tif (jpg, jpeg, bmp, webp and gif become PNG)",
                 "Loose/stray.png: it is in no pack: mark its folder as a pack",
             ]
         );
@@ -2883,7 +3172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maps_that_merge_into_one_role_are_no_name_collision() {
+    async fn maps_that_merge_into_one_role_are_no_name_collision_but_two_outputs_of_one_are() {
         let f = fixture().await;
         let textures = f.library.root_path.join("Dungeon Props/Textures");
         let png = std::fs::read(textures.join("T_StoneFloor_D.png")).unwrap();
@@ -2891,6 +3180,8 @@ mod tests {
             "Bricks_Roughness.png",
             "Bricks_Metallic.png",
             "Bricks_MaskMap.png",
+            "Tiles_Roughness.png",
+            "Tiles_Metallic.png",
         ] {
             std::fs::write(textures.join(name), &png).unwrap();
         }
@@ -2903,20 +3194,37 @@ mod tests {
             &f,
             &[
                 "Dungeon Props/Textures/Bricks_Roughness.png",
-                "Dungeon Props/Textures/Bricks_Metallic.png",
-                "Dungeon Props/Textures/Bricks_MaskMap.png",
+                "Dungeon Props/Textures/Tiles_Roughness.png",
             ],
         )
         .await;
 
-        // Each waits for texture conversion, and none is reported as sharing a name
+        // The Tiles maps share a name and merge into one MetallicSmoothness, while the Bricks
+        // set's MaskMap gives a second one of its name
         assert_eq!(
             messages(&report),
+            ["2 textures are named Bricks with the role MetallicSmoothness: Dungeon Props/Textures/Bricks_MaskMap.png and Dungeon Props/Textures/Bricks_Roughness.png. Give one another name in its Game tab"]
+        );
+        let named: Vec<&str> = report.problems[0]
+            .assets
+            .iter()
+            .map(|a| a.file_path.as_str())
+            .collect();
+        assert_eq!(
+            named,
             [
-                "Dungeon Props/Textures/Bricks_MaskMap.png: texture conversion not built yet: it needs its MaskMap channels split into URP roles",
-                "Dungeon Props/Textures/Bricks_Metallic.png: texture conversion not built yet: it needs its Metallic map merged into a MetallicSmoothness",
-                "Dungeon Props/Textures/Bricks_Roughness.png: texture conversion not built yet: it needs its Roughness map merged into a MetallicSmoothness",
+                "Dungeon Props/Textures/Bricks_MaskMap.png",
+                "Dungeon Props/Textures/Bricks_Roughness.png",
+                "Dungeon Props/Textures/Bricks_Metallic.png",
             ]
+        );
+        assert_eq!(
+            texture_entries(&report),
+            [(
+                "Tiles".to_string(),
+                "MetallicSmoothness".to_string(),
+                "Textures/Tiles_MetallicSmoothness.png".to_string()
+            )]
         );
         assert_valid(&report);
     }
@@ -3093,10 +3401,6 @@ mod tests {
                 "Dungeon Props/Models/SM_Chest.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
                 "Dungeon Props/Models/SM_Gate.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
                 "Dungeon Props/Models/SM_Pillar.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
-                // Textures the models' materials bring in
-                "Dungeon Props/Textures/T_Guard_AORM.png: texture conversion not built yet: it needs its ORM channels split into URP roles",
-                "Dungeon Props/Textures/T_Iron_M.png: texture conversion not built yet: it needs its Metallic map merged into a MetallicSmoothness",
-                "Dungeon Props/Textures/T_Iron_R.png: texture conversion not built yet: it needs its Roughness map merged into a MetallicSmoothness",
             ]
         );
         let models: Vec<_> = report
@@ -3152,14 +3456,17 @@ mod tests {
                 "Dungeon Props/Models/SM_Pillar.fbx",
             ]
         );
-        // No model exports yet, but the textures their materials bring in that pass through do
+        // No model exports yet, but the textures their materials bring in do
         let names: Vec<(String, String)> = texture_entries(&report)
             .into_iter()
             .map(|(name, role, _)| (name, role))
             .collect();
         let expected = [
             ("Gate", "BaseColor"),
+            ("Gate", "MetallicSmoothness"),
             ("Guard", "BaseColor"),
+            ("Guard", "MetallicSmoothness"),
+            ("Guard", "Occlusion"),
             ("Pillar", "BaseColor"),
             ("Pillar", "Normal"),
         ];
@@ -3201,10 +3508,14 @@ mod tests {
             format!("Dungeon Props/Models/SM_Lamp.fbx: {guard}"),
             format!("Dungeon Props/Models/SM_Shelf.fbx: {guard}"),
             format!("Dungeon Props/Models/SM_Stool.fbx: {guard}"),
-            // SM_Stool's slot finds its JPG base color by the model's name
-            "Dungeon Props/Textures/T_Stool_D.jpg: texture conversion not built yet: it needs its .jpg format to PNG".to_string(),
         ];
         assert_eq!(messages(&report), expected);
+        // SM_Stool's slot finds its JPG base color by the model's name, which becomes a PNG
+        assert!(texture_entries(&report).contains(&(
+            "Stool".to_string(),
+            "BaseColor".to_string(),
+            "Textures/Stool_BaseColor.png".to_string()
+        )));
         for problem in &report.problems {
             let path = problem.message.split(':').next().unwrap();
             assert_eq!(problem.assets.len(), 1);
@@ -3592,7 +3903,7 @@ mod tests {
                     "ORM",
                     dx,
                     false,
-                    Problem
+                    Ready
                 ),
                 (
                     "Dungeon Props/Textures/T_Guard_D.png",
@@ -3616,7 +3927,7 @@ mod tests {
                     "Metallic",
                     dx,
                     false,
-                    Problem
+                    Ready
                 ),
                 (
                     "Dungeon Props/Textures/T_Iron_R.png",
@@ -3624,7 +3935,7 @@ mod tests {
                     "Roughness",
                     dx,
                     false,
-                    Problem
+                    Ready
                 ),
                 (
                     "Dungeon Props/Textures/T_StoneFloor_D.png",
@@ -3648,7 +3959,7 @@ mod tests {
                     "BaseColor",
                     dx,
                     false,
-                    Problem
+                    Ready
                 ),
                 (
                     "Unity Moss/Textures/T_Bark_Albedo.png",
@@ -3677,20 +3988,28 @@ mod tests {
             ]
         );
 
-        // The step-5 guard names each texture that needs converting (AC14)
-        let refused: Vec<&str> = messages(&report)
+        // The textures that need converting export (AC14): the Iron maps merge into the Gate
+        // MetallicSmoothness, the AORM map splits, and the JPG becomes a PNG
+        let entries: Vec<(String, String)> = texture_entries(&report)
             .into_iter()
-            .filter(|m| m.contains("texture conversion not built yet"))
+            .map(|(name, role, _)| (name, role))
             .collect();
+        for (name, role) in [
+            ("Gate", "MetallicSmoothness"),
+            ("Guard", "MetallicSmoothness"),
+            ("Guard", "Occlusion"),
+            ("Stool", "BaseColor"),
+        ] {
+            assert!(
+                entries.contains(&(name.to_string(), role.to_string())),
+                "{name} {role} in {entries:?}"
+            );
+        }
         assert_eq!(
-            refused,
-            [
-                "Dungeon Props/Textures/T_Guard_AORM.png: texture conversion not built yet: it needs its ORM channels split into URP roles",
-                "Dungeon Props/Textures/T_Iron_M.png: texture conversion not built yet: it needs its Metallic map merged into a MetallicSmoothness",
-                "Dungeon Props/Textures/T_Iron_R.png: texture conversion not built yet: it needs its Roughness map merged into a MetallicSmoothness",
-                "Dungeon Props/Textures/T_Stool_D.jpg: texture conversion not built yet: it needs its .jpg format to PNG",
-            ]
+            entry(&report, "Gate", "MetallicSmoothness")["sourcePath"],
+            "Textures/T_Iron_R.png"
         );
+        assert!(messages(&report).iter().all(|m| !m.contains("/Textures/")));
         assert_valid(&report);
     }
 
@@ -3761,9 +4080,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standalone_sets_join_whole_and_the_guard_names_each_source() {
+    async fn standalone_sets_join_whole_and_export_one_texture_per_output_role() {
         let f = fixture().await;
-        let report = check_domain(
+        let inspection = inspect_domain(
             &f,
             &[
                 "Dungeon Props/Rocks/T_Rock_R.png",
@@ -3773,11 +4092,12 @@ mod tests {
             ],
         )
         .await;
+        let report = &inspection.report;
 
         use Status::*;
         let dx = Some(Convention::DirectX);
         assert_eq!(
-            texture_rows(&report),
+            texture_rows(report),
             [
                 (
                     "Dungeon Props/Rocks/T_Ore_M.png",
@@ -3785,7 +4105,7 @@ mod tests {
                     "Metallic",
                     None,
                     true,
-                    Problem
+                    Ready
                 ),
                 (
                     "Dungeon Props/Rocks/T_Rock_M.png",
@@ -3793,7 +4113,7 @@ mod tests {
                     "Metallic",
                     None,
                     false,
-                    Problem
+                    Ready
                 ),
                 // A `_DX` suffix is read before the role, in a pack whose maps are OpenGL
                 (
@@ -3802,7 +4122,7 @@ mod tests {
                     "Normal",
                     dx,
                     false,
-                    Problem
+                    Ready
                 ),
                 (
                     "Dungeon Props/Rocks/T_Rock_R.png",
@@ -3810,7 +4130,7 @@ mod tests {
                     "Roughness",
                     None,
                     true,
-                    Problem
+                    Ready
                 ),
                 (
                     "Dungeon Props/Rocks/T_Slate_ORM.png",
@@ -3818,7 +4138,7 @@ mod tests {
                     "ORM",
                     None,
                     true,
-                    Problem
+                    Ready
                 ),
                 (
                     "Dungeon Props/Textures/T_StoneFloor_D.png",
@@ -3838,31 +4158,267 @@ mod tests {
                 ),
             ]
         );
+        assert_eq!(messages(report), Vec::<&str>::new());
+        assert_valid(report);
+        assert_eq!(
+            texture_entries(report),
+            [
+                ("Ore", "MetallicSmoothness"),
+                ("Rock", "MetallicSmoothness"),
+                ("Rock", "Normal"),
+                ("Slate", "MetallicSmoothness"),
+                ("Slate", "Occlusion"),
+                ("StoneFloor", "BaseColor"),
+                ("StoneFloor", "Normal"),
+            ]
+            .map(|(n, r)| (
+                n.to_string(),
+                r.to_string(),
+                format!("Textures/{n}_{r}.png")
+            ))
+        );
+
+        // T_Rock_R and T_Rock_M merge into one MetallicSmoothness, whose sourcePath is the
+        // roughness map (D17): T_Rock_R is 180, so smoothness 75, and T_Rock_M is 0
+        let rock = entry(report, "Rock", "MetallicSmoothness");
+        assert_eq!(rock["sourcePath"], "Rocks/T_Rock_R.png");
+        let merge = json!({"layout": "Roughness", "role": "MetallicSmoothness", "metallicSource": "Rocks/T_Rock_M.png"});
+        assert_eq!(
+            rock["conversion"],
+            json!([
+                opendam_step("merge-metallic-smoothness", "png", merge.clone()),
+                opendam_step("invert-roughness", "png", merge),
+            ])
+        );
+        assert_eq!(
+            bundle_pixels(&inspection, "Textures/Rock_MetallicSmoothness.png").as_bytes(),
+            sixteen(&[0, 0, 0, 75])
+        );
+        // The lone metallic map gets URP Lit's default smoothness
+        let ore = entry(report, "Ore", "MetallicSmoothness");
+        assert_eq!(
+            ore["conversion"],
+            json!([opendam_step(
+                "merge-metallic-smoothness",
+                "png",
+                json!({"layout": "Metallic", "role": "MetallicSmoothness", "smoothness": 0.5})
+            )])
+        );
+        assert_eq!(
+            bundle_pixels(&inspection, "Textures/Ore_MetallicSmoothness.png").as_bytes(),
+            sixteen(&[255, 255, 255, 128])
+        );
+        // T_Rock_N_DX is the Rock Normal, its green flipped from 127
+        assert_eq!(
+            bundle_pixels(&inspection, "Textures/Rock_Normal.png").as_bytes(),
+            sixteen(&[128, 128, 255, 255])
+        );
+        assert_eq!(
+            bundle_pixels(&inspection, "Textures/Slate_MetallicSmoothness.png").as_bytes(),
+            sixteen(&[0, 0, 0, 127])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_domain_reuses_the_cache_and_converts_to_the_same_bytes() {
+        let f = fixture().await;
+        let paths = [
+            "Dungeon Props/Rocks/T_Rock_R.png",
+            "Dungeon Props/Rocks/T_Ore_M.png",
+            "Dungeon Props/Rocks/T_Slate_ORM.png",
+            "Dungeon Props/Textures/T_Wall_D.jpg",
+        ];
+        let first = inspect_domain(&f, &paths).await;
+        let contents = |inspection: &Inspection| -> Vec<(String, Vec<u8>)> {
+            let mut files: Vec<_> = inspection
+                .files
+                .iter()
+                .map(|b| (b.file.clone(), bundle_file(inspection, &b.file).0))
+                .collect();
+            files.sort();
+            files
+        };
+        let before = contents(&first);
+        // The Wall member brings in its set's T_Wall_N_DX, and every file is converted
+        assert_eq!(before.len(), 7);
+        let cache = cache::cache_dir(&f.library.root_path).join("textures");
+        let entries = || std::fs::read_dir(&cache).unwrap().count();
+        assert_eq!(entries(), 7, "every converted texture is cached");
+
+        // A second check reads the cache and lists the same bytes
+        let again = inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
+        assert_eq!(contents(&again), before);
+        assert_eq!(
+            again.report.manifest["assets"],
+            first.report.manifest["assets"]
+        );
+        assert_eq!(entries(), 7);
+
+        // A hit does no pixel work: a cache entry is used as it is
+        let rock = first
+            .files
+            .iter()
+            .find(|b| b.file == "Textures/Rock_MetallicSmoothness.png")
+            .unwrap();
+        let marker = textures::encode_png(&image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 4])),
+        ))
+        .unwrap();
+        std::fs::write(&rock.source, &marker).unwrap();
+        let hit = inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
+        let rock_entry = entry(&hit.report, "Rock", "MetallicSmoothness");
+        assert_eq!(rock_entry["sha256"], hashes::sha256_bytes(&marker));
+
+        // With the cache cleared, conversion makes the same bytes again
+        std::fs::remove_dir_all(&cache).unwrap();
+        let fresh = inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
+        assert_eq!(contents(&fresh), before);
+
+        // A changed source is converted again, under a new key
+        let rough = f.library.root_path.join("Dungeon Props/Rocks/T_Rock_R.png");
+        let mut pixels = image::open(&rough).unwrap().to_rgba8();
+        pixels.put_pixel(0, 0, image::Rgba([0, 0, 0, 255]));
+        pixels.save(&rough).unwrap();
+        let changed = inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
+        let pixels = bundle_pixels(&changed, "Textures/Rock_MetallicSmoothness.png");
+        assert_eq!(&pixels.as_bytes()[..8], [0, 0, 0, 255, 0, 0, 0, 75]);
+        assert_eq!(entries(), 8);
+    }
+
+    #[tokio::test]
+    async fn a_stale_memoized_hash_is_caught_even_when_its_old_entry_is_cached() {
+        let f = fixture().await;
+        let path = "Dungeon Props/Textures/T_Slab_D.bmp";
+        // A BMP of one size whatever its pixels, so a rewrite keeps the size its hash was taken at
+        let bmp = |pixel: [u8; 3]| {
+            let image = image::RgbImage::from_pixel(4, 4, image::Rgb(pixel));
+            let mut bytes = Vec::new();
+            image
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Bmp,
+                )
+                .unwrap();
+            bytes
+        };
+        add_file(&f, path, &bmp([10, 20, 30])).await;
+        let first = inspect_domain(&f, &[path]).await;
+        assert_eq!(messages(&first.report), Vec::<&str>::new());
+        let cache = cache::cache_dir(&f.library.root_path).join("textures");
+        let entries = || std::fs::read_dir(&cache).unwrap().count();
+        assert_eq!(entries(), 1);
+
+        // The file changes, keeping its size and mtime, so the saved hash is stale, and the entry
+        // made from the old bytes stays in the cache
+        let source = f.library.root_path.join(path);
+        let mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
+        let changed = bmp([200, 100, 50]);
+        assert_eq!(
+            changed.len(),
+            std::fs::metadata(&source).unwrap().len() as usize
+        );
+        std::fs::write(&source, &changed).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+
+        // The Check keys the texture by the bytes it reads, so it converts the new pixels
+        let again = inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
+        assert_eq!(messages(&again.report), Vec::<&str>::new());
+        let pixels = bundle_pixels(&again, "Textures/Slab_BaseColor.png");
+        assert_eq!(pixels.as_bytes(), sixteen(&[200, 100, 50]));
+        assert_eq!(entries(), 2, "a new entry under the new bytes' key");
+        // And the memo now holds the bytes' own hash
+        let memo: String = sqlx::query_scalar("SELECT sha256 FROM file_hashes WHERE file_path = ?")
+            .bind(path)
+            .fetch_one(&f.library.pool)
+            .await
+            .unwrap();
+        assert_eq!(memo, hashes::sha256_bytes(&changed));
+    }
+
+    #[tokio::test]
+    async fn maps_that_cant_be_converted_together_are_one_problem_naming_them() {
+        let f = fixture().await;
+        let rocks = "Dungeon Props/Rocks";
+        add_file(
+            &f,
+            &format!("{rocks}/T_Rock_Gloss.png"),
+            &fixture_bytes(&format!("{rocks}/T_Rock_R.png")),
+        )
+        .await;
+        // An 8 pixel metallic map, which can't merge with 4 pixel maps
+        add_file(
+            &f,
+            &format!("{rocks}/T_Pebble_M.png"),
+            &fixture_bytes("Dungeon Props/Textures/4K/T_Crate_N.png"),
+        )
+        .await;
+        add_file(
+            &f,
+            &format!("{rocks}/T_Pebble_R.png"),
+            &fixture_bytes(&format!("{rocks}/T_Rock_R.png")),
+        )
+        .await;
+        let report = check_domain(
+            &f,
+            &[
+                "Dungeon Props/Rocks/T_Rock_R.png",
+                "Dungeon Props/Rocks/T_Pebble_R.png",
+            ],
+        )
+        .await;
+
         assert_eq!(
             messages(&report),
             [
-                "Dungeon Props/Rocks/T_Ore_M.png: texture conversion not built yet: it needs its Metallic map merged into a MetallicSmoothness",
-                "Dungeon Props/Rocks/T_Rock_M.png: texture conversion not built yet: it needs its Metallic map merged into a MetallicSmoothness",
-                "Dungeon Props/Rocks/T_Rock_N_DX.png: texture conversion not built yet: it needs its DirectX normal map's green channel flipped",
-                "Dungeon Props/Rocks/T_Rock_R.png: texture conversion not built yet: it needs its Roughness map merged into a MetallicSmoothness",
-                "Dungeon Props/Rocks/T_Slate_ORM.png: texture conversion not built yet: it needs its ORM channels split into URP roles",
+                "Dungeon Props/Rocks/T_Rock_Gloss.png: its texture set has 2 roughness or gloss maps, Rocks/T_Rock_Gloss.png and Rocks/T_Rock_R.png, and merges one into its MetallicSmoothness: remove or rename the others",
+                // A file that fails to convert is found after the plan's refusals
+                "Dungeon Props/Rocks/T_Pebble_R.png: its maps differ in size (4x4 and 8x8), and nothing is resized",
             ]
         );
-        // The set whose sources all pass through exports whole
+        let paths = |i: usize| -> Vec<&str> {
+            report.problems[i]
+                .assets
+                .iter()
+                .map(|a| a.file_path.as_str())
+                .collect()
+        };
+        assert_eq!(
+            paths(0),
+            [
+                format!("{rocks}/T_Rock_Gloss.png"),
+                format!("{rocks}/T_Rock_R.png")
+            ]
+        );
+        assert_eq!(
+            paths(1),
+            [
+                format!("{rocks}/T_Pebble_R.png"),
+                format!("{rocks}/T_Pebble_M.png")
+            ]
+        );
+        // The Rock set's other maps still export
         assert_eq!(
             texture_entries(&report),
-            [
-                (
-                    "StoneFloor".to_string(),
-                    "BaseColor".to_string(),
-                    "Textures/StoneFloor_BaseColor.png".to_string()
-                ),
-                (
-                    "StoneFloor".to_string(),
-                    "Normal".to_string(),
-                    "Textures/StoneFloor_Normal.png".to_string()
-                ),
-            ]
+            [(
+                "Rock".to_string(),
+                "Normal".to_string(),
+                "Textures/Rock_Normal.png".to_string()
+            )]
         );
         assert_valid(&report);
     }

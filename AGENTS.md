@@ -52,7 +52,9 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               of collision meshes the export drops), fingerprint, what a Check
                               read, bundle, which stages the bundle beside the domain's folder,
                               diffs it and swaps it in by renaming, infer, which groups a pack's
-                              images into texture sets and infers each model's materials, unity,
+                              images into texture sets and infers each model's materials,
+                              textures, which converts a set's sources into URP roles (split,
+                              merge, green flip, to PNG) as PNG cached by cache::texture_key, unity,
                               which reads a Unity pack's .meta and .mat files, edits, your
                               corrections in export_edits, and game, what the detail panel's Game
                               tab shows

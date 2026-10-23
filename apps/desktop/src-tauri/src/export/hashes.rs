@@ -59,6 +59,15 @@ pub async fn load(pool: &Pool<Sqlite>, paths: &[String]) -> sqlx::Result<Memo> {
     })
 }
 
+/// The lowercase hex sha256 of `bytes`.
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+fn hex(digest: &[u8]) -> String {
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The lowercase hex sha256 of the file at `path`.
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = std::fs::File::open(path)?;
@@ -71,11 +80,7 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    Ok(hex(&hasher.finalize()))
 }
 
 impl Memo {
@@ -107,6 +112,20 @@ impl Memo {
         self.known.insert(file_path.to_string(), hashed.clone());
         self.fresh.push((file_path.to_string(), hashed.clone()));
         Ok(hashed.sha256)
+    }
+
+    /// Replaces the memoized sha256 of `file_path`, which `sha256` gave, with `sha256`, taken
+    /// from the file's own bytes at the same size and mtime: the memo row was stale, as when a
+    /// file is rewritten within its mtime's resolution. `fresh` keeps it for `save`, so the next
+    /// check uses it.
+    pub fn correct(&mut self, file_path: &str, sha256: String) {
+        let Some(known) = self.known.get_mut(file_path) else {
+            return;
+        };
+        known.sha256 = sha256;
+        let hashed = known.clone();
+        self.fresh.retain(|(path, _)| path != file_path);
+        self.fresh.push((file_path.to_string(), hashed));
     }
 }
 
