@@ -232,7 +232,7 @@ pub async fn write(
 mod tests {
     use super::*;
     use crate::db::memory_library_pool;
-    use crate::structure::tests::{car_kit, insert_path, SEDAN};
+    use crate::structure::tests::{car_kit, insert_path, unmounted, SEDAN};
     use serde_json::json;
 
     fn patch(value: Value) -> Edits {
@@ -269,34 +269,53 @@ mod tests {
     async fn a_texture_name_reaches_every_source_of_its_set_and_their_groups() {
         let pool = memory_library_pool().await;
         for path in [
-            "Pack/Textures/T_Rock_D.png",
-            "Pack/Textures/T_Rock_N_DX.png",
-            "Pack/Textures/t_rock_r.tga",
-            "Pack/Textures/T_Rockface_D.png",
-            "Pack/Textures/Rock.fbx",
+            "Pack/Textures/Default/T_Rock_D.png",
+            "Pack/Textures/Default/T_Rock_N_DX.png",
+            "Pack/Textures/Default/t_rock_r.tga",
+            "Pack/Textures/Default/T_Rockface_D.png",
+            "Pack/Textures/Default/Rock.fbx",
+            // A scale copy of the set's BaseColor: a 2D stack with it, outside the set's folder
+            "Pack/Textures/Double/T_Rock_D.png",
             "Pack/Other/T_Rock_D.png",
         ] {
             insert_path(&pool, path).await;
         }
+        structure::rebuild(&pool, unmounted()).await.unwrap();
+        let mut stack = structure::group_members(&pool, "Pack/Textures/Double/T_Rock_D.png")
+            .await
+            .unwrap();
+        stack.sort();
+        assert_eq!(
+            stack,
+            [
+                "Pack/Textures/Default/T_Rock_D.png",
+                "Pack/Textures/Double/T_Rock_D.png",
+            ],
+            "the copies form a stack"
+        );
+
         let written = write(
             &pool,
-            "Pack/Textures/T_Rock_N_DX.png",
+            "Pack/Textures/Default/T_Rock_N_DX.png",
             &patch(json!({"assetName": "Boulder"})),
         )
         .await
         .unwrap();
+        let expected = [
+            "Pack/Textures/Default/T_Rock_D.png",
+            "Pack/Textures/Default/T_Rock_N_DX.png",
+            "Pack/Textures/Default/t_rock_r.tga",
+            "Pack/Textures/Double/T_Rock_D.png",
+        ];
+        assert_eq!(written, expected);
+        let row = r#"{"assetName":"Boulder"}"#.to_string();
         assert_eq!(
-            written,
-            [
-                "Pack/Textures/T_Rock_D.png",
-                "Pack/Textures/T_Rock_N_DX.png",
-                "Pack/Textures/t_rock_r.tga",
-            ]
+            rows(&pool).await,
+            expected.map(|id| (id.to_string(), row.clone()))
         );
         let all = read_all(&pool).await.unwrap();
-        assert_eq!(all.len(), 3);
         assert_eq!(
-            set_name(&all, "Pack/Textures/T_Rock_M.png", "T_Rock_M.png").as_deref(),
+            set_name(&all, "Pack/Textures/Default/T_Rock_M.png", "T_Rock_M.png").as_deref(),
             Some("Boulder")
         );
         assert_eq!(
