@@ -184,6 +184,18 @@ decision changed:
   rest when a step fails. So the folder stays importable into Unity, the hidden-`.mat` rule reads
   a sidecar that exists, and the next drift check shows nothing (Edits after an import, A5).
 
+Revised again 2026-10-23 (revision 14) after GitHub Inspector's fifth review of PR #199. No
+decision changed:
+
+- **R31 - A dead process's lock is stale at once.** The lock's token names its machine, process id
+  and process start time. A lock whose token names this machine and a process that is gone is
+  stale at once, whatever its mtime, so an app restarted within 120 s of being killed recovers and
+  indexes the library right away (The advisory lock, A11).
+- **R32 - The recovery table covers step 4's failure path.** A crash after step 4 put the previous
+  folder back, or after the journal with the staging folder already gone, leaves B's journal with
+  nothing of B on disk. The row that called this impossible now names it, and a new row covers
+  the first-build version, where no folder exists at all (Flow, A11).
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -402,9 +414,14 @@ stale after 120 s by its mtime (`stale_after`, `watcher.rs:26-60`, `169`), and i
 whoever holds it (`watcher.rs:74-75`). This plan changes it for every holder (`index_paths`,
 every recovery, the library open, Remove and the build):
 
-- **Token.** Acquiring writes a unique token (machine id, process id and a random part) with the
-  timestamp, waits a moment and re-reads the file. If another holder's token is there, it lost
-  the race and lets go.
+- **Token.** Acquiring writes a unique token (machine id, process id, the process's start time and
+  a random part) with the timestamp, waits a moment and re-reads the file. If another holder's
+  token is there, it lost the race and lets go.
+- **A dead holder on this machine.** A lock whose token names this machine and a process that is
+  gone (no process with that pid, or one with a different start time, the check Live runs uses)
+  is stale at once, whatever its mtime. So an app killed mid-swap and restarted within 120 s
+  takes the lock, recovers and indexes right away. A lock from another machine is still judged by
+  its mtime.
 - **Heartbeat.** While the guard lives, a task rewrites the timestamp every 30 s, so a hold of
   any length never looks stale.
 - **A lost lock.** A heartbeat that finds another token in the file marks the guard lost and
@@ -530,7 +547,8 @@ disk. "Live" is the pack folder.
 | absent | absent | present | absent | **and `current_build IS NULL`**: a first build swapped, not committed | Roll back (steps 1, 3, 4: no `.prev` to restore). |
 | absent | present | absent | present | Crashed in a rollback, between its renames | Rename `.prev-B` back to live, then finish the rollback (steps 3-4). |
 | absent | absent | any | present | Crashed in a rollback, after its renames | Finish the rollback (steps 3-4). |
-| absent | absent | present | absent | **and `current_build` is not `NULL`**: can't arise, since a later build always has `.prev-B` or `.failed-B` until step 4's transaction clears `swap_state` | Change nothing on disk. Clear `swap_state`, delete B's manifest and journal rows, run a `Prune::Now` index of the pack, and log it. |
+| absent | absent | present | absent | **and `current_build` is not `NULL`**: nothing of B is on disk. Step 4's second rename failed and the previous folder was renamed back, or the staging folder was gone before the first rename, then the app crashed before `swap_state` was cleared. No row was carried yet. | Change nothing on disk. Clear `swap_state`, delete B's manifest and journal rows, run a `Prune::Now` index of the pack, and log it. |
+| absent | absent | absent | absent | **and `current_build IS NULL`**: the same for a first build, which has no previous folder | Change nothing on disk. Delete B's manifest and journal rows, clear `swap_state`, and log it. |
 | any | any | any | any | Any other combination, not produced by any step | Change nothing on disk. Leave `swap_state` set, mark the pack `failed` with the state found, and block its runs until you act. |
 
 With `swap_state` `NULL`:
@@ -1099,16 +1117,19 @@ confirmation names them.
     their ids and tags.
   - **Killed late in a rollback:** for a later build, after step 4's transaction and before
     `.failed-B` is deleted. On restart, library-open recovery deletes `.failed-B`, and the restored previous
-    build's folder, rows and tags are untouched. Recovery is also given the impossible state
-    (`swapping`, only the live folder, `current_build` set), and changes nothing on disk.
+    build's folder, rows and tags are untouched. Recovery is also given the state with only the
+    live folder (`swapping`, `current_build` set), and changes nothing on disk.
   - **Cancel during step 5.** Tag `Old.png`, a path only the previous build has. Press Cancel while
     step 5 runs: the build is not interrupted, and finishes by committing. A second case makes
     its index fail, so it rolls back instead. After the rollback, `Old.png`'s row has its id and
     tag. Cancel pressed before step 1 deletes the staging folder and leaves the live folder and
     every row untouched.
   - **A refresh after a crash mid-swap.** Tag `Old.png`, kill the app between the swap and the
-    commit, restart, and trigger a library refresh at once. Recovery runs when the library opens,
-    before the refresh can prune. `Old.png`'s row keeps its id and tag.
+    commit, restart within 120 s, and trigger a library refresh at once. The dead process's lock
+    is taken at once (its token names this machine and a process that is gone), so recovery runs
+    when the library opens, before the refresh can prune, with no wait for the lock to go stale.
+    `Old.png`'s row keeps its id and tag. A lock from a live process on this machine, or a fresh
+    one from another machine, is still respected.
   - **A dropped run task.** Release the guard during step 5 without a rollback (simulated
     panic), then run `index_paths` on the library. It recovers the pack before indexing, and
     `Old.png`'s row keeps its tag.
@@ -1153,6 +1174,12 @@ confirmation names them.
     second rename of step 4 fail: the build renames `.prev-B` back and fails. Kill the app after
     the first rename with the staging folder gone: recovery renames `.prev-B` back and deletes
     B's rows.
+  - **Killed in step 4's failure path.** Make the second rename fail, and kill the app after
+    `.prev-B` is renamed back and before `swap_state` is cleared, for a later build and for a
+    first build (where no folder exists). Separately, delete the staging folder after the journal
+    and kill the app before the first rename. On restart each state matches its row: B's rows are
+    deleted, `swap_state` is cleared, the live folder (if any) and every previous row are
+    untouched, and the pack's runs aren't blocked.
   - **A mid-run change:** a file changed outside OpenDAM, or a step edited, while the build
     stages. The re-check under the lock fails the run, and the live folder is unchanged.
   - **No deadlock:** no call path takes `index_lock` while holding it. A test runs a whole build
