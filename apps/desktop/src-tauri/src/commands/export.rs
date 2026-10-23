@@ -1,5 +1,6 @@
+use serde::Serialize;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::export::blender::{self, BlenderStatus};
 use crate::export::bundle::ExportOutcome;
@@ -45,17 +46,37 @@ pub async fn get_blender_status(path: Option<String>) -> Result<BlenderStatus> {
 /// Checks the domain collection `domain_id` for export (plan C14): every asset with its kind,
 /// default name, pack and status, every problem that refuses the export, the manifest it would
 /// write and the diff against the previous bundle. FBX files are read through the preview
-/// worker's `fbx_facts`. With no problem, it stages the bundle beside the domain's folder for
-/// `export_bundle` (C15).
+/// worker's `fbx_facts`, and each model the export cache doesn't hold is normalized by headless
+/// Blender (C9), with an `export:progress` event before the jobs start and as each ends. With no
+/// problem, it stages the bundle beside the domain's folder for `export_bundle` (C15).
 #[tauri::command]
 pub async fn check_export(
     domain_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<check::CheckReport> {
+    let app = state.app_handle.clone();
+    let progress = |progress: check::Progress| {
+        let _ = app.emit(
+            "export:progress",
+            ExportProgress {
+                domain_id: &domain_id,
+                progress,
+            },
+        );
+    };
     state
         .exports
-        .check(&state.db, &domain_id, &state.fbx_facts)
+        .check(&state.db, &domain_id, &state.fbx_facts, &progress)
         .await
+}
+
+/// An `export:progress` event: how the Blender jobs of a Check of `domain_id` are going.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ExportProgress<'a> {
+    domain_id: &'a str,
+    #[serde(flatten)]
+    progress: check::Progress,
 }
 
 /// Swaps the bundle the last Check of `domain_id` staged into the domain's folder, unless

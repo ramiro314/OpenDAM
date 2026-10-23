@@ -8,6 +8,7 @@ import {
   editedMessage,
   exportMenuReason,
   materialLine,
+  progressMessage,
   staleMessage,
 } from './exportView';
 
@@ -181,6 +182,17 @@ describe('materialLine', () => {
       })
     ).toBe(
       'OpenDAMDefault → OpenDAMDefault, opaque (cutout suggested), added at export: no textures'
+    );
+  });
+});
+
+describe('progressMessage', () => {
+  test('counts the Blender jobs that ended and names the last', () => {
+    expect(progressMessage({ done: 0, total: 3, asset: null })).toBe(
+      'Normalizing models in Blender: 0 of 3 models done'
+    );
+    expect(progressMessage({ done: 1, total: 1, asset: 'Props/Models/SM_Chest.fbx' })).toBe(
+      'Normalizing models in Blender: 1 of 1 model done, last SM_Chest.fbx'
     );
   });
 });

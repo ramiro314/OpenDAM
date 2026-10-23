@@ -1,8 +1,15 @@
 import { useEffect, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import clsx from 'clsx';
 import { api } from '../../api';
 import { openGameTab, useExportEditStore } from '../../store';
-import type { Collection, ExportAssetRef, ExportCheck, ExportDiffEntry } from '../../types';
+import type {
+  Collection,
+  ExportAssetRef,
+  ExportCheck,
+  ExportDiffEntry,
+  ExportProgress,
+} from '../../types';
 import {
   checkSummary,
   diffLabel,
@@ -10,6 +17,7 @@ import {
   editedAsset,
   editedMessage,
   materialLine,
+  progressMessage,
   staleMessage,
 } from '../../utils/exportView';
 import { IconExternal, IconX } from '../Icons';
@@ -48,6 +56,17 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
   const [minimized, setMinimized] = useState(false);
   /** An edit since the Check changed an asset it holds */
   const [edited, setEdited] = useState(false);
+  /** How the running Check's Blender jobs are going */
+  const [progress, setProgress] = useState<ExportProgress | null>(null);
+
+  useEffect(() => {
+    const unlisten = listen<ExportProgress>('export:progress', (e) => {
+      if (e.payload.domainId === domain.id) setProgress(e.payload);
+    });
+    return () => {
+      unlisten.then((stop) => stop()).catch(() => {});
+    };
+  }, [domain.id]);
 
   const lastEdit = useExportEditStore((s) => s.last);
   useEffect(() => {
@@ -76,6 +95,7 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
 
   const runCheck = async () => {
     setChecking(true);
+    setProgress(null);
     setError(null);
     setNotice(null);
     setEdited(false);
@@ -171,6 +191,11 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
               Check reads {domain.name} and its subcollections, builds the bundle in a staging
               folder beside the previous one, and lists what it holds, what changed and what refuses
               the export. Export then swaps it in. The previous bundle stays until then.
+            </p>
+          )}
+          {checking && progress && (
+            <p id="export-progress" className={styles.summary} role="status">
+              {progressMessage(progress)}
             </p>
           )}
           {error && <p className={dialog.error}>{error}</p>}
