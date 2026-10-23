@@ -31,6 +31,20 @@
     "bones": [],
     "takes": []
   },
+  "Dungeon Props/Models/SM_Blob.fbx": {
+    "slots": [
+      {
+        "name": "Slime",
+        "textures": {}
+      }
+    ],
+    "kept_meshes": ["SM_Blob"],
+    "dropped_meshes": [],
+    "has_kept_mesh": true,
+    "kept_mesh_without_material": false,
+    "bones": [],
+    "takes": ["Smile"]
+  },
   "Dungeon Props/Models/SM_Boulder.fbx": {
     "slots": [],
     "kept_meshes": ["SM_Boulder"],
@@ -39,6 +53,20 @@
     "kept_mesh_without_material": true,
     "bones": [],
     "takes": []
+  },
+  "Dungeon Props/Models/SM_Cabinet.fbx": {
+    "slots": [
+      {
+        "name": "Oak",
+        "textures": {}
+      }
+    ],
+    "kept_meshes": ["SM_Cabinet", "SM_Cabinet_DoorL", "SM_Cabinet_DoorR"],
+    "dropped_meshes": [],
+    "has_kept_mesh": true,
+    "kept_mesh_without_material": true,
+    "bones": [],
+    "takes": ["Open"]
   },
   "Dungeon Props/Models/SM_Chest.fbx": {
     "slots": [],
@@ -100,6 +128,24 @@
     "bones": [],
     "takes": []
   },
+  "Dungeon Props/Models/SM_Lantern.fbx": {
+    "slots": [
+      {
+        "name": "Iron",
+        "textures": {}
+      },
+      {
+        "name": "Glass",
+        "textures": {}
+      }
+    ],
+    "kept_meshes": ["SM_Lantern", "SM_Lantern_Glass"],
+    "dropped_meshes": [],
+    "has_kept_mesh": true,
+    "kept_mesh_without_material": false,
+    "bones": [],
+    "takes": ["SM_Lantern_Glass|SwingA", "SM_Lantern_Glass|SwingA"]
+  },
   "Dungeon Props/Models/SM_Pillar.fbx": {
     "slots": [
       {
@@ -144,6 +190,20 @@
     "kept_mesh_without_material": true,
     "bones": [],
     "takes": []
+  },
+  "Dungeon Props/Models/SM_Spinner.fbx": {
+    "slots": [
+      {
+        "name": "Brass",
+        "textures": {}
+      }
+    ],
+    "kept_meshes": ["SM_Spinner"],
+    "dropped_meshes": [],
+    "has_kept_mesh": true,
+    "kept_mesh_without_material": false,
+    "bones": [],
+    "takes": ["Spin"]
   },
   "Dungeon Props/Models/SM_Stool.fbx": {
     "slots": [

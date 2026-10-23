@@ -3,9 +3,10 @@ use tauri::State;
 
 use crate::export::blender::{self, BlenderStatus};
 use crate::export::bundle::ExportOutcome;
+use crate::export::game::{self, GameDetail};
 use crate::export::packs::Origin;
 use crate::export::settings::{self, ExportSettings};
-use crate::export::{cache, check};
+use crate::export::{cache, check, edits};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -91,4 +92,34 @@ pub async fn get_inferred_pack_origin(
         .await
         .ok_or_else(|| format!("Library {library_id} is not open"))?;
     check::inferred_origin(&library, &path).await
+}
+
+/// What the detail panel's Game tab shows for asset `asset_id` (plan C13): what it exports as,
+/// its `assetName` inferred and yours, and the problems naming it in the Checks of the domains
+/// holding it. Null when it exports as neither a model, an animation nor a texture.
+#[tauri::command]
+pub async fn get_game_detail(
+    asset_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<GameDetail>> {
+    game::detail(&state.db, &asset_id, &state.fbx_facts, state.exports.memo()).await
+}
+
+/// Writes your export edit `patch` to asset `asset_id` (plan C4), for example
+/// `{"assetName": "Crate"}`, where null resets a value to inferred. It reaches every member of
+/// the asset's group and, for an image, every source of its texture set. Returns the ids it
+/// wrote, so an Export view whose Check holds one asks for a new Check.
+#[tauri::command]
+pub async fn set_export_edit(
+    asset_id: String,
+    patch: edits::Edits,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<String>> {
+    let library = state
+        .db
+        .library_of_asset(&asset_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("No asset has the id {asset_id}"))?;
+    edits::write(&library.pool, &asset_id, &patch).await
 }

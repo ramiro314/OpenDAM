@@ -42,8 +42,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
     src/export/               Game export to Dungeon Game bundles: contract (schema validation and the
                               importer's other rules), settings, the export cache, check_outside_libraries,
                               which refuses an export root equal to, inside or holding a library root,
-                              after resolving symlinks, blender.rs, which finds Blender and gates it to
-                              BLENDER_SERIES (5.2), check, the Export view's Check over a domain
+                              after resolving symlinks, blender.rs, which finds Blender, gates it to
+                              BLENDER_SERIES (5.2) and runs normalize.py (embedded, versioned by
+                              NORMALIZE_VERSION) as one headless job per model and checks its result,
+                              check, the Export view's Check over a domain
                               (names, packs, textures, conversion and hashes, memoized in file_hashes,
                               and FBX models and animations by fbx_facts, which asks the preview
                               worker and caches its answers, with collision::PATTERNS, the one list
@@ -52,8 +54,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               diffs it and swaps it in by renaming, infer, which groups a pack's
                               images into texture sets and infers each model's materials,
                               textures, which converts a set's sources into URP roles (split,
-                              merge, green flip, to PNG) as PNG cached by cache::texture_key, and
-                              unity, which reads a Unity pack's .meta and .mat files
+                              merge, green flip, to PNG) as PNG cached by cache::texture_key, unity,
+                              which reads a Unity pack's .meta and .mat files, edits, your
+                              corrections in export_edits, and game, what the detail panel's Game
+                              tab shows
     tests/fixtures/game-export/  The export's fixture library, made by make_fixtures.py under Blender and
                               committed with its output, and fbx_facts.json, its FBX files' facts,
                               which test_fbx_facts.py checks and the Check's tests read
@@ -191,8 +195,8 @@ docs/plans                    Plans for this fork
     filter, so each count equals the grid's total once you select that folder or value. A format
     pill adds its extension to the active ones, so with extensions active, its count also holds
     the items they match (`FacetCounts::extension_base`).
-  - Metadata (rating, color label, favorite, description, tags, collections) is the same on
-    every member. Each write expands its asset id through `structure::group_members` in its own
+  - Metadata (rating, color label, favorite, description, tags, collections, and the game
+    export's edits in `export_edits`) is the same on every member. Each write expands its asset id through `structure::group_members` in its own
     transaction, which `no_metadata_write_bypasses_group_members` checks, and auto-tag sends
     only main items. A library or folder run sends the grid's items below it, never support
     files: `asset::folder_item_ids` runs the grid's own search for the folder. The bulk folder
@@ -202,7 +206,8 @@ docs/plans                    Plans for this fork
     re-read the tag or collection for each batch under `Database::catalog_lock`, which every
     definition update and delete also takes. When a group forms or grows, the structure pass
     gives every member the union of the group's tags and collections and the main item's fields
-    (`apply_unions`).
+    and export edits (`apply_unions`). An image's export `assetName` also reaches every source
+    of its texture set (`export::edits::write`).
   - Delete and rename reach every member and the bundled preview, unless another item shows the
     same render (`item_files` in `commands/asset.rs`). A rename gives them all the new stem,
     refuses before anything moves when a name is taken, and puts files back if a step fails.

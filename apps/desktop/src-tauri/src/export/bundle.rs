@@ -472,6 +472,12 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 }
 
 impl Exports {
+    /// What material inference has read from files this session, for a Check run elsewhere,
+    /// such as the Game tab's
+    pub fn memo(&self) -> &Arc<infer::Memo> {
+        &self.memo
+    }
+
     /// Checks the domain `domain_id` (C14), reading FBX facts with `facts`: recovers its folder
     /// after a crash, diffs the bundle against the previous one, and, when nothing refuses the
     /// export, stages it. A domain's earlier staged bundle is discarded first.
@@ -489,6 +495,7 @@ impl Exports {
             mut report,
             files,
             fingerprint,
+            ..
         } = check::inspect(db, domain_id, facts, &self.memo).await?;
         let Some(bundle) = report.bundle_path.clone().map(PathBuf::from) else {
             return Ok(report);
@@ -1213,6 +1220,14 @@ mod tests {
                 reindex().await.unwrap();
                 "the domain's members in Fixture"
             }
+            "an asset renamed in its Game tab" => {
+                let id = id_of(&f.library.pool, "Unity Moss/T_Moss_D.png").await;
+                let rename = json!({"assetName": "Lichen"});
+                crate::export::edits::write(&f.library.pool, &id, rename.as_object().unwrap())
+                    .await
+                    .unwrap();
+                "your export edits in Fixture"
+            }
             "a pack override" => {
                 sqlx::query(
                     "INSERT INTO pack_overrides (path, name, updated_at) VALUES ('Kenney Crates', 'Crates', 0)",
@@ -1261,6 +1276,7 @@ mod tests {
             "a source's bytes",
             "a source touched",
             "a member renamed",
+            "an asset renamed in its Game tab",
             "a pack override",
             "the domain renamed",
             "the root collection renamed",

@@ -55,6 +55,8 @@ interface UIState {
   activeCollectionId: string | null;
   /** Assets waiting for the delete confirmation, empty when none */
   assetsToDelete: string[];
+  /** The detail panel's tab */
+  detailTab: DetailTab;
 
   setViewMode: (mode: 'grid' | 'list') => void;
   setGridSize: (size: 'sm' | 'md' | 'lg') => void;
@@ -76,7 +78,10 @@ interface UIState {
   setActiveCollection: (id: string | null) => void;
   /** Asks to delete `ids`, behind the confirmation dialog; [] dismisses it */
   requestDelete: (ids: string[]) => void;
+  setDetailTab: (tab: DetailTab) => void;
 }
+
+export type DetailTab = 'info' | 'tags' | 'collections' | 'preview' | 'game';
 
 /** The UI state kept across restarts */
 export const persistedUI = (s: UIState) => ({
@@ -105,6 +110,7 @@ export const useUIStore = create<UIState>()(
       selectedLibraryIds: [],
       activeCollectionId: null,
       assetsToDelete: [],
+      detailTab: 'info',
 
       setViewMode: (viewMode) => set({ viewMode }),
       setGridSize: (gridSize) => set({ gridSize }),
@@ -138,6 +144,8 @@ export const useUIStore = create<UIState>()(
       clearSelection: () => set({ selectedAssetIds: new Set(), focusedAssetId: null }),
 
       focusAsset: (id) => set({ focusedAssetId: id }),
+
+      setDetailTab: (detailTab) => set({ detailTab }),
 
       setSelectedLibraryIds: (ids) =>
         set({ selectedLibraryIds: ids, activeLibraryId: ids[0] ?? null, activeCollectionId: null }),
@@ -685,6 +693,32 @@ useUIStore.subscribe((ui, prev) => {
     pinned.size === s.pinned.size && [...pinned].every(([id, a]) => s.pinned.get(id) === a);
   if (!same) useAssetStore.setState({ pinned });
 });
+
+/**
+ * Shows asset `id` in the detail panel's Game tab, as an Export view's problem links do. The
+ * asset may be in no page the grid holds, so it is fetched and pinned before it is selected.
+ */
+export async function openGameTab(id: string) {
+  const asset = await api.getAsset(id);
+  useAssetStore.setState((s) => ({ pinned: new Map(s.pinned).set(asset.id, asset) }));
+  const ui = useUIStore.getState();
+  ui.selectAsset(asset.id);
+  ui.setDetailTab('game');
+  if (!ui.detailPanelOpen) ui.toggleDetailPanel();
+}
+
+// ── Export edits ──────────────────────────────────────────────────────────
+interface ExportEditStore {
+  /** The ids the last export edit wrote, with a count that tells two edits apart */
+  last: { ids: string[]; seq: number } | null;
+  /** Says an export edit wrote `ids`, so an open Export view holding one asks for a new Check */
+  noteEdited: (ids: string[]) => void;
+}
+
+export const useExportEditStore = create<ExportEditStore>()((set) => ({
+  last: null,
+  noteEdited: (ids) => set((s) => ({ last: { ids, seq: (s.last?.seq ?? 0) + 1 } })),
+}));
 
 // ── Auto-tagging Store ────────────────────────────────────────────────────
 interface AutotagStore {

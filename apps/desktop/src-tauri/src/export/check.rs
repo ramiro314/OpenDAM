@@ -27,7 +27,7 @@ use crate::export::infer::{self, PackImages, UnityPack};
 use crate::export::names::{is_pascal, pascal};
 use crate::export::packs::{self, Origin, PackSource};
 use crate::export::textures::{self, Convention, Layout, Role, Work};
-use crate::export::{cache, contract, hashes, settings};
+use crate::export::{cache, contract, edits, hashes, settings};
 use crate::models::AssetKind;
 use crate::structure::{self, PackOverride};
 
@@ -76,7 +76,7 @@ pub struct CheckedAsset {
     #[serde(flatten)]
     pub asset: AssetRef,
     pub kind: Kind,
-    /// Its default name (C5), `None` when it has none
+    /// Its name: yours (C4), else its default (C5), `None` when it has none
     pub asset_name: Option<String>,
     pub role: Option<Role>,
     /// Its pack's id, `None` for an asset in no pack
@@ -133,6 +133,8 @@ pub struct Inspection {
     pub report: CheckReport,
     pub files: Vec<BundleFile>,
     pub fingerprint: Fingerprint,
+    /// Each listed asset's `assetName`, inferred and yours, by asset id: the Game tab's
+    pub names: HashMap<String, Field<String>>,
 }
 
 /// A pack of the domain: its manifest entry, where it is, and its normal-map convention, yours
@@ -150,12 +152,102 @@ pub struct DomainPack {
 
 /// A grid item in the domain, as its library DB holds it.
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct ItemRow {
-    id: String,
-    file_path: String,
-    file_name: String,
-    extension: String,
-    kind: String,
+pub(crate) struct ItemRow {
+    pub id: String,
+    pub file_path: String,
+    pub file_name: String,
+    pub extension: String,
+    pub kind: String,
+}
+
+impl ItemRow {
+    fn stem(&self) -> &str {
+        self.file_name
+            .rsplit_once('.')
+            .map_or(self.file_name.as_str(), |(stem, _)| stem)
+    }
+}
+
+/// A value the export infers, and yours when you set one, which wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Field<T> {
+    pub inferred: T,
+    pub yours: Option<T>,
+}
+
+impl<T: Clone> Field<T> {
+    /// What the export uses: yours, else the inferred value
+    pub fn value(&self) -> T {
+        self.yours.clone().unwrap_or_else(|| self.inferred.clone())
+    }
+}
+
+/// The `assetName` of grid item `item` among its library's edit rows `edits`: its default (C5),
+/// and yours (C4). A model's or animation's is its own, a texture's its set's. `None` for an item
+/// that exports as neither.
+pub(crate) fn asset_name(item: &ItemRow, edits: &[edits::Row]) -> Option<Field<String>> {
+    match AssetKind::from_str(&item.kind) {
+        AssetKind::Model3d => Some(Field {
+            inferred: pascal(item.stem()),
+            yours: edits
+                .iter()
+                .find(|e| e.asset_id == item.id)
+                .and_then(|e| edits::asset_name(&e.parsed())),
+        }),
+        _ if edits::is_image(&item.kind) => Some(Field {
+            inferred: pascal(&textures::read_stem(item.stem()).base),
+            yours: edits::set_name(edits, &item.file_path, &item.file_name),
+        }),
+        _ => None,
+    }
+}
+
+/// What grid item `item` exports as (C3): a model item is a model, or an animation when the
+/// facts of the FBX it exports from (`exported_fbx_of`) say so, an image is a texture, and
+/// anything else is `Other`.
+pub(crate) fn exported_kind(item: &ItemRow, facts: Option<&Result<FbxFacts, String>>) -> Kind {
+    match AssetKind::from_str(&item.kind) {
+        AssetKind::Model3d => match facts {
+            Some(Ok(facts)) if facts.reading() == Some(Reading::Animation) => Kind::Animation,
+            _ => Kind::Model,
+        },
+        _ if edits::is_image(&item.kind) => Kind::Texture,
+        _ => Kind::Other,
+    }
+}
+
+/// The FBX each of `items` exports from (A5), by item id, for each that is a format group with
+/// an FBX member, or a lone FBX file, a group of one.
+pub(crate) async fn exported_fbx_of(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    items: &[ItemRow],
+) -> sqlx::Result<HashMap<String, String>> {
+    let item_ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+    let group_fbx: Vec<(String, String)> = sqlx::query_as(
+        "SELECT group_id, file_path FROM assets
+         WHERE group_id IN (SELECT value FROM json_each(?)) AND lower(extension) = 'fbx'",
+    )
+    .bind(serde_json::to_string(&item_ids).expect("ids serialize"))
+    .fetch_all(pool)
+    .await?;
+    let mut fbx_paths: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (group, path) in &group_fbx {
+        fbx_paths.entry(group).or_default().push(path);
+    }
+    for item in items {
+        if item.extension.eq_ignore_ascii_case("fbx") {
+            fbx_paths
+                .entry(&item.id)
+                .or_insert_with(|| vec![&item.file_path]);
+        }
+    }
+    Ok(fbx_paths
+        .into_iter()
+        .map(|(id, paths)| {
+            let path = exported_fbx(paths).expect("a group with an FBX");
+            (id.to_string(), path.to_string())
+        })
+        .collect())
 }
 
 /// A pack folder of a library, with your edits.
@@ -193,6 +285,8 @@ struct LibraryInput {
     pack_images: HashMap<usize, Vec<infer::Image>>,
     /// The same files with their indexed sizes and mtimes, as the fingerprint holds them
     pack_listings: HashMap<usize, String>,
+    /// Your edits (C4) to the items and to the other sources of their texture sets
+    edits: Vec<edits::Row>,
     memo: hashes::Memo,
 }
 
@@ -363,6 +457,7 @@ pub async fn inspect(
 
     let Evaluated {
         assets,
+        names,
         packs,
         problems: mut found,
         manifest,
@@ -390,6 +485,7 @@ pub async fn inspect(
         },
         files,
         fingerprint,
+        names,
     })
 }
 
@@ -433,6 +529,16 @@ fn input_fingerprint(input: &LibraryInput, fingerprint: &mut Fingerprint) {
         );
         fingerprint.put(scope, label("the indexed files of the pack"), listing);
     }
+    let edits: Vec<_> = input
+        .edits
+        .iter()
+        .map(|e| (&e.file_path, &e.edits))
+        .collect();
+    fingerprint.put(
+        scope,
+        format!("your export edits in {}", library.name),
+        format!("{edits:?}"),
+    );
 }
 
 /// The pack at or above `dir` among `packs`, the innermost first.
@@ -451,6 +557,17 @@ fn innermost_pack(packs: &HashMap<&str, usize>, dir: &str) -> Option<usize> {
 
 fn dir_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// The pack folder among `packs` that the file at `path` is in, as a Check assigns an item its
+/// pack: the innermost at or above its folder.
+pub(crate) fn pack_at<'a>(packs: &'a [String], path: &str) -> Option<&'a str> {
+    let by_path: HashMap<&str, usize> = packs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.as_str(), i))
+        .collect();
+    innermost_pack(&by_path, dir_of(path)).map(|i| packs[i].as_str())
 }
 
 /// An indexed file of a pack: its id, path, kind, and indexed size and mtime.
@@ -555,40 +672,20 @@ async fn read_library(
     .bind(&ids)
     .fetch_all(pool)
     .await?;
-    let item_ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
-    let group_fbx: Vec<(String, String)> = sqlx::query_as(
-        "SELECT group_id, file_path FROM assets
-         WHERE group_id IN (SELECT value FROM json_each(?)) AND lower(extension) = 'fbx'",
-    )
-    .bind(serde_json::to_string(&item_ids).expect("ids serialize"))
-    .fetch_all(pool)
-    .await?;
-    let mut fbx_paths: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (group, path) in &group_fbx {
-        fbx_paths.entry(group).or_default().push(path);
-    }
-    // A lone FBX is a group of one
-    for item in &items {
-        if item.extension.eq_ignore_ascii_case("fbx") {
-            fbx_paths
-                .entry(&item.id)
-                .or_insert_with(|| vec![&item.file_path]);
-        }
-    }
     // Every read is sent at once, so the preview queue serves them all between two of its jobs
-    let reads = fbx_paths.into_iter().map(|(id, paths)| {
-        let path = exported_fbx(paths)
-            .expect("a group with an FBX")
-            .to_string();
-        let root = &library.root_path;
-        async move {
-            // Stamped as it is read, for the fingerprint
-            let source = root.join(&path);
-            let stamp = Stamp::of(&source);
-            let facts = facts.read(&source, root).await;
-            (id.to_string(), ItemFbx { path, facts }, stamp)
-        }
-    });
+    let reads = exported_fbx_of(pool, &items)
+        .await?
+        .into_iter()
+        .map(|(id, path)| {
+            let root = &library.root_path;
+            async move {
+                // Stamped as it is read, for the fingerprint
+                let source = root.join(&path);
+                let stamp = Stamp::of(&source);
+                let facts = facts.read(&source, root).await;
+                (id, ItemFbx { path, facts }, stamp)
+            }
+        });
     let mut probes = Probes::new(&library.root_path);
     let mut fbx: HashMap<String, ItemFbx> = HashMap::new();
     for (id, item, stamp) in futures_util::future::join_all(reads).await {
@@ -647,6 +744,18 @@ async fn read_library(
         pack_files.insert(*pack, own.into_iter().map(|(_, f, ..)| f).collect());
     }
 
+    // Your edits to the items, and to every image of their packs, which may join as a texture
+    let read: HashSet<&str> = items
+        .iter()
+        .map(|i| i.id.as_str())
+        .chain(pack_images.values().flatten().map(|i| i.id.as_str()))
+        .collect();
+    let edits = edits::read_all(pool)
+        .await?
+        .into_iter()
+        .filter(|row| read.contains(row.asset_id.as_str()))
+        .collect();
+
     // Textures join through materials and sets, so every image of a pack may be hashed
     let paths: Vec<String> = items
         .iter()
@@ -655,6 +764,7 @@ async fn read_library(
         .collect();
     let memo = hashes::load(pool, &paths).await?;
     Ok(LibraryInput {
+        edits,
         fbx,
         probes,
         library,
@@ -704,6 +814,7 @@ struct PlannedTexture {
 /// What `evaluate` found, with the files each library's check stats, in library order.
 struct Evaluated {
     assets: Vec<CheckedAsset>,
+    names: HashMap<String, Field<String>>,
     packs: Vec<DomainPack>,
     problems: Vec<Problem>,
     manifest: Value,
@@ -725,7 +836,7 @@ struct TextureJob {
     extension: String,
     /// Index of its pack in the domain's packs
     pack: Option<usize>,
-    name: String,
+    name: Field<String>,
     layout: Layout,
     convention: Convention,
     member: bool,
@@ -740,6 +851,7 @@ struct TextureJob {
 fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Evaluated {
     let mut problems = Vec::new();
     let mut reads: Vec<Read> = Vec::new();
+    let mut asset_names: HashMap<String, Field<String>> = HashMap::new();
     // The domain's packs in manifest order (library order, then path), by (library, pack index)
     let mut pack_order: Vec<PackKey> = Vec::new();
     for (l, input) in inputs.iter().enumerate() {
@@ -825,14 +937,11 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
             if pack.is_none() {
                 issue("it is in no pack: mark its folder as a pack".into());
             }
-            let stem = item
-                .file_name
-                .rsplit_once('.')
-                .map_or(item.file_name.as_str(), |(stem, _)| stem);
-            let mut row = CheckedAsset {
+            let fbx = input.fbx.get(&item.id);
+            let row = CheckedAsset {
                 asset: asset.clone(),
-                kind: Kind::Other,
-                asset_name: None,
+                kind: exported_kind(item, fbx.map(|f| &f.facts)),
+                asset_name: asset_name(item, &input.edits).map(|name| name.value()),
                 role: None,
                 pack: pack.map(|p| export_packs[p].id.clone()),
                 status: Status::Ready,
@@ -842,40 +951,36 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
                 materials: Vec::new(),
             };
             match AssetKind::from_str(&item.kind) {
-                AssetKind::Model3d => {
-                    row.kind = Kind::Model;
-                    row.asset_name = Some(pascal(stem));
-                    match input.fbx.get(&item.id) {
-                        None => {
-                            issue("it has no FBX file: a model exports from its group's FBX".into())
-                        }
-                        Some(fbx) => {
-                            row.kind = read_fbx(fbx, &item.file_path, &mut issue);
-                            if let Ok(facts) = &fbx.facts {
-                                if facts.reading() == Some(Reading::Model) {
-                                    if let (Some(key), Some(p)) = (key, pack) {
-                                        if sources[p].origin == Origin::Unity {
-                                            unity_packs.entry(key).or_insert_with(|| {
-                                                UnityPack::read(
-                                                    &input.pack_files[&key.1],
-                                                    &mut walkers[l].probes,
-                                                    memo,
-                                                )
-                                            });
-                                        }
+                AssetKind::Model3d => match fbx {
+                    None => {
+                        issue("it has no FBX file: a model exports from its group's FBX".into())
+                    }
+                    Some(fbx) => {
+                        read_fbx(fbx, &item.file_path, &mut issue);
+                        if let Ok(facts) = &fbx.facts {
+                            if facts.reading() == Some(Reading::Model) {
+                                if let (Some(key), Some(p)) = (key, pack) {
+                                    if sources[p].origin == Origin::Unity {
+                                        unity_packs.entry(key).or_insert_with(|| {
+                                            UnityPack::read(
+                                                &input.pack_files[&key.1],
+                                                &mut walkers[l].probes,
+                                                memo,
+                                            )
+                                        });
                                     }
-                                    // A model in no pack still has its slots, the slot the export
-                                    // adds and their names checked, with no image to bind
-                                    let key = key.unwrap_or((l, NO_PACK));
-                                    catalogs
-                                        .entry(key)
-                                        .or_insert_with(|| PackImages::new(Vec::new()));
-                                    models.push((reads.len(), key, l, i));
                                 }
+                                // A model in no pack still has its slots, the slot the export
+                                // adds and their names checked, with no image to bind
+                                let key = key.unwrap_or((l, NO_PACK));
+                                catalogs
+                                    .entry(key)
+                                    .or_insert_with(|| PackImages::new(Vec::new()));
+                                models.push((reads.len(), key, l, i));
                             }
                         }
                     }
-                }
+                },
                 AssetKind::Texture | AssetKind::Image | AssetKind::Hdri => {
                     let found = key.and_then(|key| {
                         let image = catalogs.get(&key)?.find(&item.file_path)?;
@@ -885,13 +990,13 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
                         Some(member) => members.push(member),
                         // An image in no pack has no set: it is a texture on its own
                         None => {
-                            let stem_info = textures::read_stem(stem);
+                            let stem_info = textures::read_stem(item.stem());
                             jobs.push(TextureJob {
                                 library: l,
                                 asset,
                                 extension: item.extension.to_ascii_lowercase(),
                                 pack,
-                                name: pascal(&stem_info.base),
+                                name: asset_name(item, &input.edits).expect("an image's name"),
                                 layout: stem_info.layout.unwrap_or(Layout::Role(Role::BaseColor)),
                                 convention: stem_info.convention.unwrap_or(Convention::OpenGl),
                                 member: true,
@@ -905,6 +1010,10 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
                     "it is neither a model, an animation nor an image, so it can't be exported"
                         .into(),
                 ),
+            }
+            // Images went on as texture jobs, which record theirs
+            if let Some(name) = asset_name(item, &input.edits) {
+                asset_names.insert(item.id.clone(), name);
             }
             reads.push(Read {
                 row,
@@ -934,7 +1043,27 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
         .collect();
     let mut probes: Vec<&mut Probes> = walkers.iter_mut().map(|w| &mut w.probes).collect();
     let (materials, set_names) = infer::domain(&mut catalogs, &domain_models, &mut probes, memo);
-    for ((r, ..), materials) in models.iter().zip(materials) {
+    // Your name for a set (C4): the first of its sources by path that holds one
+    let yours = |key: PackKey, set: usize| {
+        let images = &catalogs[&key];
+        let ids: HashSet<&str> = images.sets[set]
+            .sources
+            .iter()
+            .map(|i| images.images[*i].id.as_str())
+            .collect();
+        edits::first_name(
+            inputs[key.0]
+                .edits
+                .iter()
+                .filter(|e| ids.contains(e.asset_id.as_str())),
+        )
+    };
+    for ((r, key, ..), mut materials) in models.iter().zip(materials) {
+        for binding in materials.iter_mut().flat_map(|m| m.textures.values_mut()) {
+            if let Some(name) = yours(*key, binding.set) {
+                binding.asset_name = name;
+            }
+        }
         let row = &mut reads[*r].row;
         let asset = row.asset.clone();
         material_names(&materials, &mut |message: String| {
@@ -989,7 +1118,10 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
                 .map_or("", |(_, e)| e)
                 .to_ascii_lowercase(),
             pack: Some(pack),
-            name: set_names.name(&catalogs, key, images.set_of[image]),
+            name: Field {
+                inferred: set_names.name(&catalogs, key, images.set_of[image]),
+                yours: yours(key, images.set_of[image]),
+            },
             layout: images.layout(image),
             convention: images.convention(image, sources[pack].normal_convention()),
             member: member_images.contains(&(key, image)),
@@ -1006,7 +1138,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
         let mut row = CheckedAsset {
             asset: job.asset.clone(),
             kind: Kind::Texture,
-            asset_name: Some(job.name.clone()),
+            asset_name: Some(job.name.value()),
             role: None,
             pack: job.pack.map(|p| export_packs[p].id.clone()),
             status: Status::Ready,
@@ -1028,6 +1160,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
                 .1
                 .push(job.asset.clone());
         }
+        asset_names.insert(job.asset.asset_id.clone(), job.name.clone());
         reads.push(Read {
             row,
             pack: job.pack,
@@ -1083,7 +1216,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
         for output in outputs {
             let first = &jobs[group[output.inputs[0]]];
             planned.push(PlannedTexture {
-                name: first.name.clone(),
+                name: first.name.value(),
                 reads: output
                     .inputs
                     .iter()
@@ -1193,6 +1326,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
         manifest,
         files,
         probes: walkers.into_iter().map(|w| w.probes).collect(),
+        names: asset_names,
     }
 }
 
@@ -1290,10 +1424,10 @@ fn material_names(materials: &[infer::Material], issue: &mut impl FnMut(String))
     }
 }
 
-/// What a model item exporting from `fbx` is, by its facts (C3), with what refuses it: an FBX
-/// that can't be read, has two materials of one name, or has no kept mesh and no take, and the
-/// build-order guards on models and animations.
-fn read_fbx(fbx: &ItemFbx, item_path: &str, issue: &mut impl FnMut(String)) -> Kind {
+/// What refuses a model item exporting from `fbx` (C3): an FBX that can't be read, has two
+/// materials of one name, or has no kept mesh and no take, and the build-order guards on models
+/// and animations. `exported_kind` says which of the two it is.
+fn read_fbx(fbx: &ItemFbx, item_path: &str, issue: &mut impl FnMut(String)) {
     let what = if fbx.path == item_path {
         "FBX".to_string()
     } else {
@@ -1303,7 +1437,7 @@ fn read_fbx(fbx: &ItemFbx, item_path: &str, issue: &mut impl FnMut(String)) -> K
         Ok(facts) => facts,
         Err(e) => {
             issue(format!("{what} can't be read for export: {e}"));
-            return Kind::Model;
+            return;
         }
     };
     for (name, count) in facts.duplicate_slots() {
@@ -1316,17 +1450,10 @@ fn read_fbx(fbx: &ItemFbx, item_path: &str, issue: &mut impl FnMut(String)) -> K
     }
     match facts.reading() {
         Some(Reading::Model) => {
-            issue("model export not built yet (an FBX with a kept mesh exports as a model)".into());
-            Kind::Model
+            issue("model export not built yet (an FBX with a kept mesh exports as a model)".into())
         }
-        Some(Reading::Animation) => {
-            issue("animation export not built yet (an FBX with no kept mesh and a take exports as an animation)".into());
-            Kind::Animation
-        }
-        None => {
-            issue(format!("{what} has no kept mesh and no take"));
-            Kind::Model
-        }
+        Some(Reading::Animation) => issue("animation export not built yet (an FBX with no kept mesh and a take exports as an animation)".into()),
+        None => issue(format!("{what} has no kept mesh and no take")),
     }
 }
 
@@ -1394,7 +1521,7 @@ fn names(reads: &[Read], textures: &[PlannedTexture], problems: &mut Vec<Problem
             .collect();
         problems.push(Problem {
             message: format!(
-                "{} {what}: {}. Rename one so each name is unique",
+                "{} {what}: {}. Give one another name in its Game tab",
                 assets.len(),
                 paths.join(" and ")
             ),
@@ -2339,7 +2466,7 @@ mod tests {
 
         assert_eq!(
             messages(&report),
-            ["2 textures are named Banner with the role BaseColor: Dungeon Props/Textures/T_Banner_BaseColor.png and Kenney Crates/banner.png. Rename one so each name is unique"]
+            ["2 textures are named Banner with the role BaseColor: Dungeon Props/Textures/T_Banner_BaseColor.png and Kenney Crates/banner.png. Give one another name in its Game tab"]
         );
         let named: Vec<&str> = report.problems[0]
             .assets
@@ -2362,6 +2489,150 @@ mod tests {
             )]
         );
         assert_valid(&report);
+    }
+
+    fn name_edit(name: &str) -> edits::Edits {
+        json!({ "assetName": name }).as_object().unwrap().clone()
+    }
+
+    /// AC3: an edit fixes a name collision, and keeps fixing it once the file is reindexed.
+    #[tokio::test]
+    async fn an_edit_fixes_a_name_collision_and_survives_a_reindex() {
+        let f = fixture().await;
+        let banner = "Kenney Crates/banner.png";
+        let report = check_domain(
+            &f,
+            &["Dungeon Props/Textures/T_Banner_BaseColor.png", banner],
+        )
+        .await;
+        assert_eq!(report.problems.len(), 1);
+        assert_eq!(report.problems[0].assets.len(), 2);
+
+        let id = id_of(&f.library.pool, banner).await;
+        edits::write(&f.library.pool, &id, &name_edit("KenneyBanner"))
+            .await
+            .unwrap();
+        // The file changes and is indexed again, keeping its id and so its edit
+        std::fs::write(f.library.root_path.join(banner), fixture_bytes(banner)).unwrap();
+        let root = f.library.root_path.display().to_string();
+        crate::watcher::index_paths(&f.db, "fixture", &[root])
+            .await
+            .unwrap();
+        assert_eq!(id_of(&f.library.pool, banner).await, id);
+
+        let report = check(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
+        assert_eq!(messages(&report), Vec::<&str>::new());
+        assert_valid(&report);
+        let names: Vec<(String, String)> = texture_entries(&report)
+            .into_iter()
+            .map(|(name, _, file)| (name, file))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Banner", "Textures/Banner_BaseColor.png"),
+                ("KenneyBanner", "Textures/KenneyBanner_BaseColor.png"),
+            ]
+            .map(|(n, p)| (n.to_string(), p.to_string()))
+        );
+
+        // A reset gives the collision back
+        edits::write(
+            &f.library.pool,
+            &id,
+            json!({ "assetName": null }).as_object().unwrap(),
+        )
+        .await
+        .unwrap();
+        let report = check(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
+        assert_eq!(report.problems.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_name_written_to_any_member_names_the_group_and_its_texture_set() {
+        let f = fixture().await;
+        let pool = &f.library.pool;
+        let obj = id_of(pool, "Dungeon Props/Models/SM_Chest.obj").await;
+        edits::write(pool, &obj, &name_edit("TreasureChest"))
+            .await
+            .unwrap();
+        // The set's Normal is no member, but its name is the set's
+        let normal = id_of(pool, "Dungeon Props/Textures/T_StoneFloor_N.png").await;
+        edits::write(pool, &normal, &name_edit("Flagstones"))
+            .await
+            .unwrap();
+
+        let report = check_domain(
+            &f,
+            &[
+                "Dungeon Props/Models/SM_Chest.fbx",
+                "Dungeon Props/Textures/T_StoneFloor_D.png",
+            ],
+        )
+        .await;
+        let names: Vec<(&str, Option<&str>)> = report
+            .assets
+            .iter()
+            .map(|a| (a.asset.file_path.as_str(), a.asset_name.as_deref()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Dungeon Props/Models/SM_Chest.fbx", Some("TreasureChest")),
+                (
+                    "Dungeon Props/Textures/T_StoneFloor_D.png",
+                    Some("Flagstones")
+                ),
+                // Brought in with its set, under the set's name
+                (
+                    "Dungeon Props/Textures/T_StoneFloor_N.png",
+                    Some("Flagstones")
+                ),
+            ]
+        );
+    }
+
+    /// A set a model uses is named after the model (D24) until you name it, and your name
+    /// reaches the model's binding too.
+    #[tokio::test]
+    async fn your_set_name_wins_over_the_name_its_model_gives_it() {
+        let f = fixture().await;
+        let model = "Dungeon Props/Models/SM_Crate.fbx";
+        let normal = "Dungeon Props/Textures/1K/T_Crate_N.png";
+        let binding = |report: &CheckReport| {
+            let crate_ = report
+                .assets
+                .iter()
+                .find(|a| a.asset.file_path == model)
+                .unwrap();
+            crate_.materials[0].textures[&Role::Normal]
+                .asset_name
+                .clone()
+        };
+        let texture = |report: &CheckReport| {
+            report
+                .assets
+                .iter()
+                .find(|a| a.asset.file_path == normal)
+                .and_then(|a| a.asset_name.clone())
+        };
+        let report = check_domain(&f, &[model]).await;
+        assert_eq!(binding(&report), "Crate");
+        assert_eq!(texture(&report).as_deref(), Some("Crate"));
+
+        let id = id_of(&f.library.pool, normal).await;
+        edits::write(&f.library.pool, &id, &name_edit("CrateBoards"))
+            .await
+            .unwrap();
+        let report = check(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
+        assert_eq!(binding(&report), "CrateBoards");
+        assert_eq!(texture(&report).as_deref(), Some("CrateBoards"));
     }
 
     #[tokio::test]
@@ -2731,7 +3002,7 @@ mod tests {
         // set's MaskMap gives a second one of its name
         assert_eq!(
             messages(&report),
-            ["2 textures are named Bricks with the role MetallicSmoothness: Dungeon Props/Textures/Bricks_MaskMap.png and Dungeon Props/Textures/Bricks_Roughness.png. Rename one so each name is unique"]
+            ["2 textures are named Bricks with the role MetallicSmoothness: Dungeon Props/Textures/Bricks_MaskMap.png and Dungeon Props/Textures/Bricks_Roughness.png. Give one another name in its Game tab"]
         );
         let named: Vec<&str> = report.problems[0]
             .assets

@@ -903,3 +903,56 @@
   justify-content: space-between;
   gap: var(--space-2);
 }
+
+/* Game tab */
+.game {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.gameProblems {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  list-style: none;
+  background: rgba(239, 68, 68, 0.1);
+  border-radius: var(--radius-sm);
+  color: #ef4444;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.gameHint {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+.gameForm {
+  display: grid;
+  grid-template-columns: 80px 1fr;
+  gap: var(--space-2) var(--space-3);
+  align-items: center;
+}
+.gameValue {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.gameValue input {
+  flex: 1;
+}
+.gameMark {
+  padding: 1px 5px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.gameMarkYours {
+  border-color: var(--color-brand-500);
+  color: var(--color-brand-400);
+}
