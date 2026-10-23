@@ -1285,15 +1285,18 @@ mod tests {
         }
         assert_eq!(mtime(), Some(t.now()));
 
+        let token = held(&lock).token.clone();
         drop(lock);
+        assert_eq!(mtime(), None);
+
+        // A file holding the dropped guard's own token again: a heartbeat still running would
+        // rewrite it, reading the clock.
+        let old = t.now() - Duration::from_secs(1000);
+        write_lock_file(dir.path(), &token, old);
         let reads = t.reads.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(
-            t.reads.load(Ordering::SeqCst),
-            reads,
-            "the heartbeat still runs"
-        );
-        assert_eq!(mtime(), None);
+        assert_eq!(mtime(), Some(old), "the heartbeat still runs");
+        assert_eq!(t.reads.load(Ordering::SeqCst), reads);
     }
 
     #[tokio::test]
@@ -1368,6 +1371,21 @@ mod tests {
         held(&lock).beat(&t.env);
         assert!(lock.is_lost());
         assert_eq!(lock_token(dir.path()), None);
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_that_cant_read_the_lock_keeps_the_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = TestEnv::new(|_, _| true);
+        let lock = acquire(dir.path(), &t.env).await.unwrap();
+
+        // A directory in the file's place fails the read with an error other than NotFound,
+        // as a share's hiccup might: the next beat reads it again.
+        std::fs::remove_file(dir.path().join("index.lock")).unwrap();
+        std::fs::create_dir(dir.path().join("index.lock")).unwrap();
+        held(&lock).beat(&t.env);
+
+        assert!(!lock.is_lost());
     }
 
     #[tokio::test]
