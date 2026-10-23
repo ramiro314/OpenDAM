@@ -994,6 +994,43 @@ later. Where they differ from C9:
   "Check again" at once. The pack form doesn't mark the view stale yet, but Export still refuses
   through the fingerprint.
 
+### What the texture conversion ticket built differently
+
+- **Every operation's pixels run at Check time,** in Rust with the `image` crate, while the Check
+  builds the bundle (C14). Each output is a PNG in `.opendam/export-cache/textures/<key>.png`,
+  written beside its place and renamed in, and the bundle copies it from there. The key is the
+  sha256 of the canonical JSON of the inputs' sha256s in order, the output's steps (tool, tool
+  version, `by`, `from` and settings), the tool and `textures::VERSION` (`<N>`). The entry's own
+  sha256 is taken from the file on each Check, with no sidecar. An entry is synced to disk
+  before its rename, and one that isn't a whole PNG, from its signature to its `IEND` chunk
+  (left empty or cut off by an OS crash), is made again. Damage inside a whole file isn't
+  detected. A converted texture's inputs are read and keyed by their bytes' own sha256s on every
+  Check, not by `file_hashes` alone, so a file rewritten at the same size and mtime never gets
+  its old entry. The memo row is then corrected. This costs a read of every converted input per
+  Check, while pass-through textures still trust the memo.
+- **A set is planned as a whole** (`textures::plan`): each one-role source gives its role, an ORM
+  or MaskMap map an Occlusion and a MetallicSmoothness, and the set's Roughness, Gloss and
+  Metallic maps one merged MetallicSmoothness, whose inputs are the smoothness map first (D17).
+  A material brings in only the sources of the roles it binds, so a set's outputs are those of
+  the sources the domain uses. Only role textures existed to collide in step 1; now textures
+  collide by output, so a set with an ORM map and an `_MS` map (two MetallicSmoothness of one
+  name) is refused naming both, and a collision names every input of each output.
+- **New refusals.** A set with two roughness or gloss maps, or two metallic maps, is refused naming
+  them, since C8 merges one of each. Inputs of different sizes are refused, since nothing is
+  resized (D25). A file that can't be decoded is refused naming it.
+- **Steps.** `from` is the first input's extension on every step, as C8 says. A `to-png` step is
+  written for each input that needs one, before the operation. Settings always name `layout` (the
+  first input's) and `role` (the output's). A merge adds `metallicSource` when it has a metallic
+  map besides its smoothness map, `smoothness: 0.5` for a lone metallic map, and `metallic: 0`
+  for a lone roughness or gloss map. No C8 layout merges an AO map, so `aoSource` is never
+  written.
+- **Channels and depth.** Occlusion is RGB (AO in each), MetallicSmoothness RGBA, a flipped
+  normal map keeps its own alpha, and a format change alone keeps the source's channels. A
+  single-channel map is read from its first channel. The output is 16 bit when any input has
+  more than 8 bits per channel, else 8 bit. A GIF's first frame is used.
+- **Problems found while converting** (a decode failure, sizes that differ) are listed after the
+  per-asset problems, as name collisions are.
+
 ## Acceptance criteria
 
 - **AC1.** The copied schema matches `SOURCE.md`'s sha256 (a test). `sync-asset-contract.sh`
