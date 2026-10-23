@@ -78,12 +78,16 @@ impl LockEnv {
     }
 }
 
+/// This machine's id as the lock names it: the machine id hashed with a key of the app's own, as
+/// machine-id(5) asks, since the lock file sits in a shared library folder.
 fn machine_id() -> Option<String> {
-    ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+    let id = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
         .iter()
         .filter_map(|p| std::fs::read_to_string(p).ok())
         .map(|id| id.trim().to_string())
-        .find(|id| !id.is_empty() && !id.contains(char::is_whitespace))
+        .find(|id| !id.is_empty())?;
+    let keyed = format!("com.opendam.desktop index.lock {id}");
+    Some(crate::export::hashes::sha256_bytes(keyed.as_bytes())[..32].to_string())
 }
 
 /// A process's start time in clock ticks since boot, field 22 of `/proc/<pid>/stat`, counted
@@ -124,27 +128,29 @@ struct HeldLock {
     released: Mutex<bool>,
 }
 
+/// What re-reading the lock file found.
+#[derive(Debug, PartialEq)]
+enum Reread {
+    Held,
+    /// Another token, or no file: marked lost.
+    Lost,
+    /// A read error other than a missing file, maybe a share's hiccup.
+    Unreadable,
+}
+
 impl HeldLock {
-    /// One heartbeat: rewrites the timestamp while the file still holds this token, and marks the
-    /// lock lost once it doesn't.
-    fn beat(&self, env: &LockEnv) {
-        let released = self.released.lock().unwrap_or_else(|e| e.into_inner());
-        if *released || self.lost.load(Ordering::SeqCst) {
-            return;
+    /// Re-reads the file, and marks the lock lost once it holds another token or none.
+    fn reread(&self) -> Reread {
+        if self.lost.load(Ordering::SeqCst) {
+            return Reread::Lost;
         }
         let found = match read_token(&self.path) {
-            Ok(found) if found == self.token => {
-                if let Err(e) = write_lock(&self.path, &self.token, env) {
-                    tracing::warn!("Could not refresh index.lock at {:?}: {e}", self.path);
-                }
-                return;
-            }
+            Ok(found) if found == self.token => return Reread::Held,
             Ok(found) => found,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => "no lock".into(),
             Err(e) => {
-                // Maybe a share's hiccup: the next beat reads it again.
                 tracing::warn!("Could not read index.lock at {:?}: {e}", self.path);
-                return;
+                return Reread::Unreadable;
             }
         };
         self.lost.store(true, Ordering::SeqCst);
@@ -152,6 +158,19 @@ impl HeldLock {
             "index.lock at {:?} holds {found:?}, not this run's token: the lock is lost",
             self.path
         );
+        Reread::Lost
+    }
+
+    /// One heartbeat: rewrites the timestamp while the file still holds this token. An unreadable
+    /// file is read again at the next beat.
+    fn beat(&self, env: &LockEnv) {
+        let released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        if *released || self.reread() != Reread::Held {
+            return;
+        }
+        if let Err(e) = write_lock(&self.path, &self.token, env) {
+            tracing::warn!("Could not refresh index.lock at {:?}: {e}", self.path);
+        }
     }
 }
 
@@ -250,10 +269,20 @@ impl IndexLock {
     }
 
     /// Whether a heartbeat found another token in the file. A lost holder changes nothing more.
+    #[cfg(test)]
     fn is_lost(&self) -> bool {
         self.held
             .as_ref()
             .is_some_and(|h| h.lost.load(Ordering::SeqCst))
+    }
+
+    /// Re-reads the file right before a change the lock guards, rather than trusting the last
+    /// heartbeat, which may be 30 s old or, after a suspend, older than the lock's staleness. True
+    /// while the file still holds this guard's token, or when the file couldn't be written at all.
+    fn still_held(&self) -> bool {
+        self.held
+            .as_ref()
+            .is_none_or(|h| h.reread() == Reread::Held)
     }
 }
 
@@ -546,12 +575,12 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
     Ok(())
 }
 
-/// Deletes the rows of files the run didn't find, unless the run lost its lock: another holder
-/// may be mid-change, so a file this run missed may only be moving.
+/// Deletes the rows of files the run didn't find, unless the run lost its lock (or can't read it
+/// now): another holder may be mid-change, so a file this run missed may only be moving.
 async fn prune_missing(pool: &sqlx::Pool<sqlx::Sqlite>, ids: &[String], lock: &IndexLock) {
-    if lock.is_lost() {
+    if !lock.still_held() {
         tracing::warn!(
-            "This index run lost its index.lock, so it prunes none of {} missing files",
+            "This index run doesn't hold its index.lock, so it prunes none of {} missing files",
             ids.len()
         );
         return;
@@ -1406,17 +1435,52 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = TestEnv::new(|_, _| true);
         let lib = library_with_one_asset("lib", dir.path().to_path_buf()).await;
+        let ids = ["a1".to_string()];
+
+        // A heartbeat found another token.
         let lock = acquire(dir.path(), &t.env).await.unwrap();
         write_lock_file(dir.path(), "other-machine 7 7 theirs", t.now());
         held(&lock).beat(&t.env);
-
-        prune_missing(&lib.pool, &["a1".to_string()], &lock).await;
+        prune_missing(&lib.pool, &ids, &lock).await;
         assert_eq!(asset_count(&lib.pool).await, 1);
-
         drop(lock);
+
+        // Another token since the last heartbeat (say the holder was suspended past 120 s): the
+        // prune re-reads the file, and marks the guard lost.
         std::fs::remove_file(dir.path().join("index.lock")).unwrap();
         let lock = acquire(dir.path(), &t.env).await.unwrap();
-        prune_missing(&lib.pool, &["a1".to_string()], &lock).await;
+        write_lock_file(dir.path(), "other-machine 7 7 theirs", t.now());
+        prune_missing(&lib.pool, &ids, &lock).await;
+        assert_eq!(asset_count(&lib.pool).await, 1);
+        assert!(lock.is_lost());
+        drop(lock);
+
+        // A file it can't read now prunes nothing either, but isn't lost.
+        std::fs::remove_file(dir.path().join("index.lock")).unwrap();
+        let lock = acquire(dir.path(), &t.env).await.unwrap();
+        std::fs::remove_file(dir.path().join("index.lock")).unwrap();
+        std::fs::create_dir(dir.path().join("index.lock")).unwrap();
+        prune_missing(&lib.pool, &ids, &lock).await;
+        assert_eq!(asset_count(&lib.pool).await, 1);
+        assert!(!lock.is_lost());
+        drop(lock);
+
+        // A held lock prunes.
+        std::fs::remove_dir(dir.path().join("index.lock")).unwrap();
+        let lock = acquire(dir.path(), &t.env).await.unwrap();
+        prune_missing(&lib.pool, &ids, &lock).await;
         assert_eq!(asset_count(&lib.pool).await, 0);
+    }
+
+    #[test]
+    fn the_lock_names_this_machine_by_a_keyed_hash_of_its_id() {
+        let Some(id) = machine_id() else { return };
+        let raw = std::fs::read_to_string("/etc/machine-id")
+            .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+            .unwrap();
+
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(id, raw.trim());
     }
 }
