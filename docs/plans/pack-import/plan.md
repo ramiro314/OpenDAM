@@ -148,6 +148,17 @@ changed:
   not in the metadata step's options, so writing it bumps no `recipe_rev` and fails no run (Pack
   metadata, Records, A7).
 
+Revised again 2026-10-23 (revision 10) after GitHub Inspector's second review of PR #199. No
+decision changed:
+
+- **R25 - Pack targets never nest.** A target that is an ancestor or a descendant of another
+  pack's target is refused, in the dialog and when a target is edited. One pack's rebuild or
+  Remove could otherwise move or delete another pack's files (Presets, invariants, A18).
+- **R26 - The GLB cache key covers file names.** `unity_gltf.py` falls back to matching
+  materials and textures by file name, so the inputs hash adds each input's final file name. A
+  `rename` of a texture now reconverts, and a hoist, which changes folders and not names, still
+  reuses every GLB (Unity conversion, A8).
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -601,8 +612,17 @@ counts per folder and the conversion count (D23).
   tree (`Content/Waterways/Meshes/` under `hoist Meshes`), and the tree is labeled as an
   estimate.
 
-Every option can be edited there or later. A target that already exists in the library and
-isn't this import's output is refused.
+Every option can be edited there or later. Two rules guard the target, in the dialog and
+whenever a target is edited:
+
+- **It must not exist yet.** A target that already exists in the library and isn't this
+  import's output is refused.
+- **Targets never nest.** A target that is an ancestor or a descendant of another pack's target
+  in `import_packs`, of this import or any other, is refused, comparing whole path components
+  (`Pub/Pack` holds `Pub/Pack/Sub` but not `Pub/Package`). Otherwise one pack's rebuild would
+  see the other's files as drift and rename them away with its folder at the swap, and its
+  Remove would delete them. Kenney packs, all at `<Category>/<Pack>`, never nest among
+  themselves, but a Kenney category can't land under another pack's `<Pack>` target.
 
 ### Unity conversion
 
@@ -620,13 +640,18 @@ isn't this import's output is refused.
   the sha256 of: the original's sha256, the model's source path, the step options,
   `UNITY_GLB_VERSION`, the Blender version, and the **inputs hash**.
   - **The inputs hash** covers every file the step copies into the work folder: Unity files,
-    models and textures. Each is listed by its source path (a kept file by its path in the pack)
-    and its sha256, which the staged manifest already holds, sorted, then hashed.
-  - **What changes it.** An `exclude` of a texture or `.mat`, or a kept, changed texture,
-    changes what Blender reads, so the key changes and Blender runs again. Such a change
+    models and textures. Each is listed by its source path (a kept file by its path in the pack),
+    its final file name in the pack and its sha256, which the staged manifest already holds,
+    sorted, then hashed.
+  - **Why file names count.** `unity_gltf.py` resolves materials and textures by GUID through
+    the `.meta` files first, then falls back to file names (`by_name`, its `images` map by stem,
+    `named_material`). It never matches by folder. So a `rename` can change what Blender
+    produces, and a folder change can't.
+  - **What changes it.** An `exclude` or `rename` of a texture or `.mat`, or a kept, changed
+    texture, changes what Blender reads, so the key changes and Blender runs again. Such a change
     reconverts every model of the pack, not just the ones that used the file.
-  - **What doesn't.** A hoist or flatten moves files without changing their source paths or
-    bytes, so a rebuild that only toggled a hoist reuses every GLB (D18).
+  - **What doesn't.** A hoist or flatten moves files between folders without changing their
+    source paths, names or bytes, so a rebuild that only toggled a hoist reuses every GLB (D18).
 
   Settings shows the cache's size, with a Clear button.
 
@@ -864,6 +889,8 @@ confirmation names them.
     skipping packs with a live run, judged by the run's owner and heartbeat, not by its status
     alone. So no refresh or startup, on any machine, ever deletes a live build's staging folder
     or rolls back a live swap, within the limits the Known gaps state.
+- **Pack targets never nest.** No pack's target is an ancestor or a descendant of another's, so
+  every build, swap and Remove touches only its own pack's files.
 - **A rollback clears its journal before its folder.** `swap_state` and the failed build's
   records go in one transaction, before `.failed-*` is deleted. Recovery acts only on the states
   the tables list, and changes nothing on disk for any other.
@@ -970,7 +997,9 @@ confirmation names them.
   `SM_Log.glb` beside it, whose material carries the fixture's PNG. A rebuild after toggling
   `hoist` reuses the cached GLB, with no Blender run. A rebuild after an `exclude` of that PNG,
   and one after keeping a changed copy of it (drift, keep yours), each run Blender again, and
-  the new GLB carries no PNG or the changed one.
+  the new GLB carries no PNG or the changed one. A rebuild after a `rename` of that PNG also runs
+  Blender again, and its GLB matches a conversion made from scratch with the PNG under its new
+  name.
 - **A9 - Unreal, stub editor.** With a stub editor script that writes GLBs in batches and once
   makes no progress, the step loops, resumes from cache, and fails the step with the
   no-progress message. The work copy's `.uproject` has the plugins enabled, and the zip is
@@ -1097,6 +1126,15 @@ confirmation names them.
 - **A17 - Binary Unity files, by hand.** Importing a cached Unity 4 or 5 package whose `.mat`
   files are binary gives textured GLBs, and the library keeps the `.mat` files' original bytes.
   This sample also feeds the env-gated worker test.
+- **A18 - Nested targets refused.** With pack P built at `Pub/Pack`:
+  - importing pack Q to `Pub/Pack/Sub` (which doesn't exist yet), or to `Pub`, is refused in the
+    dialog, naming P;
+  - editing an existing pack's target to either path is refused the same way;
+  - a Kenney pack at `<Category>/<Pack>` is refused when an "Any other zip" pack already has
+    `<Category>` as its target;
+  - `Pub/Package` is allowed.
+
+  Nothing is written for a refused import, and P's next rebuild and Remove touch only P's files.
 
 ## Known gaps
 
