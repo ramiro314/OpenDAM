@@ -1002,10 +1002,12 @@ later. Where they differ from C9:
   sha256 of the canonical JSON of the inputs' sha256s in order, the output's steps (tool, tool
   version, `by`, `from` and settings), the tool and `textures::VERSION` (`<N>`). The entry's own
   sha256 is taken from the file on each Check, with no sidecar. An entry is synced to disk
-  before its rename, and one that doesn't start with the PNG signature (left empty by an OS
-  crash) is made again. Before converting, each input's bytes are checked against the hash its
-  key is made of, so a file that changes mid-Check never fills an entry under its old key. On a
-  mismatch the `file_hashes` row takes the bytes' own hash, so the next Check succeeds.
+  before its rename, and one that isn't a whole PNG, from its signature to its `IEND` chunk
+  (left empty or cut off by an OS crash), is made again. Damage inside a whole file isn't
+  detected. A converted texture's inputs are read and keyed by their bytes' own sha256s on every
+  Check, not by `file_hashes` alone, so a file rewritten at the same size and mtime never gets
+  its old entry. The memo row is then corrected. This costs a read of every converted input per
+  Check, while pass-through textures still trust the memo.
 - **A set is planned as a whole** (`textures::plan`): each one-role source gives its role, an ORM
   or MaskMap map an Occlusion and a MetallicSmoothness, and the set's Roughness, Gloss and
   Metallic maps one merged MetallicSmoothness, whose inputs are the smoothness map first (D17).

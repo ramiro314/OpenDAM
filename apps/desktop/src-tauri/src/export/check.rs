@@ -1332,8 +1332,10 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
 
 /// The file a bundle copies for `output`, made from the files `paths` (relative to the library
 /// root of `input`, in the output's order), and its sha256: the source itself when it passes
-/// through, else the export cache's entry (C11), converted first on a miss. Every input's bytes
-/// are checked against the hash its cache key is made of.
+/// through, else the export cache's entry (C11), converted first on a miss. A converted
+/// texture's inputs are read and keyed by their bytes' own sha256s, never by the memo alone, so a
+/// file rewritten at the same size and mtime can't be served its old entry; the memo row is
+/// corrected for the next check.
 fn texture_file(
     input: &mut LibraryInput,
     probes: &mut Probes,
@@ -1359,38 +1361,26 @@ fn texture_file(
     let Work::Convert { recipe, steps } = &output.work else {
         return Ok((root.join(&paths[0]), sha256s.swap_remove(0)));
     };
+    let mut bytes = Vec::with_capacity(paths.len());
+    for (i, path) in paths.iter().enumerate() {
+        let read = std::fs::read(root.join(path))
+            .map_err(|e| format!("{} can't be read: {e}", what(i)))?;
+        let sha256 = hashes::sha256_bytes(&read);
+        if sha256 != sha256s[i] {
+            input.memo.correct(path, sha256.clone());
+            sha256s[i] = sha256;
+        }
+        bytes.push(read);
+    }
     let key = cache::texture_key(&sha256s, steps);
-    // Inputs whose bytes don't hash to their memoized sha256, with the hash they do
-    let mut stale: Vec<(usize, String)> = Vec::new();
     let cached = cache::texture(&root, &key, || {
-        let mut bytes = Vec::with_capacity(paths.len());
-        for (i, path) in paths.iter().enumerate() {
-            let read = std::fs::read(root.join(path))
-                .map_err(|e| format!("{} can't be read: {e}", what(i)))?;
-            let sha256 = hashes::sha256_bytes(&read);
-            if sha256 != sha256s[i] {
-                stale.push((i, sha256));
-            }
-            bytes.push(read);
-        }
-        if let Some((i, _)) = stale.first() {
-            return Err(format!(
-                "{} changed while it was read: check again",
-                what(*i)
-            ));
-        }
         let named: Vec<(&str, &[u8])> = paths
             .iter()
             .zip(&bytes)
             .map(|(p, b)| (p.as_str(), b.as_slice()))
             .collect();
         textures::convert(*recipe, &named)
-    });
-    // The next check keys the texture by the bytes it read, so checking again is enough
-    for (i, sha256) in stale {
-        input.memo.correct(&paths[i], sha256);
-    }
-    let cached = cached?;
+    })?;
     let sha256 = hashes::sha256_file(&cached)
         .map_err(|e| format!("its export cache entry can't be read: {e}"))?;
     Ok((cached, sha256))
@@ -4093,7 +4083,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stale_memoized_hash_never_fills_the_cache_and_checking_again_recovers() {
+    async fn a_stale_memoized_hash_is_caught_even_when_its_old_entry_is_cached() {
         let f = fixture().await;
         let path = "Dungeon Props/Textures/T_Slab_D.bmp";
         // A BMP of one size whatever its pixels, so a rewrite keeps the size its hash was taken at
@@ -4111,8 +4101,12 @@ mod tests {
         add_file(&f, path, &bmp([10, 20, 30])).await;
         let first = inspect_domain(&f, &[path]).await;
         assert_eq!(messages(&first.report), Vec::<&str>::new());
+        let cache = cache::cache_dir(&f.library.root_path).join("textures");
+        let entries = || std::fs::read_dir(&cache).unwrap().count();
+        assert_eq!(entries(), 1);
 
-        // The file changes, keeping its size and mtime, so the saved hash is stale
+        // The file changes, keeping its size and mtime, so the saved hash is stale, and the entry
+        // made from the old bytes stays in the cache
         let source = f.library.root_path.join(path);
         let mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
         let changed = bmp([200, 100, 50]);
@@ -4127,27 +4121,16 @@ mod tests {
             .unwrap()
             .set_modified(mtime)
             .unwrap();
-        let cache = cache::cache_dir(&f.library.root_path).join("textures");
-        std::fs::remove_dir_all(&cache).unwrap();
 
-        let report = check(&f.db, "domain", &Facts::fixture(), &fresh_memo())
-            .await
-            .unwrap();
-        assert_eq!(
-            messages(&report),
-            [format!("{path}: it changed while it was read: check again")]
-        );
-        assert_eq!(report.manifest["assets"], json!([]));
-        let entries = std::fs::read_dir(&cache).map_or(0, |d| d.count());
-        assert_eq!(entries, 0, "nothing is cached under the stale key");
-
-        // The memo now holds the bytes' own hash, so checking again exports the new pixels
+        // The Check keys the texture by the bytes it reads, so it converts the new pixels
         let again = inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
             .await
             .unwrap();
         assert_eq!(messages(&again.report), Vec::<&str>::new());
         let pixels = bundle_pixels(&again, "Textures/Slab_BaseColor.png");
         assert_eq!(pixels.as_bytes(), sixteen(&[200, 100, 50]));
+        assert_eq!(entries(), 2, "a new entry under the new bytes' key");
+        // And the memo now holds the bytes' own hash
         let memo: String = sqlx::query_scalar("SELECT sha256 FROM file_hashes WHERE file_path = ?")
             .bind(path)
             .fetch_one(&f.library.pool)

@@ -2,7 +2,7 @@
 //! C11), so re-exporting an unchanged domain skips the work and writes byte-identical files. It
 //! is never pruned automatically in v1 (A9), so Settings offers "Clear export cache".
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -52,19 +52,33 @@ pub fn texture_key(inputs: &[String], steps: &[Value]) -> String {
 /// The first bytes of every PNG file.
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
 
-/// Whether the file at `path` starts like a PNG, so an empty or truncated entry left by an OS
-/// crash isn't taken for a hit.
-fn starts_like_png(path: &Path) -> bool {
-    let mut head = [0; 8];
-    std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut head))
-        .is_ok_and(|()| head == PNG_SIGNATURE)
+/// The last bytes of every PNG file: its empty `IEND` chunk and that chunk's CRC.
+const PNG_END: [u8; 12] = [0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82];
+
+/// Whether the file at `path` starts with the PNG signature and ends with the `IEND` chunk, so an
+/// entry an OS crash left empty, or one cut off anywhere, isn't taken for a hit. Damage inside an
+/// otherwise whole file isn't detected: that would mean decoding every entry on every Check.
+fn is_whole_png(path: &Path) -> bool {
+    let read = || -> std::io::Result<bool> {
+        let mut file = std::fs::File::open(path)?;
+        let length = file.metadata()?.len();
+        if length < (PNG_SIGNATURE.len() + PNG_END.len()) as u64 {
+            return Ok(false);
+        }
+        let mut head = [0; 8];
+        file.read_exact(&mut head)?;
+        let mut tail = [0; 12];
+        file.seek(SeekFrom::End(-(PNG_END.len() as i64)))?;
+        file.read_exact(&mut tail)?;
+        Ok(head == PNG_SIGNATURE && tail == PNG_END)
+    };
+    read().unwrap_or(false)
 }
 
 /// The cached texture of key `key` in the library at `root`, made by `make` and saved first when
 /// the cache doesn't hold it. A file is written beside its place, synced to disk and renamed
 /// into it, so neither a process crash nor an OS crash leaves a partial entry under the key, and
-/// an entry that doesn't start like a PNG is made again.
+/// an entry that isn't a whole PNG from signature to `IEND` is made again.
 pub fn texture(
     root: &Path,
     key: &str,
@@ -72,7 +86,7 @@ pub fn texture(
 ) -> Result<PathBuf, String> {
     let dir = cache_dir(root).join("textures");
     let path = dir.join(format!("{key}.png"));
-    if starts_like_png(&path) {
+    if is_whole_png(&path) {
         return Ok(path);
     }
     let bytes = make()?;
@@ -164,7 +178,7 @@ mod tests {
     fn a_cached_texture_is_made_once_and_then_read_back() {
         let dir = tempfile::tempdir().unwrap();
         let made = std::cell::Cell::new(0);
-        let png = [&PNG_SIGNATURE[..], b"pixels"].concat();
+        let png = [&PNG_SIGNATURE[..], b"pixels", &PNG_END[..]].concat();
         let make = || {
             made.set(made.get() + 1);
             Ok(png.clone())
@@ -186,11 +200,18 @@ mod tests {
     #[test]
     fn an_empty_or_truncated_entry_is_made_again() {
         let dir = tempfile::tempdir().unwrap();
-        let png = [&PNG_SIGNATURE[..], b"pixels"].concat();
+        let png = [&PNG_SIGNATURE[..], b"pixels", &PNG_END[..]].concat();
         let textures = cache_dir(dir.path()).join("textures");
         std::fs::create_dir_all(&textures).unwrap();
         // What an OS crash can leave after a rename whose data never reached the disk
-        for (key, left) in [("empty", &b""[..]), ("truncated", &PNG_SIGNATURE[..4])] {
+        let cut = &png[..png.len() - 1];
+        let headless = &png[1..];
+        for (key, left) in [
+            ("empty", &b""[..]),
+            ("short", &PNG_SIGNATURE[..4]),
+            ("cut", cut),
+            ("headless", headless),
+        ] {
             std::fs::write(textures.join(format!("{key}.png")), left).unwrap();
             let path = texture(dir.path(), key, || Ok(png.clone())).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), png, "{key}");
@@ -198,7 +219,7 @@ mod tests {
             assert_eq!(hit, path);
         }
         let entries = std::fs::read_dir(&textures).unwrap().count();
-        assert_eq!(entries, 2, "no partial file is left");
+        assert_eq!(entries, 4, "no partial file is left");
     }
 
     #[tokio::test]
