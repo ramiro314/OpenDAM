@@ -145,9 +145,11 @@ function MaterialSlot({
   const [error, setError] = useState<string | null>(null);
   useEffect(() => setDraft(name.value), [name.value]);
 
+  // The one commit of a name: Enter blurs the input, so blur is the only caller, and a save in
+  // flight (which disables the input, blurring it again) isn't sent twice
   const commitName = () => {
     const value = draft.trim();
-    if (value === name.value) return;
+    if (saving || value === name.value) return;
     const problem = materialNameError(value);
     if (problem) setError(problem);
     else save(slotPatch(m, { field: 'name', value }));
@@ -177,7 +179,7 @@ function MaterialSlot({
             setError(null);
           }}
           onBlur={commitName}
-          onKeyDown={(e) => e.key === 'Enter' && commitName()}
+          onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
         />
       </Row>
       {error && (
