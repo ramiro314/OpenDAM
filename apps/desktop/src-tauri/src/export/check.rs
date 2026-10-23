@@ -3,10 +3,11 @@
 //! every problem that would refuse the export.
 //!
 //! A domain is a direct child of the root collection (C3). Its assets are the grid items in it
-//! and all its subcollections, across every library, each once. Until later steps of the plan's
-//! build order land, only standalone textures that pass through byte for byte export, each with
-//! its nearest `conversion.json`'s steps (C10): the guards refuse a texture that needs converting,
-//! and any FBX.
+//! and all its subcollections, across every library, each once. A format group with an FBX, or
+//! a lone FBX, is a model or an animation by its FBX's facts (`fbx_facts`). Until later steps of
+//! the plan's build order land, only standalone textures that pass through byte for byte export,
+//! each with its nearest `conversion.json`'s steps (C10): the guards refuse a texture that needs
+//! converting, every model and every animation.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -16,6 +17,7 @@ use serde_json::{json, Value};
 
 use crate::db::{Database, LibraryHandle};
 use crate::export::conversion::{Invalid, Walker};
+use crate::export::fbx_facts::{self, FbxFacts, Reading};
 use crate::export::names::{is_pascal, pascal};
 use crate::export::packs::{self, PackSource};
 use crate::export::textures::{self, Convention, Layout, Refusal, Role};
@@ -119,12 +121,19 @@ struct PackFolder {
     edits: PackOverride,
 }
 
-/// What a check reads from one library's DB before it touches a file.
+/// The FBX a model or animation exports from (A5), and its facts.
+struct ItemFbx {
+    /// Relative to the library root
+    path: String,
+    facts: Result<FbxFacts, String>,
+}
+
+/// What a check reads from one library before it touches a file other than an FBX.
 struct LibraryInput {
     library: LibraryHandle,
     items: Vec<ItemRow>,
-    /// The main items whose group has an FBX member
-    groups_with_fbx: HashSet<String>,
+    /// The FBX of each item that is a format group with an FBX member, or a lone FBX, by id
+    fbx: HashMap<String, ItemFbx>,
     /// The pack at or above each item, by its index in `items`
     item_packs: Vec<Option<usize>>,
     packs: Vec<PackFolder>,
@@ -141,9 +150,14 @@ fn general(message: impl Into<String>) -> Problem {
     }
 }
 
-/// Checks the domain collection `domain_id`. An unknown collection is an error; everything else
-/// that would refuse the export is a problem in the report.
-pub async fn check(db: &Database, domain_id: &str) -> Result<CheckReport, String> {
+/// Checks the domain collection `domain_id`, reading FBX files' facts with `facts`. An unknown
+/// collection is an error; everything else that would refuse the export is a problem in the
+/// report.
+pub async fn check(
+    db: &Database,
+    domain_id: &str,
+    facts: &impl fbx_facts::Reader,
+) -> Result<CheckReport, String> {
     let master = &db.master_pool;
     let settings = settings::load(master).await.map_err(|e| e.to_string())?;
     let collections: Vec<(String, String, Option<String>, bool)> =
@@ -236,7 +250,7 @@ pub async fn check(db: &Database, domain_id: &str) -> Result<CheckReport, String
     let mut inputs = Vec::new();
     for library in db.get_all_libraries().await {
         inputs.push(
-            read_library(library, &subtree)
+            read_library(library, &subtree, facts)
                 .await
                 .map_err(|e| e.to_string())?,
         );
@@ -340,7 +354,30 @@ pub async fn inferred_origin(
     .map_err(|e| e.to_string())
 }
 
-async fn read_library(library: LibraryHandle, subtree: &[String]) -> sqlx::Result<LibraryInput> {
+/// Whether `path` lies in a Unity FBX format folder, `fbx(unity)` or `fbx (unity)` in any case.
+fn in_unity_fbx_folder(path: &str) -> bool {
+    let mut folders = path.split('/').rev().skip(1);
+    folders.any(|f| {
+        matches!(
+            f.to_ascii_lowercase().as_str(),
+            "fbx(unity)" | "fbx (unity)"
+        )
+    })
+}
+
+/// The FBX a group exports from (A5): its first FBX member in a Unity FBX format folder, else
+/// its first, by path ignoring case.
+fn exported_fbx<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    paths
+        .into_iter()
+        .min_by_key(|p| (!in_unity_fbx_folder(p), p.to_lowercase(), *p))
+}
+
+async fn read_library(
+    library: LibraryHandle,
+    subtree: &[String],
+    facts: &impl fbx_facts::Reader,
+) -> sqlx::Result<LibraryInput> {
     let pool = &library.pool;
     let ids = serde_json::to_string(subtree).expect("ids serialize");
     // Memberships are on every member of a group, so each is read as its grid item
@@ -356,13 +393,40 @@ async fn read_library(library: LibraryHandle, subtree: &[String]) -> sqlx::Resul
     .fetch_all(pool)
     .await?;
     let item_ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
-    let groups_with_fbx: Vec<(String,)> = sqlx::query_as(
-        "SELECT DISTINCT group_id FROM assets
+    let group_fbx: Vec<(String, String)> = sqlx::query_as(
+        "SELECT group_id, file_path FROM assets
          WHERE group_id IN (SELECT value FROM json_each(?)) AND lower(extension) = 'fbx'",
     )
     .bind(serde_json::to_string(&item_ids).expect("ids serialize"))
     .fetch_all(pool)
     .await?;
+    let mut fbx_paths: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (group, path) in &group_fbx {
+        fbx_paths.entry(group).or_default().push(path);
+    }
+    // A lone FBX is a group of one
+    for item in &items {
+        if item.extension.eq_ignore_ascii_case("fbx") {
+            fbx_paths
+                .entry(&item.id)
+                .or_insert_with(|| vec![&item.file_path]);
+        }
+    }
+    // Every read is sent at once, so the preview queue serves them all between two of its jobs
+    let reads = fbx_paths.into_iter().map(|(id, paths)| {
+        let path = exported_fbx(paths)
+            .expect("a group with an FBX")
+            .to_string();
+        let root = &library.root_path;
+        async move {
+            let facts = facts.read(&root.join(&path), root).await;
+            (id.to_string(), ItemFbx { path, facts })
+        }
+    });
+    let fbx: HashMap<String, ItemFbx> = futures_util::future::join_all(reads)
+        .await
+        .into_iter()
+        .collect();
 
     let overrides = structure::read_overrides(pool).await?;
     let folders: Vec<(String, String, Option<String>)> =
@@ -401,7 +465,7 @@ async fn read_library(library: LibraryHandle, subtree: &[String]) -> sqlx::Resul
     let paths: Vec<String> = items.iter().map(|i| i.file_path.clone()).collect();
     let memo = hashes::load(pool, &paths).await?;
     Ok(LibraryInput {
-        groups_with_fbx: groups_with_fbx.into_iter().map(|(id,)| id).collect(),
+        fbx,
         library,
         items,
         item_packs,
@@ -523,10 +587,13 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                 AssetKind::Model3d => {
                     row.kind = Kind::Model;
                     row.asset_name = Some(pascal(stem));
-                    if extension == "fbx" || input.groups_with_fbx.contains(&item.id) {
-                        issue("model export not built yet (an FBX exports as a model or an animation, and neither is built yet)".into());
-                    } else {
-                        issue("it has no FBX file: a model exports from its group's FBX".into());
+                    match input.fbx.get(&item.id) {
+                        None => {
+                            issue("it has no FBX file: a model exports from its group's FBX".into())
+                        }
+                        Some(fbx) => {
+                            row.kind = read_fbx(fbx, &item.file_path, &mut issue);
+                        }
                     }
                 }
                 AssetKind::Texture | AssetKind::Image | AssetKind::Hdri => {
@@ -621,6 +688,46 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
         })
         .collect();
     (rows, domain_packs, problems, manifest)
+}
+
+/// What a model item exporting from `fbx` is, by its facts (C3), with what refuses it: an FBX
+/// that can't be read, has two materials of one name, or has no kept mesh and no take, and the
+/// build-order guards on models and animations.
+fn read_fbx(fbx: &ItemFbx, item_path: &str, issue: &mut impl FnMut(String)) -> Kind {
+    let what = if fbx.path == item_path {
+        "FBX".to_string()
+    } else {
+        format!("its FBX {}", fbx.path)
+    };
+    let facts = match &fbx.facts {
+        Ok(facts) => facts,
+        Err(e) => {
+            issue(format!("{what} can't be read for export: {e}"));
+            return Kind::Model;
+        }
+    };
+    for (name, count) in facts.duplicate_slots() {
+        let count = if count == 2 {
+            "two".to_string()
+        } else {
+            count.to_string()
+        };
+        issue(format!("{what} has {count} materials named {name}"));
+    }
+    match facts.reading() {
+        Some(Reading::Model) => {
+            issue("model export not built yet (an FBX with a kept mesh exports as a model)".into());
+            Kind::Model
+        }
+        Some(Reading::Animation) => {
+            issue("animation export not built yet (an FBX with no kept mesh and a take exports as an animation)".into());
+            Kind::Animation
+        }
+        None => {
+            issue(format!("{what} has no kept mesh and no take"));
+            Kind::Model
+        }
+    }
 }
 
 /// `file_path` relative to the pack folder `pack_path`, with `/` separators.
@@ -944,6 +1051,65 @@ mod tests {
 
     type Pool = sqlx::Pool<sqlx::Sqlite>;
 
+    /// `fbx_facts` as the worker answers it: for the fixture's FBX files from `fbx_facts.json`,
+    /// which the worker's pytest checks against the files, and for files a test adds, what it
+    /// gives `with`. It records the files it reads, relative to their library root.
+    struct Facts {
+        by_path: HashMap<String, Result<FbxFacts, String>>,
+        read: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Facts {
+        fn fixture() -> Self {
+            let snapshot: HashMap<String, FbxFacts> = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/game-export/fbx_facts.json"
+            )))
+            .unwrap();
+            Facts {
+                by_path: snapshot.into_iter().map(|(k, v)| (k, Ok(v))).collect(),
+                read: Default::default(),
+            }
+        }
+
+        fn with(mut self, path: &str, facts: Result<FbxFacts, String>) -> Self {
+            self.by_path.insert(path.into(), facts);
+            self
+        }
+
+        fn read_files(&self) -> Vec<String> {
+            let mut read = self.read.lock().unwrap().clone();
+            read.sort();
+            read
+        }
+    }
+
+    impl fbx_facts::Reader for Facts {
+        async fn read(&self, source: &Path, root: &Path) -> Result<FbxFacts, String> {
+            let path = source.strip_prefix(root).unwrap().display().to_string();
+            self.read.lock().unwrap().push(path.clone());
+            self.by_path
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("no facts for {path}")))
+        }
+    }
+
+    /// Writes `bytes` at `path` in the fixture library and indexes it.
+    async fn add_file(f: &Fixture, path: &str, bytes: &[u8]) {
+        let target = f.library.root_path.join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, bytes).unwrap();
+        let root = f.library.root_path.display().to_string();
+        crate::watcher::index_paths(&f.db, "fixture", &[root])
+            .await
+            .unwrap();
+    }
+
+    fn fixture_bytes(path: &str) -> Vec<u8> {
+        std::fs::read(Path::new(FIXTURE).join(path)).unwrap()
+    }
+
     /// Adds collection `id` named `name` under `parent`, holding the fixture's files at `paths`.
     async fn collection(f: &Fixture, id: &str, name: &str, parent: &str, paths: &[&str]) {
         insert_collection(&f.db.master_pool, id, name, Some(parent)).await;
@@ -965,7 +1131,7 @@ mod tests {
     /// Checks a new domain holding `paths`.
     async fn check_domain(f: &Fixture, paths: &[&str]) -> CheckReport {
         collection(f, "domain", "Props", "dg", paths).await;
-        check(&f.db, "domain").await.unwrap()
+        check(&f.db, "domain", &Facts::fixture()).await.unwrap()
     }
 
     fn messages(report: &CheckReport) -> Vec<&str> {
@@ -1085,7 +1251,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(memo, 6);
-        let again = check(&f.db, "domain").await.unwrap();
+        let again = check(&f.db, "domain", &Facts::fixture()).await.unwrap();
         assert_eq!(again.manifest["assets"], report.manifest["assets"]);
     }
 
@@ -1152,7 +1318,7 @@ mod tests {
             messages(&report),
             [
                 "Converted/Ruins/T_Pillar_N.png: texture conversion not built yet: it needs its DirectX normal map's green channel flipped",
-                "Dungeon Props/Models/SM_Chest.fbx: model export not built yet (an FBX exports as a model or an animation, and neither is built yet)",
+                "Dungeon Props/Models/SM_Chest.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
                 "Dungeon Props/Textures/T_StoneFloor_ORM.png: texture conversion not built yet: it needs its ORM channels split into URP roles",
                 "Dungeon Props/Textures/T_Wall_D.jpg: texture conversion not built yet: it needs its .jpg format to PNG",
                 "Dungeon Props/Textures/T_Wall_N_DX.png: texture conversion not built yet: it needs its DirectX normal map's green channel flipped",
@@ -1208,14 +1374,20 @@ mod tests {
         )
         .await;
 
-        // Dungeon Props' normal maps are DirectX now, and Ruins' OpenGL, so only the conversion.json
-        // guard is left on the pillar
+        // Dungeon Props' normal maps are DirectX now, and Ruins' OpenGL, so the pillar's normal
+        // map passes through, with its conversion.json's steps
         assert_eq!(
             messages(&report),
-            [
-                "Converted/Ruins/T_Pillar_N.png: conversion.json support not built yet (Converted/conversion.json covers this file)",
-                "Dungeon Props/Textures/T_StoneFloor_N.png: texture conversion not built yet: it needs its DirectX normal map's green channel flipped",
-            ]
+            ["Dungeon Props/Textures/T_StoneFloor_N.png: texture conversion not built yet: it needs its DirectX normal map's green channel flipped"]
+        );
+        assert!(
+            texture_entries(&report).contains(&(
+                "Pillar".to_string(),
+                "Normal".to_string(),
+                "Textures/Pillar_Normal.png".to_string()
+            )),
+            "{:?}",
+            texture_entries(&report)
         );
         let packs: Vec<(&str, packs::Origin, Convention)> = report
             .packs
@@ -1249,7 +1421,7 @@ mod tests {
 
         // Back to inferred
         override_pack(&f, "Unity Moss", None, None).await;
-        let again = check(&f.db, "domain").await.unwrap();
+        let again = check(&f.db, "domain", &Facts::fixture()).await.unwrap();
         let moss = again.packs.iter().find(|p| p.path == "Unity Moss").unwrap();
         assert_eq!(
             (moss.pack.origin, moss.normal_convention),
@@ -1412,7 +1584,7 @@ mod tests {
         collection(&f, "domain", "Props", "dg", &[obj, floor]).await;
         collection(&f, "sub", "Floors", "domain", &[floor]).await;
         collection(&f, "subsub", "Stone", "sub", &[floor]).await;
-        let report = check(&f.db, "domain").await.unwrap();
+        let report = check(&f.db, "domain", &Facts::fixture()).await.unwrap();
 
         let rows: Vec<(&str, Kind, Option<&str>)> = report
             .assets
@@ -1522,7 +1694,7 @@ mod tests {
             .unwrap();
         collection(&f, "nested", "Nested", "lower", &[]).await;
 
-        let report = check(&f.db, "lower").await.unwrap();
+        let report = check(&f.db, "lower", &Facts::fixture()).await.unwrap();
         assert_eq!(
             messages(&report),
             [
@@ -1531,7 +1703,7 @@ mod tests {
             ]
         );
 
-        let report = check(&f.db, "nested").await.unwrap();
+        let report = check(&f.db, "nested", &Facts::fixture()).await.unwrap();
         assert_eq!(
             messages(&report),
             ["Nested is not a domain: domains are the collections directly inside the root collection DungeonGame"]
@@ -1542,13 +1714,13 @@ mod tests {
             .await
             .unwrap();
         collection(&f, "props", "Props", "dg", &[]).await;
-        let report = check(&f.db, "props").await.unwrap();
+        let report = check(&f.db, "props", &Facts::fixture()).await.unwrap();
         assert_eq!(
             messages(&report),
             ["The root collection's name Dungeon Game isn't PascalCase (a capital letter, then letters and digits): it is a folder of the bundle path"]
         );
 
-        assert!(check(&f.db, "missing").await.is_err());
+        assert!(check(&f.db, "missing", &Facts::fixture()).await.is_err());
     }
 
     #[tokio::test]
@@ -1569,7 +1741,7 @@ mod tests {
         .await
         .unwrap();
 
-        let report = check(&f.db, "props").await.unwrap();
+        let report = check(&f.db, "props", &Facts::fixture()).await.unwrap();
         assert_eq!(
             messages(&report),
             [
@@ -1586,7 +1758,7 @@ mod tests {
             .execute(&f.db.master_pool)
             .await
             .unwrap();
-        let report = check(&f.db, "props").await.unwrap();
+        let report = check(&f.db, "props", &Facts::fixture()).await.unwrap();
         assert_eq!(report.problems.len(), 1, "{:?}", messages(&report));
         assert!(
             report.problems[0]
@@ -1628,7 +1800,7 @@ mod tests {
             &["Foo Copy/tile_c.png", "Unreal/Rocks/T_Rock_D.png"],
         )
         .await;
-        let report = check(&f.db, "domain").await.unwrap();
+        let report = check(&f.db, "domain", &Facts::fixture()).await.unwrap();
 
         assert_eq!(messages(&report), Vec::<&str>::new());
         let rows: Vec<(&str, &str, Option<&str>, Status)> = report
@@ -1787,7 +1959,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = check(&f.db, "props").await.unwrap();
+        let report = check(&f.db, "props", &Facts::fixture()).await.unwrap();
         assert_eq!(
             messages(&report),
             ["The root collection dg set in Settings no longer exists"]
@@ -1940,5 +2112,254 @@ mod tests {
         assert_eq!(manifest["packs"], json!([pack("moss").manifest_entry()]));
         assert_eq!(contract::validate_manifest(&manifest), Ok(()));
         assert_eq!(contract::check_rules(&manifest), Ok(()));
+    }
+
+    /// The rows of `report`'s assets, as (path, kind, status).
+    fn kinds(report: &CheckReport) -> Vec<(&str, Kind, Status)> {
+        let mut rows: Vec<(&str, Kind, Status)> = report
+            .assets
+            .iter()
+            .map(|a| (a.asset.file_path.as_str(), a.kind, a.status))
+            .collect();
+        rows.sort_by_key(|r| r.0);
+        rows
+    }
+
+    #[tokio::test]
+    async fn fbx_groups_and_lone_fbx_files_are_models_or_animations_by_their_facts() {
+        let f = fixture().await;
+        // The mesh-less animation fixture comes with animation export; a copy stands in for it
+        let idle = "Dungeon Props/Animations/A_Idle.fbx";
+        add_file(&f, idle, &fixture_bytes("Dungeon Props/Models/SM_Hull.fbx")).await;
+        let facts = Facts::fixture().with(
+            idle,
+            Ok(FbxFacts {
+                bones: vec!["Hips".into()],
+                takes: vec!["Idle".into()],
+                ..FbxFacts::default()
+            }),
+        );
+        collection(
+            &f,
+            "domain",
+            "Props",
+            "dg",
+            &[
+                idle,
+                "Dungeon Props/Models/SK_Guard.fbx",
+                "Dungeon Props/Models/SM_Pillar.fbx",
+                "Dungeon Props/Models/SM_Gate.fbx",
+                // A member of the SM_Chest group, which reads as its main item, the FBX
+                "Dungeon Props/Models/SM_Chest.obj",
+                "Dungeon Props/Models/SM_Barrel.obj",
+            ],
+        )
+        .await;
+        let report = check(&f.db, "domain", &facts).await.unwrap();
+
+        assert_eq!(
+            messages(&report),
+            [
+                "Dungeon Props/Animations/A_Idle.fbx: animation export not built yet (an FBX with no kept mesh and a take exports as an animation)",
+                "Dungeon Props/Models/SK_Guard.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
+                "Dungeon Props/Models/SM_Barrel.obj: it has no FBX file: a model exports from its group's FBX",
+                "Dungeon Props/Models/SM_Chest.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
+                "Dungeon Props/Models/SM_Gate.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
+                "Dungeon Props/Models/SM_Pillar.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
+            ]
+        );
+        assert_eq!(
+            kinds(&report),
+            [
+                (idle, Kind::Animation, Status::Problem),
+                (
+                    "Dungeon Props/Models/SK_Guard.fbx",
+                    Kind::Model,
+                    Status::Problem
+                ),
+                (
+                    "Dungeon Props/Models/SM_Barrel.obj",
+                    Kind::Model,
+                    Status::Problem
+                ),
+                (
+                    "Dungeon Props/Models/SM_Chest.fbx",
+                    Kind::Model,
+                    Status::Problem
+                ),
+                (
+                    "Dungeon Props/Models/SM_Gate.fbx",
+                    Kind::Model,
+                    Status::Problem
+                ),
+                (
+                    "Dungeon Props/Models/SM_Pillar.fbx",
+                    Kind::Model,
+                    Status::Problem
+                ),
+            ]
+        );
+        let idle_row = report
+            .assets
+            .iter()
+            .find(|a| a.kind == Kind::Animation)
+            .unwrap();
+        assert_eq!(idle_row.asset_name.as_deref(), Some("Idle"));
+        // Only FBX files are read, and no OBJ
+        assert_eq!(
+            facts.read_files(),
+            [
+                idle,
+                "Dungeon Props/Models/SK_Guard.fbx",
+                "Dungeon Props/Models/SM_Chest.fbx",
+                "Dungeon Props/Models/SM_Gate.fbx",
+                "Dungeon Props/Models/SM_Pillar.fbx",
+            ]
+        );
+        assert_eq!(report.manifest["assets"], json!([]));
+        assert_valid(&report);
+    }
+
+    #[tokio::test]
+    async fn an_fbx_with_nothing_to_export_or_two_materials_of_one_name_is_refused_by_name() {
+        let f = fixture().await;
+        let broken = "Dungeon Props/Models/SM_Broken.fbx";
+        add_file(&f, broken, b"not an FBX").await;
+        let facts =
+            Facts::fixture().with(broken, Err("can't read the FBX: not an FBX file".into()));
+        collection(
+            &f,
+            "domain",
+            "Props",
+            "dg",
+            &[
+                broken,
+                "Dungeon Props/Models/SM_Hull.fbx",
+                "Dungeon Props/Models/SM_Bench.fbx",
+                // Material, a real DefaultMaterial and OpenDAMDefault are ordinary slots
+                "Dungeon Props/Models/SM_Stool.fbx",
+                "Dungeon Props/Models/SM_Lamp.fbx",
+                "Dungeon Props/Models/SM_Shelf.fbx",
+            ],
+        )
+        .await;
+        let report = check(&f.db, "domain", &facts).await.unwrap();
+
+        let guard = "model export not built yet (an FBX with a kept mesh exports as a model)";
+        let expected = [
+            "Dungeon Props/Models/SM_Bench.fbx: FBX has two materials named Wood".to_string(),
+            format!("Dungeon Props/Models/SM_Bench.fbx: {guard}"),
+            "Dungeon Props/Models/SM_Broken.fbx: FBX can't be read for export: can't read the FBX: not an FBX file".to_string(),
+            "Dungeon Props/Models/SM_Hull.fbx: FBX has no kept mesh and no take".to_string(),
+            format!("Dungeon Props/Models/SM_Lamp.fbx: {guard}"),
+            format!("Dungeon Props/Models/SM_Shelf.fbx: {guard}"),
+            format!("Dungeon Props/Models/SM_Stool.fbx: {guard}"),
+        ];
+        assert_eq!(messages(&report), expected);
+        for problem in &report.problems {
+            let path = problem.message.split(':').next().unwrap();
+            assert_eq!(problem.assets.len(), 1);
+            assert_eq!(problem.assets[0].file_path, path);
+        }
+        assert!(report.assets.iter().all(|a| a.kind == Kind::Model));
+        assert_valid(&report);
+    }
+
+    #[tokio::test]
+    async fn a_group_exports_from_its_unity_fbx_and_names_it_in_its_problems() {
+        let f = fixture().await;
+        let fbx = fixture_bytes("Dungeon Props/Models/SM_Bench.fbx");
+        add_file(&f, "Kit/datapackage.json", br#"{"name": "kit"}"#).await;
+        add_file(&f, "Kit/Assets/gltf/crate.gltf", b"{}").await;
+        add_file(&f, "Kit/Assets/fbx/crate.fbx", &fbx).await;
+        add_file(&f, "Kit/Assets/FBX (Unity)/crate.fbx", &fbx).await;
+        let unity = "Kit/Assets/FBX (Unity)/crate.fbx";
+        let facts = Facts::fixture().with(
+            unity,
+            Ok(serde_json::from_value(json!({
+                "slots": [{"name": "Wood"}, {"name": "Wood"}, {"name": "Wood"}],
+                "kept_meshes": ["crate"], "dropped_meshes": [], "has_kept_mesh": false,
+                "kept_mesh_without_material": false, "bones": [], "takes": [],
+            }))
+            .unwrap()),
+        );
+        let report = check_domain_with(&f, &["Kit/Assets/gltf/crate.gltf"], &facts).await;
+
+        // The glTF is the main item; the Unity FBX is the file it exports from
+        assert_eq!(
+            messages(&report),
+            [
+                "Kit/Assets/gltf/crate.gltf: its FBX Kit/Assets/FBX (Unity)/crate.fbx has 3 materials named Wood",
+                "Kit/Assets/gltf/crate.gltf: its FBX Kit/Assets/FBX (Unity)/crate.fbx has no kept mesh and no take",
+            ]
+        );
+        assert_eq!(facts.read_files(), [unity]);
+    }
+
+    /// `Facts` that answers only once `reads` reads are in flight together.
+    struct AllAtOnce {
+        facts: Facts,
+        together: tokio::sync::Barrier,
+    }
+
+    impl fbx_facts::Reader for AllAtOnce {
+        async fn read(&self, source: &Path, root: &Path) -> Result<FbxFacts, String> {
+            self.together.wait().await;
+            self.facts.read(source, root).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_libraries_fbx_files_are_read_all_at_once() {
+        let f = fixture().await;
+        let paths = [
+            "Dungeon Props/Models/SM_Pillar.fbx",
+            "Dungeon Props/Models/SM_Gate.fbx",
+            "Dungeon Props/Models/SM_Hull.fbx",
+            "Dungeon Props/Models/SM_Stool.fbx",
+            "Dungeon Props/Models/SK_Guard.fbx",
+        ];
+        collection(&f, "domain", "Props", "dg", &paths).await;
+        let facts = AllAtOnce {
+            facts: Facts::fixture(),
+            together: tokio::sync::Barrier::new(paths.len()),
+        };
+
+        // Read one after another, the first read would wait for the others for ever
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            check(&f.db, "domain", &facts),
+        )
+        .await
+        .expect("every read is in flight at once")
+        .unwrap();
+        assert_eq!(facts.facts.read_files().len(), paths.len());
+        assert!(messages(&report)
+            .contains(&"Dungeon Props/Models/SM_Hull.fbx: FBX has no kept mesh and no take"));
+    }
+
+    /// Checks a new domain holding `paths`, reading FBX facts from `facts`.
+    async fn check_domain_with(f: &Fixture, paths: &[&str], facts: &Facts) -> CheckReport {
+        collection(f, "domain", "Props", "dg", paths).await;
+        check(&f.db, "domain", facts).await.unwrap()
+    }
+
+    #[test]
+    fn the_exported_fbx_is_the_first_in_a_unity_folder_else_the_first_by_path() {
+        assert_eq!(
+            exported_fbx([
+                "Kit/fbx/b.fbx",
+                "Kit/FBX (Unity)/b.fbx",
+                "Kit/fbx(unity)/b.fbx"
+            ]),
+            Some("Kit/FBX (Unity)/b.fbx")
+        );
+        assert_eq!(
+            exported_fbx(["Kit/b/crate.fbx", "Kit/A/crate.fbx"]),
+            Some("Kit/A/crate.fbx")
+        );
+        // Only a folder counts, not a file named like one
+        assert!(!in_unity_fbx_folder("Kit/fbx(unity)"));
+        assert_eq!(exported_fbx([]), None);
     }
 }

@@ -42,13 +42,13 @@ pub async fn get_blender_status(path: Option<String>) -> Result<BlenderStatus> {
 
 /// Checks the domain collection `domain_id` for export (plan C14): every asset with its kind,
 /// default name, pack and status, every problem that refuses the export, and the manifest it
-/// would write.
+/// would write. FBX files are read through the preview worker's `fbx_facts`.
 #[tauri::command]
 pub async fn check_export(
     domain_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<check::CheckReport> {
-    check::check(&state.db, &domain_id).await
+    check::check(&state.db, &domain_id, &state.fbx_facts).await
 }
 
 /// The origin the game export infers for the pack at `path` (`""` for the root) in library

@@ -37,6 +37,8 @@ pub struct AppState {
     pub engine_version: tokio::sync::watch::Sender<Option<i64>>,
     /// The `worker.py` the Python queue runs, once `preview::start_preview_worker` has found it.
     pub preview_worker: std::sync::OnceLock<std::path::PathBuf>,
+    /// FBX facts for the game export, from the Python queue's worker, cached for the session
+    pub fbx_facts: export::fbx_facts::Cached<export::fbx_facts::Worker>,
 }
 
 /// The tagging providers runs can use, plus the fake ones in a debug build run with
@@ -149,6 +151,7 @@ pub fn run(render_choice: render::RenderChoice) {
                     }
                 }),
             );
+            let (worker_requests, requests) = tokio::sync::mpsc::channel(64);
             let state = Arc::new(AppState {
                 db,
                 credentials,
@@ -159,12 +162,15 @@ pub fn run(render_choice: render::RenderChoice) {
                 app_handle: app.handle().clone(),
                 engine_version: tokio::sync::watch::Sender::new(None),
                 preview_worker: std::sync::OnceLock::new(),
+                fbx_facts: export::fbx_facts::Cached::new(export::fbx_facts::Worker::new(
+                    worker_requests,
+                )),
             });
 
             app.manage(state.clone());
 
             // Start the background preview worker queue
-            crate::preview::start_preview_worker(state.clone());
+            crate::preview::start_preview_worker(state.clone(), requests);
 
             // Removes upscaled thumbnails once per library; `Database::new` already synced them
             thumb_cleanup::spawn(state.clone(), None);

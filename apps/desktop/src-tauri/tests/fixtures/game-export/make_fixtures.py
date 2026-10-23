@@ -26,6 +26,20 @@ Step 3 (conversion chains):
 
 - `Scans/`: a pack with its own `conversion.json`, covering `T_Boulder_D.png`, and a deeper one in
   `Scans/Cliffs/` with two steps, which replaces it for `T_Cliff_D.png`.
+
+Step 4 (`fbx_facts`, and the Check telling models from animations), in `Dungeon Props/Models/`:
+
+- `SM_Totem.fbx`: centimetres and Z up, off centre, with an asymmetric nose on its front.
+- `SM_Pillar.fbx`: Unreal style, `_LOD0` and `_LOD1` with two slots and a `UCX_` hull with its
+  own material. `SM_Gate.fbx`: the same, with a hull that has no material.
+- `SM_Boulder.fbx`: no material at all. `SK_Guard.fbx`: skinned, with the take `Wave`.
+- `SM_Hull.fbx`: only a `UCX_` hull and no take, which is refused.
+- `SM_Stool.fbx`: one material named `Material`. `SM_Bench.fbx`: two materials named `Wood`,
+  which is refused. `SM_Lamp.fbx`: a real `DefaultMaterial` beside a mesh with no material.
+  `SM_Shelf.fbx`: a slot named `OpenDAMDefault` beside a mesh with no material.
+
+After a rerun, refresh `fbx_facts.json` beside the library, as `test_fbx_facts.py` says. Only
+the FBX files this script changes on purpose are committed: each rerun stamps new times in them.
 """
 
 import json
@@ -100,6 +114,182 @@ def fbx_cube(path: str, name: str) -> None:
     bpy.ops.mesh.primitive_cube_add(size=1)
     bpy.context.active_object.name = name
     bpy.ops.export_scene.fbx(filepath=str(target), use_selection=False)
+
+
+def material(name: str, base_color: str | None = None, normal: str | None = None):
+    """A new material `name`, with the library's images at `base_color` and `normal` wired to
+    its Principled BSDF, so the FBX references them by type."""
+    mat = bpy.data.materials.new(name)
+    if mat.node_tree is None:
+        mat.use_nodes = True
+    nodes, links = mat.node_tree.nodes, mat.node_tree.links
+    bsdf = next(n for n in nodes if n.type == "BSDF_PRINCIPLED")
+    if base_color:
+        tex = nodes.new("ShaderNodeTexImage")
+        tex.image = bpy.data.images.load(str(LIBRARY / base_color))
+        links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+    if normal:
+        tex = nodes.new("ShaderNodeTexImage")
+        tex.image = bpy.data.images.load(str(LIBRARY / normal))
+        tex.image.colorspace_settings.name = "Non-Color"
+        normal_map = nodes.new("ShaderNodeNormalMap")
+        links.new(tex.outputs["Color"], normal_map.inputs["Color"])
+        links.new(normal_map.outputs["Normal"], bsdf.inputs["Normal"])
+    return mat
+
+
+def box(name: str, size=(1, 1, 1), location=(0, 0, 0), materials=()):
+    """A box mesh object `name` of `size`, its faces taking `materials` in turn."""
+    bpy.ops.mesh.primitive_cube_add(size=1, location=location)
+    obj = bpy.context.active_object
+    obj.name = obj.data.name = name
+    obj.scale = size
+    bpy.ops.object.transform_apply(scale=True)
+    for mat in materials:
+        obj.data.materials.append(mat)
+    for i, polygon in enumerate(obj.data.polygons):
+        polygon.material_index = i % max(1, len(materials))
+    return obj
+
+
+def export_fbx(path: str, **settings) -> Path:
+    """Exports the scene to `path`. Each texture is named by its path relative to the FBX, and
+    by its absolute path on the machine that made it, as real FBX files are."""
+    target = LIBRARY / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    bpy.ops.export_scene.fbx(
+        filepath=str(target), use_selection=False, path_mode="RELATIVE", **settings
+    )
+    return target
+
+
+def renamed_material(target: Path, old: str, new: str) -> None:
+    """Renames the FBX's material `old` to `new`, of the same length, in place, so it can hold
+    two materials of one name, which Blender itself never makes."""
+    assert len(old) == len(new)
+    old_name, new_name = f"{old}\x00\x01Material".encode(), f"{new}\x00\x01Material".encode()
+    data = target.read_bytes()
+    assert data.count(old_name) == 1
+    target.write_bytes(data.replace(old_name, new_name))
+
+
+def skinned(name: str, bones: list[str], take: str, mat) -> None:
+    """A mesh `name` skinned to an armature with a chain of `bones`, and one action `take`
+    turning the second bone."""
+    bpy.ops.object.armature_add(location=(0, 0, 0))
+    armature = bpy.context.active_object
+    armature.name = armature.data.name = "Armature"
+    bpy.ops.object.mode_set(mode="EDIT")
+    edit_bones = armature.data.edit_bones
+    edit_bones.remove(edit_bones[0])
+    parent = None
+    for i, bone_name in enumerate(bones):
+        bone = edit_bones.new(bone_name)
+        bone.head, bone.tail = (0, 0, i * 0.6), (0, 0, (i + 1) * 0.6)
+        bone.parent = parent
+        parent = bone
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    height = 0.6 * len(bones)
+    mesh = box(name, size=(0.5, 0.3, height), location=(0, 0, height / 2), materials=[mat])
+    # The bottom vertices follow the first bone and the top ones the last
+    for bone_name, low in [(bones[0], True), (bones[-1], False)]:
+        group = mesh.vertex_groups.new(name=bone_name)
+        group.add([v.index for v in mesh.data.vertices if (v.co.z < 0) == low], 1.0, "REPLACE")
+    mesh.parent = armature
+    mesh.modifiers.new("Armature", "ARMATURE").object = armature
+
+    action = bpy.data.actions.new(take)
+    armature.animation_data_create().action = action
+    bone = armature.pose.bones[bones[1]]
+    bone.rotation_mode = "XYZ"
+    for frame, angle in [(1, 0.0), (10, 0.6), (20, 0.0)]:
+        bone.rotation_euler = (angle, 0, 0)
+        bone.keyframe_insert("rotation_euler", frame=frame)
+    scene = bpy.context.scene
+    scene.frame_start, scene.frame_end = 1, 20
+    # Without all actions, Blender writes the scene's animation as one take named after it
+    scene.name = take
+
+
+def models() -> None:
+    """The FBX models `fbx_facts` and the Check read (step 4), in `Dungeon Props/Models/`."""
+    models = "Dungeon Props/Models"
+    floor = "Dungeon Props/Textures/T_StoneFloor_D.png"
+    floor_normal = "Dungeon Props/Textures/T_StoneFloor_N.png"
+
+    # Centimetres and Z up, off centre, with an asymmetric nose on its front (-Y): 40 x 30 x
+    # 180 cm
+    bpy.ops.wm.read_homefile(use_empty=True)
+    bpy.context.scene.unit_settings.scale_length = 0.01
+    stone = material("Stone", floor, floor_normal)
+    body = box("SM_Totem", size=(40, 30, 180), location=(25, 10, 90), materials=[stone])
+    nose = box("Nose", size=(10, 10, 10), location=(32, -10, 150), materials=[stone])
+    bpy.ops.object.select_all(action="DESELECT")
+    nose.select_set(True)
+    body.select_set(True)
+    bpy.context.view_layer.objects.active = body
+    bpy.ops.object.join()
+    export_fbx(f"{models}/SM_Totem.fbx", axis_up="Z", axis_forward="-Y", apply_unit_scale=True)
+
+    # Unreal style: two LODs with two slots each, and a UCX_ hull with its own material
+    bpy.ops.wm.read_homefile(use_empty=True)
+    slots = [material("Stone", floor, floor_normal), material("Moss")]
+    box("SM_Pillar_LOD0", size=(0.6, 0.6, 3), materials=slots)
+    box("SM_Pillar_LOD1", size=(0.6, 0.6, 3), materials=slots)
+    box("UCX_SM_Pillar_00", size=(0.7, 0.7, 3), materials=[material("Collision")])
+    export_fbx(f"{models}/SM_Pillar.fbx")
+
+    # The same, with a hull that has no material
+    bpy.ops.wm.read_homefile(use_empty=True)
+    iron = material("Iron")
+    box("SM_Gate_LOD0", size=(2, 0.2, 2.5), materials=[iron])
+    box("SM_Gate_LOD1", size=(2, 0.2, 2.5), materials=[iron])
+    box("UCX_SM_Gate_00", size=(2, 0.3, 2.5))
+    export_fbx(f"{models}/SM_Gate.fbx")
+
+    # No material at all
+    bpy.ops.wm.read_homefile(use_empty=True)
+    box("SM_Boulder", size=(1.2, 1, 0.8))
+    export_fbx(f"{models}/SM_Boulder.fbx")
+
+    # Skinned, with one take
+    bpy.ops.wm.read_homefile(use_empty=True)
+    skinned("SK_Guard", ["Hips", "Spine", "Head"], "Wave", material("Cloth"))
+    export_fbx(
+        f"{models}/SK_Guard.fbx",
+        bake_anim=True,
+        bake_anim_use_all_actions=False,
+        bake_anim_use_nla_strips=False,
+    )
+
+    # Only a UCX_ hull and no take: nothing to export
+    bpy.ops.wm.read_homefile(use_empty=True)
+    box("UCX_SM_Hull_00", materials=[material("Collision")])
+    export_fbx(f"{models}/SM_Hull.fbx")
+
+    # Its only material is named `Material`, as Blender's default cube's is
+    bpy.ops.wm.read_homefile(use_empty=True)
+    box("SM_Stool", size=(0.4, 0.4, 0.5), materials=[material("Material")])
+    export_fbx(f"{models}/SM_Stool.fbx")
+
+    # Two materials named Wood
+    bpy.ops.wm.read_homefile(use_empty=True)
+    box("SM_Bench_Seat", size=(1.5, 0.4, 0.1), location=(0, 0, 0.45), materials=[material("Wood")])
+    box("SM_Bench_Legs", size=(1.4, 0.3, 0.4), location=(0, 0, 0.2), materials=[material("W00d")])
+    renamed_material(export_fbx(f"{models}/SM_Bench.fbx"), "W00d", "Wood")
+
+    # A real DefaultMaterial, beside a mesh with no material
+    bpy.ops.wm.read_homefile(use_empty=True)
+    box("SM_Lamp_Base", size=(0.3, 0.3, 0.1), materials=[material("DefaultMaterial")])
+    box("SM_Lamp_Shade", size=(0.4, 0.4, 0.3), location=(0, 0, 0.5))
+    export_fbx(f"{models}/SM_Lamp.fbx")
+
+    # A kept slot named OpenDAMDefault, beside a mesh with no material
+    bpy.ops.wm.read_homefile(use_empty=True)
+    box("SM_Shelf_Frame", size=(1, 0.3, 2), materials=[material("OpenDAMDefault")])
+    box("SM_Shelf_Board", size=(0.9, 0.28, 0.05), location=(0, 0, 1))
+    export_fbx(f"{models}/SM_Shelf.fbx")
 
 
 OBJ_TRIANGLE = "o Barrel\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"
@@ -223,6 +413,8 @@ def main() -> None:
         ],
     )
     png("Scans/Cliffs/T_Cliff_D.png", (95, 90, 85, 255))
+
+    models()
 
 
 main()

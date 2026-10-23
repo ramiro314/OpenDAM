@@ -851,6 +851,31 @@ from the contracts above:
   infers them.
 - **Problems don't link to a Game tab yet,** which arrives with step 2.
 
+### What the `fbx_facts` ticket built differently
+
+- **`fbx_facts` reads only the node tree, not assimp** (C12, A3). Every fact comes from
+  `fbx_nodes.py`: mesh `Model` objects and their names, the `Material` objects connected to them,
+  `LimbNode` bones, and the `AnimationStack` takes whose curve nodes drive an object with at
+  least one key. assimp splits a mesh per material, renames nodes and adds its own
+  `DefaultMaterial`, and loads every vertex. The node tree is what Blender's importer reads
+  too, and a large FBX reads in milliseconds. An FBX older than 7.0 is refused.
+- **Texture references are reported, not resolved.** Each slot lists, by type (`baseColor`,
+  `normal`, `metalness`, `roughness`, `occlusion`, `emissive`, `height`), the `file` and
+  `relative` paths the FBX gives. C7's inference resolves them against the pack.
+- **The `library_root` rule:** the worker opens the FBX only when it lies inside the library
+  root, after resolving symlinks, and opens no other file.
+- **The worker is shared, not doubled.** The Check sends `fbx_facts` to the preview queue's one
+  process through `preview::WorkerRequest`, served between jobs, or at once when the queue is idle.
+- **The two FBX guards** are "model export not built yet" for an FBX with a kept mesh and
+  "animation export not built yet" for one with only takes. A model refused for its slots or for
+  having nothing to export is still listed as a model.
+- **Fixtures:** the step-4 FBX models land in `Dungeon Props/Models/`. The take of `SK_Guard` is
+  `Wave`. The two `Wood` materials of `SM_Bench` are made by renaming a second material in the
+  written file, since Blender never names two materials alike. The textures, the Unity
+  `.mat`/`.meta` pair and `SM_Crate` with its `1K`/`4K` normal maps come with C7's inference,
+  which reads them. `fbx_facts.json` beside the library holds the facts the worker reads from
+  each FBX, so the Check's Rust tests read them without Python.
+
 ## Acceptance criteria
 
 - **AC1.** The copied schema matches `SOURCE.md`'s sha256 (a test). `sync-asset-contract.sh`
