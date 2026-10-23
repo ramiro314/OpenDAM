@@ -7,10 +7,12 @@
 //!
 //! The edits are `assetName` for every asset, `materials` for a model (each slot's `name`,
 //! `surface` and `textures`, keyed by slot name), and `layout`, `role` and `normalConvention`
-//! for an image, which reach the image's own group but not the rest of its set.
+//! for an image, which reach the image's own group but not the rest of its set. A model also
+//! takes `rig` and `facingQuarterTurns`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::{Pool, Sqlite};
 
@@ -29,6 +31,31 @@ pub const MATERIALS: &str = "materials";
 pub const LAYOUT: &str = "layout";
 pub const ROLE: &str = "role";
 pub const NORMAL_CONVENTION: &str = "normalConvention";
+pub const RIG: &str = "rig";
+pub const FACING_QUARTER_TURNS: &str = "facingQuarterTurns";
+
+/// A model's rig as the manifest lists it (D20). The export infers none without an armature,
+/// else generic. Humanoid, which only you set, comes with animation export (build order step 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Rig {
+    None,
+    Generic,
+}
+
+impl Rig {
+    /// Every rig an edit can hold
+    pub const ALL: [Rig; 2] = [Rig::None, Rig::Generic];
+
+    /// What the export infers for a model: generic when it has an armature
+    pub fn inferred(has_armature: bool) -> Self {
+        if has_armature {
+            Rig::Generic
+        } else {
+            Rig::None
+        }
+    }
+}
 
 const SLOT_NAME: &str = "name";
 const SURFACE: &str = "surface";
@@ -64,6 +91,42 @@ pub fn asset_name(edits: &Edits) -> Option<String> {
         .get(ASSET_NAME)
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// The `rig` you set in `edits`, if any.
+pub fn rig(edits: &Edits) -> Option<Rig> {
+    edits.get(RIG).and_then(parse_rig)
+}
+
+/// `value` as a rig, the one reading of a stored or sent `rig`.
+fn parse_rig(value: &Value) -> Option<Rig> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+/// The most quarter turns an edit holds: four make a whole turn.
+pub const MAX_QUARTER_TURNS: u8 = 3;
+
+/// The quarter turns about Y you set in `edits` (D13), if any: 0 to 3, each clockwise seen from
+/// above, after the pack origin's default facing.
+pub fn facing_quarter_turns(edits: &Edits) -> Option<u8> {
+    edits.get(FACING_QUARTER_TURNS).and_then(parse_turns)
+}
+
+/// `value` as quarter turns, 0 to `MAX_QUARTER_TURNS`, the one reading of a stored or sent
+/// `facingQuarterTurns`.
+fn parse_turns(value: &Value) -> Option<u8> {
+    value
+        .as_u64()
+        .and_then(|turns| u8::try_from(turns).ok())
+        .filter(|turns| *turns <= MAX_QUARTER_TURNS)
+}
+
+/// The edits of asset `asset_id` among `rows`, empty when it has none.
+pub fn of(rows: &[Row], asset_id: &str) -> Edits {
+    rows.iter()
+        .find(|row| row.asset_id == asset_id)
+        .map(Row::parsed)
+        .unwrap_or_default()
 }
 
 fn parse_surface(text: &str) -> Option<Surface> {
@@ -258,8 +321,9 @@ fn validate_materials(materials: &Value) -> Result<(), String> {
 
 /// Refuses a `patch` holding a key that isn't an edit of an asset of `kind`, or a value an edit
 /// can't take: an `assetName` must be a PascalCase string, `materials` (a model's) slots of
-/// `validate_materials`, and an image's `layout`, `role` and `normalConvention` one of their
-/// names. Null resets any of them.
+/// `validate_materials`, a model's `rig` a `Rig` and `facingQuarterTurns` 0 to
+/// `MAX_QUARTER_TURNS`, read by the same parsers as the readers, and an image's `layout`, `role`
+/// and `normalConvention` one of their names. Null resets any of them.
 fn validate(kind: &str, patch: &Edits) -> Result<(), String> {
     let model = AssetKind::from_str(kind) == AssetKind::Model3d;
     let image = is_image(kind);
@@ -269,6 +333,26 @@ fn validate(kind: &str, patch: &Edits) -> Result<(), String> {
             ASSET_NAME if value.is_null() => {}
             ASSET_NAME => validate_name(value, "An assetName")?,
             MATERIALS if model => validate_materials(value)?,
+            RIG | FACING_QUARTER_TURNS if model && value.is_null() => {}
+            RIG if model && parse_rig(value).is_some() => {}
+            RIG if model => {
+                let names: Vec<String> = Rig::ALL
+                    .iter()
+                    .map(|r| {
+                        serde_json::to_value(r)
+                            .expect("a rig serializes")
+                            .to_string()
+                    })
+                    .map(|name| name.trim_matches('"').to_string())
+                    .collect();
+                return Err(format!("A rig must be {}", names.join(" or ")));
+            }
+            FACING_QUARTER_TURNS if model && parse_turns(value).is_some() => {}
+            FACING_QUARTER_TURNS if model => {
+                return Err(format!(
+                    "facingQuarterTurns must be a whole number from 0 to {MAX_QUARTER_TURNS}"
+                ))
+            }
             LAYOUT | ROLE | NORMAL_CONVENTION if image && value.is_null() => {}
             LAYOUT if image && text.and_then(LayoutEdit::parse).is_some() => {}
             LAYOUT if image => {
@@ -694,7 +778,16 @@ mod tests {
                 "\"sedan car\" isn't PascalCase: a game name starts with a capital letter, then only letters and digits",
             ),
             (json!({"assetName": 3}), "An assetName must be text"),
-            (json!({"rig": "generic"}), "rig isn't an export edit of this asset"),
+            (json!({"rig": "humanoid"}), "A rig must be none or generic"),
+            (
+                json!({"facingQuarterTurns": 4}),
+                "facingQuarterTurns must be a whole number from 0 to 3",
+            ),
+            (
+                json!({"facingQuarterTurns": 1.5}),
+                "facingQuarterTurns must be a whole number from 0 to 3",
+            ),
+            (json!({"colour": "red"}), "colour isn't an export edit of this asset"),
         ] {
             assert_eq!(
                 write(&pool, SEDAN[0], &patch(value)).await,
@@ -1018,5 +1111,72 @@ mod tests {
                 .unwrap(),
             written
         );
+    }
+
+    #[tokio::test]
+    async fn a_models_rig_and_facing_reach_its_group_and_reset_on_their_own() {
+        let pool = car_kit().await;
+        write(
+            &pool,
+            SEDAN[1],
+            &patch(json!({"rig": "generic", "facingQuarterTurns": 3})),
+        )
+        .await
+        .unwrap();
+        write(&pool, SEDAN[0], &patch(json!({"assetName": "Sedan"})))
+            .await
+            .unwrap();
+        let all = read_all(&pool).await.unwrap();
+        for id in SEDAN {
+            let edits = of(&all, id);
+            assert_eq!(rig(&edits), Some(Rig::Generic), "{id}");
+            assert_eq!(facing_quarter_turns(&edits), Some(3), "{id}");
+        }
+
+        write(&pool, SEDAN[2], &patch(json!({"facingQuarterTurns": null})))
+            .await
+            .unwrap();
+        let all = read_all(&pool).await.unwrap();
+        let edits = of(&all, SEDAN[0]);
+        assert_eq!(facing_quarter_turns(&edits), None);
+        assert_eq!(rig(&edits), Some(Rig::Generic));
+        assert_eq!(asset_name(&edits).as_deref(), Some("Sedan"));
+        assert_eq!(of(&all, "gone"), Edits::new());
+    }
+
+    /// Validation and the readers share one parser each, so every value a write accepts is read
+    /// back, whatever rigs or turns are added later.
+    #[tokio::test]
+    async fn every_rig_and_turn_a_write_accepts_is_read_back() {
+        let pool = car_kit().await;
+        for rig in Rig::ALL {
+            let edit = json!({ "rig": rig });
+            write(&pool, SEDAN[0], &patch(edit)).await.unwrap();
+            let edits = of(&read_all(&pool).await.unwrap(), SEDAN[0]);
+            assert_eq!(super::rig(&edits), Some(rig));
+        }
+        for turns in 0..=MAX_QUARTER_TURNS {
+            let edit = json!({ "facingQuarterTurns": turns });
+            write(&pool, SEDAN[0], &patch(edit)).await.unwrap();
+            let edits = of(&read_all(&pool).await.unwrap(), SEDAN[0]);
+            assert_eq!(facing_quarter_turns(&edits), Some(turns));
+        }
+        let edit = json!({ "facingQuarterTurns": 260 });
+        assert!(write(&pool, SEDAN[0], &patch(edit)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_image_has_no_rig_or_facing() {
+        let pool = memory_library_pool().await;
+        insert_path(&pool, "Pack/T_Rock_D.png").await;
+        structure::rebuild(&pool, unmounted()).await.unwrap();
+        for value in [json!({"rig": "none"}), json!({"facingQuarterTurns": 1})] {
+            let key = value.as_object().unwrap().keys().next().unwrap().clone();
+            assert_eq!(
+                write(&pool, "Pack/T_Rock_D.png", &patch(value)).await,
+                Err(format!("{key} isn't an export edit of this asset"))
+            );
+        }
+        assert_eq!(rows(&pool).await, []);
     }
 }

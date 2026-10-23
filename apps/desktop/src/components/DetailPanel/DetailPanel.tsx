@@ -64,7 +64,7 @@ import {
 } from '../../utils/packEdits';
 import { KIND_LABEL } from '../../utils/scrubKey';
 import { domainsLine, exportsAs, hasGameTab, namePatch, shownValue } from '../../utils/gameTab';
-import { MaterialEditor, TextureEditor } from './GameEditors';
+import { MaterialEditor, ModelEditor, TextureEditor } from './GameEditors';
 import { ThreeViewer } from './ThreeViewer';
 import { SuggestTags } from './SuggestTags';
 import styles from './DetailPanel.module.css';
@@ -1121,6 +1121,9 @@ function GameTab({ asset }: { asset: Asset }) {
   const [draft, setDraft] = useState('');
   const [saving, setSaving] = useState(false);
   const [reload, setReload] = useState(0);
+  // The save the last finished read followed, whether it succeeded or failed, so a control
+  // waiting for the read back of a save never waits on a read that already ended
+  const [readAfter, setReadAfter] = useState(0);
   useEffect(() => {
     let current = true;
     setChecking(true);
@@ -1136,7 +1139,11 @@ function GameTab({ asset }: { asset: Asset }) {
           setError(null);
         })
         .catch((err) => current && setError(String(err)))
-        .finally(() => current && setChecking(false));
+        .finally(() => {
+          if (!current) return;
+          setChecking(false);
+          setReadAfter(reload);
+        });
     }, 250);
     return () => {
       current = false;
@@ -1155,7 +1162,7 @@ function GameTab({ asset }: { asset: Asset }) {
   }
 
   const name = shownValue(detail.assetName);
-  const save = async (patch: ExportEditPatch) => {
+  const save = async (patch: ExportEditPatch): Promise<boolean> => {
     setSaving(true);
     setError(null);
     try {
@@ -1163,8 +1170,10 @@ function GameTab({ asset }: { asset: Asset }) {
       const ids = await api.setExportEdit(detail.assetId, patch);
       useExportEditStore.getState().noteEdited(ids);
       setReload((r) => r + 1);
+      return true;
     } catch (err) {
       setError(String(err));
+      return false;
     } finally {
       setSaving(false);
     }
@@ -1243,6 +1252,17 @@ function GameTab({ asset }: { asset: Asset }) {
           </button>
         </div>
       </form>
+      {detail.model && (
+        <ModelEditor
+          key={detail.assetId}
+          assetId={detail.assetId}
+          model={detail.model}
+          revision={reload}
+          stale={readAfter !== reload}
+          saving={saving}
+          save={save}
+        />
+      )}
       {detail.materials.length > 0 && (
         <MaterialEditor
           materials={detail.materials}

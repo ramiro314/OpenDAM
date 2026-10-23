@@ -146,3 +146,15 @@ pub async fn set_export_edit(
     let written = edits::write(&library.pool, &asset_id, &patch).await?;
     edits::touched(&library.pool, &asset_id, &patch, written).await
 }
+
+/// Shows model `asset_id` as the next export writes it (plan C13): the path of a GLB of its
+/// normalized FBX, with your facing, which Blender writes beside its export cache entry when the
+/// cache holds none. Blender runs only here, when you ask, and an error says why it can't.
+#[tauri::command]
+pub async fn show_as_exported(asset_id: String, state: State<'_, Arc<AppState>>) -> Result<String> {
+    state
+        .exports
+        .exported_view(&state.db, &asset_id, &state.fbx_facts)
+        .await
+        .map(|glb| glb.display().to_string())
+}

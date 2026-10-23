@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import clsx from 'clsx';
+import { api } from '../../api';
 import type {
   ExportEditPatch,
   GameImage,
   GameMaterial,
+  GameModelDetail,
+  GameRig,
   GameTexture,
   MaterialSurface,
   NormalConvention,
@@ -11,14 +14,23 @@ import type {
   TextureRole,
 } from '../../types';
 import {
+  exportedView,
+  facingLine,
   materialNameError,
   pickerOptions,
+  rigPatch,
   roleEditable,
   shortPaths,
   shownValue,
   slotPatch,
   sourcePatch,
+  turnPatch,
+  viewKey,
+  withPatch,
+  type ViewResult,
 } from '../../utils/gameTab';
+import { IconRotateCcw, IconRotateCw } from '../Icons';
+import { ThreeViewer } from './ThreeViewer';
 import styles from './DetailPanel.module.css';
 
 const ROLES: TextureRole[] = [
@@ -93,6 +105,148 @@ function Row({
         </button>
       </div>
     </div>
+  );
+}
+
+/**
+ * A model's rig and facing (plan game-export C13, D13, D20): a rig picker and quarter turns
+ * about Y, each marked inferred or yours with a reset, and "Show as exported", which has Blender
+ * write the normalized model for the viewer only when you ask. Once shown, the view asks again
+ * after each edit (`revision`), so it follows each turn. A turn is computed from the value the
+ * last save wrote, so the controls wait while the tab reads that save back (`stale`), showing
+ * the saved value meanwhile.
+ */
+export function ModelEditor({
+  assetId,
+  model: read,
+  revision,
+  stale,
+  saving,
+  save,
+}: Omit<EditorProps, 'save'> & {
+  assetId: string;
+  model: GameModelDetail;
+  /** Counts the tab's saved edits: each makes an open view ask again */
+  revision: number;
+  /** Whether the tab is still reading back the last save, which `model` may not show yet */
+  stale: boolean;
+  /** Resolves whether the edit was written */
+  save: (patch: ExportEditPatch) => Promise<boolean>;
+}) {
+  // The last save's values, until the detail read after it arrives
+  const [pending, setPending] = useState<ExportEditPatch | null>(null);
+  useEffect(() => setPending(null), [read]);
+  const model = withPatch(read, pending);
+  const busy = saving || stale;
+  const apply = (patch: ExportEditPatch) => {
+    setPending((p) => ({ ...p, ...patch }));
+    void save(patch).then((written) => written || setPending(null));
+  };
+  const rig = shownValue(model.rig);
+  const facing = shownValue(model.facingQuarterTurns);
+  const [showing, setShowing] = useState(false);
+  const [result, setResult] = useState<ViewResult | null>(null);
+  const key = viewKey(assetId, revision);
+  const view = exportedView(showing, result, key);
+  useEffect(() => {
+    if (!showing || result?.key === key) return;
+    let current = true;
+    api
+      .showAsExported(assetId)
+      .then((path) => current && setResult({ key, path }))
+      .catch((err) => current && setResult({ key, error: String(err) }));
+    return () => {
+      current = false;
+    };
+  }, [showing, result, key, assetId]);
+
+  return (
+    <section className={styles.gameSection} id="detail-game-model">
+      <h4 className={styles.gameHeading}>Rig and facing</h4>
+      <Row
+        label="Rig"
+        id="detail-game-rig"
+        yours={rig.mark === 'yours'}
+        saving={busy}
+        onReset={() => apply({ rig: null })}
+      >
+        <select
+          id="detail-game-rig"
+          className={SELECT}
+          value={rig.value}
+          disabled={busy}
+          title="Inferred: none without an armature, else generic"
+          onChange={(e) => {
+            const patch = rigPatch(model.rig, e.target.value as GameRig);
+            if (patch) apply(patch);
+          }}
+        >
+          <option value="none">None</option>
+          <option value="generic">Generic</option>
+        </select>
+      </Row>
+      <Row
+        label="Facing"
+        id="detail-game-facing"
+        yours={facing.mark === 'yours'}
+        saving={busy}
+        onReset={() => apply({ facingQuarterTurns: null })}
+      >
+        <button
+          type="button"
+          id="detail-game-facing"
+          className={styles.openLicenseBtn}
+          onClick={() => apply(turnPatch(model.facingQuarterTurns, -1))}
+          disabled={busy}
+          title="A quarter turn counterclockwise, seen from above"
+          aria-label="A quarter turn counterclockwise, seen from above"
+        >
+          <IconRotateCcw size={12} />
+        </button>
+        <button
+          type="button"
+          id="detail-game-facing-right"
+          className={styles.openLicenseBtn}
+          onClick={() => apply(turnPatch(model.facingQuarterTurns, 1))}
+          disabled={busy}
+          title="A quarter turn clockwise, seen from above: +Z to +X"
+          aria-label="A quarter turn clockwise, seen from above: +Z to +X"
+        >
+          <IconRotateCw size={12} />
+        </button>
+      </Row>
+      <div className={styles.gameSuggestion}>
+        <span className={styles.gameHint} id="detail-game-facing-line">
+          {facingLine(model)}.
+        </span>
+        <button
+          type="button"
+          id="detail-game-show-exported"
+          className={clsx(styles.openLicenseBtn, showing && styles.actionBtnActive)}
+          onClick={() => {
+            // Asking again retries a failure, as after setting Blender's path in Settings
+            if (!showing && result && 'error' in result) setResult(null);
+            setShowing(!showing);
+          }}
+          title="Blender writes the model as the next export does, facing the blue arrow's +Z"
+        >
+          {showing ? 'Hide' : 'Show as exported'}
+        </button>
+      </div>
+      {view.status === 'loading' && (
+        <p className={styles.gameHint}>Normalizing it in Blender as the export will…</p>
+      )}
+      {view.status === 'failed' && (
+        <p className={styles.packFormError} role="alert" id="detail-game-view-error">
+          {view.error}
+        </p>
+      )}
+      {view.status === 'shown' && (
+        <div className={styles.gameViewer} id="detail-game-viewer">
+          <ThreeViewer modelPath={view.path} forwardArrow />
+        </div>
+      )}
+    </section>
   );
 }
 

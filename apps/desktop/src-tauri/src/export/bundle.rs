@@ -19,7 +19,7 @@ use crate::export::check::{
 use crate::export::fbx_facts;
 use crate::export::fingerprint::Fingerprint;
 use crate::export::infer;
-use crate::export::{contract, hashes};
+use crate::export::{contract, game, hashes};
 
 const MANIFEST: &str = "manifest.json";
 
@@ -482,6 +482,19 @@ impl Exports {
     /// such as the Game tab's
     pub fn memo(&self) -> &Arc<infer::Memo> {
         &self.memo
+    }
+
+    /// The GLB the Game tab's "Show as exported" shows for model `asset_id`
+    /// (`game::exported_view`), made under the lock a Check holds while it runs Blender, so the
+    /// two never write one export cache entry at once.
+    pub async fn exported_view(
+        &self,
+        db: &Database,
+        asset_id: &str,
+        facts: &impl fbx_facts::Reader,
+    ) -> Result<PathBuf, String> {
+        let _normalizing = self.normalizing.lock().await;
+        game::exported_view(db, asset_id, facts).await
     }
 
     /// Checks the domain `domain_id` (C14), reading FBX facts with `facts` and normalizing the

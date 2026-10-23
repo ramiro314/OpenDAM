@@ -2,16 +2,22 @@ import { describe, expect, test } from 'bun:test';
 import type { GameImage, GameMaterial, GameRoleTexture, TextureRole } from '../types';
 import {
   domainsLine,
+  exportedView,
+  facingLine,
   hasGameTab,
   isPascal,
   materialNameError,
   namePatch,
   pickerOptions,
+  rigPatch,
   roleEditable,
   shortPaths,
   shownValue,
   slotPatch,
   sourcePatch,
+  turnPatch,
+  viewKey,
+  withPatch,
 } from './gameTab';
 
 const inferred = { inferred: 'Crate', yours: null };
@@ -77,6 +83,67 @@ describe('domainsLine', () => {
     );
     expect(domainsLine({ domains: ['Props'] })).toBe('In the domain Props');
     expect(domainsLine({ domains: ['Loot', 'Props'] })).toBe('In the domains Loot, Props');
+  });
+});
+
+describe('rigPatch', () => {
+  const inferredNone = { inferred: 'none' as const, yours: null };
+  test('writes a rig other than the inferred one', () => {
+    expect(rigPatch(inferredNone, 'generic')).toEqual({ rig: 'generic' });
+  });
+
+  test('resets yours when the inferred rig is chosen back, and changes nothing when kept', () => {
+    expect(rigPatch({ inferred: 'generic', yours: 'none' }, 'generic')).toEqual({ rig: null });
+    expect(rigPatch(inferredNone, 'none')).toBeNull();
+    expect(rigPatch({ inferred: 'generic', yours: 'none' }, 'none')).toBeNull();
+  });
+});
+
+describe('turnPatch', () => {
+  const unturned = { inferred: 0, yours: null };
+  test('turns a quarter clockwise or back, wrapping from 3 to 0', () => {
+    expect(turnPatch(unturned, 1)).toEqual({ facingQuarterTurns: 1 });
+    expect(turnPatch(unturned, -1)).toEqual({ facingQuarterTurns: 3 });
+    expect(turnPatch({ inferred: 0, yours: 2 }, 1)).toEqual({ facingQuarterTurns: 3 });
+  });
+
+  test('resets yours once it is back at the origin’s default', () => {
+    expect(turnPatch({ inferred: 0, yours: 3 }, 1)).toEqual({ facingQuarterTurns: null });
+    expect(turnPatch({ inferred: 0, yours: 1 }, -1)).toEqual({ facingQuarterTurns: null });
+  });
+});
+
+describe('facingLine', () => {
+  test('says the origin’s default, then your turns', () => {
+    const turns = (yours: number | null) => ({ inferred: 0, yours });
+    expect(facingLine({ origin: 'unreal', facingQuarterTurns: turns(null) })).toBe(
+      'Its pack is from Unreal, so its +X is turned to face +Z'
+    );
+    expect(facingLine({ origin: 'generic', facingQuarterTurns: turns(1) })).toBe(
+      'Its pack’s origin is generic, so it faces as its file does, then turned 90° clockwise seen from above'
+    );
+    expect(facingLine({ origin: null, facingQuarterTurns: turns(3) })).toBe(
+      'It is in no pack yet, then turned 270° clockwise seen from above'
+    );
+  });
+});
+
+describe('exportedView', () => {
+  test('is hidden until you ask, then loads until the answer is for the current revision', () => {
+    const key = viewKey('a', 0);
+    expect(exportedView(false, null, key)).toEqual({ status: 'hidden' });
+    expect(exportedView(true, null, key)).toEqual({ status: 'loading' });
+    const shown = { key, path: '/lib/.opendam/export-cache/models/k.glb' };
+    expect(exportedView(true, shown, key)).toEqual({ status: 'shown', path: shown.path });
+    expect(exportedView(true, { key, error: 'No Blender' }, key)).toEqual({
+      status: 'failed',
+      error: 'No Blender',
+    });
+    // After an edit, such as a quarter turn, the view asks again
+    const next = viewKey('a', 1);
+    expect(next).not.toBe(key);
+    expect(exportedView(true, shown, next)).toEqual({ status: 'loading' });
+    expect(viewKey('b', 0)).not.toBe(key);
   });
 });
 
@@ -205,5 +272,34 @@ describe('materialNameError', () => {
     expect(materialNameError('Boards')).toBeNull();
     expect(materialNameError('')).toMatch(/can’t be empty/);
     expect(materialNameError('old boards')).toMatch(/isn’t PascalCase/);
+  });
+});
+
+describe('withPatch', () => {
+  const model = {
+    rig: { inferred: 'none' as const, yours: null },
+    facingQuarterTurns: { inferred: 0, yours: null },
+    origin: 'generic' as const,
+  };
+
+  test('shows the saved rig and turns as yours, and a reset as inferred', () => {
+    const saved = withPatch(model, { rig: 'generic', facingQuarterTurns: 2 });
+    expect(saved.rig).toEqual({ inferred: 'none', yours: 'generic' });
+    expect(saved.facingQuarterTurns).toEqual({ inferred: 0, yours: 2 });
+    expect(withPatch(saved, { facingQuarterTurns: null }).facingQuarterTurns).toEqual({
+      inferred: 0,
+      yours: null,
+    });
+    expect(withPatch(model, null)).toBe(model);
+  });
+
+  test('a second turn before the detail is read back builds on the first', () => {
+    const first = turnPatch(model.facingQuarterTurns, 1);
+    const shown = withPatch(model, first);
+    expect(turnPatch(shown.facingQuarterTurns, 1)).toEqual({ facingQuarterTurns: 2 });
+    // From 3, one turn resets, and the next turns from the default again
+    const three = withPatch(model, { facingQuarterTurns: 3 });
+    const reset = withPatch(three, turnPatch(three.facingQuarterTurns, 1));
+    expect(turnPatch(reset.facingQuarterTurns, 1)).toEqual({ facingQuarterTurns: 1 });
   });
 });

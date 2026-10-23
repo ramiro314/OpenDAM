@@ -1090,6 +1090,33 @@ later. Where they differ from C9:
 - **The convention is shown for a Normal only.** It is still stored per source, and a role's
   `via` is `yours` once you picked its texture.
 
+### What the rig and facing ticket built differently
+
+- **Your choices are edits like the name.** `export::edits` takes `rig` (`none` or `generic`) and
+  `facingQuarterTurns` (0 to 3), each null to reset, and refuses both on an image. Choosing the
+  inferred rig back, or turning back to 0, resets yours, so the table holds only real edits
+  (D32). Reset of the facing removes your turns, which leaves the origin's default (D13).
+- **Your rig wins, even generic without an armature.** The manifest's `rig` is yours, else none
+  without an armature in Blender's result, else generic. The Game tab infers it from
+  `fbx_facts`' bones (A3), since it never runs Blender.
+- **"Show as exported" is a second, small Blender job.** The tab asks `show_as_exported`, which
+  makes the model's job and key as the Check does (`check::model_job`, with the pack's
+  origin from `packs::origin` and the model rule from `check::exported_kind`, as the Check
+  takes them), and returns
+  `.opendam/export-cache/models/<key>.glb` when it is there. Otherwise the gate runs, and its
+  refusal is the error the tab shows. When the cache doesn't hold the normalized FBX, the
+  normalize job runs first and fills the entry the next Check reads. Then a `view` job of the
+  same script re-imports the normalized FBX and writes it as a GLB, so the viewer shows the file
+  the bundle ships, not a second normalization. The GLB isn't versioned: it is only viewed, and
+  "Clear export cache" deletes it. It waits on the lock the Checks hold while they run Blender.
+- **The viewer's +Z is Unity's.** glTF is Y up with +Z forward, so the arrow along +Z points
+  where the model faces in Unity. X is mirrored, as for every right-handed view of Unity's axes.
+  Once shown, the view asks again after each edit you save, and the backend answers from the
+  cache when nothing its key covers changed.
+- **Staleness needs no new mechanism.** The edits are in `export_edits`, which the Check's
+  fingerprint covers, so Export refuses after a change, and the tab tells an open Export view to
+  ask for a new Check, as for names.
+
 ## Acceptance criteria
 
 - **AC1.** The copied schema matches `SOURCE.md`'s sha256 (a test). `sync-asset-contract.sh`

@@ -632,6 +632,8 @@ export interface GameDetail {
   assetId: string;
   kind: 'model' | 'texture' | 'animation';
   assetName: GameField<string>;
+  /** A model's rig and facing, null for anything else */
+  model: GameModelDetail | null;
   /** The domains holding it, by name */
   domains: string[];
   /** The problems naming it in its domains' Checks */
@@ -642,6 +644,19 @@ export interface GameDetail {
   images: GameImage[];
   /** A texture's own layout, role and convention, and its set */
   texture: GameTexture | null;
+}
+
+/** A model's rig as the manifest lists it (plan D20). Humanoid comes with animations. */
+export type GameRig = 'none' | 'generic';
+
+/** A model's rig and facing in the Game tab (plan C13, D13, D20) */
+export interface GameModelDetail {
+  /** Inferred none without bones, else generic */
+  rig: GameField<GameRig>;
+  /** Your quarter turns about Y, clockwise seen from above, after the origin's facing: 0 to 3 */
+  facingQuarterTurns: GameField<number>;
+  /** Its pack's origin, whose default facing comes first; null in no pack */
+  origin: PackOrigin | null;
 }
 
 /** Your edits to one material slot: a texture is an image's id, or null for none */
@@ -661,6 +676,8 @@ export interface ExportEditPatch {
   layout?: TextureLayoutEdit | null;
   role?: TextureRole | null;
   normalConvention?: NormalConvention | null;
+  rig?: GameRig | null;
+  facingQuarterTurns?: number | null;
 }
 
 /**

@@ -183,6 +183,11 @@ export const api = {
   /** Writes your export edits to the asset's group (an image's to its texture set), returning the ids written */
   setExportEdit: (assetId: string, patch: ExportEditPatch) =>
     invoke<string[]>('set_export_edit', { assetId, patch }),
+  /**
+   * The path of a GLB of the model as the next export writes it, normalized with your facing.
+   * Blender writes it when the export cache holds none; the error says why it can't.
+   */
+  showAsExported: (assetId: string) => invoke<string>('show_as_exported', { assetId }),
 
   // Auto-tagging runs. Progress arrives as `autotag:updated` events.
   listAutotagProviders: () => invoke<AutotagProviderOption[]>('list_autotag_providers'),

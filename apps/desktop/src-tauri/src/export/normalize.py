@@ -4,7 +4,9 @@ with headless Blender, once per model:
     blender -b --factory-startup -P normalize.py -- <job.json> <result.json>
 
 It rewrites the job's FBX to metres, Y up and facing +Z, with its pivot at the bottom centre,
-collision meshes dropped and LODs kept, then re-imports what it wrote and reports it. The
+collision meshes dropped and LODs kept, then re-imports what it wrote and reports it. A `view`
+job instead re-imports a normalized FBX and writes it as a GLB, for the Game tab's "Show as
+exported": glTF's +Y up and +Z forward are then Unity's, with X mirrored. The
 result is `{"ok": true, ...}` or `{"ok": false, "error": "..."}`, and `export::blender` checks
 it. Positions are reported in Unity's axes: Blender's (x, y, z) is Unity's (-x, z, -y), since
 the FBX is written Y up and -Z forward and Unity mirrors X on import.
@@ -28,6 +30,20 @@ VERSION = "opendam-normalize/1"
 # Each origin's default facing as a turn about Unity's Y, in degrees, positive clockwise seen
 # from above (D13): an Unreal model faces +X, turned to +Z.
 ORIGIN_YAW = {"unity": 0, "unreal": -90, "generic": 0}
+
+# Fixed GLB settings for a `view` job: the scene as imported, Y up, its materials' colours, and
+# nothing the viewer doesn't show
+VIEW = {
+    "export_format": "GLB",
+    "export_yup": True,
+    "export_apply": False,
+    "export_animations": False,
+    "export_materials": "EXPORT",
+    "export_cameras": False,
+    "export_lights": False,
+    "export_extras": False,
+    "use_selection": False,
+}
 
 # Object transform properties: a take that keys one on a root object would override the
 # normalization, which sits on that object.
@@ -372,11 +388,19 @@ def normalize(job: dict) -> dict:
     }
 
 
+def view(job: dict) -> dict:
+    """Writes the normalized FBX at the job's input as a GLB at its output."""
+    load(job["input"])
+    bpy.ops.export_scene.gltf(filepath=job["output"], **VIEW)
+    return {"version": VERSION, "blenderVersion": ".".join(map(str, bpy.app.version))}
+
+
 def main() -> None:
     job_path, result_path = sys.argv[sys.argv.index("--") + 1 :][:2]
     try:
         with open(job_path, encoding="utf-8") as f:
-            result = {"ok": True, **normalize(json.load(f))}
+            job = json.load(f)
+        result = {"ok": True, **(view(job) if job["kind"] == "view" else normalize(job))}
     except Refused as e:
         result = {"ok": False, "error": str(e)}
     except Exception as e:

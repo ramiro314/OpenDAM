@@ -286,6 +286,12 @@ pub fn read_package_name(probes: &mut Probes, path: &str) -> Option<String> {
     Some(value.get("name")?.as_str()?.trim().to_string()).filter(|n| !n.is_empty())
 }
 
+/// A pack's origin (C6, D12): `yours`, your override in `pack_overrides`, else inferred from
+/// its indexed `files` (`infer_origin`). The Check and the Game tab both resolve it here.
+pub fn origin(yours: Option<Origin>, files: &[String], walker: &mut Walker) -> Origin {
+    yours.unwrap_or_else(|| infer_origin(files, walker))
+}
+
 /// A pack's inferred origin (D12, A1), from its indexed `files` (relative to the walker's library
 /// root): `unity` when any has a `<file>.meta` beside it, else `unreal` when the nearest valid
 /// `conversion.json` of any has a step `from: "uasset"`, else `generic`. Each path it looks for
