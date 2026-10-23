@@ -1,0 +1,13 @@
+{
+  "contractVersion": 1,
+  "steps": [
+    {
+      "tool": "Substance 3D Sampler",
+      "toolVersion": "4.2",
+      "from": "jpg",
+      "settings": {
+        "resolution": 2048
+      }
+    }
+  ]
+}
