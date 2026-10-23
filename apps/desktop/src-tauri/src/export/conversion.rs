@@ -1,7 +1,7 @@
 //! `conversion.json` files (plan game-export C10). A file's conversion record is the nearest
 //! `conversion.json` from its folder up to its library root: a deeper one replaces a shallower
-//! one. Pack origin inference (C6) uses the same walk, and so does the guard that refuses a
-//! texture under a `conversion.json` until conversion chains are built (plan "Build order").
+//! one. An asset's `conversion` is that file's steps, then OpenDAM's own, and pack origin
+//! inference (C6) uses the same walk.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,6 +30,14 @@ impl Nearest {
             .as_ref()
             .is_ok_and(|steps| steps.iter().any(|s| s["from"] == from))
     }
+}
+
+/// A `conversion.json` that fails `$defs/conversionFile`, which refuses the export (C10).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Invalid {
+    /// Relative to the library root, with `/` separators
+    pub path: String,
+    pub errors: Vec<String>,
 }
 
 /// Walks folders of one library to their nearest `conversion.json`, reading each folder's file at
@@ -80,6 +88,23 @@ impl Walker {
     pub fn nearest_for_file(&mut self, file_path: &str) -> Option<Arc<Nearest>> {
         let dir = file_path.rsplit_once('/').map_or("", |(dir, _)| dir);
         self.nearest(dir)
+    }
+
+    /// An asset's `conversion` (C10): the steps of its first input's nearest `conversion.json`,
+    /// in order, then OpenDAM's own `steps`. A texture made from several files takes its first
+    /// input's chain (D17), and a file under no `conversion.json` has only OpenDAM's steps, so an
+    /// untouched one has none. `inputs` are relative to the library root.
+    pub fn chain(&mut self, inputs: &[&str], steps: Vec<Value>) -> Result<Vec<Value>, Invalid> {
+        let Some(nearest) = inputs.first().and_then(|f| self.nearest_for_file(f)) else {
+            return Ok(steps);
+        };
+        match &nearest.steps {
+            Ok(theirs) => Ok(theirs.iter().cloned().chain(steps).collect()),
+            Err(errors) => Err(Invalid {
+                path: nearest.path.clone(),
+                errors: errors.clone(),
+            }),
+        }
     }
 }
 
@@ -150,6 +175,85 @@ mod tests {
                 "conversion.json"
             ]
         );
+    }
+
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/game-export/library"
+    );
+
+    fn tools(chain: &[Value]) -> Vec<&str> {
+        chain.iter().map(|s| s["tool"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn a_chain_is_the_nearest_files_steps_then_opendams() {
+        let mut walker = Walker::new(Path::new(FIXTURE));
+        let own = json!({"tool": "OpenDAM", "toolVersion": "opendam-textures/1", "by": "to-png", "from": "jpg"});
+
+        // The pack's own conversion.json, and the deeper one that replaces it below
+        let boulder = walker.chain(&["Scans/T_Boulder_D.png"], vec![]).unwrap();
+        assert_eq!(tools(&boulder), ["Substance 3D Sampler"]);
+        assert_eq!(boulder[0]["settings"]["resolution"], 2048);
+        let cliff = walker
+            .chain(&["Scans/Cliffs/T_Cliff_D.png"], vec![own.clone()])
+            .unwrap();
+        assert_eq!(
+            tools(&cliff),
+            ["RealityScan", "Substance 3D Sampler", "OpenDAM"]
+        );
+        assert_eq!(cliff[1]["by"], "delight");
+        // One above the pack folder covers the pack
+        let pillar = walker.chain(&["Converted/Ruins/T_Pillar_D.png"], vec![]);
+        assert_eq!(tools(&pillar.unwrap()), ["UE Asset Exporter"]);
+        // Untouched files have only OpenDAM's steps, if any
+        assert_eq!(walker.chain(&["Foo A/tile_a.png"], vec![]), Ok(vec![]));
+        assert_eq!(
+            walker.chain(&["Foo A/tile_a.png"], vec![own.clone()]),
+            Ok(vec![own.clone()])
+        );
+        // A texture made from several files takes its first input's chain (D17)
+        let merged = walker
+            .chain(
+                &["Foo A/tile_a.png", "Scans/T_Boulder_D.png"],
+                vec![own.clone()],
+            )
+            .unwrap();
+        assert_eq!(tools(&merged), ["OpenDAM"]);
+        let merged = walker
+            .chain(&["Scans/Cliffs/T_Cliff_D.png", "Foo A/tile_a.png"], vec![])
+            .unwrap();
+        assert_eq!(tools(&merged), ["RealityScan", "Substance 3D Sampler"]);
+
+        for chain in [boulder, cliff] {
+            let file = json!({"contractVersion": 1, "steps": chain});
+            assert_eq!(contract::validate_conversion_file(&file), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_chain_under_an_invalid_file_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "conversion.json", &conversion("uasset"));
+        write(
+            dir.path(),
+            "Pack/conversion.json",
+            &json!({"contractVersion": 1, "steps": [{"tool": "Exporter", "from": "uasset"}]}),
+        );
+        let mut walker = Walker::new(dir.path());
+
+        let invalid = walker
+            .chain(&["Pack/Textures/rock.png"], vec![])
+            .unwrap_err();
+        assert_eq!(invalid.path, "Pack/conversion.json");
+        assert!(
+            invalid.errors[0].contains("toolVersion"),
+            "{:?}",
+            invalid.errors
+        );
+        // An invalid deeper file is not skipped for a valid shallower one
+        assert!(walker.chain(&["Pack/rock.png"], vec![]).is_err());
+        assert!(walker.chain(&["rock.png"], vec![]).is_ok());
     }
 
     #[test]

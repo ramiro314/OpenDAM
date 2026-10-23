@@ -17,11 +17,15 @@ Step 1 (domains, default names, packs and licences, and the build-order guards):
   no PascalCase name.
 - `Unity Moss/`: an MIT license file and a texture with a Unity `.meta` beside it (origin unity).
 - `Converted/conversion.json` with a `from: "uasset"` step, above the pack `Converted/Ruins/`
-  (origin unreal, so its normal map is DirectX, and its textures refused until conversion chains
-  are built).
+  (origin unreal, so its normal map is DirectX). From step 3 its textures carry that step.
 - `Foo A/`, `Foo B/` and `Foo Two/`: packs named `foo`, `foo` and `foo-2`.
 - `---/`: a pack whose folder slugifies to nothing and whose license names none (`Unknown`).
 - `Loose/stray.png`: an image in no pack.
+
+Step 3 (conversion chains):
+
+- `Scans/`: a pack with its own `conversion.json`, covering `T_Boulder_D.png`, and a deeper one in
+  `Scans/Cliffs/` with two steps, which replaces it for `T_Cliff_D.png`.
 """
 
 import json
@@ -72,6 +76,10 @@ def png(path: str, rgba: tuple[int, int, int, int], size: int = 4) -> None:
 
 def package(path: str, data: dict) -> None:
     write(path, json.dumps(data, indent=2) + "\n")
+
+
+def conversion(path: str, steps: list[dict]) -> None:
+    package(path, {"contractVersion": 1, "steps": steps})
 
 
 def blender_image(path: str, rgba: tuple[float, float, float, float], file_format: str) -> None:
@@ -159,16 +167,9 @@ def main() -> None:
     png("Unity Moss/T_Moss_D.png", (40, 120, 40, 255))
     write("Unity Moss/T_Moss_D.png.meta", "fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n")
 
-    write(
+    conversion(
         "Converted/conversion.json",
-        json.dumps(
-            {
-                "contractVersion": 1,
-                "steps": [{"tool": "UE Asset Exporter", "toolVersion": "5.4", "from": "uasset"}],
-            },
-            indent=2,
-        )
-        + "\n",
+        [{"tool": "UE Asset Exporter", "toolVersion": "5.4", "from": "uasset"}],
     )
     package(
         "Converted/Ruins/datapackage.json",
@@ -190,6 +191,38 @@ def main() -> None:
     png("---/dash.png", (90, 90, 90, 255))
 
     png("Loose/stray.png", (255, 0, 255, 255))
+
+    package(
+        "Scans/datapackage.json",
+        {"name": "scans", "title": "Scans", "licenses": [{"name": "CC0-1.0"}]},
+    )
+    conversion(
+        "Scans/conversion.json",
+        [
+            {
+                "tool": "Substance 3D Sampler",
+                "toolVersion": "4.2",
+                "from": "jpg",
+                "settings": {"resolution": 2048},
+            }
+        ],
+    )
+    png("Scans/T_Boulder_D.png", (110, 105, 95, 255))
+    # A deeper conversion.json replaces the pack's for everything below it
+    conversion(
+        "Scans/Cliffs/conversion.json",
+        [
+            {"tool": "RealityScan", "toolVersion": "2.0", "from": "jpg"},
+            {
+                "tool": "Substance 3D Sampler",
+                "toolVersion": "4.2",
+                "by": "delight",
+                "from": "exr",
+                "settings": {"resolution": 4096, "tiling": True},
+            },
+        ],
+    )
+    png("Scans/Cliffs/T_Cliff_D.png", (95, 90, 85, 255))
 
 
 main()
