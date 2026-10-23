@@ -175,6 +175,15 @@ decision changed:
   would prune that row anyway. The aside pass now moves it aside too, and the carried row takes
   the path, so no file's tags land on another file (Flow, A4, A11, Known gaps).
 
+Revised again 2026-10-23 (revision 13) after GitHub Inspector's fourth review of PR #199. No
+decision changed:
+
+- **R30 - In-app edits move the `.meta` on disk.** `.meta` files aren't indexed, so `rename_asset`,
+  `delete_asset` and `delete_assets` don't touch them today. Inside an imported pack they now
+  rename or delete each file's `.meta` beside it, in the same operation and put back with the
+  rest when a step fails. So the folder stays importable into Unity, the hidden-`.mat` rule reads
+  a sidecar that exists, and the next drift check shows nothing (Edits after an import, A5).
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -786,8 +795,12 @@ half manifest.
   path they touch in the current manifest. Inside an imported pack, in the same transaction as
   their own change, they record steps, bump `recipe_rev`, and update the manifest rows. Each kind
   of file is handled differently:
-  - **Extracted file:** a `rename` (by `source` and new name) or an `exclude` (by `source`). Its
-    `.meta` moves or goes with it, and the step covers that too.
+  - **Extracted file:** a `rename` (by `source` and new name) or an `exclude` (by `source`). The
+    step covers its `.meta` too, and the command moves or deletes that `.meta` on disk in the same
+    operation: the `.meta` joins the files the command renames or deletes (`item_files` in
+    `commands/asset.rs`), and the manifest rows of both are updated in the command's
+    transaction. When a step of the rename fails, the `.meta` is put back with the other files,
+    as a rename already does for a group's files today. `.meta` files stay unindexed.
   - **Generated GLB:** no step of its own. It is always in a format group with its source model
     (same stem, same folder), and rename and delete reach every member, so the source model's
     step covers it. The convert phase names each GLB after its source model's final name and
@@ -1017,6 +1030,10 @@ confirmation names them.
   - Renaming the nested package's `T_Rock.png` records a `rename` whose `source` is its
     two-element source path. A rebuild renames that file only, and the outer `T_Rock.png` keeps
     its name.
+  - Right after an in-app rename of `SM_Log.fbx`, its `.meta` sits beside it under the new name
+    and the old `.meta` is gone. Right after an in-app delete of a `.mat`, its `.meta` is gone
+    too. The drift check run then reports no difference, and a rename whose second file fails to
+    move leaves both files and both `.meta` files under their old names.
 - **A6 - Drift.** A file added, changed and removed outside OpenDAM is listed before Rebuild, and
   each choice (keep or discard, keep yours or use the recipe's, exclude or restore) has the
   stated effect.
