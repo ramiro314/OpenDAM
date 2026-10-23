@@ -285,16 +285,48 @@ pub async fn build_first(
         Ok(locks) => locks,
         Err(stop) => return Err(cleanup.run(stop).await),
     };
+    // Every holder of the advisory lock lets go through `release`, which runs a structure pass
+    // left pending meanwhile, still under `index_lock`.
+    let swapped = swap_in(
+        env,
+        &recipe,
+        queued_rev,
+        &staging,
+        &build_id,
+        &outputs,
+        &cleanup,
+        &index_guard,
+        &advisory,
+    )
+    .await;
+    advisory.release(pool, &root).await;
+    drop(index_guard);
+    swapped
+}
+
+/// Steps 2-7, or the rollback, under both locks, with Cancel past.
+#[allow(clippy::too_many_arguments)]
+async fn swap_in(
+    env: &BuildEnv<'_>,
+    recipe: &Recipe,
+    queued_rev: i64,
+    staging: &Path,
+    build_id: &str,
+    outputs: &[Output],
+    cleanup: &Cleanup<'_>,
+    index_guard: &tokio::sync::MutexGuard<'_, ()>,
+    advisory: &IndexLock,
+) -> Result<(), Stop> {
+    let pool = &env.library.pool;
+    let pack_id = recipe.pack_id.as_str();
+    let live = env.library.root_path.join(&recipe.target);
+    let created = cleanup.created;
     if !env.control.lock() {
         return Err(cleanup.run(Stop::Cancelled).await);
     }
 
     // ── 2. Re-check ─────────────────────────────────────────────────────
-    if let Err(stop) = recheck(
-        pool, &recipe, queued_rev, &live, &staging, &build_id, &outputs,
-    )
-    .await
-    {
+    if let Err(stop) = recheck(pool, recipe, queued_rev, &live, staging, build_id, outputs).await {
         return Err(cleanup.run(stop).await);
     }
     if !advisory.still_held() {
@@ -308,7 +340,7 @@ pub async fn build_first(
         "UPDATE import_packs SET swap_state = 'swapping', swap_build = ?, swap_prev = ?
          WHERE id = ? AND swap_state IS NULL",
     )
-    .bind(&build_id)
+    .bind(build_id)
     .bind(swap_prev)
     .bind(pack_id)
     .execute(pool)
@@ -323,10 +355,10 @@ pub async fn build_first(
         done: 0,
         total: 0,
     });
-    let prev = swap_prev.then(|| fs_swap::sibling(&live, PREV, &build_id));
+    let prev = swap_prev.then(|| fs_swap::sibling(&live, PREV, build_id));
     let swapped = fs_swap::swap(
         &live,
-        &staging,
+        staging,
         prev.as_deref(),
         fs_swap::Old::Keep,
         |a, b| {
@@ -353,7 +385,7 @@ pub async fn build_first(
                 "Could not move the built pack to {}: {error}",
                 live.display()
             );
-            if let Err(e) = unjournal(pool, pack_id, &build_id).await {
+            if let Err(e) = unjournal(pool, pack_id, build_id).await {
                 return Err(Stop::Failed(format!(
                     "{failed}. Clearing its journal failed: {e}"
                 )));
@@ -370,7 +402,7 @@ pub async fn build_first(
     });
     let pack_path = [live.to_string_lossy().into_owned()];
     let committed = async {
-        let journal = InsertedRows::after(pool, pack_id, &build_id)
+        let journal = InsertedRows::after(pool, pack_id, build_id)
             .await
             .map_err(|e| e.to_string())?;
         watcher::index_paths_locked(
@@ -378,8 +410,8 @@ pub async fn build_first(
             &env.library.id,
             &pack_path,
             Prune::Defer(&journal),
-            &index_guard,
-            &advisory,
+            index_guard,
+            advisory,
         )
         .await
         .map_err(|e| format!("Indexing the pack failed: {e:#}"))?;
@@ -388,7 +420,7 @@ pub async fn build_first(
             "UPDATE import_packs SET current_build = ?, status = 'built', built_at = ?,
              swap_state = NULL, swap_build = NULL, swap_prev = NULL WHERE id = ?",
         )
-        .bind(&build_id)
+        .bind(build_id)
         .bind(chrono::Utc::now().timestamp_millis())
         .bind(pack_id)
         .execute(pool)
@@ -401,10 +433,10 @@ pub async fn build_first(
         let swap = Swapped {
             live: &live,
             prev: prev.as_deref(),
-            build_id: &build_id,
-            created: &created,
+            build_id,
+            created,
         };
-        return Err(rollback(env, &index_guard, &advisory, pack_id, &swap, error).await);
+        return Err(rollback(env, index_guard, advisory, pack_id, &swap, error).await);
     }
 
     // ── 7. Settle ───────────────────────────────────────────────────────
@@ -418,8 +450,8 @@ pub async fn build_first(
         &env.library.id,
         &pack_path,
         Prune::Now,
-        &index_guard,
-        &advisory,
+        index_guard,
+        advisory,
     )
     .await
     {
@@ -433,12 +465,12 @@ pub async fn build_first(
         let mut tx = pool.begin().await?;
         sqlx::query("DELETE FROM import_outputs WHERE pack_id = ? AND build_id != ?")
             .bind(pack_id)
-            .bind(&build_id)
+            .bind(build_id)
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM import_moves WHERE pack_id = ? AND build_id = ?")
             .bind(pack_id)
-            .bind(&build_id)
+            .bind(build_id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await

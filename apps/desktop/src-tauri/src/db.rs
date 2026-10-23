@@ -25,6 +25,12 @@ pub struct Database {
     /// folder write (`commands/folder.rs`) from reading the definition until its commit, so a
     /// batch never copies a definition into a mirror while it is changed or removed.
     pub catalog_lock: tokio::sync::Mutex<()>,
+    /// Names each library whose late structure pass a command's follow-up task ran
+    /// (`structure::rebuild_library`), so the app can emit `library:updated`.
+    pub late_passes: tokio::sync::broadcast::Sender<String>,
+    /// The libraries with a follow-up task waiting to run their late structure pass, at most one
+    /// each (`structure::rebuild_library`).
+    pub follow_ups: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// A collection definition as stored: id, name, description, parent_id, is_smart, filter_spec,
@@ -410,17 +416,35 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
         }
     }
 
-    // The folder tree, so a library has it from its first open even when the index run that
-    // follows fails. Nothing else holds this new pool yet, so the pass needs no index lock. The
-    // DB is `<root>/.opendam/library.sqlite`.
-    let root = db_path
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or(Path::new(""));
+    Ok(pool)
+}
+
+/// Opens the DB of the library rooted at `root` (`connect_library_sqlite`) and, before the
+/// library is registered, takes its `index_lock` (`Database::index_lock`), which waits for a
+/// build of this app, then its advisory lock. Holding both, it runs swap recovery and the
+/// structure pass, so a library has its folder tree from its first open even when the index run
+/// that follows fails, and no pass runs between a pack's swap and its commit. While another
+/// holder has the advisory lock it runs neither and leaves the pass pending: that holder's
+/// release, or the next index run or open, runs it.
+pub async fn open_library_db(
+    index_lock: &tokio::sync::Mutex<()>,
+    root: &Path,
+) -> Result<Pool<Sqlite>> {
+    let db_path = root.join(".opendam").join("library.sqlite");
+    let pool = connect_library_sqlite(&db_path).await?;
+    let _index_guard = index_lock.lock().await;
+    let Some(advisory) = crate::watcher::IndexLock::try_acquire(root).await else {
+        tracing::info!(
+            "Another holder has the advisory lock of {root:?}: its structure pass runs later"
+        );
+        crate::structure::mark_pending(&pool).await;
+        return Ok(pool);
+    };
+    crate::import::recover_swaps(&pool, root, crate::import::Recovery::Open).await;
     if let Err(e) = crate::structure::rebuild(&pool, root).await {
         tracing::warn!("Could not derive the folder tree of {db_path:?}: {e}");
     }
-
+    advisory.release(&pool, root).await;
     Ok(pool)
 }
 
@@ -483,13 +507,20 @@ impl Database {
             .await
             .context("Could not add the tag description column to the master DB")?;
 
-        let mut open_libraries = HashMap::new();
+        let db = Self {
+            master_pool,
+            libraries: Default::default(),
+            index_locks: Default::default(),
+            catalog_lock: Default::default(),
+            late_passes: tokio::sync::broadcast::channel(16).0,
+            follow_ups: Default::default(),
+        };
 
         // Load all registered libraries and open their per-library SQLite pools
         if let Ok(rows) = sqlx::query_as::<_, (String, String, String)>(
             "SELECT id, name, root_paths FROM libraries ORDER BY id",
         )
-        .fetch_all(&master_pool)
+        .fetch_all(&db.master_pool)
         .await
         {
             for (id, name, root_paths_json) in rows {
@@ -501,10 +532,9 @@ impl Database {
                         let thumbs_dir = opendam_dir.join("thumbs");
                         let _ = tokio::fs::create_dir_all(&thumbs_dir).await;
 
-                        let lib_db_file = opendam_dir.join("library.sqlite");
-                        match connect_library_sqlite(&lib_db_file).await {
+                        match open_library_db(&db.index_lock(&id), &root_path).await {
                             Ok(lib_pool) => {
-                                open_libraries.insert(
+                                db.libraries.write().await.insert(
                                     id.clone(),
                                     LibraryHandle {
                                         id,
@@ -517,7 +547,7 @@ impl Database {
                             Err(e) => {
                                 tracing::error!(
                                     "Failed to open library DB at {:?}: {}",
-                                    lib_db_file,
+                                    opendam_dir.join("library.sqlite"),
                                     e
                                 );
                             }
@@ -526,13 +556,6 @@ impl Database {
                 }
             }
         }
-
-        let db = Self {
-            master_pool,
-            libraries: Arc::new(RwLock::new(open_libraries)),
-            index_locks: Default::default(),
-            catalog_lock: Default::default(),
-        };
 
         db.sync_open_libraries().await;
 
@@ -630,8 +653,7 @@ impl Database {
         let thumbs_dir = opendam_dir.join("thumbs");
         tokio::fs::create_dir_all(&thumbs_dir).await?;
 
-        let lib_db_file = opendam_dir.join("library.sqlite");
-        let lib_pool = connect_library_sqlite(&lib_db_file).await?;
+        let lib_pool = open_library_db(&self.index_lock(id), root_path).await?;
 
         let handle = LibraryHandle {
             id: id.to_string(),
@@ -858,6 +880,8 @@ pub(crate) async fn memory_database(libraries: Vec<LibraryHandle>) -> Database {
         )),
         index_locks: Default::default(),
         catalog_lock: Default::default(),
+        late_passes: tokio::sync::broadcast::channel(16).0,
+        follow_ups: Default::default(),
     }
 }
 
@@ -1100,7 +1124,8 @@ mod tests {
     #[tokio::test]
     async fn opening_a_library_derives_its_folder_tree() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("library.sqlite");
+        let file = dir.path().join(".opendam/library.sqlite");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         let pool = connect_library_sqlite(&file).await.unwrap();
         sqlx::query(
             "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at)
@@ -1111,7 +1136,9 @@ mod tests {
         .unwrap();
         pool.close().await;
 
-        let reopened = connect_library_sqlite(&file).await.unwrap();
+        let reopened = open_library_db(&Default::default(), dir.path())
+            .await
+            .unwrap();
 
         assert_eq!(
             crate::structure::tests::derived_rows(&reopened).await,
@@ -1119,10 +1146,81 @@ mod tests {
         );
     }
 
+    /// A library folder whose DB holds a row for `kits/rocks/rock.glb`, on disk too, and no
+    /// structure yet.
+    async fn library_without_structure() -> (tempfile::TempDir, PathBuf) {
+        // Not `tempfile::tempdir()`: the walker skips hidden dirs, and that names it `.tmpXXXX`.
+        let dir = tempfile::Builder::new()
+            .prefix("opendam-lib-")
+            .tempdir()
+            .unwrap();
+        let root = dir.path().join("lib");
+        std::fs::create_dir_all(root.join("kits/rocks")).unwrap();
+        std::fs::create_dir_all(root.join(".opendam/thumbs")).unwrap();
+        std::fs::write(root.join("kits/rocks/rock.glb"), "glTF").unwrap();
+        let pool = connect_library_sqlite(&root.join(".opendam/library.sqlite"))
+            .await
+            .unwrap();
+        crate::structure::tests::insert_path(&pool, "kits/rocks/rock.glb").await;
+        pool.close().await;
+        (dir, root)
+    }
+
+    #[tokio::test]
+    async fn an_open_while_another_machine_holds_the_lock_leaves_its_pass_to_the_next_open() {
+        use crate::structure::tests::{derived_rows, fresh_pass};
+        let (_dir, root) = library_without_structure().await;
+        let other_machine = crate::watcher::IndexLock::try_acquire(&root).await.unwrap();
+
+        let opened = open_library_db(&Default::default(), &root).await.unwrap();
+        assert!(
+            derived_rows(&opened).await.folders.is_empty(),
+            "the pass ran while another holder had the lock"
+        );
+        assert!(crate::structure::is_pending(&opened).await);
+
+        // It goes without a release, as if its process died.
+        drop(other_machine);
+        let reopened = open_library_db(&Default::default(), &root).await.unwrap();
+        assert_eq!(
+            derived_rows(&reopened).await,
+            fresh_pass(&["kits/rocks/rock.glb"]).await
+        );
+        assert!(!crate::structure::is_pending(&reopened).await);
+    }
+
+    #[tokio::test]
+    async fn an_open_while_another_machine_holds_the_lock_leaves_its_pass_to_the_next_index_run() {
+        use crate::structure::tests::{derived_rows, fresh_pass};
+        let (dir, root) = library_without_structure().await;
+        let other_machine = crate::watcher::IndexLock::try_acquire(&root).await.unwrap();
+        let db = Database::new(dir.path().join("master.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let pool = db.register_library("lib", "lib", &root).await.unwrap().pool;
+        let paths = [root.display().to_string()];
+        let index = || crate::watcher::index_paths(&db, "lib", &paths);
+
+        index().await.unwrap();
+        assert!(
+            derived_rows(&pool).await.folders.is_empty(),
+            "the open or the index run ran a pass while another holder had the lock"
+        );
+
+        drop(other_machine);
+        index().await.unwrap();
+        assert_eq!(
+            derived_rows(&pool).await,
+            fresh_pass(&["kits/rocks/rock.glb"]).await
+        );
+        assert!(!crate::structure::is_pending(&pool).await);
+    }
+
     #[tokio::test]
     async fn opening_a_library_made_before_support_roles_and_groups_adds_them_and_derives_them() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("library.sqlite");
+        let file = dir.path().join(".opendam/library.sqlite");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         let pool = connect_library_sqlite(&file).await.unwrap();
         let paths = [
             "kits/rocks/License.txt",
@@ -1152,7 +1250,9 @@ mod tests {
         .unwrap();
         pool.close().await;
 
-        let reopened = connect_library_sqlite(&file).await.unwrap();
+        let reopened = open_library_db(&Default::default(), dir.path())
+            .await
+            .unwrap();
 
         let derived = crate::structure::tests::derived_rows(&reopened).await;
         assert_eq!(derived, crate::structure::tests::fresh_pass(&paths).await);
@@ -1235,7 +1335,9 @@ mod tests {
         .unwrap();
         pool.close().await;
 
-        let reopened = connect_library_sqlite(&file).await.unwrap();
+        let reopened = open_library_db(&Default::default(), dir.path())
+            .await
+            .unwrap();
 
         // The pass at open reads both renders: too small, so the van is queued, and the sedan
         // keeps the thumbnail it has. Nothing else changes, and a rerun reads nothing.

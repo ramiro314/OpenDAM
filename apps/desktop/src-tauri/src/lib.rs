@@ -205,6 +205,16 @@ pub fn run(render_choice: render::RenderChoice) {
 
             tauri::async_runtime::spawn(imports.start());
 
+            // A command's structure pass that ran late, from its follow-up task
+            let mut late_passes = state.db.late_passes.subscribe();
+            let late_state = state.clone();
+            tauri::async_runtime::spawn(async move {
+                use tokio::sync::broadcast::error::RecvError;
+                while !matches!(late_passes.recv().await, Err(RecvError::Closed)) {
+                    let _ = late_state.app_handle.emit("library:updated", ());
+                }
+            });
+
             // Re-index all existing libraries on startup in background
             let startup_state = state.clone();
             tauri::async_runtime::spawn(async move {
