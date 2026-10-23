@@ -903,7 +903,9 @@ from the contracts above:
   Export view shows one line per material. The Game tab's material and texture editors wait
   for the Game tab (step 2).
 - **The cutout suggestion decodes the BaseColor with the `image` crate.** A PSD, or an image it
-  can't decode, suggests nothing.
+  can't decode, suggests nothing. Its answer, each `.meta` GUID and each `.mat` are kept for the
+  session while the file keeps its size and mtime, as `fbx_facts` answers are, so a repeated
+  Check reads none of them again. An explicit URP `_AlphaClip` wins over a stale `_Mode`.
 - **Fixtures:** `T_StoneFloor_ORM.png` moved to `Rocks/T_Slate_ORM.png`, since it would have
   joined the `StoneFloor` set. The Unity material fixtures are `Unity Moss/Models/SM_Log.fbx`
   with its `.fbx.meta`, `Materials/M_LogBark.mat` (by remap) and `Materials/Leaves.mat` (by

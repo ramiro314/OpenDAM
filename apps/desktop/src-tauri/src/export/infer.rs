@@ -11,7 +11,9 @@
 //! Nothing here is stored: inferred values are recomputed at every check (D32).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 use serde::Serialize;
 
@@ -64,6 +66,65 @@ fn folder_distance(a: &str, b: &str) -> usize {
 /// nearest, then by path ignoring case.
 fn folder_rank(from: &str, dir: &str) -> (usize, String) {
     (folder_distance(from, dir), dir.to_lowercase())
+}
+
+/// When a file was read: its size and mtime.
+type Stamp = (u64, Option<SystemTime>);
+
+/// Values read from files, kept for the session while each file keeps its size and mtime, as
+/// `fbx_facts::Cached` keeps an FBX's facts, so a repeated Check reads none of them again.
+struct FileMemo<T> {
+    entries: Mutex<HashMap<PathBuf, (Stamp, T)>>,
+}
+
+impl<T: Clone> FileMemo<T> {
+    fn new() -> Self {
+        FileMemo {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `read`'s value for the file at `path`, read again only when its size or mtime changed.
+    /// `None` when the file can't be stat'ed, which is kept for nothing.
+    fn get(&self, path: &Path, read: impl FnOnce(&Path) -> T) -> Option<T> {
+        // Stamped before the read, so a file changed during it is read again next time
+        let meta = std::fs::metadata(path).ok()?;
+        let stamp = (meta.len(), meta.modified().ok());
+        let entries = &self.entries;
+        if let Some((at, value)) = entries.lock().expect("file memo").get(path) {
+            if *at == stamp {
+                return Some(value.clone());
+            }
+        }
+        let value = read(path);
+        entries
+            .lock()
+            .expect("file memo")
+            .insert(path.to_path_buf(), (stamp, value.clone()));
+        Some(value)
+    }
+}
+
+/// Whether an image has a pixel with alpha below 0.5, by absolute path
+static CUT_ALPHA: LazyLock<FileMemo<bool>> = LazyLock::new(FileMemo::new);
+/// The GUID a `.meta` file gives, by the `.meta`'s absolute path
+static META_GUIDS: LazyLock<FileMemo<Option<String>>> = LazyLock::new(FileMemo::new);
+/// A `.mat` file as read, by absolute path
+static MATERIALS: LazyLock<FileMemo<Option<unity::Material>>> = LazyLock::new(FileMemo::new);
+
+/// Whether the image at `path` has a pixel with alpha below 0.5, decoding it without a
+/// converted copy for the usual layouts. An image that can't be decoded has none.
+fn read_cut_alpha(path: &Path) -> bool {
+    use image::DynamicImage::*;
+    match image::open(path) {
+        Ok(ImageRgba8(img)) => img.pixels().any(|p| p.0[3] < 128),
+        Ok(ImageLumaA8(img)) => img.pixels().any(|p| p.0[1] < 128),
+        Ok(ImageRgba16(img)) => img.pixels().any(|p| p.0[3] < 32768),
+        Ok(ImageLumaA16(img)) => img.pixels().any(|p| p.0[1] < 32768),
+        Ok(ImageRgba32F(img)) => img.pixels().any(|p| p.0[3] < 0.5),
+        Ok(img) if img.color().has_alpha() => img.to_rgba8().pixels().any(|p| p.0[3] < 128),
+        _ => false,
+    }
 }
 
 /// A layout someone said an image has: a Unity material's property (`strong`, which wins over
@@ -203,15 +264,8 @@ impl PackImages {
         if let Some(cut) = self.cut_alpha.get(&image) {
             return *cut;
         }
-        let cut = image::open(root.join(&self.images[image].path)).is_ok_and(|img| {
-            if !img.color().has_alpha() {
-                return false;
-            }
-            match img {
-                image::DynamicImage::ImageRgba8(rgba) => rgba.pixels().any(|p| p.0[3] < 128),
-                other => other.to_rgba16().pixels().any(|p| p.0[3] < 32768),
-            }
-        });
+        let path = root.join(&self.images[image].path);
+        let cut = CUT_ALPHA.get(&path, read_cut_alpha).unwrap_or(false);
         self.cut_alpha.insert(image, cut);
         cut
     }
@@ -227,19 +281,26 @@ pub struct UnityPack {
 }
 
 impl UnityPack {
-    /// Reads the `.meta` of each of `files` (relative to `root`) and each `.mat` among them.
+    /// Reads the `.meta` of each of `files` (relative to `root`) and each `.mat` among them,
+    /// each only when it changed since the session last read it.
     pub fn read(root: &Path, files: &[String]) -> Self {
         let mut pack = UnityPack::default();
         for file in files {
-            if let Ok(meta) = std::fs::read_to_string(root.join(format!("{file}.meta"))) {
-                if let Some(guid) = unity::meta_guid(&meta) {
-                    pack.by_guid.insert(guid, file.clone());
-                }
+            let meta = root.join(format!("{file}.meta"));
+            let guid = META_GUIDS.get(&meta, |path| {
+                let text = std::fs::read_to_string(path).ok()?;
+                unity::meta_guid(&text)
+            });
+            if let Some(guid) = guid.flatten() {
+                pack.by_guid.insert(guid, file.clone());
             }
             if extension_of(file).eq_ignore_ascii_case("mat") {
-                if let Ok(mat) = std::fs::read_to_string(root.join(file)) {
-                    pack.materials
-                        .insert(file.clone(), unity::read_material(&mat));
+                let mat = MATERIALS.get(&root.join(file), |path| {
+                    let text = std::fs::read_to_string(path).ok()?;
+                    Some(unity::read_material(&text))
+                });
+                if let Some(mat) = mat.flatten() {
+                    pack.materials.insert(file.clone(), mat);
                 }
             }
         }
@@ -1109,6 +1170,11 @@ mod tests {
         assert!(!cut(&mut images, "w32768.png"));
         // No alpha channel, no cut
         assert!(!cut(&mut images, "rgb.png"));
+        // Grey with alpha reads its own alpha channel
+        let mut la = ImageBuffer::from_pixel(2, 2, image::LumaA([90u8, 255]));
+        la.put_pixel(0, 0, image::LumaA([90, 127]));
+        la.save(dir.path().join("la127.png")).unwrap();
+        assert!(read_cut_alpha(&dir.path().join("la127.png")));
     }
 
     /// The materials of a model at `fbx_path` in `pack` whose one slot `slot` references
@@ -1216,6 +1282,28 @@ mod tests {
                 Via::Suffix
             )
         );
+    }
+
+    #[test]
+    fn file_reads_are_kept_while_the_file_keeps_its_size_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("T_Rock_D.png");
+        std::fs::write(&file, b"one").unwrap();
+        let memo = FileMemo::new();
+        let reads = std::cell::Cell::new(0);
+        let read = |_: &Path| {
+            reads.set(reads.get() + 1);
+            reads.get()
+        };
+        assert_eq!(memo.get(&file, read), Some(1));
+        assert_eq!(memo.get(&file, read), Some(1), "unchanged: not read again");
+        std::fs::write(&file, b"three").unwrap();
+        assert_eq!(memo.get(&file, read), Some(2), "a new size is read again");
+        let handle = std::fs::File::options().write(true).open(&file).unwrap();
+        handle.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+        assert_eq!(memo.get(&file, read), Some(3), "a new mtime too");
+        assert_eq!(memo.get(&dir.path().join("gone.png"), read), None);
+        assert_eq!(reads.get(), 3);
     }
 
     #[test]

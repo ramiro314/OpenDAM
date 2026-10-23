@@ -705,7 +705,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                             jobs.push(TextureJob {
                                 library: l,
                                 asset,
-                                extension: item.extension.clone(),
+                                extension: item.extension.to_ascii_lowercase(),
                                 pack,
                                 name: pascal(&stem_info.base),
                                 layout: stem_info.layout.unwrap_or(Layout::Role(Role::BaseColor)),
@@ -827,7 +827,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                 .path
                 .rsplit_once('.')
                 .map_or("", |(_, e)| e)
-                .to_string(),
+                .to_ascii_lowercase(),
             pack: Some(pack),
             name: set_names[&(key, images.set_of[image])].clone(),
             layout: images.layout(image),
@@ -2223,6 +2223,40 @@ mod tests {
             };
             assert_eq!(memo, expected, "{}", library.id);
         }
+    }
+
+    #[tokio::test]
+    async fn an_upper_case_extension_passes_through_as_a_member_and_a_set_mate() {
+        let f = fixture().await;
+        let png = fixture_bytes("Dungeon Props/Textures/T_StoneFloor_D.png");
+        let normal = fixture_bytes("Dungeon Props/Textures/T_StoneFloor_N.png");
+        add_file(&f, "Kenney Crates/Tiles/T_Tile_D.PNG", &png).await;
+        add_file(&f, "Kenney Crates/Tiles/T_Tile_N.PNG", &normal).await;
+        let report = check_domain(&f, &["Kenney Crates/Tiles/T_Tile_D.PNG"]).await;
+
+        assert_eq!(messages(&report), Vec::<&str>::new());
+        let rows: Vec<(&str, bool, Status)> = report
+            .assets
+            .iter()
+            .map(|a| (a.asset.file_path.as_str(), a.member, a.status))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Kenney Crates/Tiles/T_Tile_D.PNG", true, Status::Ready),
+                ("Kenney Crates/Tiles/T_Tile_N.PNG", false, Status::Ready),
+            ]
+        );
+        let entries = texture_entries(&report);
+        let expected = [
+            ("Tile", "BaseColor", "Textures/Tile_BaseColor.png"),
+            ("Tile", "Normal", "Textures/Tile_Normal.png"),
+        ];
+        assert_eq!(
+            entries,
+            expected.map(|(n, r, p)| (n.to_string(), r.to_string(), p.to_string()))
+        );
+        assert_valid(&report);
     }
 
     #[tokio::test]

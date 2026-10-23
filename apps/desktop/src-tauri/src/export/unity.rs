@@ -71,9 +71,9 @@ pub struct Material {
     pub alpha_clip: bool,
 }
 
-/// The floats that mean alpha clip is on (D23): URP's `_AlphaClip`, Standard's cutout `_Mode`
-/// and HDRP's `_AlphaCutoffEnable`, each 1.
-const CLIP_FLOATS: [&str; 3] = ["_AlphaClip", "_Mode", "_AlphaCutoffEnable"];
+/// The floats besides URP's `_AlphaClip` that mean alpha clip is on (D23): Standard's cutout
+/// `_Mode` and HDRP's `_AlphaCutoffEnable`, each 1.
+const CLIP_FLOATS: [&str; 2] = ["_Mode", "_AlphaCutoffEnable"];
 
 /// Reads a `.mat` file.
 pub fn read_material(mat: &str) -> Material {
@@ -86,6 +86,7 @@ pub fn read_material(mat: &str) -> Material {
     let mut material = Material::default();
     let mut section = Section::Other;
     let mut property: Option<String> = None;
+    let (mut alpha_clip, mut other_clip) = (None, false);
     for line in mat.lines() {
         let trimmed = line.trim();
         // `m_TexEnvs`, `m_Ints`, `m_Floats` and `m_Colors` sit at 4 spaces, below
@@ -116,13 +117,18 @@ pub fn read_material(mat: &str) -> Material {
             Section::Textures => property = Some(key.trim().to_string()),
             Section::Numbers => {
                 let on = value.trim().parse::<f64>().is_ok_and(|v| v == 1.0);
-                if on && CLIP_FLOATS.contains(&key.trim()) {
-                    material.alpha_clip = true;
+                match key.trim() {
+                    "_AlphaClip" => alpha_clip = Some(on),
+                    key if CLIP_FLOATS.contains(&key) => other_clip |= on,
+                    _ => {}
                 }
             }
             Section::Other => {}
         }
     }
+    // URP's own `_AlphaClip` decides when it is there: a URP material can keep a stale
+    // Standard `_Mode` from before it was converted
+    material.alpha_clip = alpha_clip.unwrap_or(other_clip);
     material
 }
 
@@ -211,6 +217,9 @@ mod tests {
         assert!(floats("- _AlphaCutoffEnable: 1"));
         assert!(!floats("- _Mode: 2"));
         assert!(!floats("- _Cutoff: 1"));
+        // URP's own switch wins over a stale Standard mode
+        assert!(!floats("- _AlphaClip: 0\n    - _Mode: 1"));
+        assert!(floats("- _AlphaClip: 1\n    - _Mode: 0"));
     }
 
     #[test]
