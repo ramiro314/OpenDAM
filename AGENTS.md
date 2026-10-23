@@ -159,6 +159,13 @@ docs/plans                    Plans for this fork
   run takes a `watcher::Prune`: `Now` deletes the rows of files it didn't find and ends with the
   structure pass, and `Defer` deletes no row, runs no pass, and reports each row it inserts to an
   `InsertJournal` inside the inserting transaction. Every run but a pack import build's is `Now`.
+- **The advisory lock keeps itself fresh.** `watcher::IndexLock` writes a token naming its holder
+  (a keyed hash of the machine id, boot id and pid namespace, then pid, process start time and a
+  nonce), re-reads it after 100 ms, and rewrites its timestamp every 30 s while held. A lock is
+  stale once its mtime is 120 s old, or at once when its token names a gone process in this
+  machine, boot and pid namespace. A guard deletes the file on drop only while the file holds its
+  token. `index_pool` re-reads the token (its `advisory` argument) right before it prunes, and
+  prunes nothing once the lock is lost.
 
 - **Structure is derived.** `folders` (each folder's path, parent, name, `is_pack`, and its
   recursive `item_count`, `hidden_count` and `split_groups`, the root being `path = ''`, and a
