@@ -97,7 +97,7 @@ install: install-paths build
 	install -Dm644 $(TAURI)/icons/128x128.png $(INSTALL_ICON)
 	install -d $(dir $(INSTALL_DESKTOP))
 	printf '%s\n' "$$DESKTOP_ENTRY" > $(INSTALL_DESKTOP)
-	install -Dm644 -t $(INSTALL_ENGINE) $(addprefix $(PREVIEW)/,worker.py textures.py pyproject.toml uv.lock .python-version)
+	install -Dm644 -t $(INSTALL_ENGINE) $(addprefix $(PREVIEW)/,worker.py textures.py fbx_nodes.py pyproject.toml uv.lock .python-version)
 	cd $(INSTALL_ENGINE) && uv sync --frozen --no-dev
 
 # Leaves the master DB (~/.local/share/com.opendam.desktop) and every library's

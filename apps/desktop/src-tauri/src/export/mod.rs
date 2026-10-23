@@ -3,8 +3,10 @@
 pub mod blender;
 pub mod cache;
 pub mod check;
+pub mod collision;
 pub mod contract;
 pub mod conversion;
+pub mod fbx_facts;
 pub mod hashes;
 pub mod names;
 pub mod packs;

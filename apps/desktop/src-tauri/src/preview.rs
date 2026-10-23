@@ -12,7 +12,7 @@ use std::time::Duration;
 use tauri::Emitter;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 pub const THUMB_SIZE: u32 = 512;
@@ -261,7 +261,8 @@ fn find_preview_worker(
     (python, worker)
 }
 
-pub fn start_preview_worker(state: Arc<AppState>) {
+/// Starts the preview queues. The Python queue's worker also serves `requests`, between jobs.
+pub fn start_preview_worker(state: Arc<AppState>, requests: mpsc::Receiver<WorkerRequest>) {
     tauri::async_runtime::spawn(async move {
         // The dev checkout is found from the cwd, the exe dir and their ancestors.
         let current_dir = std::env::current_dir().unwrap_or_default();
@@ -297,7 +298,7 @@ pub fn start_preview_worker(state: Arc<AppState>) {
         // Images and Python-backed formats run on separate queues so a slow
         // 3D conversion never holds up the (much larger) image backlog.
         tauri::async_runtime::spawn(run_image_queue(state.clone()));
-        run_python_queue(state, py_exec, worker_py).await;
+        run_python_queue(state, py_exec, worker_py, requests).await;
     });
 }
 
@@ -902,33 +903,77 @@ impl PreviewEngine {
     }
 }
 
-/// Runs 3D/CAD/DCC formats (and images Rust couldn't decode) through the persistent Python worker.
-async fn run_python_queue(state: Arc<AppState>, py_exec: PathBuf, worker_py: PathBuf) {
+/// A request for the Python queue's worker from elsewhere in the app, such as the game
+/// export's `fbx_facts`, and where its reply goes: the worker's reply line, or why there is
+/// none. The queue serves these between jobs, on the one worker process.
+#[derive(Debug)]
+pub struct WorkerRequest {
+    pub request: serde_json::Value,
+    pub reply: oneshot::Sender<std::result::Result<serde_json::Value, String>>,
+}
+
+/// Runs `request` on `engine`'s worker, starting one when none is serving and a start is due.
+async fn serve(engine: &mut PreviewEngine, WorkerRequest { request, reply }: WorkerRequest) {
+    let answer = if engine.ready().await {
+        let source = request["params"]["source"].as_str().unwrap_or_default();
+        let source = PathBuf::from(source);
+        engine
+            .run(&request, &source)
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        Err("the preview engine isn't running".to_string())
+    };
+    let _ = reply.send(answer);
+}
+
+/// Serves every request waiting in `requests`.
+async fn serve_waiting(engine: &mut PreviewEngine, requests: &mut mpsc::Receiver<WorkerRequest>) {
+    while let Ok(request) = requests.try_recv() {
+        serve(engine, request).await;
+    }
+}
+
+/// Runs 3D/CAD/DCC formats (and images Rust couldn't decode) through the persistent Python
+/// worker, and serves `requests` on it between jobs, or at once while it is idle.
+async fn run_python_queue(
+    state: Arc<AppState>,
+    py_exec: PathBuf,
+    worker_py: PathBuf,
+    mut requests: mpsc::Receiver<WorkerRequest>,
+) {
     let mut engine = PreviewEngine::new(py_exec, worker_py, state.engine_version.clone());
     loop {
         let libs = state.db.get_all_libraries().await;
-        let processed_any = python_queue_round(&libs, &mut engine, |outcome| match outcome {
-            Ok(done) => emit_done(&state, &done),
-            Err(failed) => emit_error(&state, &failed),
-        })
-        .await;
+        let processed_any =
+            python_queue_round(&libs, &mut engine, &mut requests, |outcome| match outcome {
+                Ok(done) => emit_done(&state, &done),
+                Err(failed) => emit_error(&state, &failed),
+            })
+            .await;
 
         if !processed_any {
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+            tokio::select! {
+                Some(request) = requests.recv() => serve(&mut engine, request).await,
+                _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
+            }
         }
     }
 }
 
 /// One round of the Python queue. It starts `engine`'s worker when none is serving and a start
 /// is due, with or without jobs waiting, then runs up to 10 of each library's jobs, passing each
-/// one's outcome to `finished`. Jobs wait while no worker serves: each is claimed only once a
-/// worker is ready for it, so a worker that dies fails only the job it was running, and a round
-/// whose restart backs off leaves the rest queued. Returns whether any job was claimed.
+/// one's outcome to `finished`, and serves the waiting `requests` first and after each job.
+/// Jobs wait while no worker serves: each is claimed only once a worker is ready for it, so a
+/// worker that dies fails only the job it was running, and a round whose restart backs off
+/// leaves the rest queued. Returns whether any job was claimed.
 async fn python_queue_round(
     libs: &[LibraryHandle],
     engine: &mut PreviewEngine,
+    requests: &mut mpsc::Receiver<WorkerRequest>,
     mut finished: impl FnMut(Result<PreviewDone, FailedJob>),
 ) -> bool {
+    serve_waiting(engine, requests).await;
     if !engine.ready().await {
         return false;
     }
@@ -945,6 +990,7 @@ async fn python_queue_round(
         let _ = tokio::fs::create_dir_all(&thumb_dir).await;
 
         for _ in 0..10 {
+            serve_waiting(engine, requests).await;
             if !engine.ready().await {
                 return processed_any;
             }
@@ -1694,7 +1740,8 @@ done
         libs: &[LibraryHandle],
     ) -> Vec<Result<PreviewDone, FailedJob>> {
         let mut outcomes = Vec::new();
-        python_queue_round(libs, engine, |o| outcomes.push(o)).await;
+        let (_, mut requests) = mpsc::channel(1);
+        python_queue_round(libs, engine, &mut requests, |o| outcomes.push(o)).await;
         outcomes
     }
 
@@ -1889,6 +1936,61 @@ done
         let req = json!({"id": "j1", "method": "model_meta", "params": {}});
         let reply = worker.execute(&req).await.unwrap();
         assert_eq!(reply, json!({"id": "j1", "result": {"real": true}}));
+    }
+
+    /// Sends `request` to the queue, returning where its reply arrives.
+    fn send(
+        requests: &mpsc::Sender<WorkerRequest>,
+        id: &str,
+    ) -> oneshot::Receiver<std::result::Result<serde_json::Value, String>> {
+        let (reply, answer) = oneshot::channel();
+        let request = json!({"id": id, "method": "fbx_facts", "params": {"source": "a.fbx"}});
+        requests.try_send(WorkerRequest { request, reply }).unwrap();
+        answer
+    }
+
+    #[tokio::test]
+    async fn requests_are_served_by_the_queues_worker_beside_its_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = stub_engine(dir.path(), ANSWER_2, JOB_DONE);
+        let lib = library_with_pending_job(dir.path(), "models/ship.fbx", "").await;
+        let (sender, mut requests) = mpsc::channel(4);
+        let first = send(&sender, "facts-1");
+
+        let mut outcomes = Vec::new();
+        python_queue_round(
+            std::slice::from_ref(&lib),
+            &mut engine,
+            &mut requests,
+            |o| outcomes.push(o),
+        )
+        .await;
+
+        let reply = first.await.unwrap().unwrap();
+        assert_eq!(reply["id"], "facts-1");
+        assert!(matches!(&outcomes[..], [Ok(_)]), "{outcomes:?}");
+        assert_eq!(engine.starts, 1, "one process serves both");
+
+        // An idle queue serves a request without waiting for a job
+        let second = send(&sender, "facts-2");
+        let request = requests.recv().await.unwrap();
+        serve(&mut engine, request).await;
+        assert_eq!(second.await.unwrap().unwrap()["id"], "facts-2");
+    }
+
+    #[tokio::test]
+    async fn a_request_no_worker_can_serve_is_answered_with_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = stub_engine(dir.path(), "exec sleep 3600", JOB_DONE);
+        engine.info_timeout = Duration::from_millis(200);
+        let (sender, mut requests) = mpsc::channel(4);
+        let answer = send(&sender, "facts-1");
+
+        python_queue_round(&[], &mut engine, &mut requests, |_| {}).await;
+        assert_eq!(
+            answer.await.unwrap(),
+            Err("the preview engine isn't running".to_string())
+        );
     }
 
     #[test]
