@@ -363,16 +363,17 @@ impl Runner {
         &self.blender
     }
 
-    /// Normalizes `job`'s FBX and checks what it wrote. Every error names the asset.
+    /// Normalizes `job`'s FBX and checks what it wrote. Every error names the asset. Only a
+    /// checked FBX reaches `job.output`: a failed job leaves it as it was.
     pub async fn run(&self, job: &Job) -> Result<Normalized, String> {
-        let normalized = self.normalize(job).await.and_then(|normalized| {
-            check(job, &normalized)?;
-            Ok(normalized)
-        });
-        normalized.map_err(|e| format!("{}: {e}", job.asset))
+        self.normalize(job)
+            .await
+            .map_err(|e| format!("{}: {e}", job.asset))
     }
 
-    /// Runs `<blender> -b --factory-startup -P <script> -- <job.json> <result.json>`.
+    /// Runs `<blender> -b --factory-startup -P <script> -- <job.json> <result.json>`, with the
+    /// script writing into the job's temporary folder, then checks the result and publishes
+    /// the FBX.
     async fn normalize(&self, job: &Job) -> Result<Normalized, String> {
         let _permit = self
             .permits
@@ -386,7 +387,12 @@ impl Runner {
         let script = dir.path().join("normalize.py");
         let job_file = dir.path().join("job.json");
         let result_file = dir.path().join("result.json");
-        let job_json = serde_json::to_vec(job).map_err(|e| e.to_string())?;
+        let staged = dir.path().join("output.fbx");
+        let sent = Job {
+            output: staged.clone(),
+            ..job.clone()
+        };
+        let job_json = serde_json::to_vec(&sent).map_err(|e| e.to_string())?;
         std::fs::write(&script, NORMALIZE_SCRIPT)
             .and_then(|()| std::fs::write(&job_file, job_json))
             .map_err(|e| format!("Could not write Blender's job: {e}"))?;
@@ -413,11 +419,33 @@ impl Runner {
                 )
             })?
             .map_err(|e| format!("Blender's job failed: {e}"))?;
-        match std::fs::read_to_string(&result_file) {
-            Ok(text) if output.status.success() => parse_result(&text),
-            _ => Err(crashed(&output)),
-        }
+        let normalized = match std::fs::read_to_string(&result_file) {
+            Ok(text) if output.status.success() => parse_result(&text)?,
+            _ => return Err(crashed(&output)),
+        };
+        check(job, &normalized)?;
+        publish(&staged, &job.output)?;
+        Ok(normalized)
     }
+}
+
+/// Puts the checked FBX at `staged` at `output`: copied beside it, then renamed over it, so
+/// `output` is only ever the old file or the whole new one.
+fn publish(staged: &Path, output: &Path) -> Result<(), String> {
+    let name = output
+        .file_name()
+        .ok_or("the job's output has no file name")?
+        .to_string_lossy();
+    let partial = output.with_file_name(format!(".{name}.{}.partial", uuid::Uuid::new_v4()));
+    let written = output
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::copy(staged, &partial))
+        .and_then(|_| std::fs::rename(&partial, output));
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&partial);
+        format!("Could not write {}: {e}", output.display())
+    })
 }
 
 /// Why a Blender job left no result: its status and the last lines it printed.
@@ -886,7 +914,12 @@ mod tests {
         }
     }
 
-    /// A fake Blender that keeps its arguments, script and job in `dir`, then answers `result`.
+    /// The shell line with which a fake Blender writes its FBX, where the job tells the script
+    /// to: `output.fbx` beside the result.
+    const WRITES_FBX: &str = "printf 'FBX' > \"$(dirname \"$7\")/output.fbx\"";
+
+    /// A fake Blender that keeps its arguments, script and job in `dir`, writes its FBX, then
+    /// answers `result`.
     fn answering(dir: &Path, result: &serde_json::Value) -> Blender {
         let answer = dir.join("answer.json");
         std::fs::write(&answer, result.to_string()).unwrap();
@@ -895,19 +928,34 @@ mod tests {
             dir,
             &format!(
                 "printf '%s\\n' \"$@\" > '{d}/argv'\ncp \"$4\" '{d}/script.py'\n\
-                 cp \"$6\" '{d}/job.json'\ncp '{d}/answer.json' \"$7\""
+                 cp \"$6\" '{d}/job.json'\n{WRITES_FBX}\ncp '{d}/answer.json' \"$7\""
             ),
         )
+    }
+
+    /// `lamp_job`, writing into `dir`.
+    fn lamp_job_in(dir: &Path) -> Job {
+        Job {
+            output: dir.join("cache/SM_Lamp.fbx"),
+            ..lamp_job()
+        }
     }
 
     #[tokio::test]
     async fn a_job_runs_the_embedded_script_with_its_job_and_result_files() {
         let dir = tempfile::tempdir().unwrap();
         let runner = Runner::new(answering(dir.path(), &lamp_result()));
+        let job = lamp_job_in(dir.path());
 
-        let normalized = runner.run(&lamp_job()).await.unwrap();
+        let normalized = runner.run(&job).await.unwrap();
 
         assert_eq!(normalized, lamp());
+        // The checked FBX is published at the job's output, and nothing else is left there
+        assert_eq!(std::fs::read_to_string(&job.output).unwrap(), "FBX");
+        let cache: Vec<_> = std::fs::read_dir(dir.path().join("cache"))
+            .unwrap()
+            .collect();
+        assert_eq!(cache.len(), 1);
         let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
         let argv: Vec<&str> = argv.lines().collect();
         assert_eq!(argv[..3], ["-b", "--factory-startup", "-P"]);
@@ -920,9 +968,13 @@ mod tests {
             std::fs::read_to_string(dir.path().join("script.py")).unwrap(),
             NORMALIZE_SCRIPT
         );
-        let job: serde_json::Value =
+        // The script writes into the job's temporary folder, not the output
+        let sent: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("job.json")).unwrap()).unwrap();
-        assert_eq!(job, serde_json::to_value(lamp_job()).unwrap());
+        let staged = Path::new(argv[6]).with_file_name("output.fbx");
+        let mut expected = serde_json::to_value(&job).unwrap();
+        expected["output"] = staged.to_str().unwrap().into();
+        assert_eq!(sent, expected);
         // The job's temporary folder is gone
         assert!(!Path::new(argv[3]).exists());
     }
@@ -933,6 +985,7 @@ mod tests {
         let refused = serde_json::json!({"ok": false, "error": "it has no mesh to keep"});
         let mut off = lamp_result();
         off["bounds"]["min"][1] = 0.1.into();
+        // Each fake writes its FBX before it fails, as a Blender that crashes after exporting
         for (body, error) in [
             (
                 "echo 'Fatal Python error' >&2\necho 'Segmentation fault' >&2\nexit 139",
@@ -944,12 +997,14 @@ mod tests {
             ("echo '{' > \"$7\"", "Blender's result isn't JSON".into()),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let runner = Runner::new(fake(dir.path(), body));
-            let message = runner.run(&lamp_job()).await.unwrap_err();
+            let runner = Runner::new(fake(dir.path(), &format!("{WRITES_FBX}\n{body}")));
+            let job = lamp_job_in(dir.path());
+            let message = runner.run(&job).await.unwrap_err();
             assert!(
                 message.starts_with(&format!("{asset}: {error}")),
                 "{message}"
             );
+            assert!(!job.output.exists(), "{body}");
         }
         for (result, error) in [
             (&refused, "it has no mesh to keep"),
@@ -957,12 +1012,41 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let runner = Runner::new(answering(dir.path(), result));
-            let message = runner.run(&lamp_job()).await.unwrap_err();
+            let job = lamp_job_in(dir.path());
+            let message = runner.run(&job).await.unwrap_err();
             assert!(
                 message.starts_with(&format!("{asset}: {error}")),
                 "{message}"
             );
+            // A refused or rejected FBX never reaches the output
+            assert!(!job.output.exists(), "{error}");
         }
+
+        // An output that can't be written: no partial file is left beside it
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Runner::new(answering(dir.path(), &lamp_result()));
+        std::fs::write(dir.path().join("cache"), "a file, not a folder").unwrap();
+        let job = lamp_job_in(dir.path());
+        let message = runner.run(&job).await.unwrap_err();
+        assert!(
+            message.starts_with(&format!(
+                "{asset}: Could not write {}",
+                job.output.display()
+            )),
+            "{message}"
+        );
+        let blocked = Job {
+            output: dir.path().join("SM_Lamp.fbx/"),
+            ..lamp_job()
+        };
+        std::fs::create_dir(&blocked.output).unwrap();
+        assert!(runner.run(&blocked).await.is_err());
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".partial"))
+            .collect();
+        assert_eq!(left, Vec::<String>::new());
     }
 
     #[tokio::test]
@@ -972,20 +1056,25 @@ mod tests {
         let runner = Runner::with_limits(
             fake(
                 dir.path(),
-                &format!("echo $$ > '{}'\nexec sleep 30", pid_file.display()),
+                &format!(
+                    "{WRITES_FBX}\necho $$ > '{}'\nexec sleep 30",
+                    pid_file.display()
+                ),
             ),
             1,
             Duration::from_secs(1),
         );
+        let job = lamp_job_in(dir.path());
         let started = std::time::Instant::now();
 
-        let message = runner.run(&lamp_job()).await.unwrap_err();
+        let message = runner.run(&job).await.unwrap_err();
 
         assert_eq!(
             message,
             "Dungeon Props/Models/SM_Lamp.fbx: Blender didn't finish normalizing it in 1 s"
         );
         assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(!job.output.exists());
         // The process is killed, not left running: gone, or a zombie until it is reaped
         let pid = std::fs::read_to_string(&pid_file).unwrap();
         let stat = format!("/proc/{}/stat", pid.trim());
@@ -1016,11 +1105,16 @@ mod tests {
             dir.path(),
             &format!(
                 "touch '{r}'/$$\nls '{r}' | wc -l >> '{d}/counts'\nsleep 1\nrm '{r}'/$$\n\
-                 cp '{d}/answer.json' \"$7\""
+                 {WRITES_FBX}\ncp '{d}/answer.json' \"$7\""
             ),
         );
         let runner = Runner::with_limits(blender, 2, JOB_TIMEOUT);
-        let jobs: Vec<Job> = (0..4).map(|_| lamp_job()).collect();
+        let jobs: Vec<Job> = (0..4)
+            .map(|n| Job {
+                output: dir.path().join(format!("SM_Lamp{n}.fbx")),
+                ..lamp_job()
+            })
+            .collect();
 
         let results = futures_util::future::join_all(jobs.iter().map(|job| runner.run(job))).await;
 
