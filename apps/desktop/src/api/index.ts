@@ -10,6 +10,7 @@ import type {
   PackCard,
   PackDetail,
   PackEdit,
+  PackOrigin,
   PackRef,
   Tag,
   TagPatch,
@@ -77,6 +78,9 @@ export const api = {
   /** Saves an edit to the folder's pack, reruns the structure pass, then emits `library:updated` */
   setPackOverride: (libraryId: string, path: string, edit: PackEdit) =>
     invoke<void>('set_pack_override', { libraryId, path, edit }),
+  /** The game export's origin for the pack at `path`, without yours, or null when no pack is there */
+  getInferredPackOrigin: (libraryId: string, path: string) =>
+    invoke<PackOrigin | null>('get_inferred_pack_origin', { libraryId, path }),
   /** The pack "Use as pack cover" on the asset sets: the innermost one holding the image */
   getCoverPack: (assetId: string) => invoke<PackRef | null>('get_cover_pack', { assetId }),
   /** Tags every file below the folder and their groups' members; returns how many */

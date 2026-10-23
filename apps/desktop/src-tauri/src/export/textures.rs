@@ -3,7 +3,7 @@
 //! that needs an operation is refused by the "texture conversion not built yet" guard (plan
 //! "Build order").
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A URP Lit texture role, as the contract names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -57,7 +57,8 @@ impl Layout {
 }
 
 /// A normal map's green channel convention (plan D14). URP wants OpenGL, green up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(rename_all = "lowercase")]
 pub enum Convention {
     #[serde(rename = "opengl")]
     OpenGl,

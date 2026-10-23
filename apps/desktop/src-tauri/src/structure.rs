@@ -20,6 +20,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::db::{Database, LibraryHandle};
+use crate::export::packs::Origin;
+use crate::export::textures::Convention;
 use crate::models::AssetKind;
 
 /// Rows per write transaction, as in `watcher.rs`.
@@ -304,6 +306,10 @@ pub struct PackOverride {
     pub source_url: Option<String>,
     /// The cover image, relative to the library root
     pub cover_path: Option<String>,
+    /// The game export's pack origin, in place of the inferred one (plan game-export C6)
+    pub origin: Option<Origin>,
+    /// The game export's normal-map convention, in place of the origin's default (C6)
+    pub normal_convention: Option<Convention>,
 }
 
 /// Every folder's `PackOverride`, by the folder's path relative to the library root.
@@ -318,7 +324,8 @@ pub async fn read_overrides(pool: &Pool<Sqlite>) -> sqlx::Result<Overrides> {
         edit: PackOverride,
     }
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT path, mark, name, license, source_url, cover_path FROM pack_overrides",
+        "SELECT path, mark, name, license, source_url, cover_path, origin, normal_convention
+         FROM pack_overrides",
     )
     .fetch_all(pool)
     .await?;

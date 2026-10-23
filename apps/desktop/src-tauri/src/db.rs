@@ -244,6 +244,29 @@ async fn add_preview_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
     .await
 }
 
+/// Backward compatibility: `pack_overrides` gained your pack origin and normal-map convention
+/// for the game export (plan game-export C6). Older rows read as `NULL`, inferred. As with tag
+/// descriptions, any failure other than a column already being there is an error, since the
+/// structure pass reads them.
+async fn add_pack_override_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
+    add_missing_columns(
+        pool,
+        &[
+            (
+                "pack_overrides",
+                "origin",
+                "TEXT CHECK (origin IN ('unity', 'unreal', 'generic'))",
+            ),
+            (
+                "pack_overrides",
+                "normal_convention",
+                "TEXT CHECK (normal_convention IN ('opengl', 'directx'))",
+            ),
+        ],
+    )
+    .await
+}
+
 /// Adds each `(table, column, definition)` of `columns` that its table lacks.
 async fn add_missing_columns(
     pool: &Pool<Sqlite>,
@@ -355,6 +378,9 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     add_preview_columns(&pool)
         .await
         .context("Could not add the preview version columns")?;
+    add_pack_override_columns(&pool)
+        .await
+        .context("Could not add the pack origin columns")?;
     // Search still works on the old index, so a failed conversion only waits for the next open.
     if let Err(e) = index_file_paths(&pool, false).await {
         tracing::warn!("Could not index folder names for search in {db_path:?}: {e}");
@@ -754,6 +780,7 @@ async fn memory_pool(foreign_keys: bool) -> Pool<Sqlite> {
     create_library_schema(&pool).await.unwrap();
     add_structure_columns(&pool).await.unwrap();
     add_preview_columns(&pool).await.unwrap();
+    add_pack_override_columns(&pool).await.unwrap();
     // The schema script sets the pragma itself, so pin it again afterwards.
     sqlx::query(&format!(
         "PRAGMA foreign_keys = {}",
@@ -1730,6 +1757,57 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(row, ("a1".to_string(), None, None));
+    }
+
+    #[tokio::test]
+    async fn adding_the_pack_origin_columns_to_a_library_made_before_them_keeps_its_overrides() {
+        let pool = memory_library_pool().await;
+        sqlx::query(
+            "DROP TABLE pack_overrides;
+             CREATE TABLE pack_overrides (
+                 path TEXT PRIMARY KEY,
+                 mark TEXT CHECK (mark IN ('pack', 'not_pack')),
+                 name TEXT, license TEXT, source_url TEXT, cover_path TEXT,
+                 updated_at INTEGER NOT NULL);
+             INSERT INTO pack_overrides (path, mark, name, license, source_url, cover_path, updated_at)
+                 VALUES ('Kit', 'pack', 'My kit', 'CC0', 'https://example.com', 'Kit/a.png', 1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        add_pack_override_columns(&pool).await.unwrap();
+        add_pack_override_columns(&pool).await.unwrap();
+
+        let overrides = crate::structure::read_overrides(&pool).await.unwrap();
+        assert_eq!(
+            overrides.get("Kit"),
+            Some(&crate::structure::PackOverride {
+                mark: Some(crate::structure::PackMark::Pack),
+                name: Some("My kit".into()),
+                license: Some("CC0".into()),
+                source_url: Some("https://example.com".into()),
+                cover_path: Some("Kit/a.png".into()),
+                origin: None,
+                normal_convention: None,
+            })
+        );
+        sqlx::query("UPDATE pack_overrides SET origin = 'unreal', normal_convention = 'directx'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let bad = sqlx::query("UPDATE pack_overrides SET origin = 'godot'")
+            .execute(&pool)
+            .await;
+        assert!(bad.is_err(), "an unknown origin is refused");
+        let kit = crate::structure::read_overrides(&pool).await.unwrap()["Kit"].clone();
+        assert_eq!(
+            (kit.origin, kit.normal_convention),
+            (
+                Some(crate::export::packs::Origin::Unreal),
+                Some(crate::export::textures::Convention::DirectX)
+            )
+        );
     }
 
     #[tokio::test]

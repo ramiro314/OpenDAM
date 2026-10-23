@@ -21,7 +21,9 @@ import type {
   Collection,
   Cover,
   GroupMember,
+  NormalConvention,
   PackDetail,
+  PackOrigin,
 } from '../../types';
 import {
   IconStar,
@@ -48,9 +50,11 @@ import { useBrowseView } from '../../hooks/useBrowseView';
 import { panelPackTarget } from '../../utils/packsView';
 import {
   authorsLabel,
+  conventionChoices,
   detailsEdit,
   formPlaceholders,
   licenseLabel,
+  originChoices,
   packForm,
   sourceUrlProblem,
   type PackForm,
@@ -671,21 +675,35 @@ function PackPanel({ pack }: { pack: PackDetail }) {
 }
 
 /**
- * The pack's edit form: its name, license and source URL. An empty field goes back to what the
- * structure pass detected.
+ * The pack's edit form: its name, license and source URL, and the game export's origin and
+ * normal-map convention. An empty field goes back to what the structure pass detected, and an
+ * Inferred choice to what the game export infers.
  */
 function PackEditForm({ pack, onDone }: { pack: PackDetail; onDone: () => void }) {
   const [form, setForm] = useState<PackForm>(() => packForm(pack));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The origin is inferred from the pack's files only when the form asks (plan game-export A1)
+  const [inferred, setInferred] = useState<PackOrigin | null>(null);
+  useEffect(() => {
+    let current = true;
+    api
+      .getInferredPackOrigin(pack.libraryId, pack.path)
+      .then((origin) => current && setInferred(origin))
+      .catch(() => {});
+    return () => {
+      current = false;
+    };
+  }, [pack.libraryId, pack.path]);
   const urlProblem = sourceUrlProblem(form.sourceUrl);
   const placeholders = formPlaceholders(pack);
-  const field = (key: keyof PackForm) => ({
+  const update = (patch: Partial<PackForm>) => {
+    setForm({ ...form, ...patch });
+    setError(null);
+  };
+  const field = (key: 'name' | 'license' | 'sourceUrl') => ({
     value: form[key],
-    onChange: (e: React.ChangeEvent<HTMLInputElement>) => {
-      setForm({ ...form, [key]: e.target.value });
-      setError(null);
-    },
+    onChange: (e: React.ChangeEvent<HTMLInputElement>) => update({ [key]: e.target.value }),
   });
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -737,13 +755,45 @@ function PackEditForm({ pack, onDone }: { pack: PackDetail; onDone: () => void }
         placeholder={placeholders.sourceUrl}
         {...field('sourceUrl')}
       />
+      <label className={styles.infoLabel} htmlFor="detail-pack-form-origin">
+        Origin
+      </label>
+      <select
+        id="detail-pack-form-origin"
+        className={clsx(styles.packFormInput, styles.packFormSelect)}
+        value={form.origin}
+        onChange={(e) => update({ origin: e.target.value as PackOrigin | '' })}
+      >
+        {originChoices(inferred).map((c) => (
+          <option key={c.value} value={c.value}>
+            {c.label}
+          </option>
+        ))}
+      </select>
+      <label className={styles.infoLabel} htmlFor="detail-pack-form-normals">
+        Normal maps
+      </label>
+      <select
+        id="detail-pack-form-normals"
+        className={clsx(styles.packFormInput, styles.packFormSelect)}
+        value={form.normalConvention}
+        onChange={(e) => update({ normalConvention: e.target.value as NormalConvention | '' })}
+      >
+        {conventionChoices(form, inferred).map((c) => (
+          <option key={c.value} value={c.value}>
+            {c.label}
+          </option>
+        ))}
+      </select>
       {(urlProblem || error) && (
         <p className={styles.packFormError} role="alert">
           {urlProblem ?? error}
         </p>
       )}
       <div className={styles.packFormActions}>
-        <span className={styles.packFormHint}>Leave a field empty to use what was detected.</span>
+        <span className={styles.packFormHint}>
+          Leave a field empty, or pick Inferred, to use what was detected.
+        </span>
         <button type="button" className={styles.openLicenseBtn} onClick={onDone}>
           Cancel
         </button>

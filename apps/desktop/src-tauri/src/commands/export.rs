@@ -3,6 +3,7 @@ use tauri::State;
 
 use crate::export::blender::{self, BlenderStatus};
 use crate::export::bundle::ExportOutcome;
+use crate::export::packs::Origin;
 use crate::export::settings::{self, ExportSettings};
 use crate::export::{cache, check};
 use crate::AppState;
@@ -66,4 +67,21 @@ pub async fn export_bundle(
 #[tauri::command]
 pub async fn discard_export(domain_id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
     state.exports.discard(&domain_id).await
+}
+
+/// The origin the game export infers for the pack at `path` (`""` for the root) in library
+/// `library_id`, without your override (plan A1), or null when no pack is there. The pack edit
+/// form shows it, and the normal-map convention it implies, beside your choice.
+#[tauri::command]
+pub async fn get_inferred_pack_origin(
+    library_id: String,
+    path: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<Origin>> {
+    let library = state
+        .db
+        .get_library_handle(&library_id)
+        .await
+        .ok_or_else(|| format!("Library {library_id} is not open"))?;
+    check::inferred_origin(&library, &path).await
 }

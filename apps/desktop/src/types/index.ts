@@ -190,6 +190,12 @@ export interface FolderNode {
 /** "Mark as pack" or "Not a pack", against what the pack rules detect */
 export type PackMark = 'pack' | 'not_pack';
 
+/** Where a game export pack's files come from (plan game-export D12) */
+export type PackOrigin = 'unity' | 'unreal' | 'generic';
+
+/** A normal map's green channel convention (plan game-export D14): OpenGL is green up */
+export type NormalConvention = 'opengl' | 'directx';
+
 /** Your edits to one pack (`pack_overrides`); a null field keeps what was detected */
 export interface PackOverride {
   mark?: PackMark | null;
@@ -199,12 +205,23 @@ export interface PackOverride {
   sourceUrl?: string | null;
   /** Relative to the library root */
   coverPath?: string | null;
+  /** The game export's origin, in place of the inferred one */
+  origin?: PackOrigin | null;
+  /** The game export's normal-map convention, in place of the origin's default */
+  normalConvention?: NormalConvention | null;
 }
 
 /** One edit `set_pack_override` saves. An empty text field keeps what was detected. */
 export type PackEdit =
   | { kind: 'mark'; mark: PackMark | null }
-  | { kind: 'details'; name: string | null; license: string | null; sourceUrl: string | null }
+  | {
+      kind: 'details';
+      name: string | null;
+      license: string | null;
+      sourceUrl: string | null;
+      origin: PackOrigin | null;
+      normalConvention: NormalConvention | null;
+    }
   | { kind: 'cover'; assetId: string | null };
 
 /** A pack by its library and path, with its name (`get_cover_pack`) */
@@ -483,11 +500,11 @@ export interface ExportPack {
   publisher?: string;
   sourceUrl?: string;
   licence: { spdx: string | null; name: string; url?: string };
-  origin: 'unity' | 'unreal' | 'generic';
+  origin: PackOrigin;
   libraryId: string;
   /** The pack folder, relative to the library root */
   path: string;
-  normalConvention: 'opengl' | 'directx';
+  normalConvention: NormalConvention;
 }
 
 /** What a domain's export Check found */
