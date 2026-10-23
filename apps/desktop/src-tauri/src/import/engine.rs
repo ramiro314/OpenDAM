@@ -125,6 +125,7 @@ impl Engine {
                     {
                         tracing::error!("Import run {run_id} stopped: {e}");
                         self.set_active(None);
+                        // As at a run's end: over `running` or `interrupted` only.
                         let _ = sqlx::query(
                             "UPDATE import_runs SET status = 'failed', finished_at = ?,
                              error = 'The run stopped unexpectedly'
@@ -345,6 +346,9 @@ impl Engine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .map(|p| p.step);
+        // A finished build wins over `interrupted`, which another machine sets when this run's
+        // heartbeat stopped for 10 minutes (a suspend mid-build): the end says what the build did
+        // on disk. Any status other than `running` and `interrupted` is kept.
         let finished = sqlx::query(
             "UPDATE import_runs SET status = ?, error = ?, warnings = ?, phase = ?,
              finished_at = ? WHERE id = ? AND status IN ('running', 'interrupted')",
