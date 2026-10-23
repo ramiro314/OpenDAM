@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -165,13 +166,15 @@ fn general(message: impl Into<String>) -> Problem {
     }
 }
 
-/// Checks the domain collection `domain_id`, reading FBX files' facts with `facts`. An unknown
+/// Checks the domain collection `domain_id`, reading FBX files' facts with `facts` and the files
+/// inference reads through `memo`. An unknown
 /// collection is an error; everything else that would refuse the export is a problem in the
 /// report.
 pub async fn check(
     db: &Database,
     domain_id: &str,
     facts: &impl fbx_facts::Reader,
+    memo: &Arc<infer::Memo>,
 ) -> Result<CheckReport, String> {
     let master = &db.master_pool;
     let settings = settings::load(master).await.map_err(|e| e.to_string())?;
@@ -271,8 +274,9 @@ pub async fn check(
         );
     }
     let domain_name = domain.clone();
+    let memo = Arc::clone(memo);
     let (report, inputs) = tokio::task::spawn_blocking(move || {
-        let report = evaluate(&domain_name, &mut inputs);
+        let report = evaluate(&domain_name, &mut inputs, &memo);
         (report, inputs)
     })
     .await
@@ -559,7 +563,7 @@ struct TextureJob {
 /// Everything a check does with files, run on a blocking thread: reads each item, its pack and
 /// its file, infers the models' materials and the texture sets, compares names, and builds and
 /// validates the manifest.
-fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
+fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Evaluated {
     let mut problems = Vec::new();
     let mut reads: Vec<Read> = Vec::new();
     // The domain's packs in manifest order (library order, then path), by (library, pack index)
@@ -674,7 +678,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                                 if facts.reading() == Some(Reading::Model) {
                                     if sources[p].origin == Origin::Unity {
                                         unity_packs.entry(key).or_insert_with(|| {
-                                            UnityPack::read(root, &input.pack_files[&key.1])
+                                            UnityPack::read(root, &input.pack_files[&key.1], memo)
                                         });
                                     }
                                     catalogs
@@ -741,7 +745,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
             }
         })
         .collect();
-    let (materials, set_names) = infer::domain(&mut catalogs, &domain_models);
+    let (materials, set_names) = infer::domain(&mut catalogs, &domain_models, memo);
     for ((r, ..), materials) in models.iter().zip(materials) {
         let row = &mut reads[*r].row;
         let asset = row.asset.clone();
@@ -1312,6 +1316,11 @@ mod tests {
 
     type Pool = sqlx::Pool<sqlx::Sqlite>;
 
+    /// A fresh inference memo, so no test reads another's answers.
+    fn fresh_memo() -> Arc<infer::Memo> {
+        Arc::new(infer::Memo::default())
+    }
+
     /// `fbx_facts` as the worker answers it: for the fixture's FBX files from `fbx_facts.json`,
     /// which the worker's pytest checks against the files, and for files a test adds, what it
     /// gives `with`. It records the files it reads, relative to their library root.
@@ -1392,7 +1401,9 @@ mod tests {
     /// Checks a new domain holding `paths`.
     async fn check_domain(f: &Fixture, paths: &[&str]) -> CheckReport {
         collection(f, "domain", "Props", "dg", paths).await;
-        check(&f.db, "domain", &Facts::fixture()).await.unwrap()
+        check(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap()
     }
 
     fn messages(report: &CheckReport) -> Vec<&str> {
@@ -1512,7 +1523,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(memo, 6);
-        let again = check(&f.db, "domain", &Facts::fixture()).await.unwrap();
+        let again = check(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
         assert_eq!(again.manifest["assets"], report.manifest["assets"]);
     }
 
@@ -1698,7 +1711,9 @@ mod tests {
 
         // Back to inferred
         override_pack(&f, "Unity Moss", None, None).await;
-        let again = check(&f.db, "domain", &Facts::fixture()).await.unwrap();
+        let again = check(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
         let moss = again.packs.iter().find(|p| p.path == "Unity Moss").unwrap();
         assert_eq!(
             (moss.pack.origin, moss.normal_convention),
@@ -1865,7 +1880,9 @@ mod tests {
         collection(&f, "domain", "Props", "dg", &[obj, floor]).await;
         collection(&f, "sub", "Floors", "domain", &[floor]).await;
         collection(&f, "subsub", "Stone", "sub", &[floor]).await;
-        let report = check(&f.db, "domain", &Facts::fixture()).await.unwrap();
+        let report = check(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
 
         let rows: Vec<(&str, Kind, Option<&str>)> = report
             .assets
@@ -1981,7 +1998,9 @@ mod tests {
             .unwrap();
         collection(&f, "nested", "Nested", "lower", &[]).await;
 
-        let report = check(&f.db, "lower", &Facts::fixture()).await.unwrap();
+        let report = check(&f.db, "lower", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
         assert_eq!(
             messages(&report),
             [
@@ -1990,7 +2009,9 @@ mod tests {
             ]
         );
 
-        let report = check(&f.db, "nested", &Facts::fixture()).await.unwrap();
+        let report = check(&f.db, "nested", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
         assert_eq!(
             messages(&report),
             ["Nested is not a domain: domains are the collections directly inside the root collection DungeonGame"]
@@ -2001,13 +2022,17 @@ mod tests {
             .await
             .unwrap();
         collection(&f, "props", "Props", "dg", &[]).await;
-        let report = check(&f.db, "props", &Facts::fixture()).await.unwrap();
+        let report = check(&f.db, "props", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
         assert_eq!(
             messages(&report),
             ["The root collection's name Dungeon Game isn't PascalCase (a capital letter, then letters and digits): it is a folder of the bundle path"]
         );
 
-        assert!(check(&f.db, "missing", &Facts::fixture()).await.is_err());
+        assert!(check(&f.db, "missing", &Facts::fixture(), &fresh_memo())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -2028,7 +2053,9 @@ mod tests {
         .await
         .unwrap();
 
-        let report = check(&f.db, "props", &Facts::fixture()).await.unwrap();
+        let report = check(&f.db, "props", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
         assert_eq!(
             messages(&report),
             [
@@ -2045,7 +2072,9 @@ mod tests {
             .execute(&f.db.master_pool)
             .await
             .unwrap();
-        let report = check(&f.db, "props", &Facts::fixture()).await.unwrap();
+        let report = check(&f.db, "props", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
         assert_eq!(report.problems.len(), 1, "{:?}", messages(&report));
         assert!(
             report.problems[0]
@@ -2087,7 +2116,9 @@ mod tests {
             &["Foo Copy/tile_c.png", "Unreal/Rocks/T_Rock_D.png"],
         )
         .await;
-        let report = check(&f.db, "domain", &Facts::fixture()).await.unwrap();
+        let report = check(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
 
         assert_eq!(messages(&report), Vec::<&str>::new());
         let rows: Vec<(&str, &str, Option<&str>, Status)> = report
@@ -2280,7 +2311,9 @@ mod tests {
             .await
             .unwrap();
 
-        let report = check(&f.db, "props", &Facts::fixture()).await.unwrap();
+        let report = check(&f.db, "props", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap();
         assert_eq!(
             messages(&report),
             ["The root collection dg set in Settings no longer exists"]
@@ -2475,7 +2508,7 @@ mod tests {
             ],
         )
         .await;
-        let report = check(&f.db, "domain", &facts).await.unwrap();
+        let report = check(&f.db, "domain", &facts, &fresh_memo()).await.unwrap();
 
         assert_eq!(
             messages(&report),
@@ -2583,7 +2616,7 @@ mod tests {
             ],
         )
         .await;
-        let report = check(&f.db, "domain", &facts).await.unwrap();
+        let report = check(&f.db, "domain", &facts, &fresh_memo()).await.unwrap();
 
         let guard = "model export not built yet (an FBX with a kept mesh exports as a model)";
         let expected = [
@@ -2671,7 +2704,7 @@ mod tests {
         // Read one after another, the first read would wait for the others for ever
         let report = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            check(&f.db, "domain", &facts),
+            check(&f.db, "domain", &facts, &fresh_memo()),
         )
         .await
         .expect("every read is in flight at once")
@@ -2684,7 +2717,7 @@ mod tests {
     /// Checks a new domain holding `paths`, reading FBX facts from `facts`.
     async fn check_domain_with(f: &Fixture, paths: &[&str], facts: &Facts) -> CheckReport {
         collection(f, "domain", "Props", "dg", paths).await;
-        check(&f.db, "domain", facts).await.unwrap()
+        check(&f.db, "domain", facts, &fresh_memo()).await.unwrap()
     }
 
     type MaterialRow = (

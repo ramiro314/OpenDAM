@@ -48,7 +48,7 @@ pub async fn check_export(
     domain_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<check::CheckReport> {
-    check::check(&state.db, &domain_id, &state.fbx_facts).await
+    check::check(&state.db, &domain_id, &state.fbx_facts, &state.export_memo).await
 }
 
 /// The origin the game export infers for the pack at `path` (`""` for the root) in library

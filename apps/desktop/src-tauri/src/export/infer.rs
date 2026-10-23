@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use serde::Serialize;
@@ -106,12 +106,28 @@ impl<T: Clone> FileMemo<T> {
     }
 }
 
-/// Whether an image has a pixel with alpha below 0.5, by absolute path
-static CUT_ALPHA: LazyLock<FileMemo<bool>> = LazyLock::new(FileMemo::new);
-/// The GUID a `.meta` file gives, by the `.meta`'s absolute path
-static META_GUIDS: LazyLock<FileMemo<Option<String>>> = LazyLock::new(FileMemo::new);
-/// A `.mat` file as read, by absolute path
-static MATERIALS: LazyLock<FileMemo<Option<unity::Material>>> = LazyLock::new(FileMemo::new);
+/// What inference has read from files, for a session: each image's cut alpha, each `.meta`'s
+/// GUID and each `.mat`, kept while the file keeps its size and mtime. Its owner (`AppState`,
+/// beside the FBX facts cache) passes it to every Check, so a repeated Check reads none of them
+/// again.
+pub struct Memo {
+    /// Whether an image has a pixel with alpha below 0.5, by absolute path
+    cut_alpha: FileMemo<bool>,
+    /// The GUID a `.meta` file gives, by the `.meta`'s absolute path
+    meta_guids: FileMemo<Option<String>>,
+    /// A `.mat` file as read, by absolute path
+    materials: FileMemo<Option<unity::Material>>,
+}
+
+impl Default for Memo {
+    fn default() -> Self {
+        Memo {
+            cut_alpha: FileMemo::new(),
+            meta_guids: FileMemo::new(),
+            materials: FileMemo::new(),
+        }
+    }
+}
 
 /// Whether the image at `path` has a pixel with alpha below 0.5, decoding it without a
 /// converted copy for the usual layouts. An image that can't be decoded has none.
@@ -260,9 +276,9 @@ impl PackImages {
 
     /// Whether `image` has a pixel with alpha below 0.5. An image that can't be decoded has
     /// none.
-    fn has_cut_alpha(&self, root: &Path, image: usize) -> bool {
+    fn has_cut_alpha(&self, root: &Path, image: usize, memo: &Memo) -> bool {
         let path = root.join(&self.images[image].path);
-        CUT_ALPHA.get(&path, read_cut_alpha).unwrap_or(false)
+        memo.cut_alpha.get(&path, read_cut_alpha).unwrap_or(false)
     }
 }
 
@@ -277,12 +293,12 @@ pub struct UnityPack {
 
 impl UnityPack {
     /// Reads the `.meta` of each of `files` (relative to `root`) and each `.mat` among them,
-    /// each only when it changed since the session last read it.
-    pub fn read(root: &Path, files: &[String]) -> Self {
+    /// each only when it changed since `memo` last read it.
+    pub fn read(root: &Path, files: &[String], memo: &Memo) -> Self {
         let mut pack = UnityPack::default();
         for file in files {
             let meta = root.join(format!("{file}.meta"));
-            let guid = META_GUIDS.get(&meta, |path| {
+            let guid = memo.meta_guids.get(&meta, |path| {
                 let text = std::fs::read_to_string(path).ok()?;
                 unity::meta_guid(&text)
             });
@@ -290,7 +306,7 @@ impl UnityPack {
                 pack.by_guid.insert(guid, file.clone());
             }
             if extension_of(file).eq_ignore_ascii_case("mat") {
-                let mat = MATERIALS.get(&root.join(file), |path| {
+                let mat = memo.materials.get(&root.join(file), |path| {
                     let text = std::fs::read_to_string(path).ok()?;
                     Some(unity::read_material(&text))
                 });
@@ -558,7 +574,7 @@ impl<K: Copy + Eq + Hash> SetNames<K> {
 }
 
 /// Infers the materials of a domain's `models` (C7), each model's in the order given, whose packs'
-/// images are `catalogs`, and names the sets they use (D24). It reads in two passes, so no
+/// images are `catalogs`, reading files through `memo`, and names the sets they use (D24). It reads in two passes, so no
 /// model's result depends on the others' order: first every FBX reference and Unity material the
 /// models name says what its image holds (`PackImages::hint`), then every slot is answered from
 /// the layouts that gives. So every binding names its set's files that give its role, and
@@ -566,6 +582,7 @@ impl<K: Copy + Eq + Hash> SetNames<K> {
 pub fn domain<K: Copy + Eq + Hash>(
     catalogs: &mut HashMap<K, PackImages>,
     models: &[DomainModel<K>],
+    memo: &Memo,
 ) -> (Vec<Vec<Material>>, SetNames<K>) {
     let remaps: Vec<BTreeMap<String, String>> = models.iter().map(|m| m.remap()).collect();
     for (model, remap) in models.iter().zip(&remaps) {
@@ -575,7 +592,7 @@ pub fn domain<K: Copy + Eq + Hash>(
     let drafts: Vec<Vec<Draft>> = models
         .iter()
         .zip(&remaps)
-        .map(|(model, remap)| draft(&catalogs[&model.pack], model, remap))
+        .map(|(model, remap)| draft(&catalogs[&model.pack], model, remap, memo))
         .collect();
 
     // Each set's users, as (model, first material using it, roles)
@@ -725,6 +742,7 @@ fn draft<K>(
     images: &PackImages,
     model: &DomainModel<K>,
     remap: &BTreeMap<String, String>,
+    memo: &Memo,
 ) -> Vec<Draft> {
     let mut drafts = Vec::new();
     for (slot, added) in model.slots() {
@@ -817,7 +835,7 @@ fn draft<K>(
                     images
                         .role_sources(*set, Role::BaseColor)
                         .into_iter()
-                        .any(|i| images.has_cut_alpha(model.root, i))
+                        .any(|i| images.has_cut_alpha(model.root, i, memo))
                 });
         drafts.push(Draft {
             slot,
@@ -937,7 +955,7 @@ mod tests {
         let facts = fixture_facts(path);
         let unity = path
             .starts_with("Unity Moss")
-            .then(|| UnityPack::read(root(), &pack_files(pack)));
+            .then(|| UnityPack::read(root(), &pack_files(pack), &Memo::default()));
         one(images, unity.as_ref(), path, &facts)
     }
 
@@ -958,7 +976,7 @@ mod tests {
             facts,
             asset_name: pascal(stem_of(path)),
         };
-        let (mut materials, _) = domain(&mut catalogs, &[model]);
+        let (mut materials, _) = domain(&mut catalogs, &[model], &Memo::default());
         (catalogs.remove(&0).unwrap(), materials.remove(0))
     }
 
@@ -1332,9 +1350,10 @@ mod tests {
                 })
                 .collect(),
         );
+        let memo = Memo::default();
         let cut = |images: &mut PackImages, name: &str| {
             let i = images.find(name).unwrap();
-            images.has_cut_alpha(dir.path(), i)
+            images.has_cut_alpha(dir.path(), i, &memo)
         };
         // 8 bit: 127 is below 0.5, 128 is not
         assert!(cut(&mut images, "a127.png"));
@@ -1382,7 +1401,7 @@ mod tests {
         };
         let unity = pack
             .starts_with("Unity Moss")
-            .then(|| UnityPack::read(root(), &pack_files(pack)));
+            .then(|| UnityPack::read(root(), &pack_files(pack), &Memo::default()));
         one(images, unity.as_ref(), fbx_path, &facts)
     }
 
@@ -1391,7 +1410,7 @@ mod tests {
         // SM_Leaf's FBX calls T_LeafAtlas, which has no suffix, a normal map; SM_Log's
         // Leaves.mat says it is a base color, and a Unity property wins whichever is read first
         let pack = "Unity Moss";
-        let unity = UnityPack::read(root(), &pack_files(pack));
+        let unity = UnityPack::read(root(), &pack_files(pack), &Memo::default());
         let leaf_facts = FbxFacts {
             slots: vec![Slot {
                 name: "Frond".into(),
@@ -1428,7 +1447,7 @@ mod tests {
                     ..**m
                 })
                 .collect();
-            domain(&mut catalogs, &models).0
+            domain(&mut catalogs, &models, &Memo::default()).0
         };
         let forward = run(&[&leaf, &log]);
         let mut backward = run(&[&log, &leaf]);
@@ -1576,6 +1595,49 @@ mod tests {
         assert_eq!(memo.get(&file, read), Some(3), "a new mtime too");
         assert_eq!(memo.get(&dir.path().join("gone.png"), read), None);
         assert_eq!(reads.get(), 3);
+    }
+
+    #[test]
+    fn inference_reads_files_through_the_memo_it_is_given() {
+        let guard = "Dungeon Props/Models/SK_Guard.fbx";
+        let facts = fixture_facts(guard);
+        let model = DomainModel {
+            pack: 0,
+            root: root(),
+            unity: None,
+            item_path: guard,
+            fbx_path: guard,
+            facts: &facts,
+            asset_name: "Guard".into(),
+        };
+        let read = |memo: &Memo| {
+            let mut catalogs = HashMap::from([(0, pack_images("Dungeon Props"))]);
+            domain(&mut catalogs, std::slice::from_ref(&model), memo).0
+        };
+        let (memo, other) = (Memo::default(), Memo::default());
+        let first = read(&memo);
+        assert!(first[0][0].cutout_suggested);
+        let cached = |memo: &Memo| {
+            let entries = memo.cut_alpha.entries.lock().unwrap();
+            entries
+                .keys()
+                .map(|k| k.strip_prefix(root()).unwrap().to_path_buf())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            cached(&memo),
+            [PathBuf::from("Dungeon Props/Textures/T_Guard_D.png")]
+        );
+        // Another memo starts empty, and a second read through the first gives the same answer
+        assert!(cached(&other).is_empty());
+        assert_eq!(read(&memo), first);
+        // A Unity pack's .meta and .mat files go through it too
+        let unity = UnityPack::read(root(), &pack_files("Unity Moss"), &memo);
+        assert!(unity
+            .materials
+            .contains_key("Unity Moss/Materials/Leaves.mat"));
+        assert!(!memo.meta_guids.entries.lock().unwrap().is_empty());
+        assert_eq!(memo.materials.entries.lock().unwrap().len(), 2);
     }
 
     #[test]

@@ -39,6 +39,9 @@ pub struct AppState {
     pub preview_worker: std::sync::OnceLock<std::path::PathBuf>,
     /// FBX facts for the game export, from the Python queue's worker, cached for the session
     pub fbx_facts: export::fbx_facts::Cached<export::fbx_facts::Worker>,
+    /// What material inference reads from files (cut alpha, Unity `.meta` and `.mat`), for the
+    /// session
+    pub export_memo: std::sync::Arc<export::infer::Memo>,
 }
 
 /// The tagging providers runs can use, plus the fake ones in a debug build run with
@@ -165,6 +168,7 @@ pub fn run(render_choice: render::RenderChoice) {
                 fbx_facts: export::fbx_facts::Cached::new(export::fbx_facts::Worker::new(
                     worker_requests,
                 )),
+                export_memo: Default::default(),
             });
 
             app.manage(state.clone());
