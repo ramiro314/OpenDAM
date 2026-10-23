@@ -46,6 +46,9 @@ sha2 = "0.11"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 # A temporary folder per Blender job, for its script, job and result (plan game-export A2)
 tempfile = "3"
+# Pack import: reads `.unitypackage` originals (gzipped tars) entry by entry, never unpacking one
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
 
 [profile.release]
 codegen-units = 1

@@ -64,6 +64,14 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               corrections in export_edits, and game, what the detail panel's Game
                               tab shows, with a model's rig and facing, an animation's avatarFrom
                               and takes, and the GLB of "Show as exported" (exported_view)
+    src/import/               Pack import from originals (docs/plans/pack-import/plan.md): unitypackage,
+                              the extract_unitypackage step, which unpacks a .unitypackage into a
+                              folder tree (every file and .meta, nested packages as folders), gives
+                              each file its source path and skips and reports unsafe and duplicate
+                              entries, writing only regular files and folders
+    tests/fixtures/pack-import/  Its fixture originals, made by make_fixtures.py (stdlib only) and
+                              committed with its output, and expected/, goldens from the owner's
+                              scripts, each named with its sha256 in expected/README.md
     tests/fixtures/game-export/  The export's fixture library, made by make_fixtures.py under Blender and
                               committed with its output, and fbx_facts.json, its FBX files' facts,
                               which test_fbx_facts.py checks and the Check's tests read

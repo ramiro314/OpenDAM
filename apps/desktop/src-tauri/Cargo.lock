@@ -1412,6 +1412,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3416,6 +3426,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "flate2",
  "futures-util",
  "image",
  "jsonschema",
@@ -3426,6 +3437,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "sqlx",
+ "tar",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -5270,6 +5282,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
 ]
 
 [[package]]
