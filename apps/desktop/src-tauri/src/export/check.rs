@@ -25,7 +25,7 @@ use crate::export::fingerprint::{Fingerprint, Probes, Stamp};
 use crate::export::infer::{self, PackImages, UnityPack};
 use crate::export::names::{is_pascal, pascal};
 use crate::export::packs::{self, Origin, PackSource};
-use crate::export::textures::{self, Convention, Layout, Refusal, Role, SourceEdits};
+use crate::export::textures::{self, Convention, Layout, LayoutEdit, Refusal, Role, SourceEdits};
 use crate::export::{contract, edits, hashes, settings};
 use crate::models::AssetKind;
 use crate::structure::{self, PackOverride};
@@ -199,13 +199,13 @@ impl TextureGame {
         set: Vec<PackImage>,
     ) -> Self {
         let role = edits.layout(layout).role().map(|_| Field {
-            inferred: layout.role().unwrap_or(Role::BaseColor),
+            inferred: SourceEdits::inferred_role(layout),
             yours: edits.role,
         });
         TextureGame {
             layout: Field {
-                inferred: layout.edit_name(),
-                yours: edits.layout.map(Layout::edit_name),
+                inferred: LayoutEdit::of(layout).name(),
+                yours: edits.layout.map(LayoutEdit::name),
             },
             role,
             normal_convention: Field {

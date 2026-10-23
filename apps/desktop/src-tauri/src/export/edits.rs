@@ -17,7 +17,7 @@ use sqlx::{Pool, Sqlite};
 use crate::export::check;
 use crate::export::infer::{self, SlotEdits, Surface};
 use crate::export::names::is_pascal;
-use crate::export::textures::{read_stem, Convention, Layout, Role, SourceEdits};
+use crate::export::textures::{read_stem, Convention, LayoutEdit, Role, SourceEdits};
 use crate::models::AssetKind;
 use crate::structure;
 
@@ -82,7 +82,7 @@ fn parse_convention(text: &str) -> Option<Convention> {
 pub fn source_edits(edits: &Edits) -> SourceEdits {
     let text = |key: &str| edits.get(key).and_then(Value::as_str);
     SourceEdits {
-        layout: text(LAYOUT).and_then(Layout::from_edit_name),
+        layout: text(LAYOUT).and_then(LayoutEdit::parse),
         role: text(ROLE).and_then(Role::parse),
         convention: text(NORMAL_CONVENTION).and_then(parse_convention),
     }
@@ -270,7 +270,7 @@ fn validate(kind: &str, patch: &Edits) -> Result<(), String> {
             ASSET_NAME => validate_name(value, "An assetName")?,
             MATERIALS if model => validate_materials(value)?,
             LAYOUT | ROLE | NORMAL_CONVENTION if image && value.is_null() => {}
-            LAYOUT if image && text.and_then(Layout::from_edit_name).is_some() => {}
+            LAYOUT if image && text.and_then(LayoutEdit::parse).is_some() => {}
             LAYOUT if image => {
                 return Err(
                     "A layout is passThrough, ORM, MaskMap, Roughness, Gloss or Metallic".into(),
@@ -385,8 +385,8 @@ fn apply(edits: &mut Edits, patch: &Edits) {
     let layout = edits
         .get(LAYOUT)
         .and_then(Value::as_str)
-        .and_then(Layout::from_edit_name);
-    if layout.is_some_and(|l| l.role().is_none()) {
+        .and_then(LayoutEdit::parse);
+    if matches!(layout, Some(LayoutEdit::Fixed(_))) {
         edits.remove(ROLE);
     }
 }
@@ -753,7 +753,10 @@ mod tests {
                 convention: Some(Convention::OpenGl)
             }
         );
-        assert_eq!(source_edits(&all[0].parsed()).layout, Some(Layout::Orm));
+        assert_eq!(
+            source_edits(&all[0].parsed()).layout,
+            Some(LayoutEdit::Fixed(Layout::Orm))
+        );
     }
 
     #[tokio::test]
