@@ -17,6 +17,7 @@ import {
   sourcePatch,
   turnPatch,
   viewKey,
+  withPatch,
 } from './gameTab';
 
 const inferred = { inferred: 'Crate', yours: null };
@@ -271,5 +272,34 @@ describe('materialNameError', () => {
     expect(materialNameError('Boards')).toBeNull();
     expect(materialNameError('')).toMatch(/can’t be empty/);
     expect(materialNameError('old boards')).toMatch(/isn’t PascalCase/);
+  });
+});
+
+describe('withPatch', () => {
+  const model = {
+    rig: { inferred: 'none' as const, yours: null },
+    facingQuarterTurns: { inferred: 0, yours: null },
+    origin: 'generic' as const,
+  };
+
+  test('shows the saved rig and turns as yours, and a reset as inferred', () => {
+    const saved = withPatch(model, { rig: 'generic', facingQuarterTurns: 2 });
+    expect(saved.rig).toEqual({ inferred: 'none', yours: 'generic' });
+    expect(saved.facingQuarterTurns).toEqual({ inferred: 0, yours: 2 });
+    expect(withPatch(saved, { facingQuarterTurns: null }).facingQuarterTurns).toEqual({
+      inferred: 0,
+      yours: null,
+    });
+    expect(withPatch(model, null)).toBe(model);
+  });
+
+  test('a second turn before the detail is read back builds on the first', () => {
+    const first = turnPatch(model.facingQuarterTurns, 1);
+    const shown = withPatch(model, first);
+    expect(turnPatch(shown.facingQuarterTurns, 1)).toEqual({ facingQuarterTurns: 2 });
+    // From 3, one turn resets, and the next turns from the default again
+    const three = withPatch(model, { facingQuarterTurns: 3 });
+    const reset = withPatch(three, turnPatch(three.facingQuarterTurns, 1));
+    expect(turnPatch(reset.facingQuarterTurns, 1)).toEqual({ facingQuarterTurns: 1 });
   });
 });

@@ -69,6 +69,21 @@ export function turnPatch(field: GameField<number>, by: 1 | -1): ExportEditPatch
   return { facingQuarterTurns: turns === field.inferred ? null : turns };
 }
 
+/**
+ * `model` as `patch`, a save of its rig or turns, leaves it: the patch's values as yours, null
+ * resetting to inferred. The tab shows it while the detail that save wrote is read back.
+ */
+export function withPatch(model: GameModelDetail, patch: ExportEditPatch | null): GameModelDetail {
+  if (!patch) return model;
+  const yours = <T>(field: GameField<T>, value: T | null | undefined): GameField<T> =>
+    value === undefined ? field : { ...field, yours: value };
+  return {
+    ...model,
+    rig: yours(model.rig, patch.rig),
+    facingQuarterTurns: yours(model.facingQuarterTurns, patch.facingQuarterTurns),
+  };
+}
+
 /** The line saying which way a model faces: its origin's default, then your turns */
 export function facingLine(model: Pick<GameModelDetail, 'facingQuarterTurns' | 'origin'>): string {
   const turns = shownValue(model.facingQuarterTurns).value;

@@ -26,6 +26,7 @@ import {
   sourcePatch,
   turnPatch,
   viewKey,
+  withPatch,
   type ViewResult,
 } from '../../utils/gameTab';
 import { IconRotateCcw, IconRotateCw } from '../Icons';
@@ -111,20 +112,36 @@ function Row({
  * A model's rig and facing (plan game-export C13, D13, D20): a rig picker and quarter turns
  * about Y, each marked inferred or yours with a reset, and "Show as exported", which has Blender
  * write the normalized model for the viewer only when you ask. Once shown, the view asks again
- * after each edit (`revision`), so it follows each turn.
+ * after each edit (`revision`), so it follows each turn. A turn is computed from the value the
+ * last save wrote, so the controls wait while the tab reads that save back (`stale`), showing
+ * the saved value meanwhile.
  */
 export function ModelEditor({
   assetId,
-  model,
+  model: read,
   revision,
+  stale,
   saving,
   save,
-}: EditorProps & {
+}: Omit<EditorProps, 'save'> & {
   assetId: string;
   model: GameModelDetail;
   /** Counts the tab's saved edits: each makes an open view ask again */
   revision: number;
+  /** Whether `model` was read before the last save */
+  stale: boolean;
+  /** Resolves whether the edit was written */
+  save: (patch: ExportEditPatch) => Promise<boolean>;
 }) {
+  // The last save's values, until the detail read after it arrives
+  const [pending, setPending] = useState<ExportEditPatch | null>(null);
+  useEffect(() => setPending(null), [read]);
+  const model = withPatch(read, pending);
+  const busy = saving || stale;
+  const apply = (patch: ExportEditPatch) => {
+    setPending((p) => ({ ...p, ...patch }));
+    void save(patch).then((written) => written || setPending(null));
+  };
   const rig = shownValue(model.rig);
   const facing = shownValue(model.facingQuarterTurns);
   const [showing, setShowing] = useState(false);
@@ -150,18 +167,18 @@ export function ModelEditor({
         label="Rig"
         id="detail-game-rig"
         yours={rig.mark === 'yours'}
-        saving={saving}
-        onReset={() => save({ rig: null })}
+        saving={busy}
+        onReset={() => apply({ rig: null })}
       >
         <select
           id="detail-game-rig"
           className={SELECT}
           value={rig.value}
-          disabled={saving}
+          disabled={busy}
           title="Inferred: none without an armature, else generic"
           onChange={(e) => {
             const patch = rigPatch(model.rig, e.target.value as GameRig);
-            if (patch) save(patch);
+            if (patch) apply(patch);
           }}
         >
           <option value="none">None</option>
@@ -172,15 +189,15 @@ export function ModelEditor({
         label="Facing"
         id="detail-game-facing"
         yours={facing.mark === 'yours'}
-        saving={saving}
-        onReset={() => save({ facingQuarterTurns: null })}
+        saving={busy}
+        onReset={() => apply({ facingQuarterTurns: null })}
       >
         <button
           type="button"
           id="detail-game-facing"
           className={styles.openLicenseBtn}
-          onClick={() => save(turnPatch(model.facingQuarterTurns, -1))}
-          disabled={saving}
+          onClick={() => apply(turnPatch(model.facingQuarterTurns, -1))}
+          disabled={busy}
           title="A quarter turn counterclockwise, seen from above"
           aria-label="A quarter turn counterclockwise, seen from above"
         >
@@ -190,8 +207,8 @@ export function ModelEditor({
           type="button"
           id="detail-game-facing-right"
           className={styles.openLicenseBtn}
-          onClick={() => save(turnPatch(model.facingQuarterTurns, 1))}
-          disabled={saving}
+          onClick={() => apply(turnPatch(model.facingQuarterTurns, 1))}
+          disabled={busy}
           title="A quarter turn clockwise, seen from above: +Z to +X"
           aria-label="A quarter turn clockwise, seen from above: +Z to +X"
         >

@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { Suspense } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
-import { FileLoader } from 'three';
+import { Box3, FileLoader, Vector3 } from 'three';
 import { useAssetStore } from '../../store';
-import { Model, ThreeViewer, reloadModel } from './ThreeViewer';
+import { Model, ThreeViewer, arrowPlacement, reloadModel } from './ThreeViewer';
 
 const realWindow = globalThis.window;
 // drei's GLTFLoader (three-stdlib) loads under bun through three's CommonJS build, a separate
@@ -112,5 +112,17 @@ describe('ThreeViewer', () => {
     expect(await mount(a)).not.toBe(firstA);
     expect(await mount(b)).toBe(firstB);
     expect(fetched).toEqual([toUrl(a), toUrl(b), toUrl(a)]);
+  });
+});
+
+describe('arrowPlacement', () => {
+  test('starts at the centre of the base, ends past the front, and follows Stage’s centring', () => {
+    // A normalized model: 0.4 wide, 1.8 high, 0.4 deep, standing on its pivot
+    const box = new Box3(new Vector3(-0.2, 0, -0.2), new Vector3(0.2, 1.8, 0.2));
+    const { offset, origin, length } = arrowPlacement(box);
+    expect(offset.toArray()).toEqual([-0, -0.9, -0]);
+    expect(origin.toArray()).toEqual([0, 0, 0]);
+    // Half its depth to the front, then a third of its height past it
+    expect(length).toBeCloseTo(0.2 + 0.6);
   });
 });

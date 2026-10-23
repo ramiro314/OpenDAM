@@ -1115,7 +1115,12 @@ function CollectionsTab({
  * makes an open Export view holding the asset ask for a new Check.
  */
 function GameTab({ asset }: { asset: Asset }) {
-  const [loaded, setLoaded] = useState<{ id: string; detail: GameDetail | null } | null>(null);
+  // `reload` is the save the detail was read after, so a control can tell it is behind
+  const [loaded, setLoaded] = useState<{
+    id: string;
+    detail: GameDetail | null;
+    reload: number;
+  } | null>(null);
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
@@ -1131,7 +1136,7 @@ function GameTab({ asset }: { asset: Asset }) {
         .getGameDetail(asset.id)
         .then((detail) => {
           if (!current) return;
-          setLoaded({ id: asset.id, detail });
+          setLoaded({ id: asset.id, detail, reload });
           setDraft(detail ? shownValue(detail.assetName).value : '');
           setError(null);
         })
@@ -1155,7 +1160,7 @@ function GameTab({ asset }: { asset: Asset }) {
   }
 
   const name = shownValue(detail.assetName);
-  const save = async (patch: ExportEditPatch) => {
+  const save = async (patch: ExportEditPatch): Promise<boolean> => {
     setSaving(true);
     setError(null);
     try {
@@ -1163,8 +1168,10 @@ function GameTab({ asset }: { asset: Asset }) {
       const ids = await api.setExportEdit(detail.assetId, patch);
       useExportEditStore.getState().noteEdited(ids);
       setReload((r) => r + 1);
+      return true;
     } catch (err) {
       setError(String(err));
+      return false;
     } finally {
       setSaving(false);
     }
@@ -1249,8 +1256,9 @@ function GameTab({ asset }: { asset: Asset }) {
           assetId={detail.assetId}
           model={detail.model}
           revision={reload}
+          stale={loaded?.reload !== reload}
           saving={saving}
-          save={(patch) => void save(patch)}
+          save={save}
         />
       )}
       {detail.materials.length > 0 && (

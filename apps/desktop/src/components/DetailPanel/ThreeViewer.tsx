@@ -1,6 +1,14 @@
 import { Canvas, useThree } from '@react-three/fiber';
 import { useGLTF, Stage, PresentationControls, Environment } from '@react-three/drei';
-import { Suspense, Component, useEffect, useMemo, useState, type ReactNode } from 'react';
+import {
+  Suspense,
+  Component,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from 'react';
 import { ArrowHelper, Box3, PMREMGenerator, Vector3, type Texture } from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { convertFileSrc } from '@tauri-apps/api/core';
@@ -45,22 +53,41 @@ export function Model({ url }: { url: string }) {
 }
 
 /**
- * An arrow along the model's +Z, its forward once normalized for the game (plan game-export
- * C13), from the front of its bounds, as long as half its largest side.
+ * Where the forward arrow goes for a model whose bounds, in its own space, are `box` (plan
+ * game-export C13): from the centre of its base along +Z, out past its front by a third of its
+ * largest side. `offset` is the centring Stage gives the model, so the arrow, drawn outside
+ * Stage, lines up with it without counting toward the bounds Stage centres and fits the camera to.
  */
-function ForwardArrow({ url }: { url: string }) {
-  const { scene } = useGLTF(convertFileSrc(url), false, false);
-  const arrow = useMemo(() => {
-    // In the scene's own space, whatever Stage has moved it by
-    scene.updateMatrixWorld(true);
-    const box = new Box3().setFromObject(scene).applyMatrix4(scene.matrixWorld.clone().invert());
-    const size = box.isEmpty() ? 1 : Math.max(...box.getSize(new Vector3()).toArray()) || 1;
-    const length = size / 2;
-    const front = new Vector3(0, 0, box.isEmpty() ? 0 : box.max.z);
-    return new ArrowHelper(new Vector3(0, 0, 1), front, length, 0x3b82f6, length / 3, length / 6);
-  }, [scene]);
+export function arrowPlacement(box: Box3): { offset: Vector3; origin: Vector3; length: number } {
+  const center = box.getCenter(new Vector3());
+  const largest = Math.max(...box.getSize(new Vector3()).toArray());
+  return {
+    offset: center.clone().negate(),
+    origin: new Vector3(center.x, box.min.y, center.z),
+    length: box.max.z - center.z + largest / 3,
+  };
+}
+
+/** An arrow along the model's +Z, its forward once normalized for the game, placed by `box` */
+function ForwardArrow({ box }: { box: Box3 }) {
+  const { offset, arrow } = useMemo(() => {
+    const { offset, origin, length } = arrowPlacement(box);
+    const arrow = new ArrowHelper(
+      new Vector3(0, 0, 1),
+      origin,
+      length,
+      0x3b82f6,
+      length / 4,
+      length / 8
+    );
+    return { offset, arrow };
+  }, [box]);
   useEffect(() => () => arrow.dispose(), [arrow]);
-  return <primitive object={arrow} />;
+  return (
+    <group position={offset}>
+      <primitive object={arrow} />
+    </group>
+  );
 }
 
 /**
@@ -105,6 +132,13 @@ export function ThreeViewer({
   modelPath: string;
   forwardArrow?: boolean;
 }) {
+  // The model's bounds as Stage centres it, which place the forward arrow
+  const [bounds, setBounds] = useState<Box3 | null>(null);
+  // Stage keeps the first callback it is given, so this one never changes
+  const onCentered = useCallback(
+    ({ boundingBox }: { boundingBox: Box3 }) => setBounds(boundingBox.clone()),
+    []
+  );
   // Each rerun remounts the whole viewer, canvas included, as reopening it would. Remounting only
   // `Model` inside the live canvas loads the new GLB but leaves it out of the scene.
   const revision = useAssetStore((s) => s.modelRevisions[modelPath] ?? 0);
@@ -134,10 +168,17 @@ export function ThreeViewer({
         <RoomLighting />
         <Suspense fallback={null}>
           <PresentationControls speed={1.5} global zoom={0.5} polar={[-0.1, Math.PI / 4]}>
-            <Stage environment={null} intensity={0.5}>
+            <Stage
+              environment={null}
+              intensity={0.5}
+              center={forwardArrow ? { onCentered } : undefined}
+              // The camera fits the model alone, so leave room for the arrow out front: a number
+              // is the fit's margin
+              adjustCamera={forwardArrow ? 1.6 : true}
+            >
               <Model url={modelPath} />
-              {forwardArrow && <ForwardArrow url={modelPath} />}
             </Stage>
+            {forwardArrow && bounds && !bounds.isEmpty() && <ForwardArrow box={bounds} />}
           </PresentationControls>
         </Suspense>
       </Canvas>
