@@ -3350,7 +3350,7 @@ mod tests {
         assert!(is_pending(pool).await);
 
         // The first machine's release alone runs the pass.
-        advisory.release(&first_lib.pool).await;
+        advisory.release(&first_lib.pool, &root).await;
         drop(index_guard);
         assert_eq!(dangling_members(pool).await, Vec::<String>::new());
         assert_eq!(

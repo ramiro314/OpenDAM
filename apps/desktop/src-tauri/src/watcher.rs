@@ -240,16 +240,12 @@ impl IndexLock {
         }
     }
 
-    /// Lets go of the lock, first running the structure pass on the library DB at `pool` when one
-    /// is pending (`structure::mark_pending`) and the file still holds this guard's token. The
-    /// caller still holds the library's `index_lock`.
-    pub async fn release(self, pool: &Pool<Sqlite>) {
+    /// Lets go of the lock, first running the structure pass on the library DB at `pool`, whose
+    /// files lie below `root`, when one is pending (`structure::mark_pending`) and the file still
+    /// holds this guard's token. The caller still holds the library's `index_lock`.
+    pub async fn release(self, pool: &Pool<Sqlite>, root: &Path) {
+        debug_assert!(self.path == Self::path(root));
         if self.still_held() && crate::structure::is_pending(pool).await {
-            let root = self
-                .path
-                .parent()
-                .and_then(Path::parent)
-                .unwrap_or(Path::new(""));
             if let Err(e) = crate::structure::rebuild(pool, root).await {
                 tracing::error!(target: "structure", "Pending structure pass failed for library at {root:?}: {e}");
             }
@@ -482,7 +478,7 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
     let (pool, root) = (&library.pool, library.root_path.as_path());
     crate::import::recover_swaps(pool, root, crate::import::Recovery::Entry).await;
     let run = index_paths_locked(db, library_id, paths, Prune::Now, &index_guard, &lock).await;
-    lock.release(pool).await;
+    lock.release(pool, root).await;
     run
 }
 

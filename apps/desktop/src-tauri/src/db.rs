@@ -441,7 +441,7 @@ pub async fn open_library_db(
     if let Err(e) = crate::structure::rebuild(&pool, root).await {
         tracing::warn!("Could not derive the folder tree of {db_path:?}: {e}");
     }
-    advisory.release(&pool).await;
+    advisory.release(&pool, root).await;
     Ok(pool)
 }
 

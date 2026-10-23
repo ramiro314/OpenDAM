@@ -2394,7 +2394,7 @@ async fn locked_pass(
     let (pool, root) = (&library.pool, library.root_path.as_path());
     crate::import::recover_swaps(pool, root, crate::import::Recovery::Entry).await;
     log_failure(library, rebuild(pool, root).await);
-    advisory.release(pool).await;
+    advisory.release(pool, root).await;
 }
 
 /// The structure pass for a caller that holds `library`'s `index_lock` and advisory lock, passed
@@ -6178,7 +6178,7 @@ pub(crate) mod tests {
         let lost = IndexLock::try_acquire(dir.path()).await.unwrap();
         mark_pending(pool).await;
         std::fs::write(&lock_file, "another machine").unwrap();
-        lost.release(pool).await;
+        lost.release(pool, dir.path()).await;
         assert!(
             derived_rows(pool).await.folders.is_empty(),
             "a holder that lost its lock ran a pass"
@@ -6187,7 +6187,7 @@ pub(crate) mod tests {
 
         std::fs::remove_file(&lock_file).unwrap();
         let held = IndexLock::try_acquire(dir.path()).await.unwrap();
-        held.release(pool).await;
+        held.release(pool, dir.path()).await;
         assert_eq!(
             derived_rows(pool).await,
             fresh_pass(&["kits/kit/model.glb"]).await
@@ -6200,7 +6200,7 @@ pub(crate) mod tests {
         IndexLock::try_acquire(dir.path())
             .await
             .unwrap()
-            .release(pool)
+            .release(pool, dir.path())
             .await;
         assert_eq!(
             derived_rows(pool).await.folders,
@@ -6237,7 +6237,7 @@ pub(crate) mod tests {
         IndexLock::try_acquire(dir.path())
             .await
             .unwrap()
-            .release(pool)
+            .release(pool, dir.path())
             .await;
         assert!(!is_pending(pool).await, "the release left the pass pending");
     }
