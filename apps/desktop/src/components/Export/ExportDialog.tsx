@@ -1,8 +1,14 @@
 import { useEffect, useState } from 'react';
 import clsx from 'clsx';
 import { api } from '../../api';
-import type { Collection, ExportCheck } from '../../types';
-import { checkSummary, materialLine } from '../../utils/exportView';
+import type { Collection, ExportCheck, ExportDiffEntry } from '../../types';
+import {
+  checkSummary,
+  diffLabel,
+  diffSummary,
+  materialLine,
+  staleMessage,
+} from '../../utils/exportView';
 import { IconExternal, IconX } from '../Icons';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './ExportDialog.module.css';
@@ -12,15 +18,33 @@ interface ExportDialogProps {
   onClose: () => void;
 }
 
+const statusClass = {
+  ready: styles.ready,
+  new: styles.pending,
+  changed: styles.pending,
+  problem: styles.refused,
+};
+
 /**
  * A domain's Export view (plan game-export C14). "Check" reads the domain and its
- * subcollections, builds the manifest in memory and validates it, then lists every asset with
- * its kind, default name, pack and status, and every problem that would refuse the export.
+ * subcollections, builds the bundle in a staging folder beside the domain's and validates it,
+ * then lists every asset with its kind, default name, pack and status, every problem that would
+ * refuse the export, and the diff against the previous bundle. "Export" swaps the staged bundle
+ * in, unless anything the Check read has changed since. Closing the view discards it.
  */
 export function ExportDialog({ domain, onClose }: ExportDialogProps) {
   const [check, setCheck] = useState<ExportCheck | null>(null);
   const [checking, setChecking] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    const id = domain.id;
+    return () => {
+      api.discardExport(id).catch((e) => console.warn('Could not discard the staged bundle', e));
+    };
+  }, [domain.id]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -33,14 +57,40 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
   const runCheck = async () => {
     setChecking(true);
     setError(null);
+    setNotice(null);
     try {
       setCheck(await api.checkExport(domain.id));
     } catch (e) {
+      // A Check discards the earlier staged bundle before it runs, so the old report would show
+      // an out-of-date diff with Export enabled for a bundle that is gone
+      setCheck(null);
       setError(String(e));
     } finally {
       setChecking(false);
     }
   };
+
+  const runExport = async () => {
+    setExporting(true);
+    setError(null);
+    try {
+      const outcome = await api.exportBundle(domain.id);
+      setNotice(
+        outcome.status === 'exported'
+          ? `Exported ${outcome.assets.toLocaleString()} assets to ${outcome.bundlePath}`
+          : staleMessage(outcome.changes)
+      );
+      // Either way the staged bundle is gone: a new Check stages the next one
+      setCheck((c) => c && { ...c, staged: false });
+    } catch (e) {
+      setError(String(e));
+      setCheck((c) => c && { ...c, staged: false });
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const canExport = !!check?.staged && check.problems.length === 0 && !checking && !exporting;
 
   return (
     <div className={dialog.overlay} onClick={onClose}>
@@ -66,11 +116,17 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
         <div className={dialog.content}>
           {!check && !error && (
             <p className={styles.hint}>
-              Check reads {domain.name} and its subcollections, and lists what the bundle would hold
-              and what refuses the export. It writes no files, only cached file hashes.
+              Check reads {domain.name} and its subcollections, builds the bundle in a staging
+              folder beside the previous one, and lists what it holds, what changed and what refuses
+              the export. Export then swaps it in. The previous bundle stays until then.
             </p>
           )}
           {error && <p className={dialog.error}>{error}</p>}
+          {notice && (
+            <p id="export-notice" className={styles.summary}>
+              {notice}
+            </p>
+          )}
           {check && (
             <>
               {check.bundlePath && (
@@ -92,6 +148,38 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
                       </li>
                     ))}
                   </ul>
+                </>
+              )}
+
+              {check.diff && (
+                <>
+                  <h4 className={dialog.sectionTitle}>Changes</h4>
+                  <p id="export-diff" className={styles.hint}>
+                    {diffSummary(check.diff)}
+                    {check.diff.previousExportedAt &&
+                      ` (exported ${new Date(check.diff.previousExportedAt).toLocaleString()})`}
+                  </p>
+                  {check.diff.previousExportedAt && (
+                    <div className={styles.diff}>
+                      <DiffList title="Added" entries={check.diff.added} />
+                      <DiffList title="Changed" entries={check.diff.changed} />
+                      <DiffList title="Removed" entries={check.diff.removed} />
+                      {check.diff.packs.length > 0 && (
+                        <div>
+                          <span className={styles.diffTitle}>
+                            Packs changed ({check.diff.packs.length})
+                          </span>
+                          <ul className={styles.diffList}>
+                            {check.diff.packs.map((id) => (
+                              <li key={id}>
+                                pack <span className={styles.name}>{id}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </>
               )}
 
@@ -130,14 +218,7 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
                             {a.normalConvention === 'directx' && ', DirectX'}
                           </td>
                           <td>{a.pack ?? 'none'}</td>
-                          <td
-                            className={clsx(
-                              styles.status,
-                              a.status === 'ready' ? styles.ready : styles.refused
-                            )}
-                          >
-                            {a.status}
-                          </td>
+                          <td className={clsx(styles.status, statusClass[a.status])}>{a.status}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -154,14 +235,42 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
           </button>
           <button
             id="export-check"
-            className={clsx(dialog.btn, dialog.primaryBtn)}
+            className={clsx(dialog.btn, check?.staged ? dialog.secondaryBtn : dialog.primaryBtn)}
             onClick={runCheck}
             disabled={checking}
           >
             {checking ? 'Checking…' : check ? 'Check again' : 'Check'}
           </button>
+          <button
+            id="export-export"
+            className={clsx(dialog.btn, dialog.primaryBtn)}
+            onClick={runExport}
+            disabled={!canExport}
+            title={canExport ? undefined : 'Run a Check with no problems first'}
+          >
+            {exporting ? 'Exporting…' : 'Export'}
+          </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** One list of the diff, by kind and name, left out when empty. */
+function DiffList({ title, entries }: { title: string; entries: ExportDiffEntry[] }) {
+  if (entries.length === 0) return null;
+  return (
+    <div>
+      <span className={styles.diffTitle}>
+        {title} ({entries.length})
+      </span>
+      <ul className={styles.diffList}>
+        {entries.map((e) => (
+          <li key={`${e.kind}/${e.assetName}/${e.role}`}>
+            {e.kind} <span className={styles.name}>{diffLabel(e)}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

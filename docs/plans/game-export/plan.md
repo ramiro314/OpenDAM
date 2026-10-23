@@ -913,9 +913,10 @@ from the contracts above:
   for the Game tab (step 2).
 - **The cutout suggestion decodes the BaseColor with the `image` crate.** A PSD, or an image it
   can't decode, suggests nothing. Its answer, each `.meta` GUID and each `.mat` are kept for the
-  session while the file keeps its size and mtime, in an `infer::Memo` that `AppState` owns
-  beside the `fbx_facts` cache and passes to each Check, so a repeated Check reads none of them
-  again. An explicit URP `_AlphaClip` wins over a stale `_Mode`.
+  session while the file keeps its size and mtime, in an `infer::Memo` that `bundle::Exports`
+  owns and passes to each Check and Export, so a repeated Check reads none of them again. Each
+  of those files, and each `.fbx.meta`, is stamped in the Check's `Probes`, so the fingerprint
+  holds the Unity files, which the watcher doesn't index. An explicit URP `_AlphaClip` wins over a stale `_Mode`.
 - **Fixtures:** `T_StoneFloor_ORM.png` moved to `Rocks/T_Slate_ORM.png`, since it would have
   joined the `StoneFloor` set. The Unity material fixtures are `Unity Moss/Models/SM_Log.fbx`
   with its `.fbx.meta`, `Materials/M_LogBark.mat` (by remap) and `Materials/Leaves.mat` (by

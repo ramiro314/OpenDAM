@@ -468,7 +468,11 @@ export interface ExportCheckAsset extends ExportAssetRef {
   role: TextureRole | null;
   /** Its pack's id, or null when it is in no pack */
   pack: string | null;
-  status: 'ready' | 'problem';
+  /**
+   * `ready` when the previous bundle holds it as the next one would, `changed` or `new` when it
+   * doesn't, `problem` when a problem names it
+   */
+  status: 'ready' | 'changed' | 'new' | 'problem';
   /** In the domain itself, rather than joined through a material or its texture set */
   member: boolean;
   /** A texture's layout (plan C8): a role, or ORM, MaskMap, Roughness, Gloss or Metallic */
@@ -492,6 +496,25 @@ export interface ExportMaterial {
   /** The slot the export adds for a mesh with no material */
   added: boolean;
   textures: Partial<Record<TextureRole, { via: TextureVia; assetName: string; files: string[] }>>;
+}
+
+/** An asset of a manifest, as the export's diff names it */
+export interface ExportDiffEntry {
+  kind: 'model' | 'texture' | 'animation';
+  assetName: string;
+  /** A texture's role, null for a model or an animation */
+  role: TextureRole | null;
+}
+
+/** What exporting changes in the bundle, by kind, name and role (plan C14) */
+export interface ExportDiff {
+  /** The previous bundle's `exportedAt`, null for a first export */
+  previousExportedAt: string | null;
+  added: ExportDiffEntry[];
+  changed: ExportDiffEntry[];
+  removed: ExportDiffEntry[];
+  /** Ids of the packs whose manifest entry the export adds, changes or removes */
+  packs: string[];
 }
 
 /** A pack of the domain, as the manifest names it (plan C6) */
@@ -519,7 +542,16 @@ export interface ExportCheck {
   problems: ExportProblem[];
   /** The manifest of the ready assets, as the bundle would hold it */
   manifest: unknown;
+  /** The diff against the previous bundle, once the bundle path is known */
+  diff: ExportDiff | null;
+  /** Whether the bundle is staged, so Export can swap it in */
+  staged: boolean;
 }
+
+/** What Export did: swapped the bundle in, or found that something the Check read changed */
+export type ExportOutcome =
+  | { status: 'exported'; bundlePath: string; assets: number }
+  | { status: 'stale'; changes: string[] };
 
 /** Where a provider's key comes from. It never carries the key. */
 export interface ProviderStatus {

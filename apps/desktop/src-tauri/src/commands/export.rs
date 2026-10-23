@@ -2,6 +2,7 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::export::blender::{self, BlenderStatus};
+use crate::export::bundle::ExportOutcome;
 use crate::export::packs::Origin;
 use crate::export::settings::{self, ExportSettings};
 use crate::export::{cache, check};
@@ -41,14 +42,38 @@ pub async fn get_blender_status(path: Option<String>) -> Result<BlenderStatus> {
 }
 
 /// Checks the domain collection `domain_id` for export (plan C14): every asset with its kind,
-/// default name, pack and status, every problem that refuses the export, and the manifest it
-/// would write. FBX files are read through the preview worker's `fbx_facts`.
+/// default name, pack and status, every problem that refuses the export, the manifest it would
+/// write and the diff against the previous bundle. FBX files are read through the preview
+/// worker's `fbx_facts`. With no problem, it stages the bundle beside the domain's folder for
+/// `export_bundle` (C15).
 #[tauri::command]
 pub async fn check_export(
     domain_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<check::CheckReport> {
-    check::check(&state.db, &domain_id, &state.fbx_facts, &state.export_memo).await
+    state
+        .exports
+        .check(&state.db, &domain_id, &state.fbx_facts)
+        .await
+}
+
+/// Swaps the bundle the last Check of `domain_id` staged into the domain's folder, unless
+/// anything that Check read has changed since, which asks for a new Check instead.
+#[tauri::command]
+pub async fn export_bundle(
+    domain_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ExportOutcome> {
+    state
+        .exports
+        .export(&state.db, &domain_id, &state.fbx_facts)
+        .await
+}
+
+/// Deletes the bundle the last Check of `domain_id` staged, as its Export view closes.
+#[tauri::command]
+pub async fn discard_export(domain_id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
+    state.exports.discard(&domain_id).await
 }
 
 /// The origin the game export infers for the pack at `path` (`""` for the root) in library

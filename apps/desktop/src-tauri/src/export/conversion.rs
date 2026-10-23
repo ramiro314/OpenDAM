@@ -4,12 +4,13 @@
 //! inference (C6) uses the same walk.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::export::contract;
+use crate::export::fingerprint::Probes;
 
 pub const FILE_NAME: &str = "conversion.json";
 
@@ -40,17 +41,24 @@ pub struct Invalid {
 }
 
 /// Walks folders of one library to their nearest `conversion.json`, reading each folder's file at
-/// most once, so asking for every file of a pack costs one probe per folder.
+/// most once, so asking for every file of a pack costs one probe per folder. Every path it looks
+/// at is in `probes`, found or missing, for the Check's fingerprint (C14), and so is every other
+/// file a check stats through it.
 pub struct Walker {
-    root: PathBuf,
     folders: HashMap<String, Option<Arc<Nearest>>>,
+    pub probes: Probes,
 }
 
 impl Walker {
     pub fn new(root: &Path) -> Self {
+        Walker::with_probes(Probes::new(root))
+    }
+
+    /// A walker that goes on recording in `probes`, which hold the files already read.
+    pub fn with_probes(probes: Probes) -> Self {
         Walker {
-            root: root.to_path_buf(),
             folders: HashMap::new(),
+            probes,
         }
     }
 
@@ -66,10 +74,9 @@ impl Walker {
         } else {
             format!("{dir}/{FILE_NAME}")
         };
-        let absolute = self.root.join(&path);
-        let found = if absolute.is_file() {
+        let found = if self.probes.probe(&path).is_file() {
             Some(Arc::new(Nearest {
-                steps: read(&absolute),
+                steps: read(&self.probes.root().join(&path)),
                 path,
             }))
         } else if dir.is_empty() {
@@ -161,7 +168,18 @@ mod tests {
         let root = dir.path().join("library");
         std::fs::create_dir_all(root.join("a/b")).unwrap();
 
-        assert_eq!(Walker::new(&root).nearest("a/b"), None);
+        let mut walker = Walker::new(&root);
+        assert_eq!(walker.nearest("a/b"), None);
+        // Each folder up to the root was probed, and found to have none
+        let probed: Vec<&str> = walker.probes.seen.keys().map(String::as_str).collect();
+        assert_eq!(
+            probed,
+            [
+                "a/b/conversion.json",
+                "a/conversion.json",
+                "conversion.json"
+            ]
+        );
     }
 
     const FIXTURE: &str = concat!(
