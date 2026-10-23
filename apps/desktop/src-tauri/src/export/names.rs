@@ -20,6 +20,22 @@ pub fn strip_type_prefix(stem: &str) -> &str {
         .unwrap_or(stem)
 }
 
+/// The material the export adds to a model whose kept mesh has none (plan C9 step 2).
+pub const ADDED_MATERIAL: &str = "OpenDAMDefault";
+
+/// The name of the material the export adds to a model whose kept slots are `slots`:
+/// `ADDED_MATERIAL`, or the lowest `OpenDAMDefault2`, `OpenDAMDefault3`, ... that no slot holds.
+/// It depends only on the slots, so renaming the file doesn't change it.
+pub fn added_material<'a>(slots: impl IntoIterator<Item = &'a str> + Clone) -> String {
+    (1..)
+        .map(|n| match n {
+            1 => ADDED_MATERIAL.to_string(),
+            n => format!("{ADDED_MATERIAL}{n}"),
+        })
+        .find(|name| !slots.clone().into_iter().any(|slot| slot == name))
+        .expect("a free name")
+}
+
 /// The default name for `stem`: one type prefix dropped, then words split on `_`, `-`, spaces
 /// and each lower-to-upper case change, each word capitalised, digits kept and every other
 /// character dropped. A result starting with a digit gets an `X` in front. So `SM_arch01_broken`
@@ -116,6 +132,19 @@ mod tests {
             assert_eq!(pascal(stem), "", "{stem}");
             assert!(!is_pascal(&pascal(stem)));
         }
+    }
+
+    #[test]
+    fn the_added_material_takes_the_lowest_free_name() {
+        assert_eq!(added_material([]), "OpenDAMDefault");
+        assert_eq!(added_material(["Stone", "Material"]), "OpenDAMDefault");
+        assert_eq!(added_material(["OpenDAMDefault"]), "OpenDAMDefault2");
+        assert_eq!(
+            added_material(["OpenDAMDefault2", "OpenDAMDefault", "OpenDAMDefault4"]),
+            "OpenDAMDefault3"
+        );
+        // Only an exact name is taken
+        assert_eq!(added_material(["opendamdefault"]), "OpenDAMDefault");
     }
 
     #[test]

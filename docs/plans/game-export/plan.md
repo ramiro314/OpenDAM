@@ -876,6 +876,35 @@ from the contracts above:
   which reads them. `fbx_facts.json` beside the library holds the facts the worker reads from
   each FBX, so the Check's Rust tests read them without Python.
 
+### What the Blender normalization ticket built differently
+
+The script (`export/normalize.py`) and its runner (`export::blender::Runner`) landed for models,
+proved on the fixtures. Wiring them into the export, C11's cache and the step's settings come
+later. Where they differ from C9:
+
+- **The job always carries the added material's name**, picked by `names::added_material` from
+  `fbx_facts`' slots. The script adds it only when a kept mesh has no material, and the result's
+  `addedMaterial` is null otherwise.
+- **`facingQuarterTurns` turns clockwise seen from above**, each taking +Z to +X, which is
+  Unity's positive yaw. Unreal's default is the opposite turn, +X to +Z, so an unreal model with
+  one quarter turn faces as it was. The result reports the whole turn as `yaw`, 0 to 270.
+- **Blender's slot order** is each kept mesh by name, then its slots. The added material lands
+  wherever its mesh sorts (`SM_Shelf` writes `OpenDAMDefault2, OpenDAMDefault`), so the round-trip
+  check removes it, wherever it is, and compares the rest with the source's kept slots in order.
+  Takes are compared sorted by name, since Blender lists actions by name, not in file order.
+- **Takes are written one NLA strip each**, named after the source take, because the exporter
+  names an action's take `<object>|<action>`. A take that keys a root object's own transform is
+  refused, since it would override the root transform on that object.
+- **Positions are reported in Unity's axes** as Blender's (-x, z, -y): the FBX is written Y up and
+  -Z forward, and Unity mirrors X on import. The nose fixture checks the mirror as well as the
+  facing, since its nose is off centre.
+- **Scale and axis conversion stay on the objects.** A centimetre source keeps its 0.01 object
+  scale, and Blender's axis conversion sits on root objects (`bake_space_transform` off, since
+  baking it breaks armatures). Unity shows the right size and facing, with those values on the
+  GameObjects. AC13 confirms it in Unity.
+- **Blender imports only binary FBX,** so an ASCII FBX that `fbx_facts` reads fails its Blender
+  job, naming the asset.
+
 ## Acceptance criteria
 
 - **AC1.** The copied schema matches `SOURCE.md`'s sha256 (a test). `sync-asset-contract.sh`
