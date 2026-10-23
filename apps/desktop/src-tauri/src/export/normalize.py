@@ -144,15 +144,16 @@ def add_material(objects: list, name: str) -> str | None:
     return name
 
 
-def stack_names(path: str) -> set[str]:
-    """The FBX's take (AnimationStack) names, read from its node tree."""
+def stack_names(path: str) -> list[str]:
+    """The FBX's take (AnimationStack) names in file order, read from its node tree, each one
+    listed, so a take written twice shows twice."""
     root, _version = parse_fbx.parse(path)
     objects = elem_find_first(root, b"Objects")
     if objects is None:
-        return set()
-    return {
+        return []
+    return [
         elem_name_ensure_class(e, b"AnimStack") for e in objects.elems if e.id == b"AnimationStack"
-    }
+    ]
 
 
 def animates(action) -> bool:
@@ -165,24 +166,40 @@ def animates(action) -> bool:
     )
 
 
+# What an action animates when it isn't an object, by its slot's ID type
+ANIMATED = {"KEY": "shape keys", "MATERIAL": "a material", "CAMERA": "a camera"}
+
+
 def takes(path: str) -> list[tuple]:
-    """The imported takes that animate an object still in the scene, as (object, take, action).
-    Blender's importer names each action `<object>|<take>`, or `<object>|<take>|<layer>`."""
-    stacks = stack_names(path)
+    """The imported takes that animate something, as (object, take, action), sorted by take.
+    Blender's importer makes one action per take and animated datablock, named
+    `<datablock>|<take>` or `<datablock>|<take>|<layer>`. Step 5 writes each action as a take of
+    its own, so a take must be one action on one object: one that animates anything else, more
+    than one object, or in more than one layer is refused. An action on a dropped collision mesh
+    goes with it."""
+    stacks = set(stack_names(path))
     objects = sorted(bpy.data.objects, key=lambda o: len(o.name), reverse=True)
-    found = []
+    found: dict[str, list] = {}
     for action in bpy.data.actions:
+        if not animates(action):
+            continue
+        kinds = {slot.target_id_type for slot in action.slots}
+        if kinds != {"OBJECT"}:
+            what = ", ".join(sorted(ANIMATED.get(k, k.lower()) for k in kinds))
+            raise Refused(f"its animation {action.name} animates {what}, not an object")
         owner = next((o for o in objects if action.name.startswith(o.name + "|")), None)
-        if owner is None or not animates(action):
+        if owner is None:
             continue
         rest = action.name[len(owner.name) + 1 :]
         take = rest if rest in stacks or "|" not in rest else rest.rsplit("|", 1)[0]
-        found.append((owner, take, action))
-    return found
-
-
-def take_names(found: list[tuple]) -> list[str]:
-    return sorted({take for _owner, take, _action in found})
+        found.setdefault(take, []).append((owner, action))
+    for take, entries in found.items():
+        owners = sorted({owner.name for owner, _action in entries})
+        if len(owners) > 1:
+            raise Refused(f"its take {take} animates more than one object: {', '.join(owners)}")
+        if len(entries) > 1:
+            raise Refused(f"its take {take} has more than one animation layer")
+    return [(entries[0][0], take, entries[0][1]) for take, entries in sorted(found.items())]
 
 
 def to_unity(v) -> list[float]:
@@ -226,7 +243,8 @@ def report(path: str, patterns: dict) -> dict:
         "bounds": unity_bounds(*bounds(kept)) if kept else None,
         "meshes": [o.name for o in kept],
         "slots": slots(kept),
-        "takes": take_names(takes(path)),
+        # Every take written, a duplicate or a split take included, so the check sees it
+        "takes": sorted(stack_names(path)),
         "bones": [b.name for a in armatures for b in a.data.bones],
         "hasMesh": bool(kept),
         "hasArmature": bool(armatures),
@@ -296,7 +314,7 @@ def normalize(job: dict) -> dict:
             "yaw": yaw,
             "pivot": to_unity(shift),
         },
-        "source": {"slots": source_slots, "takes": take_names(source_takes)},
+        "source": {"slots": source_slots, "takes": [take for _o, take, _a in source_takes]},
     }
 
 

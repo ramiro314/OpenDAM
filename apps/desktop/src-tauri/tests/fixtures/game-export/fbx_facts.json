@@ -31,6 +31,20 @@
     "bones": [],
     "takes": []
   },
+  "Dungeon Props/Models/SM_Blob.fbx": {
+    "slots": [
+      {
+        "name": "Slime",
+        "textures": {}
+      }
+    ],
+    "kept_meshes": ["SM_Blob"],
+    "dropped_meshes": [],
+    "has_kept_mesh": true,
+    "kept_mesh_without_material": false,
+    "bones": [],
+    "takes": ["Smile"]
+  },
   "Dungeon Props/Models/SM_Boulder.fbx": {
     "slots": [],
     "kept_meshes": ["SM_Boulder"],
@@ -39,6 +53,20 @@
     "kept_mesh_without_material": true,
     "bones": [],
     "takes": []
+  },
+  "Dungeon Props/Models/SM_Cabinet.fbx": {
+    "slots": [
+      {
+        "name": "Oak",
+        "textures": {}
+      }
+    ],
+    "kept_meshes": ["SM_Cabinet", "SM_Cabinet_DoorL", "SM_Cabinet_DoorR"],
+    "dropped_meshes": [],
+    "has_kept_mesh": true,
+    "kept_mesh_without_material": true,
+    "bones": [],
+    "takes": ["Open"]
   },
   "Dungeon Props/Models/SM_Chest.fbx": {
     "slots": [],

@@ -863,6 +863,16 @@ mod tests {
         assert!(check(&job, &normalized)
             .unwrap_err()
             .ends_with("it wrote none"));
+        // A take written twice, as a take split over two objects would be
+        normalized.takes = vec!["Idle".into(), "Wave".into(), "Wave".into()];
+        assert_eq!(
+            check(&job, &normalized),
+            Err(
+                "Blender's round trip changed the takes: the source keeps Idle, Wave, and it \
+                 wrote Idle, Wave, Wave"
+                    .into()
+            )
+        );
     }
 
     /// A fake Blender running the shell `body`, which gets the job's arguments as `$1`..`$7`.
@@ -1268,6 +1278,36 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))";
             Err(
                 "Dungeon Props/Models/SM_Spinner.fbx: its take Spin moves its root object \
                  SM_Spinner"
+                    .into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_take_on_several_objects_or_on_no_object_is_refused() {
+        let Some(runner) = fixture_runner().await else {
+            return;
+        };
+        let out = tempfile::tempdir().unwrap();
+
+        // Each door's action would be written as an Open of its own
+        let cabinet = runner.run(&fixture_job("SM_Cabinet", out.path())).await;
+        assert_eq!(
+            cabinet,
+            Err(
+                "Dungeon Props/Models/SM_Cabinet.fbx: its take Open animates more than one \
+                 object: SM_Cabinet_DoorL, SM_Cabinet_DoorR"
+                    .into()
+            )
+        );
+
+        // A shape key's take would be lost
+        let blob = runner.run(&fixture_job("SM_Blob", out.path())).await;
+        assert_eq!(
+            blob,
+            Err(
+                "Dungeon Props/Models/SM_Blob.fbx: its animation Key|Smile animates shape \
+                 keys, not an object"
                     .into()
             )
         );

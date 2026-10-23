@@ -893,8 +893,14 @@ later. Where they differ from C9:
   check removes it, wherever it is, and compares the rest with the source's kept slots in order.
   Takes are compared sorted by name, since Blender lists actions by name, not in file order.
 - **Takes are written one NLA strip each**, named after the source take, because the exporter
-  names an action's take `<object>|<action>`. A take that keys a root object's own transform is
-  refused, since it would override the root transform on that object.
+  names an action's take `<object>|<action>`. Blender's importer makes one action per take and
+  animated object, so a take must be one action on one object. A take that animates more than
+  one object (`SM_Cabinet`'s `Open` swings two doors) or is in more than one layer would be
+  written as several takes of one name, and one that animates shape keys or a material
+  (`SM_Blob`'s `Smile`) would be lost, so the script refuses both by name. A take that keys a
+  root object's own transform (`SM_Spinner`) is refused too, since it would override the root
+  transform on that object. An animation on a dropped collision mesh goes with it. The
+  round-trip check reads the written file's takes as a list, so a duplicated take fails it.
 - **Positions are reported in Unity's axes** as Blender's (-x, z, -y): the FBX is written Y up and
   -Z forward, and Unity mirrors X on import. The nose fixture checks the mirror as well as the
   facing, since its nose is off centre.

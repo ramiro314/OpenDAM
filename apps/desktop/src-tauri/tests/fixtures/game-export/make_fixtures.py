@@ -42,6 +42,9 @@ Step 6 (Blender normalization of models), in `Dungeon Props/Models/`:
 
 - `SM_Spinner.fbx`: a model whose take `Spin` turns the model's own object, not a bone, which
   the normalization script refuses.
+- `SM_Cabinet.fbx`: a model whose take `Open` swings two doors, two objects under a still root,
+  and `SM_Blob.fbx`: one whose take `Smile` animates a shape key, not an object. The script
+  refuses both, since it writes each object's animation as a take of its own.
 
 After a rerun, refresh `fbx_facts.json` beside the library, as `test_fbx_facts.py` says. Only
 the FBX files this script changes on purpose are committed: each rerun stamps new times in them.
@@ -312,6 +315,49 @@ def models() -> None:
     scene.name = "Spin"
     export_fbx(
         f"{models}/SM_Spinner.fbx",
+        bake_anim=True,
+        bake_anim_use_all_actions=False,
+        bake_anim_use_nla_strips=False,
+    )
+
+    # One take swinging two doors, each an object of its own under a root that stays still
+    bpy.ops.wm.read_homefile(use_empty=True)
+    cabinet = box(
+        "SM_Cabinet", size=(1, 0.5, 1.5), location=(0, 0, 0.75), materials=[material("Oak")]
+    )
+    for side, x in [("L", -0.25), ("R", 0.25)]:
+        door = box(f"SM_Cabinet_Door{side}", size=(0.5, 0.05, 1.4), location=(x, -0.28, 0.75))
+        door.parent = cabinet
+        door.matrix_parent_inverse = cabinet.matrix_world.inverted()
+        door.animation_data_create().action = bpy.data.actions.new(f"Open{side}")
+        for frame, angle in [(1, 0.0), (20, 1.5 if side == "L" else -1.5)]:
+            door.rotation_euler = (0, 0, angle)
+            door.keyframe_insert("rotation_euler", frame=frame)
+    scene = bpy.context.scene
+    scene.frame_start, scene.frame_end = 1, 20
+    scene.name = "Open"
+    export_fbx(
+        f"{models}/SM_Cabinet.fbx",
+        bake_anim=True,
+        bake_anim_use_all_actions=False,
+        bake_anim_use_nla_strips=False,
+    )
+
+    # A take that animates a shape key, not an object
+    bpy.ops.wm.read_homefile(use_empty=True)
+    blob = box("SM_Blob", size=(0.6, 0.6, 0.6), location=(0, 0, 0.3), materials=[material("Slime")])
+    blob.shape_key_add(name="Basis")
+    smile = blob.shape_key_add(name="Smile")
+    for point in smile.data:
+        point.co.z *= 1.5
+    for frame, value in [(1, 0.0), (20, 1.0)]:
+        smile.value = value
+        smile.keyframe_insert("value", frame=frame)
+    scene = bpy.context.scene
+    scene.frame_start, scene.frame_end = 1, 20
+    scene.name = "Smile"
+    export_fbx(
+        f"{models}/SM_Blob.fbx",
         bake_anim=True,
         bake_anim_use_all_actions=False,
         bake_anim_use_nla_strips=False,
