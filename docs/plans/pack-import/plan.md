@@ -57,7 +57,8 @@ Revised again 2026-10-23 (revision 4) after the review's third round. No decisio
   changes nothing on disk (Flow, A11).
 - **R11 - Reversing a move can't collide.** Step 5 journals every row its index inserts. A
   rollback deletes those rows first, then reverses the moves newest first, so each row's old path
-  is free again when it moves back (Flow, Records, A11).
+  is free again when it moves back (Flow, Records, A11). Revision 9 replaces the newest-first
+  order with two passes (R22).
 - **R12 - A source path is unique, nested packages included.** A file's `source_path` is the
   chain of pathnames from the original down through each nested package, stored as a JSON array.
   The manifest holds it unique per build. `rename`, `exclude`, the D31 carry and the GLB cache key
@@ -131,6 +132,21 @@ Revised again 2026-10-23 (revision 8) after the review's seventh round. No decis
   `connect_library_sqlite` into the open path, after the locks and recovery. A structure pass
   runs only while holding both locks, so none runs between a swap and its commit, on any machine
   (Flow, A11).
+
+Revised again 2026-10-23 (revision 9) after GitHub Inspector's review of PR #199. No decision
+changed:
+
+- **R22 - A carry moves every row aside first.** It used to skip a move whose new path still
+  held a row, even when that row was itself about to move away. A swap of two names then lost one
+  file's metadata. Each carried row now moves to a holding path first, and is then placed. A move
+  is skipped only when its new path holds a row that isn't moving, and a rollback reverses the
+  moves the same way (Flow, A4, A11, Known gaps).
+- **R23 - The GLB cache key covers what Blender reads.** It adds a hash of the conversion's
+  input files, each by source path and sha256. So an excluded texture or `.mat`, or a kept,
+  changed texture, makes a fresh GLB, and a hoist still reuses every one (Unity conversion, A8).
+- **R24 - The store-page answer is outside the recipe.** It is kept in `import_packs.store_page`,
+  not in the metadata step's options, so writing it bumps no `recipe_rev` and fails no run (Pack
+  metadata, Records, A7).
 
 ## Problem
 
@@ -310,10 +326,17 @@ id while staging, in 200-row transactions. Those rows mean nothing until the com
      Matching by `origin` too means a GLB follows its own row, not its model's. A file the new build
      places at another path has its asset row moved there in place, with its id and metadata. The
      move uses the update `rename_asset` uses (`file_name`, `file_path`, `extension`;
-     `commands/asset.rs:1734`), so the FTS update trigger follows it.
-   - **Journal.** Each move is written to `import_moves` in the same transaction, 200 at a time.
-   - **Collision.** A move is skipped when the new path already has a row, because a different
-     file took that path. The moved file then gets a fresh row.
+     `commands/asset.rs:1734`), so the FTS update trigger follows it. It runs in two passes, so
+     the order of the moves never matters, even when two files swap names:
+     - **Aside.** Every row that moves goes first to a holding path,
+       `<pack>/.opendam-carry/<asset id>`, which no file has and no index walks (a dot folder).
+     - **Place.** Then each goes from its holding path to its new path.
+   - **Journal.** Each move is written to `import_moves` in the same transaction as its aside,
+     200 at a time, before any row is placed.
+   - **Collision.** A move is skipped when, after the aside pass, its new path still has a row.
+     That row isn't moving: it belongs to a file the previous build had at that path, a kept file,
+     or a file added outside OpenDAM. The skipped row stays at its holding path, and step 7
+     deletes it with the pruned rows (Known gaps).
    - **Index.** It then runs `watcher::index_paths_locked` over the pack folder with
      `Prune::Defer(B)`. That adds or updates a row for every file now on disk, deletes no row, and
      runs no structure pass. Each row it *inserts* is journaled in `import_moves` as `inserted`, in
@@ -366,11 +389,11 @@ holding the lock:
 3. Undo the failed build's rows:
    - **Inserted rows.** Delete every asset row journaled as `inserted`. They were made by step 5
      for the failed build's files, during the locked window, and hold no metadata of yours.
-   - **Moved rows.** Reverse every `moved` entry, newest first, moving each row back to its
-     `from_path`. Each `from_path` is free by then: the move vacated it, any row inserted there was
-     deleted above, and any later move into it was reversed first. If one is still occupied
-     anyway, the reversal leaves that row where it is and logs the conflict. It never fails the
-     rollback.
+   - **Moved rows.** Reverse every `moved` entry in the same two passes, by `asset_id`: move each
+     row aside to its holding path, wherever the build or a crash left it, then place each back
+     at its `from_path`. Each `from_path` is free by then: the move vacated it, any row inserted
+     there was deleted above, and every moved row is aside. If one is still occupied anyway, the
+     reversal leaves that row aside and logs the conflict. It never fails the rollback.
 
    Then it runs `index_paths_locked` over the pack with `Prune::Now`. Rows of the previous build's
    paths were moved back or never touched, and never pruned, so they match the restored files
@@ -595,8 +618,17 @@ isn't this import's output is refused.
 - **ASCII FBX.** Converted with assimp into the work folder, as the script does today.
 - **The cache key.** Each GLB is cached at `~/.cache/opendam/import/glb/<key>.glb`. The key is
   the sha256 of: the original's sha256, the model's source path, the step options,
-  `UNITY_GLB_VERSION` and the Blender version. A rebuild that only toggled a hoist reuses every
-  GLB (D18). Settings shows the cache's size, with a Clear button.
+  `UNITY_GLB_VERSION`, the Blender version, and the **inputs hash**.
+  - **The inputs hash** covers every file the step copies into the work folder: Unity files,
+    models and textures. Each is listed by its source path (a kept file by its path in the pack)
+    and its sha256, which the staged manifest already holds, sorted, then hashed.
+  - **What changes it.** An `exclude` of a texture or `.mat`, or a kept, changed texture,
+    changes what Blender reads, so the key changes and Blender runs again. Such a change
+    reconverts every model of the pack, not just the ones that used the file.
+  - **What doesn't.** A hoist or flatten moves files without changing their source paths or
+    bytes, so a rebuild that only toggled a hoist reuses every GLB (D18).
+
+  Settings shows the cache's size, with a Clear button.
 
 ### Unreal conversion
 
@@ -622,9 +654,13 @@ isn't this import's output is refused.
 - **The Kenney preset.** It reads the title and version from the license header, and writes
   CC0 only when the text names it.
 - **Store-page lookup.** With "Look up store page" ticked, it sends one or two HEAD requests to
-  `https://kenney.nl/assets/<slug>`, and writes the URL only on a 200. The answer is cached in
-  the step's options after the first build, so a rebuild makes no request. This becomes the
-  third kind of outbound call in the zero-telemetry invariant (D22).
+  `https://kenney.nl/assets/<slug>`, and writes the URL only on a 200. This becomes the third
+  kind of outbound call in the zero-telemetry invariant (D22).
+  - **The answer is kept outside the recipe,** in `import_packs.store_page` (the URL, or a miss),
+    not in the step's options. Writing it is no change to the pack's steps, so it bumps no
+    `recipe_rev`, and neither this run's re-check nor another queued run fails over it.
+  - **A rebuild reuses it** and makes no request. Clearing it in the metadata step's editor
+    looks the page up again at the next build.
 
 ### Unity-only files
 
@@ -654,7 +690,8 @@ open):
 - `import_packs`: `id`, `import_id`, `source` (variant path, sub-path or project), `target`
   (relative to the library root, unique), `preset`, `built_at`, `status` (`built`, `failed`,
   `never_built`), `current_build` (the committed build id, `NULL` before the first),
-  `recipe_rev` (incremented by every change to the pack's steps, in the same transaction), and
+  `recipe_rev` (incremented by every change to the pack's steps, in the same transaction),
+  `store_page` (the Kenney lookup's answer, outside the recipe; Pack metadata), and
   `swap_state` (`NULL`, or `'swapping'` with `swap_build`).
 - `import_steps`: `pack_id`, `position`, `kind`, `enabled`, `options` (JSON).
 - `import_outputs`: `pack_id`, `build_id`, `path` (relative to the library root), `size`,
@@ -665,7 +702,7 @@ open):
 - `import_moves`: `pack_id`, `build_id`, `seq`, `kind` (`moved` or `inserted`), `asset_id`,
   `from_path` (`NULL` for `inserted`) and `to_path`. These are the asset rows a build carried to
   new paths, and the rows its index inserted (Flow, step 5). A rollback deletes the inserted rows
-  and reverses the moves, and step 7 deletes the journal.
+  and reverses the moves by `asset_id`, wherever each row is, and step 7 deletes the journal.
 - `import_runs`: `id`, `kind` (`import`, `rebuild`, `remove`), pack ids, the `recipe_rev` each
   pack was queued at, the drift choices you made (JSON), `status` (`queued`, `running`, `done`,
   `failed`, `cancelled`, `interrupted`), `phase`, `progress`, `error`, `started_at`,
@@ -903,8 +940,11 @@ confirmation names them.
     and `Rock.glb` have the same asset ids and tags.
   - Turn `hoist` back on. `Art/Rock.fbx` and `Art/Rock.glb` have them again.
   - `import_moves` is empty after each commit.
-  - When the new path already holds a different file's row, the carry is skipped: that row is
-    untouched, and the moved file gets a fresh one.
+  - Two `rename` steps that swap two files' names: each file keeps its asset id and tags under
+    its new name, whichever move is processed first.
+  - When the new path holds the row of a file that isn't moving (here, a previous-only file at
+    that path), the carry is skipped. That row stays at the path and now describes the moved
+    file, and the moved file's old row is deleted at step 7 (Known gaps).
 - **A5 - In-app edits recorded.**
   - An in-app rename and a delete inside an imported pack append `rename` and `exclude` steps.
     A rebuild keeps the new name and doesn't bring the file back.
@@ -923,11 +963,14 @@ confirmation names them.
 - **A7 - Metadata.** For the Unity, Fab and Kenney fixtures, `datapackage.json` equals the golden
   written by `gen_datapackage.py` and `gen_kenney_datapackage.py`. A publisher set at import
   survives a rebuild. With the HTTP answer injected as 200, the Kenney file gains the
-  `sources` entry the script would write. With "Look up store page" off, no
-  network request is made (tested with the HTTP call injected).
+  `sources` entry the script would write. That first build commits (storing the answer bumps no
+  `recipe_rev`), and so does a second run queued meanwhile, and a rebuild makes no request. With
+  "Look up store page" off, no network request is made (tested with the HTTP call injected).
 - **A8 - Unity GLB.** Under CI's Blender, `synthetic.unitypackage`'s `SM_Log.fbx` gets a textured
   `SM_Log.glb` beside it, whose material carries the fixture's PNG. A rebuild after toggling
-  `hoist` reuses the cached GLB, with no Blender run.
+  `hoist` reuses the cached GLB, with no Blender run. A rebuild after an `exclude` of that PNG,
+  and one after keeping a changed copy of it (drift, keep yours), each run Blender again, and
+  the new GLB carries no PNG or the changed one.
 - **A9 - Unreal, stub editor.** With a stub editor script that writes GLBs in batches and once
   makes no progress, the step loops, resumes from cache, and fails the step with the
   no-progress message. The work copy's `.uproject` has the plugins enabled, and the zip is
@@ -964,12 +1007,16 @@ confirmation names them.
     rows exist at their old paths, with their original ids and tags. No row of a path only the
     failed build had remains, and `import_moves` is empty.
 
+  - **A name swap, then a rollback.** Two `rename` steps swap `Rock.fbx` and `Pebble.fbx`, and
+    both rows are carried. Then indexing is made to fail, or the app is killed after step 5, and
+    separately killed between the carry's aside and place passes. The rollback (or recovery)
+    moves both rows back by `asset_id`. Each keeps its id and tags at its old path, no row is left
+    at a holding path, and the pack ends with `swap_state` `NULL`.
   - **A carry collision, then a rollback.** The setup is A4's collision case: file A's carry to
-    `Rock.fbx` is skipped because file B's row is still there, B is carried from `Rock.fbx` to
-    `Pebble.fbx`, and the index inserts a fresh row for A at `Rock.fbx`. Then indexing is made to
-    fail, or the app is killed after step 5. The rollback (or recovery) deletes A's inserted row,
-    moves B's row back to `Rock.fbx`, and leaves A's old row untouched. Both keep their ids and
-    tags, and the pack ends with `swap_state` `NULL`.
+    `Old.png` is skipped because the excluded file C's row is there and isn't moving. The index
+    updates C's row for A's file. Then indexing is made to fail. The rollback moves A's row back
+    from its holding path, and the restore re-indexes C's row for C's file. Both keep their ids
+    and tags.
   - **Killed late in a rollback:** for a later build, after step 4's transaction and before
     `.failed-B` is deleted. On restart, library-open recovery deletes `.failed-B`, and the restored previous
     build's folder, rows and tags are untouched. Recovery is also given the impossible state
@@ -1053,10 +1100,12 @@ confirmation names them.
 
 ## Known gaps
 
-- **A carry can collide.** When a rebuild moves a file onto a path that already holds a
-  different file's row, that row wins and the moved file starts with a fresh row (D31, A4). A
-  file that changes its path in the original itself, as in a new version of a pack, has a new
-  `source_path`, so its row isn't carried either.
+- **A carry can collide.** When a rebuild moves a file onto a path that holds the row of a file
+  that isn't moving, that row wins: it now describes the moved file, and the moved file's own row
+  is deleted at step 7 (D31, A4). The row in the way belongs to a previous-only file, a kept file
+  or a file added outside OpenDAM. Moves among the build's own files, swaps and chains included,
+  never collide. A file that changes its path in the original itself, as in a new version of a
+  pack, has a new `source_path`, so its row isn't carried either.
 - **Cross-machine exclusion is advisory.** Recovery and the swap exclude other machines through
   `.opendam/index.lock`. Its staleness is judged from the file's mtime against each machine's
   clock. A 30 s heartbeat against a 120 s limit tolerates up to about 90 s of clock skew between
