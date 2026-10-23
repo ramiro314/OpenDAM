@@ -247,6 +247,20 @@ decision changed:
   the convert phase. The dialog now offers only the choices each origin can honour (Edits after
   an import, A6).
 
+Revised again 2026-10-23 (revision 18) after GitHub Inspector's ninth review of PR #199. No
+decision changed:
+
+- **R40 - In-app edits reach kept files.** A kept file that replaced a recipe file now keeps that
+  file's `source_path`, so an in-app rename or delete of it records a `rename` or `exclude`
+  against it, and the recipe's copy can't come back at the old name. A kept file added outside
+  OpenDAM has no step: a rename moves it in the kept files and a delete drops it (Edits after an
+  import, Records, A5).
+- **R41 - A skipped structure pass is never lost.** `rebuild_library` used to skip its pass while
+  another holder had the advisory lock, with nothing to run it later. It now waits up to 5 s,
+  then marks the pass pending in `library_meta` and leaves a task that runs it once the lock
+  frees. Every holder also runs a pending pass before it releases the lock. The weaker guarantee
+  is stated in the invariants and the Known gaps (Flow, A11).
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -494,8 +508,9 @@ every recovery, the library open, Remove and the build):
   logs it. A holder checks the guard before it changes anything: an index run before it prunes
   (`watcher.rs:312-330`), so it prunes nothing, and a build before step 3, so it fails with
   nothing changed. A build past step 3 finishes, which the Known gaps cover.
-- **Release.** Dropping the guard stops the heartbeat and deletes the file only while it still
-  holds the guard's token.
+- **Release.** Before it lets go, a holder that still holds its token runs a structure pass if
+  `structure_pending` is set (`rebuild_library`, below). Dropping the guard stops the heartbeat
+  and deletes the file only while it still holds the guard's token.
 
 **The structure pass reads only the committed build.** It reads the Unity material set
 (Unity-only files) from the rows of `current_build`, and from no other build. No structure pass
@@ -589,11 +604,19 @@ them skips both.
   - **`index_paths`** already takes `index_lock`, then the advisory lock, and yields when another
     holder has it. With both locks held, it recovers any pack still marked `swapping` or
     `removing`, then indexes.
-  - **`rebuild_library`** takes `index_lock` and, newly, *tries* the advisory lock. If it gets it,
-    it recovers any `swapping` or `removing` pack, then runs its structure pass. If another holder has it, it
-    skips both and logs it. The next index run derives the structure, as after a failed pass
-    today (`structure.rs:2302-2304`). So a rename or pack edit on a second machine neither prunes
-    nor regroups a pack mid-swap.
+  - **`rebuild_library`** takes `index_lock` and, newly, the advisory lock, waiting for it up to
+    5 s. If it gets it, it recovers any `swapping` or `removing` pack, then runs its structure
+    pass. If another holder still has it, it runs neither now. So a rename or pack edit on a
+    second machine neither prunes nor regroups a pack mid-swap. The pass isn't dropped, though:
+    - **Pending.** It sets `structure_pending` in the library's `library_meta` table, and its
+      command returns.
+    - **A follow-up task.** It leaves a background task that waits for both locks, then
+      runs the pass and emits `library:updated`, so this machine's view catches up on its own.
+    - **At every release.** Every holder of the advisory lock, before it releases it, runs a
+      structure pass if `structure_pending` is set. Each pass clears the flag as it starts, so a
+      command that sets it during a pass is still caught at the release.
+    - **At the next taker.** If both processes die first, the next library open or index run,
+      which each end with a pass, clears it.
   - **Staging builds are safe.** A build still staging, before step 1 and without either lock, has
     `swap_state` `NULL`, so these entry points never touch its staging folder or rows. Only the
     build itself, and the recovery these entry points run under their guards, call the `_locked`
@@ -860,7 +883,8 @@ open):
 - `import_steps`: `pack_id`, `position`, `kind`, `enabled`, `options` (JSON).
 - `import_outputs`: `pack_id`, `build_id`, `path` (relative to the library root), `size`,
   `mtime_ns`, `sha256`, `origin` (`extracted`, `generated`, `kept`), `source_path` (Steps:
-  a JSON array; for a generated file, its source model's; `NULL` for `kept`). It is
+  a JSON array; for a generated file, its source model's; for a kept file that replaced a recipe
+  file, that file's; `NULL` for a kept file added outside OpenDAM). It is
   `UNIQUE (pack_id, build_id, source_path, origin)` and `UNIQUE (pack_id, build_id, path)`. A
   pack's manifest is its rows with `build_id = current_build`.
 - `import_moves`: `pack_id`, `build_id`, `seq`, `kind` (`moved` or `inserted`), `asset_id`,
@@ -904,9 +928,17 @@ half manifest.
     (same stem, same folder), and rename and delete reach every member, so the source model's
     step covers it. The convert phase names each GLB after its source model's final name and
     makes none for an excluded model.
-  - **`datapackage.json`:** a rename inside an imported pack is refused ("edit the pack's
-    metadata step instead"). A delete turns the metadata step off (`enabled = false`), so a
-    rebuild doesn't write the file back.
+  - **Kept file that replaced a recipe file** ("keep yours" at drift): its manifest row keeps the
+    replaced file's `source_path`, and the build puts the kept copy wherever the steps put the
+    file with that source path. So a rename records a `rename` against that source path, and a
+    delete an `exclude`, exactly as for the extracted file. The recipe's copy never comes back
+    at the old name, and a deleted one doesn't come back at all.
+  - **Kept file added outside OpenDAM:** no step. A rename renames it on disk and moves its
+    manifest row, so the build carries it under the new name, and a delete deletes it and drops
+    it from the kept files.
+  - **`datapackage.json`:** whatever its origin, a rename inside an imported pack is refused
+    ("edit the pack's metadata step instead"). A delete turns the metadata step off
+    (`enabled = false`), so a rebuild doesn't write the file back.
 
   A rebuild then reproduces your rename and your delete, for every member of a group.
 
@@ -1055,6 +1087,11 @@ files go with their tags, ratings and collections, as on any delete (D27).
     skipping packs with a live run, judged by the run's owner and heartbeat, not by its status
     alone. So no refresh or startup, on any machine, ever deletes a live build's staging folder
     or rolls back a live swap, within the limits the Known gaps state.
+- **A command's structure pass can be late, never lost.** `delete_asset`, `delete_assets`,
+  `rename_asset` and `set_pack_override` still call `rebuild_library` before they return, but
+  while another machine holds the advisory lock for more than 5 s, the pass runs later: from the
+  command's follow-up task, at that holder's release, or at the next open or index run, whichever
+  comes first. Until then `group_id`, `folders` and support roles can lag the indexed paths.
 - **Pack targets never nest.** No pack's target is an ancestor or a descendant of another's, so
   every build, swap and Remove touches only its own pack's files.
 - **A rollback clears its journal before its folder.** `swap_state` and the failed build's
@@ -1158,6 +1195,13 @@ files go with their tags, ratings and collections, as on any delete (D27).
     and the old `.meta` is gone. Right after an in-app delete of a `.mat`, its `.meta` is gone
     too. The drift check run then reports no difference, and a rename whose second file fails to
     move leaves both files and both `.meta` files under their old names.
+  - Keep a changed copy of `T_Rock.png` at drift (keep yours), then rename it in the app: a
+    `rename` against its source path is recorded, and a rebuild produces only the kept bytes
+    under the new name, with nothing at the old one. Deleting it instead records an `exclude`,
+    and a rebuild produces neither copy.
+  - A file added outside OpenDAM and kept at drift: renaming it records no step, and a rebuild
+    carries it under the new name only. Deleting it drops it from the kept files, and a rebuild
+    doesn't bring it back.
 - **A6 - Drift.** A file added, changed and removed outside OpenDAM is listed before Rebuild, and
   each choice (keep or discard, keep yours or use the recipe's, exclude or restore) has the
   stated effect. By origin:
@@ -1264,11 +1308,16 @@ files go with their tags, ratings and collections, as on any delete (D27).
   - **A second machine during the swap.** A second `Database` instance on the same library folder
     stands for another machine. While this machine's build is in step 5:
     - its `index_paths` yields, because the advisory lock is held;
-    - its `rename_asset` runs `rebuild_library`, which skips recovery and its structure pass;
+    - its `rename_asset` runs `rebuild_library`, which waits 5 s, then skips recovery and its
+      structure pass and sets `structure_pending`;
     - its library open skips recovery and the structure pass.
 
     The swap is untouched, a tagged previous-only row keeps its tag through the commit, and the
-    build commits.
+    build commits. Once the build releases the lock, the rename's pass has run (in the build's
+    step 7 or at its release, then again from the second instance's follow-up task, which emits
+    `library:updated`), and `structure_pending` is clear. With the follow-up task killed, the
+    build's release alone runs it. A deleted group main item leaves no member's `group_id`
+    pointing at a deleted row once the lock is released.
 
   - **The heartbeat.** With a test clock, step 5 lasts longer than 120 s. The advisory lock stays
     fresh, and the second instance still yields. After a simulated dead task stops the heartbeat,
@@ -1369,6 +1418,11 @@ files go with their tags, ratings and collections, as on any delete (D27).
 
   On one machine, `index_lock` and the process check keep the guarantee.
 
+- **Structure can lag on a shared library.** A rename or delete made while another machine holds
+  the advisory lock (a refresh or a build there) leaves `group_id`, folder counts and support
+  roles stale until that lock frees and the pending pass runs, a few seconds for a refresh and
+  as long as a build's swap for a build. A machine running an older OpenDAM never runs a
+  pending pass.
 - **Kept files can't be recreated.** Files kept from outside changes are carried by rebuilds,
   but nothing can recreate them if they're lost.
 - **The Unreal step's real run is manual.** The Unreal Editor isn't in CI, so only the stub
