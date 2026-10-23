@@ -49,6 +49,20 @@
     "bones": [],
     "takes": []
   },
+  "Dungeon Props/Models/SM_Crate.fbx": {
+    "slots": [
+      {
+        "name": "Planks",
+        "textures": {}
+      }
+    ],
+    "kept_meshes": ["SM_Crate"],
+    "dropped_meshes": [],
+    "has_kept_mesh": true,
+    "kept_mesh_without_material": false,
+    "bones": [],
+    "takes": []
+  },
   "Dungeon Props/Models/SM_Gate.fbx": {
     "slots": [
       {
@@ -166,6 +180,24 @@
       }
     ],
     "kept_meshes": ["SM_Totem"],
+    "dropped_meshes": [],
+    "has_kept_mesh": true,
+    "kept_mesh_without_material": false,
+    "bones": [],
+    "takes": []
+  },
+  "Unity Moss/Models/SM_Log.fbx": {
+    "slots": [
+      {
+        "name": "Bark",
+        "textures": {}
+      },
+      {
+        "name": "Leaves",
+        "textures": {}
+      }
+    ],
+    "kept_meshes": ["SM_Log"],
     "dropped_meshes": [],
     "has_kept_mesh": true,
     "kept_mesh_without_material": false,

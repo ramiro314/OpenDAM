@@ -3,6 +3,7 @@
 //! holding it find with it. So far the tab edits only the name.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -10,7 +11,7 @@ use crate::db::Database;
 pub use crate::export::check::Field;
 use crate::export::check::{self, ItemRow, Kind, Problem};
 use crate::export::fbx_facts;
-use crate::export::{edits, settings};
+use crate::export::{edits, infer, settings};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,13 +28,14 @@ pub struct GameDetail {
 
 /// The Game tab of asset `asset_id`, reading FBX facts with `facts`, or `None` when it exports
 /// as neither a model, an animation nor a texture. A group's member stands for its main item.
-/// Its kind and name come from the rules the Check uses (`check::exported_kind`,
-/// `check::asset_name`), and each domain holding it is checked as the Export view's Check does,
-/// without staging.
+/// Its kind comes from the Check's rule (`check::exported_kind`). Each domain holding it is
+/// checked as the Export view's Check does, without staging, and its name is the one the first
+/// of those Checks, by domain name, exports it with, or `check::asset_name` in no domain.
 pub async fn detail(
     db: &Database,
     asset_id: &str,
     facts: &impl fbx_facts::Reader,
+    memo: &Arc<infer::Memo>,
 ) -> Result<Option<GameDetail>, String> {
     let library = db
         .library_of_asset(asset_id)
@@ -50,7 +52,8 @@ pub async fn detail(
     .await
     .map_err(|e| e.to_string())?;
     let rows = edits::read_all(pool).await.map_err(|e| e.to_string())?;
-    let Some(asset_name) = check::asset_name(&item, &rows) else {
+    // Outside any domain, a texture's inferred name is its own set's default
+    let Some(mut asset_name) = check::asset_name(&item, &rows) else {
         return Ok(None);
     };
     let fbx = check::exported_fbx_of(pool, std::slice::from_ref(&item))
@@ -65,8 +68,9 @@ pub async fn detail(
     };
     let kind = check::exported_kind(&item, item_facts.as_ref());
 
-    // The domains holding the item: each collection it is in counts for the root collection's
-    // child above it
+    // The domains that may hold the item: each collection it is in counts for the root
+    // collection's child above it, and an image may join any domain through a material or its
+    // set (C3), so every domain may hold one
     let settings = settings::load(&db.master_pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -103,11 +107,31 @@ pub async fn detail(
                 at = parent.clone();
             }
         }
+        if kind == Kind::Texture {
+            for (id, (name, parent)) in &collections {
+                if parent.as_deref() == Some(root.as_str()) {
+                    domains.insert(id.clone(), name.clone());
+                }
+            }
+        }
     }
 
+    // By name, so the first domain, whose Check gives the inferred name, is always the same one
+    let mut domains: Vec<(String, String)> = domains.into_iter().map(|(id, n)| (n, id)).collect();
+    domains.sort();
     let mut problems: Vec<Problem> = Vec::new();
-    for domain in domains.keys() {
-        let inspection = check::inspect(db, domain, facts).await?;
+    let mut holding: Vec<String> = Vec::new();
+    for (domain_name, domain) in &domains {
+        let inspection = check::inspect(db, domain, facts, memo).await?;
+        // A domain holds the item when its Check lists it
+        let Some(name) = inspection.names.get(&item.id) else {
+            continue;
+        };
+        // In a domain, a texture's inferred name can come from the models that use its set (D24)
+        if holding.is_empty() {
+            asset_name = name.clone();
+        }
+        holding.push(domain_name.clone());
         for problem in inspection.report.problems {
             let names_item = problem
                 .assets
@@ -118,13 +142,11 @@ pub async fn detail(
             }
         }
     }
-    let mut domains: Vec<String> = domains.into_values().collect();
-    domains.sort();
     Ok(Some(GameDetail {
         asset_id: item.id,
         kind,
         asset_name,
-        domains,
+        domains: holding,
         problems,
     }))
 }
@@ -160,9 +182,15 @@ mod tests {
         }
     }
 
+    fn memo() -> Arc<infer::Memo> {
+        Arc::new(infer::Memo::default())
+    }
+
     async fn detail_of(f: &Fixture, path: &str) -> Option<GameDetail> {
         let id = id_of(&f.library.pool, path).await;
-        detail(&f.db, &id, &Snapshot::fixture()).await.unwrap()
+        detail(&f.db, &id, &Snapshot::fixture(), &memo())
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -203,7 +231,7 @@ mod tests {
         assert_eq!(shown.asset_name.yours.as_deref(), Some("KenneyBanner"));
         assert_eq!(shown.problems, []);
         // The tab shows the name and kind the Check exports it with
-        let report = check::check(&f.db, "props", &Snapshot::fixture())
+        let report = check::check(&f.db, "props", &Snapshot::fixture(), &memo())
             .await
             .unwrap();
         let row = report
@@ -213,6 +241,39 @@ mod tests {
             .unwrap();
         assert_eq!(row.asset_name, Some(shown.asset_name.value()));
         assert_eq!(row.kind, shown.kind);
+    }
+
+    #[tokio::test]
+    async fn in_a_domain_a_textures_inferred_name_is_the_one_its_model_gives_it() {
+        let f = fixture().await;
+        let model = "Dungeon Props/Models/SM_Crate.fbx";
+        let normal = "Dungeon Props/Textures/1K/T_Crate_N.png";
+        let id = id_of(&f.library.pool, model).await;
+        let rename = json!({"assetName": "Box"});
+        edits::write(&f.library.pool, &id, rename.as_object().unwrap())
+            .await
+            .unwrap();
+
+        // Outside any domain, its own stem's
+        assert_eq!(
+            detail_of(&f, normal).await.unwrap().asset_name.inferred,
+            "Crate"
+        );
+        // In one, its only model's name (D24)
+        collection(&f, "props", "Props", "dg", &[model]).await;
+        let shown = detail_of(&f, normal).await.unwrap();
+        assert_eq!(
+            shown.asset_name,
+            Field {
+                inferred: "Box".into(),
+                yours: None
+            }
+        );
+        assert_eq!(
+            shown.domains,
+            ["Props"],
+            "it joins through the model's material"
+        );
     }
 
     #[tokio::test]
@@ -241,7 +302,10 @@ mod tests {
         facts.has_kept_mesh = false;
         facts.kept_meshes.clear();
         let id = id_of(&f.library.pool, guard).await;
-        let shown = detail(&f.db, &id, &snapshot).await.unwrap().unwrap();
+        let shown = detail(&f.db, &id, &snapshot, &memo())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(shown.kind, Kind::Animation);
         assert_eq!(shown.asset_name.inferred, "Guard");
     }

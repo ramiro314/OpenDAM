@@ -7,6 +7,7 @@ import {
   editedAsset,
   editedMessage,
   exportMenuReason,
+  materialLine,
   staleMessage,
 } from './exportView';
 
@@ -46,6 +47,8 @@ const asset = (status: ExportCheckAsset['status']): ExportCheckAsset => ({
   role: 'BaseColor',
   pack: 'pack',
   status,
+  member: true,
+  layout: 'BaseColor',
 });
 
 const check = (statuses: ExportCheckAsset['status'][], problems: number): ExportCheck => ({
@@ -144,5 +147,40 @@ describe('editedAsset', () => {
 
   test('an edit to an asset the Check doesn’t hold leaves it as it is', () => {
     expect(editedAsset({ assets: listed }, ['elsewhere'])).toBeNull();
+  });
+});
+
+describe('materialLine', () => {
+  test('names the slot, its textures and where each was found', () => {
+    expect(
+      materialLine({
+        slot: 'M_Stone',
+        name: 'Stone',
+        surface: 'opaque',
+        cutoutSuggested: false,
+        added: false,
+        textures: {
+          BaseColor: { via: 'fbx', assetName: 'Pillar', files: ['Kit/T_Stone_D.png'] },
+          Normal: { via: 'suffix', assetName: 'Pillar', files: ['Kit/T_Stone_N.png'] },
+        },
+      })
+    ).toBe(
+      'M_Stone → Stone, opaque: BaseColor Pillar (from the FBX), Normal Pillar (by file name)'
+    );
+  });
+
+  test('marks a cutout suggestion and the slot the export adds', () => {
+    expect(
+      materialLine({
+        slot: 'OpenDAMDefault',
+        name: 'OpenDAMDefault',
+        surface: 'opaque',
+        cutoutSuggested: true,
+        added: true,
+        textures: {},
+      })
+    ).toBe(
+      'OpenDAMDefault → OpenDAMDefault, opaque (cutout suggested), added at export: no textures'
+    );
   });
 });

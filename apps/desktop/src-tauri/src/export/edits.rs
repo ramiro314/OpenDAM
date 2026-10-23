@@ -12,7 +12,8 @@ use std::collections::BTreeSet;
 use serde_json::{Map, Value};
 use sqlx::{Pool, Sqlite};
 
-use crate::export::names::{is_pascal, strip_type_prefix};
+use crate::export::infer;
+use crate::export::names::is_pascal;
 use crate::export::textures::read_stem;
 use crate::models::AssetKind;
 use crate::structure;
@@ -63,14 +64,15 @@ pub fn is_image(kind: &str) -> bool {
     )
 }
 
-/// The texture set of an image named `file_name` (C8): its stem without the type prefix, the
-/// `_DX`/`_GL` suffix and the role or layout suffix, ignoring case. `T_Rock_D.png`,
-/// `T_Rock_N_DX.png` and `t_rock_r.tga` are all in the set `rock`.
-pub fn set_key(file_name: &str) -> String {
+/// The texture set an image named `file_name` shares with the other images of its folder, as
+/// the Check groups them (`infer::set_key`, C8). `T_Rock_D.png`, `T_Rock_N_DX.png` and
+/// `t_rock_r.tga` are all in the set `rock`. `None` makes it a set of its own, such as an image
+/// whose suffix names no role or layout.
+pub fn set_key(file_name: &str) -> Option<String> {
     let stem = file_name
         .rsplit_once('.')
         .map_or(file_name, |(stem, _)| stem);
-    strip_type_prefix(&read_stem(stem).base).to_ascii_lowercase()
+    infer::set_key(&read_stem(stem))
 }
 
 fn dir_of(path: &str) -> &str {
@@ -80,9 +82,14 @@ fn dir_of(path: &str) -> &str {
 /// Whether `row` is a source of the texture set of the image at `file_path` named `file_name`:
 /// an image in the same folder in the same set, the image itself included.
 pub fn in_set_of(row: &Row, file_path: &str, file_name: &str) -> bool {
+    if row.file_path == file_path {
+        return true;
+    }
+    let key = set_key(file_name);
     is_image(&row.kind)
         && dir_of(&row.file_path) == dir_of(file_path)
-        && set_key(&row.file_name) == set_key(file_name)
+        && key.is_some()
+        && set_key(&row.file_name) == key
 }
 
 /// The `assetName` you set for the texture set of the image at `file_path`, among `rows`: the
@@ -93,9 +100,17 @@ pub fn set_name<'a>(
     file_path: &str,
     file_name: &str,
 ) -> Option<String> {
+    first_name(
+        rows.into_iter()
+            .filter(|row| in_set_of(row, file_path, file_name)),
+    )
+}
+
+/// The `assetName` of the first of `rows` by path, ignoring case, that holds one: a texture
+/// set's name among its sources' rows.
+pub fn first_name<'a>(rows: impl IntoIterator<Item = &'a Row>) -> Option<String> {
     let mut named: Vec<(String, &str, String)> = rows
         .into_iter()
-        .filter(|row| in_set_of(row, file_path, file_name))
         .filter_map(|row| {
             asset_name(&row.parsed())
                 .map(|name| (row.file_path.to_lowercase(), row.file_path.as_str(), name))
@@ -185,12 +200,14 @@ pub async fn write(
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
-        let key = set_key(&file_name);
-        images
-            .into_iter()
-            .filter(|(_, name, kind)| is_image(kind) && set_key(name) == key)
-            .map(|(id, _, _)| id)
-            .collect()
+        match set_key(&file_name) {
+            None => vec![asset_id.to_string()],
+            key => images
+                .into_iter()
+                .filter(|(_, name, kind)| is_image(kind) && set_key(name) == key)
+                .map(|(id, _, _)| id)
+                .collect(),
+        }
     } else {
         vec![asset_id.to_string()]
     };

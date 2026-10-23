@@ -102,7 +102,7 @@ pub async fn get_game_detail(
     asset_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<GameDetail>> {
-    game::detail(&state.db, &asset_id, &state.fbx_facts).await
+    game::detail(&state.db, &asset_id, &state.fbx_facts, state.exports.memo()).await
 }
 
 /// Writes your export edit `patch` to asset `asset_id` (plan C4), for example

@@ -12,9 +12,11 @@ pub mod fbx_facts;
 pub mod fingerprint;
 pub mod game;
 pub mod hashes;
+pub mod infer;
 pub mod names;
 pub mod packs;
 pub mod settings;
 #[cfg(test)]
 pub mod test_fixture;
 pub mod textures;
+pub mod unity;

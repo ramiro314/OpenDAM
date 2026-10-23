@@ -8,6 +8,24 @@ const TYPE_PREFIXES: [&str; 11] = [
     "SM_", "SK_", "S_", "T_", "M_", "MI_", "MAT_", "A_", "AN_", "P_", "BP_",
 ];
 
+/// The material the export adds for a kept mesh with no material (C9 step 2), when no kept
+/// slot already has this name.
+pub const ADDED_MATERIAL: &str = "OpenDAMDefault";
+
+/// The name of the material the export adds beside the kept slots `slots`: `ADDED_MATERIAL`, or
+/// the lowest `OpenDAMDefault2`, `OpenDAMDefault3`, ... no slot has. Picked from the slot names
+/// alone, so renaming a file never changes it.
+pub fn added_material<'a>(slots: impl IntoIterator<Item = &'a str> + Clone) -> String {
+    let taken = |name: &str| slots.clone().into_iter().any(|s| s == name);
+    if !taken(ADDED_MATERIAL) {
+        return ADDED_MATERIAL.into();
+    }
+    (2..)
+        .map(|n| format!("{ADDED_MATERIAL}{n}"))
+        .find(|name| !taken(name))
+        .expect("some name is free")
+}
+
 /// `stem` without its leading type prefix, if it has one and something follows it.
 pub fn strip_type_prefix(stem: &str) -> &str {
     TYPE_PREFIXES
@@ -116,6 +134,19 @@ mod tests {
             assert_eq!(pascal(stem), "", "{stem}");
             assert!(!is_pascal(&pascal(stem)));
         }
+    }
+
+    #[test]
+    fn the_added_material_takes_the_first_free_name() {
+        assert_eq!(added_material([]), "OpenDAMDefault");
+        assert_eq!(added_material(["DefaultMaterial"]), "OpenDAMDefault");
+        assert_eq!(added_material(["OpenDAMDefault"]), "OpenDAMDefault2");
+        assert_eq!(
+            added_material(["OpenDAMDefault2", "OpenDAMDefault", "OpenDAMDefault3"]),
+            "OpenDAMDefault4"
+        );
+        // Names are compared exactly, as Blender compares them
+        assert_eq!(added_material(["opendamdefault"]), "OpenDAMDefault");
     }
 
     #[test]

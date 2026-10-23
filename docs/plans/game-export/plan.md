@@ -876,21 +876,74 @@ from the contracts above:
   which reads them. `fbx_facts.json` beside the library holds the facts the worker reads from
   each FBX, so the Check's Rust tests read them without Python.
 
+### What the material inference ticket built differently
+
+- **A slot takes every role from the first source that answers any** (D11, C7), so a material
+  never mixes maps that different sources found. An FBX that wires only a base color gives a
+  material with only a base color, until the Game tab's texture pickers fill the rest. The
+  suffix lookup is one source: the slot's name, then the model's, may each fill roles. A Unity
+  material's alpha clip sets the surface even when an earlier source gave the textures.
+- **An image has one layout across a domain, whatever order its models are read in.**
+  `infer::domain` first collects what every FBX reference and Unity material says each image
+  holds, keeping a Unity property over an FBX reference, then the first type or property in its
+  list, and only then answers the slots. So a slot's FBX reference takes its image as that
+  layout, and every binding names a file that gives its role. `infer::domain` also names the
+  sets (D24) and returns complete bindings, which the Check only lists.
+- **FBX references resolve against the pack's indexed images,** never the file system: the given
+  path under the library root, the relative path with each component ignoring case, then the
+  file name ignoring case and extension, by C7's folder rule and then the reference's own
+  extension. `textures.py`'s naming heuristics aren't used.
+- **The watcher already indexes `.mat` files,** so a Unity material is one of the pack's files,
+  and a `.mat` named like the slot is matched by file stem, ignoring case, nearest the model
+  first. Each pack file's `.meta` is read for its GUID. A Unity property's layout wins over an
+  image's suffix, and an FBX reference's type only fills in for an image with no suffix.
+- **Stems are compared by their default name lowercased** (`infer::match_key`), in sets and in
+  the suffix lookup, so case, word separators and one type prefix don't count. Only images with
+  a role or layout suffix take part in the suffix lookup. The same-stem lookup reads the folders
+  of the main item and the exported FBX: images never join a model's format group.
+- **A model in no pack** is refused for that, and still has its slots, the slot the export adds
+  and their names checked. With no pack to search, it binds no texture.
+- **D24 per set:** a set used by one model is `<AssetName><MaterialName>` when that model has
+  more than one set in a role this set fills for it, `MaterialName` being the first material
+  that uses it.
+- **Textures a model's materials bring in are listed while the model is refused** (every model
+  is, until step 6), and those that pass through are in the Check's manifest.
+- **The report carries the inference:** a model row has its `materials` (slot, name, surface,
+  the cutout suggestion, whether the export adds it, and each role's set name, source and
+  files), and a texture row its layout, normal-map convention and whether it is a member. The
+  Export view shows one line per material. The Game tab's material and texture editors wait
+  for the Game tab (step 2).
+- **The cutout suggestion decodes the BaseColor with the `image` crate,** after reading its
+  header: an image with no alpha channel is never decoded. A PSD, or an image it can't decode,
+  suggests nothing. Its answer, each `.meta` GUID and each `.mat` are kept for the
+  session while the file keeps its size and mtime, in an `infer::Memo` that `bundle::Exports`
+  owns and passes to each Check and Export, so a repeated Check reads none of them again. Each
+  of those files, and each `.fbx.meta`, is stamped in the Check's `Probes`, so the fingerprint
+  holds the Unity files, which the watcher doesn't index. An explicit URP `_AlphaClip` wins over a stale `_Mode`.
+- **Fixtures:** `T_StoneFloor_ORM.png` moved to `Rocks/T_Slate_ORM.png`, since it would have
+  joined the `StoneFloor` set. The Unity material fixtures are `Unity Moss/Models/SM_Log.fbx`
+  with its `.fbx.meta`, `Materials/M_LogBark.mat` (by remap) and `Materials/Leaves.mat` (by
+  name, alpha clip).
+
 ### What the edits ticket built differently
 
 - **Only `assetName` is an edit so far** (C4). `export::edits::write` refuses any other key, and a
   name that isn't PascalCase, so the Check's "no PascalCase name" problem comes only from file
   names. Typing the inferred name back resets yours, so the table holds only real edits (D32).
-- **A texture's set is C8's stem rule,** applied when the name is written: the images in the
-  image's folder whose stems match once the prefix, `_DX`/`_GL` and role or layout suffix are
-  dropped. Each source's group gets it too.
+- **A texture's set is the Check's** (`infer::set_key`, shared by `infer::PackImages` and
+  `export::edits`): the images of one folder with a role or layout suffix whose stems match. A
+  name is written to every source of the set and their groups, and wins over the set's D24
+  name, in the texture rows and in the bindings of the models that use it.
 - **When a set disagrees, the first source by path that holds a name wins,** not the first source
   by path, so a file that joins the set later can't drop your name.
 - **A7 merges per key.** When a group forms, the main item's edits win, and a key it leaves unset
   takes the first member's that has it, by path, as `apply_unions` already does for the main
   item's fields.
-- **The Game tab's problems are live.** The tab runs the Check of each domain holding the asset,
-  without staging, when it opens and after each save, and lists the problems naming it.
+- **The Game tab's problems are live.** The tab runs the Check of each domain that may hold the
+  asset, without staging, when it opens and after each save: its members' domains, and for an
+  image every domain, since it may join one through a material. A domain holds it when its
+  Check lists it. The tab lists the problems naming it, and takes its inferred name from the
+  first of those domains by name, since a set's D24 name depends on the domain's models.
 - **Problems link to the Game tab.** A link shrinks the Export view to a bar, keeping its Check,
   and shows the asset in the Game tab. An edit to an asset the Check holds makes the view ask to
   "Check again" at once. The pack form doesn't mark the view stale yet, but Export still refuses

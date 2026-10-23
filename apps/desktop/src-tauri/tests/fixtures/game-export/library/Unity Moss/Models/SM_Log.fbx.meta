@@ -1,0 +1,12 @@
+fileFormatVersion: 2
+guid: d0000000000000000000000000000001
+ModelImporter:
+  serializedVersion: 22200
+  externalObjects:
+  - first:
+      type: UnityEngine:Material
+      assembly: UnityEngine.CoreModule
+      name: Bark
+    second: {fileID: 2100000, guid: c0000000000000000000000000000001, type: 2}
+  materials:
+    materialImportMode: 2
