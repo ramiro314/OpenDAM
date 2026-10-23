@@ -74,8 +74,8 @@ const ORIGIN_LABEL: Record<PackOrigin, string> = {
 };
 
 const CONVENTION_LABEL: Record<NormalConvention, string> = {
-  opengl: 'OpenGL (green up)',
-  directx: 'DirectX (green down)',
+  opengl: 'OpenGL',
+  directx: 'DirectX',
 };
 
 /** The normal-map convention an origin implies (plan game-export D14): DirectX for unreal. */

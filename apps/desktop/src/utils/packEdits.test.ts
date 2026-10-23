@@ -145,11 +145,11 @@ describe('the pack edit form', () => {
     expect(originConvention('generic')).toBe('opengl');
     const inferred = (origin: '' | 'unreal' | 'generic', from: 'unreal' | 'unity' | null) =>
       conventionChoices({ origin }, from)[0].label;
-    expect(inferred('', 'unreal')).toBe('Inferred: DirectX (green down)');
-    expect(inferred('', 'unity')).toBe('Inferred: OpenGL (green up)');
+    expect(inferred('', 'unreal')).toBe('Inferred: DirectX');
+    expect(inferred('', 'unity')).toBe('Inferred: OpenGL');
     // Your origin, not the inferred one, sets the default
-    expect(inferred('unreal', 'unity')).toBe('Inferred: DirectX (green down)');
-    expect(inferred('generic', 'unreal')).toBe('Inferred: OpenGL (green up)');
+    expect(inferred('unreal', 'unity')).toBe('Inferred: DirectX');
+    expect(inferred('generic', 'unreal')).toBe('Inferred: OpenGL');
     expect(inferred('', null)).toBe('Inferred');
     expect(conventionChoices({ origin: '' }, null).map((c) => c.value)).toEqual([
       '',

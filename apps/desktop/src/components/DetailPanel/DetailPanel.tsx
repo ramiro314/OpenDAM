@@ -760,7 +760,7 @@ function PackEditForm({ pack, onDone }: { pack: PackDetail; onDone: () => void }
       </label>
       <select
         id="detail-pack-form-origin"
-        className={styles.packFormInput}
+        className={clsx(styles.packFormInput, styles.packFormSelect)}
         value={form.origin}
         onChange={(e) => update({ origin: e.target.value as PackOrigin | '' })}
       >
@@ -775,7 +775,7 @@ function PackEditForm({ pack, onDone }: { pack: PackDetail; onDone: () => void }
       </label>
       <select
         id="detail-pack-form-normals"
-        className={styles.packFormInput}
+        className={clsx(styles.packFormInput, styles.packFormSelect)}
         value={form.normalConvention}
         onChange={(e) => update({ normalConvention: e.target.value as NormalConvention | '' })}
       >
