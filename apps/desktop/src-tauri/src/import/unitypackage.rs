@@ -684,4 +684,43 @@ mod tests {
         let err = extract_unitypackage(&original, &tmp.path().join("u"), None).unwrap_err();
         assert!(err.to_string().contains("x.txt would overwrite"), "{err}");
     }
+
+    #[test]
+    fn a_top_folder_is_dropped_only_when_every_file_shares_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("tops.unitypackage");
+        let cases: [(&[u8], &[&str]); 2] = [
+            // Two top folders.
+            (b"Assets/B/y.txt", &["A/x.txt", "B/y.txt"]),
+            // A file at the top level.
+            (b"Assets/z.txt", &["A/x.txt", "z.txt"]),
+        ];
+        for (i, (second, expected)) in cases.into_iter().enumerate() {
+            fs::write(
+                &original,
+                package(&[
+                    ("g1/asset", EntryType::Regular, b"x"),
+                    ("g1/pathname", EntryType::Regular, b"Assets/A/x.txt"),
+                    ("g2/asset", EntryType::Regular, b"y"),
+                    ("g2/pathname", EntryType::Regular, second),
+                ]),
+            )
+            .unwrap();
+            let target = tmp.path().join(i.to_string());
+            let extraction = extract_unitypackage(&original, &target, None).unwrap();
+            assert_eq!(paths(&extraction), expected);
+            assert_eq!(on_disk(&target), expected);
+        }
+    }
+
+    #[test]
+    fn a_target_that_is_not_empty_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("mine.txt"), b"mine").unwrap();
+        let err =
+            extract_unitypackage(&fixture("synthetic.unitypackage"), tmp.path(), None).unwrap_err();
+        assert!(err.to_string().contains("is not empty"), "{err}");
+        assert_eq!(on_disk(tmp.path()), ["mine.txt"]);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
 }
