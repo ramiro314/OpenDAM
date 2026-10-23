@@ -3,12 +3,11 @@
 //! structure pass derived (`PackInfo`), your `pack_overrides` edits and, for the origin, the
 //! pack's files at read time (A1).
 
-use std::path::Path;
-
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::export::conversion::Walker;
+use crate::export::fingerprint::Probes;
 use crate::export::textures::Convention;
 use crate::structure::{spdx_kind, LicenseKind, PackInfo, PackOverride, PackageLicense};
 
@@ -263,11 +262,12 @@ pub fn licence(info: &PackInfo, edits: &PackOverride) -> Licence {
     }
 }
 
-/// The `name` of the `datapackage.json` at `path` (relative to `root`), if the file reads and
-/// has a string `name`. It is read under the structure pass's size limit, so a file the pass
-/// ignores as too large gives no name either.
-pub fn read_package_name(root: &Path, path: &str) -> Option<String> {
-    let bytes = crate::structure::read_package_bytes(&root.join(path))
+/// The `name` of the `datapackage.json` at `path` (relative to the library root of `probes`,
+/// which records the file's stamp), if the file reads and has a string `name`. It is read under
+/// the structure pass's size limit, so a file the pass ignores as too large gives no name either.
+pub fn read_package_name(probes: &mut Probes, path: &str) -> Option<String> {
+    probes.probe(path);
+    let bytes = crate::structure::read_package_bytes(&probes.root().join(path))
         .ok()?
         .ok()?;
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
@@ -339,6 +339,7 @@ pub fn export_packs(sources: &[PackSource]) -> Vec<ExportPack> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::export::fingerprint::Stamp;
     use crate::structure::{LicenseFile, LicenseText, PackageFile, PackageLicense, PackageMeta};
 
     fn ids(natural: &[&str]) -> Vec<String> {
@@ -583,11 +584,15 @@ mod tests {
         let big = format!(r#"{{"name": "props"{}}}"#, " ".repeat(1 << 20));
         std::fs::write(dir.path().join("big.json"), big).unwrap();
 
+        let mut probes = Probes::new(dir.path());
         assert_eq!(
-            read_package_name(dir.path(), "small.json").as_deref(),
+            read_package_name(&mut probes, "small.json").as_deref(),
             Some("props")
         );
-        assert_eq!(read_package_name(dir.path(), "big.json"), None);
-        assert_eq!(read_package_name(dir.path(), "missing.json"), None);
+        assert_eq!(read_package_name(&mut probes, "big.json"), None);
+        assert_eq!(read_package_name(&mut probes, "missing.json"), None);
+        // Each read is stamped for the fingerprint, a missing file too
+        assert_eq!(probes.seen.len(), 3);
+        assert_eq!(probes.seen["missing.json"], Stamp::Missing);
     }
 }

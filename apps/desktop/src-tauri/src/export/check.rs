@@ -541,17 +541,17 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
         .map(|(l, p)| {
             let input = &inputs[*l];
             let pack = &input.packs[*p];
-            let root = &input.library.root_path;
             let files = input.pack_files.get(p).map_or(&[][..], Vec::as_slice);
             let walker = &mut walkers[*l];
             PackSource {
                 library_id: input.library.id.clone(),
                 path: pack.path.clone(),
                 folder_name: pack.name.clone(),
-                package_name: pack.info.package.as_ref().and_then(|f| {
-                    walker.probes.probe(&f.path);
-                    packs::read_package_name(root, &f.path)
-                }),
+                package_name: pack
+                    .info
+                    .package
+                    .as_ref()
+                    .and_then(|f| packs::read_package_name(&mut walker.probes, &f.path)),
                 origin: packs::infer_origin(files, walker),
                 info: pack.info.clone(),
                 edits: pack.edits.clone(),
@@ -639,8 +639,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                             exportable = false;
                         }
                         Ok(pass) if exportable && is_pascal(&name) => {
-                            walkers[l].probes.probe(&item.file_path);
-                            match input.memo.sha256(&root, &item.file_path) {
+                            match input.memo.sha256(&mut walkers[l].probes, &item.file_path) {
                                 Ok(sha256) => {
                                     let pack_path = &sources[pack.expect("exportable")].path;
                                     ready = Some(ReadyTexture {
@@ -915,8 +914,10 @@ fn invalid(manifest: &Value, domain: &str, assets: &[&AssetRef]) -> Vec<Problem>
         .collect()
 }
 
-/// `assets` with the status their problems give them.
-fn with_status(mut assets: Vec<CheckedAsset>, problems: &[Problem]) -> Vec<CheckedAsset> {
+/// `assets` with the status their problems give them: `Problem` for each asset a problem names.
+/// The only place that rule lives; `bundle` reapplies it after adding its own problems, and only
+/// refines the other assets' status by the diff.
+pub fn with_status(mut assets: Vec<CheckedAsset>, problems: &[Problem]) -> Vec<CheckedAsset> {
     let refused: HashSet<&str> = problems
         .iter()
         .flat_map(|p| &p.assets)

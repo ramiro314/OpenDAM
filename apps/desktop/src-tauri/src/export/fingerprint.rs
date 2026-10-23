@@ -52,7 +52,8 @@ impl fmt::Display for Stamp {
 }
 
 /// The files of one library a Check stats, by their path relative to the library root, each
-/// stamped when it is first looked at.
+/// stamped when it is looked at. Every function that reads a file for a Check takes the library's
+/// `Probes` and stamps the file itself, so no read is left out of the fingerprint.
 #[derive(Debug, Clone)]
 pub struct Probes {
     root: PathBuf,
@@ -65,6 +66,11 @@ impl Probes {
             root: root.to_path_buf(),
             seen: BTreeMap::new(),
         }
+    }
+
+    /// The library root the paths are relative to.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Stamps the file at `path` (relative to the library root) and records it.

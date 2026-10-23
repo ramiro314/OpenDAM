@@ -4,7 +4,7 @@
 //! texture under a `conversion.json` until conversion chains are built (plan "Build order").
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -37,7 +37,6 @@ impl Nearest {
 /// at is in `probes`, found or missing, for the Check's fingerprint (C14), and so is every other
 /// file a check stats through it.
 pub struct Walker {
-    root: PathBuf,
     folders: HashMap<String, Option<Arc<Nearest>>>,
     pub probes: Probes,
 }
@@ -45,7 +44,6 @@ pub struct Walker {
 impl Walker {
     pub fn new(root: &Path) -> Self {
         Walker {
-            root: root.to_path_buf(),
             folders: HashMap::new(),
             probes: Probes::new(root),
         }
@@ -65,7 +63,7 @@ impl Walker {
         };
         let found = if self.probes.probe(&path).is_file() {
             Some(Arc::new(Nearest {
-                steps: read(&self.root.join(&path)),
+                steps: read(&self.probes.root().join(&path)),
                 path,
             }))
         } else if dir.is_empty() {

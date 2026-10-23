@@ -12,7 +12,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::db::Database;
-use crate::export::check::{self, BundleFile, CheckReport, Inspection, Kind, Problem, Status};
+use crate::export::check::{self, BundleFile, CheckReport, Inspection, Problem, Status};
 use crate::export::fingerprint::Fingerprint;
 use crate::export::{contract, hashes};
 
@@ -81,39 +81,24 @@ pub fn diff(previous: Option<&Value>, next: &Value) -> Diff {
     diff
 }
 
-/// `report`'s statuses once `report.diff` is set: `Problem` for each asset a problem names, else
-/// `New` or `Changed` when the diff adds or changes it, else `Ready`.
+/// Refines `report`'s statuses by `report.diff`: an asset that no problem names (`check::
+/// with_status` decides that) is `New` or `Changed` when the diff adds or changes it, else stays
+/// `Ready`. Its key is read by `entry_of` from the asset's own serialized fields, as the diff
+/// reads each manifest entry's, so the two can't disagree.
 fn with_diff_status(report: &mut CheckReport) {
-    let refused: HashSet<&str> = report
-        .problems
-        .iter()
-        .flat_map(|p| &p.assets)
-        .map(|a| a.asset_id.as_str())
-        .collect();
-    let diff = report.diff.as_ref();
-    let has =
-        |list: Option<&Vec<DiffEntry>>, entry: &DiffEntry| list.is_some_and(|l| l.contains(entry));
+    let Some(diff) = &report.diff else {
+        return;
+    };
     for asset in &mut report.assets {
-        let entry = DiffEntry {
-            kind: match asset.kind {
-                Kind::Model => "model",
-                Kind::Texture => "texture",
-                Kind::Animation => "animation",
-                Kind::Other => "other",
-            }
-            .into(),
-            asset_name: asset.asset_name.clone().unwrap_or_default(),
-            role: asset.role.map(|r| r.as_str().to_string()),
-        };
-        asset.status = if refused.contains(asset.asset.asset_id.as_str()) {
-            Status::Problem
-        } else if has(diff.map(|d| &d.added), &entry) {
-            Status::New
-        } else if has(diff.map(|d| &d.changed), &entry) {
-            Status::Changed
-        } else {
-            Status::Ready
-        };
+        if asset.status == Status::Problem {
+            continue;
+        }
+        let entry = entry_of(&serde_json::to_value(&*asset).expect("an asset serializes"));
+        if diff.added.contains(&entry) {
+            asset.status = Status::New;
+        } else if diff.changed.contains(&entry) {
+            asset.status = Status::Changed;
+        }
     }
 }
 
@@ -500,6 +485,7 @@ impl Exports {
 
         report.diff = Some(diff(previous.as_ref(), &report.manifest));
         report.problems.extend(problems);
+        report.assets = check::with_status(std::mem::take(&mut report.assets), &report.problems);
         with_diff_status(&mut report);
         if let Some((staging, assets)) = staging {
             report.staged = true;
