@@ -55,6 +55,9 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
     try {
       setCheck(await api.checkExport(domain.id));
     } catch (e) {
+      // A Check discards the earlier staged bundle before it runs, so the old report would show
+      // an out-of-date diff with Export enabled for a bundle that is gone
+      setCheck(null);
       setError(String(e));
     } finally {
       setChecking(false);
