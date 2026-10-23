@@ -219,6 +219,21 @@ decision changed:
   unsafe entry, as `extract_unity.py` reads only `member.isfile()` entries. The
   `escape.unitypackage` fixture gains a hardlink (Steps, Fixtures, A2).
 
+Revised again 2026-10-23 (revision 16) after GitHub Inspector's seventh review of PR #199. No
+decision changed:
+
+- **R36 - An index over the pack reads and prunes only the pack.** Today `index_paths` loads
+  every asset row of the library (`watcher.rs:177-187`) and deletes every row whose path it
+  didn't walk (`watcher.rs:312-329`). Every caller passes the library root, so that is right
+  today, but a run over one pack folder would delete every row outside it. A scoped run now
+  loads and prunes only rows under the paths it walks, matched on whole path components, and a
+  new case checks that a tagged asset outside the pack survives every build, rollback, recovery
+  and Remove (Flow, invariants, A11, A13).
+- **R37 - A rollback with no previous folder prunes nothing.** When `swap_prev` is false, the
+  pack folder is gone again after the rollback, so a pruning index would delete the rows the
+  rollback just put back. That rollback runs only the structure pass, and its rows wait, as they
+  did before the build, for the next refresh (Flow, A11).
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -429,6 +444,16 @@ id while staging, in 200-row transactions. Those rows mean nothing until the com
    folder, the old build's manifest rows and the new build's `import_moves`, releases the lock,
    and emits `library:updated`.
 
+**A scoped index.** Today `index_paths` loads every asset row of the library into `existing_map`
+(`watcher.rs:177-187`) and, after its walk, deletes every row whose path it didn't see
+(`watcher.rs:312-329`). Every caller passes the library root, so that is right today. Every run
+in this plan passes one pack folder, so the index core changes for every caller: it loads, and
+so may prune, only the rows whose `file_path` lies under one of the walked paths, compared on
+whole path components (`Pub/Pack` holds `Pub/Pack/Rock.fbx` but not `Pub/Package/Rock.fbx`). A
+run over the library root keeps every row in scope, as today. Rows elsewhere in the library are
+never read or deleted by a run over a pack, whether it settles a build (step 7), rolls one back,
+recovers one or runs a Remove.
+
 `index_paths_locked` and `rebuild_library_locked` are new variants of `index_paths` and
 `rebuild_library`. They take both held guards as proof instead of locking: the
 `&tokio::sync::MutexGuard<'_, ()>` and the advisory `IndexLock`. So they never try to take the
@@ -480,10 +505,14 @@ holding the lock:
      still occupied anyway, the reversal leaves that row aside and logs the conflict. It never
      fails the rollback.
 
-   Then it runs `index_paths_locked` over the pack with `Prune::Now`. Rows of the previous build's
-   paths were moved back or never touched, and never pruned, so they match the restored files
-   with their ids and metadata intact. The structure pass that ends this run reads
-   `current_build`, which is still the previous build, or `NULL` for a first build.
+   Then, when `swap_prev` is set, it runs `index_paths_locked` over the pack with `Prune::Now`.
+   Rows of the previous build's paths were moved back or never touched, and never pruned, so
+   they match the restored files with their ids and metadata intact. When `swap_prev` is false,
+   the pack folder is gone again, as it was before the build, and a pruning index would delete
+   the rows just moved back. So it runs no index, only `rebuild_library_locked`: the previous
+   build's rows wait, exactly as before the build, and the next refresh prunes them as it would
+   for any deleted folder. Either structure pass reads `current_build`, which is still the
+   previous build, or `NULL` for a first build.
 
 4. In **one transaction**, clear `swap_state` and delete the failed build's manifest rows and
    its `import_moves`. Only then delete the `.failed-<build id>` folder, and fail the run. A crash
@@ -963,6 +992,9 @@ confirmation names them.
 - **Locked variants.** `watcher::index_paths_locked` and `structure::rebuild_library_locked`
   take a held `index_lock` guard and the held advisory `IndexLock` guard. Code that holds the locks
   calls these, never the locking functions.
+- **An index reads and prunes only what it walks.** Every index run loads, and may delete, only
+  the rows under the paths it walks, on whole path components. A run over the library root
+  covers every row, as today.
 - **Pruning waits for the commit.** `index_paths_locked` with `Prune::Defer` deletes no row,
   runs no structure pass, and journals each row it inserts. Only an import build uses it,
   between its swap and its commit. Every
@@ -1223,7 +1255,13 @@ confirmation names them.
     the tagged row. The build commits, and the file keeps its id and tag. Then repeat it and kill
     the app after step 5: recovery rolls back, the carried row is back at its old path with its
     tag, inserted rows are gone, `current_build` still names the previous build, and the pack
-    folder is absent again, as before the build.
+    folder is absent again, as before the build. The rollback ran no pruning index, and a library
+    refresh afterwards prunes those rows, as for any deleted folder.
+  - **Rows outside the pack.** Tag `Other/Tree.png`, a file in another folder of the same library,
+    and a file of a second imported pack. Run a build that commits and settles, one that rolls
+    back, a recovery of each `swapping` row that runs an index, a `swap_state NULL` settle, and a
+    Remove of the first pack. After each, both rows exist with their ids and tags. A pack at
+    `Pub/Pack` beside `Pub/Package` leaves `Pub/Package`'s rows alone.
   - **A mid-run change:** a file changed outside OpenDAM, or a step edited, while the build
     stages. The re-check under the lock fails the run, and the live folder is unchanged.
   - **No deadlock:** no call path takes `index_lock` while holding it. A test runs a whole build
@@ -1232,7 +1270,8 @@ confirmation names them.
 - **A12 - Memory cap.** A capped process killed with status 137 fails its step with "killed by
   the memory cap".
 - **A13 - Remove import.** Removing deletes exactly the manifest's files and empty folders, and
-  the confirmation lists any drift first.
+  the confirmation lists any drift first. A tagged asset outside the pack keeps its row and tag
+  (A11, rows outside the pack).
 - **A14 - Unity-only files hidden.** In an imported pack, a `.mat` whose `.mat.meta` is in the
   current manifest is a hidden `unity` support file, and shows with `showHidden`. A `.mat` in a
   folder that wasn't imported keeps its kind and stays visible. `derive` reads no file for this,
