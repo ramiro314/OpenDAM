@@ -186,6 +186,16 @@ pub fn run(render_choice: render::RenderChoice) {
             // Auto-tagging runs: replays writes left pending, then serves queued items
             tauri::async_runtime::spawn(async move { autotag.start().await });
 
+            // A command's structure pass that ran late, from its follow-up task
+            let mut late_passes = state.db.late_passes.subscribe();
+            let late_state = state.clone();
+            tauri::async_runtime::spawn(async move {
+                use tokio::sync::broadcast::error::RecvError;
+                while !matches!(late_passes.recv().await, Err(RecvError::Closed)) {
+                    let _ = late_state.app_handle.emit("library:updated", ());
+                }
+            });
+
             // Re-index all existing libraries on startup in background
             let startup_state = state.clone();
             tauri::async_runtime::spawn(async move {

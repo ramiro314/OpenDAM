@@ -24,6 +24,8 @@ const STALE_AFTER: Duration = Duration::from_secs(120);
 const HEARTBEAT: Duration = Duration::from_secs(30);
 /// How long a new holder waits before it re-reads the file to see whether it won the race.
 const SETTLE: Duration = Duration::from_millis(100);
+/// How often a holder that waits for the lock (`acquire_within`) tries it again.
+const RETRY: Duration = Duration::from_millis(250);
 
 /// What the lock needs from the world: a clock, which processes on this machine are alive, and
 /// who this process is. Tests inject their own.
@@ -202,7 +204,8 @@ impl HeldLock {
 /// the heartbeat and deletes the file only while it still holds the guard's token.
 ///
 /// Holding one, with the library's `index_lock`, is the proof the `_locked` variants
-/// (`index_paths_locked`, `structure::rebuild_library_locked`) take instead of locking.
+/// (`index_paths_locked`, `structure::rebuild_library_locked`) take instead of locking. Every
+/// holder lets go through `release`, which runs a structure pass left pending meanwhile.
 pub struct IndexLock {
     path: PathBuf,
     /// `None` when the file couldn't be written: the run goes on unlocked, as it always has.
@@ -220,6 +223,35 @@ impl IndexLock {
     /// another holder has it.
     pub async fn try_acquire(root: &Path) -> Option<Self> {
         Self::try_acquire_with(&Self::path(root), STALE_AFTER, &LockEnv::system()).await
+    }
+
+    /// `try_acquire`, trying again until `wait` has passed while another holder has the lock.
+    pub async fn acquire_within(root: &Path, wait: Duration) -> Option<Self> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(lock) = Self::try_acquire(root).await {
+                return Some(lock);
+            }
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            tokio::time::sleep(RETRY.min(left)).await;
+        }
+    }
+
+    /// Lets go of the lock, first running the structure pass on the library DB at `pool`, whose
+    /// files lie below `root`, when one is pending (`structure::mark_pending`) and the file still
+    /// holds this guard's token. A pass pending only because this holder's own pass just failed is
+    /// left to the next entry point (`structure::owed_to_release`). The caller still holds the
+    /// library's `index_lock`.
+    pub async fn release(self, pool: &Pool<Sqlite>, root: &Path) {
+        debug_assert!(self.path == Self::path(root));
+        if self.still_held() && crate::structure::owed_to_release(pool).await {
+            if let Err(e) = crate::structure::rebuild(pool, root).await {
+                tracing::error!(target: "structure", "Pending structure pass failed for library at {root:?}: {e}");
+            }
+        }
     }
 
     async fn try_acquire_with(
@@ -428,8 +460,9 @@ async fn mounted(db: &Database, library_id: &str) -> Option<LibraryHandle> {
     Some(library)
 }
 
-/// Takes library `library_id`'s `index_lock`, then the advisory lock, and runs
-/// `index_paths_locked` with `Prune::Now`. Yields when another machine holds the advisory lock.
+/// Takes library `library_id`'s `index_lock`, then the advisory lock, runs swap recovery and
+/// `index_paths_locked` with `Prune::Now`, then releases. Yields when another machine holds the
+/// advisory lock.
 pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> Result<()> {
     let Some(library) = mounted(db, library_id).await else {
         return Ok(());
@@ -444,7 +477,11 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
         return Ok(()); // another instance is indexing — yield
     };
 
-    index_paths_locked(db, library_id, paths, Prune::Now, &index_guard, &lock).await
+    let (pool, root) = (&library.pool, library.root_path.as_path());
+    crate::import::recover_swaps(pool, root, crate::import::Recovery::Entry).await;
+    let run = index_paths_locked(db, library_id, paths, Prune::Now, &index_guard, &lock).await;
+    lock.release(pool, root).await;
+    run
 }
 
 /// `index_paths` for a caller that holds library `library_id`'s `index_lock` and advisory lock,

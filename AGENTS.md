@@ -157,8 +157,8 @@ docs/plans                    Plans for this fork
   the held `index_lock` guard and the held advisory `watcher::IndexLock` guard as proof and never
   lock again. Code that holds the locks calls these, never `index_paths` or `rebuild_library`
   (`index_lock` isn't re-entrant). `index_paths` takes both locks and calls `index_paths_locked`
-  with `Prune::Now`. `rebuild_library` takes only `index_lock`: another machine's index run that
-  finds the advisory lock held skips its run instead of waiting, so a command must not hold it. Under both sit lock-free cores,
+  with `Prune::Now`. `rebuild_library` takes `index_lock`, then the advisory lock, waiting up to
+  5 s for it (`IndexLock::acquire_within`). Under both sit lock-free cores,
   `watcher::index_pool` and `structure::rebuild`, for a pool that isn't registered yet. An index
   run takes a `watcher::Prune`: `Now` deletes the rows of files it didn't find and ends with the
   structure pass, and `Defer` deletes no row, runs no pass, and reports each row it inserts to an
@@ -169,7 +169,28 @@ docs/plans                    Plans for this fork
   stale once its mtime is 120 s old, or at once when its token names a gone process in this
   machine, boot and pid namespace. A guard deletes the file on drop only while the file holds its
   token. `index_pool` re-reads the token (its `advisory` argument) right before it prunes, and
-  prunes nothing once the lock is lost.
+  prunes nothing once the lock is lost. Every holder lets go through `IndexLock::release`, which
+  first runs the structure pass when `structure_pending` is set and the file still holds its
+  token.
+- **No structure pass without both locks.** Every pass runs holding the library's `index_lock`
+  and its advisory lock, so none runs between a pack import's swap and its commit on any machine.
+  The pass at library open runs in `db::open_library_db`, after `connect_library_sqlite` (which
+  runs none) and before the library is registered. `import::recover_swaps` is where swap recovery
+  runs, holding both locks: at open, and at the start of `index_paths` and `rebuild_library`.
+- **A command's structure pass can be late, never lost.** `delete_asset`, `delete_assets`,
+  `rename_asset` and `set_pack_override` call `rebuild_library` before they return. When another
+  holder keeps the advisory lock past its 5 s wait, it sets `structure_pending` in
+  `library_meta`, returns, and leaves the library's one follow-up task (`Database::follow_ups`),
+  which runs the pass once both locks free if it is still pending and announces it on
+  `Database::late_passes`, which the app turns into `library:updated`. A library open that finds
+  the lock held sets the flag too. The holder's release, the follow-up task, or the next open or
+  index run, whichever comes first, runs it. Each pass clears the flag as it starts, so a flag set
+  during a pass is caught at the release, and sets it again when it fails, to `failed`, which the
+  failing holder's own release leaves to the next entry point (`structure::owed_to_release`).
+  Known gap: until then
+  `group_id`, `folders` and support roles lag the indexed paths, a few seconds behind another
+  machine's refresh and as long as a build's swap behind a build, and a machine running an older
+  OpenDAM never runs a pending pass.
 
 - **Structure is derived.** `folders` (each folder's path, parent, name, `is_pack`, and its
   recursive `item_count`, `hidden_count` and `split_groups`, the root being `path = ''`, and a
@@ -188,14 +209,14 @@ docs/plans                    Plans for this fork
   render's size on the render's own row: `render_width` and `render_height`, with the
   `size_bytes` and `modified_at` it read them at in `render_read_bytes` and `render_read_mtime`.
   A header it can't read sets all four to `NULL`, so the next pass reads it again. Opening a
-  library DB (`connect_library_sqlite`) runs the pass once, and
-  every `watcher::index_paths` run ends with it, under the library's `Database::index_lock`. Only
+  library (`db::open_library_db`) runs the pass once, and every `watcher::index_paths` run ends
+  with it, under both of the library's locks. Only
   `structure.rs` writes `folders`, `support_role`, `group_id`, `bundled_preview` and the
   `render_*` columns: a command
   that changes the
   indexed paths (`delete_asset`, `delete_assets`, `rename_asset`) calls
   `structure::rebuild_library` before it returns, rather than patching rows, and that waits for
-  any index run holding the lock. Searches hide support files (`support_role IS NOT NULL`) unless
+  any index run holding the locks. Searches hide support files (`support_role IS NOT NULL`) unless
   the filter's `showHidden` is set.
   - Your pack edits ("Mark as pack", "Not a pack", a pack's name, license, source URL and cover,
     and the game export's origin and normal-map convention) live only in `pack_overrides`, keyed by the folder's relative path, so they outlive the

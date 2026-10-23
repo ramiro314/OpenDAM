@@ -17,7 +17,7 @@ use sqlx::{Pool, Sqlite};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::db::{Database, LibraryHandle};
 use crate::export::packs::Origin;
@@ -2123,8 +2123,32 @@ pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
     Ok(pass(pool, root).await?.written)
 }
 
-/// `rebuild`, saying what it did.
+/// `rebuild`, saying what it did. It clears `structure_pending` as it starts, so a pass left
+/// pending while it runs stays pending for the release that follows, and sets it again when it
+/// fails, so a failed pass is still owed.
 pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassRun> {
+    sqlx::query("DELETE FROM library_meta WHERE key = ?")
+        .bind(PENDING_KEY)
+        .execute(pool)
+        .await?;
+    let run = derive_and_apply(pool, root).await;
+    if run.is_err() {
+        // Unless a command left it pending meanwhile, the flag says the pass failed, so the
+        // release that follows doesn't retry it at once (`owed_to_release`).
+        let marked = sqlx::query("INSERT OR IGNORE INTO library_meta (key, value) VALUES (?, ?)")
+            .bind(PENDING_KEY)
+            .bind(FAILED)
+            .execute(pool)
+            .await;
+        if let Err(e) = marked {
+            tracing::error!(target: "structure", "Could not leave a failed structure pass pending: {e}");
+        }
+    }
+    run
+}
+
+/// `pass` once the flag is cleared.
+async fn derive_and_apply(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassRun> {
     let started = Instant::now();
     let files: Vec<FileRow> = sqlx::query_as(
         "SELECT id, file_path, extension, support_role, group_id, bundled_preview, preview_status,
@@ -2302,17 +2326,133 @@ pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassR
     })
 }
 
-/// Reruns the pass for `library` once any index run on it has finished, for a command that
-/// changed its paths: takes its `index_lock` and runs the pass. A failed pass is logged, not
-/// returned: the change itself went through, and the next index run derives the structure again.
+/// The `library_meta` key set while a structure pass is owed: a command's pass that couldn't take
+/// the advisory lock, or a library open that couldn't. Every pass clears it as it starts.
+const PENDING_KEY: &str = "structure_pending";
+/// `PENDING_KEY`'s value after a failed pass: still owed to the next entry point, but not to the
+/// release of the holder whose pass just failed.
+const FAILED: &str = "failed";
+/// How long a command's pass waits for another holder's advisory lock before it leaves the pass
+/// pending (`rebuild_library`).
+const COMMAND_WAIT: Duration = Duration::from_secs(5);
+/// How often a command's follow-up task tries the locks again.
+const FOLLOW_UP_RETRY: Duration = Duration::from_secs(2);
+
+/// Leaves a structure pass pending on the library DB at `pool`, for the advisory lock's holder to
+/// run before it releases, or the next follow-up task, index run or open.
+pub(crate) async fn mark_pending(pool: &Pool<Sqlite>) {
+    let marked = sqlx::query(
+        "INSERT INTO library_meta (key, value) VALUES (?, '1')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(PENDING_KEY)
+    .execute(pool)
+    .await;
+    if let Err(e) = marked {
+        tracing::error!(target: "structure", "Could not leave a structure pass pending: {e}");
+    }
+}
+
+/// Whether a structure pass is pending on the library DB at `pool`. An unreadable flag counts as
+/// set: an extra pass costs a read, a lost one leaves the structure stale.
+pub(crate) async fn is_pending(pool: &Pool<Sqlite>) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT 1 FROM library_meta WHERE key = ?")
+        .bind(PENDING_KEY)
+        .fetch_optional(pool)
+        .await
+        .map_or(true, |found| found.is_some())
+}
+
+/// Whether a holder's release owes the library DB at `pool` a pass: one is pending, and not
+/// because the holder's own pass just failed. An unreadable flag counts as owed, like `is_pending`.
+pub(crate) async fn owed_to_release(pool: &Pool<Sqlite>) -> bool {
+    sqlx::query_scalar::<_, String>("SELECT value FROM library_meta WHERE key = ?")
+        .bind(PENDING_KEY)
+        .fetch_optional(pool)
+        .await
+        .map_or(true, |value| value.is_some_and(|v| v != FAILED))
+}
+
+/// Reruns the pass for `library`, for a command that changed its paths. It takes the library's
+/// `index_lock`, so it waits for any index run of this app, then its advisory lock, waiting up to
+/// 5 s for another holder, so it never runs between a pack import's swap and its commit on any
+/// machine. Holding both, it runs swap recovery, the pass, and the release. A failed pass is
+/// logged, not returned: the change itself went through, and the next index run derives the
+/// structure again.
 ///
-/// It takes no advisory lock: an index run on another machine that finds one skips its whole
-/// run rather than waiting, so a command holding it would lose that machine's run. Taking it,
-/// with a wait and a pass that is late but never lost, is the pack import's next step.
+/// While another holder keeps the advisory lock past the wait, the pass is late, never lost: it
+/// is left pending (`structure_pending`) and the command returns. The library's one follow-up
+/// task (`Database::follow_ups`) runs it once both locks free, unless the holder's release, or the
+/// next index run or open, ran it first, and announces it on `Database::late_passes`. A failed
+/// pass leaves it pending, unannounced.
 pub async fn rebuild_library(db: &Database, library: &LibraryHandle) {
     let lock = db.index_lock(&library.id);
-    let _index_guard = lock.lock().await;
-    log_failure(library, rebuild(&library.pool, &library.root_path).await);
+    let index_guard = lock.lock().await;
+    if let Some(advisory) = IndexLock::acquire_within(&library.root_path, COMMAND_WAIT).await {
+        locked_pass(library, &index_guard, advisory, true).await;
+        return;
+    }
+    tracing::info!(
+        target: "structure",
+        "Another holder keeps the advisory lock of library {}: its structure pass runs later",
+        library.id
+    );
+    mark_pending(&library.pool).await;
+    let follow_ups = db.follow_ups.clone();
+    // A follow-up task already waiting runs this pass too: it can't be mid-pass while this
+    // command holds `index_lock`, and it removes itself under that lock.
+    if !follow_ups
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(library.id.clone())
+    {
+        return;
+    }
+    drop(index_guard);
+    let (library, late) = (library.clone(), db.late_passes.clone());
+    let done = {
+        let id = library.id.clone();
+        move || {
+            let mut follow_ups = follow_ups.lock().unwrap_or_else(|e| e.into_inner());
+            follow_ups.remove(&id);
+        }
+    };
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(FOLLOW_UP_RETRY).await;
+            // Offline: its next open or index run runs the pass.
+            if !library.root_path.exists() {
+                done();
+                return;
+            }
+            let index_guard = lock.lock().await;
+            if let Some(advisory) = IndexLock::try_acquire(&library.root_path).await {
+                // The holder's release may have run it already.
+                let pending = is_pending(&library.pool).await;
+                let ran = locked_pass(&library, &index_guard, advisory, pending).await;
+                done();
+                if ran {
+                    let _ = late.send(library.id.clone());
+                }
+                return;
+            }
+        }
+    });
+}
+
+/// A locking entry point's work once it holds both locks: swap recovery, the pass when `pass` is
+/// set, then the release, which runs a pass left pending meanwhile. False when the pass failed.
+async fn locked_pass(
+    library: &LibraryHandle,
+    _index_guard: &tokio::sync::MutexGuard<'_, ()>,
+    advisory: IndexLock,
+    pass: bool,
+) -> bool {
+    let (pool, root) = (&library.pool, library.root_path.as_path());
+    crate::import::recover_swaps(pool, root, crate::import::Recovery::Entry).await;
+    let ran = !pass || log_failure(library, rebuild(pool, root).await);
+    advisory.release(pool, root).await;
+    ran
 }
 
 /// The structure pass for a caller that holds `library`'s `index_lock` and advisory lock, passed
@@ -2330,10 +2470,12 @@ pub async fn rebuild_library_locked(
     log_failure(library, rebuild(&library.pool, &library.root_path).await);
 }
 
-fn log_failure(library: &LibraryHandle, pass: sqlx::Result<usize>) {
-    if let Err(e) = pass {
+/// Logs a failed pass. True when it succeeded.
+fn log_failure(library: &LibraryHandle, pass: sqlx::Result<usize>) -> bool {
+    if let Err(e) = &pass {
         tracing::error!(target: "structure", "Structure pass failed for library {}: {e}", library.id);
     }
+    pass.is_ok()
 }
 
 #[cfg(test)]
@@ -6000,80 +6142,261 @@ pub(crate) mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_commands_pass_still_runs_while_another_machine_holds_the_advisory_lock() {
+    /// A library over an in-memory pool whose root is a temp folder, so it has a lock file.
+    async fn locked_library() -> (tempfile::TempDir, Database, LibraryHandle) {
         let dir = tempfile::Builder::new()
             .prefix("opendam-lib-")
             .tempdir()
             .unwrap();
-        let lock_file = dir.path().join(".opendam/index.lock");
         std::fs::create_dir_all(dir.path().join(".opendam")).unwrap();
-        let pool = memory_library_pool().await;
         let library = LibraryHandle {
             root_path: dir.path().to_path_buf(),
-            ..crate::db::memory_library("lib", pool.clone())
+            ..crate::db::memory_library("lib", memory_library_pool().await)
         };
         let db = crate::db::memory_database(vec![library.clone()]).await;
-        insert_path(&pool, "kits/kit/model.glb").await;
-        insert_path(&pool, "kits/other/rock.glb").await;
-        rebuild(&pool, &library.root_path).await.unwrap();
+        (dir, db, library)
+    }
+
+    #[tokio::test]
+    async fn a_commands_pass_waits_5_s_for_another_holder_then_runs_late_never_lost() {
+        let (dir, db, library) = locked_library().await;
+        let pool = &library.pool;
+        let lock_file = dir.path().join(".opendam/index.lock");
+        insert_path(pool, "kits/kit/model.glb").await;
+        insert_path(pool, "kits/other/rock.glb").await;
+        rebuild(pool, &library.root_path).await.unwrap();
+        let mut late = db.late_passes.subscribe();
 
         // Another machine's fresh lock, and a command that changed the indexed paths.
         std::fs::write(&lock_file, "another machine").unwrap();
         sqlx::query("DELETE FROM assets WHERE file_path = 'kits/other/rock.glb'")
-            .execute(&pool)
+            .execute(pool)
             .await
             .unwrap();
+        let started = Instant::now();
         rebuild_library(&db, &library).await;
 
+        let waited = started.elapsed();
+        assert!(waited >= COMMAND_WAIT, "it waited only {waited:?}");
+        assert!(waited < COMMAND_WAIT * 2, "it waited {waited:?}");
         assert_eq!(
-            derived_rows(&pool).await,
-            fresh_pass(&["kits/kit/model.glb"]).await,
-            "the pass ran, as it always has"
+            derived_rows(pool).await.folders,
+            fresh_pass(&["kits/kit/model.glb", "kits/other/rock.glb"])
+                .await
+                .folders,
+            "the pass ran while another holder had the lock"
         );
+        assert!(is_pending(pool).await);
         assert_eq!(
             std::fs::read_to_string(&lock_file).unwrap(),
             "another machine",
             "the other machine's lock is left alone"
         );
+
+        // A second command times out too, and leaves its pass to the follow-up already waiting.
+        rebuild_library(&db, &library).await;
+        assert_eq!(db.follow_ups.lock().unwrap().len(), 1);
+
+        // The other machine lets go: the one follow-up task runs the pass and says so, once.
+        std::fs::remove_file(&lock_file).unwrap();
+        let ran = tokio::time::timeout(Duration::from_secs(10), late.recv()).await;
+        assert_eq!(ran.expect("no follow-up pass ran").unwrap(), "lib");
+        assert_eq!(
+            derived_rows(pool).await,
+            fresh_pass(&["kits/kit/model.glb"]).await
+        );
+        assert!(!is_pending(pool).await);
+        assert!(!lock_file.exists(), "the follow-up task kept the lock");
+        let again = tokio::time::timeout(FOLLOW_UP_RETRY * 2, late.recv()).await;
+        assert!(again.is_err(), "a second follow-up ran: {again:?}");
+        assert!(db.follow_ups.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn a_commands_pass_never_takes_the_advisory_lock() {
-        let dir = tempfile::Builder::new()
-            .prefix("opendam-lib-")
-            .tempdir()
+    async fn a_failed_pass_leaves_its_pass_pending_but_not_for_its_own_release() {
+        let (dir, _db, library) = locked_library().await;
+        let pool = &library.pool;
+        insert_path(pool, "kits/kit/model.glb").await;
+        sqlx::query(
+            "CREATE TRIGGER the_share_went_away BEFORE INSERT ON folders BEGIN
+                 SELECT RAISE(ABORT, 'disk I/O error');
+             END",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let lock = IndexLock::try_acquire(dir.path()).await.unwrap();
+
+        assert!(rebuild(pool, dir.path()).await.is_err());
+        assert!(is_pending(pool).await, "a failed pass cleared the flag");
+
+        // The share is back, but the holder whose pass just failed doesn't retry it at release.
+        sqlx::query("DROP TRIGGER the_share_went_away")
+            .execute(pool)
+            .await
             .unwrap();
+        lock.release(pool, dir.path()).await;
+        assert!(
+            derived_rows(pool).await.folders.is_empty(),
+            "the release retried its own failed pass"
+        );
+        assert!(is_pending(pool).await);
+
+        // The next entry point runs it.
+        rebuild(pool, dir.path()).await.unwrap();
+        assert!(!is_pending(pool).await);
+        assert_eq!(
+            derived_rows(pool).await,
+            fresh_pass(&["kits/kit/model.glb"]).await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commands_pass_takes_a_stale_lock_and_lets_go_of_it() {
+        let (dir, db, library) = locked_library().await;
         let lock_file = dir.path().join(".opendam/index.lock");
-        std::fs::create_dir_all(dir.path().join(".opendam")).unwrap();
-        // A dead holder's lock, stale for an hour: taking the lock would write over it and
-        // delete it on release.
+        // A dead holder's lock, stale for an hour.
         std::fs::write(&lock_file, "a dead holder").unwrap();
         std::fs::File::options()
             .write(true)
             .open(&lock_file)
             .unwrap()
-            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
             .unwrap();
-        let pool = memory_library_pool().await;
-        let library = LibraryHandle {
-            root_path: dir.path().to_path_buf(),
-            ..crate::db::memory_library("lib", pool.clone())
-        };
-        let db = crate::db::memory_database(vec![library.clone()]).await;
-        insert_path(&pool, "kits/kit/model.glb").await;
+        insert_path(&library.pool, "kits/kit/model.glb").await;
 
         rebuild_library(&db, &library).await;
 
         assert_eq!(
-            derived_rows(&pool).await,
+            derived_rows(&library.pool).await,
             fresh_pass(&["kits/kit/model.glb"]).await
         );
-        // An index run on another machine that found the lock held would skip its whole run.
+        assert!(!lock_file.exists());
+    }
+
+    #[tokio::test]
+    async fn a_holder_runs_a_pending_pass_before_it_releases_unless_it_lost_the_lock() {
+        let (dir, _db, library) = locked_library().await;
+        let pool = &library.pool;
+        let lock_file = dir.path().join(".opendam/index.lock");
+        insert_path(pool, "kits/kit/model.glb").await;
+
+        let lost = IndexLock::try_acquire(dir.path()).await.unwrap();
+        mark_pending(pool).await;
+        std::fs::write(&lock_file, "another machine").unwrap();
+        lost.release(pool, dir.path()).await;
+        assert!(
+            derived_rows(pool).await.folders.is_empty(),
+            "a holder that lost its lock ran a pass"
+        );
+        assert!(is_pending(pool).await);
+
+        std::fs::remove_file(&lock_file).unwrap();
+        let held = IndexLock::try_acquire(dir.path()).await.unwrap();
+        held.release(pool, dir.path()).await;
         assert_eq!(
-            std::fs::read_to_string(&lock_file).unwrap(),
-            "a dead holder",
-            "the command's pass took the advisory lock"
+            derived_rows(pool).await,
+            fresh_pass(&["kits/kit/model.glb"]).await
+        );
+        assert!(!is_pending(pool).await, "the pass didn't clear the flag");
+        assert!(!lock_file.exists());
+
+        // With nothing pending, a release runs no pass.
+        insert_path(pool, "kits/other/rock.glb").await;
+        IndexLock::try_acquire(dir.path())
+            .await
+            .unwrap()
+            .release(pool, dir.path())
+            .await;
+        assert_eq!(
+            derived_rows(pool).await.folders,
+            fresh_pass(&["kits/kit/model.glb"]).await.folders
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flag_set_during_a_pass_outlives_it_for_the_release() {
+        let (dir, _db, library) = locked_library().await;
+        let pool = &library.pool;
+        insert_path(pool, "kits/kit/model.glb").await;
+        mark_pending(pool).await;
+        // Another machine's command leaves a pass pending while this one writes its folders.
+        sqlx::query(
+            "CREATE TRIGGER pending_during_the_pass AFTER INSERT ON folders BEGIN
+                 INSERT OR REPLACE INTO library_meta (key, value) VALUES ('structure_pending', '1');
+             END",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        rebuild(pool, dir.path()).await.unwrap();
+        assert!(
+            is_pending(pool).await,
+            "the pass cleared a flag set while it ran"
+        );
+
+        sqlx::query("DROP TRIGGER pending_during_the_pass")
+            .execute(pool)
+            .await
+            .unwrap();
+        IndexLock::try_acquire(dir.path())
+            .await
+            .unwrap()
+            .release(pool, dir.path())
+            .await;
+        assert!(!is_pending(pool).await, "the release left the pass pending");
+    }
+
+    #[tokio::test]
+    async fn a_commands_pass_takes_the_lock_once_its_holder_lets_go_within_the_wait() {
+        let (dir, db, library) = locked_library().await;
+        let lock_file = dir.path().join(".opendam/index.lock");
+        insert_path(&library.pool, "kits/kit/model.glb").await;
+        std::fs::write(&lock_file, "another machine").unwrap();
+        tokio::spawn({
+            let lock_file = lock_file.clone();
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                std::fs::remove_file(lock_file).unwrap();
+            }
+        });
+
+        let started = Instant::now();
+        rebuild_library(&db, &library).await;
+
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(1),
+            "it waited only {waited:?}"
+        );
+        assert!(waited < COMMAND_WAIT, "it waited {waited:?}");
+        assert_eq!(
+            derived_rows(&library.pool).await,
+            fresh_pass(&["kits/kit/model.glb"]).await
+        );
+        assert!(!is_pending(&library.pool).await);
+        assert!(!lock_file.exists());
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_task_leaves_an_offline_librarys_pass_pending() {
+        let (dir, db, library) = locked_library().await;
+        insert_path(&library.pool, "kits/kit/model.glb").await;
+        std::fs::write(dir.path().join(".opendam/index.lock"), "another machine").unwrap();
+        let mut late = db.late_passes.subscribe();
+        rebuild_library(&db, &library).await;
+        assert!(is_pending(&library.pool).await);
+
+        // The share goes away before the follow-up task's first try.
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        let ran = tokio::time::timeout(FOLLOW_UP_RETRY * 2, late.recv()).await;
+
+        assert!(ran.is_err(), "the follow-up task ran a pass: {ran:?}");
+        assert!(derived_rows(&library.pool).await.folders.is_empty());
+        assert!(
+            is_pending(&library.pool).await,
+            "the next open or index run has no pass left to run"
         );
     }
 
