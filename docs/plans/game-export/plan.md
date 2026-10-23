@@ -883,8 +883,12 @@ from the contracts above:
   material with only a base color, until the Game tab's texture pickers fill the rest. The
   suffix lookup is one source: the slot's name, then the model's, may each fill roles. A Unity
   material's alpha clip sets the surface even when an earlier source gave the textures.
-- **A binding is dropped when, once every model is read, its set no longer gives its role** (a
-  later Unity material relabelled the image). The slot doesn't fall through to a later source.
+- **An image has one layout across a domain, whatever order its models are read in.**
+  `infer::domain` first collects what every FBX reference and Unity material says each image
+  holds, keeping a Unity property over an FBX reference, then the first type or property in its
+  list, and only then answers the slots. So a slot's FBX reference takes its image as that
+  layout, and every binding names a file that gives its role. `infer::domain` also names the
+  sets (D24) and returns complete bindings, which the Check only lists.
 - **FBX references resolve against the pack's indexed images,** never the file system: the given
   path under the library root, the relative path with each component ignoring case, then the
   file name ignoring case and extension, by C7's folder rule and then the reference's own

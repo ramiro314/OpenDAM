@@ -615,9 +615,10 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
     }
     let mut unity_packs: HashMap<PackKey, UnityPack> = HashMap::new();
 
-    // Each model with materials, as (its index in `reads`, its pack), and each member image in a
+    // Each model with materials, as (its index in `reads`, its pack, its library and its item),
+    // and each member image in a
     // pack, as (its pack, its index in the pack's images)
-    let mut models: Vec<(usize, PackKey)> = Vec::new();
+    let mut models: Vec<(usize, PackKey, usize, usize)> = Vec::new();
     let mut members: Vec<(PackKey, usize)> = Vec::new();
     let mut jobs: Vec<TextureJob> = Vec::new();
     let mut seen = HashSet::new();
@@ -671,22 +672,15 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                             row.kind = read_fbx(fbx, &item.file_path, &mut issue);
                             if let (Ok(facts), Some(key), Some(p)) = (&fbx.facts, key, pack) {
                                 if facts.reading() == Some(Reading::Model) {
-                                    let unity = (sources[p].origin == Origin::Unity).then(|| {
-                                        &*unity_packs.entry(key).or_insert_with(|| {
+                                    if sources[p].origin == Origin::Unity {
+                                        unity_packs.entry(key).or_insert_with(|| {
                                             UnityPack::read(root, &input.pack_files[&key.1])
-                                        })
-                                    });
-                                    let model = infer::Model {
-                                        item_path: &item.file_path,
-                                        fbx_path: &fbx.path,
-                                        facts,
-                                    };
-                                    let images = catalogs
+                                        });
+                                    }
+                                    catalogs
                                         .entry(key)
                                         .or_insert_with(|| PackImages::new(Vec::new()));
-                                    row.materials = infer::materials(images, root, unity, &model);
-                                    material_names(&row.materials, &mut issue);
-                                    models.push((reads.len(), key));
+                                    models.push((reads.len(), key, l, i));
                                 }
                             }
                         }
@@ -729,33 +723,37 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
         }
     }
 
-    // Every hint is in now, so a binding whose set no longer gives its role (another model's
-    // Unity material called its image something else) has no texture, and is dropped
-    for (r, key) in &models {
-        let images = &catalogs[key];
-        for material in &mut reads[*r].row.materials {
-            material
-                .textures
-                .retain(|role, b| !images.role_sources(b.set, *role).is_empty());
-        }
+    // The models' materials, inferred over the whole domain (C7, D24)
+    let domain_models: Vec<infer::DomainModel<PackKey>> = models
+        .iter()
+        .map(|(r, key, l, i)| {
+            let input = &inputs[*l];
+            let item = &input.items[*i];
+            let fbx = &input.fbx[&item.id];
+            infer::DomainModel {
+                pack: *key,
+                root: &input.library.root_path,
+                unity: unity_packs.get(key),
+                item_path: &item.file_path,
+                fbx_path: &fbx.path,
+                facts: fbx.facts.as_ref().expect("a model's facts"),
+                asset_name: reads[*r].row.asset_name.clone().unwrap_or_default(),
+            }
+        })
+        .collect();
+    let (materials, set_names) = infer::domain(&mut catalogs, &domain_models);
+    for ((r, ..), materials) in models.iter().zip(materials) {
+        let row = &mut reads[*r].row;
+        let asset = row.asset.clone();
+        material_names(&materials, &mut |message: String| {
+            problems.push(Problem {
+                message: format!("{}: {message}", asset.file_path),
+                assets: vec![asset.clone()],
+            })
+        });
+        row.materials = materials;
     }
 
-    // The sets the models use, with the models using them (D24)
-    let mut users: BTreeMap<(PackKey, usize), Vec<infer::SetUse>> = BTreeMap::new();
-    for (m, (r, key)) in models.iter().enumerate() {
-        for material in &reads[*r].row.materials {
-            let mut roles: BTreeMap<usize, Vec<Role>> = BTreeMap::new();
-            for (role, binding) in &material.textures {
-                roles.entry(binding.set).or_default().push(*role);
-            }
-            for (set, roles) in roles {
-                users
-                    .entry((*key, set))
-                    .or_default()
-                    .push((m, material.name.clone(), roles));
-            }
-        }
-    }
     // A member image brings in its whole set, and a material the sources of the roles it uses
     let mut wanted: Vec<(PackKey, usize)> = Vec::new();
     for (key, image) in &members {
@@ -767,55 +765,14 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                 .map(|i| (*key, *i)),
         );
     }
-    // Each binding, as (model's index in `reads`, material, role, pack, set, files)
-    let mut bound: Vec<(usize, usize, Role, PackKey, usize, Vec<String>)> = Vec::new();
-    for (r, key) in &models {
+    for (r, key, ..) in &models {
         let images = &catalogs[key];
-        for (m, material) in reads[*r].row.materials.iter().enumerate() {
+        for material in &reads[*r].row.materials {
             for (role, binding) in &material.textures {
                 let sources = images.role_sources(binding.set, *role);
-                let files = sources
-                    .iter()
-                    .map(|i| images.images[*i].path.clone())
-                    .collect();
                 wanted.extend(sources.into_iter().map(|i| (*key, i)));
-                bound.push((*r, m, *role, *key, binding.set, files));
             }
         }
-    }
-
-    // Every set's default name (D24), before the rows change
-    let set_names: HashMap<(PackKey, usize), String> = {
-        let model_names: Vec<String> = models
-            .iter()
-            .map(|(r, _)| reads[*r].row.asset_name.clone().unwrap_or_default())
-            .collect();
-        let model_sets = |m: usize, role: Role| {
-            let materials = &reads[models[m].0].row.materials;
-            let sets: HashSet<usize> = materials
-                .iter()
-                .filter_map(|material| material.textures.get(&role).map(|b| b.set))
-                .collect();
-            sets.len()
-        };
-        wanted
-            .iter()
-            .map(|(key, image)| (*key, catalogs[key].set_of[*image]))
-            .chain(bound.iter().map(|b| (b.3, b.4)))
-            .map(|(key, set)| {
-                let users = users.get(&(key, set)).map_or(&[][..], Vec::as_slice);
-                let name = infer::set_name(&catalogs[&key], set, users, &model_names, model_sets);
-                ((key, set), name)
-            })
-            .collect()
-    };
-    for (r, m, role, key, set, files) in bound {
-        let binding = reads[r].row.materials[m]
-            .textures
-            .get_mut(&role)
-            .expect("a bound role");
-        binding.asset_name = set_names[&(key, set)].clone();
-        binding.files = files;
     }
     let member_images: HashSet<(PackKey, usize)> = members.into_iter().collect();
     let mut joined = HashSet::new();
@@ -840,7 +797,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                 .map_or("", |(_, e)| e)
                 .to_ascii_lowercase(),
             pack: Some(pack),
-            name: set_names[&(key, images.set_of[image])].clone(),
+            name: set_names.name(&catalogs, key, images.set_of[image]),
             layout: images.layout(image),
             convention: images.convention(image, sources[pack].normal_convention()),
             member: member_images.contains(&(key, image)),
@@ -3131,10 +3088,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_binding_another_model_leaves_without_a_file_is_dropped() {
+    async fn an_image_two_models_disagree_about_has_one_layout_for_both() {
         let f = fixture().await;
-        // Read before SM_Log: its FBX calls T_LeafAtlas, which has no suffix, a normal map.
-        // SM_Log's Leaves.mat then says it is a base color, which wins
+        // SM_Leaf's FBX calls T_LeafAtlas, which has no suffix, a normal map, and SM_Log's
+        // Leaves.mat a base color. The Unity property wins, whichever model is read first, and
+        // SM_Leaf's slot takes the image as what it is
         let leaf = "Unity Moss/Models/SM_Leaf.fbx";
         add_file(&f, leaf, &fixture_bytes("Unity Moss/Models/SM_Log.fbx")).await;
         let facts = Facts::fixture().with(
@@ -3150,11 +3108,15 @@ mod tests {
         );
         let report = check_domain_with(&f, &[leaf, "Unity Moss/Models/SM_Log.fbx"], &facts).await;
 
-        assert_eq!(materials_of(&report, leaf)[0].5, []);
+        // Used by two models, the set keeps its stem (D24)
+        assert_eq!(
+            materials_of(&report, leaf)[0].5,
+            [(Role::BaseColor, "LeafAtlas".to_string(), Via::Fbx)]
+        );
         let leaves = &materials_of(&report, "Unity Moss/Models/SM_Log.fbx")[1];
         assert_eq!(
             leaves.5,
-            [(Role::BaseColor, "LogLeaves".to_string(), Via::Unity)]
+            [(Role::BaseColor, "LeafAtlas".to_string(), Via::Unity)]
         );
         for asset in &report.assets {
             for material in &asset.materials {

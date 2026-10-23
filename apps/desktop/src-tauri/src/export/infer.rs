@@ -11,6 +11,7 @@
 //! Nothing here is stored: inferred values are recomputed at every check (D32).
 
 use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
@@ -133,6 +134,8 @@ fn read_cut_alpha(path: &Path) -> bool {
 struct Hint {
     layout: Layout,
     strong: bool,
+    /// The reference type's or property's place in `REFERENCE_TYPES` or `UNITY_PROPERTIES`
+    rank: usize,
 }
 
 /// One texture set (C8): the images of one folder whose stems match once prefix and suffixes
@@ -155,8 +158,6 @@ pub struct PackImages {
     /// Each image's set
     pub set_of: Vec<usize>,
     hints: HashMap<usize, Hint>,
-    /// Whether an image has a pixel with alpha below 0.5, once read
-    cut_alpha: HashMap<usize, bool>,
 }
 
 impl PackImages {
@@ -193,7 +194,6 @@ impl PackImages {
             sets,
             set_of,
             hints: HashMap::new(),
-            cut_alpha: HashMap::new(),
         }
     }
 
@@ -231,13 +231,13 @@ impl PackImages {
         self.stems[image].convention.unwrap_or(pack)
     }
 
-    /// Records `hint` for `image`. The first hint of each kind stays.
+    /// Records `hint` for `image`, keeping the strongest of its hints: a Unity property's over
+    /// an FBX reference's, then the first type or property in its list. So the layout an image
+    /// ends up with doesn't depend on the order its hints come in.
     fn hint(&mut self, image: usize, hint: Hint) {
-        let stays = self
-            .hints
-            .get(&image)
-            .is_some_and(|h| h.strong || !hint.strong);
-        if !stays {
+        let key = |h: &Hint| (!h.strong, h.rank);
+        let better = self.hints.get(&image).is_none_or(|h| key(&hint) < key(h));
+        if better {
             self.hints.insert(image, hint);
         }
     }
@@ -260,14 +260,9 @@ impl PackImages {
 
     /// Whether `image` has a pixel with alpha below 0.5. An image that can't be decoded has
     /// none.
-    fn has_cut_alpha(&mut self, root: &Path, image: usize) -> bool {
-        if let Some(cut) = self.cut_alpha.get(&image) {
-            return *cut;
-        }
+    fn has_cut_alpha(&self, root: &Path, image: usize) -> bool {
         let path = root.join(&self.images[image].path);
-        let cut = CUT_ALPHA.get(&path, read_cut_alpha).unwrap_or(false);
-        self.cut_alpha.insert(image, cut);
-        cut
+        CUT_ALPHA.get(&path, read_cut_alpha).unwrap_or(false)
     }
 }
 
@@ -353,10 +348,9 @@ pub struct Binding {
     #[serde(skip)]
     pub set: usize,
     pub via: Via,
-    /// The set's default name (C5), once the domain's sets are named
+    /// The set's default name (D24, C5)
     pub asset_name: String,
-    /// The set's sources that give the role, relative to the library root, never empty: a
-    /// binding left with none once every model is read is dropped (`check::evaluate`)
+    /// The set's sources that give the role, relative to the library root, never empty
     pub files: Vec<String>,
 }
 
@@ -381,15 +375,6 @@ pub struct Material {
     /// The slot the export adds for a kept mesh with no material (C9 step 2)
     pub added: bool,
     pub textures: BTreeMap<Role, Binding>,
-}
-
-/// A model to infer the materials of, in its pack.
-pub struct Model<'a> {
-    /// The grid item, relative to the library root
-    pub item_path: &'a str,
-    /// The FBX it exports from (A5)
-    pub fbx_path: &'a str,
-    pub facts: &'a FbxFacts,
 }
 
 /// FBX texture reference types, in the order their answers are taken, with the layout each
@@ -509,61 +494,261 @@ impl Answers {
     }
 }
 
-/// The materials of `model`, whose pack's images are `images` in the library at `root`. In a
-/// Unity pack, `unity` holds its `.meta` and `.mat` files. The slots are the kept meshes' (C7),
-/// each once, then the one the export adds for a kept mesh with no material.
-pub fn materials(
-    images: &mut PackImages,
-    root: &Path,
-    unity: Option<&UnityPack>,
-    model: &Model,
-) -> Vec<Material> {
-    let mut slots: Vec<&str> = Vec::new();
-    for slot in &model.facts.slots {
-        if !slots.contains(&slot.name.as_str()) {
-            slots.push(&slot.name);
+/// A model of a domain, in its pack.
+pub struct DomainModel<'a, K> {
+    /// The key of its pack's images among the catalogs `domain` is given
+    pub pack: K,
+    /// Its library's root
+    pub root: &'a Path,
+    /// Its pack's Unity files, in a Unity pack
+    pub unity: Option<&'a UnityPack>,
+    /// The grid item, relative to the library root
+    pub item_path: &'a str,
+    /// The FBX it exports from (A5)
+    pub fbx_path: &'a str,
+    pub facts: &'a FbxFacts,
+    /// Its `assetName`, after which the sets only it uses are named (D24)
+    pub asset_name: String,
+}
+
+impl<K> DomainModel<'_, K> {
+    /// Its slots (C7): the kept meshes' each once, then the one the export adds for a kept mesh
+    /// with no material, with whether it is that one.
+    fn slots(&self) -> Vec<(String, bool)> {
+        let mut slots: Vec<String> = Vec::new();
+        for slot in &self.facts.slots {
+            if !slots.contains(&slot.name) {
+                slots.push(slot.name.clone());
+            }
+        }
+        let added = self
+            .facts
+            .kept_mesh_without_material
+            .then(|| added_material(slots.iter().map(String::as_str)));
+        let kept = slots.into_iter().map(|s| (s, false));
+        kept.chain(added.map(|a| (a, true))).collect()
+    }
+
+    /// In a Unity pack, its `.fbx.meta`'s material remap.
+    fn remap(&self) -> BTreeMap<String, String> {
+        self.unity
+            .and_then(|_| {
+                let meta = self.root.join(format!("{}.meta", self.fbx_path));
+                std::fs::read_to_string(meta).ok()
+            })
+            .map(|meta| unity::material_remap(&meta))
+            .unwrap_or_default()
+    }
+}
+
+/// The default name of each texture set a domain's models use (D24, C5).
+pub struct SetNames<K> {
+    names: HashMap<(K, usize), String>,
+}
+
+impl<K: Copy + Eq + Hash> SetNames<K> {
+    /// The default name of set `set` of the pack `pack`: what the models using it give it, else,
+    /// used by none, its stem without prefix and suffixes.
+    pub fn name(&self, catalogs: &HashMap<K, PackImages>, pack: K, set: usize) -> String {
+        self.names
+            .get(&(pack, set))
+            .cloned()
+            .unwrap_or_else(|| pascal(catalogs[&pack].set_base(set)))
+    }
+}
+
+/// Infers the materials of a domain's `models` (C7), each model's in the order given, whose packs'
+/// images are `catalogs`, and names the sets they use (D24). It reads in two passes, so no
+/// model's result depends on the others' order: first every FBX reference and Unity material the
+/// models name says what its image holds (`PackImages::hint`), then every slot is answered from
+/// the layouts that gives. So every binding names its set's files that give its role, and
+/// never none.
+pub fn domain<K: Copy + Eq + Hash>(
+    catalogs: &mut HashMap<K, PackImages>,
+    models: &[DomainModel<K>],
+) -> (Vec<Vec<Material>>, SetNames<K>) {
+    let remaps: Vec<BTreeMap<String, String>> = models.iter().map(|m| m.remap()).collect();
+    for (model, remap) in models.iter().zip(&remaps) {
+        let images = catalogs.get_mut(&model.pack).expect("a model's pack");
+        hint(images, model, remap);
+    }
+    let drafts: Vec<Vec<Draft>> = models
+        .iter()
+        .zip(&remaps)
+        .map(|(model, remap)| draft(&catalogs[&model.pack], model, remap))
+        .collect();
+
+    // Each set's users, as (model, first material using it, roles)
+    let mut users: HashMap<(K, usize), Vec<SetUse>> = HashMap::new();
+    for (m, (model, drafts)) in models.iter().zip(&drafts).enumerate() {
+        for draft in drafts {
+            let mut roles: BTreeMap<usize, Vec<Role>> = BTreeMap::new();
+            for (role, (set, _)) in &draft.textures {
+                roles.entry(*set).or_default().push(*role);
+            }
+            for (set, roles) in roles {
+                let name = pascal(&draft.slot);
+                users
+                    .entry((model.pack, set))
+                    .or_default()
+                    .push((m, name, roles));
+            }
         }
     }
-    let added = model
-        .facts
-        .kept_mesh_without_material
-        .then(|| added_material(slots.iter().copied()));
-    let remap = unity
-        .and_then(|_| std::fs::read_to_string(root.join(format!("{}.meta", model.fbx_path))).ok())
-        .map(|meta| unity::material_remap(&meta))
-        .unwrap_or_default();
-
-    let names = slots
+    let model_names: Vec<String> = models.iter().map(|m| m.asset_name.clone()).collect();
+    let model_sets = |m: usize, role: Role| {
+        let sets: std::collections::HashSet<usize> = drafts[m]
+            .iter()
+            .filter_map(|d| d.textures.get(&role).map(|(set, _)| *set))
+            .collect();
+        sets.len()
+    };
+    let names: HashMap<(K, usize), String> = users
         .iter()
-        .map(|s| (s.to_string(), false))
-        .chain(added.map(|a| (a, true)));
-    let mut materials = Vec::new();
-    for (slot, is_added) in names {
+        .map(|((pack, set), uses)| {
+            let name = set_name(&catalogs[pack], *set, uses, &model_names, model_sets);
+            ((*pack, *set), name)
+        })
+        .collect();
+
+    let materials = models
+        .iter()
+        .zip(drafts)
+        .map(|(model, drafts)| {
+            let images = &catalogs[&model.pack];
+            drafts
+                .into_iter()
+                .map(|draft| {
+                    let textures = draft
+                        .textures
+                        .into_iter()
+                        .filter_map(|(role, (set, via))| {
+                            let files: Vec<String> = images
+                                .role_sources(set, role)
+                                .into_iter()
+                                .map(|i| images.images[i].path.clone())
+                                .collect();
+                            let asset_name = names[&(model.pack, set)].clone();
+                            // Answered from final layouts, a role always has a file; the filter
+                            // keeps the invariant should that ever change
+                            (!files.is_empty()).then_some((
+                                role,
+                                Binding {
+                                    set,
+                                    via,
+                                    asset_name,
+                                    files,
+                                },
+                            ))
+                        })
+                        .collect();
+                    Material {
+                        name: pascal(&draft.slot),
+                        surface: if draft.cutout {
+                            Surface::Cutout
+                        } else {
+                            Surface::Opaque
+                        },
+                        cutout_suggested: draft.cutout_suggested,
+                        added: draft.added,
+                        textures,
+                        slot: draft.slot,
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    (materials, SetNames { names })
+}
+
+/// Records what `model`'s FBX references and Unity materials say each image they name holds
+/// (C7 steps 1 and 2), whether or not a slot ends up taking it.
+fn hint<K>(images: &mut PackImages, model: &DomainModel<K>, remap: &BTreeMap<String, String>) {
+    for slot in &model.facts.slots {
+        for (rank, (kind, layout)) in REFERENCE_TYPES.into_iter().enumerate() {
+            let refs = slot.textures.get(kind).into_iter().flatten();
+            let image = refs
+                .filter_map(|r| resolve(images, model.root, model.fbx_path, r))
+                .next();
+            if let Some(image) = image {
+                let strong = false;
+                images.hint(
+                    image,
+                    Hint {
+                        layout,
+                        strong,
+                        rank,
+                    },
+                );
+            }
+        }
+    }
+    let Some(unity) = model.unity else { return };
+    for (slot, _) in model.slots() {
+        let Some(mat) = unity.material(remap, model.fbx_path, &slot) else {
+            continue;
+        };
+        for (rank, property) in UNITY_PROPERTIES.into_iter().enumerate() {
+            let image = mat
+                .textures
+                .get(property)
+                .and_then(|guid| unity.by_guid.get(guid))
+                .and_then(|path| images.find(path));
+            if let (Some(image), Some(layout)) = (image, unity::property_layout(property)) {
+                let strong = true;
+                images.hint(
+                    image,
+                    Hint {
+                        layout,
+                        strong,
+                        rank,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// One slot, answered, before the domain's sets are named.
+struct Draft {
+    slot: String,
+    added: bool,
+    cutout: bool,
+    cutout_suggested: bool,
+    /// The set and source of each role
+    textures: BTreeMap<Role, (usize, Via)>,
+}
+
+/// Answers each slot of `model` from the first source with an answer (D11), reading each
+/// image's layout as every model's hints left it.
+fn draft<K>(
+    images: &PackImages,
+    model: &DomainModel<K>,
+    remap: &BTreeMap<String, String>,
+) -> Vec<Draft> {
+    let mut drafts = Vec::new();
+    for (slot, added) in model.slots() {
         let mut answers = Answers::default();
 
-        // 1. The FBX's references
+        // 1. The FBX's references: an image referenced as two types gives the roles of its
+        // layout only
         let references = model.facts.slots.iter().find(|s| s.name == slot);
-        for (kind, layout) in REFERENCE_TYPES {
+        for (kind, _) in REFERENCE_TYPES {
             let refs = references.and_then(|s| s.textures.get(kind));
-            for reference in refs.into_iter().flatten() {
-                if let Some(image) = resolve(images, root, model.fbx_path, reference) {
-                    images.hint(
-                        image,
-                        Hint {
-                            layout,
-                            strong: false,
-                        },
-                    );
-                    // The layout the image now has, which its set's sources are read by: an
-                    // image referenced as two types gives the roles of the first only
-                    answers.answer(images.layout(image), images.set_of[image], Via::Fbx);
-                    break;
-                }
+            let image = refs
+                .into_iter()
+                .flatten()
+                .filter_map(|r| resolve(images, model.root, model.fbx_path, r))
+                .next();
+            if let Some(image) = image {
+                answers.answer(images.layout(image), images.set_of[image], Via::Fbx);
             }
         }
 
-        // 2. A Unity material
-        let mat = unity.and_then(|u| Some((u, u.material(&remap, model.fbx_path, &slot)?)));
+        // 2. A Unity material, whose alpha clip sets the surface whichever source answered
+        let mat = model
+            .unity
+            .and_then(|u| Some((u, u.material(remap, model.fbx_path, &slot)?)));
         if let Some((unity, mat)) = mat {
             answers.cutout = mat.alpha_clip;
             for property in UNITY_PROPERTIES {
@@ -572,17 +757,9 @@ pub fn materials(
                     .get(property)
                     .and_then(|guid| unity.by_guid.get(guid))
                     .and_then(|path| images.find(path));
-                let (Some(image), Some(layout)) = (image, unity::property_layout(property)) else {
-                    continue;
-                };
-                images.hint(
-                    image,
-                    Hint {
-                        layout,
-                        strong: true,
-                    },
-                );
-                answers.answer(images.layout(image), images.set_of[image], Via::Unity);
+                if let Some(image) = image {
+                    answers.answer(images.layout(image), images.set_of[image], Via::Unity);
+                }
             }
         }
 
@@ -594,12 +771,11 @@ pub fn materials(
             // Each role from one set, chosen by its folder
             let mut best: BTreeMap<Role, ((usize, String), usize)> = BTreeMap::new();
             for (i, stem) in images.stems.iter().enumerate() {
-                let Some(layout) = stem.layout else { continue };
-                if images.keys[i] != key {
+                if stem.layout.is_none() || images.keys[i] != key {
                     continue;
                 }
                 let rank = folder_rank(dir_of(model.fbx_path), dir_of(&images.images[i].path));
-                for role in layout.outputs() {
+                for role in images.layout(i).outputs() {
                     let entry = best
                         .entry(*role)
                         .or_insert((rank.clone(), images.set_of[i]));
@@ -613,7 +789,8 @@ pub fn materials(
             }
         }
 
-        // 4. An image beside the model with its stem, when no other source answered
+        // 4. An image beside the model with its stem, as BaseColor, when no other source
+        // answered
         if answers.textures.is_empty() {
             let beside = [model.item_path, model.fbx_path];
             let same_stem = (0..images.images.len())
@@ -625,16 +802,8 @@ pub fn materials(
                 })
                 .min_by_key(|i| images.images[*i].path.to_lowercase());
             if let Some(image) = same_stem {
-                let layout = Layout::Role(Role::BaseColor);
-                images.hint(
-                    image,
-                    Hint {
-                        layout,
-                        strong: false,
-                    },
-                );
-                // Only as a BaseColor: an image another source called something else isn't
                 if images.layout(image).outputs().contains(&Role::BaseColor) {
+                    let layout = Layout::Role(Role::BaseColor);
                     answers.answer(layout, images.set_of[image], Via::Stem);
                 }
             }
@@ -648,46 +817,27 @@ pub fn materials(
                     images
                         .role_sources(*set, Role::BaseColor)
                         .into_iter()
-                        .any(|i| images.has_cut_alpha(root, i))
+                        .any(|i| images.has_cut_alpha(model.root, i))
                 });
-        materials.push(Material {
-            name: pascal(&slot),
-            surface: if answers.cutout {
-                Surface::Cutout
-            } else {
-                Surface::Opaque
-            },
-            cutout_suggested,
-            added: is_added,
-            textures: answers
-                .textures
-                .into_iter()
-                .map(|(role, (set, via))| {
-                    (
-                        role,
-                        Binding {
-                            set,
-                            via,
-                            asset_name: String::new(),
-                            files: Vec::new(),
-                        },
-                    )
-                })
-                .collect(),
+        drafts.push(Draft {
             slot,
+            added,
+            cutout: answers.cutout,
+            cutout_suggested,
+            textures: answers.textures,
         });
     }
-    materials
+    drafts
 }
 
 /// One model's use of a texture set: the model's index, the name of the first material using
 /// the set, and the roles the model uses it in.
-pub type SetUse = (usize, String, Vec<Role>);
+type SetUse = (usize, String, Vec<Role>);
 
 /// A texture set's default name (D24, C5): the model's `assetName` when one model uses it, or
 /// `<AssetName><MaterialName>` when that model has more than one set in a role this set fills
 /// for it, else its stem without prefix and suffixes.
-pub fn set_name(
+fn set_name(
     images: &PackImages,
     set: usize,
     users: &[SetUse],
@@ -783,18 +933,33 @@ mod tests {
     /// Each material of the fixture model at `path` as (slot, name, surface, suggested, added,
     /// role -> (set's first file, via)).
     fn infer(pack: &str, path: &str) -> (PackImages, Vec<Material>) {
-        let mut images = pack_images(pack);
+        let images = pack_images(pack);
         let facts = fixture_facts(path);
         let unity = path
             .starts_with("Unity Moss")
             .then(|| UnityPack::read(root(), &pack_files(pack)));
-        let model = Model {
+        one(images, unity.as_ref(), path, &facts)
+    }
+
+    /// `domain` over the one model at `path` with `facts`, whose pack's images are `images`.
+    fn one(
+        images: PackImages,
+        unity: Option<&UnityPack>,
+        path: &str,
+        facts: &FbxFacts,
+    ) -> (PackImages, Vec<Material>) {
+        let mut catalogs = HashMap::from([(0, images)]);
+        let model = DomainModel {
+            pack: 0,
+            root: root(),
+            unity,
             item_path: path,
             fbx_path: path,
-            facts: &facts,
+            facts,
+            asset_name: pascal(stem_of(path)),
         };
-        let materials = materials(&mut images, root(), unity.as_ref(), &model);
-        (images, materials)
+        let (mut materials, _) = domain(&mut catalogs, &[model]);
+        (catalogs.remove(&0).unwrap(), materials.remove(0))
     }
 
     /// `material`'s textures as role -> (the set's sources giving it, via).
@@ -901,7 +1066,7 @@ mod tests {
         assert_eq!(pillar.len(), 2);
 
         // A reference by absolute path inside the library, and one found only by its name
-        let mut images = pack_images("Dungeon Props");
+        let images = pack_images("Dungeon Props");
         let absolute = root().join("Dungeon Props/Textures/T_Wall_N_DX.png");
         let facts = FbxFacts {
             slots: vec![Slot {
@@ -934,12 +1099,7 @@ mod tests {
             has_kept_mesh: true,
             ..FbxFacts::default()
         };
-        let model = Model {
-            item_path: "Dungeon Props/Models/SM_Wall.fbx",
-            fbx_path: "Dungeon Props/Models/SM_Wall.fbx",
-            facts: &facts,
-        };
-        let wall = materials(&mut images, root(), None, &model);
+        let (images, wall) = one(images, None, "Dungeon Props/Models/SM_Wall.fbx", &facts);
         assert_eq!(
             textures(&images, &wall[0]),
             [
@@ -1200,7 +1360,7 @@ mod tests {
         slot: &str,
         references: &[(&str, &str)],
     ) -> (PackImages, Vec<Material>) {
-        let mut images = pack_images(pack);
+        let images = pack_images(pack);
         let facts = FbxFacts {
             slots: vec![Slot {
                 name: slot.into(),
@@ -1223,13 +1383,79 @@ mod tests {
         let unity = pack
             .starts_with("Unity Moss")
             .then(|| UnityPack::read(root(), &pack_files(pack)));
-        let model = Model {
-            item_path: fbx_path,
-            fbx_path,
-            facts: &facts,
+        one(images, unity.as_ref(), fbx_path, &facts)
+    }
+
+    #[test]
+    fn a_domains_materials_dont_depend_on_the_order_its_models_are_read_in() {
+        // SM_Leaf's FBX calls T_LeafAtlas, which has no suffix, a normal map; SM_Log's
+        // Leaves.mat says it is a base color, and a Unity property wins whichever is read first
+        let pack = "Unity Moss";
+        let unity = UnityPack::read(root(), &pack_files(pack));
+        let leaf_facts = FbxFacts {
+            slots: vec![Slot {
+                name: "Frond".into(),
+                textures: BTreeMap::from([(
+                    "normal".to_string(),
+                    vec![TextureRef {
+                        file: None,
+                        relative: Some("../Textures/T_LeafAtlas.png".into()),
+                    }],
+                )]),
+            }],
+            has_kept_mesh: true,
+            ..FbxFacts::default()
         };
-        let materials = materials(&mut images, root(), unity.as_ref(), &model);
-        (images, materials)
+        let log_facts = fixture_facts("Unity Moss/Models/SM_Log.fbx");
+        let model = |path: &'static str, facts| DomainModel {
+            pack: 0,
+            root: root(),
+            unity: Some(&unity),
+            item_path: path,
+            fbx_path: path,
+            facts,
+            asset_name: pascal(stem_of(path)),
+        };
+        let leaf = model("Unity Moss/Models/SM_Leaf.fbx", &leaf_facts);
+        let log = model("Unity Moss/Models/SM_Log.fbx", &log_facts);
+        let run = |models: &[&DomainModel<i32>]| {
+            let mut catalogs = HashMap::from([(0, pack_images(pack))]);
+            let models: Vec<DomainModel<i32>> = models
+                .iter()
+                .map(|m| DomainModel {
+                    unity: m.unity,
+                    asset_name: m.asset_name.clone(),
+                    ..**m
+                })
+                .collect();
+            domain(&mut catalogs, &models).0
+        };
+        let forward = run(&[&leaf, &log]);
+        let mut backward = run(&[&log, &leaf]);
+        backward.reverse();
+        assert_eq!(forward, backward);
+
+        // The FBX's reference answers the slot with the image's one layout, BaseColor, and the
+        // set two models use keeps its stem
+        let frond = &forward[0][0];
+        assert_eq!(frond.textures.len(), 1);
+        let binding = &frond.textures[&Role::BaseColor];
+        assert_eq!(
+            (
+                binding.via,
+                binding.asset_name.as_str(),
+                binding.files.as_slice()
+            ),
+            (
+                Via::Fbx,
+                "LeafAtlas",
+                &["Unity Moss/Textures/T_LeafAtlas.png".to_string()][..]
+            )
+        );
+        assert_eq!(
+            forward[1][1].textures[&Role::BaseColor].asset_name,
+            "LeafAtlas"
+        );
     }
 
     #[test]
