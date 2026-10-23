@@ -108,24 +108,8 @@ pub async fn runs(pool: &Pool<Sqlite>, library_id: &str) -> sqlx::Result<Vec<Run
     Ok(rows.into_iter().map(|r| summary(library_id, r)).collect())
 }
 
-/// A run's owner: the process that queued it (`watcher::this_process`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Owner {
-    pub machine: Option<String>,
-    pub pid: u32,
-    pub started: u64,
-}
-
-impl Owner {
-    pub fn this_process() -> Self {
-        let (machine, pid, started) = crate::watcher::this_process();
-        Owner {
-            machine,
-            pid,
-            started,
-        }
-    }
-}
+/// A run's owner: the process that queued it, then the one that runs it.
+pub type Owner = crate::watcher::ProcessIdentity;
 
 /// A step as the caller gives it, before it is stored.
 #[derive(Debug, Clone)]
@@ -207,13 +191,14 @@ pub async fn create_import(
         recipe_rev: 0
     }]);
     sqlx::query(
-        "INSERT INTO import_runs (id, kind, packs, status, created_at, owner_machine, owner_pid,
-         owner_started, heartbeat_at) VALUES (?, 'import', ?, 'queued', ?, ?, ?, ?, ?)",
+        "INSERT INTO import_runs (id, kind, packs, status, created_at, owner_machine, owner_boot,
+         owner_pid, owner_started, heartbeat_at) VALUES (?, 'import', ?, 'queued', ?, ?, ?, ?, ?, ?)",
     )
     .bind(&run_id)
     .bind(packs.to_string())
     .bind(now)
     .bind(&owner.machine)
+    .bind(&owner.boot)
     .bind(owner.pid as i64)
     .bind(owner.started as i64)
     .bind(now)

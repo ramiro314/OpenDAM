@@ -27,6 +27,8 @@ use crate::db::{Database, LibraryHandle};
 const HEARTBEAT: Duration = Duration::from_secs(30);
 /// Another machine's run whose heartbeat is this old is gone.
 const DEAD_AFTER: Duration = Duration::from_secs(10 * 60);
+/// How long the engine waits before retrying a run it couldn't claim.
+const CLAIM_RETRY: Duration = Duration::from_secs(5);
 /// How long a build waits for another machine's advisory lock.
 const LOCK_WAIT: Duration = Duration::from_secs(5 * 60);
 
@@ -90,7 +92,7 @@ impl Engine {
             events,
             wake: Notify::new(),
             active: Mutex::new(None),
-            owner: Owner::this_process(),
+            owner: crate::watcher::this_process(),
             hooks: Hooks::default(),
             lock_wait,
         })
@@ -137,19 +139,24 @@ impl Engine {
 
     async fn interrupt_dead_runs(&self, library: &LibraryHandle) -> sqlx::Result<()> {
         #[allow(clippy::type_complexity)]
-        let running: Vec<(String, Option<String>, i64, i64, Option<i64>)> = sqlx::query_as(
-            "SELECT id, owner_machine, owner_pid, owner_started, heartbeat_at FROM import_runs
-             WHERE status = 'running'",
+        let running: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+            Option<i64>,
+        )> = sqlx::query_as(
+            "SELECT id, owner_machine, owner_boot, owner_pid, owner_started, heartbeat_at
+                 FROM import_runs WHERE status = 'running'",
         )
         .fetch_all(&library.pool)
         .await?;
         let now = now_ms();
-        for (id, machine, pid, started, heartbeat) in running {
-            let gone = if machine.is_some() && machine == self.owner.machine {
-                !crate::watcher::process_alive(pid as u32, started as u64)
-            } else {
-                now - heartbeat.unwrap_or(0) >= DEAD_AFTER.as_millis() as i64
-            };
+        for (id, machine, boot, pid, started, heartbeat) in running {
+            let gone = self
+                .local_owner_gone(&machine, &boot, pid, started)
+                .unwrap_or_else(|| now - heartbeat.unwrap_or(0) >= DEAD_AFTER.as_millis() as i64);
             if !gone {
                 continue;
             }
@@ -170,9 +177,17 @@ impl Engine {
     async fn next_run(&self) -> Option<(LibraryHandle, Queued)> {
         for library in self.db.get_all_libraries().await {
             #[allow(clippy::type_complexity)]
-            let queued: Vec<(String, String, String, Option<String>, i64, i64)> = match sqlx::query_as(
-                "SELECT id, kind, packs, owner_machine, owner_pid, owner_started FROM import_runs
-                 WHERE status = 'queued' ORDER BY created_at, rowid",
+            let queued: Vec<(
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                i64,
+                i64,
+            )> = match sqlx::query_as(
+                "SELECT id, kind, packs, owner_machine, owner_boot, owner_pid, owner_started
+                 FROM import_runs WHERE status = 'queued' ORDER BY created_at, rowid",
             )
             .fetch_all(&library.pool)
             .await
@@ -183,13 +198,12 @@ impl Engine {
                     continue;
                 }
             };
-            for (id, kind, packs, machine, pid, started) in queued {
+            for (id, kind, packs, machine, boot, pid, started) in queued {
                 let mine = machine == self.owner.machine
+                    && boot == self.owner.boot
                     && pid as u32 == self.owner.pid
                     && started as u64 == self.owner.started;
-                let orphan = machine.is_some()
-                    && machine == self.owner.machine
-                    && !crate::watcher::process_alive(pid as u32, started as u64);
+                let orphan = self.local_owner_gone(&machine, &boot, pid, started) == Some(true);
                 if mine || orphan {
                     let packs = serde_json::from_str(&packs).unwrap_or_default();
                     return Some((library, Queued { id, kind, packs }));
@@ -199,26 +213,53 @@ impl Engine {
         None
     }
 
+    /// Whether a run's owner on this machine is gone: one of an earlier boot always is, one of
+    /// this boot while no process has its pid and start time. `None` for another machine's run,
+    /// or when this machine's id is unknown, which only its heartbeat can tell.
+    fn local_owner_gone(
+        &self,
+        machine: &Option<String>,
+        boot: &Option<String>,
+        pid: i64,
+        started: i64,
+    ) -> Option<bool> {
+        if self.owner.machine.is_none() || *machine != self.owner.machine {
+            return None;
+        }
+        Some(*boot != self.owner.boot || !crate::watcher::process_alive(pid as u32, started as u64))
+    }
+
     async fn execute(&self, library: &LibraryHandle, run: Queued) {
         let control = Arc::new(RunControl::default());
         self.set_active(Some((run.id.clone(), control.clone())));
         let claimed = sqlx::query(
             "UPDATE import_runs SET status = 'running', started_at = ?, heartbeat_at = ?,
-             owner_machine = ?, owner_pid = ?, owner_started = ?
+             owner_machine = ?, owner_boot = ?, owner_pid = ?, owner_started = ?
              WHERE id = ? AND status = 'queued'",
         )
         .bind(now_ms())
         .bind(now_ms())
         .bind(&self.owner.machine)
+        .bind(&self.owner.boot)
         .bind(self.owner.pid as i64)
         .bind(self.owner.started as i64)
         .bind(&run.id)
         .execute(&library.pool)
         .await;
-        if !matches!(&claimed, Ok(done) if done.rows_affected() == 1) {
-            // Cancelled while queued, or claimed by another engine.
-            self.set_active(None);
-            return;
+        match claimed {
+            Ok(done) if done.rows_affected() == 1 => {}
+            // Cancelled while queued, or claimed by another engine: no longer queued.
+            Ok(_) => {
+                self.set_active(None);
+                return;
+            }
+            Err(e) => {
+                // Still queued: wait before the loop finds it again.
+                tracing::error!("Could not claim import run {}: {e}", run.id);
+                self.set_active(None);
+                tokio::time::sleep(CLAIM_RETRY).await;
+                return;
+            }
         }
         self.updated(library, &run.id).await;
 
@@ -1024,35 +1065,26 @@ mod tests {
     async fn startup_interrupts_only_runs_whose_owner_is_gone() {
         let s = setup().await;
         let me = s.engine.owner.clone();
+        let (here, boot) = (me.machine.as_deref(), me.boot.as_deref());
+        let (pid, started) = (me.pid as i64, me.started as i64);
         let now = now_ms();
         let stale = now - DEAD_AFTER.as_millis() as i64 - 1;
-        let runs: [(&str, Option<&str>, i64, i64, i64); 4] = [
-            ("dead_here", me.machine.as_deref(), i32::MAX as i64, 1, now),
+        let runs: [OwnedRun; 5] = [
+            ("dead_here", here, boot, i32::MAX as i64, 1, now),
+            // A pid and start time that this boot's process has, from an earlier boot.
             (
-                "mine",
-                me.machine.as_deref(),
-                me.pid as i64,
-                me.started as i64,
+                "earlier_boot_here",
+                here,
+                Some("earlier"),
+                pid,
+                started,
                 now,
             ),
-            ("silent_there", Some("elsewhere"), 1, 1, stale),
-            ("alive_there", Some("elsewhere"), 1, 1, now),
+            ("mine", here, boot, pid, started, now),
+            ("silent_there", Some("elsewhere"), boot, 1, 1, stale),
+            ("alive_there", Some("elsewhere"), boot, 1, 1, now),
         ];
-        for (id, machine, pid, started, heartbeat) in runs {
-            sqlx::query(
-                "INSERT INTO import_runs (id, kind, packs, status, created_at, owner_machine,
-                 owner_pid, owner_started, heartbeat_at) VALUES (?, 'import', '[]', 'running',
-                 0, ?, ?, ?, ?)",
-            )
-            .bind(id)
-            .bind(machine)
-            .bind(pid)
-            .bind(started)
-            .bind(heartbeat)
-            .execute(&s.lib.pool)
-            .await
-            .unwrap();
-        }
+        insert_runs(&s, "running", &runs).await;
 
         s.engine.interrupt_dead_runs(&s.lib).await.unwrap();
 
@@ -1060,10 +1092,38 @@ mod tests {
             .strings("SELECT id FROM import_runs WHERE status = 'interrupted' ORDER BY id")
             .await;
         if me.machine.is_some() {
-            assert_eq!(interrupted, ["dead_here", "silent_there"]);
+            assert_eq!(
+                interrupted,
+                ["dead_here", "earlier_boot_here", "silent_there"]
+            );
         } else {
             // Without a machine id, a run is judged by its heartbeat alone.
             assert_eq!(interrupted, ["silent_there"]);
+        }
+    }
+
+    /// A run as `(id, machine, boot, pid, started, heartbeat)`.
+    type OwnedRun<'a> = (&'a str, Option<&'a str>, Option<&'a str>, i64, i64, i64);
+
+    /// Inserts `runs` in `status`, created in order.
+    async fn insert_runs(s: &Setup, status: &str, runs: &[OwnedRun<'_>]) {
+        for (created, (id, machine, boot, pid, started, heartbeat)) in runs.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO import_runs (id, kind, packs, status, created_at, owner_machine,
+                 owner_boot, owner_pid, owner_started, heartbeat_at)
+                 VALUES (?, 'import', '[]', ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(status)
+            .bind(created as i64)
+            .bind(machine)
+            .bind(boot)
+            .bind(pid)
+            .bind(started)
+            .bind(heartbeat)
+            .execute(&s.lib.pool)
+            .await
+            .unwrap();
         }
     }
 
@@ -1093,6 +1153,12 @@ mod tests {
         let run = s.engine.start_import(s.golden_request()).await.unwrap();
         s.wait_for_step("waiting for the library").await;
 
+        // The wait leaves this app's index lock free for its own commands.
+        let index_lock = s.engine.db.index_lock("lib");
+        let free = tokio::time::timeout(Duration::from_millis(500), index_lock.lock())
+            .await
+            .expect("the build held the index lock while it waited");
+        drop(free);
         s.engine.cancel_run("lib", &run.id).await.unwrap();
 
         s.unchanged_after_cancel(&run.id, &assets).await;
@@ -1129,45 +1195,45 @@ mod tests {
     async fn an_engine_claims_its_own_runs_and_a_dead_local_process_s_but_no_other_owner_s() {
         let s = setup_with(false).await;
         let me = s.engine.owner.clone();
+        let (here, boot) = (me.machine.as_deref(), me.boot.as_deref());
         // Another live process on this machine: the test's parent.
         let parent = std::os::unix::process::parent_id();
         let parent_started = crate::watcher::process_start_time(parent).unwrap() as i64;
-        let runs: [(&str, Option<&str>, i64, i64); 3] = [
-            ("live_elsewhere", Some("elsewhere"), 1, 1),
+        let now = now_ms();
+        let runs: [OwnedRun; 4] = [
+            ("live_elsewhere", Some("elsewhere"), boot, 1, 1, now),
+            ("live_here", here, boot, parent as i64, parent_started, now),
+            // The parent's pid and start time, from an earlier boot: gone.
             (
-                "live_here",
-                me.machine.as_deref(),
+                "earlier_boot",
+                here,
+                Some("earlier"),
                 parent as i64,
                 parent_started,
+                now,
             ),
-            ("orphan", me.machine.as_deref(), i32::MAX as i64, 1),
+            ("orphan", here, boot, i32::MAX as i64, 1, now),
         ];
-        for (created, (id, machine, pid, started)) in runs.into_iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO import_runs (id, kind, packs, status, created_at, owner_machine,
-                 owner_pid, owner_started) VALUES (?, 'import', '[]', 'queued', ?, ?, ?, ?)",
-            )
-            .bind(id)
-            .bind(created as i64)
-            .bind(machine)
-            .bind(pid)
-            .bind(started)
-            .execute(&s.lib.pool)
-            .await
-            .unwrap();
+        insert_runs(&s, "queued", &runs).await;
+        let mut claims = Vec::new();
+        while let Some((_, run)) = s.engine.next_run().await {
+            sqlx::query("DELETE FROM import_runs WHERE id = ?")
+                .bind(&run.id)
+                .execute(&s.lib.pool)
+                .await
+                .unwrap();
+            claims.push(run.id);
         }
-        let claimed = s.engine.next_run().await.map(|(_, run)| run.id);
         if me.machine.is_some() {
-            assert_eq!(claimed.as_deref(), Some("orphan"));
+            assert_eq!(claims, ["earlier_boot", "orphan"]);
         } else {
-            assert_eq!(claimed, None, "without a machine id no orphan is adopted");
+            assert!(
+                claims.is_empty(),
+                "without a machine id no orphan is adopted"
+            );
         }
 
         let run = s.engine.start_import(s.golden_request()).await.unwrap();
-        sqlx::query("DELETE FROM import_runs WHERE id = 'orphan'")
-            .execute(&s.lib.pool)
-            .await
-            .unwrap();
         let claimed = s.engine.next_run().await.map(|(_, run)| run.id);
         assert_eq!(claimed, Some(run.id), "its own run, never another owner's");
     }

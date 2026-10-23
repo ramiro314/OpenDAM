@@ -281,9 +281,8 @@ pub async fn build_first(
         total: 0,
     });
     let index_lock = env.db.index_lock(&env.library.id);
-    let index_guard = index_lock.lock().await;
-    let advisory = match advisory_lock(env, &root).await {
-        Ok(advisory) => advisory,
+    let (index_guard, advisory) = match both_locks(env, &index_lock, &root).await {
+        Ok(locks) => locks,
         Err(stop) => return Err(cleanup.run(stop).await),
     };
     if !env.control.lock() {
@@ -611,14 +610,22 @@ fn file_stamp(path: &Path) -> std::io::Result<(u64, i64)> {
     Ok((meta.len(), mtime.as_nanos() as i64))
 }
 
-/// Takes the advisory lock, waiting up to `lock_wait` for another holder. Cancel still stops the
-/// wait. A lock taken at once is returned even when cancelled: `RunControl::lock` decides then.
-async fn advisory_lock(env: &BuildEnv<'_>, root: &Path) -> Result<IndexLock, Stop> {
+/// Takes the library's `index_lock`, then the advisory lock, waiting up to `lock_wait` for
+/// another holder of the advisory lock. Between tries it lets `index_lock` go, so this app's own
+/// commands and index runs aren't held up by another machine. Cancel stops the wait. Locks taken
+/// are returned even when cancelled: `RunControl::lock` decides then.
+async fn both_locks<'l>(
+    env: &BuildEnv<'_>,
+    index_lock: &'l tokio::sync::Mutex<()>,
+    root: &Path,
+) -> Result<(tokio::sync::MutexGuard<'l, ()>, IndexLock), Stop> {
     let deadline = tokio::time::Instant::now() + env.lock_wait;
     loop {
+        let index_guard = index_lock.lock().await;
         if let Some(lock) = IndexLock::try_acquire(root).await {
-            return Ok(lock);
+            return Ok((index_guard, lock));
         }
+        drop(index_guard);
         if env.control.cancelled() {
             return Err(Stop::Cancelled);
         }

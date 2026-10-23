@@ -234,7 +234,8 @@ CREATE TABLE IF NOT EXISTS import_moves (
 -- Import runs, a durable queue (import/engine.rs). `packs` is a JSON array of
 -- {"packId", "recipeRev"}, each pack's `recipe_rev` when it was queued, and `warnings` a JSON
 -- array of the entries a build skipped. A run belongs to the process that queued it: its owner
--- (`watcher` names a machine, boot and pid namespace) and a heartbeat its task rewrites.
+-- (its machine and pid namespace, its boot, pid and start time, `watcher::this_process`) and a
+-- heartbeat its task rewrites.
 CREATE TABLE IF NOT EXISTS import_runs (
     id              TEXT PRIMARY KEY,
     kind            TEXT NOT NULL CHECK (kind IN ('import', 'rebuild', 'remove')),
@@ -251,6 +252,7 @@ CREATE TABLE IF NOT EXISTS import_runs (
     started_at      INTEGER,
     finished_at     INTEGER,
     owner_machine   TEXT,
+    owner_boot      TEXT,
     owner_pid       INTEGER NOT NULL,
     owner_started   INTEGER NOT NULL,
     heartbeat_at    INTEGER
