@@ -6,21 +6,12 @@
         "textures": {}
       }
     ],
-    "kept_meshes": [
-      "SK_Guard"
-    ],
+    "kept_meshes": ["SK_Guard"],
     "dropped_meshes": [],
     "has_kept_mesh": true,
     "kept_mesh_without_material": false,
-    "bones": [
-      "Hips",
-      "Spine",
-      "Head",
-      "Head_end"
-    ],
-    "takes": [
-      "Wave"
-    ]
+    "bones": ["Hips", "Spine", "Head", "Head_end"],
+    "takes": ["Wave"]
   },
   "Dungeon Props/Models/SM_Bench.fbx": {
     "slots": [
@@ -33,10 +24,7 @@
         "textures": {}
       }
     ],
-    "kept_meshes": [
-      "SM_Bench_Legs",
-      "SM_Bench_Seat"
-    ],
+    "kept_meshes": ["SM_Bench_Legs", "SM_Bench_Seat"],
     "dropped_meshes": [],
     "has_kept_mesh": true,
     "kept_mesh_without_material": false,
@@ -45,9 +33,7 @@
   },
   "Dungeon Props/Models/SM_Boulder.fbx": {
     "slots": [],
-    "kept_meshes": [
-      "SM_Boulder"
-    ],
+    "kept_meshes": ["SM_Boulder"],
     "dropped_meshes": [],
     "has_kept_mesh": true,
     "kept_mesh_without_material": true,
@@ -56,9 +42,7 @@
   },
   "Dungeon Props/Models/SM_Chest.fbx": {
     "slots": [],
-    "kept_meshes": [
-      "SM_Chest"
-    ],
+    "kept_meshes": ["SM_Chest"],
     "dropped_meshes": [],
     "has_kept_mesh": true,
     "kept_mesh_without_material": true,
@@ -72,13 +56,8 @@
         "textures": {}
       }
     ],
-    "kept_meshes": [
-      "SM_Gate_LOD0",
-      "SM_Gate_LOD1"
-    ],
-    "dropped_meshes": [
-      "UCX_SM_Gate_00"
-    ],
+    "kept_meshes": ["SM_Gate_LOD0", "SM_Gate_LOD1"],
+    "dropped_meshes": ["UCX_SM_Gate_00"],
     "has_kept_mesh": true,
     "kept_mesh_without_material": false,
     "bones": [],
@@ -87,9 +66,7 @@
   "Dungeon Props/Models/SM_Hull.fbx": {
     "slots": [],
     "kept_meshes": [],
-    "dropped_meshes": [
-      "UCX_SM_Hull_00"
-    ],
+    "dropped_meshes": ["UCX_SM_Hull_00"],
     "has_kept_mesh": false,
     "kept_mesh_without_material": false,
     "bones": [],
@@ -102,10 +79,7 @@
         "textures": {}
       }
     ],
-    "kept_meshes": [
-      "SM_Lamp_Base",
-      "SM_Lamp_Shade"
-    ],
+    "kept_meshes": ["SM_Lamp_Base", "SM_Lamp_Shade"],
     "dropped_meshes": [],
     "has_kept_mesh": true,
     "kept_mesh_without_material": true,
@@ -136,13 +110,8 @@
         "textures": {}
       }
     ],
-    "kept_meshes": [
-      "SM_Pillar_LOD0",
-      "SM_Pillar_LOD1"
-    ],
-    "dropped_meshes": [
-      "UCX_SM_Pillar_00"
-    ],
+    "kept_meshes": ["SM_Pillar_LOD0", "SM_Pillar_LOD1"],
+    "dropped_meshes": ["UCX_SM_Pillar_00"],
     "has_kept_mesh": true,
     "kept_mesh_without_material": false,
     "bones": [],
@@ -155,10 +124,7 @@
         "textures": {}
       }
     ],
-    "kept_meshes": [
-      "SM_Shelf_Board",
-      "SM_Shelf_Frame"
-    ],
+    "kept_meshes": ["SM_Shelf_Board", "SM_Shelf_Frame"],
     "dropped_meshes": [],
     "has_kept_mesh": true,
     "kept_mesh_without_material": true,
@@ -172,9 +138,7 @@
         "textures": {}
       }
     ],
-    "kept_meshes": [
-      "SM_Stool"
-    ],
+    "kept_meshes": ["SM_Stool"],
     "dropped_meshes": [],
     "has_kept_mesh": true,
     "kept_mesh_without_material": false,
@@ -201,9 +165,7 @@
         }
       }
     ],
-    "kept_meshes": [
-      "SM_Totem"
-    ],
+    "kept_meshes": ["SM_Totem"],
     "dropped_meshes": [],
     "has_kept_mesh": true,
     "kept_mesh_without_material": false,

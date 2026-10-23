@@ -5,7 +5,8 @@ FBX 7.5 and ASCII files, which Blender doesn't write, are built here from one sc
 
 `fbx_facts.json`, beside the fixture library, holds the facts of its FBX files, which stand in
 for the worker in the Rust Check's tests. After `make_fixtures.py` changes them, rewrite it with
-`PYTHONPATH=. uv run --frozen python tests/test_fbx_facts.py`.
+`PYTHONPATH=. uv run --frozen python tests/test_fbx_facts.py`, then format it with `bun run format`
+at the repository root, as `make lint` checks.
 """
 
 from __future__ import annotations
