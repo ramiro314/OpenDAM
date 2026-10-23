@@ -1122,18 +1122,23 @@ function GameTab({ asset }: { asset: Asset }) {
   useEffect(() => {
     let current = true;
     setChecking(true);
-    api
-      .getGameDetail(asset.id)
-      .then((detail) => {
-        if (!current) return;
-        setLoaded({ id: asset.id, detail });
-        setDraft(detail ? shownValue(detail.assetName).value : '');
-        setError(null);
-      })
-      .catch((err) => current && setError(String(err)))
-      .finally(() => current && setChecking(false));
+    // Reading the detail runs its domains' Checks, so moving through assets reads only the one
+    // it settles on
+    const timer = setTimeout(() => {
+      api
+        .getGameDetail(asset.id)
+        .then((detail) => {
+          if (!current) return;
+          setLoaded({ id: asset.id, detail });
+          setDraft(detail ? shownValue(detail.assetName).value : '');
+          setError(null);
+        })
+        .catch((err) => current && setError(String(err)))
+        .finally(() => current && setChecking(false));
+    }, 250);
     return () => {
       current = false;
+      clearTimeout(timer);
     };
   }, [asset.id, reload]);
   const detail = loaded?.id === asset.id ? loaded.detail : undefined;
@@ -1152,7 +1157,8 @@ function GameTab({ asset }: { asset: Asset }) {
     setSaving(true);
     setError(null);
     try {
-      const ids = await api.setExportEdit(asset.id, patch);
+      // The item the tab shows: a group's main item, whose texture set the Check uses
+      const ids = await api.setExportEdit(detail.assetId, patch);
       useExportEditStore.getState().noteEdited(ids);
       setReload((r) => r + 1);
     } catch (err) {

@@ -558,6 +558,17 @@ fn dir_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
+/// The pack folder among `packs` that the file at `path` is in, as a Check assigns an item its
+/// pack: the innermost at or above its folder.
+pub(crate) fn pack_at<'a>(packs: &'a [String], path: &str) -> Option<&'a str> {
+    let by_path: HashMap<&str, usize> = packs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.as_str(), i))
+        .collect();
+    innermost_pack(&by_path, dir_of(path)).map(|i| packs[i].as_str())
+}
+
 /// An indexed file of a pack: its id, path, kind, and indexed size and mtime.
 type PackFile = (String, String, String, i64, i64);
 

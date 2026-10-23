@@ -69,8 +69,8 @@ pub async fn detail(
     let kind = check::exported_kind(&item, item_facts.as_ref());
 
     // The domains that may hold the item: each collection it is in counts for the root
-    // collection's child above it, and an image may join any domain through a material or its
-    // set (C3), so every domain may hold one
+    // collection's child above it, and an image may join a domain through a material or its set
+    // (C3), which only a domain with an item in the image's own pack can bring in
     let settings = settings::load(&db.master_pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -108,9 +108,35 @@ pub async fn detail(
             }
         }
         if kind == Kind::Texture {
-            for (id, (name, parent)) in &collections {
-                if parent.as_deref() == Some(root.as_str()) {
-                    domains.insert(id.clone(), name.clone());
+            let packs: Vec<String> = sqlx::query_scalar("SELECT path FROM folders WHERE is_pack")
+                .fetch_all(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Some(pack) = check::pack_at(&packs, &item.file_path) {
+                for (id, (name, parent)) in &collections {
+                    if parent.as_deref() != Some(root.as_str()) || domains.contains_key(id) {
+                        continue;
+                    }
+                    let subtree = subtree(&collections, id);
+                    // The domain's items below the pack folder, as their main items
+                    let paths: Vec<String> = sqlx::query_scalar(
+                        "SELECT DISTINCT m.file_path FROM collection_assets ca
+                         JOIN assets a ON a.id = ca.asset_id
+                         JOIN assets m ON m.id = COALESCE(a.group_id, a.id)
+                         WHERE ca.collection_id IN (SELECT value FROM json_each(?1))
+                           AND (?2 = '' OR (m.file_path >= ?2 || '/' AND m.file_path < ?2 || '0'))",
+                    )
+                    .bind(serde_json::to_string(&subtree).expect("ids serialize"))
+                    .bind(pack)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    if paths
+                        .iter()
+                        .any(|p| check::pack_at(&packs, p) == Some(pack))
+                    {
+                        domains.insert(id.clone(), name.clone());
+                    }
                 }
             }
         }
@@ -149,6 +175,24 @@ pub async fn detail(
         domains: holding,
         problems,
     }))
+}
+
+/// Collection `id` and every collection below it.
+fn subtree(collections: &BTreeMap<String, (String, Option<String>)>, id: &str) -> Vec<String> {
+    let mut ids = vec![id.to_string()];
+    let mut i = 0;
+    while i < ids.len() {
+        let parent = ids[i].clone();
+        ids.extend(
+            collections
+                .iter()
+                .filter(|(c, (_, p))| p.as_deref() == Some(parent.as_str()) && !ids.contains(c))
+                .map(|(c, _)| c.clone())
+                .collect::<Vec<_>>(),
+        );
+        i += 1;
+    }
+    ids
 }
 
 #[cfg(test)]
@@ -274,6 +318,32 @@ mod tests {
             ["Props"],
             "it joins through the model's material"
         );
+    }
+
+    /// FBX facts no test may ask for: a Check of a domain holding a model would.
+    struct Unread;
+
+    impl fbx_facts::Reader for Unread {
+        async fn read(&self, source: &Path, _: &Path) -> Result<FbxFacts, String> {
+            panic!("read {} for its facts", source.display())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_image_runs_no_check_of_a_domain_with_nothing_in_its_pack() {
+        let f = fixture().await;
+        collection(
+            &f,
+            "props",
+            "Props",
+            "dg",
+            &["Dungeon Props/Models/SM_Chest.fbx"],
+        )
+        .await;
+        let id = id_of(&f.library.pool, "Kenney Crates/crate_wood.png").await;
+        let shown = detail(&f.db, &id, &Unread, &memo()).await.unwrap().unwrap();
+        assert_eq!(shown.domains, Vec::<String>::new());
+        assert_eq!(shown.asset_name.inferred, "CrateWood");
     }
 
     #[tokio::test]

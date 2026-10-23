@@ -166,8 +166,9 @@ fn apply(edits: &mut Edits, patch: &Edits) {
 }
 
 /// Writes your edit `patch` to asset `asset_id` (C4): each key set to its value, or reset to
-/// inferred when the value is null. It reaches every member of the asset's group, and for an
-/// image, every source of its texture set and their groups, in one transaction. A row left
+/// inferred when the value is null. A group's member stands for its main item. It reaches every
+/// member of the item's group, and for an image, every source of its texture set and their
+/// groups, in one transaction. A row left
 /// with no edit is deleted, so the table holds only what you set. Returns the ids it wrote.
 pub async fn write(
     pool: &Pool<Sqlite>,
@@ -181,13 +182,16 @@ pub async fn write(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(|e| e.to_string())?;
-    let (file_path, file_name, kind): (String, String, String) =
-        sqlx::query_as("SELECT file_path, file_name, kind FROM assets WHERE id = ?")
-            .bind(asset_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("No asset has the id {asset_id}"))?;
+    // A member stands for its main item, whose set is the one the Check uses
+    let (item_id, file_path, file_name, kind): (String, String, String, String) = sqlx::query_as(
+        "SELECT id, file_path, file_name, kind FROM assets
+             WHERE id = (SELECT COALESCE(group_id, id) FROM assets WHERE id = ?)",
+    )
+    .bind(asset_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("No asset has the id {asset_id}"))?;
     let sources: Vec<String> = if is_image(&kind) {
         let folder = match dir_of(&file_path) {
             "" => String::new(),
@@ -201,7 +205,7 @@ pub async fn write(
         .await
         .map_err(|e| e.to_string())?;
         match set_key(&file_name) {
-            None => vec![asset_id.to_string()],
+            None => vec![item_id],
             key => images
                 .into_iter()
                 .filter(|(_, name, kind)| is_image(kind) && set_key(name) == key)
@@ -209,7 +213,7 @@ pub async fn write(
                 .collect(),
         }
     } else {
-        vec![asset_id.to_string()]
+        vec![item_id]
     };
     let mut targets = BTreeSet::new();
     for source in &sources {
@@ -318,6 +322,15 @@ mod tests {
         )
         .await
         .unwrap();
+        // Written from the stack's copy, it reaches the main item's set all the same
+        let from_copy = write(
+            &pool,
+            "Pack/Textures/Double/T_Rock_D.png",
+            &patch(json!({"assetName": "Boulder"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(from_copy, written);
         let expected = [
             "Pack/Textures/Default/T_Rock_D.png",
             "Pack/Textures/Default/T_Rock_N_DX.png",

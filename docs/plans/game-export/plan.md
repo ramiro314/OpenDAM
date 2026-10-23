@@ -986,8 +986,8 @@ later. Where they differ from C9:
   item's fields.
 - **The Game tab's problems are live.** The tab runs the Check of each domain that may hold the
   asset, without staging, when it opens and after each save: its members' domains, and for an
-  image every domain, since it may join one through a material. A domain holds it when its
-  Check lists it. The tab lists the problems naming it, and takes its inferred name from the
+  image every domain with an item in its pack, since it may join one through a material. A
+  domain holds it when its Check lists it. The tab lists the problems naming it, and takes its inferred name from the
   first of those domains by name, since a set's D24 name depends on the domain's models.
 - **Problems link to the Game tab.** A link shrinks the Export view to a bar, keeping its Check,
   and shows the asset in the Game tab. An edit to an asset the Check holds makes the view ask to
