@@ -12,6 +12,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
 
 use super::unitypackage::{below, clean, join, ExtractedFile};
 use crate::structure::is_package_file;
@@ -20,7 +21,9 @@ use crate::structure::is_package_file;
 /// files, as `flatten_pack.py`'s `LOOSE`, and `datapackage.json`.
 const LOOSE: [&str; 6] = ["txt", "md", "pdf", "rtf", "meta", "url"];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A place step as `import_steps` stores it: `kind` in its column, the other fields as `options`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlaceStep {
     /// Merges the root's only folder into the root while nothing else there is an asset,
     /// repeatedly.

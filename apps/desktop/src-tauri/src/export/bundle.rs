@@ -20,6 +20,7 @@ use crate::export::fbx_facts;
 use crate::export::fingerprint::Fingerprint;
 use crate::export::infer;
 use crate::export::{contract, game, hashes};
+use crate::fs_swap;
 
 const MANIFEST: &str = "manifest.json";
 
@@ -124,10 +125,10 @@ fn with_diff_status(report: &mut CheckReport) {
     }
 }
 
-/// The folder name prefixes of the domain folder `D`'s staging and old bundles.
-fn prefixes(domain: &str) -> (String, String) {
-    (format!(".{domain}.staging-"), format!(".{domain}.old-"))
-}
+/// The `fs_swap` tags of the domain folder `D`'s staging and old bundles, `.D.staging-*` and
+/// `.D.old-*`.
+const STAGING: &str = "staging";
+const OLD: &str = "old";
 
 /// The folder holding `bundle`, and the domain's name, which is `bundle`'s folder name.
 fn parts(bundle: &Path) -> (&Path, String) {
@@ -145,28 +146,17 @@ fn parts(bundle: &Path) -> (&Path, String) {
 /// are for you to choose one.
 pub fn recover(bundle: &Path) -> Result<(), String> {
     let (parent, domain) = parts(bundle);
-    let (staging_prefix, old_prefix) = prefixes(&domain);
-    let entries = match std::fs::read_dir(parent) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(format!("Could not read {}: {e}", parent.display())),
-        Ok(entries) => entries,
-    };
-    let mut olds = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Could not read {}: {e}", parent.display()))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&staging_prefix) {
-            std::fs::remove_dir_all(entry.path())
-                .map_err(|e| format!("Could not delete the leftover staging folder {name}: {e}"))?;
-            tracing::info!(
-                "Deleted the leftover staging folder {}",
-                entry.path().display()
-            );
-        } else if name.starts_with(&old_prefix) {
-            olds.push(entry.path());
-        }
+    let unreadable = |e: std::io::Error| format!("Could not read {}: {e}", parent.display());
+    for staging in fs_swap::leftovers(bundle, STAGING).map_err(unreadable)? {
+        std::fs::remove_dir_all(&staging).map_err(|e| {
+            format!(
+                "Could not delete the leftover staging folder {}: {e}",
+                staging.file_name().unwrap_or_default().to_string_lossy()
+            )
+        })?;
+        tracing::info!("Deleted the leftover staging folder {}", staging.display());
     }
-    olds.sort();
+    let olds = fs_swap::leftovers(bundle, OLD).map_err(unreadable)?;
     if bundle.exists() {
         // A `D/` OpenDAM didn't write may have appeared after a crash: an old bundle may then be
         // the only copy of the last export, so it is kept, and the Check reports `D/` (`previous`)
@@ -252,10 +242,10 @@ pub fn stage(
     manifest: &Value,
     files: &[BundleFile],
 ) -> Result<PathBuf, Vec<Problem>> {
-    let (parent, domain) = parts(bundle);
-    let staging = parent.join(format!("{}{}", prefixes(&domain).0, uuid::Uuid::new_v4()));
-    let result = std::fs::create_dir_all(parent)
-        .and_then(|()| std::fs::create_dir(&staging))
+    let id = uuid::Uuid::new_v4().to_string();
+    let staging = fs_swap::sibling(bundle, STAGING, &id);
+    let result = fs_swap::create_staging(bundle, STAGING, &id)
+        .map(drop)
         .map_err(|e| {
             vec![general(format!(
                 "Could not create the staging folder {}: {e}",
@@ -378,14 +368,7 @@ pub fn verify(folder: &Path, files: &[BundleFile]) -> Result<(), Vec<Problem>> {
 
 /// Deletes a staging folder, logging a failure: the next Check deletes what is left.
 fn discard(staging: &Path) {
-    match std::fs::remove_dir_all(staging) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => tracing::warn!(
-            "Could not delete the staging folder {}: {e}",
-            staging.display()
-        ),
-    }
+    fs_swap::discard(staging);
 }
 
 /// Swaps `staging` in as `bundle` (C15 step 3) through `rename`: renames an existing `bundle` to
@@ -394,46 +377,31 @@ fn discard(staging: &Path) {
 pub fn swap(
     bundle: &Path,
     staging: &Path,
-    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<(), String> {
-    let (parent, domain) = parts(bundle);
-    let old = if bundle.exists() {
-        let old = parent.join(format!("{}{}", prefixes(&domain).1, uuid::Uuid::new_v4()));
-        rename(bundle, &old).map_err(|e| {
-            format!(
+    let old = bundle
+        .exists()
+        .then(|| fs_swap::sibling(bundle, OLD, &uuid::Uuid::new_v4().to_string()));
+    fs_swap::swap(bundle, staging, old.as_deref(), fs_swap::Old::Delete, rename).map_err(|e| {
+        match e {
+            fs_swap::SwapError::Aside(e) => format!(
                 "Could not move the previous bundle {} aside: {e}",
                 bundle.display()
-            )
-        })?;
-        Some(old)
-    } else {
-        None
-    };
-    if let Err(e) = rename(staging, bundle) {
-        if let Some(old) = &old {
-            if let Err(back) = rename(old, bundle) {
-                return Err(format!(
-                    "Could not move the checked bundle to {}: {e}. The previous bundle is in {}, which the next Check puts back ({back})",
-                    bundle.display(),
-                    old.display()
-                ));
-            }
+            ),
+            fs_swap::SwapError::In {
+                error,
+                restored: Some(Err(back)),
+            } => format!(
+                "Could not move the checked bundle to {}: {error}. The previous bundle is in {}, which the next Check puts back ({back})",
+                bundle.display(),
+                old.as_deref().unwrap_or(bundle).display()
+            ),
+            fs_swap::SwapError::In { error, .. } => format!(
+                "Could not move the checked bundle to {}: {error}. The previous bundle is kept",
+                bundle.display()
+            ),
         }
-        return Err(format!(
-            "Could not move the checked bundle to {}: {e}. The previous bundle is kept",
-            bundle.display()
-        ));
-    }
-    if let Some(old) = old {
-        // The next Check deletes it if this fails
-        if let Err(e) = std::fs::remove_dir_all(&old) {
-            tracing::warn!(
-                "Could not delete the previous bundle {}: {e}",
-                old.display()
-            );
-        }
-    }
-    Ok(())
+    })
 }
 
 /// A Check's staged bundle, waiting for Export.

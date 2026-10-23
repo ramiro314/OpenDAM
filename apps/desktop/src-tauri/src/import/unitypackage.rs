@@ -20,7 +20,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use flate2::read::MultiGzDecoder;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tar::EntryType;
 
 /// A file the extraction wrote.
@@ -36,7 +36,7 @@ pub struct ExtractedFile {
     pub size: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SkipReason {
     /// An absolute pathname.
@@ -54,7 +54,7 @@ pub enum SkipReason {
 }
 
 /// An entry the extraction skipped, for the run's warnings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkippedEntry {
     /// The entry's source path, or for a tar member with no known `pathname`, the chain ending in

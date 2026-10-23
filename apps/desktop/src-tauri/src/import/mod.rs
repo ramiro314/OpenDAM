@@ -1,6 +1,9 @@
 //! Pack import from originals (docs/plans/pack-import/plan.md).
 
+pub mod build;
+pub mod engine;
 pub mod place;
+pub mod records;
 pub mod unitypackage;
 
 use sqlx::{Pool, Sqlite};
@@ -18,6 +21,7 @@ pub enum Recovery {
 /// Swap recovery for the library DB at `pool`, whose files lie below `root`. Its callers hold
 /// the library's `index_lock` and advisory lock and call it before they touch a row: the library
 /// open (`db::open_library_db`), `watcher::index_paths` and `structure::rebuild_library`, its
-/// follow-up task included. No build swaps a pack yet, so there is nothing to recover: the
-/// import build fills this in.
+/// follow-up task included. A first build (`build`) can now leave a pack `swapping` when its
+/// process dies mid-swap. Recovering it is the plan's recovery ticket: until then this does
+/// nothing, and such a pack stays `swapping`.
 pub async fn recover_swaps(_pool: &Pool<Sqlite>, _root: &Path, _tables: Recovery) {}

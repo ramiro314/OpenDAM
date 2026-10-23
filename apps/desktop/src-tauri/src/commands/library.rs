@@ -49,6 +49,7 @@ pub async fn add_library(
     )
     .await?;
     allow_library_roots(&state.app_handle, &library.root_paths);
+    state.imports.library_opened(&library.id).await;
     crate::thumb_cleanup::spawn(Arc::clone(&state), Some(library.id.clone()));
     crate::model_preview_regen::spawn(Arc::clone(&state), Some(library.id.clone()));
 

@@ -5,6 +5,7 @@ pub mod bench;
 pub mod collection;
 pub mod export;
 pub mod folder;
+pub mod import;
 pub mod library;
 pub mod preview;
 pub mod settings;

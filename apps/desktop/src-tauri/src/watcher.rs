@@ -54,7 +54,7 @@ impl LockEnv {
             .clone();
         LockEnv {
             now: Arc::new(SystemTime::now),
-            alive: Arc::new(|pid, started| process_start_time(pid) == Some(started)),
+            alive: Arc::new(process_alive),
             machine,
             pid: std::process::id(),
             started,
@@ -83,16 +83,67 @@ impl LockEnv {
     }
 }
 
+/// A process as an import run records its owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    /// This machine and pid namespace, apart from the boot, as a keyed hash: `None` when unknown.
+    pub machine: Option<String>,
+    /// This boot, as a keyed hash: `None` when unknown. A pid and start time compare only within
+    /// one boot, so any process of an earlier boot of this machine is gone.
+    pub boot: Option<String>,
+    pub pid: u32,
+    pub started: u64,
+}
+
+/// This process, for an import run's owner.
+pub(crate) fn this_process() -> ProcessIdentity {
+    static ME: OnceLock<(Option<String>, Option<String>)> = OnceLock::new();
+    let (machine, boot) = ME
+        .get_or_init(|| {
+            let keyed = |what: &str, parts: &[&str]| {
+                let text = format!(
+                    "com.opendam.desktop import owner {what}\n{}",
+                    parts.join("\n")
+                );
+                crate::export::hashes::sha256_bytes(text.as_bytes())[..32].to_string()
+            };
+            let machine = machine_id().and_then(|machine| {
+                let pid_ns = std::fs::read_link("/proc/self/ns/pid").ok()?;
+                Some(keyed("machine", &[&machine, &pid_ns.to_string_lossy()]))
+            });
+            let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .ok()
+                .map(|boot| keyed("boot", &[boot.trim()]));
+            (machine, boot)
+        })
+        .clone();
+    ProcessIdentity {
+        machine,
+        boot,
+        pid: std::process::id(),
+        started: process_start_time(std::process::id()).unwrap_or(0),
+    }
+}
+
+fn machine_id() -> Option<String> {
+    ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .map(|id| id.trim().to_string())
+        .find(|id| !id.is_empty())
+}
+
+/// Whether this machine runs a process with this pid and start time.
+pub(crate) fn process_alive(pid: u32, started: u64) -> bool {
+    process_start_time(pid) == Some(started)
+}
+
 /// The space a pid and start time are comparable in, as the lock names it: this machine, this
 /// boot and this pid namespace. The machine id alone isn't enough: VMs or containers cloned from
 /// one image share it, and a sandboxed instance on the same host has its own pids. A start time is
 /// counted from boot, so it compares only within one boot.
 fn local_id() -> Option<String> {
-    let machine = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
-        .iter()
-        .filter_map(|p| std::fs::read_to_string(p).ok())
-        .map(|id| id.trim().to_string())
-        .find(|id| !id.is_empty())?;
+    let machine = machine_id()?;
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     let pid_ns = std::fs::read_link("/proc/self/ns/pid").ok()?;
     Some(local_id_of(
@@ -111,7 +162,7 @@ fn local_id_of(machine: &str, boot: &str, pid_ns: &str) -> String {
 
 /// A process's start time in clock ticks since boot, field 22 of `/proc/<pid>/stat`, counted
 /// after the last `)`, since `(comm)` may hold spaces or parentheses.
-fn process_start_time(pid: u32) -> Option<u64> {
+pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     stat[stat.rfind(')')? + 1..]
         .split_whitespace()
@@ -341,7 +392,7 @@ impl IndexLock {
     /// Re-reads the file right before a change the lock guards, rather than trusting the last
     /// heartbeat, which may be 30 s old or, after a suspend, older than the lock's staleness. True
     /// while the file still holds this guard's token, or when the file couldn't be written at all.
-    fn still_held(&self) -> bool {
+    pub(crate) fn still_held(&self) -> bool {
         self.held.as_ref().is_none_or(|h| {
             let _beat = h.released.lock().unwrap_or_else(|e| e.into_inner());
             h.reread() == Reread::Held

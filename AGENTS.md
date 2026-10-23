@@ -56,7 +56,7 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               worker and caches its answers, with collision::PATTERNS, the one list
                               of collision meshes the export drops), fingerprint, what a Check
                               read, bundle, which stages the bundle beside the domain's folder,
-                              diffs it and swaps it in by renaming, infer, which groups a pack's
+                              diffs it and swaps it in by renaming (through src/fs_swap.rs), infer, which groups a pack's
                               images into texture sets and infers each model's materials,
                               textures, which converts a set's sources into URP roles (split,
                               merge, green flip, to PNG) as PNG cached by cache::texture_key, unity,
@@ -71,7 +71,16 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               entries, writing only regular files and folders, and place, the place
                               phase's flatten, hoist, rename and exclude steps over that tree, which
                               name a file by source path, move or drop its .meta with it, and fail
-                              naming the step and path on a clash or a source no longer produced
+                              naming the step and path on a clash or a source no longer produced,
+                              records, the import tables (imports, import_packs, import_steps,
+                              import_outputs, import_moves, import_runs), build, a pack's first
+                              build (stage beside the target, lock, re-check, journal, swap,
+                              index with Prune::Defer, commit current_build, settle, or roll back),
+                              with test hooks to pause or fail it, and engine, the durable run
+                              queue (one run at a time, owner and heartbeat, import:progress and
+                              import:updated, Cancel before the lock), behind commands/import.rs
+    src/fs_swap.rs            Staging a folder beside the one it replaces and swapping it in by
+                              rename, shared by the export's bundles and the import's builds
     tests/fixtures/pack-import/  Its fixture originals, made by make_fixtures.py (stdlib only) and
                               committed with its output, and expected/, goldens from the owner's
                               scripts (the extraction's, and flatten and hoist Art's after it), each
@@ -95,7 +104,20 @@ docs/plans                    Plans for this fork
 
 - **Relative paths in library DBs.** Every path stored in `.opendam/library.sqlite` is relative to
   the library root (`textures/rock.png`, `.opendam/thumbs/...`), so a library folder works wherever
-  it is mounted.
+  it is mounted. The one exception is `imports.original_path`: an import's original lives outside
+  every library, so it is stored by absolute path, with its size, mtime and sha256.
+- **Originals are read-only.** Nothing writes to an import's original or to the folder it sits in.
+  An original inside the library is refused (`import::engine::start_import`).
+- **An imported pack changes on disk only by a swap.** A build stages the whole pack beside its
+  target as `.<Pack>.import-<build id>` (a dot folder, which no index walks), writing its manifest
+  rows under the new build id, then takes the library's `index_lock` and the advisory lock and
+  holds both to the end. Under them it re-checks, journals `import_packs.swap_state`, renames the
+  staging folder in, indexes the pack with `Prune::Defer`, and commits by flipping
+  `import_packs.current_build` in one transaction. A failure before the commit rolls the swap back
+  in-run: the folder goes, the rows the index inserted (journaled in `import_moves`) are deleted,
+  and `current_build` stays as it was. Cancel works only before the lock; after it a run
+  finishes. Rebuilds, swap recovery at library open and in-app edits recording steps come with
+  the plan's later tickets: until then a pack left `swapping` by a crash stays so.
 - **`DELETE` journaling on library DBs.** Library DBs use rollback journaling because WAL's `-shm`
   locking is unreliable on network shares. Keep `SqliteJournalMode::Delete` in `db.rs`.
 - **Batched writes.** Database writes go in transactions of about 200 rows, as `watcher.rs` does.
