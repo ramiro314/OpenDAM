@@ -84,6 +84,17 @@ Revised again 2026-10-23 (revision 5) after the review's fourth round. No decisi
   with `.meta` appended to the last element, so `(source_path, origin)` stays unique when a
   pack keeps its `.meta` files (Steps, A2).
 
+Revised again 2026-10-23 (revision 6) after the review's fifth round. No decision changed:
+
+- **R16 - Each recovery table has its own trigger.**
+  - **The `swapping` table** runs when a library opens and at the start of every locking index
+    run.
+  - **The `swap_state NULL` table** (staging, `.failed-*`, `.prev-*` leftovers) runs only when a
+    library opens. It skips every pack whose run is queued or running, so a refresh, or a library
+    reconnecting mid-session, never deletes the staging folder of a build still in progress.
+  - **Lock-free entry points.** Recovery at library open uses lock-free cores, since nothing else
+    holds the pool yet (Flow, A11).
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -301,18 +312,44 @@ holding the lock:
 
 So a rollback loses nothing of the previous build, including paths it alone had.
 
-**Swap recovery** runs for every imported pack whose `swap_state` is set. Two places trigger it,
-so no pruning index can reach a pack mid-swap:
+**Swap recovery** has two tables, below: one for packs whose `swap_state` is `'swapping'`, and
+one for leftovers of packs whose `swap_state` is `NULL`. Each has its own triggers:
 
-- **When a library opens.** In `connect_library_sqlite`, before the structure pass it runs today
-  (`db.rs:412-422`). At that point nothing else holds the new pool, and the library isn't
-  registered for index runs yet. That covers startup and a library that comes online later.
+| Trigger | `swapping` table | `swap_state NULL` table |
+|---|---|---|
+| A library opens: startup, or an offline library coming back online | yes | yes, skipping every pack whose run is `queued` or `running` |
+| A locking `index_paths` or `rebuild_library` starts | yes | **never** |
+
+- **When a library opens.** Recovery runs in `connect_library_sqlite`, before the structure pass
+  it runs today (`db.rs:412-422`). At that point nothing else holds the new pool, and the library
+  isn't registered for index runs yet. That covers startup and a library that comes online later.
+  - **Lock-free cores.** There is no `index_lock` guard to hand to the `_locked` variants here, so
+    recovery calls the lock-free cores directly, as today's pass calls `structure::rebuild(&pool,
+    root)` (`structure.rs:2121`): `watcher::index_pool(pool, root, paths, prune)` (the body of
+    `index_paths` after its library lookup and locks, split out) and `structure::rebuild`. The
+    `_locked` variants and the locking functions are thin wrappers over the same two cores.
+  - **The advisory lock.** Recovery also takes the cross-machine `.opendam/index.lock`, as
+    `index_paths` does (`watcher.rs:169`). If another machine holds it, the open skips recovery.
+    The next locking index run handles any `swapping` pack, and the next open handles leftovers.
+    Skipping is safe, because nothing is pruned meanwhile.
+  - **Which runs it skips.** At startup the engine first marks runs found `running` as
+    `interrupted`, before any library opens. So at startup no build is in progress, and every
+    leftover is recovered. A library reconnecting mid-session can have a build staging for one of
+    its packs. The `swap_state NULL` table skips every pack with a run `queued` or `running`.
 - **At the start of every locking index or structure entry point.** `index_paths` and
   `rebuild_library`, after taking `index_lock`, first recover any pack still marked `swapping`.
-  A build holds the lock from step 1 through step 7 or the end of its rollback. So a locking
-  caller that gets the lock and finds a pack `swapping` knows its build is gone, for example
-  because the run task panicked and released the guard. Only the build itself and recovery call
-  the `_locked` variants, which skip this check.
+  They run only the `swapping` table, never the `swap_state NULL` one. A build sets and clears
+  `swap_state` only while it holds the lock, from step 1 through step 7 or the end of its
+  rollback. So a locking caller that gets the lock and finds a pack `swapping` knows its build is
+  gone, for example because the run task panicked and released the guard. A build still staging,
+  before step 1 and without the lock, has `swap_state` `NULL`, so these entry points never touch
+  its staging folder or rows. Only the build itself, and the recovery these entry points run
+  under their guard, call the `_locked` variants, which skip this check.
+- **Leftovers of a dead task.** If a build task dies mid-session after its commit (in step 7),
+  its `.prev-*` folder and journal stay until the library next opens. Its previous-only rows were
+  committed away anyway, and any refresh prunes them as usual. If a task dies while staging, its
+  run stays `running` until the app restarts, and its staging folder is removed at the next
+  startup.
 
 With `swap_state = 'swapping'` and build id B, recovery checks these rows in order, by what is on
 disk. "Live" is the pack folder.
@@ -592,8 +629,9 @@ half manifest.
   - **A dropped task.** The build's steps 1-7 and its rollback run in one task that holds the
     guard and never awaits a cancellation signal. If that task dies anyway (a panic), the pack
     stays `swapping`, and the next library open or locking index run recovers it first (Flow).
-- **Startup.** Swap recovery runs as each library opens (Flow), and runs found `running` become
-  `interrupted`.
+- **Startup.** Runs found `running` become `interrupted` first. Then swap recovery runs as each
+  library opens (Flow): both tables at startup, and the `swap_state NULL` table skipping packs with
+  a run `queued` or `running` when a library reconnects mid-session.
 - **Capped processes.** A shared `capped_command` helper runs Blender and the UE editor through
   `systemd-run --user --scope -p MemoryMax=<cap> -p MemorySwapMax=0`, mirroring
   `scripts/memory-cap.sh`. It warns and runs uncapped when `systemd-run --user` is unavailable,
@@ -666,8 +704,10 @@ confirmation names them.
   with every row its index inserts. A rollback deletes the inserted rows, then reverses the moves,
   so neither a rebuild nor its rollback loses metadata (D31).
 - **No pruning index reaches a pack mid-swap.** Cancel takes effect only before a build takes the
-  lock. Swap recovery runs when a library opens, before its structure pass, and at the start of
-  every locking `index_paths` and `rebuild_library` for any pack still marked `swapping`.
+  lock. The `swapping` recovery runs when a library opens, before its structure pass, and at the
+  start of every locking `index_paths` and `rebuild_library`. The leftovers table
+  (`swap_state NULL`) runs only when a library opens, skipping packs with a run queued or running.
+  So no refresh ever deletes a staging folder.
 - **A rollback clears its journal before its folder.** `swap_state` and the failed build's
   records go in one transaction, before `.failed-*` is deleted. Recovery acts only on the states
   the tables list, and changes nothing on disk for any other.
@@ -790,9 +830,9 @@ confirmation names them.
     - A first build is rolled back too: its folder and rows are gone, and `current_build` stays
       `NULL`.
   - **Killed inside a rollback,** between its renames and after them: recovery finishes it.
-  - **Killed after the commit, before settling:** step 7 runs at startup. The rows of paths only
-    the previous build had are pruned, `.prev` and the old rows are deleted, and the new build
-    stays.
+  - **Killed after the commit, before settling:** step 7 runs when the library next opens, from
+    the `swap_state NULL` table. The rows of paths only the previous build had are pruned, `.prev`,
+    the old rows and the build's `import_moves` are deleted, and the new build stays.
   - **Indexing fails,** for a later build and for a first build: the swap is rolled back, and the
     run fails.
   - **What a rollback keeps.** Tag three files:
@@ -812,7 +852,7 @@ confirmation names them.
     moves B's row back to `Rock.fbx`, and leaves A's old row untouched. Both keep their ids and
     tags, and the pack ends with `swap_state` `NULL`.
   - **Killed late in a rollback:** for a later build, after step 4's transaction and before
-    `.failed-B` is deleted. On restart, recovery deletes `.failed-B`, and the restored previous
+    `.failed-B` is deleted. On restart, library-open recovery deletes `.failed-B`, and the restored previous
     build's folder, rows and tags are untouched. Recovery is also given the impossible state
     (`swapping`, only the live folder, `current_build` set), and changes nothing on disk.
   - **Cancel during step 5.** Tag `Old.png`, a path only the previous build has. Press Cancel while
@@ -828,6 +868,13 @@ confirmation names them.
     `Old.png`'s row keeps its tag.
   - **A library that opens late** with a pack left `swapping` (an offline library reconnecting)
     is recovered as it opens.
+  - **A refresh during staging.** While a build stages (before step 1, without the lock), trigger
+    a library refresh, and separately a simulated reconnect that reopens its pool. The staging
+    folder and its manifest rows are untouched each time, and the build then commits normally.
+  - **Leftovers at the next open.** Leave a `.prev-*`, a `.failed-*` and an `.import-*` folder
+    behind with `swap_state` `NULL` and no run queued or running. A refresh leaves all three in
+    place. The next library open removes them: it settles the `.prev`, and deletes the other two
+    with their rows.
   - **A mid-run change:** a file changed outside OpenDAM, or a step edited, while the build
     stages. The re-check under the lock fails the run, and the live folder is unchanged.
   - **No deadlock:** no call path takes `index_lock` while holding it. A test runs a whole build
