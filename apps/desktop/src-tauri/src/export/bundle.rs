@@ -802,6 +802,17 @@ mod tests {
 
         assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
         assert!(!report.staged);
+        // The diff leaves the others ready, and the refused asset a problem
+        assert_eq!(
+            statuses(&report),
+            [
+                ("Kenney Crates/crate_wood.png", Status::Ready),
+                ("Unity Moss/T_Moss_D.png", Status::Ready),
+                ("Dungeon Props/Textures/T_Sky.exr", Status::Problem),
+                (TEXTURES[0], Status::Ready),
+                (TEXTURES[1], Status::Ready),
+            ]
+        );
         assert_eq!(leftovers(&f), Vec::<String>::new());
         assert_eq!(
             std::fs::read(bundle_dir(&f).join(MANIFEST)).unwrap(),
@@ -982,6 +993,14 @@ mod tests {
                 insert_collection(&f.db.master_pool, "sub", "Sub", Some("props")).await;
                 "the domain's subcollections"
             }
+            "the export root moved" => {
+                let other = f.dir.path().join("other-export");
+                std::fs::create_dir(&other).unwrap();
+                crate::export::settings::update(&f.db.master_pool, json!({"root": other}))
+                    .await
+                    .unwrap();
+                "the export settings"
+            }
             _ => unreachable!("{case}"),
         }
     }
@@ -1000,6 +1019,7 @@ mod tests {
             "the domain renamed",
             "the root collection renamed",
             "a subcollection added",
+            "the export root moved",
         ] {
             let f = fixture().await;
             domain(&f, &TEXTURES).await;
@@ -1017,6 +1037,10 @@ mod tests {
             assert!(!bundle_dir(&f).exists(), "{case}");
             assert!(!f.export_root.join("Game").exists(), "{case}");
             assert!(!f.export_root.join("DungeonGame/Loot").exists(), "{case}");
+            assert!(
+                !f.dir.path().join("other-export/DungeonGame").exists(),
+                "{case}"
+            );
             assert_eq!(leftovers(&f), Vec::<String>::new(), "{case}");
         }
     }
@@ -1066,6 +1090,32 @@ mod tests {
         assert!(!staging.exists());
     }
 
+    /// A valid manifest listing one texture, `Textures/Rock_BaseColor.png` with the sha256
+    /// `sha256`, and that texture's bundle file, copied from `source`.
+    fn rock_bundle(sha256: &str, source: PathBuf) -> (Value, BundleFile) {
+        let manifest = json!({
+            "contractVersion": 1, "domain": "Props", "exportedAt": "2026-10-22T12:00:00+02:00",
+            "exporter": {"name": "OpenDAM", "version": "0.1.0"},
+            "packs": [{"id": "pack", "name": "Pack", "licence": {"spdx": null, "name": "Unknown"}, "origin": "generic"}],
+            "assets": [{
+                "kind": "texture", "assetName": "Rock", "file": "Textures/Rock_BaseColor.png",
+                "sha256": sha256, "pack": "pack", "sourcePath": "rock.png",
+                "conversion": [], "role": "BaseColor"
+            }]
+        });
+        let file = BundleFile {
+            file: "Textures/Rock_BaseColor.png".into(),
+            source,
+            sha256: sha256.into(),
+            asset: check::AssetRef {
+                library_id: "lib".into(),
+                asset_id: "rock".into(),
+                file_path: "Pack/rock.png".into(),
+            },
+        };
+        (manifest, file)
+    }
+
     #[test]
     fn verify_refuses_unlisted_files_and_wrong_hashes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1073,28 +1123,10 @@ mod tests {
         std::fs::create_dir(folder.join("Textures")).unwrap();
         std::fs::write(folder.join("Textures/Rock_BaseColor.png"), "rock").unwrap();
         std::fs::write(folder.join("Textures/Extra.png"), "extra").unwrap();
-        let manifest = json!({
-            "contractVersion": 1, "domain": "Props", "exportedAt": "2026-10-22T12:00:00+02:00",
-            "exporter": {"name": "OpenDAM", "version": "0.1.0"},
-            "packs": [{"id": "pack", "name": "Pack", "licence": {"spdx": null, "name": "Unknown"}, "origin": "generic"}],
-            "assets": [{
-                "kind": "texture", "assetName": "Rock", "file": "Textures/Rock_BaseColor.png",
-                "sha256": "0".repeat(64), "pack": "pack", "sourcePath": "rock.png",
-                "conversion": [], "role": "BaseColor"
-            }]
-        });
+        let (manifest, file) = rock_bundle(&"0".repeat(64), folder.join("unused"));
         std::fs::write(folder.join(MANIFEST), manifest.to_string()).unwrap();
-        let rock = check::AssetRef {
-            library_id: "lib".into(),
-            asset_id: "rock".into(),
-            file_path: "Pack/rock.png".into(),
-        };
-        let files = [BundleFile {
-            file: "Textures/Rock_BaseColor.png".into(),
-            source: folder.join("unused"),
-            sha256: "0".repeat(64),
-            asset: rock.clone(),
-        }];
+        let rock = file.asset.clone();
+        let files = [file];
 
         let problems = verify(folder, &files).unwrap_err();
         assert_eq!(problems.len(), 2, "{problems:?}");
@@ -1106,6 +1138,72 @@ mod tests {
             problems[1].message,
             "The staged bundle holds Textures/Extra.png, which the manifest doesn't list"
         );
+    }
+
+    /// A check that fails while staging, copying or validating, deletes its staging folder and
+    /// leaves the previous bundle as it was.
+    #[test]
+    fn a_failed_staging_deletes_the_staging_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("DungeonGame");
+        let bundle = parent.join("Props");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join(MANIFEST), "previous").unwrap();
+        let source = dir.path().join("rock.png");
+        std::fs::write(&source, "rock").unwrap();
+        let folders = || {
+            let mut names: Vec<String> = std::fs::read_dir(&parent)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+
+        // The copy fails: the source is gone
+        let (manifest, missing) = rock_bundle(&"0".repeat(64), dir.path().join("gone.png"));
+        let problems = stage(&bundle, &manifest, &[missing]).unwrap_err();
+        assert!(
+            problems[0]
+                .message
+                .starts_with("Pack/rock.png: it can't be copied into the bundle as Textures/Rock_BaseColor.png: "),
+            "{problems:?}"
+        );
+        assert_eq!(problems[0].assets[0].asset_id, "rock");
+        assert_eq!(folders(), ["Props"]);
+
+        // Validation fails: the copied file doesn't match the manifest's sha256
+        let (manifest, changed) = rock_bundle(&"0".repeat(64), source.clone());
+        let problems = stage(&bundle, &manifest, &[changed]).unwrap_err();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0]
+            .message
+            .starts_with("The staged Textures/Rock_BaseColor.png has the sha256 "));
+        assert_eq!(folders(), ["Props"]);
+
+        // Validation fails: the manifest breaks the schema
+        let sha256 = hashes::sha256_file(&source).unwrap();
+        let (mut manifest, file) = rock_bundle(&sha256, source.clone());
+        manifest["domain"] = json!("not pascal");
+        let problems = stage(&bundle, &manifest, std::slice::from_ref(&file)).unwrap_err();
+        assert!(
+            problems[0]
+                .message
+                .starts_with("The staged manifest is invalid at /domain: "),
+            "{problems:?}"
+        );
+        assert_eq!(folders(), ["Props"]);
+        assert_eq!(
+            std::fs::read_to_string(bundle.join(MANIFEST)).unwrap(),
+            "previous"
+        );
+
+        // With all of it right, the staging folder stays for Export
+        let (manifest, _) = rock_bundle(&sha256, source);
+        let staging = stage(&bundle, &manifest, &[file]).unwrap();
+        assert!(staging.starts_with(&parent));
+        assert_eq!(folders().len(), 2);
+        assert_eq!(verify(&staging, &[]), Ok(()));
     }
 
     #[test]
