@@ -748,7 +748,7 @@ mod tests {
             std::fs::read(f.library.root_path.join("Foo A/tile_a.png")).unwrap(),
         )
         .unwrap();
-        add_members(&f.library, "props", &[TEXTURES[3]]).await;
+        add_members(&f.db, &f.library, "props", &[TEXTURES[3]]).await;
         sqlx::query("DELETE FROM collection_assets WHERE asset_id = ?")
             .bind(id_of(&f.library.pool, TEXTURES[1]).await)
             .execute(&f.library.pool)
@@ -783,7 +783,13 @@ mod tests {
         export(&f, &exports).await;
         let before = std::fs::read(bundle_dir(&f).join(MANIFEST)).unwrap();
 
-        add_members(&f.library, "props", &["Dungeon Props/Textures/T_Sky.exr"]).await;
+        add_members(
+            &f.db,
+            &f.library,
+            "props",
+            &["Dungeon Props/Textures/T_Sky.exr"],
+        )
+        .await;
         let report = exports.check(&f.db, "props").await.unwrap();
 
         assert_eq!(report.problems.len(), 1, "{:?}", report.problems);

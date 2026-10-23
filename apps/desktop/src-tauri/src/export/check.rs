@@ -1666,6 +1666,7 @@ mod tests {
 
         collection(&f, "domain", "Props", "dg", &["Foo A/tile_a.png"]).await;
         add_members(
+            &f.db,
             &second,
             "domain",
             &["Foo Copy/tile_c.png", "Unreal/Rocks/T_Rock_D.png"],

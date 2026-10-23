@@ -106,17 +106,17 @@ pub type Pool = sqlx::Pool<sqlx::Sqlite>;
 /// Adds collection `id` named `name` under `parent`, holding the fixture's files at `paths`.
 pub async fn collection(f: &Fixture, id: &str, name: &str, parent: &str, paths: &[&str]) {
     insert_collection(&f.db.master_pool, id, name, Some(parent)).await;
-    add_members(&f.library, id, paths).await;
+    add_members(&f.db, &f.library, id, paths).await;
 }
 
-/// Puts the files at `paths` of `library` in collection `id`.
-pub async fn add_members(library: &LibraryHandle, id: &str, paths: &[&str]) {
+/// Puts the files at `paths` of `library` in collection `id`, as the app does: each with its
+/// format group's members, and in the collection's ancestors too.
+pub async fn add_members(db: &Database, library: &LibraryHandle, id: &str, paths: &[&str]) {
+    let mut ids = Vec::new();
     for path in paths {
-        sqlx::query("INSERT INTO collection_assets (collection_id, asset_id) VALUES (?, ?)")
-            .bind(id)
-            .bind(id_of(&library.pool, path).await)
-            .execute(&library.pool)
-            .await
-            .unwrap();
+        ids.push(id_of(&library.pool, path).await);
     }
+    crate::commands::collection::add_assets_to_collection(db, id, &ids)
+        .await
+        .unwrap();
 }

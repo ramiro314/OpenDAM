@@ -142,7 +142,7 @@ pub async fn add_to_collection(
 /// (`structure::group_members`). The collection must be in the
 /// master catalog; it is copied, ancestors first, into that library's mirror before the
 /// membership, since a mirror can lack it after a failed mirror write.
-async fn add_assets_to_collection(
+pub(crate) async fn add_assets_to_collection(
     db: &Database,
     collection_id: &str,
     asset_ids: &[String],
