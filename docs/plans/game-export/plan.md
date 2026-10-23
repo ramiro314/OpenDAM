@@ -899,8 +899,13 @@ later. Where they differ from C9:
   written as several takes of one name, and one that animates shape keys or a material
   (`SM_Blob`'s `Smile`) would be lost, so the script refuses both by name. A take that keys a
   root object's own transform (`SM_Spinner`) is refused too, since it would override the root
-  transform on that object. An animation on a dropped collision mesh goes with it. The
-  round-trip check reads the written file's takes as a list, so a duplicated take fails it.
+  transform on that object. An animation on a dropped collision mesh goes with it.
+- **The round-trip check reads takes from the files themselves.** The source's takes and the
+  written ones both come from each FBX's node tree, by `fbx_facts`' rule (a take counts when a
+  keyed curve drives something), minus takes only on dropped collision meshes, as sorted
+  lists, so a duplicated or lost take fails. An imported action that can't be matched to an
+  object and a take the file names is refused, as when Blender renames a second take of one
+  name `<take>.001` (`SM_Lantern`).
 - **Positions are reported in Unity's axes** as Blender's (-x, z, -y): the FBX is written Y up and
   -Z forward, and Unity mirrors X on import. The nose fixture checks the mirror as well as the
   facing, since its nose is off centre.

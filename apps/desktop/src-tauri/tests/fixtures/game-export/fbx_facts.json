@@ -114,6 +114,24 @@
     "bones": [],
     "takes": []
   },
+  "Dungeon Props/Models/SM_Lantern.fbx": {
+    "slots": [
+      {
+        "name": "Iron",
+        "textures": {}
+      },
+      {
+        "name": "Glass",
+        "textures": {}
+      }
+    ],
+    "kept_meshes": ["SM_Lantern", "SM_Lantern_Glass"],
+    "dropped_meshes": [],
+    "has_kept_mesh": true,
+    "kept_mesh_without_material": false,
+    "bones": [],
+    "takes": ["SM_Lantern_Glass|SwingA", "SM_Lantern_Glass|SwingA"]
+  },
   "Dungeon Props/Models/SM_Pillar.fbx": {
     "slots": [
       {

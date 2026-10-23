@@ -218,7 +218,8 @@ pub struct Normalized {
     pub meshes: Vec<String>,
     /// The written material slots, in Blender's order: each kept mesh's by name, then by slot
     pub slots: Vec<String>,
-    /// The written takes, by name
+    /// The written file's takes that animate something, sorted, a name written twice listed
+    /// twice
     pub takes: Vec<String>,
     pub bones: Vec<String>,
     pub has_mesh: bool,
@@ -258,6 +259,8 @@ pub struct Transform {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Source {
     pub slots: Vec<String>,
+    /// The source file's takes that animate something it keeps, sorted, read from its node
+    /// tree as the preview worker's `fbx_facts` reads them, not from Blender's import
     pub takes: Vec<String>,
 }
 
@@ -1136,18 +1139,25 @@ mod tests {
         Some(Runner::new(gate(program.to_str()).await.unwrap()))
     }
 
-    /// The job for the fixture model `name`, written into `out`, with the added material's name
-    /// picked from its facts as the export picks it.
-    fn fixture_job(name: &str, out: &Path) -> Job {
-        let asset = format!("Dungeon Props/Models/{name}.fbx");
-        let facts: std::collections::HashMap<String, crate::export::fbx_facts::FbxFacts> =
+    /// The fixture model `name`'s facts, as the preview worker reads them.
+    fn fixture_facts(name: &str) -> crate::export::fbx_facts::FbxFacts {
+        let mut facts: std::collections::HashMap<String, crate::export::fbx_facts::FbxFacts> =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/fixtures/game-export/fbx_facts.json"
             )))
             .unwrap();
+        facts
+            .remove(&format!("Dungeon Props/Models/{name}.fbx"))
+            .unwrap()
+    }
+
+    /// The job for the fixture model `name`, written into `out`, with the added material's name
+    /// picked from its facts as the export picks it.
+    fn fixture_job(name: &str, out: &Path) -> Job {
+        let asset = format!("Dungeon Props/Models/{name}.fbx");
         let added = crate::export::names::added_material(
-            facts[&asset].slots.iter().map(|s| s.name.as_str()),
+            fixture_facts(name).slots.iter().map(|s| s.name.as_str()),
         );
         Job {
             input: Path::new(LIBRARY).join(&asset),
@@ -1408,6 +1418,25 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))";
     }
 
     #[tokio::test]
+    async fn a_take_blender_imports_under_another_name_is_refused() {
+        let Some(runner) = fixture_runner().await else {
+            return;
+        };
+        let out = tempfile::tempdir().unwrap();
+
+        // Its two takes share a name, so Blender names the second one's action `...|SwingA.001`
+        let lantern = runner.run(&fixture_job("SM_Lantern", out.path())).await;
+
+        assert_eq!(
+            lantern,
+            Err("Dungeon Props/Models/SM_Lantern.fbx: its animation \
+                 SM_Lantern_Glass|SM_Lantern_Glass|SwingA.001 can't be matched to an object and \
+                 a take"
+                .into())
+        );
+    }
+
+    #[tokio::test]
     async fn takes_keep_their_source_names() {
         let Some(runner) = fixture_runner().await else {
             return;
@@ -1420,7 +1449,9 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))";
             .unwrap();
 
         assert_eq!(guard.takes, ["Wave"]);
+        // Read from the source file's node tree, as the preview worker reads them
         assert_eq!(guard.source.takes, ["Wave"]);
+        assert_eq!(guard.source.takes, fixture_facts("SK_Guard").takes);
         assert!(guard.has_armature);
         assert_eq!(guard.bones, ["Hips", "Spine", "Head", "Head_end"]);
         assert_eq!(guard.slots, ["Cloth"]);

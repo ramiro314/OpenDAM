@@ -45,6 +45,9 @@ Step 6 (Blender normalization of models), in `Dungeon Props/Models/`:
 - `SM_Cabinet.fbx`: a model whose take `Open` swings two doors, two objects under a still root,
   and `SM_Blob.fbx`: one whose take `Smile` animates a shape key, not an object. The script
   refuses both, since it writes each object's animation as a take of its own.
+- `SM_Lantern.fbx`: two takes of one name, `SM_Lantern_Glass|SwingA`, whose second action Blender
+  imports as `...|SwingA.001`. The script refuses it rather than write that take under a name the
+  file doesn't give.
 
 After a rerun, refresh `fbx_facts.json` beside the library, as `test_fbx_facts.py` says. Only
 the FBX files this script changes on purpose are committed: each rerun stamps new times in them.
@@ -362,6 +365,36 @@ def models() -> None:
         bake_anim_use_all_actions=False,
         bake_anim_use_nla_strips=False,
     )
+
+    # Two takes of one name: two actions on a child object, the second renamed in the file
+    bpy.ops.wm.read_homefile(use_empty=True)
+    post = box("SM_Lantern", size=(0.1, 0.1, 2), location=(0, 0, 1), materials=[material("Iron")])
+    glass = box(
+        "SM_Lantern_Glass",
+        size=(0.3, 0.3, 0.4),
+        location=(0, 0.25, 1.6),
+        materials=[material("Glass")],
+    )
+    glass.parent = post
+    glass.matrix_parent_inverse = post.matrix_world.inverted()
+    data = glass.animation_data_create()
+    for name, angle in [("SwingB", -0.3), ("SwingA", 0.3)]:
+        data.action = bpy.data.actions.new(name)
+        for frame, value in [(1, 0.0), (20, angle)]:
+            glass.rotation_euler = (value, 0, 0)
+            glass.keyframe_insert("rotation_euler", frame=frame)
+        data.action.use_fake_user = True
+    target = export_fbx(
+        f"{models}/SM_Lantern.fbx",
+        bake_anim=True,
+        bake_anim_use_all_actions=True,
+        bake_anim_use_nla_strips=False,
+    )
+    # Every mention of its name, the take and its layer among them, to one of the same length
+    old, new = b"SM_Lantern_Glass|SwingB", b"SM_Lantern_Glass|SwingA"
+    written = target.read_bytes()
+    assert written.count(old) > 0
+    target.write_bytes(written.replace(old, new))
 
 
 OBJ_TRIANGLE = "o Barrel\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"
