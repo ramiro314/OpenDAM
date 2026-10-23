@@ -142,14 +142,22 @@ pub struct NewImport<'a> {
     pub steps: &'a [StepRecord],
 }
 
+/// Another pack's target that is `?1`, or an ancestor or descendant of it, on whole path
+/// components (`Pub/Pack` holds `Pub/Pack/Sub` but not `Pub/Package`).
+const NESTING: &str = "SELECT target FROM import_packs WHERE target = ?1
+    OR substr(?1, 1, length(target) + 1) = target || '/'
+    OR substr(target, 1, length(?1) + 1) = ?1 || '/'";
+
 /// Records `import` and queues its first build, owned by `owner`, in one transaction. Returns
-/// the run's id. A pack target already recorded fails it (`import_packs.target` is unique).
+/// the run's id, or as the inner error another pack's target that nests with this one: the
+/// pack's insert checks that in the same statement, so imports that overlap, from this process
+/// or another, never both record nesting targets.
 pub async fn create_import(
     pool: &Pool<Sqlite>,
     import: &NewImport<'_>,
     owner: &Owner,
     now: i64,
-) -> sqlx::Result<String> {
+) -> sqlx::Result<Result<String, String>> {
     let import_id = uuid::Uuid::new_v4().to_string();
     let pack_id = uuid::Uuid::new_v4().to_string();
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -167,13 +175,23 @@ pub async fn create_import(
     .bind(now)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("INSERT INTO import_packs (id, import_id, target, preset) VALUES (?, ?, ?, ?)")
-        .bind(&pack_id)
-        .bind(&import_id)
-        .bind(import.target)
-        .bind(import.preset)
-        .execute(&mut *tx)
-        .await?;
+    let inserted = sqlx::query(&format!(
+        "INSERT INTO import_packs (id, import_id, target, preset)
+         SELECT ?2, ?3, ?1, ?4 WHERE NOT EXISTS ({NESTING})"
+    ))
+    .bind(import.target)
+    .bind(&pack_id)
+    .bind(&import_id)
+    .bind(import.preset)
+    .execute(&mut *tx)
+    .await?;
+    if inserted.rows_affected() == 0 {
+        let other: String = sqlx::query_scalar(NESTING)
+            .bind(import.target)
+            .fetch_one(&mut *tx)
+            .await?;
+        return Ok(Err(other));
+    }
     for (position, step) in import.steps.iter().enumerate() {
         sqlx::query(
             "INSERT INTO import_steps (pack_id, position, kind, enabled, options)
@@ -205,7 +223,7 @@ pub async fn create_import(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(run_id)
+    Ok(Ok(run_id))
 }
 
 /// A pack's recipe as a build reads it.

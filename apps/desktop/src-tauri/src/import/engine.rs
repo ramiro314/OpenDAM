@@ -454,14 +454,11 @@ impl Engine {
             preset: "unity",
             steps: &steps,
         };
+        // Checked again in the insert: an import that overlapped this one may have got there.
         let run_id = records::create_import(&library.pool, &import, &self.owner, now_ms())
             .await
-            .map_err(|e| match e {
-                sqlx::Error::Database(e) if e.is_unique_violation() => {
-                    format!("Another import already builds {target}")
-                }
-                e => e.to_string(),
-            })?;
+            .map_err(|e| e.to_string())?
+            .map_err(|other| nests(&target, &other))?;
         let run = records::run(&library.pool, &library.id, &run_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -552,6 +549,10 @@ fn original(path: &str, root: &Path) -> Result<PathBuf, String> {
     Ok(original)
 }
 
+fn nests(target: &str, other: &str) -> String {
+    format!("{target} would nest with the pack imported to {other}")
+}
+
 /// Refuses a target that exists in the library, or that is another pack's target, or an
 /// ancestor or descendant of one, on whole path components.
 async fn check_target(pool: &Pool<Sqlite>, root: &Path, target: &str) -> Result<(), String> {
@@ -567,14 +568,12 @@ async fn check_target(pool: &Pool<Sqlite>, root: &Path, target: &str) -> Result<
         .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
-    let nests = |a: &str, b: &str| a == b || b.starts_with(&format!("{a}/"));
+    let within = |a: &str, b: &str| a == b || b.starts_with(&format!("{a}/"));
     if let Some(other) = targets
         .iter()
-        .find(|t| nests(t, target) || nests(target, t))
+        .find(|t| within(t, target) || within(target, t))
     {
-        return Err(format!(
-            "{target} would nest with the pack imported to {other}"
-        ));
+        return Err(nests(target, other));
     }
     Ok(())
 }
@@ -1326,5 +1325,58 @@ mod tests {
             .await
             .expect("the task still runs");
         assert!(ended.is_err(), "the task let its sender go");
+    }
+
+    #[tokio::test]
+    async fn the_insert_itself_refuses_a_target_nesting_with_another_pack() {
+        let s = setup_with(false).await;
+        let record = |target: &'static str| {
+            let pool = s.lib.pool.clone();
+            let owner = s.engine.owner.clone();
+            async move {
+                let import = NewImport {
+                    original_path: "/o.unitypackage",
+                    original_size: 0,
+                    original_mtime_ns: 0,
+                    original_sha256: "",
+                    kind: "unitypackage",
+                    target,
+                    preset: "unity",
+                    steps: &[],
+                };
+                records::create_import(&pool, &import, &owner, 0)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        record("Kits/Rock").await.unwrap();
+        for target in ["Kits", "Kits/Rock", "Kits/Rock/Sub"] {
+            assert_eq!(record(target).await, Err("Kits/Rock".into()), "{target}");
+        }
+        for target in ["Kits/Rocks", "Kit", "Pub"] {
+            assert!(record(target).await.is_ok(), "{target}");
+        }
+        assert_eq!(s.count("SELECT COUNT(*) FROM imports").await, 4);
+        assert_eq!(s.count("SELECT COUNT(*) FROM import_runs").await, 4);
+    }
+
+    #[tokio::test]
+    async fn overlapping_imports_of_nesting_targets_record_only_one() {
+        let s = setup_with(false).await;
+        let mut outer = s.golden_request();
+        outer.target = "Kits".into();
+        let mut inner = s.golden_request();
+        inner.target = "Kits/Rock".into();
+
+        let (a, b) = tokio::join!(s.engine.start_import(outer), s.engine.start_import(inner));
+
+        assert!(a.is_ok() != b.is_ok(), "{a:?} {b:?}");
+        let error = a.err().or(b.err()).unwrap();
+        assert!(
+            error.contains("would nest with the pack imported to"),
+            "{error}"
+        );
+        assert_eq!(s.count("SELECT COUNT(*) FROM import_packs").await, 1);
     }
 }
