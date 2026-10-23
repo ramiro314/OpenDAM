@@ -700,6 +700,9 @@ struct Evaluated {
 /// A pack of a library, by the library's and the pack's indices in `inputs`.
 type PackKey = (usize, usize);
 
+/// The pack index of a model in no pack, whose catalog of images is empty.
+const NO_PACK: usize = usize::MAX;
+
 /// One image the domain exports as a texture: a member, or a source joined through a material
 /// or its texture set (C3).
 struct TextureJob {
@@ -831,17 +834,22 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
                         }
                         Some(fbx) => {
                             row.kind = read_fbx(fbx, &item.file_path, &mut issue);
-                            if let (Ok(facts), Some(key), Some(p)) = (&fbx.facts, key, pack) {
+                            if let Ok(facts) = &fbx.facts {
                                 if facts.reading() == Some(Reading::Model) {
-                                    if sources[p].origin == Origin::Unity {
-                                        unity_packs.entry(key).or_insert_with(|| {
-                                            UnityPack::read(
-                                                &input.pack_files[&key.1],
-                                                &mut walkers[l].probes,
-                                                memo,
-                                            )
-                                        });
+                                    if let (Some(key), Some(p)) = (key, pack) {
+                                        if sources[p].origin == Origin::Unity {
+                                            unity_packs.entry(key).or_insert_with(|| {
+                                                UnityPack::read(
+                                                    &input.pack_files[&key.1],
+                                                    &mut walkers[l].probes,
+                                                    memo,
+                                                )
+                                            });
+                                        }
                                     }
+                                    // A model in no pack still has its slots, the slot the export
+                                    // adds and their names checked, with no image to bind
+                                    let key = key.unwrap_or((l, NO_PACK));
                                     catalogs
                                         .entry(key)
                                         .or_insert_with(|| PackImages::new(Vec::new()));
@@ -3375,6 +3383,54 @@ mod tests {
             ]
         );
         assert_valid(&report);
+    }
+
+    #[tokio::test]
+    async fn a_model_in_no_pack_still_has_its_slots_and_their_names_checked() {
+        let f = fixture().await;
+        let table = "Loose/SM_Table.fbx";
+        add_file(
+            &f,
+            table,
+            &fixture_bytes("Dungeon Props/Models/SM_Stool.fbx"),
+        )
+        .await;
+        let facts = Facts::fixture().with(
+            table,
+            Ok(serde_json::from_value(json!({
+                "slots": [{"name": "M_Wood"}, {"name": "Wood"}],
+                "kept_meshes": ["SM_Table", "SM_Table_Top"], "dropped_meshes": [],
+                "has_kept_mesh": true, "kept_mesh_without_material": true,
+                "bones": [], "takes": [],
+            }))
+            .unwrap()),
+        );
+        let report = check_domain_with(&f, &[table], &facts).await;
+
+        assert_eq!(
+            messages(&report),
+            [
+                "Loose/SM_Table.fbx: it is in no pack: mark its folder as a pack",
+                "Loose/SM_Table.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
+                "Loose/SM_Table.fbx: 2 of its materials are named Wood: slots M_Wood and Wood. Rename one so each name is unique",
+            ]
+        );
+        let slots: Vec<(String, bool)> = materials_of(&report, table)
+            .into_iter()
+            .map(|m| (m.0, m.4))
+            .collect();
+        assert_eq!(
+            slots,
+            [("M_Wood", false), ("Wood", false), ("OpenDAMDefault", true)]
+                .map(|(s, added)| (s.to_string(), added))
+        );
+        let row = report
+            .assets
+            .iter()
+            .find(|a| a.asset.file_path == table)
+            .unwrap();
+        assert_eq!(row.pack, None);
+        assert!(row.materials.iter().all(|m| m.textures.is_empty()));
     }
 
     #[tokio::test]

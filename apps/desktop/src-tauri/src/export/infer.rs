@@ -128,18 +128,30 @@ impl Default for Memo {
     }
 }
 
-/// Whether the image at `path` has a pixel with alpha below 0.5, decoding it without a
-/// converted copy for the usual layouts. An image that can't be decoded has none.
+/// Whether the image at `path` has a pixel with alpha below 0.5. Its header is read first, so
+/// an image with no alpha channel (a JPG, an RGB PNG) is never decoded, and one with alpha is
+/// decoded without a converted copy for the usual layouts. An image that can't be decoded has
+/// none.
 fn read_cut_alpha(path: &Path) -> bool {
-    use image::DynamicImage::*;
-    match image::open(path) {
+    use image::{DynamicImage, DynamicImage::*, ImageDecoder, ImageReader};
+    let decoder = ImageReader::open(path)
+        .and_then(|reader| reader.with_guessed_format())
+        .map_err(image::ImageError::IoError)
+        .and_then(|reader| reader.into_decoder());
+    let Ok(decoder) = decoder else {
+        return false;
+    };
+    if !decoder.color_type().has_alpha() {
+        return false;
+    }
+    match DynamicImage::from_decoder(decoder) {
         Ok(ImageRgba8(img)) => img.pixels().any(|p| p.0[3] < 128),
         Ok(ImageLumaA8(img)) => img.pixels().any(|p| p.0[1] < 128),
         Ok(ImageRgba16(img)) => img.pixels().any(|p| p.0[3] < 32768),
         Ok(ImageLumaA16(img)) => img.pixels().any(|p| p.0[1] < 32768),
         Ok(ImageRgba32F(img)) => img.pixels().any(|p| p.0[3] < 0.5),
-        Ok(img) if img.color().has_alpha() => img.to_rgba8().pixels().any(|p| p.0[3] < 128),
-        _ => false,
+        Ok(img) => img.to_rgba8().pixels().any(|p| p.0[3] < 128),
+        Err(_) => false,
     }
 }
 
@@ -1402,6 +1414,10 @@ mod tests {
         la.put_pixel(0, 0, image::LumaA([90, 127]));
         la.save(dir.path().join("la127.png")).unwrap();
         assert!(read_cut_alpha(&dir.path().join("la127.png")));
+        // A JPG has no alpha channel, so its header answers without a decode
+        assert!(!read_cut_alpha(
+            &root().join("Dungeon Props/Textures/T_Wall_D.jpg")
+        ));
     }
 
     /// The materials of a model at `fbx_path` in `pack` whose one slot `slot` references

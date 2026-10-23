@@ -901,6 +901,8 @@ from the contracts above:
   the suffix lookup, so case, word separators and one type prefix don't count. Only images with
   a role or layout suffix take part in the suffix lookup. The same-stem lookup reads the folders
   of the main item and the exported FBX: images never join a model's format group.
+- **A model in no pack** is refused for that, and still has its slots, the slot the export adds
+  and their names checked. With no pack to search, it binds no texture.
 - **D24 per set:** a set used by one model is `<AssetName><MaterialName>` when that model has
   more than one set in a role this set fills for it, `MaterialName` being the first material
   that uses it.
@@ -911,8 +913,9 @@ from the contracts above:
   files), and a texture row its layout, normal-map convention and whether it is a member. The
   Export view shows one line per material. The Game tab's material and texture editors wait
   for the Game tab (step 2).
-- **The cutout suggestion decodes the BaseColor with the `image` crate.** A PSD, or an image it
-  can't decode, suggests nothing. Its answer, each `.meta` GUID and each `.mat` are kept for the
+- **The cutout suggestion decodes the BaseColor with the `image` crate,** after reading its
+  header: an image with no alpha channel is never decoded. A PSD, or an image it can't decode,
+  suggests nothing. Its answer, each `.meta` GUID and each `.mat` are kept for the
   session while the file keeps its size and mtime, in an `infer::Memo` that `bundle::Exports`
   owns and passes to each Check and Export, so a repeated Check reads none of them again. Each
   of those files, and each `.fbx.meta`, is stamped in the Check's `Probes`, so the fingerprint
