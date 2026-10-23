@@ -234,6 +234,19 @@ decision changed:
   rollback just put back. That rollback runs only the structure pass, and its rows wait, as they
   did before the build, for the next refresh (Flow, A11).
 
+Revised again 2026-10-23 (revision 17) after GitHub Inspector's eighth review of PR #199. No
+decision changed:
+
+- **R38 - A Remove is journaled and always finished.** A Remove interrupted midway failed its
+  own drift re-check on resume, and one interrupted after deleting the import's records had lost
+  its target and manifest. It now journals `swap_state = 'removing'` before it deletes anything,
+  deletes the records last, after the scoped prune, and recovery finishes a `removing` pack
+  without a re-check, from the records it kept (Remove import, Flow, A13).
+- **R39 - Drift choices depend on the file's origin.** A generated GLB, `datapackage.json` and a
+  kept file can't take an `exclude` step, and keeping a changed generated GLB would clash with
+  the convert phase. The dialog now offers only the choices each origin can honour (Edits after
+  an import, A6).
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -574,10 +587,10 @@ them skips both.
 - **At the start of every locking index or structure entry point.** Each one runs only the
   `swapping` table, never the `swap_state NULL` one, and only while holding both locks:
   - **`index_paths`** already takes `index_lock`, then the advisory lock, and yields when another
-    holder has it. With both locks held, it recovers any pack still marked `swapping`, then
-    indexes.
+    holder has it. With both locks held, it recovers any pack still marked `swapping` or
+    `removing`, then indexes.
   - **`rebuild_library`** takes `index_lock` and, newly, *tries* the advisory lock. If it gets it,
-    it recovers any `swapping` pack, then runs its structure pass. If another holder has it, it
+    it recovers any `swapping` or `removing` pack, then runs its structure pass. If another holder has it, it
     skips both and logs it. The next index run derives the structure, as after a failed pass
     today (`structure.rs:2302-2304`). So a rename or pack edit on a second machine neither prunes
     nor regroups a pack mid-swap.
@@ -616,9 +629,13 @@ With `swap_state` `NULL`:
 | A `.failed-*` folder | A rollback finished its transaction, then crashed before deleting it | Delete the folder. |
 | A `.prev-*` folder | Committed, not settled | Run step 7: prune by `Prune::Now`, run the structure pass, delete `.prev`, rows of builds other than `current_build`, and their `import_moves`. |
 
+With `swap_state = 'removing'`, whatever is on disk, recovery finishes the Remove from its
+step 4 (Remove import), with no re-check. The `swapping` table's triggers and locks apply to it.
+
 Then, except in the last row of the first table, it clears `swap_state` and marks the run
-`interrupted`. Recovery never rolls forward: an
-uncommitted build is always discarded, and the cached conversions make its rerun cheap. The swap,
+`interrupted`. Recovery never rolls a build forward: an uncommitted build is always discarded,
+and the cached conversions make its rerun cheap. A journaled Remove is the one thing recovery
+finishes, since every step of it can be repeated. The swap,
 staging and recovery code moves out of `export/bundle.rs` into a shared `fs_swap` module that both
 features use, with a flag that keeps the old folder until the caller commits.
 
@@ -838,8 +855,8 @@ open):
   `never_built`), `current_build` (the committed build id, `NULL` before the first),
   `recipe_rev` (incremented by every change to the pack's steps, in the same transaction),
   `store_page` (the Kenney lookup's answer, outside the recipe; Pack metadata), and
-  `swap_state` (`NULL`, or `'swapping'` with `swap_build` and `swap_prev`, whether step 4 moved a
-  live folder aside).
+  `swap_state` (`NULL`; `'swapping'` with `swap_build` and `swap_prev`, whether step 4 moved a
+  live folder aside; or `'removing'`, Remove import).
 - `import_steps`: `pack_id`, `position`, `kind`, `enabled`, `options` (JSON).
 - `import_outputs`: `pack_id`, `build_id`, `path` (relative to the library root), `size`,
   `mtime_ns`, `sha256`, `origin` (`extracted`, `generated`, `kept`), `source_path` (Steps:
@@ -899,12 +916,17 @@ half manifest.
   (Flow, step 2).
 - **Outside changes (drift).** Before a Rebuild or a Remove, the live pack folder is compared
   with its manifest by size and mtime, hashing only on a mismatch. The dialog lists the
-  differences:
+  differences, and offers each file only the choices its origin can honour:
+
+  | Difference | Extracted file | Generated GLB | `datapackage.json` | Kept file |
+  |---|---|---|---|---|
+  | *Changed* | **keep yours** (carried over as `kept`, replacing the recipe's file) or **use the recipe's** | **use the recipe's** only: the convert phase writes that path again, so a kept copy would clash | **keep yours** (turns the metadata step off and carries the file as `kept`, so no step writes that path) or **use the recipe's** | **keep yours** only (the new bytes are kept) |
+  | *Missing* | **record as `exclude`** or **restore** | **restore** only. No step can drop one GLB: delete its model in the app, or turn `unity_glb` off | **turn the metadata step off** (as an in-app delete does) or **restore** | **forget** only (dropped from the kept files) |
+
   - *Added* (a file the manifest doesn't hold): **keep** (carried into the new output as
-    `kept`) or **discard**.
-  - *Changed*: **keep yours** (carried over as `kept`, replacing the recipe's file) or **use the
-    recipe's**.
-  - *Missing*: **record as `exclude`** or **restore**.
+    `kept`) or **discard**. A file added at a path the build itself writes (a generated GLB's
+    or `datapackage.json` while the metadata step is on) is offered **discard** only, and the
+    build's file takes the path.
 
   Kept files are listed in the Preparation panel as "not from the original", since a later
   rebuild can carry them but can't recreate them.
@@ -964,15 +986,30 @@ half manifest.
 
 ### Remove import
 
-The confirmation lists the pack's files and any drift that removing would lose. Removing runs as
-a `remove` run under the library's `index_lock` and the advisory `.opendam/index.lock`, taken and
-kept as a build takes them (Flow, step 1), after the same re-check as a build (Flow, step 2). It deletes exactly the current manifest's files and the folders left empty, then the
-import's records, then runs `index_paths_locked` over the pack folder with `Prune::Now`, which deletes the
-removed files' rows and ends with the structure pass. Removing is idempotent: a
-remove interrupted by a crash is marked `interrupted` and finished at the next startup, since
-deleting a file that is already gone is not an error. Asset rows of deleted files go with their tags,
-ratings and collections, as on any delete (D27). Kept files are deleted too, and the
-confirmation names them.
+The confirmation lists the pack's files and any drift that removing would lose. Kept files are
+deleted too, and the confirmation names them. Removing runs as a `remove` run, journaled like a
+swap so that a crash at any point is finished, never left half done:
+
+1. **Lock.** It takes the library's `index_lock` and the advisory `.opendam/index.lock`, and
+   keeps them, as a build does (Flow, step 1).
+2. **Re-check.** It compares the live folder with the current manifest plus the drift choices,
+   as a build does (Flow, step 2), and fails with nothing changed on a difference. This runs
+   only on the first attempt.
+3. **Journal.** It sets `import_packs.swap_state = 'removing'`. From here on the pack's runs and
+   in-app edits are refused, and the records, its `target` and its current manifest included,
+   stay until step 6.
+4. **Delete files.** It deletes exactly the current manifest's files and the folders left empty.
+   A file already gone is not an error.
+5. **Prune.** It runs `index_paths_locked` over the target with `Prune::Now`, scoped to the pack
+   (A scoped index), which deletes the removed files' rows and ends with the structure pass.
+6. **Records.** In one transaction it deletes the pack's records (its row, steps, manifest rows
+   and journal), and the import's row when no other pack is left. This is the end of the Remove.
+
+Every step from 4 on can be repeated. A Remove interrupted after step 3 is marked `interrupted`,
+and recovery, which finds the pack `removing` when the library opens or at the next locking index
+run, holding both locks, runs steps 4-6 again with no re-check: the folder no longer matches the
+manifest by then, and the records still name the target and the files. Asset rows of deleted
+files go with their tags, ratings and collections, as on any delete (D27).
 
 ## Changes to the invariants (CLAUDE.md)
 
@@ -1123,7 +1160,15 @@ confirmation names them.
     move leaves both files and both `.meta` files under their old names.
 - **A6 - Drift.** A file added, changed and removed outside OpenDAM is listed before Rebuild, and
   each choice (keep or discard, keep yours or use the recipe's, exclude or restore) has the
-  stated effect.
+  stated effect. By origin:
+  - a missing `SM_Log.glb` offers only **restore**, and the rebuild writes it again; a changed
+    one offers only **use the recipe's**;
+  - a missing `datapackage.json` with **turn the metadata step off** gives a rebuild without it,
+    as an in-app delete does; a changed one with **keep yours** turns the step off, carries the
+    file as `kept`, and the rebuild succeeds with no clash;
+  - a missing kept file offers only **forget**;
+  - with the metadata step off, a `datapackage.json` added outside OpenDAM, then the step turned
+    back on: the added file offers only **discard**, and the rebuild writes the recipe's.
 - **A7 - Metadata.** For the Unity, Fab and Kenney fixtures, `datapackage.json` equals the golden
   written by `gen_datapackage.py` and `gen_kenney_datapackage.py`. A publisher set at import
   survives a rebuild. With the HTTP answer injected as 200, the Kenney file gains the
@@ -1271,7 +1316,11 @@ confirmation names them.
   the memory cap".
 - **A13 - Remove import.** Removing deletes exactly the manifest's files and empty folders, and
   the confirmation lists any drift first. A tagged asset outside the pack keeps its row and tag
-  (A11, rows outside the pack).
+  (A11, rows outside the pack). Kill the Remove midway through deleting files, and separately
+  after the prune and before the records are deleted. On restart, recovery finishes each: every
+  manifest file and its row is gone, the pack's and the import's records are gone, no re-check
+  fails it, and rows outside the pack are untouched. A Remove whose re-check finds drift fails
+  before the journal, with nothing deleted.
 - **A14 - Unity-only files hidden.** In an imported pack, a `.mat` whose `.mat.meta` is in the
   current manifest is a hidden `unity` support file, and shows with `showHidden`. A `.mat` in a
   folder that wasn't imported keeps its kind and stays visible. `derive` reads no file for this,
