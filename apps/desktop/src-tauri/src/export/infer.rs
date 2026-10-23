@@ -1058,6 +1058,167 @@ mod tests {
     }
 
     #[test]
+    fn alpha_below_half_is_a_cut_and_half_is_not() {
+        use image::{ImageBuffer, Rgb, Rgba};
+        let dir = tempfile::tempdir().unwrap();
+        let save8 = |name: &str, alpha: u8| {
+            let mut img = ImageBuffer::from_pixel(2, 2, Rgba([90u8, 90, 90, 255]));
+            img.put_pixel(1, 1, Rgba([90, 90, 90, alpha]));
+            img.save(dir.path().join(name)).unwrap();
+        };
+        let save16 = |name: &str, alpha: u16| {
+            let mut img = ImageBuffer::from_pixel(2, 2, Rgba([9000u16, 9000, 9000, 65535]));
+            img.put_pixel(0, 1, Rgba([9000, 9000, 9000, alpha]));
+            img.save(dir.path().join(name)).unwrap();
+        };
+        save8("a127.png", 127);
+        save8("a128.png", 128);
+        save8("a254.png", 254);
+        save16("w32767.png", 32767);
+        save16("w32768.png", 32768);
+        ImageBuffer::from_pixel(2, 2, Rgb([90u8, 90, 90]))
+            .save(dir.path().join("rgb.png"))
+            .unwrap();
+        let names = [
+            "a127.png",
+            "a128.png",
+            "a254.png",
+            "w32767.png",
+            "w32768.png",
+            "rgb.png",
+        ];
+        let mut images = PackImages::new(
+            names
+                .iter()
+                .map(|n| Image {
+                    id: n.to_string(),
+                    path: n.to_string(),
+                })
+                .collect(),
+        );
+        let cut = |images: &mut PackImages, name: &str| {
+            let i = images.find(name).unwrap();
+            images.has_cut_alpha(dir.path(), i)
+        };
+        // 8 bit: 127 is below 0.5, 128 is not
+        assert!(cut(&mut images, "a127.png"));
+        assert!(!cut(&mut images, "a128.png"));
+        assert!(!cut(&mut images, "a254.png"));
+        // 16 bit: the same boundary at its own depth
+        assert!(cut(&mut images, "w32767.png"));
+        assert!(!cut(&mut images, "w32768.png"));
+        // No alpha channel, no cut
+        assert!(!cut(&mut images, "rgb.png"));
+    }
+
+    /// The materials of a model at `fbx_path` in `pack` whose one slot `slot` references
+    /// `references`, by type, with its relative path.
+    fn infer_slot(
+        pack: &str,
+        fbx_path: &str,
+        slot: &str,
+        references: &[(&str, &str)],
+    ) -> (PackImages, Vec<Material>) {
+        let mut images = pack_images(pack);
+        let facts = FbxFacts {
+            slots: vec![Slot {
+                name: slot.into(),
+                textures: references
+                    .iter()
+                    .map(|(kind, relative)| {
+                        (
+                            kind.to_string(),
+                            vec![TextureRef {
+                                file: None,
+                                relative: Some(relative.to_string()),
+                            }],
+                        )
+                    })
+                    .collect(),
+            }],
+            has_kept_mesh: true,
+            ..FbxFacts::default()
+        };
+        let unity = pack
+            .starts_with("Unity Moss")
+            .then(|| UnityPack::read(root(), &pack_files(pack)));
+        let model = Model {
+            item_path: fbx_path,
+            fbx_path,
+            facts: &facts,
+        };
+        let materials = materials(&mut images, root(), unity.as_ref(), &model);
+        (images, materials)
+    }
+
+    #[test]
+    fn each_role_falls_through_to_the_next_source_on_its_own() {
+        // The FBX names only a base color: it wins over the slot's suffixed T_StoneFloor_D,
+        // and the normal map still comes from the suffix lookup
+        let (images, floor) = infer_slot(
+            "Dungeon Props",
+            "Dungeon Props/Models/SM_Floor.fbx",
+            "StoneFloor",
+            &[("baseColor", "../Textures/T_Wall_D.jpg")],
+        );
+        assert_eq!(
+            textures(&images, &floor[0]),
+            [
+                (
+                    Role::BaseColor,
+                    paths(&["Dungeon Props/Textures/T_Wall_D.jpg"]),
+                    Via::Fbx
+                ),
+                (
+                    Role::Normal,
+                    paths(&["Dungeon Props/Textures/T_StoneFloor_N.png"]),
+                    Via::Suffix
+                ),
+            ]
+        );
+
+        // The FBX's reference wins over the Unity material's base color, and the material
+        // still gives the normal map
+        let (images, log) = infer_slot(
+            "Unity Moss",
+            "Unity Moss/Models/SM_Log.fbx",
+            "Bark",
+            &[("baseColor", "T_Bark_D.png")],
+        );
+        assert_eq!(
+            textures(&images, &log[0]),
+            [
+                (
+                    Role::BaseColor,
+                    paths(&["Unity Moss/Models/T_Bark_D.png"]),
+                    Via::Fbx
+                ),
+                (
+                    Role::Normal,
+                    paths(&["Unity Moss/Textures/T_Bark_Normal.png"]),
+                    Via::Unity
+                ),
+            ]
+        );
+
+        // A suffixed base color wins over SM_Boulder.png, the image with the model's stem
+        let (images, boulder) = infer_slot(
+            "Dungeon Props",
+            "Dungeon Props/Models/SM_Boulder.fbx",
+            "Iron",
+            &[],
+        );
+        assert_eq!(
+            textures(&images, &boulder[0])[0],
+            (
+                Role::BaseColor,
+                paths(&["Dungeon Props/Textures/T_Iron_D.png"]),
+                Via::Suffix
+            )
+        );
+    }
+
+    #[test]
     fn set_names_follow_their_users() {
         let images = pack_images("Dungeon Props");
         let floor = images.set_of[images
