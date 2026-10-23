@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use crate::export::collision::Patterns;
+use crate::export::fbx_facts::FbxFacts;
 use crate::export::packs::Origin;
 
 /// The only major.minor exports accept (D29). CI installs a release of it
@@ -327,6 +328,36 @@ pub fn check(job: &Job, normalized: &Normalized) -> Result<(), String> {
             "Blender's round trip changed the takes: the source keeps {}, and it wrote {}",
             list(&normalized.source.takes),
             list(&normalized.takes),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks the source's kept slots and takes, as Blender read them, against the preview
+/// worker's `fbx_facts`, which the Check showed and your edits name (C9). They are compared as
+/// sets, since Blender and the worker may order them differently: a difference means the two
+/// read the model differently, and the manifest would list materials or clips the Check never
+/// showed. The export calls it with the facts its Check read.
+pub fn check_facts(normalized: &Normalized, facts: &FbxFacts) -> Result<(), String> {
+    use std::collections::BTreeSet;
+    let blender: BTreeSet<&str> = normalized.source.slots.iter().map(String::as_str).collect();
+    let worker: BTreeSet<&str> = facts.slots.iter().map(|s| s.name.as_str()).collect();
+    if blender != worker {
+        return Err(format!(
+            "Blender and the preview engine read different material slots: Blender keeps {}, \
+             and the preview engine {}",
+            list(&blender),
+            list(&worker),
+        ));
+    }
+    let blender: BTreeSet<&str> = normalized.source.takes.iter().map(String::as_str).collect();
+    let worker: BTreeSet<&str> = facts.takes.iter().map(String::as_str).collect();
+    if blender != worker {
+        return Err(format!(
+            "Blender and the preview engine read different takes: Blender keeps {}, and the \
+             preview engine {}",
+            list(&blender),
+            list(&worker),
         ));
     }
     Ok(())
@@ -906,6 +937,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_source_must_read_as_the_worker_read_it_in_any_order() {
+        let facts = |slots: &[&str], takes: &[&str]| FbxFacts {
+            slots: slots
+                .iter()
+                .map(|name| crate::export::fbx_facts::Slot {
+                    name: name.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            takes: takes.iter().map(|t| t.to_string()).collect(),
+            ..FbxFacts::default()
+        };
+        let mut normalized = lamp();
+        normalized.source.slots = vec!["Stone".into(), "Moss".into()];
+        normalized.source.takes = vec!["Idle".into(), "Wave".into()];
+
+        assert_eq!(
+            check_facts(&normalized, &facts(&["Moss", "Stone"], &["Wave", "Idle"])),
+            Ok(())
+        );
+        assert_eq!(
+            check_facts(&normalized, &facts(&["Stone"], &["Idle", "Wave"])),
+            Err(
+                "Blender and the preview engine read different material slots: Blender keeps \
+                 Moss, Stone, and the preview engine Stone"
+                    .into()
+            )
+        );
+        assert_eq!(
+            check_facts(&normalized, &facts(&["Stone", "Moss"], &["Idle"])),
+            Err(
+                "Blender and the preview engine read different takes: Blender keeps Idle, \
+                 Wave, and the preview engine Idle"
+                    .into()
+            )
+        );
+    }
+
     /// A fake Blender running the shell `body`, which gets the job's arguments as `$1`..`$7`.
     fn fake(dir: &Path, body: &str) -> Blender {
         let program = dir.join("blender");
@@ -1434,6 +1504,32 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))";
                  a take"
                 .into())
         );
+    }
+
+    #[tokio::test]
+    async fn blender_reads_each_fixture_model_as_the_worker_does() {
+        let Some(runner) = fixture_runner().await else {
+            return;
+        };
+        let out = tempfile::tempdir().unwrap();
+
+        for name in [
+            "SM_Totem",
+            "SM_Pillar",
+            "SM_Gate",
+            "SM_Boulder",
+            "SM_Lamp",
+            "SM_Shelf",
+            "SM_Stool",
+            "SK_Guard",
+        ] {
+            let normalized = runner.run(&fixture_job(name, out.path())).await.unwrap();
+            assert_eq!(
+                check_facts(&normalized, &fixture_facts(name)),
+                Ok(()),
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

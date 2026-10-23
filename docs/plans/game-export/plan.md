@@ -906,6 +906,11 @@ later. Where they differ from C9:
   lists, so a duplicated or lost take fails. An imported action that can't be matched to an
   object and a take the file names is refused, as when Blender renames a second take of one
   name `<take>.001` (`SM_Lantern`).
+- **The check against the worker is its own function,** `blender::check_facts`, comparing the
+  source's kept slots and takes with `fbx_facts`' as sets. `Runner::run` does the same-run checks
+  only, since a `Job` carries no facts. The export (#179) calls `check_facts` with the facts its
+  Check read, so a model Blender and the worker read differently is refused there. A take only on
+  a collision mesh counts for `fbx_facts` but not for the script, so such a model fails it.
 - **Positions are reported in Unity's axes** as Blender's (-x, z, -y): the FBX is written Y up and
   -Z forward, and Unity mirrors X on import. The nose fixture checks the mirror as well as the
   facing, since its nose is off centre.
