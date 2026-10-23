@@ -155,6 +155,20 @@ export function ExportDialog({ domain, onClose }: ExportDialogProps) {
                       <DiffList title="Added" entries={check.diff.added} />
                       <DiffList title="Changed" entries={check.diff.changed} />
                       <DiffList title="Removed" entries={check.diff.removed} />
+                      {check.diff.packs.length > 0 && (
+                        <div>
+                          <span className={styles.diffTitle}>
+                            Packs changed ({check.diff.packs.length})
+                          </span>
+                          <ul className={styles.diffList}>
+                            {check.diff.packs.map((id) => (
+                              <li key={id}>
+                                pack <span className={styles.name}>{id}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
                     </div>
                   )}
                 </>

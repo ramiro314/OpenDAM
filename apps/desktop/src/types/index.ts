@@ -490,6 +490,8 @@ export interface ExportDiff {
   added: ExportDiffEntry[];
   changed: ExportDiffEntry[];
   removed: ExportDiffEntry[];
+  /** Ids of the packs whose manifest entry the export adds, changes or removes */
+  packs: string[];
 }
 
 /** A pack of the domain, as the manifest names it (plan C6) */

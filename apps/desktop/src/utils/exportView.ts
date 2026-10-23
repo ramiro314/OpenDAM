@@ -52,7 +52,7 @@ export function diffLabel(entry: ExportDiffEntry): string {
 
 /** The line above the diff: what the export adds, changes and removes in the bundle. */
 export function diffSummary(diff: ExportDiff): string {
-  const { added, changed, removed } = diff;
+  const { added, changed, removed, packs } = diff;
   if (diff.previousExportedAt === null) {
     return added.length === 0
       ? 'No bundle yet, and nothing to export'
@@ -62,6 +62,7 @@ export function diffSummary(diff: ExportDiff): string {
     added.length > 0 && `${added.length} added`,
     changed.length > 0 && `${changed.length} changed`,
     removed.length > 0 && `${removed.length} removed`,
+    packs.length > 0 && plural(packs.length, 'pack') + ' changed',
   ].filter(Boolean);
   if (parts.length === 0) return 'The bundle already holds exactly this';
   return `Against the previous bundle: ${parts.join(', ')}`;

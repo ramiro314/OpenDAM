@@ -75,6 +75,7 @@ const diff = (previousExportedAt: string | null, parts: Partial<ExportDiff>): Ex
   added: [],
   changed: [],
   removed: [],
+  packs: [],
   ...parts,
 });
 
@@ -94,6 +95,10 @@ describe('diffSummary', () => {
     );
     expect(diffSummary(diff(then, { changed: [rock] }))).toBe(
       'Against the previous bundle: 1 changed'
+    );
+    // A pack-only change is a change too
+    expect(diffSummary(diff(then, { packs: ['kenney-crates'] }))).toBe(
+      'Against the previous bundle: 1 pack changed'
     );
   });
 

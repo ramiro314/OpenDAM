@@ -256,6 +256,13 @@ pub async fn inspect(
                 problems.push(general(format!(
                     "{domain} is not a domain: domains are the collections directly inside the root collection {name}"
                 )));
+            } else if collections
+                .iter()
+                .any(|c| c.0 != domain_id && c.2.as_deref() == Some(id) && c.1 == domain)
+            {
+                problems.push(general(format!(
+                    "Another domain in {name} is also named {domain}: each domain is a folder of the bundle path, so rename one"
+                )));
             }
             if !is_pascal(name) {
                 problems.push(general(format!(

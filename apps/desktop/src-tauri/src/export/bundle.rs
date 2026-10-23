@@ -31,7 +31,7 @@ pub struct DiffEntry {
 
 /// What an export changes in the bundle (C14): the assets it adds, changes (their file's sha256
 /// or any other field of their entry) and removes, by kind, `assetName` and role, so a renamed
-/// asset is a removal plus an addition.
+/// asset is a removal plus an addition, and the packs whose entry it adds, changes or removes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Diff {
@@ -40,6 +40,9 @@ pub struct Diff {
     pub added: Vec<DiffEntry>,
     pub changed: Vec<DiffEntry>,
     pub removed: Vec<DiffEntry>,
+    /// The ids of the packs whose manifest entry differs (a licence, name or origin edit, say),
+    /// or that only one of the two manifests lists, sorted
+    pub packs: Vec<String>,
 }
 
 fn entry_of(asset: &Value) -> DiffEntry {
@@ -78,6 +81,20 @@ pub fn diff(previous: Option<&Value>, next: &Value) -> Diff {
         .iter()
         .map(entry_of)
         .filter(|e| !after.contains(e))
+        .collect();
+    let packs = |m: Option<&Value>| -> HashMap<String, Value> {
+        m.and_then(|m| m["packs"].as_array())
+            .into_iter()
+            .flatten()
+            .map(|p| (p["id"].as_str().unwrap_or_default().to_string(), p.clone()))
+            .collect()
+    };
+    let (before, after) = (packs(previous), packs(Some(next)));
+    let ids: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    diff.packs = ids
+        .into_iter()
+        .filter(|id| before.get(*id) != after.get(*id))
+        .cloned()
         .collect();
     diff
 }
@@ -147,6 +164,11 @@ pub fn recover(bundle: &Path) -> Result<(), String> {
     }
     olds.sort();
     if bundle.exists() {
+        // A `D/` OpenDAM didn't write may have appeared after a crash: an old bundle may then be
+        // the only copy of the last export, so it is kept, and the Check reports `D/` (`previous`)
+        if previous(bundle).is_err() {
+            return Ok(());
+        }
         // The swap finished: the old bundles are leftovers
         for old in olds {
             std::fs::remove_dir_all(&old).map_err(|e| {
@@ -415,6 +437,8 @@ struct Staged {
     bundle: PathBuf,
     staging: PathBuf,
     fingerprint: Fingerprint,
+    /// The manifest of the bundle the Check diffed against, which Export must still find there
+    previous: Option<Value>,
     assets: usize,
 }
 
@@ -490,6 +514,7 @@ impl Exports {
         .await?;
 
         report.diff = Some(diff(previous.as_ref(), &report.manifest));
+        let checked_previous = previous;
         report.problems.extend(problems);
         report.assets = check::with_status(std::mem::take(&mut report.assets), &report.problems);
         with_diff_status(&mut report);
@@ -501,6 +526,7 @@ impl Exports {
                     bundle,
                     staging,
                     fingerprint,
+                    previous: checked_previous,
                     assets,
                 },
             );
@@ -509,8 +535,9 @@ impl Exports {
     }
 
     /// Swaps the domain's staged bundle in (C15 step 3), once a fresh read of everything the
-    /// Check read finds no change (C14). On a change, the staged bundle is discarded and nothing
-    /// is written.
+    /// Check read finds no change (C14), and the domain's folder still holds the bundle the Check
+    /// diffed against, or still holds nothing. On a change, the staged bundle is discarded and
+    /// nothing is written or deleted.
     pub async fn export(
         &self,
         db: &Database,
@@ -546,16 +573,29 @@ impl Exports {
         let Staged {
             bundle,
             staging,
+            previous: checked_previous,
             assets,
             ..
         } = checked;
         let path = bundle.display().to_string();
-        blocking(move || {
+        let swapped = blocking(move || {
+            // Whatever is at `D/` now is what the swap deletes
+            if !matches!(previous(&bundle), Ok(now) if now == checked_previous) {
+                discard(&staging);
+                return Ok(false);
+            }
             let swapped = swap(&bundle, &staging, |from, to| std::fs::rename(from, to));
             discard(&staging);
-            swapped
+            swapped.map(|()| true)
         })
         .await??;
+        if !swapped {
+            return Ok(ExportOutcome::Stale {
+                changes: vec![format!(
+                    "{path} no longer holds the bundle the Check compared against"
+                )],
+            });
+        }
         tracing::info!("Exported {assets} assets to {path}");
         Ok(ExportOutcome::Exported {
             bundle_path: path,
@@ -914,6 +954,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_leaves_a_domain_folder_that_changed_since_the_check_alone() {
+        let f = fixture().await;
+        domain(&f, &TEXTURES).await;
+        let exports = Exports::default();
+
+        // A folder of yours appears where no bundle was
+        assert!(exports.check(&f.db, "props", &NoFbx).await.unwrap().staged);
+        std::fs::create_dir_all(bundle_dir(&f)).unwrap();
+        std::fs::write(bundle_dir(&f).join("notes.txt"), "mine").unwrap();
+        let ExportOutcome::Stale { changes } = export(&f, &exports).await else {
+            panic!("exported over a folder of yours");
+        };
+        assert!(changes[0].ends_with("no longer holds the bundle the Check compared against"));
+        assert_eq!(listing(&bundle_dir(&f)), ["notes.txt"]);
+        assert_eq!(leftovers(&f), Vec::<String>::new());
+        std::fs::remove_dir_all(bundle_dir(&f)).unwrap();
+
+        // The previous bundle is replaced by another export after the Check
+        exports.check(&f.db, "props", &NoFbx).await.unwrap();
+        export(&f, &exports).await;
+        assert!(exports.check(&f.db, "props", &NoFbx).await.unwrap().staged);
+        let manifest = bundle_dir(&f).join(MANIFEST);
+        let mut other: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        other["exportedAt"] = json!("2026-10-23T09:00:00+00:00");
+        std::fs::write(&manifest, other.to_string()).unwrap();
+        assert!(matches!(
+            export(&f, &exports).await,
+            ExportOutcome::Stale { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            other.to_string()
+        );
+        assert_eq!(leftovers(&f), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn two_domains_of_one_name_are_refused_and_touch_no_folder() {
+        let f = fixture().await;
+        domain(&f, &TEXTURES).await;
+        insert_collection(&f.db.master_pool, "props2", "Props", Some("dg")).await;
+        let exports = Exports::default();
+
+        for id in ["props", "props2"] {
+            let report = exports.check(&f.db, id, &NoFbx).await.unwrap();
+            assert_eq!(
+                report.problems.iter().map(|p| p.message.as_str()).collect::<Vec<_>>(),
+                ["Another domain in DungeonGame is also named Props: each domain is a folder of the bundle path, so rename one"]
+            );
+            assert_eq!(report.bundle_path, None);
+            assert!(!report.staged);
+        }
+        assert!(!f.export_root.join("DungeonGame").exists());
+    }
+
+    #[tokio::test]
+    async fn old_bundles_are_kept_while_the_domain_folder_isnt_an_opendam_bundle() {
+        let f = fixture().await;
+        domain(&f, &TEXTURES).await;
+        let exports = Exports::default();
+        exports.check(&f.db, "props", &NoFbx).await.unwrap();
+        export(&f, &exports).await;
+        let files = listing(&bundle_dir(&f));
+
+        // A crash after the first rename, then a folder of yours at the bundle path
+        let parent = f.export_root.join("DungeonGame");
+        std::fs::rename(bundle_dir(&f), parent.join(".Props.old-crashed")).unwrap();
+        std::fs::create_dir(bundle_dir(&f)).unwrap();
+        std::fs::write(bundle_dir(&f).join("notes.txt"), "mine").unwrap();
+
+        let report = exports.check(&f.db, "props", &NoFbx).await.unwrap();
+        assert_eq!(report.problems.len(), 1);
+        assert!(report.problems[0]
+            .message
+            .contains("holds no manifest.json that OpenDAM wrote"));
+        assert_eq!(leftovers(&f), [".Props.old-crashed"]);
+        assert_eq!(listing(&parent.join(".Props.old-crashed")), files);
+
+        // Once your folder is moved away, the next Check restores the bundle
+        std::fs::remove_dir_all(bundle_dir(&f)).unwrap();
+        let report = exports.check(&f.db, "props", &NoFbx).await.unwrap();
+        assert_eq!(report.problems, []);
+        assert_eq!(listing(&bundle_dir(&f)), files);
+    }
+
+    #[tokio::test]
+    async fn a_pack_only_change_shows_in_the_diff() {
+        let f = fixture().await;
+        domain(&f, &TEXTURES).await;
+        let exports = Exports::default();
+        exports.check(&f.db, "props", &NoFbx).await.unwrap();
+        export(&f, &exports).await;
+
+        sqlx::query(
+            "INSERT INTO pack_overrides (path, name, updated_at) VALUES ('Kenney Crates', 'Crates', 0)",
+        )
+        .execute(&f.library.pool)
+        .await
+        .unwrap();
+        crate::structure::rebuild_library(&f.db, &f.library).await;
+        let report = exports.check(&f.db, "props", &NoFbx).await.unwrap();
+        let diff = report.diff.unwrap();
+        assert_eq!(diff.packs, ["kenney-crates"]);
+        assert!(diff.added.is_empty() && diff.changed.is_empty() && diff.removed.is_empty());
+    }
+
+    #[tokio::test]
     async fn a_folder_that_isnt_an_opendam_bundle_is_never_replaced() {
         let f = fixture().await;
         domain(&f, &TEXTURES).await;
@@ -1246,5 +1393,17 @@ mod tests {
         assert_eq!(names(&d.changed), [("Rock", Some("Normal"))]);
         assert_eq!(names(&d.removed), [("Old", Some("BaseColor"))]);
         assert_eq!(names(&diff(None, &next).added).len(), 3);
+        assert!(d.packs.is_empty());
+
+        // Packs are compared by id: an edited entry, a new one and one that left
+        let pack = |id: &str, name: &str| json!({"id": id, "name": name});
+        let mut previous = previous;
+        previous["packs"] = json!([pack("crates", "Crates"), pack("gone", "Gone")]);
+        let mut next = next;
+        next["packs"] = json!([pack("crates", "Crate Kit"), pack("moss", "Moss")]);
+        assert_eq!(
+            diff(Some(&previous), &next).packs,
+            ["crates", "gone", "moss"]
+        );
     }
 }
