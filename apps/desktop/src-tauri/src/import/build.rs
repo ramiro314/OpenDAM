@@ -79,6 +79,8 @@ pub enum Point {
     MoveIn,
     /// The engine's claim of a queued run, before its `UPDATE`.
     Claim,
+    /// A failed claim, after the engine cleared the active run and before it checks for Cancel.
+    ClaimFailed,
     /// `Engine::cancel_run`, after it found the run isn't the active one.
     CancelLookup,
 }

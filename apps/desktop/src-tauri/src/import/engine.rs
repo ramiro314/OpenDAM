@@ -297,13 +297,16 @@ impl Engine {
                 // Still queued: wait before the loop finds it again. A Cancel already accepted
                 // carries over to that attempt.
                 tracing::error!("Could not claim import run {}: {e}", run.id);
+                // Cleared first: a Cancel through `cancel_active` either landed before, and is
+                // seen here, or finds no active run and cancels the queued row instead.
+                self.set_active(None);
+                let _ = self.hooks.at(Point::ClaimFailed).await;
                 if control.cancelled() {
                     self.pending_cancels
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(run.id.clone());
                 }
-                self.set_active(None);
                 tokio::time::sleep(CLAIM_RETRY).await;
                 return;
             }
@@ -416,8 +419,8 @@ impl Engine {
     /// Cancels a queued run, or the running one while its build hasn't taken the library's lock.
     /// After that it answers "Finishing, can't cancel now", and the build completes.
     pub async fn cancel_run(&self, library_id: &str, run_id: &str) -> Result<(), String> {
-        if let Some(control) = self.active_control(run_id) {
-            return control.cancel();
+        if let Some(cancelled) = self.cancel_active(run_id) {
+            return cancelled;
         }
         self.hooks.at(Point::CancelLookup).await?;
         let library = self.library(library_id).await?;
@@ -432,22 +435,23 @@ impl Engine {
         .map_err(|e| e.to_string())?;
         if cancelled.rows_affected() == 0 {
             // The engine may have claimed it meanwhile: it sets the active run first.
-            return match self.active_control(run_id) {
-                Some(control) => control.cancel(),
-                None => Err("The run is neither queued nor running".into()),
-            };
+            return self
+                .cancel_active(run_id)
+                .unwrap_or_else(|| Err("The run is neither queued nor running".into()));
         }
         self.updated(&library, run_id).await;
         Ok(())
     }
 
-    /// The Cancel of run `run_id` while it is the one being executed.
-    fn active_control(&self, run_id: &str) -> Option<Arc<RunControl>> {
+    /// Cancels run `run_id` through its `RunControl` while it is the one being executed, `None`
+    /// when it isn't. The Cancel happens under the `active` lock, so it is ordered against the
+    /// engine clearing the run.
+    fn cancel_active(&self, run_id: &str) -> Option<Result<(), String>> {
         let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         active
             .as_ref()
             .filter(|(id, _)| id == run_id)
-            .map(|(_, control)| control.clone())
+            .map(|(_, control)| control.cancel())
     }
 
     pub async fn list_runs(&self, library_id: &str) -> Result<Vec<RunSummary>, String> {
@@ -1593,5 +1597,22 @@ mod tests {
         staged.release.notify_one();
 
         s.unchanged_after_cancel(&run.id, &assets).await;
+    }
+
+    #[tokio::test]
+    async fn a_cancel_between_a_failed_claim_and_its_check_cancels_the_queued_row() {
+        let s = setup().await;
+        let assets = s.strings("SELECT id FROM assets ORDER BY id").await;
+        s.engine.hooks().fail_once(Point::Claim);
+        let gap = s.engine.hooks().pause(Point::ClaimFailed);
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        gap.reached.notified().await;
+
+        s.engine.cancel_run("lib", &run.id).await.unwrap();
+        gap.release.notify_one();
+
+        s.unchanged_after_cancel(&run.id, &assets).await;
+        let ended = records::run(&s.lib.pool, "lib", &run.id).await.unwrap();
+        assert_eq!(ended.started_at, None, "the retry never claimed it");
     }
 }
