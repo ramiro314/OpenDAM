@@ -128,7 +128,7 @@ export function ModelEditor({
   model: GameModelDetail;
   /** Counts the tab's saved edits: each makes an open view ask again */
   revision: number;
-  /** Whether `model` was read before the last save */
+  /** Whether the tab is still reading back the last save, which `model` may not show yet */
   stale: boolean;
   /** Resolves whether the edit was written */
   save: (patch: ExportEditPatch) => Promise<boolean>;

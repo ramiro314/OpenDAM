@@ -1115,17 +1115,15 @@ function CollectionsTab({
  * makes an open Export view holding the asset ask for a new Check.
  */
 function GameTab({ asset }: { asset: Asset }) {
-  // `reload` is the save the detail was read after, so a control can tell it is behind
-  const [loaded, setLoaded] = useState<{
-    id: string;
-    detail: GameDetail | null;
-    reload: number;
-  } | null>(null);
+  const [loaded, setLoaded] = useState<{ id: string; detail: GameDetail | null } | null>(null);
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
   const [saving, setSaving] = useState(false);
   const [reload, setReload] = useState(0);
+  // The save the last finished read followed, whether it succeeded or failed, so a control
+  // waiting for the read back of a save never waits on a read that already ended
+  const [readAfter, setReadAfter] = useState(0);
   useEffect(() => {
     let current = true;
     setChecking(true);
@@ -1136,12 +1134,16 @@ function GameTab({ asset }: { asset: Asset }) {
         .getGameDetail(asset.id)
         .then((detail) => {
           if (!current) return;
-          setLoaded({ id: asset.id, detail, reload });
+          setLoaded({ id: asset.id, detail });
           setDraft(detail ? shownValue(detail.assetName).value : '');
           setError(null);
         })
         .catch((err) => current && setError(String(err)))
-        .finally(() => current && setChecking(false));
+        .finally(() => {
+          if (!current) return;
+          setChecking(false);
+          setReadAfter(reload);
+        });
     }, 250);
     return () => {
       current = false;
@@ -1256,7 +1258,7 @@ function GameTab({ asset }: { asset: Asset }) {
           assetId={detail.assetId}
           model={detail.model}
           revision={reload}
-          stale={loaded?.reload !== reload}
+          stale={readAfter !== reload}
           saving={saving}
           save={save}
         />
