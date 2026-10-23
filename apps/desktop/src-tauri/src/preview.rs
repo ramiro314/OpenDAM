@@ -1979,6 +1979,48 @@ done
     }
 
     #[tokio::test]
+    async fn waiting_requests_are_all_answered_before_the_next_job() {
+        let dir = tempfile::tempdir().unwrap();
+        // The worker logs each request and job id it runs, in order
+        let logged = format!(r#"echo "$id" >> "$DIR/order"; {JOB_DONE}"#);
+        let mut engine = stub_engine(dir.path(), ANSWER_2, &logged);
+        let lib = library_with_pending_job(dir.path(), "models/a.fbx", "").await;
+        sqlx::query(
+            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes, modified_at, indexed_at, preview_status)
+             VALUES ('a2', 'models/a2.fbx', 'a2.fbx', 'fbx', 'model', 0, 0, 0, 'pending');
+             INSERT INTO preview_jobs (id, asset_id, status, created_at) VALUES ('j2', 'a2', 'pending', 0)",
+        )
+        .execute(&lib.pool)
+        .await
+        .unwrap();
+        let (sender, mut requests) = mpsc::channel(8);
+        let answers: Vec<_> = (1..=3)
+            .map(|n| send(&sender, &format!("facts-{n}")))
+            .collect();
+
+        let mut outcomes = Vec::new();
+        python_queue_round(
+            std::slice::from_ref(&lib),
+            &mut engine,
+            &mut requests,
+            |o| outcomes.push(o),
+        )
+        .await;
+
+        for (n, answer) in answers.into_iter().enumerate() {
+            assert_eq!(
+                answer.await.unwrap().unwrap()["id"],
+                format!("facts-{}", n + 1)
+            );
+        }
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        let order = std::fs::read_to_string(dir.path().join("order")).unwrap();
+        let order: Vec<&str> = order.lines().collect();
+        assert_eq!(&order[..3], ["facts-1", "facts-2", "facts-3"], "{order:?}");
+        assert_eq!(order.len(), 5, "{order:?}");
+    }
+
+    #[tokio::test]
     async fn a_request_no_worker_can_serve_is_answered_with_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut engine = stub_engine(dir.path(), "exec sleep 3600", JOB_DONE);

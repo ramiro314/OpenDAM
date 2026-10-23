@@ -360,15 +360,21 @@ async fn read_library(
                 .or_insert_with(|| vec![&item.file_path]);
         }
     }
-    let mut fbx = HashMap::new();
-    for (id, paths) in fbx_paths {
+    // Every read is sent at once, so the preview queue serves them all between two of its jobs
+    let reads = fbx_paths.into_iter().map(|(id, paths)| {
         let path = exported_fbx(paths)
             .expect("a group with an FBX")
             .to_string();
-        let source = library.root_path.join(&path);
-        let facts = facts.read(&source, &library.root_path).await;
-        fbx.insert(id.to_string(), ItemFbx { path, facts });
-    }
+        let root = &library.root_path;
+        async move {
+            let facts = facts.read(&root.join(&path), root).await;
+            (id.to_string(), ItemFbx { path, facts })
+        }
+    });
+    let fbx: HashMap<String, ItemFbx> = futures_util::future::join_all(reads)
+        .await
+        .into_iter()
+        .collect();
 
     let overrides = structure::read_overrides(pool).await?;
     let folders: Vec<(String, String, Option<String>)> =
@@ -2002,6 +2008,48 @@ mod tests {
             ]
         );
         assert_eq!(facts.read_files(), [unity]);
+    }
+
+    /// `Facts` that answers only once `reads` reads are in flight together.
+    struct AllAtOnce {
+        facts: Facts,
+        together: tokio::sync::Barrier,
+    }
+
+    impl fbx_facts::Reader for AllAtOnce {
+        async fn read(&self, source: &Path, root: &Path) -> Result<FbxFacts, String> {
+            self.together.wait().await;
+            self.facts.read(source, root).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_libraries_fbx_files_are_read_all_at_once() {
+        let f = fixture().await;
+        let paths = [
+            "Dungeon Props/Models/SM_Pillar.fbx",
+            "Dungeon Props/Models/SM_Gate.fbx",
+            "Dungeon Props/Models/SM_Hull.fbx",
+            "Dungeon Props/Models/SM_Stool.fbx",
+            "Dungeon Props/Models/SK_Guard.fbx",
+        ];
+        collection(&f, "domain", "Props", "dg", &paths).await;
+        let facts = AllAtOnce {
+            facts: Facts::fixture(),
+            together: tokio::sync::Barrier::new(paths.len()),
+        };
+
+        // Read one after another, the first read would wait for the others for ever
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            check(&f.db, "domain", &facts),
+        )
+        .await
+        .expect("every read is in flight at once")
+        .unwrap();
+        assert_eq!(facts.facts.read_files().len(), paths.len());
+        assert!(messages(&report)
+            .contains(&"Dungeon Props/Models/SM_Hull.fbx: FBX has no kept mesh and no take"));
     }
 
     /// Checks a new domain holding `paths`, reading FBX facts from `facts`.

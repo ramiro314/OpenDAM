@@ -42,6 +42,8 @@ tauri-plugin-notification = "2"
 jsonschema = { version = "0.60", default-features = false }
 # Source and bundle file hashes (plan game-export A4)
 sha2 = "0.11"
+# Joins a Check's FBX fact reads, so they reach the preview worker together (already in the tree)
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [profile.release]
 codegen-units = 1
