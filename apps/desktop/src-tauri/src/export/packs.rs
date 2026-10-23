@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::export::conversion::Walker;
@@ -24,12 +24,23 @@ pub struct PackSource {
     pub edits: PackOverride,
     /// The `datapackage.json` `name`, which the structure pass doesn't keep
     pub package_name: Option<String>,
+    /// Yours (`edits.origin`), else the one `infer_origin` reads from the pack's files
     pub origin: Origin,
 }
 
+impl PackSource {
+    /// The pack's normal-map convention (D14): yours, else its origin's default.
+    pub fn normal_convention(&self) -> Convention {
+        self.edits
+            .normal_convention
+            .unwrap_or_else(|| self.origin.normal_convention())
+    }
+}
+
 /// Where a pack's files come from (D12).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
+#[sqlx(rename_all = "lowercase")]
 pub enum Origin {
     Unity,
     Unreal,
