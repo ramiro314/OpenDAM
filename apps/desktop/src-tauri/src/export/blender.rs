@@ -958,8 +958,15 @@ mod tests {
     #[tokio::test]
     async fn a_job_past_its_timeout_is_stopped() {
         let dir = tempfile::tempdir().unwrap();
-        let runner =
-            Runner::with_limits(fake(dir.path(), "exec sleep 30"), 1, Duration::from_secs(1));
+        let pid_file = dir.path().join("pid");
+        let runner = Runner::with_limits(
+            fake(
+                dir.path(),
+                &format!("echo $$ > '{}'\nexec sleep 30", pid_file.display()),
+            ),
+            1,
+            Duration::from_secs(1),
+        );
         let started = std::time::Instant::now();
 
         let message = runner.run(&lamp_job()).await.unwrap_err();
@@ -969,6 +976,22 @@ mod tests {
             "Dungeon Props/Models/SM_Lamp.fbx: Blender didn't finish normalizing it in 1 s"
         );
         assert!(started.elapsed() < Duration::from_secs(10));
+        // The process is killed, not left running: gone, or a zombie until it is reaped
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let stat = format!("/proc/{}/stat", pid.trim());
+        let alive = || {
+            std::fs::read_to_string(&stat)
+                .is_ok_and(|s| s.rsplit(") ").next().is_some_and(|s| !s.starts_with('Z')))
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while alive() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !alive(),
+            "Blender {} still runs after its timeout",
+            pid.trim()
+        );
     }
 
     #[tokio::test]
@@ -1228,6 +1251,26 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))";
         assert_eq!(stool.slots, ["Material"]);
         assert_eq!(stool.added_material, None);
         assert_size(stool.bounds, [0.4, 0.5, 0.4]);
+    }
+
+    #[tokio::test]
+    async fn a_take_that_moves_the_root_object_is_refused() {
+        let Some(runner) = fixture_runner().await else {
+            return;
+        };
+        let out = tempfile::tempdir().unwrap();
+
+        // Its take Spin turns SM_Spinner itself, where the normalization goes
+        let spinner = runner.run(&fixture_job("SM_Spinner", out.path())).await;
+
+        assert_eq!(
+            spinner,
+            Err(
+                "Dungeon Props/Models/SM_Spinner.fbx: its take Spin moves its root object \
+                 SM_Spinner"
+                    .into()
+            )
+        );
     }
 
     #[tokio::test]

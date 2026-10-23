@@ -38,6 +38,11 @@ Step 4 (`fbx_facts`, and the Check telling models from animations), in `Dungeon 
   which is refused. `SM_Lamp.fbx`: a real `DefaultMaterial` beside a mesh with no material.
   `SM_Shelf.fbx`: a slot named `OpenDAMDefault` beside a mesh with no material.
 
+Step 6 (Blender normalization of models), in `Dungeon Props/Models/`:
+
+- `SM_Spinner.fbx`: a model whose take `Spin` turns the model's own object, not a bone, which
+  the normalization script refuses.
+
 After a rerun, refresh `fbx_facts.json` beside the library, as `test_fbx_facts.py` says. Only
 the FBX files this script changes on purpose are committed: each rerun stamps new times in them.
 """
@@ -99,7 +104,9 @@ def conversion(path: str, steps: list[dict]) -> None:
 def blender_image(path: str, rgba: tuple[float, float, float, float], file_format: str) -> None:
     target = LIBRARY / path
     target.parent.mkdir(parents=True, exist_ok=True)
-    image = bpy.data.images.new(target.stem, 4, 4, alpha=True, float_buffer=file_format == "OPEN_EXR")
+    image = bpy.data.images.new(
+        target.stem, 4, 4, alpha=True, float_buffer=file_format == "OPEN_EXR"
+    )
     image.pixels = list(rgba) * 16
     image.filepath_raw = str(target)
     image.file_format = file_format
@@ -291,6 +298,25 @@ def models() -> None:
     box("SM_Shelf_Board", size=(0.9, 0.28, 0.05), location=(0, 0, 1))
     export_fbx(f"{models}/SM_Shelf.fbx")
 
+    # A take that turns the model's own object, which would undo its normalization
+    bpy.ops.wm.read_homefile(use_empty=True)
+    spinner = box(
+        "SM_Spinner", size=(0.5, 0.5, 1), location=(0, 0, 0.5), materials=[material("Brass")]
+    )
+    spinner.animation_data_create().action = bpy.data.actions.new("Spin")
+    for frame, angle in [(1, 0.0), (20, 3.0)]:
+        spinner.rotation_euler = (0, 0, angle)
+        spinner.keyframe_insert("rotation_euler", frame=frame)
+    scene = bpy.context.scene
+    scene.frame_start, scene.frame_end = 1, 20
+    scene.name = "Spin"
+    export_fbx(
+        f"{models}/SM_Spinner.fbx",
+        bake_anim=True,
+        bake_anim_use_all_actions=False,
+        bake_anim_use_nla_strips=False,
+    )
+
 
 OBJ_TRIANGLE = "o Barrel\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"
 
@@ -355,7 +381,10 @@ def main() -> None:
 
     write("Unity Moss/License.txt", MIT_LICENSE)
     png("Unity Moss/T_Moss_D.png", (40, 120, 40, 255))
-    write("Unity Moss/T_Moss_D.png.meta", "fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n")
+    write(
+        "Unity Moss/T_Moss_D.png.meta",
+        "fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n",
+    )
 
     conversion(
         "Converted/conversion.json",

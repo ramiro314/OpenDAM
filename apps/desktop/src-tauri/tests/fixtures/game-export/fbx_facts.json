@@ -131,6 +131,20 @@
     "bones": [],
     "takes": []
   },
+  "Dungeon Props/Models/SM_Spinner.fbx": {
+    "slots": [
+      {
+        "name": "Brass",
+        "textures": {}
+      }
+    ],
+    "kept_meshes": ["SM_Spinner"],
+    "dropped_meshes": [],
+    "has_kept_mesh": true,
+    "kept_mesh_without_material": false,
+    "bones": [],
+    "takes": ["Spin"]
+  },
   "Dungeon Props/Models/SM_Stool.fbx": {
     "slots": [
       {
