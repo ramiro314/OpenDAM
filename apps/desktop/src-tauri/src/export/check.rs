@@ -135,12 +135,102 @@ pub struct DomainPack {
 
 /// A grid item in the domain, as its library DB holds it.
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct ItemRow {
-    id: String,
-    file_path: String,
-    file_name: String,
-    extension: String,
-    kind: String,
+pub(crate) struct ItemRow {
+    pub id: String,
+    pub file_path: String,
+    pub file_name: String,
+    pub extension: String,
+    pub kind: String,
+}
+
+impl ItemRow {
+    fn stem(&self) -> &str {
+        self.file_name
+            .rsplit_once('.')
+            .map_or(self.file_name.as_str(), |(stem, _)| stem)
+    }
+}
+
+/// A value the export infers, and yours when you set one, which wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Field<T> {
+    pub inferred: T,
+    pub yours: Option<T>,
+}
+
+impl<T: Clone> Field<T> {
+    /// What the export uses: yours, else the inferred value
+    pub fn value(&self) -> T {
+        self.yours.clone().unwrap_or_else(|| self.inferred.clone())
+    }
+}
+
+/// The `assetName` of grid item `item` among its library's edit rows `edits`: its default (C5),
+/// and yours (C4). A model's or animation's is its own, a texture's its set's. `None` for an item
+/// that exports as neither.
+pub(crate) fn asset_name(item: &ItemRow, edits: &[edits::Row]) -> Option<Field<String>> {
+    match AssetKind::from_str(&item.kind) {
+        AssetKind::Model3d => Some(Field {
+            inferred: pascal(item.stem()),
+            yours: edits
+                .iter()
+                .find(|e| e.asset_id == item.id)
+                .and_then(|e| edits::asset_name(&e.parsed())),
+        }),
+        _ if edits::is_image(&item.kind) => Some(Field {
+            inferred: pascal(&textures::read_stem(item.stem()).base),
+            yours: edits::set_name(edits, &item.file_path, &item.file_name),
+        }),
+        _ => None,
+    }
+}
+
+/// What grid item `item` exports as (C3): a model item is a model, or an animation when the
+/// facts of the FBX it exports from (`exported_fbx_of`) say so, an image is a texture, and
+/// anything else is `Other`.
+pub(crate) fn exported_kind(item: &ItemRow, facts: Option<&Result<FbxFacts, String>>) -> Kind {
+    match AssetKind::from_str(&item.kind) {
+        AssetKind::Model3d => match facts {
+            Some(Ok(facts)) if facts.reading() == Some(Reading::Animation) => Kind::Animation,
+            _ => Kind::Model,
+        },
+        _ if edits::is_image(&item.kind) => Kind::Texture,
+        _ => Kind::Other,
+    }
+}
+
+/// The FBX each of `items` exports from (A5), by item id, for each that is a format group with
+/// an FBX member, or a lone FBX file, a group of one.
+pub(crate) async fn exported_fbx_of(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    items: &[ItemRow],
+) -> sqlx::Result<HashMap<String, String>> {
+    let item_ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+    let group_fbx: Vec<(String, String)> = sqlx::query_as(
+        "SELECT group_id, file_path FROM assets
+         WHERE group_id IN (SELECT value FROM json_each(?)) AND lower(extension) = 'fbx'",
+    )
+    .bind(serde_json::to_string(&item_ids).expect("ids serialize"))
+    .fetch_all(pool)
+    .await?;
+    let mut fbx_paths: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (group, path) in &group_fbx {
+        fbx_paths.entry(group).or_default().push(path);
+    }
+    for item in items {
+        if item.extension.eq_ignore_ascii_case("fbx") {
+            fbx_paths
+                .entry(&item.id)
+                .or_insert_with(|| vec![&item.file_path]);
+        }
+    }
+    Ok(fbx_paths
+        .into_iter()
+        .map(|(id, paths)| {
+            let path = exported_fbx(paths).expect("a group with an FBX");
+            (id.to_string(), path.to_string())
+        })
+        .collect())
 }
 
 /// A pack folder of a library, with your edits.
@@ -511,7 +601,7 @@ fn in_unity_fbx_folder(path: &str) -> bool {
 
 /// The FBX a group exports from (A5): its first FBX member in a Unity FBX format folder, else
 /// its first, by path ignoring case.
-pub(crate) fn exported_fbx<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+fn exported_fbx<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     paths
         .into_iter()
         .min_by_key(|p| (!in_unity_fbx_folder(p), p.to_lowercase(), *p))
@@ -536,40 +626,20 @@ async fn read_library(
     .bind(&ids)
     .fetch_all(pool)
     .await?;
-    let item_ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
-    let group_fbx: Vec<(String, String)> = sqlx::query_as(
-        "SELECT group_id, file_path FROM assets
-         WHERE group_id IN (SELECT value FROM json_each(?)) AND lower(extension) = 'fbx'",
-    )
-    .bind(serde_json::to_string(&item_ids).expect("ids serialize"))
-    .fetch_all(pool)
-    .await?;
-    let mut fbx_paths: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (group, path) in &group_fbx {
-        fbx_paths.entry(group).or_default().push(path);
-    }
-    // A lone FBX is a group of one
-    for item in &items {
-        if item.extension.eq_ignore_ascii_case("fbx") {
-            fbx_paths
-                .entry(&item.id)
-                .or_insert_with(|| vec![&item.file_path]);
-        }
-    }
     // Every read is sent at once, so the preview queue serves them all between two of its jobs
-    let reads = fbx_paths.into_iter().map(|(id, paths)| {
-        let path = exported_fbx(paths)
-            .expect("a group with an FBX")
-            .to_string();
-        let root = &library.root_path;
-        async move {
-            // Stamped as it is read, for the fingerprint
-            let source = root.join(&path);
-            let stamp = Stamp::of(&source);
-            let facts = facts.read(&source, root).await;
-            (id.to_string(), ItemFbx { path, facts }, stamp)
-        }
-    });
+    let reads = exported_fbx_of(pool, &items)
+        .await?
+        .into_iter()
+        .map(|(id, path)| {
+            let root = &library.root_path;
+            async move {
+                // Stamped as it is read, for the fingerprint
+                let source = root.join(&path);
+                let stamp = Stamp::of(&source);
+                let facts = facts.read(&source, root).await;
+                (id, ItemFbx { path, facts }, stamp)
+            }
+        });
     let mut probes = Probes::new(&library.root_path);
     let mut fbx: HashMap<String, ItemFbx> = HashMap::new();
     for (id, item, stamp) in futures_util::future::join_all(reads).await {
@@ -752,48 +822,31 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
             if pack.is_none() {
                 issue("it is in no pack: mark its folder as a pack".into());
             }
-            let stem = item
-                .file_name
-                .rsplit_once('.')
-                .map_or(item.file_name.as_str(), |(stem, _)| stem);
             let extension = item.extension.to_ascii_lowercase();
+            let fbx = input.fbx.get(&item.id);
             let mut row = CheckedAsset {
                 asset: asset.clone(),
-                kind: Kind::Other,
-                asset_name: None,
+                kind: exported_kind(item, fbx.map(|f| &f.facts)),
+                asset_name: asset_name(item, &input.edits).map(|name| name.value()),
                 role: None,
                 pack: pack.map(|p| export_packs[p].id.clone()),
                 status: Status::Ready,
             };
             let mut ready = None;
             match AssetKind::from_str(&item.kind) {
-                AssetKind::Model3d => {
-                    row.kind = Kind::Model;
-                    let yours = input
-                        .edits
-                        .iter()
-                        .find(|e| e.asset_id == item.id)
-                        .and_then(|e| edits::asset_name(&e.parsed()));
-                    row.asset_name = Some(yours.unwrap_or_else(|| pascal(stem)));
-                    match input.fbx.get(&item.id) {
-                        None => {
-                            issue("it has no FBX file: a model exports from its group's FBX".into())
-                        }
-                        Some(fbx) => {
-                            row.kind = read_fbx(fbx, &item.file_path, &mut issue);
-                        }
+                AssetKind::Model3d => match fbx {
+                    None => {
+                        issue("it has no FBX file: a model exports from its group's FBX".into())
                     }
-                }
+                    Some(fbx) => read_fbx(fbx, &item.file_path, &mut issue),
+                },
                 AssetKind::Texture | AssetKind::Image | AssetKind::Hdri => {
-                    row.kind = Kind::Texture;
-                    let stem_info = textures::read_stem(stem);
+                    let stem_info = textures::read_stem(item.stem());
                     let layout = stem_info.layout.unwrap_or(Layout::Role(Role::BaseColor));
                     let convention = stem_info.convention.unwrap_or_else(|| {
                         pack.map_or(Convention::OpenGl, |p| sources[p].normal_convention())
                     });
-                    let name = edits::set_name(&input.edits, &item.file_path, &item.file_name)
-                        .unwrap_or_else(|| pascal(&stem_info.base));
-                    row.asset_name = Some(name.clone());
+                    let name = row.asset_name.clone().expect("an image has a name");
                     if let Layout::Role(role) = layout {
                         row.role = Some(role);
                     }
@@ -887,10 +940,10 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
     }
 }
 
-/// What a model item exporting from `fbx` is, by its facts (C3), with what refuses it: an FBX
-/// that can't be read, has two materials of one name, or has no kept mesh and no take, and the
-/// build-order guards on models and animations.
-fn read_fbx(fbx: &ItemFbx, item_path: &str, issue: &mut impl FnMut(String)) -> Kind {
+/// What refuses a model item exporting from `fbx` (C3): an FBX that can't be read, has two
+/// materials of one name, or has no kept mesh and no take, and the build-order guards on models
+/// and animations. `exported_kind` says which of the two it is.
+fn read_fbx(fbx: &ItemFbx, item_path: &str, issue: &mut impl FnMut(String)) {
     let what = if fbx.path == item_path {
         "FBX".to_string()
     } else {
@@ -900,7 +953,7 @@ fn read_fbx(fbx: &ItemFbx, item_path: &str, issue: &mut impl FnMut(String)) -> K
         Ok(facts) => facts,
         Err(e) => {
             issue(format!("{what} can't be read for export: {e}"));
-            return Kind::Model;
+            return;
         }
     };
     for (name, count) in facts.duplicate_slots() {
@@ -913,17 +966,10 @@ fn read_fbx(fbx: &ItemFbx, item_path: &str, issue: &mut impl FnMut(String)) -> K
     }
     match facts.reading() {
         Some(Reading::Model) => {
-            issue("model export not built yet (an FBX with a kept mesh exports as a model)".into());
-            Kind::Model
+            issue("model export not built yet (an FBX with a kept mesh exports as a model)".into())
         }
-        Some(Reading::Animation) => {
-            issue("animation export not built yet (an FBX with no kept mesh and a take exports as an animation)".into());
-            Kind::Animation
-        }
-        None => {
-            issue(format!("{what} has no kept mesh and no take"));
-            Kind::Model
-        }
+        Some(Reading::Animation) => issue("animation export not built yet (an FBX with no kept mesh and a take exports as an animation)".into()),
+        None => issue(format!("{what} has no kept mesh and no take")),
     }
 }
 

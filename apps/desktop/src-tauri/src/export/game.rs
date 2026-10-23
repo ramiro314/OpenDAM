@@ -7,19 +7,10 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::db::Database;
-use crate::export::check::{self, Kind, Problem};
-use crate::export::fbx_facts::{self, Reading};
-use crate::export::names::pascal;
-use crate::export::textures::read_stem;
+pub use crate::export::check::Field;
+use crate::export::check::{self, ItemRow, Kind, Problem};
+use crate::export::fbx_facts;
 use crate::export::{edits, settings};
-use crate::models::AssetKind;
-
-/// A value the export infers, and yours when you set one, which wins.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Field<T> {
-    pub inferred: T,
-    pub yours: Option<T>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,17 +25,11 @@ pub struct GameDetail {
     pub problems: Vec<Problem>,
 }
 
-#[derive(sqlx::FromRow)]
-struct Item {
-    id: String,
-    file_path: String,
-    file_name: String,
-    kind: String,
-}
-
 /// The Game tab of asset `asset_id`, reading FBX facts with `facts`, or `None` when it exports
 /// as neither a model, an animation nor a texture. A group's member stands for its main item.
-/// Each domain holding the item is checked as the Export view's Check does, without staging.
+/// Its kind and name come from the rules the Check uses (`check::exported_kind`,
+/// `check::asset_name`), and each domain holding it is checked as the Export view's Check does,
+/// without staging.
 pub async fn detail(
     db: &Database,
     asset_id: &str,
@@ -56,62 +41,29 @@ pub async fn detail(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("No asset has the id {asset_id}"))?;
     let pool = &library.pool;
-    let item: Item = sqlx::query_as(
-        "SELECT id, file_path, file_name, kind FROM assets
+    let item: ItemRow = sqlx::query_as(
+        "SELECT id, file_path, file_name, extension, kind FROM assets
          WHERE id = (SELECT COALESCE(group_id, id) FROM assets WHERE id = ?)",
     )
     .bind(asset_id)
     .fetch_one(pool)
     .await
     .map_err(|e| e.to_string())?;
-    let stem = item
-        .file_name
-        .rsplit_once('.')
-        .map_or(item.file_name.as_str(), |(stem, _)| stem);
     let rows = edits::read_all(pool).await.map_err(|e| e.to_string())?;
-
-    let (kind, asset_name) = match AssetKind::from_str(&item.kind) {
-        AssetKind::Model3d => {
-            let mut paths: Vec<String> = sqlx::query_scalar(
-                "SELECT file_path FROM assets WHERE group_id = ? AND lower(extension) = 'fbx'",
-            )
-            .bind(&item.id)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-            if item.file_name.to_ascii_lowercase().ends_with(".fbx") {
-                paths.push(item.file_path.clone());
-            }
-            let mut kind = Kind::Model;
-            if let Some(fbx) = check::exported_fbx(paths.iter().map(String::as_str)) {
-                let root = &library.root_path;
-                if let Ok(facts) = facts.read(&root.join(fbx), root).await {
-                    if facts.reading() == Some(Reading::Animation) {
-                        kind = Kind::Animation;
-                    }
-                }
-            }
-            let yours = rows
-                .iter()
-                .find(|r| r.asset_id == item.id)
-                .and_then(|r| edits::asset_name(&r.parsed()));
-            (
-                kind,
-                Field {
-                    inferred: pascal(stem),
-                    yours,
-                },
-            )
-        }
-        _ if edits::is_image(&item.kind) => (
-            Kind::Texture,
-            Field {
-                inferred: pascal(&read_stem(stem).base),
-                yours: edits::set_name(&rows, &item.file_path, &item.file_name),
-            },
-        ),
-        _ => return Ok(None),
+    let Some(asset_name) = check::asset_name(&item, &rows) else {
+        return Ok(None);
     };
+    let fbx = check::exported_fbx_of(pool, std::slice::from_ref(&item))
+        .await
+        .map_err(|e| e.to_string())?;
+    let item_facts = match fbx.get(&item.id) {
+        Some(path) => {
+            let root = &library.root_path;
+            Some(facts.read(&root.join(path), root).await)
+        }
+        None => None,
+    };
+    let kind = check::exported_kind(&item, item_facts.as_ref());
 
     // The domains holding the item: each collection it is in counts for the root collection's
     // child above it
@@ -250,6 +202,17 @@ mod tests {
         let shown = detail_of(&f, banner).await.unwrap();
         assert_eq!(shown.asset_name.yours.as_deref(), Some("KenneyBanner"));
         assert_eq!(shown.problems, []);
+        // The tab shows the name and kind the Check exports it with
+        let report = check::check(&f.db, "props", &Snapshot::fixture())
+            .await
+            .unwrap();
+        let row = report
+            .assets
+            .iter()
+            .find(|a| a.asset.asset_id == id)
+            .unwrap();
+        assert_eq!(row.asset_name, Some(shown.asset_name.value()));
+        assert_eq!(row.kind, shown.kind);
     }
 
     #[tokio::test]
