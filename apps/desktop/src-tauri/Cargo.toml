@@ -44,6 +44,8 @@ jsonschema = { version = "0.60", default-features = false }
 sha2 = "0.11"
 # Joins a Check's FBX fact reads, so they reach the preview worker together (already in the tree)
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+# A temporary folder per Blender job, for its script, job and result (plan game-export A2)
+tempfile = "3"
 
 [profile.release]
 codegen-units = 1
@@ -54,5 +56,4 @@ strip = true
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
 toml = "0.8"
-tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }

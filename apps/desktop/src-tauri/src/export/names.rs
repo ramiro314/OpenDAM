@@ -145,6 +145,11 @@ mod tests {
             added_material(["OpenDAMDefault2", "OpenDAMDefault", "OpenDAMDefault3"]),
             "OpenDAMDefault4"
         );
+        // The lowest free name, even below a taken one
+        assert_eq!(
+            added_material(["OpenDAMDefault2", "OpenDAMDefault", "OpenDAMDefault4"]),
+            "OpenDAMDefault3"
+        );
         // Names are compared exactly, as Blender compares them
         assert_eq!(added_material(["opendamdefault"]), "OpenDAMDefault");
     }
