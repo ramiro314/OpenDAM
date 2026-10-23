@@ -68,10 +68,14 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               the extract_unitypackage step, which unpacks a .unitypackage into a
                               folder tree (every file and .meta, nested packages as folders), gives
                               each file its source path and skips and reports unsafe and duplicate
-                              entries, writing only regular files and folders
+                              entries, writing only regular files and folders, and place, the place
+                              phase's flatten, hoist, rename and exclude steps over that tree, which
+                              name a file by source path, move or drop its .meta with it, and fail
+                              naming the step and path on a clash or a source no longer produced
     tests/fixtures/pack-import/  Its fixture originals, made by make_fixtures.py (stdlib only) and
                               committed with its output, and expected/, goldens from the owner's
-                              scripts, each named with its sha256 in expected/README.md
+                              scripts (the extraction's, and flatten and hoist Art's after it), each
+                              named with its sha256 in expected/README.md
     tests/fixtures/game-export/  The export's fixture library, made by make_fixtures.py under Blender and
                               committed with its output, and fbx_facts.json, its FBX files' facts,
                               which test_fbx_facts.py checks and the Check's tests read

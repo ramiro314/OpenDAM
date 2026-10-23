@@ -399,7 +399,7 @@ fn member_parts(name: &str) -> Option<(&str, &str)> {
 }
 
 /// A relative path's components, without empty and `.` ones.
-fn clean(path: &str) -> std::result::Result<Vec<String>, SkipReason> {
+pub(super) fn clean(path: &str) -> std::result::Result<Vec<String>, SkipReason> {
     if path.starts_with('/') {
         return Err(SkipReason::Absolute);
     }
@@ -437,14 +437,14 @@ fn nested_folder(parts: &[String]) -> Option<String> {
 }
 
 /// `path` relative to `folder` when it is the folder or below it (`""` for the folder itself).
-fn below<'p>(path: &'p str, folder: &str) -> Option<&'p str> {
+pub(super) fn below<'p>(path: &'p str, folder: &str) -> Option<&'p str> {
     match path.strip_prefix(folder)? {
         "" => Some(""),
         rest => rest.strip_prefix('/'),
     }
 }
 
-fn join(a: &str, b: &str) -> String {
+pub(super) fn join(a: &str, b: &str) -> String {
     match (a.is_empty(), b.is_empty()) {
         (true, _) => b.to_string(),
         (_, true) => a.to_string(),
@@ -453,17 +453,17 @@ fn join(a: &str, b: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
 
-    fn fixture(name: &str) -> PathBuf {
+    pub(in crate::import) fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/pack-import")
             .join(name)
     }
 
-    fn golden(name: &str) -> Vec<String> {
+    pub(in crate::import) fn golden(name: &str) -> Vec<String> {
         fs::read_to_string(fixture("expected").join(name))
             .unwrap()
             .lines()
@@ -473,7 +473,7 @@ mod tests {
 
     /// Every path below `root`, sorted, checking that each is a regular file or a folder with
     /// one link.
-    fn on_disk(root: &Path) -> Vec<String> {
+    pub(in crate::import) fn on_disk(root: &Path) -> Vec<String> {
         let mut files = Vec::new();
         for entry in walkdir::WalkDir::new(root).min_depth(1) {
             let entry = entry.unwrap();
