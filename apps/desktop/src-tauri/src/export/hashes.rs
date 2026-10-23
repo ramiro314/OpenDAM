@@ -8,6 +8,8 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 use sqlx::{Pool, Sqlite};
 
+use crate::export::fingerprint::{Probes, Stamp};
+
 use crate::structure::BATCH;
 
 /// A file's size and mtime (nanoseconds since the epoch) as a hash was taken at, and the hash.
@@ -77,16 +79,21 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
 }
 
 impl Memo {
-    /// The sha256 of `file_path` under `root`: the memoized one while the file's size and mtime
-    /// are those it was taken at, else a fresh one, which `fresh` keeps for `save`.
-    pub fn sha256(&mut self, root: &Path, file_path: &str) -> std::io::Result<String> {
-        let absolute = root.join(file_path);
-        let meta = std::fs::metadata(&absolute)?;
-        let size_bytes = meta.len() as i64;
-        let modified_at = meta
-            .modified()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as i64);
+    /// The sha256 of `file_path` (relative to the library root of `probes`, which records the
+    /// file's stamp): the memoized one while the file's size and mtime are those it was taken at,
+    /// else a fresh one, which `fresh` keeps for `save`.
+    pub fn sha256(&mut self, probes: &mut Probes, file_path: &str) -> std::io::Result<String> {
+        let (size_bytes, modified_at) = match probes.probe(file_path) {
+            Stamp::File { size, mtime_ns } => (size as i64, mtime_ns as i64),
+            Stamp::Missing => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "the file is missing",
+                ))
+            }
+            Stamp::Other => return Err(std::io::Error::other("it is not a file")),
+        };
+        let absolute = probes.root().join(file_path);
         if let Some(known) = self.known.get(file_path) {
             if known.size_bytes == size_bytes && known.modified_at == modified_at {
                 return Ok(known.sha256.clone());
@@ -140,9 +147,12 @@ mod tests {
         std::fs::write(dir.path().join("rock.png"), "abc").unwrap();
         let paths = vec!["rock.png".to_string()];
 
+        let mut probes = Probes::new(dir.path());
         let mut memo = load(&pool, &paths).await.unwrap();
-        assert_eq!(memo.sha256(dir.path(), "rock.png").unwrap(), ABC);
+        assert_eq!(memo.sha256(&mut probes, "rock.png").unwrap(), ABC);
         assert_eq!(memo.fresh.len(), 1);
+        // The read is stamped for the fingerprint
+        assert!(probes.seen["rock.png"].is_file());
         save(&pool, &memo.fresh).await.unwrap();
 
         // A memoized row is used while the size and mtime match, even if the bytes don't
@@ -151,12 +161,12 @@ mod tests {
             .await
             .unwrap();
         let mut memo = load(&pool, &paths).await.unwrap();
-        assert_eq!(memo.sha256(dir.path(), "rock.png").unwrap(), "memo");
+        assert_eq!(memo.sha256(&mut probes, "rock.png").unwrap(), "memo");
         assert!(memo.fresh.is_empty());
 
         // A changed size hashes again, and saving replaces the row
         std::fs::write(dir.path().join("rock.png"), "abcd").unwrap();
-        let fresh = memo.sha256(dir.path(), "rock.png").unwrap();
+        let fresh = memo.sha256(&mut probes, "rock.png").unwrap();
         assert_ne!(fresh, "memo");
         save(&pool, &memo.fresh).await.unwrap();
         let rows: Vec<(String, String)> =
@@ -173,6 +183,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut memo = load(&pool, &[]).await.unwrap();
 
-        assert!(memo.sha256(dir.path(), "gone.png").is_err());
+        let mut probes = Probes::new(dir.path());
+        assert!(memo.sha256(&mut probes, "gone.png").is_err());
+        assert_eq!(probes.seen["gone.png"], Stamp::Missing);
     }
 }

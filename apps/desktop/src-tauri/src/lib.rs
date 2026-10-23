@@ -37,6 +37,8 @@ pub struct AppState {
     pub engine_version: tokio::sync::watch::Sender<Option<i64>>,
     /// The `worker.py` the Python queue runs, once `preview::start_preview_worker` has found it.
     pub preview_worker: std::sync::OnceLock<std::path::PathBuf>,
+    /// The game export's staged bundles, one per open Export view
+    pub exports: crate::export::bundle::Exports,
     /// FBX facts for the game export, from the Python queue's worker, cached for the session
     pub fbx_facts: export::fbx_facts::Cached<export::fbx_facts::Worker>,
 }
@@ -162,6 +164,7 @@ pub fn run(render_choice: render::RenderChoice) {
                 app_handle: app.handle().clone(),
                 engine_version: tokio::sync::watch::Sender::new(None),
                 preview_worker: std::sync::OnceLock::new(),
+                exports: Default::default(),
                 fbx_facts: export::fbx_facts::Cached::new(export::fbx_facts::Worker::new(
                     worker_requests,
                 )),
@@ -286,6 +289,8 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::export::clear_export_cache,
             commands::export::get_blender_status,
             commands::export::check_export,
+            commands::export::export_bundle,
+            commands::export::discard_export,
             commands::export::get_inferred_pack_origin,
             commands::autotag::list_autotag_providers,
             commands::autotag::estimate_autotag_run,
