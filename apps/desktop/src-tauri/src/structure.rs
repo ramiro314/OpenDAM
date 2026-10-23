@@ -23,6 +23,7 @@ use crate::db::{Database, LibraryHandle};
 use crate::export::packs::Origin;
 use crate::export::textures::Convention;
 use crate::models::AssetKind;
+use crate::watcher::IndexLock;
 
 /// Rows per write transaction, as in `watcher.rs`.
 pub(crate) const BATCH: usize = 200;
@@ -2116,8 +2117,8 @@ pub(crate) struct PassRun {
 /// path, derives the structure and applies it. It reads a pack's license file and its
 /// `datapackage.json` only when the file's size or mtime changed since the last pass, and a
 /// render's header only when the render has no read recorded or its size or mtime changed since.
-/// Returns the rows written. The caller holds the
-/// library's `index_lock`.
+/// Returns the rows written. The lock-free core of `rebuild_library`: the caller holds the
+/// library's `index_lock` and advisory lock, or owns a pool no one else can reach yet.
 pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
     Ok(pass(pool, root).await?.written)
 }
@@ -2302,12 +2303,37 @@ pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassR
 }
 
 /// Reruns the pass for `library` once any index run on it has finished, for a command that
-/// changed its paths. A failed pass is logged, not returned: the change itself went through,
-/// and the next index run derives the structure again.
+/// changed its paths: takes its `index_lock`, then the advisory lock, and runs
+/// `rebuild_library_locked`. A failed pass is logged, not returned: the change itself went
+/// through, and the next index run derives the structure again.
 pub async fn rebuild_library(db: &Database, library: &LibraryHandle) {
     let lock = db.index_lock(&library.id);
-    let _guard = lock.lock().await;
-    if let Err(e) = rebuild(&library.pool, &library.root_path).await {
+    let index_guard = lock.lock().await;
+    match IndexLock::try_acquire(&library.root_path.join(".opendam"), 120) {
+        Some(advisory) => rebuild_library_locked(db, library, &index_guard, &advisory).await,
+        // Another machine is indexing. The pass runs anyway, as it always has: holding off and
+        // catching up later is the pack import's advisory lock work (plan pack-import).
+        None => log_failure(library, rebuild(&library.pool, &library.root_path).await),
+    }
+}
+
+/// `rebuild_library` for a caller that holds `library`'s `index_lock` and advisory lock, passed
+/// as proof: it never locks either again.
+pub async fn rebuild_library_locked(
+    db: &Database,
+    library: &LibraryHandle,
+    index_guard: &tokio::sync::MutexGuard<'_, ()>,
+    _advisory: &IndexLock,
+) {
+    debug_assert!(std::ptr::eq(
+        tokio::sync::MutexGuard::mutex(index_guard),
+        &*db.index_lock(&library.id)
+    ));
+    log_failure(library, rebuild(&library.pool, &library.root_path).await);
+}
+
+fn log_failure(library: &LibraryHandle, pass: sqlx::Result<usize>) {
+    if let Err(e) = pass {
         tracing::error!(target: "structure", "Structure pass failed for library {}: {e}", library.id);
     }
 }
