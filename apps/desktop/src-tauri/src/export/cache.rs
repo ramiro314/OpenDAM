@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::db::LibraryHandle;
+use crate::export::blender::{self, Job, Normalized};
 use crate::export::{hashes, textures};
 
 /// The export cache folder of the library at `root`.
@@ -47,6 +48,114 @@ pub fn texture_key(inputs: &[String], steps: &[Value]) -> String {
         "version": textures::VERSION,
     });
     hashes::sha256_bytes(canonical(&material).as_bytes())
+}
+
+/// The cache key of a model that `job` normalizes from a source whose sha256 is `source` (C11):
+/// the sha256 of the canonical JSON of the source's sha256, every setting the script reads
+/// besides the FBX (the kind, the origin's facing, your quarter turns, the collision patterns and
+/// the added material's name), the tool, `BLENDER_SERIES` rather than the exact version, so a
+/// lookup needs no Blender, and `NORMALIZE_VERSION`. Neither the file's path nor its name is in
+/// it, so renaming a file keeps its entry.
+pub fn model_key(source: &str, job: &Job) -> String {
+    let material = json!({
+        "inputs": [source],
+        "settings": {
+            "kind": job.kind,
+            "originFacing": job.origin_facing,
+            "facingQuarterTurns": job.facing_quarter_turns,
+            "patterns": job.patterns,
+            "addedMaterial": job.added_material,
+        },
+        "tool": "Blender",
+        "toolVersion": blender::BLENDER_SERIES,
+        "version": blender::NORMALIZE_VERSION,
+    });
+    hashes::sha256_bytes(canonical(&material).as_bytes())
+}
+
+/// Where the model of key `key` is cached in the library at `root`: a Blender job writes its FBX
+/// there, and `save_model` then records its result beside it.
+pub fn model_fbx(root: &Path, key: &str) -> PathBuf {
+    cache_dir(root).join("models").join(format!("{key}.fbx"))
+}
+
+fn model_result(root: &Path, key: &str) -> PathBuf {
+    cache_dir(root).join("models").join(format!("{key}.json"))
+}
+
+/// A normalized model in the export cache: its FBX, the FBX's sha256 and Blender's result,
+/// which records the exact version that wrote it (C11).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CachedModel {
+    pub fbx: PathBuf,
+    pub sha256: String,
+    pub normalized: Normalized,
+}
+
+/// The model of key `key` the cache in the library at `root` holds, or `None` on a miss: no
+/// result, a result that can't be read, or an FBX that is missing or isn't the file the result
+/// was saved with, as one a crash cut off. Its FBX is hashed to tell, which the manifest needs
+/// anyway.
+pub fn cached_model(root: &Path, key: &str) -> Option<CachedModel> {
+    let text = std::fs::read(model_result(root, key)).ok()?;
+    let entry: Value = serde_json::from_slice(&text).ok()?;
+    let sha256 = entry.get("sha256")?.as_str()?.to_string();
+    let normalized: Normalized = serde_json::from_value(entry.get("result")?.clone()).ok()?;
+    let fbx = model_fbx(root, key);
+    (hashes::sha256_file(&fbx).ok()? == sha256).then_some(CachedModel {
+        fbx,
+        sha256,
+        normalized,
+    })
+}
+
+/// Records `normalized`, the result of the job that wrote the FBX of key `key` in the library at
+/// `root`, completing the entry. The FBX is synced to disk first, then the result, which names
+/// the FBX's sha256, is written beside its place, synced and renamed in, so an entry is a hit
+/// only once both are whole.
+pub fn save_model(root: &Path, key: &str, normalized: Normalized) -> Result<CachedModel, String> {
+    let fbx = model_fbx(root, key);
+    let save = || -> std::io::Result<CachedModel> {
+        std::fs::File::open(&fbx)?.sync_all()?;
+        let sha256 = hashes::sha256_file(&fbx)?;
+        let entry = json!({ "sha256": sha256, "result": normalized });
+        let bytes = serde_json::to_vec_pretty(&entry).map_err(std::io::Error::other)?;
+        write_synced(&model_result(root, key), &bytes)?;
+        Ok(CachedModel {
+            fbx: fbx.clone(),
+            sha256,
+            normalized,
+        })
+    };
+    save().map_err(|e| format!("its normalized FBX can't be saved in the export cache: {e}"))
+}
+
+/// Writes `bytes` beside `path`, syncs them to disk and renames them into place, so neither a
+/// process crash nor an OS crash leaves a partial file at `path`.
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().expect("a cache file has a folder");
+    std::fs::create_dir_all(dir)?;
+    let name = path
+        .file_name()
+        .expect("a cache file has a name")
+        .to_string_lossy();
+    let partial = dir.join(format!(".{name}.{}.partial", uuid::Uuid::new_v4()));
+    let saved = std::fs::File::create(&partial)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&partial, path));
+    if saved.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    saved?;
+    // The rename is durable once the folder is: best effort, since some file systems can't
+    // sync a folder
+    if let Ok(folder) = std::fs::File::open(dir) {
+        let _ = folder.sync_all();
+    }
+    Ok(())
 }
 
 /// The first bytes of every PNG file.
@@ -90,27 +199,8 @@ pub fn texture(
         return Ok(path);
     }
     let bytes = make()?;
-    let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(&dir)?;
-        let partial = dir.join(format!(".{key}.{}.partial", uuid::Uuid::new_v4()));
-        let saved = std::fs::File::create(&partial)
-            .and_then(|mut file| {
-                file.write_all(&bytes)?;
-                file.sync_all()
-            })
-            .and_then(|()| std::fs::rename(&partial, &path));
-        if saved.is_err() {
-            let _ = std::fs::remove_file(&partial);
-        }
-        saved?;
-        // The rename is durable once the folder is: best effort, since some file systems can't
-        // sync a folder
-        if let Ok(folder) = std::fs::File::open(&dir) {
-            let _ = folder.sync_all();
-        }
-        Ok(())
-    };
-    write().map_err(|e| format!("its converted file can't be saved in the export cache: {e}"))?;
+    write_synced(&path, &bytes)
+        .map_err(|e| format!("its converted file can't be saved in the export cache: {e}"))?;
     Ok(path)
 }
 
@@ -139,6 +229,8 @@ pub async fn clear(libraries: &[LibraryHandle]) -> Result<usize, String> {
 mod tests {
     use super::*;
     use crate::db::memory_library_pool;
+    use crate::export::collision::{Patterns, PATTERNS};
+    use crate::export::packs::Origin;
 
     #[test]
     fn a_texture_key_covers_inputs_in_order_steps_and_the_version() {
@@ -161,6 +253,142 @@ mod tests {
             texture_key(std::slice::from_ref(&a), &[step("MetallicSmoothness")])
         );
         assert_ne!(key, texture_key(&[a, b], &[step("Occlusion")]));
+    }
+
+    fn lamp_job() -> Job {
+        Job {
+            asset: "Dungeon Props/Models/SM_Lamp.fbx".into(),
+            kind: blender::JobKind::Model,
+            input: "/lib/Dungeon Props/Models/SM_Lamp.fbx".into(),
+            output: "/lib/.opendam/export-cache/models/k.fbx".into(),
+            origin_facing: Origin::Unreal,
+            facing_quarter_turns: 1,
+            patterns: &PATTERNS,
+            added_material: "OpenDAMDefault".into(),
+        }
+    }
+
+    /// Collision patterns other than `PATTERNS`
+    static OTHER_PATTERNS: Patterns = Patterns {
+        prefixes: &["UCX_", "UBX_"],
+        suffixes: &["_Collision"],
+    };
+
+    #[test]
+    fn a_model_key_covers_the_source_and_every_setting_the_script_reads_but_no_path() {
+        let a = "a".repeat(64);
+        let key = model_key(&a, &lamp_job());
+        assert_eq!(key.len(), 64);
+        // Renaming or moving the file, or caching it elsewhere, keeps its entry
+        let moved = Job {
+            asset: "Props/SM_LampRenamed.fbx".into(),
+            input: "/elsewhere/SM_LampRenamed.fbx".into(),
+            output: "/elsewhere/out.fbx".into(),
+            ..lamp_job()
+        };
+        assert_eq!(model_key(&a, &moved), key);
+
+        let changed = [
+            model_key(&"b".repeat(64), &lamp_job()),
+            model_key(
+                &a,
+                &Job {
+                    origin_facing: Origin::Generic,
+                    ..lamp_job()
+                },
+            ),
+            model_key(
+                &a,
+                &Job {
+                    facing_quarter_turns: 2,
+                    ..lamp_job()
+                },
+            ),
+            model_key(
+                &a,
+                &Job {
+                    added_material: "OpenDAMDefault2".into(),
+                    ..lamp_job()
+                },
+            ),
+            model_key(
+                &a,
+                &Job {
+                    patterns: &OTHER_PATTERNS,
+                    ..lamp_job()
+                },
+            ),
+        ];
+        for (i, other) in changed.iter().enumerate() {
+            assert_ne!(*other, key, "change {i}");
+        }
+    }
+
+    /// AC15's cache half: no model keeps its entry once the collision patterns change, so the
+    /// next export re-runs every job.
+    #[test]
+    fn changing_the_collision_patterns_changes_every_model_key() {
+        for (source, origin, turns, added) in [
+            ("a", Origin::Generic, 0, "OpenDAMDefault"),
+            ("b", Origin::Unreal, 3, "OpenDAMDefault2"),
+            ("c", Origin::Unity, 1, "OpenDAMDefault"),
+        ] {
+            let source = source.repeat(64);
+            let job = Job {
+                origin_facing: origin,
+                facing_quarter_turns: turns,
+                added_material: added.into(),
+                ..lamp_job()
+            };
+            let other = Job {
+                patterns: &OTHER_PATTERNS,
+                ..job.clone()
+            };
+            assert_ne!(model_key(&source, &job), model_key(&source, &other));
+        }
+    }
+
+    #[test]
+    fn a_saved_model_is_a_hit_until_its_fbx_or_result_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let normalized =
+            blender::test_normalized(&["DefaultMaterial"], Some("OpenDAMDefault"), &[], &[]);
+        assert_eq!(
+            cached_model(root, "k"),
+            None,
+            "an empty cache holds nothing"
+        );
+
+        // A job writes the FBX, then the result completes the entry
+        let fbx = model_fbx(root, "k");
+        std::fs::create_dir_all(fbx.parent().unwrap()).unwrap();
+        std::fs::write(&fbx, b"normalized FBX").unwrap();
+        assert_eq!(cached_model(root, "k"), None, "an FBX alone is no entry");
+        let saved = save_model(root, "k", normalized.clone()).unwrap();
+        assert_eq!(
+            saved,
+            CachedModel {
+                fbx: fbx.clone(),
+                sha256: hashes::sha256_bytes(b"normalized FBX"),
+                normalized,
+            }
+        );
+        assert_eq!(cached_model(root, "k"), Some(saved.clone()));
+        let entries = std::fs::read_dir(fbx.parent().unwrap()).unwrap().count();
+        assert_eq!(entries, 2, "no partial file is left");
+
+        // An FBX cut off or rewritten since is a miss, and so is a result that can't be read
+        std::fs::write(&fbx, b"normalized").unwrap();
+        assert_eq!(cached_model(root, "k"), None);
+        std::fs::write(&fbx, b"normalized FBX").unwrap();
+        assert_eq!(cached_model(root, "k"), Some(saved));
+        let result = fbx.with_extension("json");
+        let text = std::fs::read(&result).unwrap();
+        std::fs::write(&result, &text[..text.len() / 2]).unwrap();
+        assert_eq!(cached_model(root, "k"), None);
+        std::fs::remove_file(&fbx).unwrap();
+        assert!(save_model(root, "k", blender::test_normalized(&[], None, &[], &[])).is_err());
     }
 
     #[test]
