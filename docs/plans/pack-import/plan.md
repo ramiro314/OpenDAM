@@ -29,6 +29,25 @@ isn't possible, as R6 explains.
     Asset Store content, which can't be committed, and nothing available writes the format. The
     binary path is tested by an env-gated worker test and by hand instead (A17, Known gaps).
 
+Revised again 2026-10-22 (revision 3) after the review's second round. One decision was added
+(D31, carry moved files' rows), asked while repairing R8:
+
+- **R7 - The structure pass reads only the committed build.** No structure pass runs before the
+  commit, and the pass always reads `current_build`'s manifest, so a rollback or recovery can
+  never derive Unity roles from a failed build. The recovery table now covers every folder state,
+  including a first build swapped but not committed, and a later build that crashed between the
+  journal and the first rename. The in-run rollback handles a first build with no previous
+  folder (Flow, A11, A14).
+- **R8 - Asset rows survive rollbacks and moves.** Indexing before the commit prunes no row, and
+  rows of files missing from disk are pruned only after the commit. A rollback therefore restores
+  the previous build's files to the rows, tags, ratings and collections they never lost. Repairing
+  this exposed a loss on a *committed* rebuild that moves files (a hoist toggled off, say), so you
+  decided (D31) that a rebuild carries each moved file's row to its new path. The move is matched
+  by `source_path`, journaled in `import_moves`, and reversed by a rollback (Flow, A4, A11).
+- **R9 - Escaping paths are skipped and reported.** An archive entry that would land outside the
+  target is skipped, as `extract_unity.py` does, and listed as a warning on the run. It never
+  fails the build, so `synthetic.unitypackage` serves A2, A3 and A8 alike (Steps, A2).
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -72,6 +91,9 @@ Facts that shape the design:
 - **No live file watcher.** Indexing runs only when asked (`watcher::index_paths`), and it skips
   dot folders (`watcher.rs:199`), so a staging folder named `.<pack>...`
   beside the target is never indexed.
+- **Indexing prunes.** After upserting the files it walked, `index_paths` deletes the rows of
+  indexed paths it didn't see (`watcher.rs:312-330`, "Detect and remove deleted files"). Their
+  tags, collections and other metadata go with them.
 - **`.mat` is indexed** as a Material (`SUPPORTED_EXTENSIONS`), but `.meta`, `.prefab`, `.unity`
   and `.cs` are not.
 - **The structure pass reads DB state as inputs.** `structure::derive` (`structure.rs:492`) is
@@ -127,6 +149,7 @@ Facts that shape the design:
 | D28 | Porting the scripts | File work (tar/zip extraction, flatten, hoist, `datapackage.json`) **in Rust**. `unity_gltf.py` and `ue_gltf_export.py` **embedded as versioned scripts** like `normalize.py`, with their heuristics kept as they are. `unity_binary_to_text` in the preview worker. |
 | D29 | Testing | Small committed fixtures (a synthetic `.unitypackage` with nested and binary files, a Fab-style zip, a Kenney-style zip); the Unity GLB step under CI's Blender; the Unreal step with a stub editor in CI, plus a manual run on `Waterways.zip` as an acceptance item. Revision 2 narrows this: the binary files can't be a committed fixture (R6). |
 | D30 | The scripts in `~/Documents/Assets` | **Untouched** by this work. You retire them after your re-import. |
+| D31 | Moved files' metadata (asked in review round 2) | **A rebuild carries a moved file's asset row** (id, tags, rating, collections) to the file's new path, matched by `source_path`. A rollback moves it back. |
 
 ## Design
 
@@ -158,8 +181,9 @@ flowchart LR
   M --> D{Drift check vs<br/>current manifest}
   D --> W[Under index_lock: re-check,<br/>journal, swap by rename]
   W --> L[Library folder]
-  L --> I[index_paths_locked +<br/>rebuild_library_locked]
+  L --> I[Carry moved rows, then<br/>index_paths_locked, Prune::Defer]
   I --> CM[Commit: flip current_build<br/>else roll back to .prev]
+  CM --> ST[Settle: prune, structure pass,<br/>delete .prev]
 ```
 
 A build never writes into the live pack folder. Each build has a new **build id**. It builds
@@ -168,7 +192,7 @@ filesystem, so the swap is a rename. It writes the staged files' manifest rows u
 id while staging, in 200-row transactions. Those rows mean nothing until the commit, because
 `import_packs.current_build` still names the previous build. Then:
 
-1. **Lock.** It takes the library's `Database::index_lock` and holds the guard through step 6.
+1. **Lock.** It takes the library's `Database::index_lock` and holds the guard through step 7.
    OpenDAM has no live file watcher, so no other index run or structure pass can touch the
    library meanwhile.
 2. **Re-check under the lock.** It compares the pack's `recipe_rev` with the one the run started
@@ -176,35 +200,78 @@ id while staging, in 200-row transactions. Those rows mean nothing until the com
    with. On any difference it stops: it deletes the staging folder and its rows, and fails the
    run with "the pack changed during the build; Rebuild again". Cached conversions make the
    retry cheap.
-3. **Journal.** It sets `import_packs.swap_state = 'swapping'` with the build id, in one
-   transaction.
+3. **Journal.** It sets `import_packs.swap_state = 'swapping'` and `swap_build` to the build id,
+   in one transaction.
 4. **Swap.** It renames the live folder to `.<Pack>.prev-<build id>`, then the staging folder to
    the live name. A pack's first build has no live folder and skips the first rename.
-5. **Index.** It runs `watcher::index_paths_locked` over the pack folder, then
-   `structure::rebuild_library_locked`. These are new variants of `index_paths` and
-   `rebuild_library` that take the held guard (`&tokio::sync::MutexGuard<'_, ()>`) as proof
-   instead of locking. The existing functions take the lock and call them.
+5. **Carry moved rows, then index without pruning.**
+   - **Carry.** It joins the previous build's manifest with the new one on `(source_path, origin)`.
+     Matching by `origin` too means a GLB follows its own row, not its model's. A file the new build
+     places at another path has its asset row moved there in place, with its id and metadata. The
+     move uses the update `rename_asset` uses (`file_name`, `file_path`, `extension`;
+     `commands/asset.rs:1734`), so the FTS update trigger follows it.
+   - **Journal.** Each move is written to `import_moves` in the same transaction, 200 at a time.
+   - **Collision.** A move is skipped when the new path already has a row, because a different
+     file took that path. The moved file then gets a fresh row.
+   - **Index.** It then runs `watcher::index_paths_locked` over the pack folder with
+     `Prune::Defer`. That adds or updates a row for every file now on disk, deletes no row, and
+     runs no structure pass. Rows of paths only the previous build had stay exactly as they were.
 6. **Commit.** In one transaction it sets `current_build` to the new build id, `status = 'built'`
-   and `swap_state = NULL`. This is the **commit point**. The lock is released after it.
-7. **Clean up.** It deletes the previous folder and the old build's manifest rows. A crash here
-   leaves only garbage that recovery deletes.
+   and `swap_state = NULL`. This is the **commit point**.
+7. **Settle.** Still holding the lock, it runs `index_paths_locked` over the pack with
+   `Prune::Now`. That deletes the rows of files no longer on disk, the paths only the previous
+   build had, then runs the structure pass (`rebuild_library_locked`). It deletes the previous
+   folder, the old build's manifest rows and the new build's `import_moves`, releases the lock,
+   and emits `library:updated`.
 
-**Indexing fails** (step 5): the build rolls back while still holding the lock. It renames the
-live folder to `.<Pack>.failed-<build id>` and the previous folder back. It reruns
-`index_paths_locked` and `rebuild_library_locked` so the rows match the restored folder, clears
-`swap_state`, deletes the failed folder and the new build's rows, and fails the run. A path that
-existed in both builds keeps its asset row throughout, because rows are matched by path.
+`index_paths_locked` and `rebuild_library_locked` are new variants of `index_paths` and
+`rebuild_library`. They take the held guard (`&tokio::sync::MutexGuard<'_, ()>`) as proof instead
+of locking. The existing functions take the lock and call them with `Prune::Now`, so every other
+caller behaves as today. Between steps 5 and 7 the pack's rows cover both builds' paths, with the
+old structure. The lock keeps every other index run and structure pass out, and the UI refreshes
+once, on step 7's `library:updated`.
+
+**The structure pass reads only the committed build.** It reads the Unity material set
+(Unity-only files) from the rows of `current_build`, and from no other build. No structure pass
+runs between the swap and the commit. So no pass, whether in a build, a rollback or recovery, can
+derive roles from a build that never committed.
+
+**Rollback.** Step 5 failing, or recovery finding a swap that wasn't committed, rolls back while
+holding the lock:
+
+1. Rename the live folder to `.<Pack>.failed-<build id>`.
+2. If a `.prev-<build id>` folder exists, rename it back to the live name. A first build has none,
+   so its pack folder is simply gone.
+3. Reverse the failed build's `import_moves`, newest first, moving each row back to its old
+   path. Then run `index_paths_locked` over the pack with `Prune::Now`. Rows of paths only the
+   failed build had are deleted: they were new, made in step 5. Rows of the previous build's
+   paths were moved back or never touched, and never pruned, so they match the restored files
+   with their ids and metadata intact. The structure pass that ends this run reads
+   `current_build`, which is still the previous build, or `NULL` for a first build.
+4. Delete the failed folder, the failed build's manifest rows and its `import_moves`, clear
+   `swap_state`, and fail the run.
+
+So a rollback loses nothing of the previous build, including paths it alone had.
 
 **Startup recovery** runs for each imported pack before any run starts, under the library's
-lock. It goes by `swap_state` and what is on disk:
+lock. With `swap_state = 'swapping'` and build id B, it checks these rows in order, by what is on
+disk. "Live" is the pack folder.
 
-| State found | Meaning | Recovery |
+| Staging `.import-B` | `.prev-B` | Live | `.failed-B` | Meaning | Recovery |
+|---|---|---|---|---|---|
+| present | absent | any | absent | Crashed after the journal, before any rename. With a live folder, a later build; without one, a first build. | Delete the staging folder and B's rows. |
+| present | present | absent | absent | Crashed between the two renames | Rename `.prev-B` back to live. Delete the staging folder and B's rows. |
+| absent | present | present | absent | A later build swapped, not committed | Roll back (steps 1-4). |
+| absent | absent | present | absent | A first build swapped, not committed (`current_build` is `NULL`) | Roll back (steps 1, 3, 4: no `.prev` to restore). |
+| absent | present | absent | present | Crashed in a rollback, between its renames | Rename `.prev-B` back to live, then finish the rollback (steps 3-4). |
+| absent | absent | any | present | Crashed in a rollback, after its renames | Finish the rollback (steps 3-4). |
+
+With `swap_state` `NULL`:
+
+| Found | Meaning | Recovery |
 |---|---|---|
-| `swap_state` NULL, a `.import-*` staging folder | Crashed while staging | Delete the folder and that build's rows. |
-| `'swapping'`, `.prev-<id>` present, live folder missing | Crashed between the two renames | Rename `.prev` back to live. |
-| `'swapping'`, `.prev-<id>` and live both present | Swapped, not committed | Roll back as for a failed index: set the live folder aside, restore `.prev`, re-index the pack, delete the new build's rows. |
-| `'swapping'`, staging present, no `.prev` (first build) | Crashed before or during the swap | Delete the staging folder and its rows. |
-| `swap_state` NULL, a `.prev-*` folder, `current_build` is newer | Committed, not cleaned up | Delete `.prev` and rows of builds other than `current_build`. |
+| An `.import-*` staging folder | Crashed while staging | Delete the folder and that build's rows. |
+| A `.prev-*` folder | Committed, not settled | Run step 7: prune by `Prune::Now`, run the structure pass, delete `.prev`, rows of builds other than `current_build`, and their `import_moves`. |
 
 Then it clears `swap_state` and marks the run `interrupted`. Recovery never rolls forward: an
 uncommitted build is always discarded, and the cached conversions make its rerun cheap. The swap,
@@ -218,8 +285,8 @@ they run in recipe order. Each step has `enabled` and JSON `options`.
 
 | Step | Phase | Options | Behavior (ported from) |
 |---|---|---|---|
-| `extract_unitypackage` | extract | `variant` (the inner path of the chosen `.unitypackage` in a zip), `subpath` (a pipeline folder inside the package, else all of it) | Unpacks the tar.gz by GUID, rebuilds `pathname`s, drops `Assets/` and a top folder every file shares, refuses paths that escape the target, **keeps every file and each `.meta`**, and unpacks nested packages into a folder named after each (`extract_unity.py`). |
-| `extract_zip` | extract | `subpath` | Copies one sub-folder of a zip, or all of it. Refuses absolute and `..` entries and symlinks. |
+| `extract_unitypackage` | extract | `variant` (the inner path of the chosen `.unitypackage` in a zip), `subpath` (a pipeline folder inside the package, else all of it) | Unpacks the tar.gz by GUID, rebuilds `pathname`s, drops `Assets/` and a top folder every file shares, skips and reports a path that would escape the target (below), **keeps every file and each `.meta`**, and unpacks nested packages into a folder named after each (`extract_unity.py`). |
+| `extract_zip` | extract | `subpath` | Copies one sub-folder of a zip, or all of it. Skips and reports absolute and `..` entries and symlinks (below). |
 | `export_unreal` | extract | `batch` (30) | The Unreal pack's producer (below). Its GLBs are the extracted files. |
 | `flatten` | place | none | Merges the root's only folder into the root while nothing else there is an asset (docs, `.meta` and `datapackage.json` don't count), repeatedly. Moves each `.meta` with its file, and stops the build on a name clash (`flatten_pack.py`). |
 | `hoist` | place | `folder` | Moves one folder's contents up to the pack root, with the same clash rule. |
@@ -228,6 +295,10 @@ they run in recipe order. Each step has `enabled` and JSON `options`.
 | `unity_glb` | convert | `max_texture` (1024), `force` | Runs the embedded `unity_glb.py` (ported `unity_gltf.py`) in Blender on a work copy, then writes `X.glb` beside each `X.fbx`/`X.obj` that doesn't already ship a `.glb` (D13). |
 | `metadata` | metadata | `preset` (`unity`, `fab`, `kenney`, `none`), `title`, `version`, `publisher`, `authors`, `license`, `sources`, `lookup_store_page` | Writes `datapackage.json` at the pack root (`gen_datapackage.py`, `gen_kenney_datapackage.py`). Its `resources` names the first model in the final tree. |
 
+- **Unsafe entries are skipped and reported.** An archive entry that is absolute, climbs out with
+  `..`, resolves outside the target, or is a symlink is never written. It is skipped, as
+  `extract_unity.py` skips it, and listed as a warning on the run and in the Preparation panel
+  (path and reason). The build goes on, and the manifest doesn't hold the entry.
 - **Clashes stop the build.** These fail the build with the step and path named:
   - a step that would overwrite a file;
   - a `rename` or `exclude` whose `source` the extract step no longer produces, for example
@@ -335,9 +406,9 @@ isn't this import's output is refused.
   - **Scope.** The rule applies to imported packs only. A `.mat` in a folder that wasn't imported
     keeps its kind, so a non-Unity material never hides. Your libraries will all be re-imported
     (D6), so every Unity pack is covered.
-  - **Which build.** During a swap (Flow, step 5) the pass reads the rows of the build being
-    swapped in, named by `swap_state`'s build id. At other times it reads `current_build`'s, so
-    it always sees the files on disk.
+  - **Which build.** The pass reads `current_build`'s rows, and nothing else. No structure pass
+    runs between a swap and its commit, and a rollback's pass runs while `current_build` still
+    names the restored build (Flow). So the roles always match the committed files on disk.
 
 ### Records (library DB)
 
@@ -356,6 +427,9 @@ open):
   `mtime_ns`, `sha256`, `origin` (`extracted`, `generated`, `kept`), `source_path` (in the
   original; for a generated file, its source model's; `NULL` for `kept`). A pack's manifest is its
   rows with `build_id = current_build`.
+- `import_moves`: `pack_id`, `build_id`, `seq`, `asset_id`, `from_path`, `to_path`. These are the
+  asset rows a build carried to new paths (Flow, step 5). A rollback reverses them, and step 7
+  deletes them.
 - `import_runs`: `id`, `kind` (`import`, `rebuild`, `remove`), pack ids, the `recipe_rev` each
   pack was queued at, the drift choices you made (JSON), `status` (`queued`, `running`, `done`,
   `failed`, `cancelled`, `interrupted`), `phase`, `progress`, `error`, `started_at`,
@@ -457,7 +531,8 @@ half manifest.
 The confirmation lists the pack's files and any drift that removing would lose. Removing runs as
 a `remove` run under the library's `index_lock`, after the same re-check as a build (Flow, step
 2). It deletes exactly the current manifest's files and the folders left empty, then the
-import's records, then runs `structure::rebuild_library_locked`. Removing is idempotent: a
+import's records, then runs `index_paths_locked` over the pack folder with `Prune::Now`, which deletes the
+removed files' rows and ends with the structure pass. Removing is idempotent: a
 remove interrupted by a crash is marked `interrupted` and finished at the next startup, since
 deleting a file that is already gone is not an error. Asset rows of deleted files go with their tags,
 ratings and collections, as on any delete (D27). Kept files are deleted too, and the
@@ -481,6 +556,12 @@ confirmation names them.
 - **Locked variants.** `watcher::index_paths_locked` and `structure::rebuild_library_locked`
   take a held `index_lock` guard. Code that holds the lock calls these, never the locking
   functions.
+- **Pruning waits for the commit.** `index_paths_locked` with `Prune::Defer` deletes no row and
+  runs no structure pass. Only an import build uses it, between its swap and its commit. Every
+  other index run prunes as today.
+- **Rows follow their files.** A rebuild carries each moved file's asset row to the file's new
+  path, matched by `source_path` and `origin`, and journals the move in `import_moves`. A
+  rollback reverses the moves, so neither a rebuild nor its rollback loses metadata (D31).
 - **Zero telemetry.** The list of outbound calls gains the Kenney store-page HEAD requests, made
   only for an import with "Look up store page" ticked.
 - **Layout.** CLAUDE.md gains `src/import/` (engine, steps, presets, embedded scripts).
@@ -499,7 +580,9 @@ confirmation names them.
     - text-format `.mat`, `.prefab` and `.meta` files written by the script;
     - `Models/SM_Log.fbx`, copied from `tests/fixtures/game-export/library/Unity Moss/`, with a
       PNG base color its `.mat` names by GUID;
-    - one `pathname` that escapes the target (`../escape.txt`).
+    - one `pathname` that escapes the target (`../escape.txt`). It is skipped and reported, as
+      `extract_unity.py` skips it, so the goldens don't hold it and A3 and A8 build this fixture
+      cleanly.
   - `fab-unity.zip`: two `.unitypackage` variants, `URP` and `Built-In`.
   - `fab-unity-folders.zip`: one package with `URP/` and `Built-In/` folders inside.
   - `kenney.zip`: a shared top folder, then `<Category>/<Pack>/License.txt` with a Kenney header
@@ -529,14 +612,22 @@ confirmation names them.
   and mtime unchanged (checked by test).
 - **A2 - Unity extraction.** The synthetic `.unitypackage` fixture extracts with `Assets/` and
   the shared top folder dropped, nested packages as folders, and every `.meta`, `.mat` and
-  `.prefab` present. A path escaping the target is refused.
+  `.prefab` present. The entry escaping the target (`../escape.txt`) is skipped: nothing is
+  written outside the target, the build succeeds, and the run lists one warning naming the
+  path.
 - **A3 - Flatten and hoist.** On `synthetic.unitypackage`, `extract_unitypackage`, `flatten` and
   `hoist Art` give exactly the golden file list from `extract_unity.py --keep-all` and
   `flatten_pack.py --hoist Art`. A clash fails the build naming the path, and the live folder is
   unchanged.
 - **A4 - Reversible steps.** Turning `hoist` off and rebuilding restores the unhoisted tree, and
   turning it back on restores the hoisted one. Asset ids for paths present in both builds are
-  unchanged, so a tag on such an asset survives.
+  unchanged, so a tag on such an asset survives. Moved files keep their rows too (D31):
+  - Tag `Art/Rock.fbx` and its generated `Art/Rock.glb`, then turn `hoist Art` off. `Rock.fbx`
+    and `Rock.glb` have the same asset ids and tags.
+  - Turn `hoist` back on. `Art/Rock.fbx` and `Art/Rock.glb` have them again.
+  - `import_moves` is empty after each commit.
+  - When the new path already holds a different file's row, the carry is skipped: that row is
+    untouched, and the moved file gets a fresh one.
 - **A5 - In-app edits recorded.**
   - An in-app rename and a delete inside an imported pack append `rename` and `exclude` steps.
     A rebuild keeps the new name and doesn't bring the file back.
@@ -564,20 +655,40 @@ confirmation names them.
 - **A10 - Unreal, manual.** Importing `~/Downloads/Waterways.zip` into the Fab library produces
   `<Publisher>/Waterways/` holding GLBs, docs and `datapackage.json`, under the 20G cap, and
   the pack browses with textured models. This item is checked by hand.
-- **A11 - Interruption and the commit point.** Each case runs with crash points injected (as
-  autotag undo's tests do) and with a failing `index_paths_locked`:
-  - Killed while staging: the live folder is as it was. On restart the run is `interrupted`,
+- **A11 - Interruption, rollback and the commit point.** Each case runs with crash points
+  injected (as autotag undo's tests do), and with a failing `index_paths_locked`. Each row of both
+  recovery tables has its own case:
+  - **Killed while staging:** the live folder is as it was. On restart the run is `interrupted`,
     and no staging folder or uncommitted manifest row remains.
-  - Killed between the two renames: `.prev` is renamed back.
-  - Killed after the swap, before the commit: the swap is rolled back. The previous build's
-    files and manifest are current again, and asset ids of paths in both builds are unchanged.
-  - Killed after the commit, before clean-up: `.prev` and the old rows are deleted, and the new
-    build stays.
-  - Indexing fails: the swap is rolled back as above, and the run fails.
-  - A file changed outside OpenDAM, or a step edited, while the build stages: the re-check
-    under the lock fails the run, and the live folder is unchanged.
-  - No call path takes `index_lock` while holding it: a test runs a whole build with a timeout,
-    which a deadlock would hit.
+  - **Killed after the journal, before the first rename,** for a later build (live folder
+    present) and for a first build (none): staging and B's rows are deleted, and the live
+    folder, if any, is untouched.
+  - **Killed between the two renames:** `.prev` is renamed back.
+  - **Killed after the swap, before the commit:**
+    - A later build is rolled back. The previous build's files and manifest are current again.
+    - A first build is rolled back too: its folder and rows are gone, and `current_build` stays
+      `NULL`.
+  - **Killed inside a rollback,** between its renames and after them: recovery finishes it.
+  - **Killed after the commit, before settling:** step 7 runs at startup. The rows of paths only
+    the previous build had are pruned, `.prev` and the old rows are deleted, and the new build
+    stays.
+  - **Indexing fails,** for a later build and for a first build: the swap is rolled back, and the
+    run fails.
+  - **What a rollback keeps.** Tag three files:
+    - `Art/Rock.fbx`, which the new build moves to `Rock.fbx` (so step 5 carries its row);
+    - `Old.png`, a path only the previous build has, because the test turns on an `exclude`
+      step for it;
+    - `Readme.txt`, a path both builds have.
+
+    Make the new build's indexing fail, or kill it after step 5. After the rollback, all three
+    rows exist at their old paths, with their original ids and tags. No row of a path only the
+    failed build had remains, and `import_moves` is empty.
+
+  - **A mid-run change:** a file changed outside OpenDAM, or a step edited, while the build
+    stages. The re-check under the lock fails the run, and the live folder is unchanged.
+  - **No deadlock:** no call path takes `index_lock` while holding it. A test runs a whole build
+    with a timeout, which a deadlock would hit.
+
 - **A12 - Memory cap.** A capped process killed with status 137 fails its step with "killed by
   the memory cap".
 - **A13 - Remove import.** Removing deletes exactly the manifest's files and empty folders, and
@@ -585,7 +696,9 @@ confirmation names them.
 - **A14 - Unity-only files hidden.** In an imported pack, a `.mat` whose `.mat.meta` is in the
   current manifest is a hidden `unity` support file, and shows with `showHidden`. A `.mat` in a
   folder that wasn't imported keeps its kind and stays visible. `derive` reads no file for this,
-  which a test with the file system unavailable checks.
+  which a test with the file system unavailable checks. After a rollback, and after recovery
+  of each row in A11, the roles match the restored build's manifest. A test gives the failed
+  build a `.mat.meta` that the previous build lacks, and the restored `.mat` stays visible.
 - **A15 - Original state.** A moved original marks its import Original missing and disables
   Rebuild. Locating it again by matching sha256 re-enables Rebuild.
 - **A16 - A real Fab Unity download, by hand.** Importing a Fab Unity download you choose
@@ -598,6 +711,10 @@ confirmation names them.
 
 ## Known gaps
 
+- **A carry can collide.** When a rebuild moves a file onto a path that already holds a
+  different file's row, that row wins and the moved file starts with a fresh row (D31, A4). A
+  file that changes its path in the original itself, as in a new version of a pack, has a new
+  `source_path`, so its row isn't carried either.
 - **Kept files can't be recreated.** Files kept from outside changes are carried by rebuilds,
   but nothing can recreate them if they're lost.
 - **The Unreal step's real run is manual.** The Unreal Editor isn't in CI, so only the stub
