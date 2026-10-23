@@ -55,6 +55,17 @@ Step 4 (C7's material inference and C8's texture sets):
   by the slot's name and clips alpha. Every texture and material has a `.meta` with its GUID. A
   `Models/T_Bark_D.png` that the suffix lookup would pick shows the Unity material winning.
 
+Step 6 (Blender normalization of models), in `Dungeon Props/Models/`:
+
+- `SM_Spinner.fbx`: a model whose take `Spin` turns the model's own object, not a bone, which
+  the normalization script refuses.
+- `SM_Cabinet.fbx`: a model whose take `Open` swings two doors, two objects under a still root,
+  and `SM_Blob.fbx`: one whose take `Smile` animates a shape key, not an object. The script
+  refuses both, since it writes each object's animation as a take of its own.
+- `SM_Lantern.fbx`: two takes of one name, `SM_Lantern_Glass|SwingA`, whose second action Blender
+  imports as `...|SwingA.001`. The script refuses it rather than write that take under a name the
+  file doesn't give.
+
 After a rerun, refresh `fbx_facts.json` beside the library, as `test_fbx_facts.py` says. Only
 the FBX files this script changes on purpose are committed: each rerun stamps new times in them.
 """
@@ -123,7 +134,9 @@ def conversion(path: str, steps: list[dict]) -> None:
 def blender_image(path: str, rgba: tuple[float, float, float, float], file_format: str) -> None:
     target = LIBRARY / path
     target.parent.mkdir(parents=True, exist_ok=True)
-    image = bpy.data.images.new(target.stem, 4, 4, alpha=True, float_buffer=file_format == "OPEN_EXR")
+    image = bpy.data.images.new(
+        target.stem, 4, 4, alpha=True, float_buffer=file_format == "OPEN_EXR"
+    )
     image.pixels = list(rgba) * 16
     image.filepath_raw = str(target)
     image.file_format = file_format
@@ -394,6 +407,98 @@ def unity_log() -> None:
         f"      name: Bark\n    second: {{fileID: 2100000, guid: {mat_bark}, type: 2}}\n"
         "  materials:\n    materialImportMode: 2\n",
     )
+
+    # A take that turns the model's own object, which would undo its normalization
+    bpy.ops.wm.read_homefile(use_empty=True)
+    spinner = box(
+        "SM_Spinner", size=(0.5, 0.5, 1), location=(0, 0, 0.5), materials=[material("Brass")]
+    )
+    spinner.animation_data_create().action = bpy.data.actions.new("Spin")
+    for frame, angle in [(1, 0.0), (20, 3.0)]:
+        spinner.rotation_euler = (0, 0, angle)
+        spinner.keyframe_insert("rotation_euler", frame=frame)
+    scene = bpy.context.scene
+    scene.frame_start, scene.frame_end = 1, 20
+    scene.name = "Spin"
+    export_fbx(
+        f"{models}/SM_Spinner.fbx",
+        bake_anim=True,
+        bake_anim_use_all_actions=False,
+        bake_anim_use_nla_strips=False,
+    )
+
+    # One take swinging two doors, each an object of its own under a root that stays still
+    bpy.ops.wm.read_homefile(use_empty=True)
+    cabinet = box(
+        "SM_Cabinet", size=(1, 0.5, 1.5), location=(0, 0, 0.75), materials=[material("Oak")]
+    )
+    for side, x in [("L", -0.25), ("R", 0.25)]:
+        door = box(f"SM_Cabinet_Door{side}", size=(0.5, 0.05, 1.4), location=(x, -0.28, 0.75))
+        door.parent = cabinet
+        door.matrix_parent_inverse = cabinet.matrix_world.inverted()
+        door.animation_data_create().action = bpy.data.actions.new(f"Open{side}")
+        for frame, angle in [(1, 0.0), (20, 1.5 if side == "L" else -1.5)]:
+            door.rotation_euler = (0, 0, angle)
+            door.keyframe_insert("rotation_euler", frame=frame)
+    scene = bpy.context.scene
+    scene.frame_start, scene.frame_end = 1, 20
+    scene.name = "Open"
+    export_fbx(
+        f"{models}/SM_Cabinet.fbx",
+        bake_anim=True,
+        bake_anim_use_all_actions=False,
+        bake_anim_use_nla_strips=False,
+    )
+
+    # A take that animates a shape key, not an object
+    bpy.ops.wm.read_homefile(use_empty=True)
+    blob = box("SM_Blob", size=(0.6, 0.6, 0.6), location=(0, 0, 0.3), materials=[material("Slime")])
+    blob.shape_key_add(name="Basis")
+    smile = blob.shape_key_add(name="Smile")
+    for point in smile.data:
+        point.co.z *= 1.5
+    for frame, value in [(1, 0.0), (20, 1.0)]:
+        smile.value = value
+        smile.keyframe_insert("value", frame=frame)
+    scene = bpy.context.scene
+    scene.frame_start, scene.frame_end = 1, 20
+    scene.name = "Smile"
+    export_fbx(
+        f"{models}/SM_Blob.fbx",
+        bake_anim=True,
+        bake_anim_use_all_actions=False,
+        bake_anim_use_nla_strips=False,
+    )
+
+    # Two takes of one name: two actions on a child object, the second renamed in the file
+    bpy.ops.wm.read_homefile(use_empty=True)
+    post = box("SM_Lantern", size=(0.1, 0.1, 2), location=(0, 0, 1), materials=[material("Iron")])
+    glass = box(
+        "SM_Lantern_Glass",
+        size=(0.3, 0.3, 0.4),
+        location=(0, 0.25, 1.6),
+        materials=[material("Glass")],
+    )
+    glass.parent = post
+    glass.matrix_parent_inverse = post.matrix_world.inverted()
+    data = glass.animation_data_create()
+    for name, angle in [("SwingB", -0.3), ("SwingA", 0.3)]:
+        data.action = bpy.data.actions.new(name)
+        for frame, value in [(1, 0.0), (20, angle)]:
+            glass.rotation_euler = (value, 0, 0)
+            glass.keyframe_insert("rotation_euler", frame=frame)
+        data.action.use_fake_user = True
+    target = export_fbx(
+        f"{models}/SM_Lantern.fbx",
+        bake_anim=True,
+        bake_anim_use_all_actions=True,
+        bake_anim_use_nla_strips=False,
+    )
+    # Every mention of its name, the take and its layer among them, to one of the same length
+    old, new = b"SM_Lantern_Glass|SwingB", b"SM_Lantern_Glass|SwingA"
+    written = target.read_bytes()
+    assert written.count(old) > 0
+    target.write_bytes(written.replace(old, new))
 
 
 OBJ_TRIANGLE = "o Barrel\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"

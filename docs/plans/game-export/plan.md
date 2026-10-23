@@ -925,6 +925,51 @@ from the contracts above:
   with its `.fbx.meta`, `Materials/M_LogBark.mat` (by remap) and `Materials/Leaves.mat` (by
   name, alpha clip).
 
+### What the Blender normalization ticket built differently
+
+The script (`export/normalize.py`) and its runner (`export::blender::Runner`) landed for models,
+proved on the fixtures. Wiring them into the export, C11's cache and the step's settings come
+later. Where they differ from C9:
+
+- **The job always carries the added material's name**, picked by `names::added_material` from
+  `fbx_facts`' slots. The script adds it only when a kept mesh has no material, and the result's
+  `addedMaterial` is null otherwise.
+- **`facingQuarterTurns` turns clockwise seen from above**, each taking +Z to +X, which is
+  Unity's positive yaw. Unreal's default is the opposite turn, +X to +Z, so an unreal model with
+  one quarter turn faces as it was. The result reports the whole turn as `yaw`, 0 to 270.
+- **Blender's slot order** is each kept mesh by name, then its slots. The added material lands
+  wherever its mesh sorts (`SM_Shelf` writes `OpenDAMDefault2, OpenDAMDefault`), so the round-trip
+  check removes it, wherever it is, and compares the rest with the source's kept slots in order.
+  Takes are compared sorted by name, since Blender lists actions by name, not in file order.
+- **Takes are written one NLA strip each**, named after the source take, because the exporter
+  names an action's take `<object>|<action>`. Blender's importer makes one action per take and
+  animated object, so a take must be one action on one object. A take that animates more than
+  one object (`SM_Cabinet`'s `Open` swings two doors) or is in more than one layer would be
+  written as several takes of one name, and one that animates shape keys or a material
+  (`SM_Blob`'s `Smile`) would be lost, so the script refuses both by name. A take that keys a
+  root object's own transform (`SM_Spinner`) is refused too, since it would override the root
+  transform on that object. An animation on a dropped collision mesh goes with it.
+- **The round-trip check reads takes from the files themselves.** The source's takes and the
+  written ones both come from each FBX's node tree, by `fbx_facts`' rule (a take counts when a
+  keyed curve drives something), minus takes only on dropped collision meshes, as sorted
+  lists, so a duplicated or lost take fails. An imported action that can't be matched to an
+  object and a take the file names is refused, as when Blender renames a second take of one
+  name `<take>.001` (`SM_Lantern`).
+- **The check against the worker is its own function,** `blender::check_facts`, comparing the
+  source's kept slots and takes with `fbx_facts`' as sets. `Runner::run` does the same-run checks
+  only, since a `Job` carries no facts. The export (#179) calls `check_facts` with the facts its
+  Check read, so a model Blender and the worker read differently is refused there. A take only on
+  a collision mesh counts for `fbx_facts` but not for the script, so such a model fails it.
+- **Positions are reported in Unity's axes** as Blender's (-x, z, -y): the FBX is written Y up and
+  -Z forward, and Unity mirrors X on import. The nose fixture checks the mirror as well as the
+  facing, since its nose is off centre.
+- **Scale and axis conversion stay on the objects.** A centimetre source keeps its 0.01 object
+  scale, and Blender's axis conversion sits on root objects (`bake_space_transform` off, since
+  baking it breaks armatures). Unity shows the right size and facing, with those values on the
+  GameObjects. AC13 confirms it in Unity.
+- **Blender imports only binary FBX,** so an ASCII FBX that `fbx_facts` reads fails its Blender
+  job, naming the asset.
+
 ### What the edits ticket built differently
 
 - **Only `assetName` is an edit so far** (C4). `export::edits::write` refuses any other key, and a
