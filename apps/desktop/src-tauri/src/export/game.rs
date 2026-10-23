@@ -1,6 +1,8 @@
 //! What the detail panel's Game tab shows for an asset (plan game-export C13): what it exports
 //! as, its `assetName`, inferred and yours (C4, C5), and the problems the Checks of the domains
-//! holding it find with it. So far the tab edits only the name.
+//! holding it find with it. A model shows each material slot's name, surface and texture per
+//! role, and its pack's images for the texture pickers. A texture shows its own layout, role and
+//! normal-map convention, and its texture set. Each value is inferred, or yours when you set it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -9,8 +11,10 @@ use serde::Serialize;
 
 use crate::db::Database;
 pub use crate::export::check::Field;
-use crate::export::check::{self, ItemRow, Kind, Problem};
+use crate::export::check::{self, Inspection, ItemRow, Kind, PackImage, Problem, TextureGame};
 use crate::export::fbx_facts;
+use crate::export::infer::{Binding, Surface};
+use crate::export::textures::Role;
 use crate::export::{edits, infer, settings};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -24,13 +28,97 @@ pub struct GameDetail {
     pub domains: Vec<String>,
     /// The problems of those domains' Checks that name the item, each once
     pub problems: Vec<Problem>,
+    /// A model's materials (C7), in slot order
+    pub materials: Vec<MaterialDetail>,
+    /// A model's pack's images, by path, which its texture pickers offer
+    pub images: Vec<PackImage>,
+    /// A texture's own layout, role and normal-map convention, and its texture set
+    pub texture: Option<TextureGame>,
+}
+
+/// One material slot of a model, as the Game tab shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterialDetail {
+    pub slot: String,
+    /// The slot the export adds for a kept mesh with no material (C9 step 2)
+    pub added: bool,
+    pub name: Field<String>,
+    pub surface: Field<Surface>,
+    /// Its BaseColor has a cut-out alpha: a suggestion you accept with one click (D23)
+    pub cutout_suggested: bool,
+    /// Every role, in the contract's order
+    pub textures: Vec<RoleTexture>,
+}
+
+/// One role of a material: its texture, inferred and yours.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleTexture {
+    pub role: Role,
+    pub inferred: Option<TexturePick>,
+    /// Whether you chose this role's texture, or none: `value` is then yours
+    pub yours: bool,
+    /// What the export uses, `None` for no texture
+    pub value: Option<TexturePick>,
+}
+
+/// A texture set filling a role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TexturePick {
+    /// The source the role is bound by: the image you picked, else the set's first giving it
+    pub asset_id: String,
+    /// The set's name
+    pub asset_name: String,
+    /// The set's sources that give the role
+    pub files: Vec<String>,
+}
+
+impl From<&Binding> for TexturePick {
+    fn from(binding: &Binding) -> Self {
+        TexturePick {
+            asset_id: binding.source.clone(),
+            asset_name: binding.asset_name.clone(),
+            files: binding.files.clone(),
+        }
+    }
+}
+
+impl From<&infer::Material> for MaterialDetail {
+    fn from(material: &infer::Material) -> Self {
+        let textures = Role::ALL
+            .into_iter()
+            .map(|role| RoleTexture {
+                role,
+                inferred: material.inferred.textures.get(&role).map(TexturePick::from),
+                yours: material.yours.textures.contains_key(&role),
+                value: material.textures.get(&role).map(TexturePick::from),
+            })
+            .collect();
+        MaterialDetail {
+            slot: material.slot.clone(),
+            added: material.added,
+            name: Field {
+                inferred: material.inferred.name.clone(),
+                yours: material.yours.name.clone(),
+            },
+            surface: Field {
+                inferred: material.inferred.surface,
+                yours: material.yours.surface,
+            },
+            cutout_suggested: material.cutout_suggested,
+            textures,
+        }
+    }
 }
 
 /// The Game tab of asset `asset_id`, reading FBX facts with `facts`, or `None` when it exports
 /// as neither a model, an animation nor a texture. A group's member stands for its main item.
 /// Its kind comes from the Check's rule (`check::exported_kind`). Each domain holding it is
-/// checked as the Export view's Check does, without staging, and its name is the one the first
-/// of those Checks, by domain name, exports it with, or `check::asset_name` in no domain.
+/// checked as the Export view's Check does, without staging, and its name, materials and texture
+/// set are the ones the first of those Checks, by domain name, exports it with. In no domain,
+/// they are a Check's of it alone (`check::inspect_alone`).
 pub async fn detail(
     db: &Database,
     asset_id: &str,
@@ -147,6 +235,7 @@ pub async fn detail(
     domains.sort();
     let mut problems: Vec<Problem> = Vec::new();
     let mut holding: Vec<String> = Vec::new();
+    let mut shown: Option<Inspection> = None;
     for (domain_name, domain) in &domains {
         let inspection = check::inspect(db, domain, facts, memo).await?;
         // A domain holds the item when its Check lists it
@@ -158,22 +247,37 @@ pub async fn detail(
             asset_name = name.clone();
         }
         holding.push(domain_name.clone());
-        for problem in inspection.report.problems {
+        for problem in &inspection.report.problems {
             let names_item = problem
                 .assets
                 .iter()
                 .any(|a| a.library_id == library.id && a.asset_id == item.id);
-            if names_item && !problems.contains(&problem) {
-                problems.push(problem);
+            if names_item && !problems.contains(problem) {
+                problems.push(problem.clone());
             }
         }
+        shown.get_or_insert(inspection);
     }
+    let shown = match shown {
+        Some(inspection) => inspection,
+        None => check::inspect_alone(library.clone(), &item.id, facts, memo).await?,
+    };
+    let (materials, images) = match shown.models.get(&item.id) {
+        Some(model) => (
+            model.materials.iter().map(MaterialDetail::from).collect(),
+            model.images.clone(),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
     Ok(Some(GameDetail {
-        asset_id: item.id,
+        asset_id: item.id.clone(),
         kind,
         asset_name,
         domains: holding,
         problems,
+        materials,
+        images,
+        texture: shown.textures.get(&item.id).cloned(),
     }))
 }
 
@@ -200,6 +304,7 @@ mod tests {
     use super::*;
     use crate::export::fbx_facts::FbxFacts;
     use crate::export::test_fixture::*;
+    use crate::export::textures::Convention;
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::Path;
@@ -378,5 +483,193 @@ mod tests {
             .unwrap();
         assert_eq!(shown.kind, Kind::Animation);
         assert_eq!(shown.asset_name.inferred, "Guard");
+    }
+
+    fn pick_files(pick: &Option<TexturePick>) -> Vec<&str> {
+        pick.iter()
+            .flat_map(|p| p.files.iter().map(String::as_str))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_model_shows_each_slot_inferred_and_yours_and_its_packs_images() {
+        let f = fixture().await;
+        let model = "Dungeon Props/Models/SM_Crate.fbx";
+        collection(&f, "props", "Props", "dg", &[model]).await;
+        let shown = detail_of(&f, model).await.unwrap();
+        let [planks] = shown.materials.as_slice() else {
+            panic!("{:?}", shown.materials)
+        };
+        assert_eq!(planks.slot, "Planks");
+        assert!(!planks.added);
+        assert_eq!(
+            planks.name,
+            Field {
+                inferred: "Planks".into(),
+                yours: None
+            }
+        );
+        assert_eq!(
+            planks.surface,
+            Field {
+                inferred: Surface::Opaque,
+                yours: None
+            }
+        );
+        let roles: Vec<Role> = planks.textures.iter().map(|t| t.role).collect();
+        assert_eq!(roles, Role::ALL, "every role, each with a picker");
+        let normal = &planks.textures[1];
+        assert_eq!(
+            pick_files(&normal.inferred),
+            ["Dungeon Props/Textures/1K/T_Crate_N.png"]
+        );
+        assert!(!normal.yours);
+        assert_eq!(normal.value, normal.inferred);
+        assert_eq!(planks.textures[0].value, None);
+        // The pickers offer the pack's images, each with the roles it gives
+        let crate_n: Vec<(&str, &[Role])> = shown
+            .images
+            .iter()
+            .filter(|i| i.file_path.ends_with("T_Crate_N.png"))
+            .map(|i| (i.file_path.as_str(), i.roles.as_slice()))
+            .collect();
+        assert_eq!(
+            crate_n,
+            [
+                (
+                    "Dungeon Props/Textures/1K/T_Crate_N.png",
+                    &[Role::Normal][..]
+                ),
+                (
+                    "Dungeon Props/Textures/4K/T_Crate_N.png",
+                    &[Role::Normal][..]
+                ),
+            ]
+        );
+        assert!(shown
+            .images
+            .iter()
+            .all(|i| i.file_path.starts_with("Dungeon Props/")));
+
+        let id = id_of(&f.library.pool, model).await;
+        let crate_4k = id_of(&f.library.pool, "Dungeon Props/Textures/4K/T_Crate_N.png").await;
+        let edit = json!({"materials": {"Planks": {
+            "name": "Boards",
+            "surface": "cutout",
+            "textures": {"Normal": crate_4k, "BaseColor": null}
+        }}});
+        edits::write(&f.library.pool, &id, edit.as_object().unwrap())
+            .await
+            .unwrap();
+        let shown = detail_of(&f, model).await.unwrap();
+        let planks = &shown.materials[0];
+        assert_eq!(planks.name.yours.as_deref(), Some("Boards"));
+        assert_eq!(planks.surface.value(), Surface::Cutout);
+        let normal = &planks.textures[1];
+        assert!(normal.yours);
+        assert_eq!(
+            pick_files(&normal.value),
+            ["Dungeon Props/Textures/4K/T_Crate_N.png"]
+        );
+        assert_eq!(normal.value.as_ref().unwrap().asset_id, crate_4k);
+        assert_eq!(
+            pick_files(&normal.inferred),
+            ["Dungeon Props/Textures/1K/T_Crate_N.png"]
+        );
+        let base = &planks.textures[0];
+        assert!(base.yours, "none, chosen, is yours");
+        assert_eq!((base.inferred.clone(), base.value.clone()), (None, None));
+    }
+
+    #[tokio::test]
+    async fn a_model_in_no_domain_shows_its_materials_and_the_added_slot() {
+        let f = fixture().await;
+        let guard = detail_of(&f, "Dungeon Props/Models/SK_Guard.fbx")
+            .await
+            .unwrap();
+        assert_eq!(guard.domains, Vec::<String>::new());
+        assert_eq!(guard.problems, []);
+        assert_eq!(guard.materials.len(), 1);
+        assert!(guard.materials[0].cutout_suggested);
+
+        let boulder = detail_of(&f, "Dungeon Props/Models/SM_Boulder.fbx")
+            .await
+            .unwrap();
+        let added = &boulder.materials[0];
+        assert_eq!((added.slot.as_str(), added.added), ("OpenDAMDefault", true));
+        assert_eq!(
+            pick_files(&added.textures[0].value),
+            ["Dungeon Props/Models/SM_Boulder.png"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_texture_shows_its_set_and_its_own_layout_role_and_convention() {
+        let f = fixture().await;
+        let normal = "Dungeon Props/Rocks/T_Rock_N_DX.png";
+        let rough = "Dungeon Props/Rocks/T_Rock_R.png";
+        let shown = detail_of(&f, normal).await.unwrap();
+        assert!(shown.materials.is_empty());
+        let texture = shown.texture.unwrap();
+        assert_eq!(
+            texture.layout,
+            Field {
+                inferred: "passThrough",
+                yours: None
+            }
+        );
+        assert_eq!(
+            texture.role,
+            Some(Field {
+                inferred: Role::Normal,
+                yours: None
+            })
+        );
+        assert_eq!(
+            texture.normal_convention,
+            Field {
+                inferred: Convention::DirectX,
+                yours: None
+            }
+        );
+        let set: Vec<(&str, &str)> = texture
+            .set
+            .iter()
+            .map(|s| (s.file_path.as_str(), s.layout))
+            .collect();
+        assert_eq!(
+            set,
+            [
+                ("Dungeon Props/Rocks/T_Rock_M.png", "Metallic"),
+                (normal, "Normal"),
+                (rough, "Roughness"),
+            ]
+        );
+        assert_eq!(texture.outputs, [Role::Normal, Role::MetallicSmoothness]);
+
+        // A Roughness map merges into its set's MetallicSmoothness: no role of its own
+        let texture = detail_of(&f, rough).await.unwrap().texture.unwrap();
+        assert_eq!(texture.layout.inferred, "Roughness");
+        assert_eq!(texture.role, None);
+
+        let id = id_of(&f.library.pool, rough).await;
+        let edit = json!({"layout": "passThrough", "normalConvention": "directx"});
+        edits::write(&f.library.pool, &id, edit.as_object().unwrap())
+            .await
+            .unwrap();
+        let texture = detail_of(&f, rough).await.unwrap().texture.unwrap();
+        assert_eq!(texture.layout.yours, Some("passThrough"));
+        assert_eq!(
+            texture.role,
+            Some(Field {
+                inferred: Role::BaseColor,
+                yours: None
+            })
+        );
+        assert_eq!(texture.normal_convention.yours, Some(Convention::DirectX));
+        assert_eq!(
+            texture.outputs,
+            [Role::BaseColor, Role::Normal, Role::MetallicSmoothness]
+        );
     }
 }

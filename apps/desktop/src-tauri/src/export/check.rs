@@ -25,7 +25,7 @@ use crate::export::fingerprint::{Fingerprint, Probes, Stamp};
 use crate::export::infer::{self, PackImages, UnityPack};
 use crate::export::names::{is_pascal, pascal};
 use crate::export::packs::{self, Origin, PackSource};
-use crate::export::textures::{self, Convention, Layout, Refusal, Role};
+use crate::export::textures::{self, Convention, Layout, Refusal, Role, SourceEdits};
 use crate::export::{contract, edits, hashes, settings};
 use crate::models::AssetKind;
 use crate::structure::{self, PackOverride};
@@ -134,6 +134,90 @@ pub struct Inspection {
     pub fingerprint: Fingerprint,
     /// Each listed asset's `assetName`, inferred and yours, by asset id: the Game tab's
     pub names: HashMap<String, Field<String>>,
+    /// What the Game tab shows of each model with materials, by asset id
+    pub models: HashMap<String, ModelGame>,
+    /// What the Game tab shows of each texture source, by asset id
+    pub textures: HashMap<String, TextureGame>,
+}
+
+/// An image as the Game tab offers or shows it: its layout and the roles it gives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackImage {
+    pub asset_id: String,
+    /// Relative to the library root
+    pub file_path: String,
+    /// Its layout's label: a role, or ORM, MaskMap, Roughness, Gloss or Metallic
+    pub layout: &'static str,
+    pub roles: Vec<Role>,
+}
+
+impl PackImage {
+    fn of(images: &PackImages, image: usize) -> Self {
+        let layout = images.layout(image);
+        PackImage {
+            asset_id: images.images[image].id.clone(),
+            file_path: images.images[image].path.clone(),
+            layout: layout.label(),
+            roles: layout.outputs().to_vec(),
+        }
+    }
+}
+
+/// What the Game tab shows of a model (C13): its materials, inferred and with your edits, and
+/// its pack's images, which its texture pickers offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelGame {
+    pub materials: Vec<infer::Material>,
+    /// By path
+    pub images: Vec<PackImage>,
+}
+
+/// What the Game tab shows of a texture source (C13): its own layout, role and normal-map
+/// convention, each inferred and yours, and its texture set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextureGame {
+    /// As an edit names it: `passThrough` for one role, else ORM, MaskMap, Roughness, Gloss or
+    /// Metallic
+    pub layout: Field<&'static str>,
+    /// Its role, when its layout passes one role through. Other layouts fix their roles (C4).
+    pub role: Option<Field<Role>>,
+    pub normal_convention: Field<Convention>,
+    /// The sources of its texture set, itself included, by path
+    pub set: Vec<PackImage>,
+    /// The roles its set exports, one texture each
+    pub outputs: Vec<Role>,
+}
+
+impl TextureGame {
+    /// A source inferred as `layout` and `convention`, with your `edits`, in a set of `set`.
+    fn new(
+        layout: Layout,
+        convention: Convention,
+        edits: SourceEdits,
+        set: Vec<PackImage>,
+    ) -> Self {
+        let role = edits.layout(layout).role().map(|_| Field {
+            inferred: layout.role().unwrap_or(Role::BaseColor),
+            yours: edits.role,
+        });
+        TextureGame {
+            layout: Field {
+                inferred: layout.edit_name(),
+                yours: edits.layout.map(Layout::edit_name),
+            },
+            role,
+            normal_convention: Field {
+                inferred: convention,
+                yours: edits.convention,
+            },
+            outputs: (Role::ALL.into_iter())
+                .filter(|r| set.iter().any(|s| s.roles.contains(r)))
+                .collect(),
+            set,
+        }
+    }
 }
 
 /// A pack of the domain: its manifest entry, where it is, and its normal-map convention, yours
@@ -429,7 +513,7 @@ pub async fn inspect(
     let mut inputs = Vec::new();
     for library in db.get_all_libraries().await {
         inputs.push(
-            read_library(library, &subtree, facts)
+            read_library(library, Members::Collections(&subtree), facts)
                 .await
                 .map_err(|e| e.to_string())?,
         );
@@ -457,6 +541,8 @@ pub async fn inspect(
     let Evaluated {
         assets,
         names,
+        models,
+        textures,
         packs,
         problems: mut found,
         manifest,
@@ -485,6 +571,44 @@ pub async fn inspect(
         files,
         fingerprint,
         names,
+        models,
+        textures,
+    })
+}
+
+/// Reads asset `asset_id` of `library` on its own, as a Check of a domain holding only it would,
+/// for the Game tab of an asset in no domain: its name, materials and texture set. Nothing is
+/// staged, and its problems are no domain's.
+pub async fn inspect_alone(
+    library: LibraryHandle,
+    asset_id: &str,
+    facts: &impl fbx_facts::Reader,
+    memo: &Arc<infer::Memo>,
+) -> Result<Inspection, String> {
+    let mut inputs = vec![read_library(library, Members::Item(asset_id), facts)
+        .await
+        .map_err(|e| e.to_string())?];
+    let memo = Arc::clone(memo);
+    // No domain name: the manifest's errors about the domain are left out
+    let evaluated = tokio::task::spawn_blocking(move || evaluate("", &mut inputs, &memo))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Inspection {
+        report: CheckReport {
+            domain: String::new(),
+            bundle_path: None,
+            assets: evaluated.assets,
+            packs: evaluated.packs,
+            problems: evaluated.problems,
+            manifest: evaluated.manifest,
+            diff: None,
+            staged: false,
+        },
+        files: evaluated.files,
+        fingerprint: Fingerprint::default(),
+        names: evaluated.names,
+        models: evaluated.models,
+        textures: evaluated.textures,
     })
 }
 
@@ -652,25 +776,45 @@ fn exported_fbx<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<&'a str>
         .min_by_key(|p| (!in_unity_fbx_folder(p), p.to_lowercase(), *p))
 }
 
+/// What a check reads as its items.
+enum Members<'a> {
+    /// The grid items in these collections
+    Collections(&'a [String]),
+    /// One asset's grid item
+    Item(&'a str),
+}
+
 async fn read_library(
     library: LibraryHandle,
-    subtree: &[String],
+    members: Members<'_>,
     facts: &impl fbx_facts::Reader,
 ) -> sqlx::Result<LibraryInput> {
     let pool = &library.pool;
-    let ids = serde_json::to_string(subtree).expect("ids serialize");
     // Memberships are on every member of a group, so each is read as its grid item
-    let items: Vec<ItemRow> = sqlx::query_as(
-        "SELECT a.id, a.file_path, a.file_name, a.extension, a.kind FROM assets a
-         WHERE a.id IN (
-             SELECT COALESCE(m.group_id, m.id) FROM collection_assets ca
-             JOIN assets m ON m.id = ca.asset_id
-             WHERE ca.collection_id IN (SELECT value FROM json_each(?)))
-         ORDER BY a.file_path",
-    )
-    .bind(&ids)
-    .fetch_all(pool)
-    .await?;
+    let items: Vec<ItemRow> = match members {
+        Members::Collections(subtree) => {
+            sqlx::query_as(
+                "SELECT a.id, a.file_path, a.file_name, a.extension, a.kind FROM assets a
+                 WHERE a.id IN (
+                     SELECT COALESCE(m.group_id, m.id) FROM collection_assets ca
+                     JOIN assets m ON m.id = ca.asset_id
+                     WHERE ca.collection_id IN (SELECT value FROM json_each(?)))
+                 ORDER BY a.file_path",
+            )
+            .bind(serde_json::to_string(subtree).expect("ids serialize"))
+            .fetch_all(pool)
+            .await?
+        }
+        Members::Item(id) => {
+            sqlx::query_as(
+                "SELECT id, file_path, file_name, extension, kind FROM assets
+                 WHERE id = (SELECT COALESCE(group_id, id) FROM assets WHERE id = ?)",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await?
+        }
+    };
     // Every read is sent at once, so the preview queue serves them all between two of its jobs
     let reads = exported_fbx_of(pool, &items)
         .await?
@@ -801,6 +945,8 @@ struct Read {
 struct Evaluated {
     assets: Vec<CheckedAsset>,
     names: HashMap<String, Field<String>>,
+    models: HashMap<String, ModelGame>,
+    textures: HashMap<String, TextureGame>,
     packs: Vec<DomainPack>,
     problems: Vec<Problem>,
     manifest: Value,
@@ -826,6 +972,7 @@ struct TextureJob {
     layout: Layout,
     convention: Convention,
     member: bool,
+    game: TextureGame,
 }
 
 /// Everything a check does with files, run on a blocking thread: reads each item, its pack and
@@ -884,11 +1031,20 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
         .map(|(i, key)| (*key, i))
         .collect();
 
+    // Your edits to each source image (C4), by library and asset id
+    let source_edits: Vec<HashMap<String, SourceEdits>> = inputs
+        .iter()
+        .map(|input| {
+            (input.edits.iter())
+                .map(|row| (row.asset_id.clone(), edits::source_edits(&row.parsed())))
+                .collect()
+        })
+        .collect();
     // Each pack's images in their texture sets (C8), and what a Unity pack's files say
     let mut catalogs: HashMap<PackKey, PackImages> = HashMap::new();
     for (l, input) in inputs.iter_mut().enumerate() {
         for (p, images) in input.pack_images.drain() {
-            catalogs.insert((l, p), PackImages::new(images));
+            catalogs.insert((l, p), PackImages::new(images).with_edits(&source_edits[l]));
         }
     }
     let mut unity_packs: HashMap<PackKey, UnityPack> = HashMap::new();
@@ -974,15 +1130,27 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
                         // An image in no pack has no set: it is a texture on its own
                         None => {
                             let stem_info = textures::read_stem(item.stem());
+                            let inferred =
+                                stem_info.layout.unwrap_or(Layout::Role(Role::BaseColor));
+                            let convention = stem_info.convention.unwrap_or(Convention::OpenGl);
+                            let edits = source_edits[l].get(&item.id).copied().unwrap_or_default();
+                            let layout = edits.layout(inferred);
+                            let alone = PackImage {
+                                asset_id: item.id.clone(),
+                                file_path: item.file_path.clone(),
+                                layout: layout.label(),
+                                roles: layout.outputs().to_vec(),
+                            };
                             jobs.push(TextureJob {
                                 library: l,
                                 asset,
                                 extension: item.extension.to_ascii_lowercase(),
                                 pack,
                                 name: asset_name(item, &input.edits).expect("an image's name"),
-                                layout: stem_info.layout.unwrap_or(Layout::Role(Role::BaseColor)),
-                                convention: stem_info.convention.unwrap_or(Convention::OpenGl),
+                                layout,
+                                convention: edits.convention.unwrap_or(convention),
                                 member: true,
+                                game: TextureGame::new(inferred, convention, edits, vec![alone]),
                             });
                         }
                     }
@@ -1020,6 +1188,10 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
                 fbx_path: &fbx.path,
                 facts: fbx.facts.as_ref().expect("a model's facts"),
                 asset_name: reads[*r].row.asset_name.clone().unwrap_or_default(),
+                edits: (input.edits.iter())
+                    .find(|e| e.asset_id == item.id)
+                    .map(|e| edits::slot_edits(&e.parsed()))
+                    .unwrap_or_default(),
             }
         })
         .collect();
@@ -1040,20 +1212,40 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
                 .filter(|e| ids.contains(e.asset_id.as_str())),
         )
     };
+    let mut model_games: HashMap<String, ModelGame> = HashMap::new();
     for ((r, key, ..), mut materials) in models.iter().zip(materials) {
-        for binding in materials.iter_mut().flat_map(|m| m.textures.values_mut()) {
+        let bindings = (materials.iter_mut()).flat_map(|m| {
+            m.textures
+                .values_mut()
+                .chain(m.inferred.textures.values_mut())
+        });
+        for binding in bindings {
             if let Some(name) = yours(*key, binding.set) {
                 binding.asset_name = name;
             }
         }
         let row = &mut reads[*r].row;
         let asset = row.asset.clone();
-        material_names(&materials, &mut |message: String| {
+        let mut issue = |message: String| {
             problems.push(Problem {
                 message: format!("{}: {message}", asset.file_path),
                 assets: vec![asset.clone()],
             })
-        });
+        };
+        material_names(&materials, &mut issue);
+        for message in materials.iter().flat_map(|m| &m.unfilled) {
+            issue(message.clone());
+        }
+        let images = &catalogs[key];
+        model_games.insert(
+            asset.asset_id.clone(),
+            ModelGame {
+                materials: materials.clone(),
+                images: (0..images.images.len())
+                    .map(|i| PackImage::of(images, i))
+                    .collect(),
+            },
+        );
         row.materials = materials;
     }
 
@@ -1107,13 +1299,23 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
             layout: images.layout(image),
             convention: images.convention(image, sources[pack].normal_convention()),
             member: member_images.contains(&(key, image)),
+            game: TextureGame::new(
+                images.inferred_layout(image),
+                images.inferred_convention(image, sources[pack].normal_convention()),
+                images.edits(image),
+                (images.sets[images.set_of[image]].sources.iter())
+                    .map(|i| PackImage::of(images, *i))
+                    .collect(),
+            ),
         });
     }
 
     // Each invalid conversion.json, by library and path, with the assets it covers
     let mut invalid_conversions: BTreeMap<(usize, String), (Invalid, Vec<AssetRef>)> =
         BTreeMap::new();
+    let mut texture_games: HashMap<String, TextureGame> = HashMap::new();
     for job in jobs {
+        texture_games.insert(job.asset.asset_id.clone(), job.game.clone());
         let input = &mut inputs[job.library];
         let mut issue = |message: String| {
             problems.push(Problem {
@@ -1235,6 +1437,8 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
         files,
         probes: walkers.into_iter().map(|w| w.probes).collect(),
         names: asset_names,
+        models: model_games,
+        textures: texture_games,
     }
 }
 
@@ -3828,5 +4032,201 @@ mod tests {
                 "Unity Moss/Textures/T_LeafAtlas.png.meta in Fixture",
             ]
         );
+    }
+
+    /// Writes your export edit `value` to the fixture's file at `path`.
+    async fn edit(f: &Fixture, path: &str, value: Value) {
+        let id = id_of(&f.library.pool, path).await;
+        edits::write(&f.library.pool, &id, value.as_object().unwrap())
+            .await
+            .unwrap();
+    }
+
+    async fn recheck(f: &Fixture) -> CheckReport {
+        check(&f.db, "domain", &Facts::fixture(), &fresh_memo())
+            .await
+            .unwrap()
+    }
+
+    /// AC4's edit part: each edit replaces its inferred value in what the export uses, and a
+    /// reset restores the inferred one.
+    #[tokio::test]
+    async fn each_edit_replaces_its_inferred_value_and_a_reset_restores_it() {
+        use Role::*;
+        use Surface::*;
+        use Via::*;
+        let f = fixture().await;
+        let (crate_, gate, guard) = (
+            "Dungeon Props/Models/SM_Crate.fbx",
+            "Dungeon Props/Models/SM_Gate.fbx",
+            "Dungeon Props/Models/SK_Guard.fbx",
+        );
+        let (aorm, rock_n) = (
+            "Dungeon Props/Textures/T_Guard_AORM.png",
+            "Dungeon Props/Rocks/T_Rock_N_DX.png",
+        );
+        let inferred = check_domain(&f, &[crate_, gate, guard, rock_n]).await;
+        assert_eq!(
+            materials_of(&inferred, guard),
+            [material(
+                "Cloth",
+                "Cloth",
+                Opaque,
+                true,
+                false,
+                &[
+                    (BaseColor, "Guard", Suffix),
+                    (MetallicSmoothness, "Guard", Suffix),
+                    (Occlusion, "Guard", Suffix),
+                ],
+            )]
+        );
+
+        let crate_4k = id_of(&f.library.pool, "Dungeon Props/Textures/4K/T_Crate_N.png").await;
+        let planks = json!({"Planks": {"textures": {"Normal": crate_4k}}});
+        edit(&f, crate_, json!({ "materials": planks })).await;
+        let iron = json!({"Iron": {"name": "Metal", "textures": {"BaseColor": null}}});
+        edit(&f, gate, json!({ "materials": iron })).await;
+        // The cutout suggestion, accepted
+        edit(
+            &f,
+            guard,
+            json!({"materials": {"Cloth": {"surface": "cutout"}}}),
+        )
+        .await;
+        // The AORM map passes its AO through as it is, and the DirectX map is OpenGL after all
+        let occlusion = json!({"layout": "passThrough", "role": "Occlusion"});
+        edit(&f, aorm, occlusion).await;
+        edit(&f, rock_n, json!({"normalConvention": "opengl"})).await;
+        let yours = recheck(&f).await;
+
+        assert_eq!(
+            materials_of(&yours, crate_),
+            [material(
+                "Planks",
+                "Planks",
+                Opaque,
+                false,
+                false,
+                &[(Normal, "Crate", Yours)]
+            )]
+        );
+        let planks = &yours
+            .assets
+            .iter()
+            .find(|a| a.asset.file_path == crate_)
+            .unwrap()
+            .materials[0];
+        assert_eq!(
+            planks.textures[&Normal].files,
+            ["Dungeon Props/Textures/4K/T_Crate_N.png"]
+        );
+        assert_eq!(planks.textures[&Normal].source, crate_4k);
+        assert_eq!(
+            planks.inferred.textures[&Normal].files,
+            ["Dungeon Props/Textures/1K/T_Crate_N.png"],
+            "what was inferred is kept beside your pick"
+        );
+        assert_eq!(
+            materials_of(&yours, gate),
+            [material(
+                "Iron",
+                "Metal",
+                Opaque,
+                false,
+                false,
+                &[(MetallicSmoothness, "Gate", Suffix)]
+            )]
+        );
+        assert_eq!(
+            materials_of(&yours, guard),
+            [material(
+                "Cloth",
+                "Cloth",
+                Cutout,
+                false,
+                false,
+                &[(BaseColor, "Guard", Suffix), (Occlusion, "Guard", Suffix)],
+            )]
+        );
+
+        use Status::*;
+        let rows = texture_rows(&yours);
+        let row = |path: &str| rows.iter().find(|r| r.0 == path).copied();
+        // Only what the export now uses joins the domain
+        assert!(row("Dungeon Props/Textures/4K/T_Crate_N.png").is_some());
+        assert_eq!(row("Dungeon Props/Textures/1K/T_Crate_N.png"), None);
+        assert_eq!(row("Dungeon Props/Textures/T_Iron_D.png"), None);
+        assert_eq!(
+            row(aorm),
+            Some((aorm, "Guard", "Occlusion", None, false, Ready))
+        );
+        assert_eq!(
+            row(rock_n),
+            Some((
+                rock_n,
+                "Rock",
+                "Normal",
+                Some(Convention::OpenGl),
+                true,
+                Ready
+            ))
+        );
+        let entries = texture_entries(&yours);
+        for entry in [
+            ("Crate", "Normal", "Textures/Crate_Normal.png"),
+            ("Guard", "Occlusion", "Textures/Guard_Occlusion.png"),
+            ("Rock", "Normal", "Textures/Rock_Normal.png"),
+        ] {
+            let entry = (entry.0.into(), entry.1.into(), entry.2.into());
+            assert!(entries.contains(&entry), "{entry:?} in {entries:?}");
+        }
+        assert_valid(&yours);
+
+        // Each reset gives back what was inferred, and leaves no row
+        edit(&f, crate_, json!({"materials": null})).await;
+        edit(&f, gate, json!({"materials": {"Iron": null}})).await;
+        edit(&f, guard, json!({"materials": {"Cloth": {}}})).await;
+        edit(&f, aorm, json!({"layout": null, "role": null})).await;
+        edit(&f, rock_n, json!({"normalConvention": null})).await;
+        let reset = recheck(&f).await;
+        for path in [crate_, gate, guard] {
+            assert_eq!(
+                materials_of(&reset, path),
+                materials_of(&inferred, path),
+                "{path}"
+            );
+        }
+        assert_eq!(texture_rows(&reset), texture_rows(&inferred));
+        assert_eq!(edits::read_all(&f.library.pool).await.unwrap(), []);
+    }
+
+    #[tokio::test]
+    async fn a_pick_that_gives_no_role_is_a_problem_and_a_fixed_layout_ignores_your_role() {
+        let f = fixture().await;
+        let gate = "Dungeon Props/Models/SM_Gate.fbx";
+        let metallic = id_of(&f.library.pool, "Dungeon Props/Textures/T_Iron_M.png").await;
+        let pick = json!({"Iron": {"textures": {"BaseColor": metallic}}});
+        edit(&f, gate, json!({ "materials": pick })).await;
+        // A Roughness map merges into its set's MetallicSmoothness, which fixes its role
+        edit(
+            &f,
+            "Dungeon Props/Textures/T_Iron_R.png",
+            json!({"role": "Height"}),
+        )
+        .await;
+        let report = check_domain(&f, &[gate]).await;
+        assert!(messages(&report).contains(
+            &"Dungeon Props/Models/SM_Gate.fbx: its material Iron has Dungeon Props/Textures/T_Iron_M.png picked as its BaseColor, but that image's layout gives no BaseColor: change its layout in its Game tab, or pick another"
+        ), "{:?}", messages(&report));
+        let model = report
+            .assets
+            .iter()
+            .find(|a| a.asset.file_path == gate)
+            .unwrap();
+        assert!(!model.materials[0].textures.contains_key(&Role::BaseColor));
+        let rows = texture_rows(&report);
+        let rough = rows.iter().find(|r| r.0.ends_with("T_Iron_R.png")).unwrap();
+        assert_eq!(rough.2, "Roughness");
     }
 }

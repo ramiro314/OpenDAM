@@ -484,13 +484,16 @@ export interface ExportCheckAsset extends ExportAssetRef {
 }
 
 /** Where an inferred texture came from (plan D11) */
-export type TextureVia = 'fbx' | 'unity' | 'suffix' | 'stem';
+export type TextureVia = 'fbx' | 'unity' | 'suffix' | 'stem' | 'yours';
+
+/** A material's surface (plan D23) */
+export type MaterialSurface = 'opaque' | 'cutout';
 
 /** A model's material slot, as inferred (plan C7) */
 export interface ExportMaterial {
   slot: string;
   name: string;
-  surface: 'opaque' | 'cutout';
+  surface: MaterialSurface;
   /** Its base color has alpha below 0.5: a suggestion, which exports opaque until accepted */
   cutoutSuggested: boolean;
   /** The slot the export adds for a mesh with no material */
@@ -554,6 +557,70 @@ export interface GameField<T> {
   yours: T | null;
 }
 
+/** A texture set filling a material's role */
+export interface GameTexturePick {
+  /** The source the role is bound by: the image you picked, else the set's first giving it */
+  assetId: string;
+  /** The set's name */
+  assetName: string;
+  /** The set's sources that give the role */
+  files: string[];
+}
+
+/** One role of a material: its texture, inferred and yours */
+export interface GameRoleTexture {
+  role: TextureRole;
+  inferred: GameTexturePick | null;
+  /** Whether you chose this role's texture, or none: `value` is then yours */
+  yours: boolean;
+  /** What the export uses, null for no texture */
+  value: GameTexturePick | null;
+}
+
+/** One material slot of a model, as the Game tab shows it (plan C7, C13) */
+export interface GameMaterial {
+  slot: string;
+  /** The slot the export adds for a kept mesh with no material */
+  added: boolean;
+  name: GameField<string>;
+  surface: GameField<MaterialSurface>;
+  /** Its base color has a cut-out alpha: a suggestion you accept with one click */
+  cutoutSuggested: boolean;
+  /** Every role, in the contract's order */
+  textures: GameRoleTexture[];
+}
+
+/** An image of a pack, with its layout and the roles it gives */
+export interface GameImage {
+  assetId: string;
+  /** Relative to the library root */
+  filePath: string;
+  /** A role, or ORM, MaskMap, Roughness, Gloss or Metallic */
+  layout: string;
+  roles: TextureRole[];
+}
+
+/** A source image's layout as an edit names it (plan C8): `passThrough` gives one role as it is */
+export type TextureLayoutEdit =
+  | 'passThrough'
+  | 'ORM'
+  | 'MaskMap'
+  | 'Roughness'
+  | 'Gloss'
+  | 'Metallic';
+
+/** A texture source as the Game tab shows it (plan C13) */
+export interface GameTexture {
+  layout: GameField<TextureLayoutEdit>;
+  /** Its role, when its layout passes one role through; other layouts fix their roles */
+  role: GameField<TextureRole> | null;
+  normalConvention: GameField<NormalConvention>;
+  /** The sources of its texture set, itself included, by path */
+  set: GameImage[];
+  /** The roles its set exports */
+  outputs: TextureRole[];
+}
+
 /** What the detail panel's Game tab shows for an asset (plan C13) */
 export interface GameDetail {
   /** The grid item the tab is about: a group's main item */
@@ -564,11 +631,31 @@ export interface GameDetail {
   domains: string[];
   /** The problems naming it in its domains' Checks */
   problems: ExportProblem[];
+  /** A model's materials, in slot order */
+  materials: GameMaterial[];
+  /** A model's pack's images, by path, which its texture pickers offer */
+  images: GameImage[];
+  /** A texture's own layout, role and convention, and its set */
+  texture: GameTexture | null;
 }
 
-/** Your export edits to an asset: a value sets it, null resets it to inferred */
+/** Your edits to one material slot: a texture is an image's id, or null for none */
+export interface MaterialEdits {
+  name?: string;
+  surface?: MaterialSurface;
+  textures?: Partial<Record<TextureRole, string | null>>;
+}
+
+/**
+ * Your export edits to an asset: a value sets it, null resets it to inferred. `materials`
+ * replaces each slot it names, and null resets a slot or all of them.
+ */
 export interface ExportEditPatch {
   assetName?: string | null;
+  materials?: Record<string, MaterialEdits | null> | null;
+  layout?: TextureLayoutEdit | null;
+  role?: TextureRole | null;
+  normalConvention?: NormalConvention | null;
 }
 
 /** What Export did: swapped the bundle in, or found that something the Check read changed */

@@ -994,6 +994,30 @@ later. Where they differ from C9:
   "Check again" at once. The pack form doesn't mark the view stale yet, but Export still refuses
   through the fingerprint.
 
+### What the material and texture editors ticket built differently
+
+- **A texture edit's layout names:** `layout` is `passThrough` (one role, as it is), `ORM`,
+  `MaskMap`, `Roughness`, `Gloss` or `Metallic`. `role` counts only when the layout passes one
+  role through, so writing any other layout drops your role. Layout, role and
+  `normalConvention` reach the image's own group (its 2D stack copies), not the other sources of
+  its set; `assetName` still reaches the whole set.
+- **A slot's edits are written whole.** A `materials` patch replaces each slot it names, and null
+  resets a slot, or every slot as `materials: null`. A role's texture is the asset id of the
+  image you picked, `null` for none, and a role left out is inferred.
+- **A pick must give its role.** The picker offers the pack's images whose layout gives the
+  role, plus the one bound now. The write refuses an image outside the model's pack. A pick
+  whose image no longer gives the role (its layout changed) or is no longer in the pack is a
+  problem naming the slot, which refuses the export, rather than a binding with no file.
+- **Your edits feed inference, not only its output.** Layout and convention edits apply before
+  the slots are answered, and texture picks before the sets are named, so D24's names and the
+  textures that join the domain follow your choices. `<AssetName><MaterialName>` uses your
+  material name.
+- **The cutout suggestion is gone once you set a surface,** either way.
+- **A model or image in no domain** shows its materials, pickers and texture set from a Check of
+  it alone (`check::inspect_alone`), with no problems, since problems are a domain's.
+- **The convention is shown for a Normal only.** It is still stored per source, and a role's
+  `via` is `yours` once you picked its texture.
+
 ## Acceptance criteria
 
 - **AC1.** The copied schema matches `SOURCE.md`'s sha256 (a test). `sync-asset-contract.sh`

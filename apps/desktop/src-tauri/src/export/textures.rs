@@ -17,6 +17,20 @@ pub enum Role {
 }
 
 impl Role {
+    pub const ALL: [Role; 6] = [
+        Role::BaseColor,
+        Role::Normal,
+        Role::MetallicSmoothness,
+        Role::Occlusion,
+        Role::Emission,
+        Role::Height,
+    ];
+
+    /// The role the contract names `name`.
+    pub fn parse(name: &str) -> Option<Role> {
+        Role::ALL.into_iter().find(|r| r.as_str() == name)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Role::BaseColor => "BaseColor",
@@ -55,6 +69,38 @@ impl Layout {
         }
     }
 
+    /// The one role a source of this layout passes through as, if it is one.
+    pub fn role(self) -> Option<Role> {
+        match self {
+            Layout::Role(role) => Some(role),
+            _ => None,
+        }
+    }
+
+    /// The layout as your edit names it (C4): `passThrough` for any one role, whose role is then
+    /// an edit of its own, else its label.
+    pub fn edit_name(self) -> &'static str {
+        match self {
+            Layout::Role(_) => PASS_THROUGH,
+            other => other.label(),
+        }
+    }
+
+    /// The layout your edit names `name`. `passThrough` gives `Layout::Role(BaseColor)`, whose
+    /// role `SourceEdits::layout` replaces.
+    pub fn from_edit_name(name: &str) -> Option<Layout> {
+        [
+            Layout::Role(Role::BaseColor),
+            Layout::Orm,
+            Layout::MaskMap,
+            Layout::Roughness,
+            Layout::Gloss,
+            Layout::Metallic,
+        ]
+        .into_iter()
+        .find(|l| l.edit_name() == name)
+    }
+
     /// The roles a source of this layout gives once converted (C8): an ORM or MaskMap map
     /// splits into Occlusion and MetallicSmoothness, and a Roughness, Gloss or Metallic map
     /// merges into its set's MetallicSmoothness.
@@ -68,6 +114,34 @@ impl Layout {
             Layout::Role(Role::Height) => &[Role::Height],
             Layout::Orm | Layout::MaskMap => &[Role::Occlusion, Role::MetallicSmoothness],
             Layout::Roughness | Layout::Gloss | Layout::Metallic => &[Role::MetallicSmoothness],
+        }
+    }
+}
+
+/// The edit name of a layout that passes one role through (C4).
+pub const PASS_THROUGH: &str = "passThrough";
+
+/// Your edits to one source image (C4): its layout, its role when that layout passes one role
+/// through, and its normal-map convention. A layout with several outputs (ORM, MaskMap) or one
+/// merged with other sources (Roughness, Gloss, Metallic) fixes its roles, so a role edit then
+/// counts for nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceEdits {
+    pub layout: Option<Layout>,
+    pub role: Option<Role>,
+    pub convention: Option<Convention>,
+}
+
+impl SourceEdits {
+    /// The layout of a source inferred as `inferred`, with these edits: your layout, else the
+    /// inferred one. When it passes one role through, the role is yours, else the inferred
+    /// layout's, else BaseColor.
+    pub fn layout(&self, inferred: Layout) -> Layout {
+        match self.layout.unwrap_or(inferred) {
+            Layout::Role(_) => {
+                Layout::Role(self.role.or(inferred.role()).unwrap_or(Role::BaseColor))
+            }
+            layout => layout,
         }
     }
 }
@@ -244,6 +318,58 @@ mod tests {
             layout,
             convention,
         }
+    }
+
+    #[test]
+    fn your_layout_wins_and_your_role_counts_only_when_one_role_passes_through() {
+        let edits = |layout: Option<&str>, role: Option<Role>| SourceEdits {
+            layout: layout.map(|l| Layout::from_edit_name(l).unwrap()),
+            role,
+            convention: None,
+        };
+        let normal = Layout::Role(Role::Normal);
+        for (yours, inferred, expected) in [
+            (edits(None, None), Layout::Orm, Layout::Orm),
+            (edits(Some("ORM"), None), normal, Layout::Orm),
+            // Your role replaces the inferred one
+            (
+                edits(None, Some(Role::Height)),
+                normal,
+                Layout::Role(Role::Height),
+            ),
+            // A layout with several outputs fixes its roles
+            (
+                edits(None, Some(Role::Height)),
+                Layout::MaskMap,
+                Layout::MaskMap,
+            ),
+            (
+                edits(Some("Gloss"), Some(Role::Height)),
+                normal,
+                Layout::Gloss,
+            ),
+            // Passing through keeps the inferred role, else BaseColor
+            (edits(Some(PASS_THROUGH), None), normal, normal),
+            (
+                edits(Some(PASS_THROUGH), None),
+                Layout::Orm,
+                Layout::Role(Role::BaseColor),
+            ),
+            (
+                edits(Some(PASS_THROUGH), Some(Role::Emission)),
+                Layout::Metallic,
+                Layout::Role(Role::Emission),
+            ),
+        ] {
+            assert_eq!(
+                yours.layout(inferred),
+                expected,
+                "{yours:?} on {inferred:?}"
+            );
+        }
+        assert_eq!(Layout::from_edit_name("Normal"), None);
+        assert_eq!(Layout::Orm.edit_name(), "ORM");
+        assert_eq!(normal.edit_name(), PASS_THROUGH);
     }
 
     #[test]

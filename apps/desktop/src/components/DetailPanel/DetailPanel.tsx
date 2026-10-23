@@ -64,6 +64,7 @@ import {
 } from '../../utils/packEdits';
 import { KIND_LABEL } from '../../utils/scrubKey';
 import { domainsLine, exportsAs, hasGameTab, namePatch, shownValue } from '../../utils/gameTab';
+import { MaterialEditor, TextureEditor } from './GameEditors';
 import { ThreeViewer } from './ThreeViewer';
 import { SuggestTags } from './SuggestTags';
 import styles from './DetailPanel.module.css';
@@ -1108,9 +1109,10 @@ function CollectionsTab({
 // ── Game Tab ──────────────────────────────────────────────────────────────
 /**
  * What the game export makes of the asset (plan game-export C13): the problems the Checks of
- * its domains find with it, what it exports as, and its `assetName`, marked inferred or yours,
- * with a reset to inferred. A save writes to the asset's group, or to an image's texture set,
- * and makes an open Export view holding the asset ask for a new Check.
+ * its domains find with it, what it exports as, its `assetName`, a model's materials and a
+ * texture's layout, role and convention, each marked inferred or yours, with a reset to
+ * inferred. A save writes to the asset's group (a name to an image's whole texture set), and
+ * makes an open Export view holding the asset ask for a new Check.
  */
 function GameTab({ asset }: { asset: Asset }) {
   const [loaded, setLoaded] = useState<{ id: string; detail: GameDetail | null } | null>(null);
@@ -1241,6 +1243,21 @@ function GameTab({ asset }: { asset: Asset }) {
           </button>
         </div>
       </form>
+      {detail.materials.length > 0 && (
+        <MaterialEditor
+          materials={detail.materials}
+          images={detail.images}
+          saving={saving}
+          save={(patch) => void save(patch)}
+        />
+      )}
+      {detail.texture && (
+        <TextureEditor
+          texture={detail.texture}
+          saving={saving}
+          save={(patch) => void save(patch)}
+        />
+      )}
     </div>
   );
 }
