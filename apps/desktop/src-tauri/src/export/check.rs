@@ -1,6 +1,7 @@
 //! The Export view's Check (plan game-export C14): reads a domain, builds its manifest in memory,
 //! validates it, and lists every asset with its kind, default `assetName`, pack and status, and
-//! every problem that would refuse the export.
+//! every problem that would refuse the export. It also returns what the bundle module needs to
+//! stage the bundle: the files to copy, and the fingerprint of everything it read (C14).
 //!
 //! A domain is a direct child of the root collection (C3). Its assets are the grid items in it
 //! and all its subcollections, across every library, each once. Until later steps of the plan's
@@ -8,13 +9,15 @@
 //! refuse a texture under a `conversion.json`, a texture that needs converting, and any FBX.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::db::{Database, LibraryHandle};
+use crate::export::bundle::Diff;
 use crate::export::conversion::Walker;
+use crate::export::fingerprint::{Fingerprint, Probes};
 use crate::export::names::{is_pascal, pascal};
 use crate::export::packs::{self, PackSource};
 use crate::export::textures::{self, Convention, Layout, Refusal, Role};
@@ -49,10 +52,14 @@ pub enum Kind {
     Other,
 }
 
+/// An asset's status in the Export view: `Ready` when the previous bundle holds it as the next
+/// one would, `Changed` or `New` when it doesn't, and `Problem` when a problem names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Ready,
+    Changed,
+    New,
     Problem,
 }
 
@@ -76,7 +83,9 @@ pub struct CheckedAsset {
 #[serde(rename_all = "camelCase")]
 pub struct CheckReport {
     pub domain: String,
-    /// `<export root>/<root collection>/<domain>`, once both settings are set
+    /// `<export root>/<root collection>/<domain>`, once both settings are set, the export root is
+    /// outside every library, the domain is a child of the root collection, and both their names
+    /// are PascalCase
     pub bundle_path: Option<String>,
     pub assets: Vec<CheckedAsset>,
     /// Every pack an asset of the domain is in, in manifest order
@@ -84,6 +93,28 @@ pub struct CheckReport {
     pub problems: Vec<Problem>,
     /// The manifest of the assets that are ready, as the bundle would hold it
     pub manifest: Value,
+    /// What exporting `manifest` changes in the bundle, once the bundle path is known
+    pub diff: Option<Diff>,
+    /// Whether the bundle is staged, so Export can swap it in
+    pub staged: bool,
+}
+
+/// A file the bundle holds: its `file` in the manifest, the file to copy and its sha256.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleFile {
+    pub file: String,
+    pub source: PathBuf,
+    pub sha256: String,
+    pub asset: AssetRef,
+}
+
+/// A Check before anything is staged: its report, the bundle's files, and the fingerprint of
+/// everything it read.
+#[derive(Debug, Clone)]
+pub struct Inspection {
+    pub report: CheckReport,
+    pub files: Vec<BundleFile>,
+    pub fingerprint: Fingerprint,
 }
 
 /// A pack of the domain: its manifest entry, where it is, and its inferred normal-map
@@ -114,6 +145,8 @@ struct ItemRow {
 struct PackFolder {
     path: String,
     name: String,
+    /// The `pack_json` the info is read from, for the fingerprint
+    json: Option<String>,
     info: structure::PackInfo,
     edits: PackOverride,
 }
@@ -129,6 +162,8 @@ struct LibraryInput {
     packs: Vec<PackFolder>,
     /// The indexed files of each pack an item is in, by its index in `packs`
     pack_files: HashMap<usize, Vec<String>>,
+    /// The same files with their indexed sizes and mtimes, as the fingerprint holds them
+    pack_listings: HashMap<usize, String>,
     memo: hashes::Memo,
 }
 
@@ -140,9 +175,15 @@ fn general(message: impl Into<String>) -> Problem {
     }
 }
 
-/// Checks the domain collection `domain_id`. An unknown collection is an error; everything else
-/// that would refuse the export is a problem in the report.
+/// Checks the domain collection `domain_id`, without staging anything.
+#[cfg(test)]
 pub async fn check(db: &Database, domain_id: &str) -> Result<CheckReport, String> {
+    inspect(db, domain_id).await.map(|i| i.report)
+}
+
+/// Reads the domain collection `domain_id` as a Check does. An unknown collection is an error;
+/// everything else that would refuse the export is a problem in the report.
+pub async fn inspect(db: &Database, domain_id: &str) -> Result<Inspection, String> {
     let master = &db.master_pool;
     let settings = settings::load(master).await.map_err(|e| e.to_string())?;
     let collections: Vec<(String, String, Option<String>, bool)> =
@@ -154,6 +195,13 @@ pub async fn check(db: &Database, domain_id: &str) -> Result<CheckReport, String
     let (_, domain, domain_parent, _) = find(domain_id)
         .ok_or_else(|| format!("No collection has the id {domain_id}"))?
         .clone();
+    let mut fingerprint = Fingerprint::default();
+    fingerprint.put(
+        "",
+        "the export settings",
+        serde_json::to_string(&settings).expect("settings serialize"),
+    );
+    fingerprint.put("", "the domain's name", &domain);
 
     let mut problems = Vec::new();
     match &settings.root {
@@ -181,6 +229,7 @@ pub async fn check(db: &Database, domain_id: &str) -> Result<CheckReport, String
             None
         }
         Some((id, Some((_, name, _, _)))) => {
+            fingerprint.put("", "the root collection's name", name);
             if domain_parent.as_deref() != Some(id) {
                 problems.push(general(format!(
                     "{domain} is not a domain: domains are the collections directly inside the root collection {name}"
@@ -199,6 +248,8 @@ pub async fn check(db: &Database, domain_id: &str) -> Result<CheckReport, String
             "The domain's name {domain} isn't PascalCase (a capital letter, then letters and digits): it is a folder of the bundle path and the manifest's domain"
         )));
     }
+    // Every problem so far is about the bundle path: with one, no folder is touched
+    let path_ok = problems.is_empty();
 
     // The domain and every collection below it, parents first
     let mut subtree = vec![domain_id.to_string()];
@@ -213,6 +264,8 @@ pub async fn check(db: &Database, domain_id: &str) -> Result<CheckReport, String
         subtree.extend(children);
         i += 1;
     }
+    let tree: Vec<_> = subtree.iter().filter_map(|id| find(id)).collect();
+    fingerprint.put("", "the domain's subcollections", format!("{tree:?}"));
     for id in &subtree {
         if let Some((_, name, _, true)) = find(id) {
             problems.push(general(format!(
@@ -222,7 +275,7 @@ pub async fn check(db: &Database, domain_id: &str) -> Result<CheckReport, String
     }
 
     let bundle_path = match (&settings.root, &root_name) {
-        (Some(root), Some(root_name)) => Some(
+        (Some(root), Some(root_name)) if path_ok => Some(
             Path::new(root)
                 .join(root_name)
                 .join(&domain)
@@ -240,10 +293,13 @@ pub async fn check(db: &Database, domain_id: &str) -> Result<CheckReport, String
                 .map_err(|e| e.to_string())?,
         );
     }
+    for input in &inputs {
+        input_fingerprint(input, &mut fingerprint);
+    }
     let domain_name = domain.clone();
-    let (report, inputs) = tokio::task::spawn_blocking(move || {
-        let report = evaluate(&domain_name, &mut inputs);
-        (report, inputs)
+    let (evaluated, inputs) = tokio::task::spawn_blocking(move || {
+        let evaluated = evaluate(&domain_name, &mut inputs);
+        (evaluated, inputs)
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -256,17 +312,76 @@ pub async fn check(db: &Database, domain_id: &str) -> Result<CheckReport, String
         }
     }
 
-    let (assets, packs, mut found, manifest) = report;
-    problems.append(&mut found);
-    let assets = with_status(assets, &problems);
-    Ok(CheckReport {
-        domain,
-        bundle_path,
+    let Evaluated {
         assets,
         packs,
-        problems,
+        problems: mut found,
         manifest,
+        files,
+        probes,
+    } = evaluated;
+    for (input, probes) in inputs.iter().zip(probes) {
+        let library = &input.library;
+        for (path, stamp) in probes.seen {
+            fingerprint.put(&library.id, format!("{path} in {}", library.name), stamp);
+        }
+    }
+    problems.append(&mut found);
+    let assets = with_status(assets, &problems);
+    Ok(Inspection {
+        report: CheckReport {
+            domain,
+            bundle_path,
+            assets,
+            packs,
+            problems,
+            manifest,
+            diff: None,
+            staged: false,
+        },
+        files,
+        fingerprint,
     })
+}
+
+/// Puts what a check read from one library's DB in `fingerprint`: the domain's items, which
+/// folders are packs, and each pack of an item with your edits and its indexed files.
+fn input_fingerprint(input: &LibraryInput, fingerprint: &mut Fingerprint) {
+    let library = &input.library;
+    let scope = library.id.as_str();
+    let items: Vec<_> = input
+        .items
+        .iter()
+        .map(|i| (&i.id, &i.file_path, &i.kind))
+        .collect();
+    fingerprint.put(
+        scope,
+        format!("the domain's members in {}", library.name),
+        format!("{items:?}"),
+    );
+    let mut groups: Vec<&String> = input.groups_with_fbx.iter().collect();
+    groups.sort();
+    fingerprint.put(
+        scope,
+        format!("the domain's format groups in {}", library.name),
+        format!("{groups:?}"),
+    );
+    let paths: Vec<&str> = input.packs.iter().map(|p| p.path.as_str()).collect();
+    fingerprint.put(
+        scope,
+        format!("the packs of {}", library.name),
+        format!("{paths:?}"),
+    );
+    for (p, listing) in &input.pack_listings {
+        let pack = &input.packs[*p];
+        let label = |what: &str| format!("{what} {} in {}", pack.path, library.name);
+        fingerprint.put(
+            scope,
+            label("the pack"),
+            format!("{:?} {:?} {:?}", pack.name, pack.json, pack.edits),
+        );
+        fingerprint.put(scope, label("the indexed files of the pack"), listing);
+    }
 }
 
 /// The pack at or above `dir` among `packs`, the innermost first.
@@ -321,6 +436,7 @@ async fn read_library(library: LibraryHandle, subtree: &[String]) -> sqlx::Resul
         .map(|(path, name, json)| PackFolder {
             edits: overrides.get(&path).cloned().unwrap_or_default(),
             info: structure::parse_pack(json.as_deref()).unwrap_or_default(),
+            json,
             name: if name.is_empty() {
                 library.name.clone()
             } else {
@@ -340,22 +456,24 @@ async fn read_library(library: LibraryHandle, subtree: &[String]) -> sqlx::Resul
         .collect();
 
     let mut pack_files = HashMap::new();
+    let mut pack_listings = HashMap::new();
     for pack in item_packs.iter().flatten().collect::<HashSet<_>>() {
         let path = &packs[*pack].path;
-        let below: Vec<(String,)> = sqlx::query_as(
-            "SELECT file_path FROM assets
-             WHERE ?1 = '' OR (file_path >= ?1 || '/' AND file_path < ?1 || '0')",
+        let below: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT file_path, size_bytes, modified_at FROM assets
+             WHERE ?1 = '' OR (file_path >= ?1 || '/' AND file_path < ?1 || '0')
+             ORDER BY file_path",
         )
         .bind(path)
         .fetch_all(pool)
         .await?;
         // A nested pack's files are its own
-        let files = below
+        let own: Vec<(String, i64, i64)> = below
             .into_iter()
-            .map(|(f,)| f)
-            .filter(|f| innermost_pack(&by_path, dir_of(f)) == Some(*pack))
+            .filter(|(f, _, _)| innermost_pack(&by_path, dir_of(f)) == Some(*pack))
             .collect();
-        pack_files.insert(*pack, files);
+        pack_listings.insert(*pack, format!("{own:?}"));
+        pack_files.insert(*pack, own.into_iter().map(|(f, _, _)| f).collect());
     }
 
     let paths: Vec<String> = items.iter().map(|i| i.file_path.clone()).collect();
@@ -367,6 +485,7 @@ async fn read_library(library: LibraryHandle, subtree: &[String]) -> sqlx::Resul
         item_packs,
         packs,
         pack_files,
+        pack_listings,
         memo,
     })
 }
@@ -378,6 +497,8 @@ struct ReadyTexture {
     extension: &'static str,
     sha256: String,
     source_path: String,
+    /// The file to copy into the bundle
+    source: PathBuf,
 }
 
 /// One asset as the check reads it, before names are compared.
@@ -388,7 +509,15 @@ struct Read {
     ready: Option<ReadyTexture>,
 }
 
-type Evaluated = (Vec<CheckedAsset>, Vec<DomainPack>, Vec<Problem>, Value);
+/// What `evaluate` found, with the files each library's check stats, in library order.
+struct Evaluated {
+    assets: Vec<CheckedAsset>,
+    packs: Vec<DomainPack>,
+    problems: Vec<Problem>,
+    manifest: Value,
+    files: Vec<BundleFile>,
+    probes: Vec<Probes>,
+}
 
 /// Everything a check does with files, run on a blocking thread: reads each item, its pack and
 /// its file, compares names, and builds and validates the manifest.
@@ -414,16 +543,16 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
             let pack = &input.packs[*p];
             let root = &input.library.root_path;
             let files = input.pack_files.get(p).map_or(&[][..], Vec::as_slice);
+            let walker = &mut walkers[*l];
             PackSource {
                 library_id: input.library.id.clone(),
                 path: pack.path.clone(),
                 folder_name: pack.name.clone(),
-                package_name: pack
-                    .info
-                    .package
-                    .as_ref()
-                    .and_then(|f| packs::read_package_name(root, &f.path)),
-                origin: packs::infer_origin(root, files, &mut walkers[*l]),
+                package_name: pack.info.package.as_ref().and_then(|f| {
+                    walker.probes.probe(&f.path);
+                    packs::read_package_name(root, &f.path)
+                }),
+                origin: packs::infer_origin(files, walker),
                 info: pack.info.clone(),
                 edits: pack.edits.clone(),
             }
@@ -510,6 +639,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                             exportable = false;
                         }
                         Ok(pass) if exportable && is_pascal(&name) => {
+                            walkers[l].probes.probe(&item.file_path);
                             match input.memo.sha256(&root, &item.file_path) {
                                 Ok(sha256) => {
                                     let pack_path = &sources[pack.expect("exportable")].path;
@@ -519,6 +649,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
                                         extension: pass.extension,
                                         sha256,
                                         source_path: relative_to(pack_path, &item.file_path),
+                                        source: root.join(&item.file_path),
                                     })
                                 }
                                 Err(e) => issue(format!("it can't be read: {e}")),
@@ -537,7 +668,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
     }
 
     names(&reads, &mut problems);
-    let (manifest, mut invalid) = manifest(domain, &reads, &export_packs, &problems);
+    let (manifest, mut invalid, files) = manifest(domain, &reads, &export_packs, &problems);
     problems.append(&mut invalid);
     let mut rows: Vec<CheckedAsset> = reads.into_iter().map(|r| r.row).collect();
     rows.sort_by(|a, b| {
@@ -558,7 +689,14 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
             pack,
         })
         .collect();
-    (rows, domain_packs, problems, manifest)
+    Evaluated {
+        assets: rows,
+        packs: domain_packs,
+        problems,
+        manifest,
+        files,
+        probes: walkers.into_iter().map(|w| w.probes).collect(),
+    }
 }
 
 /// `file_path` relative to the pack folder `pack_path`, with `/` separators.
@@ -628,21 +766,23 @@ fn names(reads: &[Read], problems: &mut Vec<Problem>) {
     }
 }
 
-/// One asset's manifest entry, with the asset it is and its pack's index in the domain's packs.
+/// One asset's manifest entry, with the asset it is, its pack's index in the domain's packs and
+/// the file to copy into the bundle.
 struct Entry<'a> {
     value: Value,
     asset: &'a AssetRef,
     pack: usize,
+    source: PathBuf,
 }
 
-/// The manifest of the assets no problem names, and the problems its schema validation and the
-/// importer's rules (C1) find, each naming the asset at its pointer.
+/// The manifest of the assets no problem names, the problems its schema validation and the
+/// importer's rules (C1) find, each naming the asset at its pointer, and the manifest's files.
 fn manifest(
     domain: &str,
     reads: &[Read],
     export_packs: &[packs::ExportPack],
     problems: &[Problem],
-) -> (Value, Vec<Problem>) {
+) -> (Value, Vec<Problem>, Vec<BundleFile>) {
     let refused: HashSet<&str> = problems
         .iter()
         .flat_map(|p| &p.assets)
@@ -670,6 +810,7 @@ fn manifest(
             }),
             asset: &read.row.asset,
             pack,
+            source: texture.source.clone(),
         });
     }
     let kind_rank = |v: &Value| match v["kind"].as_str() {
@@ -692,12 +833,13 @@ fn manifest(
 
 /// Validates the manifest of `entries` and drops every asset an error names, with the packs only
 /// it used, until what is left passes, so the manifest holds exactly the assets that are ready.
-/// Returns that manifest and the problems found on the way.
+/// Returns that manifest, the problems found on the way and the manifest's files. `exportedAt` is
+/// the local time with its offset (RFC 3339, C15).
 fn validated(
     domain: &str,
     mut entries: Vec<Entry>,
     export_packs: &[packs::ExportPack],
-) -> (Value, Vec<Problem>) {
+) -> (Value, Vec<Problem>, Vec<BundleFile>) {
     let exported_at = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
     let mut found: Vec<Problem> = Vec::new();
     loop {
@@ -727,7 +869,16 @@ fn validated(
         }
         // Each round drops at least one asset, so this ends
         if named.is_empty() {
-            return (manifest, found);
+            let files = entries
+                .into_iter()
+                .map(|e| BundleFile {
+                    file: e.value["file"].as_str().unwrap_or_default().to_string(),
+                    sha256: e.value["sha256"].as_str().unwrap_or_default().to_string(),
+                    source: e.source,
+                    asset: e.asset.clone(),
+                })
+                .collect();
+            return (manifest, found, files);
         }
         entries.retain(|e| !named.contains(&e.asset.asset_id));
     }
@@ -782,123 +933,8 @@ fn with_status(mut assets: Vec<CheckedAsset>, problems: &[Problem]) -> Vec<Check
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{insert_collection, memory_database, memory_library_pool};
+    use crate::export::test_fixture::*;
     use serde_json::json;
-    use std::path::PathBuf;
-
-    const FIXTURE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/game-export/library"
-    );
-
-    /// The fixture library copied into a temporary folder and indexed, an export root outside
-    /// it, and the root collection `DungeonGame`, both set.
-    struct Fixture {
-        db: Database,
-        library: LibraryHandle,
-        export_root: PathBuf,
-        dir: tempfile::TempDir,
-    }
-
-    async fn fixture() -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("library");
-        for entry in walkdir::WalkDir::new(FIXTURE) {
-            let entry = entry.unwrap();
-            let target = root.join(entry.path().strip_prefix(FIXTURE).unwrap());
-            if entry.file_type().is_dir() {
-                std::fs::create_dir_all(&target).unwrap();
-            } else {
-                std::fs::copy(entry.path(), &target).unwrap();
-            }
-        }
-        let library = LibraryHandle {
-            id: "fixture".into(),
-            name: "Fixture".into(),
-            root_path: root.clone(),
-            pool: memory_library_pool().await,
-        };
-        let db = memory_database(vec![library.clone()]).await;
-        sqlx::query(
-            "INSERT INTO libraries (id, name, root_paths, created_at) VALUES ('fixture', 'Fixture', ?, 0)",
-        )
-        .bind(json!([root]).to_string())
-        .execute(&db.master_pool)
-        .await
-        .unwrap();
-        crate::watcher::index_paths(&db, "fixture", &[root.display().to_string()])
-            .await
-            .unwrap();
-
-        let export_root = dir.path().join("export");
-        std::fs::create_dir(&export_root).unwrap();
-        insert_collection(&db.master_pool, "dg", "DungeonGame", None).await;
-        settings::update(
-            &db.master_pool,
-            json!({"root": export_root, "rootCollection": "dg"}),
-        )
-        .await
-        .unwrap();
-        Fixture {
-            db,
-            library,
-            export_root,
-            dir,
-        }
-    }
-
-    /// Opens, registers and indexes a second library `id` at `root`, beside the fixture.
-    async fn add_library(f: &Fixture, id: &str, root: &Path) -> LibraryHandle {
-        let library = LibraryHandle {
-            id: id.into(),
-            name: id.into(),
-            root_path: root.to_path_buf(),
-            pool: memory_library_pool().await,
-        };
-        f.db.libraries
-            .write()
-            .await
-            .insert(id.into(), library.clone());
-        sqlx::query("INSERT INTO libraries (id, name, root_paths, created_at) VALUES (?, ?, ?, 0)")
-            .bind(id)
-            .bind(id)
-            .bind(json!([root]).to_string())
-            .execute(&f.db.master_pool)
-            .await
-            .unwrap();
-        crate::watcher::index_paths(&f.db, id, &[root.display().to_string()])
-            .await
-            .unwrap();
-        library
-    }
-
-    async fn id_of(pool: &Pool, path: &str) -> String {
-        sqlx::query_scalar("SELECT id FROM assets WHERE file_path = ?")
-            .bind(path)
-            .fetch_one(pool)
-            .await
-            .unwrap_or_else(|e| panic!("{path} isn't indexed: {e}"))
-    }
-
-    type Pool = sqlx::Pool<sqlx::Sqlite>;
-
-    /// Adds collection `id` named `name` under `parent`, holding the fixture's files at `paths`.
-    async fn collection(f: &Fixture, id: &str, name: &str, parent: &str, paths: &[&str]) {
-        insert_collection(&f.db.master_pool, id, name, Some(parent)).await;
-        add_members(&f.library, id, paths).await;
-    }
-
-    /// Puts the files at `paths` of `library` in collection `id`.
-    async fn add_members(library: &LibraryHandle, id: &str, paths: &[&str]) {
-        for path in paths {
-            sqlx::query("INSERT INTO collection_assets (collection_id, asset_id) VALUES (?, ?)")
-                .bind(id)
-                .bind(id_of(&library.pool, path).await)
-                .execute(&library.pool)
-                .await
-                .unwrap();
-        }
-    }
 
     /// Checks a new domain holding `paths`.
     async fn check_domain(f: &Fixture, paths: &[&str]) -> CheckReport {
@@ -1640,6 +1676,7 @@ mod tests {
             }),
             asset,
             pack,
+            source: PathBuf::from(format!("/library/{name}.png")),
         };
         let entries = vec![
             entry("Moss", &"0".repeat(64), 1, &moss),
@@ -1647,7 +1684,8 @@ mod tests {
             entry("Rock", "BAD", 0, &rock),
         ];
 
-        let (manifest, problems) = validated("Props", entries, &[pack("rocks"), pack("moss")]);
+        let (manifest, problems, files) =
+            validated("Props", entries, &[pack("rocks"), pack("moss")]);
 
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert_eq!(problems[0].assets, std::slice::from_ref(&rock));
@@ -1656,6 +1694,17 @@ mod tests {
             .starts_with("Pack/rock.png: the manifest is invalid at /assets/1/sha256: "));
         assert_eq!(manifest["assets"].as_array().unwrap().len(), 1);
         assert_eq!(manifest["assets"][0]["assetName"], "Moss");
+        let files: Vec<(&str, &Path)> = files
+            .iter()
+            .map(|f| (f.file.as_str(), f.source.as_path()))
+            .collect();
+        assert_eq!(
+            files,
+            [(
+                "Textures/Moss_BaseColor.png",
+                Path::new("/library/Moss.png")
+            )]
+        );
         assert_eq!(manifest["packs"], json!([pack("moss").manifest_entry()]));
         assert_eq!(contract::validate_manifest(&manifest), Ok(()));
         assert_eq!(contract::check_rules(&manifest), Ok(()));

@@ -27,6 +27,7 @@ import type {
   AiSettingsPatch,
   BlenderStatus,
   ExportCheck,
+  ExportOutcome,
   ExportSettings,
   ExportSettingsPatch,
   ProviderStatus,
@@ -159,8 +160,15 @@ export const api = {
   clearExportCache: () => invoke<number>('clear_export_cache'),
   /** The Blender at `path` (null is `blender` on PATH), its version, and whether exports accept it */
   getBlenderStatus: (path: string | null) => invoke<BlenderStatus>('get_blender_status', { path }),
-  /** Reads a domain collection and lists its assets and the problems that refuse its export */
+  /**
+   * Checks a domain collection: its assets, the problems that refuse its export and the diff
+   * against the previous bundle. With no problem, it stages the bundle for `exportBundle`.
+   */
   checkExport: (domainId: string) => invoke<ExportCheck>('check_export', { domainId }),
+  /** Swaps the domain's checked bundle in, unless anything the Check read changed since */
+  exportBundle: (domainId: string) => invoke<ExportOutcome>('export_bundle', { domainId }),
+  /** Deletes the bundle the domain's last Check staged */
+  discardExport: (domainId: string) => invoke<void>('discard_export', { domainId }),
 
   // Auto-tagging runs. Progress arrives as `autotag:updated` events.
   listAutotagProviders: () => invoke<AutotagProviderOption[]>('list_autotag_providers'),

@@ -275,13 +275,14 @@ pub fn read_package_name(root: &Path, path: &str) -> Option<String> {
     Some(value.get("name")?.as_str()?.trim().to_string()).filter(|n| !n.is_empty())
 }
 
-/// A pack's inferred origin (D12, A1), from its indexed `files` (relative to `root`): `unity` when
-/// any has a `<file>.meta` beside it, else `unreal` when the nearest valid `conversion.json` of any
-/// has a step `from: "uasset"`, else `generic`.
-pub fn infer_origin(root: &Path, files: &[String], walker: &mut Walker) -> Origin {
+/// A pack's inferred origin (D12, A1), from its indexed `files` (relative to the walker's library
+/// root): `unity` when any has a `<file>.meta` beside it, else `unreal` when the nearest valid
+/// `conversion.json` of any has a step `from: "uasset"`, else `generic`. Each path it looks for
+/// is in `walker.probes`.
+pub fn infer_origin(files: &[String], walker: &mut Walker) -> Origin {
     if files
         .iter()
-        .any(|f| root.join(format!("{f}.meta")).is_file())
+        .any(|f| walker.probes.probe(&format!("{f}.meta")).is_file())
     {
         return Origin::Unity;
     }
@@ -560,15 +561,15 @@ mod tests {
         let files = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<Vec<_>>();
 
         assert_eq!(
-            infer_origin(root, &files(&["Unity/Textures/moss.png"]), &mut walker),
+            infer_origin(&files(&["Unity/Textures/moss.png"]), &mut walker),
             Origin::Unity
         );
         assert_eq!(
-            infer_origin(root, &files(&["Converted/Ruins/wall.png"]), &mut walker),
+            infer_origin(&files(&["Converted/Ruins/wall.png"]), &mut walker),
             Origin::Unreal
         );
         assert_eq!(
-            infer_origin(root, &files(&["Plain/rock.png"]), &mut walker),
+            infer_origin(&files(&["Plain/rock.png"]), &mut walker),
             Origin::Generic
         );
         assert_eq!(Origin::Unreal.normal_convention(), Convention::DirectX);

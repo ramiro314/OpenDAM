@@ -43,8 +43,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               importer's other rules), settings, the export cache, check_outside_libraries,
                               which refuses an export root equal to, inside or holding a library root,
                               after resolving symlinks, blender.rs, which finds Blender and gates it to
-                              BLENDER_SERIES (5.2), and check, the Export view's Check over a domain
-                              (names, packs, textures, conversion and hashes, memoized in file_hashes)
+                              BLENDER_SERIES (5.2), check, the Export view's Check over a domain
+                              (names, packs, textures, conversion and hashes, memoized in file_hashes),
+                              fingerprint, what a Check read, and bundle, which stages the bundle
+                              beside the domain's folder, diffs it and swaps it in by renaming
     tests/fixtures/game-export/  The export's fixture library, made by make_fixtures.py under Blender and
                               committed with its output
     src/db.rs                 Master DB + per-library SQLite pools and pragmas
