@@ -59,6 +59,15 @@ pub async fn load(pool: &Pool<Sqlite>, paths: &[String]) -> sqlx::Result<Memo> {
     })
 }
 
+/// The lowercase hex sha256 of `bytes`.
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+fn hex(digest: &[u8]) -> String {
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The lowercase hex sha256 of the file at `path`.
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = std::fs::File::open(path)?;
@@ -71,11 +80,7 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    Ok(hex(&hasher.finalize()))
 }
 
 impl Memo {

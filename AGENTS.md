@@ -50,7 +50,9 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               of collision meshes the export drops), fingerprint, what a Check
                               read, bundle, which stages the bundle beside the domain's folder,
                               diffs it and swaps it in by renaming, infer, which groups a pack's
-                              images into texture sets and infers each model's materials, and
+                              images into texture sets and infers each model's materials,
+                              textures, which converts a set's sources into URP roles (split,
+                              merge, green flip, to PNG) as PNG cached by cache::texture_key, and
                               unity, which reads a Unity pack's .meta and .mat files
     tests/fixtures/game-export/  The export's fixture library, made by make_fixtures.py under Blender and
                               committed with its output, and fbx_facts.json, its FBX files' facts,

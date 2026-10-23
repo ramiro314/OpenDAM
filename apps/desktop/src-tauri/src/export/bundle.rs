@@ -795,6 +795,69 @@ mod tests {
         assert_eq!(leftovers(&f), Vec::<String>::new());
     }
 
+    /// Every file of the bundle at `dir` but its manifest, with its bytes.
+    fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        listing(dir)
+            .into_iter()
+            .filter(|f| f != MANIFEST)
+            .map(|f| {
+                let bytes = std::fs::read(dir.join(&f)).unwrap();
+                (f, bytes)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn converted_textures_re_export_byte_identical_from_the_cache() {
+        let f = fixture().await;
+        domain(
+            &f,
+            &[
+                "Dungeon Props/Rocks/T_Rock_R.png",
+                "Dungeon Props/Rocks/T_Ore_M.png",
+                "Dungeon Props/Rocks/T_Slate_ORM.png",
+                "Dungeon Props/Textures/T_Wall_D.jpg",
+            ],
+        )
+        .await;
+        let exports = Exports::default();
+        let report = exports.check(&f.db, "props", &NoFbx).await.unwrap();
+        assert_eq!(report.problems, []);
+        assert!(matches!(
+            export(&f, &exports).await,
+            ExportOutcome::Exported { assets: 7, .. }
+        ));
+        let first = assert_bundle(&bundle_dir(&f));
+        let files = contents(&bundle_dir(&f));
+        assert_eq!(
+            files.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(),
+            [
+                "Textures/Ore_MetallicSmoothness.png",
+                "Textures/Rock_MetallicSmoothness.png",
+                "Textures/Rock_Normal.png",
+                "Textures/Slate_MetallicSmoothness.png",
+                "Textures/Slate_Occlusion.png",
+                "Textures/Wall_BaseColor.png",
+                "Textures/Wall_Normal.png",
+            ]
+        );
+
+        // A new session's export of the unchanged domain reads the cache: the same files, and a
+        // manifest that differs only in exportedAt
+        let exports = Exports::default();
+        let again = exports.check(&f.db, "props", &NoFbx).await.unwrap();
+        let diff = again.diff.as_ref().unwrap();
+        assert!(diff.added.is_empty() && diff.changed.is_empty() && diff.removed.is_empty());
+        assert!(matches!(
+            export(&f, &exports).await,
+            ExportOutcome::Exported { .. }
+        ));
+        let second = assert_bundle(&bundle_dir(&f));
+        assert_eq!(contents(&bundle_dir(&f)), files);
+        assert_eq!(second["assets"], first["assets"]);
+        assert_eq!(second["packs"], first["packs"]);
+    }
+
     #[tokio::test]
     async fn the_diff_lists_added_changed_and_removed_assets_and_their_status() {
         let f = fixture().await;
