@@ -3261,6 +3261,111 @@ mod tests {
             .any(|f| f.0.starts_with("3D assets/Nature Kit")));
     }
 
+    /// Members whose `group_id` names a row that is gone.
+    async fn dangling_members(pool: &Pool<Sqlite>) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT file_path FROM assets WHERE group_id NOT IN (SELECT id FROM assets)
+             ORDER BY file_path",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn group_of(pool: &Pool<Sqlite>, path: &str) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT m.file_path FROM assets a JOIN assets m ON m.id = a.group_id
+             WHERE a.file_path = ?",
+        )
+        .bind(path)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_second_machines_commands_while_the_first_holds_the_lock_run_their_pass_late() {
+        use crate::structure::is_pending;
+        use crate::watcher::{index_paths, IndexLock};
+        let dir = tempfile::Builder::new()
+            .prefix("opendam-lib-")
+            .tempdir()
+            .unwrap();
+        let root = dir.path().join("lib");
+        let files = ["rock.glb", "rock.fbx", "stone.glb", "pebble.obj"];
+        std::fs::create_dir_all(root.join("kits")).unwrap();
+        for file in files {
+            std::fs::write(root.join("kits").join(file), "glTF").unwrap();
+        }
+        // Two databases over one library folder stand for two machines.
+        let machine = |n: u32| {
+            let (master, root) = (dir.path().join(format!("master-{n}.sqlite")), root.clone());
+            async move {
+                let db = Database::new(master.to_str().unwrap()).await.unwrap();
+                let lib = db.register_library("lib", "lib", &root).await.unwrap();
+                (db, lib)
+            }
+        };
+        let (first, first_lib) = machine(1).await;
+        index_paths(&first, "lib", &[root.display().to_string()])
+            .await
+            .unwrap();
+        let (second, lib) = machine(2).await;
+        let pool = &lib.pool;
+        assert_eq!(
+            group_of(pool, "kits/rock.fbx").await.as_deref(),
+            Some("kits/rock.glb")
+        );
+        let rock: String = sqlx::query_scalar("SELECT id FROM assets WHERE file_path = ?")
+            .bind("kits/rock.glb")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let stone: String = sqlx::query_scalar("SELECT id FROM assets WHERE file_path = ?")
+            .bind("kits/stone.glb")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let mut late = second.late_passes.subscribe();
+
+        // The first machine holds both its locks, as a build does through its swap.
+        let index_lock = first.index_lock("lib");
+        let index_guard = index_lock.lock().await;
+        let advisory = IndexLock::try_acquire(&root).await.unwrap();
+
+        // The second deletes the rock's group, but the FBX can't go to the trash, and renames the
+        // stone into the pebble's group.
+        let trash = |path: &Path| match path.extension() {
+            Some(ext) if ext == "fbx" => Err("trash unavailable".to_string()),
+            _ => std::fs::remove_file(path).map_err(|e| e.to_string()),
+        };
+        let deleted = delete_assets_with(&second, &ids(&[&rock]), true, trash).await;
+        assert!(deleted.is_err());
+        rename_asset_with(&second, &stone, "pebble", fs_rename)
+            .await
+            .unwrap();
+
+        assert_eq!(dangling_members(pool).await, ["kits/rock.fbx"]);
+        assert_eq!(group_of(pool, "kits/pebble.obj").await, None);
+        assert!(is_pending(pool).await);
+
+        // The first machine's release alone runs the pass.
+        advisory.release(&first_lib.pool).await;
+        drop(index_guard);
+        assert_eq!(dangling_members(pool).await, Vec::<String>::new());
+        assert_eq!(
+            group_of(pool, "kits/pebble.obj").await.as_deref(),
+            Some("kits/pebble.glb")
+        );
+        assert!(!is_pending(pool).await);
+
+        // The second machine's follow-up task runs its pass too, and says so.
+        let ran = tokio::time::timeout(std::time::Duration::from_secs(10), late.recv()).await;
+        assert_eq!(ran.expect("no follow-up pass ran").unwrap(), "lib");
+        assert_eq!(dangling_members(pool).await, Vec::<String>::new());
+        assert!(!is_pending(pool).await);
+    }
+
     #[tokio::test]
     async fn renaming_an_asset_leaves_the_folders_a_fresh_pass_would() {
         let (root, db, pool) = library_in_folders(&FOLDER_FILES).await;
