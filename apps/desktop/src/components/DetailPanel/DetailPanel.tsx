@@ -1262,6 +1262,7 @@ function GameTab({ asset }: { asset: Asset }) {
           key={detail.assetId}
           assetId={detail.assetId}
           model={detail.model}
+          revision={reload}
           saving={saving}
           onSave={save}
         />
@@ -1273,17 +1274,20 @@ function GameTab({ asset }: { asset: Asset }) {
 /**
  * A model's rig and facing (plan game-export C13, D13, D20): a rig picker and quarter turns
  * about Y, each marked inferred or yours with a reset, and "Show as exported", which has Blender
- * write the normalized model for the viewer only when you ask. Once shown, the view follows each
- * turn. Each save makes an open Export view holding the model ask for a new Check.
+ * write the normalized model for the viewer only when you ask. Once shown, the view asks again
+ * after each edit, so it follows each turn. Each save makes an open Export view holding the model ask for a new Check.
  */
 function ModelControls({
   assetId,
   model,
+  revision,
   saving,
   onSave,
 }: {
   assetId: string;
   model: GameModelDetail;
+  /** Counts the tab's saved edits: each makes an open view ask again */
+  revision: number;
   saving: boolean;
   onSave: (patch: ExportEditPatch) => Promise<void>;
 }) {
@@ -1291,7 +1295,7 @@ function ModelControls({
   const facing = shownValue(model.facingQuarterTurns);
   const [showing, setShowing] = useState(false);
   const [result, setResult] = useState<ViewResult | null>(null);
-  const key = viewKey(assetId, model);
+  const key = viewKey(assetId, revision);
   const view = exportedView(showing, result, key);
   useEffect(() => {
     if (!showing || result?.key === key) return;

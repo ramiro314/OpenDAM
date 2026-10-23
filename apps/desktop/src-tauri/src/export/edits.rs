@@ -36,6 +36,9 @@ pub enum Rig {
 }
 
 impl Rig {
+    /// Every rig an edit can hold
+    pub const ALL: [Rig; 2] = [Rig::None, Rig::Generic];
+
     /// What the export infers for a model: generic when it has an armature
     pub fn inferred(has_armature: bool) -> Self {
         if has_armature {
@@ -80,19 +83,30 @@ pub fn asset_name(edits: &Edits) -> Option<String> {
 
 /// The `rig` you set in `edits`, if any.
 pub fn rig(edits: &Edits) -> Option<Rig> {
-    edits
-        .get(RIG)
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    edits.get(RIG).and_then(parse_rig)
 }
+
+/// `value` as a rig, the one reading of a stored or sent `rig`.
+fn parse_rig(value: &Value) -> Option<Rig> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+/// The most quarter turns an edit holds: four make a whole turn.
+pub const MAX_QUARTER_TURNS: u8 = 3;
 
 /// The quarter turns about Y you set in `edits` (D13), if any: 0 to 3, each clockwise seen from
 /// above, after the pack origin's default facing.
 pub fn facing_quarter_turns(edits: &Edits) -> Option<u8> {
-    edits
-        .get(FACING_QUARTER_TURNS)
-        .and_then(Value::as_u64)
-        .filter(|turns| *turns <= 3)
-        .map(|turns| turns as u8)
+    edits.get(FACING_QUARTER_TURNS).and_then(parse_turns)
+}
+
+/// `value` as quarter turns, 0 to `MAX_QUARTER_TURNS`, the one reading of a stored or sent
+/// `facingQuarterTurns`.
+fn parse_turns(value: &Value) -> Option<u8> {
+    value
+        .as_u64()
+        .and_then(|turns| u8::try_from(turns).ok())
+        .filter(|turns| *turns <= MAX_QUARTER_TURNS)
 }
 
 /// The edits of asset `asset_id` among `rows`, empty when it has none.
@@ -194,12 +208,20 @@ fn validate(patch: &Edits, image: bool) -> Result<(), String> {
                 return Err(format!("{key} is a model's edit, and this is an image"))
             }
             (RIG | FACING_QUARTER_TURNS, Value::Null) => {}
-            (RIG, Value::String(rig)) if matches!(rig.as_str(), "none" | "generic") => {}
-            (RIG, _) => return Err("A rig must be none or generic".into()),
-            (FACING_QUARTER_TURNS, Value::Number(turns))
-                if turns.as_u64().is_some_and(|t| t <= 3) => {}
+            (RIG, rig) if parse_rig(rig).is_some() => {}
+            (RIG, _) => {
+                let names: Vec<String> = Rig::ALL
+                    .iter()
+                    .map(|r| serde_json::to_value(r).expect("a rig serializes").to_string())
+                    .map(|name| name.trim_matches('"').to_string())
+                    .collect();
+                return Err(format!("A rig must be {}", names.join(" or ")));
+            }
+            (FACING_QUARTER_TURNS, turns) if parse_turns(turns).is_some() => {}
             (FACING_QUARTER_TURNS, _) => {
-                return Err("facingQuarterTurns must be a whole number from 0 to 3".into())
+                return Err(format!(
+                    "facingQuarterTurns must be a whole number from 0 to {MAX_QUARTER_TURNS}"
+                ))
             }
             (ASSET_NAME, Value::Null) => {}
             (ASSET_NAME, Value::String(name)) if is_pascal(name) => {}
@@ -503,6 +525,27 @@ mod tests {
         assert_eq!(rig(&edits), Some(Rig::Generic));
         assert_eq!(asset_name(&edits).as_deref(), Some("Sedan"));
         assert_eq!(of(&all, "gone"), Edits::new());
+    }
+
+    /// Validation and the readers share one parser each, so every value a write accepts is read
+    /// back, whatever rigs or turns are added later.
+    #[tokio::test]
+    async fn every_rig_and_turn_a_write_accepts_is_read_back() {
+        let pool = car_kit().await;
+        for rig in Rig::ALL {
+            let edit = json!({ "rig": rig });
+            write(&pool, SEDAN[0], &patch(edit)).await.unwrap();
+            let edits = of(&read_all(&pool).await.unwrap(), SEDAN[0]);
+            assert_eq!(super::rig(&edits), Some(rig));
+        }
+        for turns in 0..=MAX_QUARTER_TURNS {
+            let edit = json!({ "facingQuarterTurns": turns });
+            write(&pool, SEDAN[0], &patch(edit)).await.unwrap();
+            let edits = of(&read_all(&pool).await.unwrap(), SEDAN[0]);
+            assert_eq!(facing_quarter_turns(&edits), Some(turns));
+        }
+        let edit = json!({ "facingQuarterTurns": 260 });
+        assert!(write(&pool, SEDAN[0], &patch(edit)).await.is_err());
     }
 
     #[tokio::test]

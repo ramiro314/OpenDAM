@@ -13,7 +13,7 @@ use crate::db::Database;
 pub use crate::export::check::Field;
 use crate::export::check::{self, ItemRow, Kind, Problem};
 use crate::export::edits::Rig;
-use crate::export::fbx_facts::{self, Reading};
+use crate::export::fbx_facts;
 use crate::export::packs::Origin;
 use crate::export::{blender, cache, edits, hashes, infer, settings};
 
@@ -252,7 +252,8 @@ pub async fn exported_view(
         .read(&root.join(&fbx), &root)
         .await
         .map_err(|e| format!("{fbx}: the preview engine can't read it: {e}"))?;
-    if item_facts.reading() != Some(Reading::Model) {
+    // The Check's rule, so the tab shows what the bundle would ship
+    if check::exported_kind(&item, Some(&Ok(item_facts.clone()))) != Kind::Model {
         return Err(format!(
             "{path}: it doesn't export as a model, so it has no normalized model to show"
         ));
@@ -598,6 +599,31 @@ mod tests {
         );
     }
 
+    /// The cached FBX of the GLB `glb`, by its key.
+    fn cached_fbx(root: &Path, glb: &Path) -> Option<std::path::PathBuf> {
+        let key = glb.file_stem().unwrap().to_str().unwrap();
+        cache::cached_model(root, key).map(|cached| cached.fbx)
+    }
+
+    /// The file the domain `props`'s Check ships as `Models/Totem.fbx`, taking models only from
+    /// the export cache, as the Game tab's Check does.
+    async fn checked_model(f: &Fixture) -> Option<std::path::PathBuf> {
+        let inspection = check::inspect(
+            &f.db,
+            "props",
+            &Snapshot::fixture(),
+            &memo(),
+            check::Models::Cached,
+        )
+        .await
+        .unwrap();
+        inspection
+            .files
+            .iter()
+            .find(|file| file.file == "Models/Totem.fbx")
+            .map(|file| file.source.clone())
+    }
+
     /// With the Blender in `OPENDAM_BLENDER`: "Show as exported" writes the normalized model as a
     /// GLB beside its cache entry, facing glTF's +Z, which the viewer's arrow points along, and
     /// your quarter turn makes a new one.
@@ -623,9 +649,13 @@ mod tests {
             Some(cache::cache_dir(root).join("models").as_path())
         );
         assert_eq!(nose(&glb_vertices(&program, &glb).await), ["+Z"]);
-        // The normalized FBX it showed is the entry the next Check reads
-        let key = glb.file_stem().unwrap().to_str().unwrap();
-        assert!(cache::cached_model(root, key).is_some());
+        // The normalized FBX it showed is the entry the Check reads: a Check that takes models
+        // only from the cache ships it, from the GLB's own key
+        collection(&f, "props", "Props", "dg", &[totem]).await;
+        assert_eq!(
+            checked_model(&f).await.unwrap(),
+            cached_fbx(root, &glb).unwrap()
+        );
 
         // Asked again, the GLB comes from the cache, with no Blender to run
         set_blender(&f, &f.dir.path().join("no-blender")).await;
@@ -649,5 +679,9 @@ mod tests {
             .unwrap();
         assert_ne!(turned, glb);
         assert_eq!(nose(&glb_vertices(&program, &turned).await), ["+X"]);
+        assert_eq!(
+            checked_model(&f).await.unwrap(),
+            cached_fbx(root, &turned).unwrap()
+        );
     }
 }

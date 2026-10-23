@@ -1073,7 +1073,9 @@ later. Where they differ from C9:
   without an armature in Blender's result, else generic. The Game tab infers it from
   `fbx_facts`' bones (A3), since it never runs Blender.
 - **"Show as exported" is a second, small Blender job.** The tab asks `show_as_exported`, which
-  makes the model's job and key as the Check does (`check::model_job`), and returns
+  makes the model's job and key as the Check does (`check::model_job`, with the pack's
+  origin from `packs::origin` and the model rule from `check::exported_kind`, as the Check
+  takes them), and returns
   `.opendam/export-cache/models/<key>.glb` when it is there. Otherwise the gate runs, and its
   refusal is the error the tab shows. When the cache doesn't hold the normalized FBX, the
   normalize job runs first and fills the entry the next Check reads. Then a `view` job of the
@@ -1082,7 +1084,8 @@ later. Where they differ from C9:
   "Clear export cache" deletes it. It waits on the lock the Checks hold while they run Blender.
 - **The viewer's +Z is Unity's.** glTF is Y up with +Z forward, so the arrow along +Z points
   where the model faces in Unity. X is mirrored, as for every right-handed view of Unity's axes.
-  Once shown, each quarter turn asks for the turned model's GLB again.
+  Once shown, the view asks again after each edit you save, and the backend answers from the
+  cache when nothing its key covers changed.
 - **Staleness needs no new mechanism.** The edits are in `export_edits`, which the Check's
   fingerprint covers, so Export refuses after a change, and the tab tells an open Export view to
   ask for a new Check, as for names.

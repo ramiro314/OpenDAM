@@ -86,11 +86,13 @@ export type ExportedView =
   | { status: 'failed'; error: string };
 
 /**
- * The key of a model's "Show as exported" view: a new facing is another normalized model, so
- * the view asks for it again.
+ * The key of a model's "Show as exported" view at `revision`, which counts the tab's saved
+ * edits. The view asks again after every edit rather than guessing which ones change the
+ * normalized model: only the backend knows its cache key, and it answers from the cache when
+ * nothing that key covers changed.
  */
-export function viewKey(assetId: string, model: Pick<GameModelDetail, 'facingQuarterTurns'>) {
-  return `${assetId}:${shownValue(model.facingQuarterTurns).value}`;
+export function viewKey(assetId: string, revision: number) {
+  return `${assetId}:${revision}`;
 }
 
 /**

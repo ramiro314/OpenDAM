@@ -675,7 +675,36 @@ pub async fn inferred_origin(
     library: &LibraryHandle,
     path: &str,
 ) -> Result<Option<packs::Origin>, String> {
-    let path = path.trim_matches('/');
+    pack_origin(library, path.trim_matches('/'), None).await
+}
+
+/// The origin of the pack holding the file at `path` as a Check gives it (C6, A1): your override,
+/// else inferred from the pack's files, both through `packs::origin`. `None` for a file in no
+/// pack.
+pub(crate) async fn origin_at(
+    library: &LibraryHandle,
+    path: &str,
+) -> Result<Option<packs::Origin>, String> {
+    let pack_paths: Vec<String> = sqlx::query_scalar("SELECT path FROM folders WHERE is_pack")
+        .fetch_all(&library.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(pack) = pack_at(&pack_paths, path) else {
+        return Ok(None);
+    };
+    let overrides = structure::read_overrides(&library.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    pack_origin(library, pack, overrides.get(pack).and_then(|o| o.origin)).await
+}
+
+/// The origin of the pack at `path` given your override `yours` (`packs::origin`), reading the
+/// pack's indexed files as a check does, or `None` when no pack is at `path`.
+async fn pack_origin(
+    library: &LibraryHandle,
+    path: &str,
+    yours: Option<packs::Origin>,
+) -> Result<Option<packs::Origin>, String> {
     let pack_paths: Vec<String> = sqlx::query_scalar("SELECT path FROM folders WHERE is_pack")
         .fetch_all(&library.pool)
         .await
@@ -695,31 +724,9 @@ pub async fn inferred_origin(
         .map(|(_, f, ..)| f)
         .collect();
     let root = library.root_path.clone();
-    tokio::task::spawn_blocking(move || Some(packs::infer_origin(&files, &mut Walker::new(&root))))
+    tokio::task::spawn_blocking(move || Some(packs::origin(yours, &files, &mut Walker::new(&root))))
         .await
         .map_err(|e| e.to_string())
-}
-
-/// The origin of the pack holding the file at `path` as a Check gives it (C6, A1): your override,
-/// else inferred from the pack's files. `None` for a file in no pack.
-pub(crate) async fn origin_at(
-    library: &LibraryHandle,
-    path: &str,
-) -> Result<Option<packs::Origin>, String> {
-    let pack_paths: Vec<String> = sqlx::query_scalar("SELECT path FROM folders WHERE is_pack")
-        .fetch_all(&library.pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    let Some(pack) = pack_at(&pack_paths, path) else {
-        return Ok(None);
-    };
-    let overrides = structure::read_overrides(&library.pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    match overrides.get(pack).and_then(|o| o.origin) {
-        Some(origin) => Ok(Some(origin)),
-        None => inferred_origin(library, pack).await,
-    }
 }
 
 /// Whether `path` lies in a Unity FBX format folder, `fbx(unity)` or `fbx (unity)` in any case.
@@ -1003,10 +1010,7 @@ fn evaluate(inputs: &mut [LibraryInput], memo: &infer::Memo) -> Evaluated {
                     .package
                     .as_ref()
                     .and_then(|f| packs::read_package_name(&mut walker.probes, &f.path)),
-                origin: pack
-                    .edits
-                    .origin
-                    .unwrap_or_else(|| packs::infer_origin(files, walker)),
+                origin: packs::origin(pack.edits.origin, files, walker),
                 info: pack.info.clone(),
                 edits: pack.edits.clone(),
             }

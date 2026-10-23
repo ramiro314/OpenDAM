@@ -121,9 +121,8 @@ describe('facingLine', () => {
 });
 
 describe('exportedView', () => {
-  const turned = (yours: number | null) => ({ facingQuarterTurns: { inferred: 0, yours } });
-  test('is hidden until you ask, then loads until the answer is for the current facing', () => {
-    const key = viewKey('a', turned(null));
+  test('is hidden until you ask, then loads until the answer is for the current revision', () => {
+    const key = viewKey('a', 0);
     expect(exportedView(false, null, key)).toEqual({ status: 'hidden' });
     expect(exportedView(true, null, key)).toEqual({ status: 'loading' });
     const shown = { key, path: '/lib/.opendam/export-cache/models/k.glb' };
@@ -132,10 +131,10 @@ describe('exportedView', () => {
       status: 'failed',
       error: 'No Blender',
     });
-    // A quarter turn is another model, which the view asks for again
-    const next = viewKey('a', turned(1));
+    // After an edit, such as a quarter turn, the view asks again
+    const next = viewKey('a', 1);
     expect(next).not.toBe(key);
     expect(exportedView(true, shown, next)).toEqual({ status: 'loading' });
-    expect(viewKey('b', turned(null))).not.toBe(key);
+    expect(viewKey('b', 0)).not.toBe(key);
   });
 });
