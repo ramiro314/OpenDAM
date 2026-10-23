@@ -600,8 +600,9 @@ async fn blocking<T: Send + 'static>(
         .map_err(Stop::Failed)
 }
 
-/// A file's size and mtime in nanoseconds.
-fn file_stamp(path: &Path) -> std::io::Result<(u64, i64)> {
+/// A file's size and mtime in nanoseconds. An original's stamp is recorded and checked with this
+/// one function, so the two always agree.
+pub(crate) fn file_stamp(path: &Path) -> std::io::Result<(u64, i64)> {
     let meta = std::fs::metadata(path)?;
     let mtime = meta
         .modified()?

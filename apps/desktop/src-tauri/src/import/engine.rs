@@ -420,13 +420,9 @@ impl Engine {
 
         let path = original.clone();
         let (size, mtime_ns, sha256) = tokio::task::spawn_blocking(move || {
-            let meta = std::fs::metadata(&path)?;
-            let mtime = meta
-                .modified()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
+            let (size, mtime_ns) = build::file_stamp(&path)?;
             let sha256 = crate::export::hashes::sha256_file(&path)?;
-            Ok::<_, std::io::Error>((meta.len(), mtime.as_nanos() as i64, sha256))
+            Ok::<_, std::io::Error>((size, mtime_ns, sha256))
         })
         .await
         .map_err(|e| e.to_string())?
