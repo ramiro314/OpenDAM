@@ -9,6 +9,7 @@ import {
   usePackDetailStore,
   usePacksStore,
   useFolderActionStore,
+  useExportEditStore,
   lookupAsset,
   packRef,
   shownMember,
@@ -20,6 +21,8 @@ import type {
   ColorLabel,
   Collection,
   Cover,
+  ExportEditPatch,
+  GameDetail,
   GroupMember,
   NormalConvention,
   PackDetail,
@@ -60,6 +63,7 @@ import {
   type PackForm,
 } from '../../utils/packEdits';
 import { KIND_LABEL } from '../../utils/scrubKey';
+import { domainsLine, exportsAs, hasGameTab, namePatch, shownValue } from '../../utils/gameTab';
 import { ThreeViewer } from './ThreeViewer';
 import { SuggestTags } from './SuggestTags';
 import styles from './DetailPanel.module.css';
@@ -87,7 +91,8 @@ export function DetailPanel() {
   const collections = useCollectionStore((s) => s.collections);
   const addToCollection = useCollectionStore((s) => s.addToCollection);
   const removeFromCollection = useCollectionStore((s) => s.removeFromCollection);
-  const [tab, setTab] = useState<'info' | 'tags' | 'collections' | 'preview'>('info');
+  const chosenTab = useUIStore((s) => s.detailTab);
+  const setTab = useUIStore((s) => s.setDetailTab);
 
   const [isEditingName, setIsEditingName] = useState(false);
   const [editingName, setEditingName] = useState('');
@@ -251,6 +256,8 @@ export function DetailPanel() {
   }
 
   const isPending = asset.previewStatus === 'pending' || asset.previewStatus === 'generating';
+  const gameTab = hasGameTab(asset.kind);
+  const tab = chosenTab === 'game' && !gameTab ? 'info' : chosenTab;
 
   return (
     <aside className={styles.panel} id="detail-panel">
@@ -374,16 +381,18 @@ export function DetailPanel() {
 
       {/* Tabs */}
       <div className={styles.tabs}>
-        {(['info', 'tags', 'collections', 'preview'] as const).map((t) => (
-          <button
-            key={t}
-            id={`detail-tab-${t}`}
-            className={clsx(styles.tab, tab === t && styles.tabActive)}
-            onClick={() => setTab(t)}
-          >
-            {t.charAt(0).toUpperCase() + t.slice(1)}
-          </button>
-        ))}
+        {(['info', 'tags', 'collections', 'preview', 'game'] as const)
+          .filter((t) => t !== 'game' || gameTab)
+          .map((t) => (
+            <button
+              key={t}
+              id={`detail-tab-${t}`}
+              className={clsx(styles.tab, tab === t && styles.tabActive)}
+              onClick={() => setTab(t)}
+            >
+              {t.charAt(0).toUpperCase() + t.slice(1)}
+            </button>
+          ))}
       </div>
 
       <div className={styles.tabContent}>
@@ -413,6 +422,7 @@ export function DetailPanel() {
         {tab === 'preview' && (
           <PreviewTab asset={asset} onGeneratePreview={handleGeneratePreview} />
         )}
+        {tab === 'game' && <GameTab asset={asset} />}
       </div>
 
       <ConfirmDeleteDialog
@@ -1091,6 +1101,146 @@ function CollectionsTab({
           </button>
         );
       })}
+    </div>
+  );
+}
+
+// ── Game Tab ──────────────────────────────────────────────────────────────
+/**
+ * What the game export makes of the asset (plan game-export C13): the problems the Checks of
+ * its domains find with it, what it exports as, and its `assetName`, marked inferred or yours,
+ * with a reset to inferred. A save writes to the asset's group, or to an image's texture set,
+ * and makes an open Export view holding the asset ask for a new Check.
+ */
+function GameTab({ asset }: { asset: Asset }) {
+  const [loaded, setLoaded] = useState<{ id: string; detail: GameDetail | null } | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [reload, setReload] = useState(0);
+  useEffect(() => {
+    let current = true;
+    setChecking(true);
+    // Reading the detail runs its domains' Checks, so moving through assets reads only the one
+    // it settles on
+    const timer = setTimeout(() => {
+      api
+        .getGameDetail(asset.id)
+        .then((detail) => {
+          if (!current) return;
+          setLoaded({ id: asset.id, detail });
+          setDraft(detail ? shownValue(detail.assetName).value : '');
+          setError(null);
+        })
+        .catch((err) => current && setError(String(err)))
+        .finally(() => current && setChecking(false));
+    }, 250);
+    return () => {
+      current = false;
+      clearTimeout(timer);
+    };
+  }, [asset.id, reload]);
+  const detail = loaded?.id === asset.id ? loaded.detail : undefined;
+
+  if (detail === undefined) {
+    return (
+      <p className={styles.gameHint}>{error ?? 'Reading what the game export makes of it…'}</p>
+    );
+  }
+  if (detail === null) {
+    return <p className={styles.gameHint}>This file doesn’t export to the game.</p>;
+  }
+
+  const name = shownValue(detail.assetName);
+  const save = async (patch: ExportEditPatch) => {
+    setSaving(true);
+    setError(null);
+    try {
+      // The item the tab shows: a group's main item, whose texture set the Check uses
+      const ids = await api.setExportEdit(detail.assetId, patch);
+      useExportEditStore.getState().noteEdited(ids);
+      setReload((r) => r + 1);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const result = namePatch(detail.assetName, draft);
+    if (!result) return;
+    if ('error' in result) setError(result.error);
+    else void save(result.patch);
+  };
+
+  return (
+    <div className={styles.game} id="detail-game">
+      {detail.problems.length > 0 && (
+        <ul id="detail-game-problems" className={styles.gameProblems}>
+          {detail.problems.map((p, i) => (
+            <li key={i}>{p.message}</li>
+          ))}
+        </ul>
+      )}
+      <p className={styles.gameHint}>
+        {exportsAs(detail)}. {domainsLine(detail)}.{checking && ' Checking…'}
+      </p>
+      <form id="detail-game-form" className={styles.gameForm} onSubmit={handleSubmit}>
+        <label className={styles.infoLabel} htmlFor="detail-game-name">
+          Name
+        </label>
+        <div className={styles.gameValue}>
+          <input
+            id="detail-game-name"
+            className={styles.packFormInput}
+            value={draft}
+            spellCheck={false}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              setError(null);
+            }}
+          />
+          <span
+            id="detail-game-name-mark"
+            className={clsx(styles.gameMark, name.mark === 'yours' && styles.gameMarkYours)}
+            title={
+              name.mark === 'yours'
+                ? 'You set this name'
+                : 'Inferred from the file name: save your own to replace it'
+            }
+          >
+            {name.mark}
+          </span>
+        </div>
+        {error && (
+          <p className={styles.packFormError} role="alert">
+            {error}
+          </p>
+        )}
+        <div className={styles.packFormActions}>
+          <span className={styles.packFormHint}>Inferred: {detail.assetName.inferred}</span>
+          <button
+            type="button"
+            id="detail-game-name-reset"
+            className={styles.openLicenseBtn}
+            onClick={() => void save({ assetName: null })}
+            disabled={saving || name.mark === 'inferred'}
+            title="Go back to the inferred name"
+          >
+            Reset
+          </button>
+          <button
+            type="submit"
+            id="detail-game-name-save"
+            className={clsx(styles.openLicenseBtn, styles.packFormSave)}
+            disabled={saving || draft.trim() === name.value}
+          >
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </form>
     </div>
   );
 }

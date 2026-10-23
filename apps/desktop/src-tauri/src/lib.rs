@@ -292,6 +292,8 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::export::export_bundle,
             commands::export::discard_export,
             commands::export::get_inferred_pack_origin,
+            commands::export::get_game_detail,
+            commands::export::set_export_edit,
             commands::autotag::list_autotag_providers,
             commands::autotag::estimate_autotag_run,
             commands::autotag::start_autotag_run,

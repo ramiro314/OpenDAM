@@ -140,6 +140,14 @@ CREATE TABLE IF NOT EXISTS file_hashes (
     sha256       TEXT NOT NULL
 );
 
+-- ── Export edits: your game export corrections (plan game-export C4, export/edits.rs) ──────
+-- Only what you set (D32), as a JSON object, on every member of the asset's group. Kept out of
+-- `metadata`, which `assets_fts` indexes.
+CREATE TABLE IF NOT EXISTS export_edits (
+    asset_id  TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+    edits     TEXT NOT NULL
+);
+
 -- The full-text table and its triggers are in 003_assets_fts.sql, so a library made before
 -- `file_path` was indexed can recreate them inside a transaction (db::index_file_paths).
 

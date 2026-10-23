@@ -54,6 +54,14 @@ pub fn match_key(stem: &str) -> String {
     pascal(stem).to_ascii_lowercase()
 }
 
+/// The texture set an image whose stem reads as `stem` shares with the other images of its
+/// folder (C8): its `match_key`, when a suffix names its role or layout and the key isn't empty.
+/// `None` makes it a set of its own.
+pub fn set_key(stem: &StemInfo) -> Option<String> {
+    let key = match_key(&stem.base);
+    (stem.layout.is_some() && !key.is_empty()).then_some(key)
+}
+
 /// How many folders apart `a` and `b` are: steps up from `a` to the folder they share, then down
 /// to `b`.
 fn folder_distance(a: &str, b: &str) -> usize {
@@ -198,15 +206,15 @@ impl PackImages {
         let mut set_of = Vec::with_capacity(images.len());
         let keys: Vec<String> = stems.iter().map(|s| match_key(&s.base)).collect();
         for (i, (image, stem)) in images.iter().zip(&stems).enumerate() {
-            let key = keys[i].clone();
-            let shared = (stem.layout.is_some() && !key.is_empty())
-                .then(|| by_key.get(&(dir_of(&image.path), key.clone())).copied())
-                .flatten();
+            let key = set_key(stem);
+            let shared = key
+                .as_ref()
+                .and_then(|key| by_key.get(&(dir_of(&image.path), key.clone())).copied());
             let set = shared.unwrap_or_else(|| {
                 sets.push(TextureSet {
                     sources: Vec::new(),
                 });
-                if stem.layout.is_some() && !key.is_empty() {
+                if let Some(key) = key {
                     by_key.insert((dir_of(&image.path), key), sets.len() - 1);
                 }
                 sets.len() - 1

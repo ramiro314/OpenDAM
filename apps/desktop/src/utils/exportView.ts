@@ -1,6 +1,7 @@
 import type {
   Collection,
   ExportCheck,
+  ExportCheckAsset,
   ExportDiff,
   ExportDiffEntry,
   ExportMaterial,
@@ -96,4 +97,21 @@ export function staleMessage(changes: string[]): string {
   const shown = changes.slice(0, 3).join('; ');
   const more = changes.length > 3 ? ` and ${changes.length - 3} more` : '';
   return `Nothing was exported: since the Check, this changed: ${shown}${more}. Check again`;
+}
+
+/**
+ * The asset of `check` that an edit writing `ids` changed, or null. The Check no longer holds
+ * what the domain exports then, so its staged bundle is stale (plan C14).
+ */
+export function editedAsset(
+  check: Pick<ExportCheck, 'assets'>,
+  ids: string[]
+): ExportCheckAsset | null {
+  const written = new Set(ids);
+  return check.assets.find((a) => written.has(a.assetId)) ?? null;
+}
+
+/** What the Export view says once an edit made its Check stale. */
+export function editedMessage(asset: Pick<ExportCheckAsset, 'filePath'>): string {
+  return `You edited ${asset.filePath} since the Check. Check again to export it`;
 }
