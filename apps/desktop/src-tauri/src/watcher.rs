@@ -30,7 +30,8 @@ struct LockEnv {
     now: Arc<dyn Fn() -> SystemTime + Send + Sync>,
     /// Whether this machine runs a process with this pid and start time.
     alive: Arc<dyn Fn(u32, u64) -> bool + Send + Sync>,
-    /// `None` when unknown (or `/proc` can't be read), which turns the dead-process rule off.
+    /// Where `alive` can answer: this machine, boot and pid namespace (`local_id`). `None` when
+    /// unknown (or `/proc` can't be read), which turns the dead-process rule off.
     machine: Option<String>,
     pid: u32,
     started: u64,
@@ -44,7 +45,7 @@ impl LockEnv {
         let (machine, started) = ME
             .get_or_init(|| {
                 let started = process_start_time(std::process::id());
-                (started.and_then(|_| machine_id()), started.unwrap_or(0))
+                (started.and_then(|_| local_id()), started.unwrap_or(0))
             })
             .clone();
         LockEnv {
@@ -64,7 +65,7 @@ impl LockEnv {
         format!("{machine} {} {} {}", self.pid, self.started, Uuid::new_v4())
     }
 
-    /// Whether `token` names a process on this machine that is gone.
+    /// Whether `token` names a process in this machine, boot and pid namespace that is gone.
     fn names_a_dead_process(&self, token: &str) -> bool {
         let mut parts = token.split(' ');
         let (Some(machine), Some(pid), Some(started)) = (parts.next(), parts.next(), parts.next())
@@ -78,16 +79,30 @@ impl LockEnv {
     }
 }
 
-/// This machine's id as the lock names it: the machine id hashed with a key of the app's own, as
-/// machine-id(5) asks, since the lock file sits in a shared library folder.
-fn machine_id() -> Option<String> {
-    let id = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+/// The space a pid and start time are comparable in, as the lock names it: this machine, this
+/// boot and this pid namespace. The machine id alone isn't enough: VMs or containers cloned from
+/// one image share it, and a sandboxed instance on the same host has its own pids. A start time is
+/// counted from boot, so it compares only within one boot.
+fn local_id() -> Option<String> {
+    let machine = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
         .iter()
         .filter_map(|p| std::fs::read_to_string(p).ok())
         .map(|id| id.trim().to_string())
         .find(|id| !id.is_empty())?;
-    let keyed = format!("com.opendam.desktop index.lock {id}");
-    Some(crate::export::hashes::sha256_bytes(keyed.as_bytes())[..32].to_string())
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let pid_ns = std::fs::read_link("/proc/self/ns/pid").ok()?;
+    Some(local_id_of(
+        &machine,
+        boot.trim(),
+        &pid_ns.to_string_lossy(),
+    ))
+}
+
+/// Hashed with a key of the app's own, as machine-id(5) asks, since the lock file sits in a
+/// shared library folder.
+fn local_id_of(machine: &str, boot: &str, pid_ns: &str) -> String {
+    let keyed = format!("com.opendam.desktop index.lock\n{machine}\n{boot}\n{pid_ns}");
+    crate::export::hashes::sha256_bytes(keyed.as_bytes())[..32].to_string()
 }
 
 /// A process's start time in clock ticks since boot, field 22 of `/proc/<pid>/stat`, counted
@@ -177,10 +192,10 @@ impl HeldLock {
 /// RAII guard over `.opendam/index.lock`, which keeps two machines (or two processes) from
 /// indexing the same library at once, since interleaved batch writes would corrupt the catalogue.
 ///
-/// The file holds a token naming its holder's machine, process and process start time, and a
-/// timestamp that a heartbeat rewrites every 30 s, so a hold of any length stays fresh. A lock is
-/// stale once its mtime is 120 s old, or at once when its token names a process on this machine
-/// that is gone. Dropping the guard stops the heartbeat and deletes the file only while it still
+/// The file holds a token naming its holder's machine (with its boot and pid namespace), process
+/// and process start time, and a timestamp that a heartbeat rewrites every 30 s, so a hold of any
+/// length stays fresh. A lock is stale once its mtime is 120 s old, or at once when its token
+/// names a process in this machine, boot and pid namespace that is gone. Dropping the guard stops the heartbeat and deletes the file only while it still
 /// holds the guard's token.
 struct IndexLock {
     /// `None` when the file couldn't be written: the run goes on unlocked, as it always has.
@@ -1473,14 +1488,22 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_names_this_machine_by_a_keyed_hash_of_its_id() {
-        let Some(id) = machine_id() else { return };
-        let raw = std::fs::read_to_string("/etc/machine-id")
-            .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
-            .unwrap();
+    fn the_lock_names_this_machine_boot_and_pid_namespace_by_a_keyed_hash() {
+        let id = local_id_of("m", "b", "pid:[1]");
 
         assert_eq!(id.len(), 32);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(id, raw.trim());
+        // A clone with the same machine id but another boot, or a sandbox on the same boot with
+        // its own pids, isn't this space.
+        assert_ne!(id, local_id_of("m", "b2", "pid:[1]"));
+        assert_ne!(id, local_id_of("m", "b", "pid:[2]"));
+        assert_ne!(id, local_id_of("m2", "b", "pid:[1]"));
+
+        let Some(here) = local_id() else { return };
+        let raw = std::fs::read_to_string("/etc/machine-id")
+            .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+            .unwrap();
+        assert_eq!(here.len(), 32);
+        assert_ne!(here, raw.trim());
     }
 }
