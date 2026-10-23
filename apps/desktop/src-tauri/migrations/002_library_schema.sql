@@ -125,7 +125,10 @@ CREATE TABLE IF NOT EXISTS pack_overrides (
     license     TEXT,
     source_url  TEXT,
     cover_path  TEXT,
-    updated_at  INTEGER NOT NULL
+    updated_at  INTEGER NOT NULL,
+    -- The game export's pack origin and normal-map convention (plan game-export C6)
+    origin             TEXT CHECK (origin IN ('unity', 'unreal', 'generic')),
+    normal_convention  TEXT CHECK (normal_convention IN ('opengl', 'directx'))
 );
 
 -- ── File hashes: source sha256s memoized for the game export (export/hashes.rs) ──────

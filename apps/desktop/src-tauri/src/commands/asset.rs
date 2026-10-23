@@ -5443,6 +5443,8 @@ mod tests {
             name: name.map(str::to_string),
             license: None,
             source_url: None,
+            origin: None,
+            normal_convention: None,
         };
         let edits = [
             (

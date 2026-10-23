@@ -1,4 +1,11 @@
-import type { LicenseKind, PackDetail, PackEdit, PackMark } from '../types';
+import type {
+  LicenseKind,
+  NormalConvention,
+  PackDetail,
+  PackEdit,
+  PackMark,
+  PackOrigin,
+} from '../types';
 
 /** One pack mark item of a tree node's or pack card's context menu */
 export interface MarkChoice {
@@ -23,11 +30,13 @@ export function markChoices(isPack: boolean, mark: PackMark | null | undefined):
   return choices;
 }
 
-/** The edit form's fields, as typed */
+/** The edit form's fields, as typed. An empty origin or convention is the inferred one. */
 export interface PackForm {
   name: string;
   license: string;
   sourceUrl: string;
+  origin: PackOrigin | '';
+  normalConvention: NormalConvention | '';
 }
 
 /** The form a pack's edit starts from: your name, else the one shown, and your other fields. */
@@ -36,6 +45,8 @@ export function packForm(pack: PackDetail): PackForm {
     name: pack.edits.name ?? pack.name,
     license: pack.edits.license ?? '',
     sourceUrl: pack.edits.sourceUrl ?? '',
+    origin: pack.edits.origin ?? '',
+    normalConvention: pack.edits.normalConvention ?? '',
   };
 }
 
@@ -51,7 +62,63 @@ export function detailsEdit(form: PackForm, pack: PackDetail): PackEdit {
     name: pack.edits.name == null && name === pack.name ? null : name,
     license: text(form.license),
     sourceUrl: text(form.sourceUrl),
+    origin: form.origin || null,
+    normalConvention: form.normalConvention || null,
   };
+}
+
+const ORIGIN_LABEL: Record<PackOrigin, string> = {
+  unity: 'Unity',
+  unreal: 'Unreal',
+  generic: 'Generic',
+};
+
+const CONVENTION_LABEL: Record<NormalConvention, string> = {
+  opengl: 'OpenGL',
+  directx: 'DirectX',
+};
+
+/** The normal-map convention an origin implies (plan game-export D14): DirectX for unreal. */
+export function originConvention(origin: PackOrigin): NormalConvention {
+  return origin === 'unreal' ? 'directx' : 'opengl';
+}
+
+/** One option of the Origin or Normal maps select; `''` is the inferred value */
+export interface Choice<T extends string> {
+  value: T | '';
+  label: string;
+}
+
+/** "Inferred: <label>", or "Inferred" until the inference has answered */
+const inferredLabel = (label: string | null) => (label ? `Inferred: ${label}` : 'Inferred');
+
+/** The Origin select's options: the origin inferred from the pack's files (`inferred`), then each. */
+export function originChoices(inferred: PackOrigin | null): Choice<PackOrigin>[] {
+  return [
+    { value: '', label: inferredLabel(inferred && ORIGIN_LABEL[inferred]) },
+    ...(Object.keys(ORIGIN_LABEL) as PackOrigin[]).map((o) => ({
+      value: o,
+      label: ORIGIN_LABEL[o],
+    })),
+  ];
+}
+
+/**
+ * The Normal maps select's options: the convention the form's origin implies, yours or else the
+ * inferred one, then each.
+ */
+export function conventionChoices(
+  form: Pick<PackForm, 'origin'>,
+  inferred: PackOrigin | null
+): Choice<NormalConvention>[] {
+  const origin = form.origin || inferred;
+  return [
+    { value: '', label: inferredLabel(origin && CONVENTION_LABEL[originConvention(origin)]) },
+    ...(Object.keys(CONVENTION_LABEL) as NormalConvention[]).map((c) => ({
+      value: c,
+      label: CONVENTION_LABEL[c],
+    })),
+  ];
 }
 
 /** Why `url` can't be a source URL, or `null` when it can (empty is fine: it clears it). */

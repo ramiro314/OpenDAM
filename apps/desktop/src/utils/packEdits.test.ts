@@ -2,10 +2,13 @@ import { describe, expect, test } from 'bun:test';
 import type { LicenseKind, PackDetail, PackLicense, PackOverride } from '../types';
 import {
   authorsLabel,
+  conventionChoices,
   detailsEdit,
   formPlaceholders,
   licenseLabel,
   markChoices,
+  originChoices,
+  originConvention,
   packForm,
   sourceUrlProblem,
 } from './packEdits';
@@ -56,34 +59,103 @@ describe('the pack mark items', () => {
 
 describe('the pack edit form', () => {
   test('starts from your edits, and from the name shown when you gave none', () => {
-    expect(packForm(pack('Car Kit'))).toEqual({ name: 'Car Kit', license: '', sourceUrl: '' });
-    const edited = pack('My cars', { name: 'My cars', license: 'CC0', sourceUrl: 'https://k.nl' });
+    expect(packForm(pack('Car Kit'))).toEqual({
+      name: 'Car Kit',
+      license: '',
+      sourceUrl: '',
+      origin: '',
+      normalConvention: '',
+    });
+    const edited = pack('My cars', {
+      name: 'My cars',
+      license: 'CC0',
+      sourceUrl: 'https://k.nl',
+      origin: 'unreal',
+      normalConvention: 'opengl',
+    });
     expect(packForm(edited)).toEqual({
       name: 'My cars',
       license: 'CC0',
       sourceUrl: 'https://k.nl',
+      origin: 'unreal',
+      normalConvention: 'opengl',
     });
   });
 
   test('saves trimmed fields, and empty ones as null to keep what was detected', () => {
-    const form = { name: ' My cars ', license: ' ', sourceUrl: ' https://kenney.nl ' };
+    const form = {
+      name: ' My cars ',
+      license: ' ',
+      sourceUrl: ' https://kenney.nl ',
+      origin: 'unity',
+      normalConvention: 'directx',
+    } as const;
     expect(detailsEdit(form, pack('Car Kit'))).toEqual({
       kind: 'details',
       name: 'My cars',
       license: null,
       sourceUrl: 'https://kenney.nl',
+      origin: 'unity',
+      normalConvention: 'directx',
     });
-    expect(
-      detailsEdit({ name: '', license: '', sourceUrl: '' }, pack('My cars', { name: 'x' }))
-    ).toEqual({ kind: 'details', name: null, license: null, sourceUrl: null });
+    const empty = {
+      name: '',
+      license: '',
+      sourceUrl: '',
+      origin: '',
+      normalConvention: '',
+    } as const;
+    expect(detailsEdit(empty, pack('My cars', { name: 'x', origin: 'unity' }))).toEqual({
+      kind: 'details',
+      name: null,
+      license: null,
+      sourceUrl: null,
+      origin: null,
+      normalConvention: null,
+    });
   });
 
   test('a name left as detected stays detected, but your own name stays yours', () => {
-    const form = { name: 'Car Kit', license: 'MIT', sourceUrl: '' };
+    const form = {
+      name: 'Car Kit',
+      license: 'MIT',
+      sourceUrl: '',
+      origin: '',
+      normalConvention: '',
+    } as const;
     expect(detailsEdit(form, pack('Car Kit'))).toMatchObject({ name: null, license: 'MIT' });
     expect(detailsEdit(form, pack('Car Kit', { name: 'Car Kit' }))).toMatchObject({
       name: 'Car Kit',
     });
+  });
+
+  test('the origin offers the inferred one first, which resets yours', () => {
+    expect(originChoices('unity')).toEqual([
+      { value: '', label: 'Inferred: Unity' },
+      { value: 'unity', label: 'Unity' },
+      { value: 'unreal', label: 'Unreal' },
+      { value: 'generic', label: 'Generic' },
+    ]);
+    expect(originChoices(null)[0]).toEqual({ value: '', label: 'Inferred' });
+  });
+
+  test('the inferred normal maps follow the origin: DirectX for unreal, else OpenGL', () => {
+    expect(originConvention('unreal')).toBe('directx');
+    expect(originConvention('unity')).toBe('opengl');
+    expect(originConvention('generic')).toBe('opengl');
+    const inferred = (origin: '' | 'unreal' | 'generic', from: 'unreal' | 'unity' | null) =>
+      conventionChoices({ origin }, from)[0].label;
+    expect(inferred('', 'unreal')).toBe('Inferred: DirectX');
+    expect(inferred('', 'unity')).toBe('Inferred: OpenGL');
+    // Your origin, not the inferred one, sets the default
+    expect(inferred('unreal', 'unity')).toBe('Inferred: DirectX');
+    expect(inferred('generic', 'unreal')).toBe('Inferred: OpenGL');
+    expect(inferred('', null)).toBe('Inferred');
+    expect(conventionChoices({ origin: '' }, null).map((c) => c.value)).toEqual([
+      '',
+      'opengl',
+      'directx',
+    ]);
   });
 
   test('a source URL must be a web address, or empty', () => {
