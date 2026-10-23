@@ -53,6 +53,7 @@ const VIA: Record<string, string> = {
   unity: 'from its Unity material',
   suffix: 'by file name',
   stem: 'by the model’s name',
+  yours: 'yours',
 };
 
 /**
