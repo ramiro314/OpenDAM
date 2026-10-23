@@ -67,13 +67,22 @@ jobs:
     needs: [changes]
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
+    # make build checks that the release build compiles and links, not how fast
+    # it runs. Fat LTO with one codegen unit (Cargo.toml's release profile, which
+    # make install keeps) spent 2.5 to 4.5 minutes on one core compiling the
+    # crate. At job level so rust-cache, which hashes CARGO_* variables into its
+    # key, keeps the dependencies built this way.
+    env:
+      CARGO_PROFILE_RELEASE_LTO: 'false'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
     steps:
       - uses: actions/checkout@v4
       # https://v2.tauri.app/start/prerequisites/#linux
       - name: Install Tauri system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            libwebkit2gtk-4.1-dev build-essential curl wget file
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
       - uses: oven-sh/setup-bun@v2
         with:
@@ -103,12 +112,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # The second line is what the Blender tarball links that the first doesn't promise
+      # The last line is what the Blender tarball links that the others don't promise
       - name: Install Tauri and Blender system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            libwebkit2gtk-4.1-dev build-essential curl wget file
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
             libvulkan1 libx11-6 libxrender1 libxfixes3 libxi6 libxkbcommon0
       # The Blender-backed Rust tests run the pinned Blender (.github/blender.env), and fail
       # without it under CI. Not apt's: Ubuntu's Blender is older than the series exports accept.

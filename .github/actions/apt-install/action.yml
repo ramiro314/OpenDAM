@@ -1,0 +1,64 @@
+name: Install apt packages
+description: >-
+  apt-get install with the downloaded .deb files cached. Azure's Ubuntu mirror
+  often serves them slowly enough that downloading about 65 MB took 3 to 22
+  minutes in a third of CI runs.
+
+inputs:
+  packages:
+    description: Package names, separated by whitespace
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # The cache key hashes the exact files apt would fetch, versions and
+    # checksums included, so a package update saves a new cache. Its prefix
+    # names the Ubuntu release, read from os-release because the env context
+    # doesn't hold the runner's own variables such as ImageOS.
+    - name: List the packages to download
+      id: list
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        read -ra pkgs <<< "$PACKAGES"
+        archives=$HOME/.cache/opendam-apt
+        mkdir -p "$archives"
+        sudo install -d -o _apt -m 700 "$archives/partial"
+        sudo apt-get update
+        hash=$(sudo apt-get install --print-uris -qq -o Dir::Cache::Archives="$archives" "${pkgs[@]}" \
+          | sha256sum | cut -c1-16)
+        # shellcheck source=/dev/null
+        . /etc/os-release
+        echo "prefix=apt-$ID-$VERSION_ID-$(dpkg --print-architecture)-" >> "$GITHUB_OUTPUT"
+        echo "hash=$hash" >> "$GITHUB_OUTPUT"
+    - name: Restore the downloaded packages
+      id: cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.cache/opendam-apt
+        key: ${{ steps.list.outputs.prefix }}${{ steps.list.outputs.hash }}
+        restore-keys: ${{ steps.list.outputs.prefix }}
+    # apt checks a cached .deb against the index's checksum before using it.
+    # autoclean drops the ones a near-match cache brought that are no longer
+    # current, and the files apt wrote as root are handed to the runner user
+    # for actions/cache.
+    - name: Install the packages
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        read -ra pkgs <<< "$PACKAGES"
+        archives=$HOME/.cache/opendam-apt
+        apt_opts=(-o Dir::Cache::Archives="$archives" -o APT::Keep-Downloaded-Packages=true)
+        sudo apt-get install -y "${apt_opts[@]}" "${pkgs[@]}"
+        sudo apt-get autoclean -qq "${apt_opts[@]}"
+        sudo rm -rf "$archives/partial" "$archives/lock"
+        sudo chown -R "$USER" "$archives"
+    - name: Cache the downloaded packages
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.cache/opendam-apt
+        key: ${{ steps.cache.outputs.cache-primary-key }}
