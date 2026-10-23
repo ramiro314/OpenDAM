@@ -44,7 +44,9 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               which refuses an export root equal to, inside or holding a library root,
                               after resolving symlinks, blender.rs, which finds Blender, gates it to
                               BLENDER_SERIES (5.2) and runs normalize.py (embedded, versioned by
-                              NORMALIZE_VERSION) as one headless job per model and checks its result,
+                              NORMALIZE_VERSION) as one headless job per model and checks its result, which
+                              the Check runs for each model the export cache doesn't hold
+                              (cache::model_key),
                               check, the Export view's Check over a domain
                               (names, packs, textures, conversion and hashes, memoized in file_hashes,
                               and FBX models and animations by fbx_facts, which asks the preview

@@ -210,8 +210,9 @@ pub struct Job {
     pub added_material: String,
 }
 
-/// What the script wrote, re-imported (C9 step 6), with what it read from the source.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// What the script wrote, re-imported (C9 step 6), with what it read from the source. The export
+/// cache keeps it beside the FBX (C11).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Normalized {
     pub bounds: Bounds,
@@ -245,7 +246,7 @@ pub struct Bounds {
 }
 
 /// The root transform the script applied (C9 step 3).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Transform {
     pub origin_facing: Origin,
@@ -257,7 +258,7 @@ pub struct Transform {
 }
 
 /// The source's kept slots and takes, read before any change (C9 step 2).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Source {
     pub slots: Vec<String>,
     /// The source file's takes that animate something it keeps, sorted, read from its node
@@ -361,6 +362,33 @@ pub fn check_facts(normalized: &Normalized, facts: &FbxFacts) -> Result<(), Stri
         ));
     }
     Ok(())
+}
+
+/// The conversion step a normalized model records (C9, D33): Blender at the exact version that
+/// wrote the file, by `NORMALIZE_VERSION`, with flat settings: your quarter turns, the origin
+/// whose facing came first, the pivot's translation, how many collision meshes were dropped, and
+/// the added material's name, when one was added.
+pub fn step(normalized: &Normalized) -> serde_json::Value {
+    let transform = &normalized.transform;
+    let [x, y, z] = transform.pivot;
+    let mut settings = serde_json::json!({
+        "facingQuarterTurns": transform.facing_quarter_turns,
+        "originFacing": transform.origin_facing,
+        "pivotX": x,
+        "pivotY": y,
+        "pivotZ": z,
+        "droppedMeshes": normalized.dropped_meshes.len(),
+    });
+    if let Some(added) = &normalized.added_material {
+        settings["addedMaterial"] = added.as_str().into();
+    }
+    serde_json::json!({
+        "tool": "Blender",
+        "toolVersion": normalized.blender_version,
+        "by": NORMALIZE_VERSION,
+        "from": "fbx",
+        "settings": settings,
+    })
 }
 
 /// Names joined for a message, or "none".
@@ -539,8 +567,42 @@ pub(crate) fn test_blender() -> Option<PathBuf> {
     found
 }
 
+/// What the script reports for a model, for tests that need a result without Blender: a 1 m
+/// cube standing on its pivot, unturned, made by Blender 5.2.2 from a source keeping `slots` and
+/// `takes`, written with `added` after the slots, and an armature when it has `bones`.
 #[cfg(test)]
-mod tests {
+pub(crate) fn test_normalized(
+    slots: &[&str],
+    added: Option<&str>,
+    takes: &[&str],
+    bones: &[&str],
+) -> Normalized {
+    let written: Vec<&str> = slots.iter().copied().chain(added).collect();
+    serde_json::from_value(serde_json::json!({
+        "bounds": {"min": [-0.5, 0.0, -0.5], "max": [0.5, 1.0, 0.5]},
+        "meshes": ["Mesh"],
+        "slots": written,
+        "takes": takes,
+        "bones": bones,
+        "hasMesh": true,
+        "hasArmature": !bones.is_empty(),
+        "version": NORMALIZE_VERSION,
+        "blenderVersion": "5.2.2",
+        "droppedMeshes": [],
+        "addedMaterial": added,
+        "transform": {
+            "originFacing": "generic",
+            "facingQuarterTurns": 0,
+            "yaw": 0,
+            "pivot": [0.0, 0.25, 0.0],
+        },
+        "source": {"slots": slots, "takes": takes},
+    }))
+    .expect("a result")
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1262,7 +1324,7 @@ mod tests {
 
     /// Checks `bounds` is a box of `size` metres (Unity's x, y, z) standing on its bottom
     /// centre, within 0.1% of its largest dimension.
-    fn assert_size(bounds: Bounds, size: [f64; 3]) {
+    pub(crate) fn assert_size(bounds: Bounds, size: [f64; 3]) {
         let tolerance = size.iter().cloned().fold(0.0, f64::max) * PIVOT_TOLERANCE;
         let min = [-size[0] / 2.0, 0.0, -size[2] / 2.0];
         let max = [size[0] / 2.0, size[1], size[2] / 2.0];
@@ -1276,7 +1338,7 @@ mod tests {
     }
 
     /// The vertices of the FBX at `fbx`, in Unity's axes, as Blender imports them.
-    async fn vertices(blender: &Path, fbx: &Path) -> Vec<[f64; 3]> {
+    pub(crate) async fn vertices(blender: &Path, fbx: &Path) -> Vec<[f64; 3]> {
         const READ: &str = "import bpy, json, sys
 bpy.ops.wm.read_homefile(use_empty=True)
 bpy.ops.import_scene.fbx(filepath=sys.argv[-1])
@@ -1299,7 +1361,7 @@ print('OPENDAM_VERTICES', json.dumps([[-p.x, p.z, -p.y] for p in points]))";
 
     /// Which way `SM_Totem`'s nose points, in Unity's axes: the side whose outermost vertices
     /// are all the nose's, 1.45 to 1.55 m up.
-    fn nose(vertices: &[[f64; 3]]) -> Vec<&'static str> {
+    pub(crate) fn nose(vertices: &[[f64; 3]]) -> Vec<&'static str> {
         [
             ("+X", 0, 1.0),
             ("-X", 0, -1.0),

@@ -148,7 +148,7 @@ pub async fn detail(
     let mut problems: Vec<Problem> = Vec::new();
     let mut holding: Vec<String> = Vec::new();
     for (domain_name, domain) in &domains {
-        let inspection = check::inspect(db, domain, facts, memo).await?;
+        let inspection = check::inspect(db, domain, facts, memo, check::Models::Cached).await?;
         // A domain holds the item when its Check lists it
         let Some(name) = inspection.names.get(&item.id) else {
             continue;

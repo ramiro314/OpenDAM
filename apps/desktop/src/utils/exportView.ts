@@ -5,6 +5,7 @@ import type {
   ExportDiff,
   ExportDiffEntry,
   ExportMaterial,
+  ExportProgress,
   ExportSettings,
 } from '../types';
 
@@ -114,4 +115,12 @@ export function editedAsset(
 /** What the Export view says once an edit made its Check stale. */
 export function editedMessage(asset: Pick<ExportCheckAsset, 'filePath'>): string {
   return `You edited ${asset.filePath} since the Check. Check again to export it`;
+}
+
+/** What the Export view says while a Check's Blender jobs run (plan C14). */
+export function progressMessage(
+  progress: Pick<ExportProgress, 'done' | 'total' | 'asset'>
+): string {
+  const line = `Normalizing models in Blender: ${progress.done.toLocaleString()} of ${plural(progress.total, 'model')} done`;
+  return progress.asset ? `${line}, last ${progress.asset.split('/').pop()}` : line;
 }

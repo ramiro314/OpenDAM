@@ -1031,6 +1031,31 @@ later. Where they differ from C9:
 - **Problems found while converting** (a decode failure, sizes that differ) are listed after the
   per-asset problems, as name collisions are.
 
+### What the model export ticket built differently
+
+- **Only the Export view's Check runs Blender.** The Game tab's Check and Export's re-read
+  (C14) take models from the export cache alone (`check::Models::Cached`) and never look for
+  Blender. A model the cache doesn't hold is left out of their manifest without a problem, which
+  neither of them writes: Export follows a Check that filled the cache.
+- **A cache entry is two files** in `.opendam/export-cache/models/`: `<key>.fbx`, which the job
+  writes, then `<key>.json`, Blender's result with the FBX's sha256, synced and renamed in last.
+  A hit needs both, and the FBX must still hash to that sha256, which the manifest needs anyway,
+  so an entry a crash cut off is made again.
+- **The source FBX is keyed by its bytes' sha256 on every Check,** not by `file_hashes` alone, as
+  for converted textures, and the memo row is corrected when it was stale.
+- **The gate's refusal is one problem** naming every model the cache doesn't hold, with why
+  Blender can't run.
+- **Progress is sent once before the jobs and once as each ends** (`export:progress`, with the
+  domain's id), not as each starts, since jobs queue for the runner's `job_limit` permits. The
+  Export view shows "Normalizing models in Blender: 2 of 5 models done, last SM_Chest.fbx".
+- **`facingQuarterTurns` is always 0 and `rig` never `humanoid`** until the Game tab's rig and
+  facing ticket adds those edits. Both are already in the job and the cache key.
+- **Every material writes its `surface`,** `opaque` unless a Unity material says cutout (a cutout
+  suggestion exports opaque until accepted, C7).
+- **A slot Blender writes that inference has no material for is a problem,** though
+  `check_facts` already compares the slots as sets. A model whose material names a texture the
+  Check refused is dropped by the manifest's validation, naming the model.
+
 ## Acceptance criteria
 
 - **AC1.** The copied schema matches `SOURCE.md`'s sha256 (a test). `sync-asset-contract.sh`

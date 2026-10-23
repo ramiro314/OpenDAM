@@ -8,8 +8,9 @@
 //! a lone FBX, is a model or an animation by its FBX's facts (`fbx_facts`). Textures export by
 //! texture set (C8): a source that is ready passes through byte for byte, and every other one is
 //! converted into the export cache (C11), with its nearest `conversion.json`'s steps, then
-//! OpenDAM's own (C10). Until later steps of the plan's build order land, the guards refuse every
-//! model and every animation.
+//! OpenDAM's own (C10). A model is normalized by headless Blender (C9) into the export cache, or
+//! taken from it, and lists its bounds, rig, clips and materials. Until animations land (build
+//! order step 7), a guard refuses every animation.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -19,15 +20,17 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::db::{Database, LibraryHandle};
+use crate::export::blender::{self, Job, JobKind, Runner};
 use crate::export::bundle::Diff;
+use crate::export::cache::CachedModel;
 use crate::export::conversion::{Invalid, Walker};
 use crate::export::fbx_facts::{self, FbxFacts, Reading};
 use crate::export::fingerprint::{Fingerprint, Probes, Stamp};
 use crate::export::infer::{self, PackImages, UnityPack};
-use crate::export::names::{is_pascal, pascal};
+use crate::export::names::{added_material, is_pascal, pascal};
 use crate::export::packs::{self, Origin, PackSource};
 use crate::export::textures::{self, Convention, Layout, Role, Work};
-use crate::export::{cache, contract, edits, hashes, settings};
+use crate::export::{cache, collision, contract, edits, hashes, settings};
 use crate::models::AssetKind;
 use crate::structure::{self, PackOverride};
 
@@ -115,6 +118,30 @@ pub struct CheckReport {
     pub diff: Option<Diff>,
     /// Whether the bundle is staged, so Export can swap it in
     pub staged: bool,
+}
+
+/// How a Check treats the models headless Blender normalizes (C9, C11).
+#[derive(Clone, Copy)]
+pub enum Models<'a> {
+    /// Runs Blender for each model the export cache doesn't hold, once the gate accepts it (C2),
+    /// telling `progress` how the jobs go: the Export view's Check. With every model cached,
+    /// it never looks for Blender.
+    Normalize(&'a (dyn Fn(Progress) + Sync)),
+    /// Takes models only from the export cache and never looks for Blender, leaving a model the
+    /// cache doesn't hold out of the manifest without a problem: the Game tab's Check, and
+    /// Export's re-read, which follows a Check that filled the cache.
+    Cached,
+}
+
+/// How a Check's Blender jobs are going, sent once before they start and once as each ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Progress {
+    /// The jobs that have ended, and how many there are
+    pub done: usize,
+    pub total: usize,
+    /// The asset whose job just ended, relative to its library root
+    pub asset: Option<String>,
 }
 
 /// A file the bundle holds: its `file` in the manifest, the file to copy and its sha256.
@@ -299,7 +326,7 @@ fn general(message: impl Into<String>) -> Problem {
 }
 
 /// Checks the domain collection `domain_id`, reading FBX files' facts with `facts` and the files
-/// inference reads through `memo`, without staging anything.
+/// inference reads through `memo`, without staging anything or running Blender.
 #[cfg(test)]
 pub async fn check(
     db: &Database,
@@ -307,17 +334,21 @@ pub async fn check(
     facts: &impl fbx_facts::Reader,
     memo: &Arc<infer::Memo>,
 ) -> Result<CheckReport, String> {
-    inspect(db, domain_id, facts, memo).await.map(|i| i.report)
+    inspect(db, domain_id, facts, memo, Models::Cached)
+        .await
+        .map(|i| i.report)
 }
 
 /// Reads the domain collection `domain_id` as a Check does, reading FBX files' facts with
-/// `facts` and the files inference reads through `memo`. An unknown collection is an error;
-/// everything else that would refuse the export is a problem in the report.
+/// `facts`, the files inference reads through `memo`, and its models as `models` says. An
+/// unknown collection is an error; everything else that would refuse the export is a problem
+/// in the report.
 pub async fn inspect(
     db: &Database,
     domain_id: &str,
     facts: &impl fbx_facts::Reader,
     memo: &Arc<infer::Memo>,
+    models: Models<'_>,
 ) -> Result<Inspection, String> {
     let master = &db.master_pool;
     let settings = settings::load(master).await.map_err(|e| e.to_string())?;
@@ -438,10 +469,9 @@ pub async fn inspect(
     for input in &inputs {
         input_fingerprint(input, &mut fingerprint);
     }
-    let domain_name = domain.clone();
     let memo = Arc::clone(memo);
     let (evaluated, inputs) = tokio::task::spawn_blocking(move || {
-        let evaluated = evaluate(&domain_name, &mut inputs, &memo);
+        let evaluated = evaluate(&mut inputs, &memo);
         (evaluated, inputs)
     })
     .await
@@ -456,12 +486,12 @@ pub async fn inspect(
     }
 
     let Evaluated {
-        assets,
+        mut reads,
         names,
+        export_packs,
         packs,
         problems: mut found,
-        manifest,
-        files,
+        models: planned,
         probes,
     } = evaluated;
     for (input, probes) in inputs.iter().zip(probes) {
@@ -471,6 +501,42 @@ pub async fn inspect(
         }
     }
     problems.append(&mut found);
+
+    let roots: Vec<PathBuf> = inputs.iter().map(|i| i.library.root_path.clone()).collect();
+    let normalized = normalize(
+        planned,
+        &roots,
+        models,
+        settings.blender_path.as_deref(),
+        &reads,
+        &mut problems,
+    )
+    .await?;
+    for (model, cached) in normalized {
+        match model_entry(&model, &reads[model.read], &export_packs, &cached) {
+            Ok(entry) => {
+                reads[model.read].model = Some(ReadyModel {
+                    entry,
+                    source: cached.fbx,
+                })
+            }
+            Err(e) => {
+                let asset = reads[model.read].row.asset.clone();
+                problems.push(Problem {
+                    message: format!("{}: {e}", asset.file_path),
+                    assets: vec![asset],
+                })
+            }
+        }
+    }
+
+    let domain_name = domain.clone();
+    let (manifest, files, assets, problems) = tokio::task::spawn_blocking(move || {
+        let (manifest, files, rows) = finish(&domain_name, reads, &export_packs, &mut problems);
+        (manifest, files, rows, problems)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     let assets = with_status(assets, &problems);
     Ok(Inspection {
         report: CheckReport {
@@ -790,6 +856,13 @@ struct ReadyTexture {
     source: PathBuf,
 }
 
+/// A model the check normalized, or took from the export cache: its manifest entry and the
+/// cached FBX the bundle copies.
+struct ReadyModel {
+    entry: Value,
+    source: PathBuf,
+}
+
 /// One asset as the check reads it, before names are compared.
 struct Read {
     row: CheckedAsset,
@@ -797,6 +870,25 @@ struct Read {
     pack: Option<usize>,
     /// The textures it is the first input of (D17)
     ready: Vec<ReadyTexture>,
+    model: Option<ReadyModel>,
+}
+
+/// A model no problem names, ready for its Blender job (C9): what the job and the manifest
+/// entry need.
+struct PlannedModel {
+    /// Its index in the check's reads
+    read: usize,
+    library: usize,
+    /// Its exported FBX (A5), relative to the library root
+    fbx: String,
+    /// The FBX's sha256, from its bytes
+    sha256: String,
+    facts: FbxFacts,
+    origin: Origin,
+    /// The FBX relative to its pack folder
+    source_path: String,
+    /// Its nearest `conversion.json`'s steps, which Blender's step follows (C10)
+    conversion: Vec<Value>,
 }
 
 /// One texture a set exports (C8), before its file is made.
@@ -813,12 +905,12 @@ struct PlannedTexture {
 
 /// What `evaluate` found, with the files each library's check stats, in library order.
 struct Evaluated {
-    assets: Vec<CheckedAsset>,
+    reads: Vec<Read>,
     names: HashMap<String, Field<String>>,
+    export_packs: Vec<packs::ExportPack>,
     packs: Vec<DomainPack>,
     problems: Vec<Problem>,
-    manifest: Value,
-    files: Vec<BundleFile>,
+    models: Vec<PlannedModel>,
     probes: Vec<Probes>,
 }
 
@@ -845,10 +937,10 @@ struct TextureJob {
     set: Option<(PackKey, usize)>,
 }
 
-/// Everything a check does with files, run on a blocking thread: reads each item, its pack and
-/// its file, infers the models' materials and the texture sets, compares names, and builds and
-/// validates the manifest.
-fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Evaluated {
+/// Everything a check does with files before Blender, run on a blocking thread: reads each
+/// item, its pack and its file, infers the models' materials and the texture sets, compares
+/// names, makes the textures and plans the models' jobs.
+fn evaluate(inputs: &mut [LibraryInput], memo: &infer::Memo) -> Evaluated {
     let mut problems = Vec::new();
     let mut reads: Vec<Read> = Vec::new();
     let mut asset_names: HashMap<String, Field<String>> = HashMap::new();
@@ -1019,6 +1111,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
                 row,
                 pack,
                 ready: Vec::new(),
+                model: None,
             });
         }
     }
@@ -1165,7 +1258,21 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
             row,
             pack: job.pack,
             ready: Vec::new(),
+            model: None,
         });
+    }
+
+    // A model's FBX is covered by its nearest conversion.json too
+    for (r, _, l, i) in &models {
+        let input = &inputs[*l];
+        let fbx = &input.fbx[&input.items[*i].id].path;
+        if let Err(invalid) = walkers[*l].chain(&[fbx], Vec::new()) {
+            invalid_conversions
+                .entry((*l, invalid.path.clone()))
+                .or_insert_with(|| (invalid, Vec::new()))
+                .1
+                .push(reads[*r].row.asset.clone());
+        }
     }
 
     // Each texture set's sources go through C8's table together, by path
@@ -1298,7 +1405,284 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
         }
     }
 
-    let (manifest, mut invalid, files) = manifest(domain, &reads, &export_packs, &problems);
+    // Each model no problem names goes on to its Blender job, with its FBX's sha256
+    let mut planned_models = Vec::new();
+    for (r, _, l, i) in &models {
+        let read = &reads[*r];
+        let (Some(pack), Some(name)) = (read.pack, &read.row.asset_name) else {
+            continue;
+        };
+        if !is_pascal(name) || refused.contains(&read.row.asset.asset_id) {
+            continue;
+        }
+        let input = &mut inputs[*l];
+        let item = &input.items[*i];
+        let fbx = &input.fbx[&item.id];
+        let (fbx_path, facts) = (
+            fbx.path.clone(),
+            fbx.facts.clone().expect("a model's facts"),
+        );
+        let walker = &mut walkers[*l];
+        // An invalid conversion.json is a problem already
+        let Ok(conversion) = walker.chain(&[&fbx_path], Vec::new()) else {
+            continue;
+        };
+        match fbx_sha256(input, &mut walker.probes, &fbx_path) {
+            Ok(sha256) => planned_models.push(PlannedModel {
+                read: *r,
+                library: *l,
+                source_path: relative_to(&sources[pack].path, &fbx_path),
+                fbx: fbx_path,
+                sha256,
+                facts,
+                origin: sources[pack].origin,
+                conversion,
+            }),
+            Err(e) => problems.push(Problem {
+                message: format!(
+                    "{}: its FBX {fbx_path} can't be read: {e}",
+                    read.row.asset.file_path
+                ),
+                assets: vec![read.row.asset.clone()],
+            }),
+        }
+    }
+
+    let domain_packs = export_packs
+        .iter()
+        .cloned()
+        .zip(&sources)
+        .map(|(pack, source)| DomainPack {
+            normal_convention: source.normal_convention(),
+            library_id: source.library_id.clone(),
+            path: source.path.clone(),
+            pack,
+        })
+        .collect();
+    Evaluated {
+        reads,
+        export_packs,
+        packs: domain_packs,
+        problems,
+        models: planned_models,
+        probes: walkers.into_iter().map(|w| w.probes).collect(),
+        names: asset_names,
+    }
+}
+
+/// The sha256 of the FBX at `path` in `input`'s library, from its bytes, never from the memo
+/// alone, so a file rewritten at the same size and mtime can't be served its old cache entry.
+/// The memo row is corrected for the next check, as for converted textures.
+fn fbx_sha256(
+    input: &mut LibraryInput,
+    probes: &mut Probes,
+    path: &str,
+) -> std::io::Result<String> {
+    let memoized = input.memo.sha256(probes, path)?;
+    let sha256 = hashes::sha256_file(&input.library.root_path.join(path))?;
+    if sha256 != memoized {
+        input.memo.correct(path, sha256.clone());
+    }
+    Ok(sha256)
+}
+
+/// Normalizes each planned model with headless Blender (C9), or takes it from its library's
+/// export cache (C11), as `models` says, and checks the source's kept slots and takes, as
+/// Blender read them, against the facts the Check showed. Blender is looked for (C2) only when a
+/// model's entry is missing, and a timeout, a crash, a refusal or a mismatch is a problem naming
+/// the model. Returns each model that is ready, with its cache entry.
+async fn normalize(
+    planned: Vec<PlannedModel>,
+    roots: &[PathBuf],
+    models: Models<'_>,
+    blender_path: Option<&str>,
+    reads: &[Read],
+    problems: &mut Vec<Problem>,
+) -> Result<Vec<(PlannedModel, CachedModel)>, String> {
+    let asset = |model: &PlannedModel| reads[model.read].row.asset.clone();
+    // Each model's job, writing into its cache entry, and the entry's key
+    let jobs: Vec<(Job, String)> = planned
+        .iter()
+        .map(|model| {
+            let root = &roots[model.library];
+            let mut job = Job {
+                asset: asset(model).file_path,
+                kind: JobKind::Model,
+                input: root.join(&model.fbx),
+                output: PathBuf::new(),
+                origin_facing: model.origin,
+                // Your quarter turns come with the Game tab's facing control
+                facing_quarter_turns: 0,
+                patterns: &collision::PATTERNS,
+                added_material: added_material(model.facts.slots.iter().map(|s| s.name.as_str())),
+            };
+            let key = cache::model_key(&model.sha256, &job);
+            job.output = cache::model_fbx(root, &key);
+            (job, key)
+        })
+        .collect();
+    let lookups: Vec<(PathBuf, String)> = planned
+        .iter()
+        .zip(&jobs)
+        .map(|(model, (_, key))| (roots[model.library].clone(), key.clone()))
+        .collect();
+    let mut cached: Vec<Option<CachedModel>> = tokio::task::spawn_blocking(move || {
+        lookups
+            .iter()
+            .map(|(root, key)| cache::cached_model(root, key))
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let misses: Vec<usize> = (0..planned.len())
+        .filter(|i| cached[*i].is_none())
+        .collect();
+    if let (Models::Normalize(progress), false) = (models, misses.is_empty()) {
+        match blender::gate(blender_path).await {
+            Err(e) => {
+                let assets: Vec<AssetRef> = misses.iter().map(|i| asset(&planned[*i])).collect();
+                let paths: Vec<&str> = assets.iter().map(|a| a.file_path.as_str()).collect();
+                let what = if assets.len() == 1 {
+                    "the export cache doesn't hold its normalized FBX, so Blender must make it"
+                } else {
+                    "the export cache doesn't hold their normalized FBX files, so Blender must make them"
+                };
+                problems.push(Problem {
+                    message: format!("{}: {what}: {e}", paths.join(", ")),
+                    assets,
+                });
+            }
+            Ok(blender) => {
+                let runner = Runner::new(blender);
+                let total = misses.len();
+                let done = std::sync::atomic::AtomicUsize::new(0);
+                progress(Progress {
+                    done: 0,
+                    total,
+                    asset: None,
+                });
+                let runs = misses.iter().map(|i| {
+                    let (job, key) = &jobs[*i];
+                    let root = roots[planned[*i].library].clone();
+                    let (runner, done) = (&runner, &done);
+                    async move {
+                        let result = match runner.run(job).await {
+                            Ok(normalized) => {
+                                let key = key.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    cache::save_model(&root, &key, normalized)
+                                })
+                                .await
+                                .map_err(|e| e.to_string())
+                                .and_then(|saved| saved)
+                                .map_err(|e| format!("{}: {e}", job.asset))
+                            }
+                            Err(e) => Err(e),
+                        };
+                        let done = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        progress(Progress {
+                            done,
+                            total,
+                            asset: Some(job.asset.clone()),
+                        });
+                        (*i, result)
+                    }
+                });
+                for (i, result) in futures_util::future::join_all(runs).await {
+                    match result {
+                        Ok(entry) => cached[i] = Some(entry),
+                        Err(message) => problems.push(Problem {
+                            message,
+                            assets: vec![asset(&planned[i])],
+                        }),
+                    }
+                }
+            }
+        }
+    }
+
+    let mut ready = Vec::new();
+    for (model, cached) in planned.into_iter().zip(cached) {
+        let Some(cached) = cached else {
+            continue;
+        };
+        match blender::check_facts(&cached.normalized, &model.facts) {
+            Ok(()) => ready.push((model, cached)),
+            Err(e) => problems.push(Problem {
+                message: format!("{}: {e}", asset(&model).file_path),
+                assets: vec![asset(&model)],
+            }),
+        }
+    }
+    Ok(ready)
+}
+
+/// The manifest entry of `model`, read as `read`, from its normalized FBX `cached` (C9): its
+/// bounds from Blender's result, `rig` none without an armature, else generic, its takes as
+/// `clips`, left out when there are none, and its materials as inference gives them (C7), in
+/// Blender's slot order. Its `conversion` is its nearest `conversion.json`'s steps, then
+/// Blender's (C10).
+fn model_entry(
+    model: &PlannedModel,
+    read: &Read,
+    export_packs: &[packs::ExportPack],
+    cached: &CachedModel,
+) -> Result<Value, String> {
+    let normalized = &cached.normalized;
+    let name = read.row.asset_name.as_deref().unwrap_or_default();
+    let pack = read.pack.expect("a planned model's pack");
+    let mut materials = Vec::new();
+    for slot in &normalized.slots {
+        let material = read
+            .row
+            .materials
+            .iter()
+            .find(|m| &m.slot == slot)
+            .ok_or_else(|| {
+                format!("Blender wrote the material slot {slot}, which the Check didn't infer")
+            })?;
+        let textures: serde_json::Map<String, Value> = material
+            .textures
+            .iter()
+            .map(|(role, binding)| (role.as_str().to_string(), binding.asset_name.clone().into()))
+            .collect();
+        materials.push(json!({
+            "slot": slot,
+            "name": material.name,
+            "surface": material.surface,
+            "textures": textures,
+        }));
+    }
+    let mut conversion = model.conversion.clone();
+    conversion.push(blender::step(normalized));
+    let mut entry = json!({
+        "kind": "model",
+        "assetName": name,
+        "file": format!("Models/{name}.fbx"),
+        "sha256": cached.sha256,
+        "pack": export_packs[pack].id,
+        "sourcePath": model.source_path,
+        "conversion": conversion,
+        "bounds": normalized.bounds,
+        "rig": if normalized.has_armature { "generic" } else { "none" },
+        "materials": materials,
+    });
+    if !normalized.takes.is_empty() {
+        entry["clips"] = json!(normalized.takes);
+    }
+    Ok(entry)
+}
+
+/// The manifest of `reads`, the problems its validation adds, the manifest's files and the
+/// Export view's rows, sorted.
+fn finish(
+    domain: &str,
+    reads: Vec<Read>,
+    export_packs: &[packs::ExportPack],
+    problems: &mut Vec<Problem>,
+) -> (Value, Vec<BundleFile>, Vec<CheckedAsset>) {
+    let (manifest, mut invalid, files) = manifest(domain, &reads, export_packs, problems);
     problems.append(&mut invalid);
     let mut rows: Vec<CheckedAsset> = reads.into_iter().map(|r| r.row).collect();
     rows.sort_by(|a, b| {
@@ -1309,25 +1693,7 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput], memo: &infer::Memo) -> Ev
             &b.asset.file_path,
         ))
     });
-    let domain_packs = export_packs
-        .into_iter()
-        .zip(&sources)
-        .map(|(pack, source)| DomainPack {
-            normal_convention: source.normal_convention(),
-            library_id: source.library_id.clone(),
-            path: source.path.clone(),
-            pack,
-        })
-        .collect();
-    Evaluated {
-        assets: rows,
-        packs: domain_packs,
-        problems,
-        manifest,
-        files,
-        probes: walkers.into_iter().map(|w| w.probes).collect(),
-        names: asset_names,
-    }
+    (manifest, files, rows)
 }
 
 /// The file a bundle copies for `output`, made from the files `paths` (relative to the library
@@ -1415,8 +1781,8 @@ fn material_names(materials: &[infer::Material], issue: &mut impl FnMut(String))
 }
 
 /// What refuses a model item exporting from `fbx` (C3): an FBX that can't be read, has two
-/// materials of one name, or has no kept mesh and no take, and the build-order guards on models
-/// and animations. `exported_kind` says which of the two it is.
+/// materials of one name, or has no kept mesh and no take, and the build-order guard on
+/// animations. `exported_kind` says which of the two it is.
 fn read_fbx(fbx: &ItemFbx, item_path: &str, issue: &mut impl FnMut(String)) {
     let what = if fbx.path == item_path {
         "FBX".to_string()
@@ -1439,9 +1805,7 @@ fn read_fbx(fbx: &ItemFbx, item_path: &str, issue: &mut impl FnMut(String)) {
         issue(format!("{what} has {count} materials named {name}"));
     }
     match facts.reading() {
-        Some(Reading::Model) => {
-            issue("model export not built yet (an FBX with a kept mesh exports as a model)".into())
-        }
+        Some(Reading::Model) => {}
         Some(Reading::Animation) => issue("animation export not built yet (an FBX with no kept mesh and a take exports as an animation)".into()),
         None => issue(format!("{what} has no kept mesh and no take")),
     }
@@ -1549,6 +1913,14 @@ fn manifest(
         };
         if refused.contains(read.row.asset.asset_id.as_str()) {
             continue;
+        }
+        if let Some(model) = &read.model {
+            entries.push(Entry {
+                value: model.entry.clone(),
+                asset: &read.row.asset,
+                pack,
+                source: model.source.clone(),
+            });
         }
         for texture in &read.ready {
             let role = texture.role.as_str();
@@ -1937,9 +2309,15 @@ mod tests {
     /// Inspects a new domain holding `paths`, as a Check does before staging.
     async fn inspect_domain(f: &Fixture, paths: &[&str]) -> Inspection {
         collection(f, "domain", "Props", "dg", paths).await;
-        inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
-            .await
-            .unwrap()
+        inspect(
+            &f.db,
+            "domain",
+            &Facts::fixture(),
+            &fresh_memo(),
+            Models::Cached,
+        )
+        .await
+        .unwrap()
     }
 
     /// The manifest entry of the texture `name` in the role `role`.
@@ -1981,7 +2359,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn textures_that_need_work_are_converted_and_only_models_wait() {
+    async fn textures_that_need_work_are_converted() {
         let f = fixture().await;
         let inspection = inspect_domain(
             &f,
@@ -1990,17 +2368,13 @@ mod tests {
                 "Dungeon Props/Rocks/T_Slate_ORM.png",
                 "Dungeon Props/Textures/T_Wall_N_DX.png",
                 "Dungeon Props/Textures/T_Wall_D.jpg",
-                "Dungeon Props/Models/SM_Chest.fbx",
             ],
         )
         .await;
         let report = &inspection.report;
 
-        // The step-5 guard's cases export, and the model guard still refuses
-        assert_eq!(
-            messages(report),
-            ["Dungeon Props/Models/SM_Chest.fbx: model export not built yet (an FBX with a kept mesh exports as a model)"]
-        );
+        // The step-5 guard's cases export
+        assert_eq!(messages(report), Vec::<&str>::new());
         assert_valid(report);
         assert_eq!(
             texture_entries(report),
@@ -3185,11 +3559,7 @@ mod tests {
             messages(&report),
             [
                 "Dungeon Props/Animations/A_Idle.fbx: animation export not built yet (an FBX with no kept mesh and a take exports as an animation)",
-                "Dungeon Props/Models/SK_Guard.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
                 "Dungeon Props/Models/SM_Barrel.obj: it has no FBX file: a model exports from its group's FBX",
-                "Dungeon Props/Models/SM_Chest.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
-                "Dungeon Props/Models/SM_Gate.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
-                "Dungeon Props/Models/SM_Pillar.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
             ]
         );
         let models: Vec<_> = report
@@ -3204,7 +3574,7 @@ mod tests {
                 (
                     "Dungeon Props/Models/SK_Guard.fbx",
                     Kind::Model,
-                    Status::Problem
+                    Status::Ready
                 ),
                 (
                     "Dungeon Props/Models/SM_Barrel.obj",
@@ -3214,17 +3584,17 @@ mod tests {
                 (
                     "Dungeon Props/Models/SM_Chest.fbx",
                     Kind::Model,
-                    Status::Problem
+                    Status::Ready
                 ),
                 (
                     "Dungeon Props/Models/SM_Gate.fbx",
                     Kind::Model,
-                    Status::Problem
+                    Status::Ready
                 ),
                 (
                     "Dungeon Props/Models/SM_Pillar.fbx",
                     Kind::Model,
-                    Status::Problem
+                    Status::Ready
                 ),
             ]
         );
@@ -3288,15 +3658,10 @@ mod tests {
         .await;
         let report = check(&f.db, "domain", &facts, &fresh_memo()).await.unwrap();
 
-        let guard = "model export not built yet (an FBX with a kept mesh exports as a model)";
         let expected = [
-            "Dungeon Props/Models/SM_Bench.fbx: FBX has two materials named Wood".to_string(),
-            format!("Dungeon Props/Models/SM_Bench.fbx: {guard}"),
-            "Dungeon Props/Models/SM_Broken.fbx: FBX can't be read for export: can't read the FBX: not an FBX file".to_string(),
-            "Dungeon Props/Models/SM_Hull.fbx: FBX has no kept mesh and no take".to_string(),
-            format!("Dungeon Props/Models/SM_Lamp.fbx: {guard}"),
-            format!("Dungeon Props/Models/SM_Shelf.fbx: {guard}"),
-            format!("Dungeon Props/Models/SM_Stool.fbx: {guard}"),
+            "Dungeon Props/Models/SM_Bench.fbx: FBX has two materials named Wood",
+            "Dungeon Props/Models/SM_Broken.fbx: FBX can't be read for export: can't read the FBX: not an FBX file",
+            "Dungeon Props/Models/SM_Hull.fbx: FBX has no kept mesh and no take",
         ];
         assert_eq!(messages(&report), expected);
         // SM_Stool's slot finds its JPG base color by the model's name, which becomes a PNG
@@ -4035,9 +4400,15 @@ mod tests {
         assert_eq!(entries(), 7, "every converted texture is cached");
 
         // A second check reads the cache and lists the same bytes
-        let again = inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
-            .await
-            .unwrap();
+        let again = inspect(
+            &f.db,
+            "domain",
+            &Facts::fixture(),
+            &fresh_memo(),
+            Models::Cached,
+        )
+        .await
+        .unwrap();
         assert_eq!(contents(&again), before);
         assert_eq!(
             again.report.manifest["assets"],
@@ -4056,17 +4427,29 @@ mod tests {
         ))
         .unwrap();
         std::fs::write(&rock.source, &marker).unwrap();
-        let hit = inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
-            .await
-            .unwrap();
+        let hit = inspect(
+            &f.db,
+            "domain",
+            &Facts::fixture(),
+            &fresh_memo(),
+            Models::Cached,
+        )
+        .await
+        .unwrap();
         let rock_entry = entry(&hit.report, "Rock", "MetallicSmoothness");
         assert_eq!(rock_entry["sha256"], hashes::sha256_bytes(&marker));
 
         // With the cache cleared, conversion makes the same bytes again
         std::fs::remove_dir_all(&cache).unwrap();
-        let fresh = inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
-            .await
-            .unwrap();
+        let fresh = inspect(
+            &f.db,
+            "domain",
+            &Facts::fixture(),
+            &fresh_memo(),
+            Models::Cached,
+        )
+        .await
+        .unwrap();
         assert_eq!(contents(&fresh), before);
 
         // A changed source is converted again, under a new key
@@ -4074,9 +4457,15 @@ mod tests {
         let mut pixels = image::open(&rough).unwrap().to_rgba8();
         pixels.put_pixel(0, 0, image::Rgba([0, 0, 0, 255]));
         pixels.save(&rough).unwrap();
-        let changed = inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
-            .await
-            .unwrap();
+        let changed = inspect(
+            &f.db,
+            "domain",
+            &Facts::fixture(),
+            &fresh_memo(),
+            Models::Cached,
+        )
+        .await
+        .unwrap();
         let pixels = bundle_pixels(&changed, "Textures/Rock_MetallicSmoothness.png");
         assert_eq!(&pixels.as_bytes()[..8], [0, 0, 0, 255, 0, 0, 0, 75]);
         assert_eq!(entries(), 8);
@@ -4123,9 +4512,15 @@ mod tests {
             .unwrap();
 
         // The Check keys the texture by the bytes it reads, so it converts the new pixels
-        let again = inspect(&f.db, "domain", &Facts::fixture(), &fresh_memo())
-            .await
-            .unwrap();
+        let again = inspect(
+            &f.db,
+            "domain",
+            &Facts::fixture(),
+            &fresh_memo(),
+            Models::Cached,
+        )
+        .await
+        .unwrap();
         assert_eq!(messages(&again.report), Vec::<&str>::new());
         let pixels = bundle_pixels(&again, "Textures/Slab_BaseColor.png");
         assert_eq!(pixels.as_bytes(), sixteen(&[200, 100, 50]));
@@ -4238,7 +4633,6 @@ mod tests {
             messages(&report),
             [
                 "Loose/SM_Table.fbx: it is in no pack: mark its folder as a pack",
-                "Loose/SM_Table.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
                 "Loose/SM_Table.fbx: 2 of its materials are named Wood: slots M_Wood and Wood. Rename one so each name is unique",
             ]
         );
@@ -4284,7 +4678,6 @@ mod tests {
         assert_eq!(
             messages(&report),
             [
-                "Dungeon Props/Models/SM_Table.fbx: model export not built yet (an FBX with a kept mesh exports as a model)",
                 "Dungeon Props/Models/SM_Table.fbx: its material slot 木 gives no PascalCase name (a capital letter, then letters and digits)",
                 "Dungeon Props/Models/SM_Table.fbx: 2 of its materials are named Wood: slots M_Wood and Wood. Rename one so each name is unique",
             ]
@@ -4326,11 +4719,11 @@ mod tests {
         let fbx = "Dungeon Props/Models/SM_Chest.fbx";
         collection(&f, "domain", "Props", "dg", &[fbx]).await;
         let facts = Facts::fixture();
-        let before = inspect(&f.db, "domain", &facts, &fresh_memo())
+        let before = inspect(&f.db, "domain", &facts, &fresh_memo(), Models::Cached)
             .await
             .unwrap();
         assert_eq!(facts.read_files(), [fbx]);
-        let again = inspect(&f.db, "domain", &facts, &fresh_memo())
+        let again = inspect(&f.db, "domain", &facts, &fresh_memo(), Models::Cached)
             .await
             .unwrap();
         assert_eq!(
@@ -4345,7 +4738,7 @@ mod tests {
         let later =
             file.metadata().unwrap().modified().unwrap() + std::time::Duration::from_secs(3600);
         file.set_modified(later).unwrap();
-        let after = inspect(&f.db, "domain", &facts, &fresh_memo())
+        let after = inspect(&f.db, "domain", &facts, &fresh_memo(), Models::Cached)
             .await
             .unwrap();
         assert_eq!(
@@ -4363,7 +4756,9 @@ mod tests {
         collection(&f, "domain", "Props", "dg", &[log]).await;
         let facts = Facts::fixture();
         let memo = fresh_memo();
-        let before = inspect(&f.db, "domain", &facts, &memo).await.unwrap();
+        let before = inspect(&f.db, "domain", &facts, &memo, Models::Cached)
+            .await
+            .unwrap();
         for file in [
             "Unity Moss/Models/SM_Log.fbx.meta",
             "Unity Moss/Textures/T_LeafAtlas.png.meta",
@@ -4376,7 +4771,9 @@ mod tests {
                 + std::time::Duration::from_secs(3600);
             handle.set_modified(later).unwrap();
         }
-        let after = inspect(&f.db, "domain", &facts, &memo).await.unwrap();
+        let after = inspect(&f.db, "domain", &facts, &memo, Models::Cached)
+            .await
+            .unwrap();
         assert_eq!(
             before.fingerprint.changes(&after.fingerprint),
             [
@@ -4384,5 +4781,586 @@ mod tests {
                 "Unity Moss/Textures/T_LeafAtlas.png.meta in Fixture",
             ]
         );
+    }
+
+    /// A Blender at `dir/blender` that reports `version` and leaves `dir/ran` when anything
+    /// runs it.
+    fn stub_blender(dir: &Path, version: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("blender");
+        let ran = dir.join("ran");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nprintf 'Blender {version}\\n'\n",
+                ran.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    async fn set_blender(f: &Fixture, path: &Path) {
+        settings::update(&f.db.master_pool, json!({ "blenderPath": path }))
+            .await
+            .unwrap();
+    }
+
+    /// Inspects the domain as the Export view's Check does, running Blender for the models the
+    /// cache doesn't hold, with the progress it reports.
+    async fn normalize_domain(f: &Fixture, facts: &Facts) -> (Inspection, Vec<Progress>) {
+        let seen = std::sync::Mutex::new(Vec::new());
+        let progress = |p: Progress| seen.lock().unwrap().push(p);
+        let inspection = inspect(
+            &f.db,
+            "domain",
+            facts,
+            &fresh_memo(),
+            Models::Normalize(&progress),
+        )
+        .await
+        .unwrap();
+        (inspection, seen.into_inner().unwrap())
+    }
+
+    /// Puts `normalized` in the fixture library's export cache as what the FBX at `path`, with
+    /// kept slots `slots`, normalizes to in a pack of origin `origin`, keyed as a Check keys it.
+    fn cache_model(
+        f: &Fixture,
+        path: &str,
+        origin: Origin,
+        slots: &[&str],
+        normalized: blender::Normalized,
+    ) -> CachedModel {
+        let root = &f.library.root_path;
+        let sha256 = hashes::sha256_file(&root.join(path)).unwrap();
+        let job = Job {
+            asset: path.into(),
+            kind: JobKind::Model,
+            input: root.join(path),
+            output: PathBuf::new(),
+            origin_facing: origin,
+            facing_quarter_turns: 0,
+            patterns: &collision::PATTERNS,
+            added_material: added_material(slots.iter().copied()),
+        };
+        let key = cache::model_key(&sha256, &job);
+        let fbx = cache::model_fbx(root, &key);
+        std::fs::create_dir_all(fbx.parent().unwrap()).unwrap();
+        std::fs::write(&fbx, format!("{path}, normalized")).unwrap();
+        cache::save_model(root, &key, normalized).unwrap()
+    }
+
+    fn model_entries(report: &CheckReport) -> Vec<&Value> {
+        report.manifest["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["kind"] == "model")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn only_a_model_the_cache_doesnt_hold_looks_for_blender() {
+        let f = fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        set_blender(&f, &stub_blender(dir.path(), "4.5.3 LTS")).await;
+        let ran = dir.path().join("ran");
+        let stool = "Dungeon Props/Models/SM_Stool.fbx";
+
+        // Textures alone never look for Blender
+        collection(
+            &f,
+            "domain",
+            "Props",
+            "dg",
+            &["Dungeon Props/Rocks/T_Rock_R.png"],
+        )
+        .await;
+        let (inspection, progress) = normalize_domain(&f, &Facts::fixture()).await;
+        assert_eq!(messages(&inspection.report), Vec::<&str>::new());
+        assert!(!ran.exists(), "Blender was asked its version");
+        assert_eq!(progress, []);
+
+        // A model the export cache doesn't hold needs Blender, which the gate refuses
+        add_members(&f.db, &f.library, "domain", &[stool]).await;
+        let (inspection, progress) = normalize_domain(&f, &Facts::fixture()).await;
+        let report = &inspection.report;
+        assert_eq!(
+            messages(report),
+            [format!(
+                "{stool}: the export cache doesn't hold its normalized FBX, so Blender must make \
+                 it: Blender 4.5.3 isn't 5.2.x, the only version exports accept"
+            )]
+        );
+        assert_eq!(report.problems[0].assets.len(), 1);
+        assert_eq!(report.problems[0].assets[0].file_path, stool);
+        assert!(ran.exists());
+        assert_eq!(progress, [], "no job ran");
+        assert_eq!(model_entries(report), Vec::<&Value>::new());
+        assert_valid(report);
+
+        // Once the cache holds it, Blender isn't looked for, and the model exports
+        std::fs::remove_file(&ran).unwrap();
+        cache_model(
+            &f,
+            stool,
+            Origin::Generic,
+            &["Material"],
+            blender::test_normalized(&["Material"], None, &[], &[]),
+        );
+        let (inspection, progress) = normalize_domain(&f, &Facts::fixture()).await;
+        assert_eq!(messages(&inspection.report), Vec::<&str>::new());
+        assert!(!ran.exists(), "Blender was asked its version");
+        assert_eq!(progress, []);
+        let models = model_entries(&inspection.report);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["file"], "Models/Stool.fbx");
+        assert_valid(&inspection.report);
+        let files: Vec<&str> = inspection.files.iter().map(|f| f.file.as_str()).collect();
+        assert!(files.contains(&"Models/Stool.fbx"), "{files:?}");
+    }
+
+    #[tokio::test]
+    async fn a_model_entry_has_blender_s_bounds_rig_clips_and_slot_order_after_its_conversion_json()
+    {
+        let f = fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        set_blender(&f, &dir.path().join("no-blender")).await;
+        let guard = "Dungeon Props/Models/SK_Guard.fbx";
+        // Below a conversion.json with a step from uasset, so the pack is unreal
+        let ruin = "Converted/Ruins/SM_Ruin.fbx";
+        add_file(
+            &f,
+            ruin,
+            &fixture_bytes("Dungeon Props/Models/SM_Pillar.fbx"),
+        )
+        .await;
+        let facts = Facts::fixture().with(
+            ruin,
+            Ok(
+                Facts::fixture().by_path["Dungeon Props/Models/SM_Pillar.fbx"]
+                    .clone()
+                    .unwrap(),
+            ),
+        );
+        collection(&f, "domain", "Props", "dg", &[guard, ruin]).await;
+        let bones = ["Hips", "Spine", "Head", "Head_end"];
+        let cached_guard = cache_model(
+            &f,
+            guard,
+            Origin::Generic,
+            &["Cloth"],
+            blender::test_normalized(&["Cloth"], None, &["Wave"], &bones),
+        );
+        // Blender's slot order, which may differ from the worker's
+        let mut normalized = blender::test_normalized(&["Moss", "Stone"], None, &[], &[]);
+        normalized.transform.origin_facing = Origin::Unreal;
+        normalized.dropped_meshes = vec!["UCX_SM_Pillar_00".into()];
+        let cached_ruin = cache_model(&f, ruin, Origin::Unreal, &["Stone", "Moss"], normalized);
+
+        let (inspection, _) = normalize_domain(&f, &facts).await;
+        let report = &inspection.report;
+        assert_eq!(messages(report), Vec::<&str>::new());
+        assert_valid(report);
+        let models = model_entries(report);
+        let blender_step = |origin: &str, dropped: usize| {
+            json!({
+                "tool": "Blender",
+                "toolVersion": "5.2.2",
+                "by": blender::NORMALIZE_VERSION,
+                "from": "fbx",
+                "settings": {
+                    "facingQuarterTurns": 0,
+                    "originFacing": origin,
+                    "pivotX": 0.0,
+                    "pivotY": 0.25,
+                    "pivotZ": 0.0,
+                    "droppedMeshes": dropped,
+                },
+            })
+        };
+        let bounds = json!({"min": [-0.5, 0.0, -0.5], "max": [0.5, 1.0, 0.5]});
+        assert_eq!(
+            *models[0],
+            json!({
+                "kind": "model",
+                "assetName": "Guard",
+                "file": "Models/Guard.fbx",
+                "sha256": cached_guard.sha256,
+                "pack": "dungeon-props",
+                "sourcePath": "Models/SK_Guard.fbx",
+                "conversion": [blender_step("generic", 0)],
+                "bounds": bounds,
+                "rig": "generic",
+                "clips": ["Wave"],
+                "materials": [{
+                    "slot": "Cloth",
+                    "name": "Cloth",
+                    "surface": "opaque",
+                    "textures": {
+                        "BaseColor": "Guard",
+                        "MetallicSmoothness": "Guard",
+                        "Occlusion": "Guard",
+                    },
+                }],
+            })
+        );
+        assert_eq!(
+            *models[1],
+            json!({
+                "kind": "model",
+                "assetName": "Ruin",
+                "file": "Models/Ruin.fbx",
+                "sha256": cached_ruin.sha256,
+                "pack": "ruins",
+                "sourcePath": "SM_Ruin.fbx",
+                "conversion": [
+                    {"tool": "UE Asset Exporter", "toolVersion": "5.4", "from": "uasset"},
+                    blender_step("unreal", 1),
+                ],
+                "bounds": bounds,
+                "rig": "none",
+                "materials": [
+                    {"slot": "Moss", "name": "Moss", "surface": "opaque", "textures": {}},
+                    {"slot": "Stone", "name": "Stone", "surface": "opaque", "textures": {}},
+                ],
+            })
+        );
+        let file = |name: &str| inspection.files.iter().find(|f| f.file == name).unwrap();
+        assert_eq!(file("Models/Guard.fbx").source, cached_guard.fbx);
+        assert_eq!(file("Models/Ruin.fbx").source, cached_ruin.fbx);
+    }
+
+    #[tokio::test]
+    async fn slots_blender_and_the_worker_read_differently_are_a_problem_naming_the_model() {
+        let f = fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        set_blender(&f, &dir.path().join("no-blender")).await;
+        let stool = "Dungeon Props/Models/SM_Stool.fbx";
+        collection(&f, "domain", "Props", "dg", &[stool]).await;
+        cache_model(
+            &f,
+            stool,
+            Origin::Generic,
+            &["Material"],
+            blender::test_normalized(&["Wood"], None, &["Spin"], &[]),
+        );
+
+        let (inspection, _) = normalize_domain(&f, &Facts::fixture()).await;
+
+        let report = &inspection.report;
+        assert_eq!(
+            messages(report),
+            [format!(
+                "{stool}: Blender and the preview engine read different material slots: \
+                 Blender keeps Wood, and the preview engine Material"
+            )]
+        );
+        assert_eq!(report.problems[0].assets[0].file_path, stool);
+        assert_eq!(model_entries(report), Vec::<&Value>::new());
+    }
+
+    /// Every file below `dir`, by its path relative to it.
+    fn bundle_contents(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        walkdir::WalkDir::new(dir)
+            .min_depth(1)
+            .into_iter()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| {
+                let path = e.path().strip_prefix(dir).unwrap().display().to_string();
+                (path, std::fs::read(e.path()).unwrap())
+            })
+            .collect()
+    }
+
+    /// The mesh names of the FBX at `fbx` as Blender imports it, and its vertices in Unity's
+    /// axes.
+    async fn reimport(blender: &Path, fbx: &Path) -> (Vec<String>, Vec<[f64; 3]>) {
+        const READ: &str = "import bpy, json, sys
+bpy.ops.wm.read_homefile(use_empty=True)
+bpy.ops.import_scene.fbx(filepath=sys.argv[-1])
+meshes = [o for o in bpy.data.objects if o.type == 'MESH']
+points = [o.matrix_world @ v.co for o in meshes for v in o.data.vertices]
+print('OPENDAM_REIMPORT', json.dumps({'meshes': sorted(o.name for o in meshes), 'vertices': [[-p.x, p.z, -p.y] for p in points]}))";
+        let output = tokio::process::Command::new(blender)
+            .args(["-b", "--factory-startup", "--python-exit-code", "1"])
+            .args(["--python-expr", READ, "--"])
+            .arg(fbx)
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("OPENDAM_REIMPORT "))
+            .unwrap_or_else(|| panic!("{stdout}"));
+        let read: Value = serde_json::from_str(line).unwrap();
+        (
+            serde_json::from_value(read["meshes"].clone()).unwrap(),
+            serde_json::from_value(read["vertices"].clone()).unwrap(),
+        )
+    }
+
+    /// AC2 for models, AC5 and AC10, with the Blender in `OPENDAM_BLENDER`: the fixture's models
+    /// and textures export end to end, normalized, and export again from the export cache
+    /// without Blender, byte for byte, even once a model's file is renamed.
+    #[tokio::test]
+    async fn the_fixture_s_models_export_normalized_and_again_from_the_cache_byte_identical() {
+        use crate::export::blender::tests::{assert_size, nose};
+        use crate::export::bundle::{ExportOutcome, Exports};
+        let Some(program) = blender::test_blender() else {
+            return;
+        };
+        let f = fixture().await;
+        set_blender(&f, &program).await;
+        let names = [
+            "SK_Guard",
+            "SM_Boulder",
+            "SM_Crate",
+            "SM_Gate",
+            "SM_Lamp",
+            "SM_Pillar",
+            "SM_Shelf",
+            "SM_Stool",
+            "SM_Totem",
+        ];
+        let models: Vec<String> = names
+            .iter()
+            .map(|n| format!("Dungeon Props/Models/{n}.fbx"))
+            .collect();
+        let mut members: Vec<&str> = models.iter().map(String::as_str).collect();
+        members.push("Dungeon Props/Rocks/T_Rock_R.png");
+        collection(&f, "domain", "Props", "dg", &members).await;
+        let exports = Exports::default();
+        let mut facts = Facts::fixture();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let progress = |p: Progress| seen.lock().unwrap().push(p);
+
+        let report = exports
+            .check(&f.db, "domain", &facts, &progress)
+            .await
+            .unwrap();
+
+        assert_eq!(messages(&report), Vec::<&str>::new());
+        assert!(report.staged);
+        // Once before the jobs, then once as each ends
+        let reported = std::mem::take(&mut *seen.lock().unwrap());
+        assert_eq!(
+            reported[0],
+            Progress {
+                done: 0,
+                total: names.len(),
+                asset: None
+            }
+        );
+        let dones: Vec<usize> = reported[1..].iter().map(|p| p.done).collect();
+        assert_eq!(dones, (1..=names.len()).collect::<Vec<_>>());
+        let mut ended: Vec<String> = reported[1..]
+            .iter()
+            .map(|p| p.asset.clone().unwrap())
+            .collect();
+        ended.sort();
+        assert_eq!(ended, models);
+
+        let ExportOutcome::Exported { bundle_path, .. } =
+            exports.export(&f.db, "domain", &facts).await.unwrap()
+        else {
+            panic!("the export was refused");
+        };
+        let bundle = PathBuf::from(&bundle_path);
+        assert_eq!(crate::export::bundle::verify(&bundle, &[]), Ok(()));
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+        let mut listed: Vec<String> = manifest["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["file"].as_str().unwrap().to_string())
+            .chain(["manifest.json".to_string()])
+            .collect();
+        listed.sort();
+        assert_eq!(
+            bundle_contents(&bundle).into_keys().collect::<Vec<_>>(),
+            listed
+        );
+        let model = |name: &str| -> Value {
+            manifest["assets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["kind"] == "model" && a["assetName"] == name)
+                .unwrap_or_else(|| panic!("no model {name} in {manifest:#}"))
+                .clone()
+        };
+        let slots = |name: &str| -> Vec<String> {
+            model(name)["materials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["slot"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let settings = |name: &str| model(name)["conversion"][0]["settings"].clone();
+
+        // Each model, as written and as Blender reads the bundle's file back: (its name, its
+        // slots, its size in metres, its kept meshes)
+        type Expected<'a> = (&'a str, &'a [&'a str], [f64; 3], &'a [&'a str]);
+        let expected: [Expected; 9] = [
+            ("Guard", &["Cloth"], [0.5, 1.8, 0.3], &[]),
+            ("Boulder", &["OpenDAMDefault"], [1.2, 0.8, 1.0], &[]),
+            ("Crate", &["Planks"], [0.0; 3], &[]),
+            (
+                "Gate",
+                &["Iron"],
+                [2.0, 2.5, 0.2],
+                &["SM_Gate_LOD0", "SM_Gate_LOD1"],
+            ),
+            (
+                "Lamp",
+                &["DefaultMaterial", "OpenDAMDefault"],
+                [0.0; 3],
+                &[],
+            ),
+            (
+                "Pillar",
+                &["Stone", "Moss"],
+                [0.6, 3.0, 0.6],
+                &["SM_Pillar_LOD0", "SM_Pillar_LOD1"],
+            ),
+            (
+                "Shelf",
+                &["OpenDAMDefault2", "OpenDAMDefault"],
+                [0.0; 3],
+                &[],
+            ),
+            ("Stool", &["Material"], [0.4, 0.5, 0.4], &["SM_Stool"]),
+            ("Totem", &["Stone"], [0.4, 1.8, 0.4], &["SM_Totem"]),
+        ];
+        for (name, expected_slots, size, meshes) in expected {
+            let entry = model(name);
+            assert_eq!(slots(name), expected_slots, "{name}");
+            let step = &entry["conversion"][0];
+            assert_eq!(entry["conversion"].as_array().unwrap().len(), 1, "{name}");
+            assert_eq!(step["tool"], "Blender");
+            assert_eq!(step["by"], blender::NORMALIZE_VERSION);
+            assert!(
+                step["toolVersion"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("{}.", blender::BLENDER_SERIES)),
+                "{step}"
+            );
+            assert_eq!(entry["file"], format!("Models/{name}.fbx"));
+            let bounds: blender::Bounds = serde_json::from_value(entry["bounds"].clone()).unwrap();
+            if size != [0.0; 3] {
+                assert_size(bounds, size);
+            }
+
+            let (found, vertices) =
+                reimport(&program, &bundle.join(format!("Models/{name}.fbx"))).await;
+            if !meshes.is_empty() {
+                assert_eq!(found, meshes, "{name}");
+            }
+            assert!(
+                found.iter().all(|m| !m.starts_with("UCX_")),
+                "{name} keeps a collision mesh: {found:?}"
+            );
+            let largest = (0..3)
+                .map(|i| bounds.max[i] - bounds.min[i])
+                .fold(0.0, f64::max);
+            for axis in 0..3 {
+                let low = vertices.iter().map(|v| v[axis]).fold(f64::MAX, f64::min);
+                let high = vertices.iter().map(|v| v[axis]).fold(f64::MIN, f64::max);
+                assert!(
+                    (low - bounds.min[axis]).abs() <= largest * 0.001
+                        && (high - bounds.max[axis]).abs() <= largest * 0.001,
+                    "{name} re-imports over {low}..{high} on axis {axis}, not {bounds:?}"
+                );
+            }
+            if name == "Totem" {
+                assert_eq!(nose(&vertices), ["+Z"]);
+            }
+        }
+        assert_eq!(model("Guard")["rig"], "generic");
+        assert_eq!(model("Guard")["clips"], json!(["Wave"]));
+        for name in ["Boulder", "Pillar", "Stool", "Totem"] {
+            assert_eq!(model(name)["rig"], "none", "{name}");
+            assert_eq!(model(name).get("clips"), None, "{name}");
+        }
+        assert_eq!(settings("Pillar")["droppedMeshes"], 1);
+        assert_eq!(settings("Gate")["droppedMeshes"], 1);
+        assert_eq!(settings("Boulder")["addedMaterial"], "OpenDAMDefault");
+        assert_eq!(settings("Shelf")["addedMaterial"], "OpenDAMDefault2");
+        assert_eq!(settings("Stool").get("addedMaterial"), None);
+        // The models' textures are in the bundle beside them
+        let crate_normal = &model("Crate")["materials"][0]["textures"]["Normal"];
+        assert_eq!(crate_normal, "Crate");
+        assert!(bundle.join("Textures/Crate_Normal.png").is_file());
+        let first = bundle_contents(&bundle);
+
+        // AC10: with no Blender to find, a second export reuses the cache, byte for byte
+        let dir = tempfile::tempdir().unwrap();
+        set_blender(&f, &dir.path().join("no-blender")).await;
+        let report = exports
+            .check(&f.db, "domain", &facts, &progress)
+            .await
+            .unwrap();
+        assert_eq!(messages(&report), Vec::<&str>::new());
+        assert_eq!(*seen.lock().unwrap(), [], "a Blender job ran");
+        let diff = report.diff.as_ref().unwrap();
+        assert!(diff.added.is_empty() && diff.changed.is_empty() && diff.removed.is_empty());
+        let outcome = exports.export(&f.db, "domain", &facts).await.unwrap();
+        assert!(
+            matches!(outcome, ExportOutcome::Exported { .. }),
+            "{outcome:?}"
+        );
+        let second = bundle_contents(&bundle);
+        assert_eq!(
+            first.keys().collect::<Vec<_>>(),
+            second.keys().collect::<Vec<_>>()
+        );
+        for (path, bytes) in &first {
+            if path != "manifest.json" {
+                assert!(second[path] == *bytes, "{path} changed");
+            }
+        }
+        let without_time = |bytes: &[u8]| {
+            let mut manifest: Value = serde_json::from_slice(bytes).unwrap();
+            manifest["exportedAt"] = Value::Null;
+            manifest
+        };
+        assert_eq!(
+            without_time(&first["manifest.json"]),
+            without_time(&second["manifest.json"])
+        );
+
+        // AC5: renaming SM_Shelf changes neither its added slot's name nor its cached file
+        let shelf = "Dungeon Props/Models/SM_Shelf.fbx";
+        let renamed = "Dungeon Props/Models/SM_ShelfLow.fbx";
+        let root = &f.library.root_path;
+        std::fs::rename(root.join(shelf), root.join(renamed)).unwrap();
+        crate::watcher::index_paths(&f.db, "fixture", &[root.display().to_string()])
+            .await
+            .unwrap();
+        add_members(&f.db, &f.library, "domain", &[renamed]).await;
+        let shelf_facts = facts.by_path[shelf].clone();
+        facts = facts.with(renamed, shelf_facts);
+        let report = exports
+            .check(&f.db, "domain", &facts, &progress)
+            .await
+            .unwrap();
+        assert_eq!(messages(&report), Vec::<&str>::new());
+        assert_eq!(*seen.lock().unwrap(), [], "a Blender job ran");
+        let entry = model_entries(&report)
+            .into_iter()
+            .find(|m| m["assetName"] == "ShelfLow")
+            .unwrap()
+            .clone();
+        assert_eq!(entry["sha256"], model("Shelf")["sha256"]);
+        assert_eq!(entry["materials"], model("Shelf")["materials"]);
+        assert_eq!(entry["conversion"], model("Shelf")["conversion"]);
     }
 }
