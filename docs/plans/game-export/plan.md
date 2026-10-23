@@ -1035,9 +1035,9 @@ later. Where they differ from C9:
 
 - **A texture edit's layout names:** `layout` is `passThrough` (one role, as it is), `ORM`,
   `MaskMap`, `Roughness`, `Gloss` or `Metallic`. `role` counts only when the layout passes one
-  role through, so writing any other layout drops your role. Layout, role and
-  `normalConvention` reach the image's own group (its 2D stack copies), not the other sources of
-  its set; `assetName` still reaches the whole set.
+  role through, so writing any other layout, or resetting yours, drops your role. Layout, role
+  and `normalConvention` reach the image's own group (its 2D stack copies), not the other
+  sources of its set; `assetName` still reaches the whole set.
 - **A slot's edits are written whole.** A `materials` patch replaces each slot it names, and null
   resets a slot, or every slot as `materials: null`. A role's texture is the asset id of the
   image you picked, `null` for none, and a role left out is inferred.

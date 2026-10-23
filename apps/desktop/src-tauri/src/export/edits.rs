@@ -345,8 +345,10 @@ async fn validate_picks(
 }
 
 /// Applies `patch` to `edits`: each key set to its value, or removed when the value is null.
-/// `materials` merges by slot, each slot's edits replaced by the patch's, or removed when null,
-/// and a layout that doesn't pass one role through drops your role, which it fixes.
+/// `materials` merges by slot, each slot's edits replaced by the patch's, or removed when null.
+/// A layout that doesn't pass one role through drops your role, which it fixes, and so does a
+/// layout reset: the role came with your layout, and under an inferred layout that fixes roles
+/// it would be left counting for nothing, with no control to reset it.
 fn apply(edits: &mut Edits, patch: &Edits) {
     for (key, value) in patch {
         match (key.as_str(), value) {
@@ -386,7 +388,8 @@ fn apply(edits: &mut Edits, patch: &Edits) {
         .get(LAYOUT)
         .and_then(Value::as_str)
         .and_then(LayoutEdit::parse);
-    if matches!(layout, Some(LayoutEdit::Fixed(_))) {
+    let layout_reset = patch.get(LAYOUT).is_some_and(Value::is_null);
+    if layout_reset || matches!(layout, Some(LayoutEdit::Fixed(_))) {
         edits.remove(ROLE);
     }
 }
@@ -908,5 +911,31 @@ mod tests {
             write(pool, &model, &other).await,
             Err("No asset has the id gone".into())
         );
+    }
+
+    #[tokio::test]
+    async fn a_layout_reset_takes_your_role_with_it() {
+        let pool = memory_library_pool().await;
+        insert_path(&pool, "Pack/T_Rock_R.png").await;
+        let id = "Pack/T_Rock_R.png";
+        // A Roughness map made one role, then its layout reset to the inferred Roughness
+        let one_role = patch(json!({"layout": "passThrough", "role": "Height"}));
+        write(&pool, id, &one_role).await.unwrap();
+        let both = r#"{"layout":"passThrough","role":"Height"}"#.to_string();
+        assert_eq!(rows(&pool).await, [(id.to_string(), both)]);
+        write(&pool, id, &patch(json!({"layout": null})))
+            .await
+            .unwrap();
+        assert_eq!(rows(&pool).await, [], "no role is left behind");
+
+        // Your other edits stay
+        let edits =
+            json!({"layout": "passThrough", "role": "Height", "normalConvention": "directx"});
+        write(&pool, id, &patch(edits)).await.unwrap();
+        write(&pool, id, &patch(json!({"layout": null})))
+            .await
+            .unwrap();
+        let left = r#"{"normalConvention":"directx"}"#.to_string();
+        assert_eq!(rows(&pool).await, [(id.to_string(), left)]);
     }
 }
