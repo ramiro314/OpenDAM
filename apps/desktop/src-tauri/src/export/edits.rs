@@ -831,4 +831,22 @@ mod tests {
         }
         assert_eq!(rows(&pool).await, []);
     }
+
+    #[tokio::test]
+    async fn a_model_in_no_pack_has_no_image_to_pick() {
+        let pool = memory_library_pool().await;
+        for path in ["Loose/rock.fbx", "Loose/T_Rock_D.png"] {
+            insert_path(&pool, path).await;
+        }
+        let pick =
+            json!({"materials": {"Rock": {"textures": {"BaseColor": "Loose/T_Rock_D.png"}}}});
+        assert_eq!(
+            write(&pool, "Loose/rock.fbx", &patch(pick)).await,
+            Err(
+                "The model is in no pack, so it has no images to pick: mark its folder as a pack"
+                    .into()
+            )
+        );
+        assert_eq!(rows(&pool).await, []);
+    }
 }

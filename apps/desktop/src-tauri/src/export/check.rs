@@ -4229,4 +4229,43 @@ mod tests {
         let rough = rows.iter().find(|r| r.0.ends_with("T_Iron_R.png")).unwrap();
         assert_eq!(rough.2, "Roughness");
     }
+
+    #[tokio::test]
+    async fn a_pick_no_longer_in_the_pack_is_a_problem_and_binds_nothing() {
+        let f = fixture().await;
+        let crate_ = "Dungeon Props/Models/SM_Crate.fbx";
+        let crate_4k = id_of(&f.library.pool, "Dungeon Props/Textures/4K/T_Crate_N.png").await;
+        let pick = json!({"Planks": {"textures": {"Normal": crate_4k}}});
+        edit(&f, crate_, json!({ "materials": pick })).await;
+        // The picked image leaves the pack after the write, as when its file is deleted
+        sqlx::query("DELETE FROM assets WHERE id = ?")
+            .bind(&crate_4k)
+            .execute(&f.library.pool)
+            .await
+            .unwrap();
+        let report = check_domain(&f, &[crate_]).await;
+        assert!(
+            messages(&report).contains(
+                &"Dungeon Props/Models/SM_Crate.fbx: its material Planks has a Normal you picked that is no longer an image of its pack: pick another in its Game tab, or reset it"
+            ),
+            "{:?}",
+            messages(&report)
+        );
+        let model = report
+            .assets
+            .iter()
+            .find(|a| a.asset.file_path == crate_)
+            .unwrap();
+        assert_eq!(model.status, Status::Problem);
+        assert!(
+            !model.materials[0].textures.contains_key(&Role::Normal),
+            "the role doesn't fall back to the inferred texture"
+        );
+        assert!(
+            !texture_rows(&report)
+                .iter()
+                .any(|r| r.0.ends_with("T_Crate_N.png")),
+            "no normal map joins the domain"
+        );
+    }
 }
