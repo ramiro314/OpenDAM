@@ -95,6 +95,22 @@ Revised again 2026-10-23 (revision 6) after the review's fifth round. No decisio
   - **Lock-free entry points.** Recovery at library open uses lock-free cores, since nothing else
     holds the pool yet (Flow, A11).
 
+Revised again 2026-10-23 (revision 7) after the review's sixth round. No decision changed:
+
+- **R17 - Recovery at library open takes the build's lock.** It runs after `connect_library_sqlite`
+  and before `register_library`, holding `Database::index_lock` for the library id, which exists
+  before the pool and outlives it. A build in steps 1-7 holds that lock, so a library reconnecting
+  mid-session waits for it to finish and never rolls back a live swap (Flow, A11).
+- **R18 - The swap excludes other machines too.**
+  - **The build holds the advisory lock.** It holds the cross-machine `.opendam/index.lock` from
+    step 1 to the end of step 7 or of its rollback, with a heartbeat that keeps the lock from
+    going stale.
+  - **Recovery needs both locks.** Every `swapping` recovery, `rebuild_library`'s included, runs
+    only while holding both locks, and otherwise skips.
+  - **What other machines do.** Another machine's refresh yields, as `index_paths` already does.
+    Its rename or pack edit runs only the structure pass, which prunes nothing (Flow, A11, Known
+    gaps).
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -239,9 +255,22 @@ filesystem, so the swap is a rename. It writes the staged files' manifest rows u
 id while staging, in 200-row transactions. Those rows mean nothing until the commit, because
 `import_packs.current_build` still names the previous build. Then:
 
-1. **Lock.** It takes the library's `Database::index_lock` and holds the guard through step 7.
-   OpenDAM has no live file watcher, so no other index run or structure pass can touch the
-   library meanwhile.
+1. **Lock.** It takes the library's `Database::index_lock` (in-process), then the cross-machine
+   advisory `.opendam/index.lock` (`watcher::IndexLock`, `watcher.rs:21`). It holds both through
+   step 7, or through the end of its rollback.
+   - **Heartbeat.** Today's lock is written once and counts as stale after 120 s
+     (`stale_after`, `watcher.rs:26-60`, `169`). The build rewrites its timestamp every 30 s, so a
+     long step 5 never looks stale to another machine.
+   - **Confirming the lock.** It writes a unique token, waits a moment and re-reads the file. If
+     another machine's token is there, it has lost the race and lets go.
+   - **Another machine holds it.** The build waits for it, up to a limit, then fails the run
+     ("another machine is indexing this library") before step 3. Nothing has changed at that point.
+
+   With both locks held, no index run or structure pass in this process can touch the library.
+   On another machine, a locking index run yields to the advisory lock, as `index_paths` already
+   does, and the structure-only entry points can't start a recovery (below). OpenDAM has no live
+   file watcher.
+
 2. **Re-check under the lock.** It compares the pack's `recipe_rev` with the one the run started
    from, and the live folder with the current manifest plus the drift choices the run was queued
    with. On any difference it stops: it deletes the staging folder and its rows, and fails the
@@ -274,8 +303,9 @@ id while staging, in 200-row transactions. Those rows mean nothing until the com
    and emits `library:updated`.
 
 `index_paths_locked` and `rebuild_library_locked` are new variants of `index_paths` and
-`rebuild_library`. They take the held guard (`&tokio::sync::MutexGuard<'_, ()>`) as proof instead
-of locking. The existing functions take the lock and call them with `Prune::Now`, so every other
+`rebuild_library`. They take both held guards as proof instead of locking: the
+`&tokio::sync::MutexGuard<'_, ()>` and the advisory `IndexLock`. So they never try to take the
+advisory lock again and yield to their own build. The existing functions take the lock and call them with `Prune::Now`, so every other
 caller behaves as today. Between steps 5 and 7 the pack's rows cover both builds' paths, with the
 old structure. The lock keeps every other index run and structure pass out, and the UI refreshes
 once, on step 7's `library:updated`.
@@ -317,39 +347,60 @@ one for leftovers of packs whose `swap_state` is `NULL`. Each has its own trigge
 
 | Trigger | `swapping` table | `swap_state NULL` table |
 |---|---|---|
-| A library opens: startup, or an offline library coming back online | yes | yes, skipping every pack whose run is `queued` or `running` |
-| A locking `index_paths` or `rebuild_library` starts | yes | **never** |
+| A library opens: startup, or an offline library coming back online | yes, holding both locks | yes, holding both locks, skipping every pack whose run is `queued` or `running` |
+| A locking `index_paths` or `rebuild_library` starts | yes, only while holding both locks | **never** |
 
-- **When a library opens.** Recovery runs in `connect_library_sqlite`, before the structure pass
-  it runs today (`db.rs:412-422`). At that point nothing else holds the new pool, and the library
-  isn't registered for index runs yet. That covers startup and a library that comes online later.
-  - **Lock-free cores.** There is no `index_lock` guard to hand to the `_locked` variants here, so
-    recovery calls the lock-free cores directly, as today's pass calls `structure::rebuild(&pool,
-    root)` (`structure.rs:2121`): `watcher::index_pool(pool, root, paths, prune)` (the body of
-    `index_paths` after its library lookup and locks, split out) and `structure::rebuild`. The
-    `_locked` variants and the locking functions are thin wrappers over the same two cores.
-  - **The advisory lock.** Recovery also takes the cross-machine `.opendam/index.lock`, as
+**The safety argument.** A build holds both the in-process `index_lock` and the advisory
+`.opendam/index.lock`, kept fresh by its heartbeat, from step 1 to the end of step 7 or of its
+rollback. It sets and clears `swap_state` only inside that window. So any caller that holds both
+locks and finds a pack `swapping` knows that pack's build is gone, on this machine or any other.
+Every `swapping` recovery holds both locks, and a caller that can't take them skips recovery.
+
+- **When a library opens.** Recovery runs in the library-open path (`open_library` and the
+  startup open), right after `connect_library_sqlite` returns and before `register_library`.
+  - **The in-process lock.** It first takes `db.index_lock(library_id)`. That lock is keyed by the
+    library id in `Database` (`db.rs:670`), so it exists before the pool is registered and
+    outlives any earlier pool of the same library. A build in steps 1-7 holds it. A library
+    reconnecting mid-session therefore waits for that build to commit or roll back, and then
+    finds its `swap_state` `NULL`.
+  - **The advisory lock.** It then takes the cross-machine `.opendam/index.lock`, as
     `index_paths` does (`watcher.rs:169`). If another machine holds it, the open skips recovery.
     The next locking index run handles any `swapping` pack, and the next open handles leftovers.
     Skipping is safe, because nothing is pruned meanwhile.
+  - **Lock-free cores.** The library isn't registered yet, so the `_locked` variants, which look up
+    its handle, can't run. Holding both guards, recovery calls the lock-free cores with the new
+    pool: `watcher::index_pool(pool, root, paths, prune)` (the body of `index_paths` after its
+    library lookup and locks, split out) and `structure::rebuild(&pool, root)`
+    (`structure.rs:2121`). The `_locked` variants and the locking functions are thin wrappers
+    over the same two cores.
+  - **The structure pass at open.** `connect_library_sqlite` already runs it (`db.rs:412-422`), so
+    it now runs before recovery. That pass prunes nothing and reads only `current_build`. If
+    recovery then rolls a pack back, the rollback reruns the pass.
   - **Which runs it skips.** At startup the engine first marks runs found `running` as
     `interrupted`, before any library opens. So at startup no build is in progress, and every
     leftover is recovered. A library reconnecting mid-session can have a build staging for one of
-    its packs. The `swap_state NULL` table skips every pack with a run `queued` or `running`.
-- **At the start of every locking index or structure entry point.** `index_paths` and
-  `rebuild_library`, after taking `index_lock`, first recover any pack still marked `swapping`.
-  They run only the `swapping` table, never the `swap_state NULL` one. A build sets and clears
-  `swap_state` only while it holds the lock, from step 1 through step 7 or the end of its
-  rollback. So a locking caller that gets the lock and finds a pack `swapping` knows its build is
-  gone, for example because the run task panicked and released the guard. A build still staging,
-  before step 1 and without the lock, has `swap_state` `NULL`, so these entry points never touch
-  its staging folder or rows. Only the build itself, and the recovery these entry points run
-  under their guard, call the `_locked` variants, which skip this check.
+    its packs, without the lock. The `swap_state NULL` table skips every pack with a run `queued`
+    or `running`. The `swapping` table needs no skip: a staging build has `swap_state` `NULL`, and
+    a build past step 1 holds the lock this recovery waited for.
+- **At the start of every locking index or structure entry point.** Each one runs only the
+  `swapping` table, never the `swap_state NULL` one, and only while holding both locks:
+  - **`index_paths`** already takes `index_lock`, then the advisory lock, and yields when another
+    machine holds it. With both locks held, it recovers any pack still marked `swapping`, then
+    indexes.
+  - **`rebuild_library`** takes `index_lock` and, newly, *tries* the advisory lock. If it gets it,
+    it recovers any `swapping` pack, then runs its structure pass. If another machine holds it, it
+    skips recovery and runs only the structure pass. That pass prunes no row, so a rename or pack
+    edit on a second machine can't touch a live swap.
+  - **Staging builds are safe.** A build still staging, before step 1 and without either lock, has
+    `swap_state` `NULL`, so these entry points never touch its staging folder or rows. Only the
+    build itself, and the recovery these entry points run under their guards, call the `_locked`
+    variants, which skip this check.
 - **Leftovers of a dead task.** If a build task dies mid-session after its commit (in step 7),
   its `.prev-*` folder and journal stay until the library next opens. Its previous-only rows were
   committed away anyway, and any refresh prunes them as usual. If a task dies while staging, its
   run stays `running` until the app restarts, and its staging folder is removed at the next
-  startup.
+  startup. A dead task's advisory lock stops its heartbeat, so the lock goes stale after 120 s and
+  other machines can recover the pack.
 
 With `swap_state = 'swapping'` and build id B, recovery checks these rows in order, by what is on
 disk. "Live" is the pack folder.
@@ -668,8 +719,8 @@ half manifest.
 ### Remove import
 
 The confirmation lists the pack's files and any drift that removing would lose. Removing runs as
-a `remove` run under the library's `index_lock`, after the same re-check as a build (Flow, step
-2). It deletes exactly the current manifest's files and the folders left empty, then the
+a `remove` run under the library's `index_lock` and the advisory `.opendam/index.lock`, taken and
+kept as a build takes them (Flow, step 1), after the same re-check as a build (Flow, step 2). It deletes exactly the current manifest's files and the folders left empty, then the
 import's records, then runs `index_paths_locked` over the pack folder with `Prune::Now`, which deletes the
 removed files' rows and ends with the structure pass. Removing is idempotent: a
 remove interrupted by a crash is marked `interrupted` and finished at the next startup, since
@@ -693,8 +744,8 @@ confirmation names them.
   and delete change it otherwise, and they record a step in the same transaction. They are
   refused while a run for the pack is queued or running.
 - **Locked variants.** `watcher::index_paths_locked` and `structure::rebuild_library_locked`
-  take a held `index_lock` guard. Code that holds the lock calls these, never the locking
-  functions.
+  take a held `index_lock` guard and the held advisory `IndexLock` guard. Code that holds the locks
+  calls these, never the locking functions.
 - **Pruning waits for the commit.** `index_paths_locked` with `Prune::Defer` deletes no row,
   runs no structure pass, and journals each row it inserts. Only an import build uses it,
   between its swap and its commit. Every
@@ -704,10 +755,15 @@ confirmation names them.
   with every row its index inserts. A rollback deletes the inserted rows, then reverses the moves,
   so neither a rebuild nor its rollback loses metadata (D31).
 - **No pruning index reaches a pack mid-swap.** Cancel takes effect only before a build takes the
-  lock. The `swapping` recovery runs when a library opens, before its structure pass, and at the
-  start of every locking `index_paths` and `rebuild_library`. The leftovers table
-  (`swap_state NULL`) runs only when a library opens, skipping packs with a run queued or running.
-  So no refresh ever deletes a staging folder.
+  lock.
+  - **The build's locks.** From step 1 to the end of step 7 or of its rollback, a build holds both
+    the in-process `index_lock` and the advisory `.opendam/index.lock`, with a 30 s heartbeat.
+  - **Recovery's locks.** Every `swapping` recovery holds both locks, and skips when it can't take
+    them. That covers library open (after `connect_library_sqlite`, before `register_library`),
+    `index_paths` and `rebuild_library`.
+  - **Leftovers.** The leftovers table (`swap_state NULL`) runs only when a library opens, skipping
+    packs with a run queued or running. So no refresh, on any machine, ever deletes a staging
+    folder or rolls back a live swap.
 - **A rollback clears its journal before its folder.** `swap_state` and the failed build's
   records go in one transaction, before `.failed-*` is deleted. Recovery acts only on the states
   the tables list, and changes nothing on disk for any other.
@@ -875,6 +931,20 @@ confirmation names them.
     behind with `swap_state` `NULL` and no run queued or running. A refresh leaves all three in
     place. The next library open removes them: it settles the `.prev`, and deletes the other two
     with their rows.
+  - **A reconnect during the swap.** While the build is in step 5, simulate a library reconnect
+    that reopens its pool. The open's recovery waits on `index_lock`, the swap is untouched, the
+    build commits normally, and the open then finds the pack's `swap_state` `NULL`.
+  - **A second machine during the swap.** A second `Database` instance on the same library folder
+    stands for another machine. While this machine's build is in step 5:
+    - its `index_paths` yields, because the advisory lock is held;
+    - its `rename_asset` runs `rebuild_library`, which skips recovery and prunes nothing.
+
+    The swap is untouched, a tagged previous-only row keeps its tag through the commit, and the
+    build commits.
+
+  - **The heartbeat.** With a test clock, step 5 lasts longer than 120 s. The advisory lock stays
+    fresh, and the second instance still yields. After a simulated dead task stops the heartbeat,
+    the lock goes stale, and the second instance's `index_paths` recovers the pack.
   - **A mid-run change:** a file changed outside OpenDAM, or a step edited, while the build
     stages. The re-check under the lock fails the run, and the live folder is unchanged.
   - **No deadlock:** no call path takes `index_lock` while holding it. A test runs a whole build
@@ -906,6 +976,12 @@ confirmation names them.
   different file's row, that row wins and the moved file starts with a fresh row (D31, A4). A
   file that changes its path in the original itself, as in a new version of a pack, has a new
   `source_path`, so its row isn't carried either.
+- **Cross-machine exclusion is advisory.** Recovery and the swap exclude other machines through
+  `.opendam/index.lock`. Its staleness is judged from the file's mtime against each machine's
+  clock. A 30 s heartbeat against a 120 s limit tolerates up to about 90 s of clock skew between
+  machines; more than that could let another machine take a live build's lock. A share without
+  reliable mtimes, or two machines writing their tokens within the confirmation wait, weakens it
+  the same way. On one machine, `index_lock` alone keeps the guarantee.
 - **Kept files can't be recreated.** Files kept from outside changes are carried by rebuilds,
   but nothing can recreate them if they're lost.
 - **The Unreal step's real run is manual.** The Unreal Editor isn't in CI, so only the stub
