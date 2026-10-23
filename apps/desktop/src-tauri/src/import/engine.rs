@@ -5,7 +5,12 @@
 //! engine claims only its own queued runs, and those of a dead process on its own machine. While
 //! a run is `running`, its task rewrites `heartbeat_at` every 30 s. At startup, a `running` run
 //! whose owner is gone becomes `interrupted`: a dead process on this machine, or another
-//! machine's run whose heartbeat stopped 10 minutes ago.
+//! machine's run whose heartbeat stopped 10 minutes ago. So does one in a library opened later
+//! (`library_opened`).
+//!
+//! A run that ends records how it ended even when another machine marked it `interrupted`
+//! meanwhile (a build suspended past the 10 minutes, say): what its build did on disk, committed
+//! or rolled back, is what happened. The end overwrites only `running` and `interrupted`.
 //!
 //! Progress arrives as `import:progress` events and status changes as `import:updated`. Cancel
 //! takes effect only before a build takes the library's lock (`build::RunControl`).
@@ -122,7 +127,8 @@ impl Engine {
                         self.set_active(None);
                         let _ = sqlx::query(
                             "UPDATE import_runs SET status = 'failed', finished_at = ?,
-                             error = 'The run stopped unexpectedly' WHERE id = ?",
+                             error = 'The run stopped unexpectedly'
+                             WHERE id = ? AND status IN ('running', 'interrupted')",
                         )
                         .bind(now_ms())
                         .bind(&run_id)
@@ -341,7 +347,7 @@ impl Engine {
             .map(|p| p.step);
         let finished = sqlx::query(
             "UPDATE import_runs SET status = ?, error = ?, warnings = ?, phase = ?,
-             finished_at = ? WHERE id = ?",
+             finished_at = ? WHERE id = ? AND status IN ('running', 'interrupted')",
         )
         .bind(status)
         .bind(&error)
@@ -1453,5 +1459,57 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the orphaned queued run was never claimed");
+    }
+
+    #[tokio::test]
+    async fn a_build_that_finishes_after_another_machine_marked_it_interrupted_records_done() {
+        let s = setup().await;
+        let pause = s.engine.hooks().pause(Point::Indexed);
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        pause.reached.notified().await;
+        // Another machine found its heartbeat 10 minutes old.
+        sqlx::query("UPDATE import_runs SET status = 'interrupted' WHERE id = ?")
+            .bind(&run.id)
+            .execute(&s.lib.pool)
+            .await
+            .unwrap();
+        pause.release.notify_one();
+
+        let done = s.wait_for(&run.id, "done").await;
+        assert_eq!(done.error, None);
+        assert_eq!(s.pack().await.0, "built", "the record agrees with the disk");
+        assert_eq!(on_disk(&s.live()), golden("synthetic.place.txt"));
+    }
+
+    #[tokio::test]
+    async fn a_run_ends_only_from_running_or_interrupted() {
+        let s = setup().await;
+        let pause = s.engine.hooks().pause(Point::Indexed);
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        pause.reached.notified().await;
+        sqlx::query("UPDATE import_runs SET status = 'cancelled' WHERE id = ?")
+            .bind(&run.id)
+            .execute(&s.lib.pool)
+            .await
+            .unwrap();
+        pause.release.notify_one();
+
+        // The run's end announces it, unchanged: no other write marks it cancelled.
+        let ended = |e: &ImportEvent| matches!(e, ImportEvent::Updated(r) if r.id == run.id && r.status == "cancelled");
+        let mut announced = false;
+        for _ in 0..500 {
+            announced = s.events.lock().unwrap().iter().any(ended);
+            if announced {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(announced, "the run never ended");
+        assert_eq!(s.pack().await.0, "built");
+        let ended = records::run(&s.lib.pool, "lib", &run.id).await.unwrap();
+        assert_eq!(
+            ended.status, "cancelled",
+            "an end left in no other state is kept"
+        );
     }
 }
