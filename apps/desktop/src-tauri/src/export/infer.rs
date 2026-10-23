@@ -355,7 +355,8 @@ pub struct Binding {
     pub via: Via,
     /// The set's default name (C5), once the domain's sets are named
     pub asset_name: String,
-    /// The set's sources that give the role, relative to the library root
+    /// The set's sources that give the role, relative to the library root, never empty: a
+    /// binding left with none once every model is read is dropped (`check::evaluate`)
     pub files: Vec<String>,
 }
 
@@ -543,8 +544,9 @@ pub fn materials(
                             strong: false,
                         },
                     );
-                    let layout = images.stems[image].layout.unwrap_or(layout);
-                    answers.answer(layout, images.set_of[image], Via::Fbx);
+                    // The layout the image now has, which its set's sources are read by: an
+                    // image referenced as two types gives the roles of the first only
+                    answers.answer(images.layout(image), images.set_of[image], Via::Fbx);
                     break;
                 }
             }
@@ -570,7 +572,7 @@ pub fn materials(
                         strong: true,
                     },
                 );
-                answers.answer(layout, images.set_of[image], Via::Unity);
+                answers.answer(images.layout(image), images.set_of[image], Via::Unity);
             }
         }
 
@@ -621,7 +623,10 @@ pub fn materials(
                         strong: false,
                     },
                 );
-                answers.answer(layout, images.set_of[image], Via::Stem);
+                // Only as a BaseColor: an image another source called something else isn't
+                if images.layout(image).outputs().contains(&Role::BaseColor) {
+                    answers.answer(layout, images.set_of[image], Via::Stem);
+                }
             }
         }
 
@@ -1215,6 +1220,29 @@ mod tests {
         };
         let materials = materials(&mut images, root(), unity.as_ref(), &model);
         (images, materials)
+    }
+
+    #[test]
+    fn an_image_referenced_as_two_types_gives_the_first_types_role_only() {
+        // Blender links Emission Color to the base color image: the image is one BaseColor, and
+        // no Emission binding is left without a file that gives it
+        let (images, screen) = infer_slot(
+            "Dungeon Props",
+            "Dungeon Props/Models/SM_Screen.fbx",
+            "Screen",
+            &[
+                ("baseColor", "../Textures/mattress_01.png"),
+                ("emissive", "../Textures/mattress_01.png"),
+            ],
+        );
+        assert_eq!(
+            textures(&images, &screen[0]),
+            [(
+                Role::BaseColor,
+                paths(&["Dungeon Props/Textures/mattress_01.png"]),
+                Via::Fbx
+            )]
+        );
     }
 
     #[test]

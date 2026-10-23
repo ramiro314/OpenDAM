@@ -729,6 +729,17 @@ fn evaluate(domain: &str, inputs: &mut [LibraryInput]) -> Evaluated {
         }
     }
 
+    // Every hint is in now, so a binding whose set no longer gives its role (another model's
+    // Unity material called its image something else) has no texture, and is dropped
+    for (r, key) in &models {
+        let images = &catalogs[key];
+        for material in &mut reads[*r].row.materials {
+            material
+                .textures
+                .retain(|role, b| !images.role_sources(b.set, *role).is_empty());
+        }
+    }
+
     // The sets the models use, with the models using them (D24)
     let mut users: BTreeMap<(PackKey, usize), Vec<infer::SetUse>> = BTreeMap::new();
     for (m, (r, key)) in models.iter().enumerate() {
@@ -2981,6 +2992,14 @@ mod tests {
             crate_.materials[0].textures[&Normal].files,
             ["Dungeon Props/Textures/1K/T_Crate_N.png"]
         );
+        // Every binding names a file that gives its role
+        for asset in &report.assets {
+            for material in &asset.materials {
+                for binding in material.textures.values() {
+                    assert!(!binding.files.is_empty(), "{}", asset.asset.file_path);
+                }
+            }
+        }
 
         use Status::*;
         let dx = None;
@@ -3109,6 +3128,41 @@ mod tests {
             ]
         );
         assert_valid(&report);
+    }
+
+    #[tokio::test]
+    async fn a_binding_another_model_leaves_without_a_file_is_dropped() {
+        let f = fixture().await;
+        // Read before SM_Log: its FBX calls T_LeafAtlas, which has no suffix, a normal map.
+        // SM_Log's Leaves.mat then says it is a base color, which wins
+        let leaf = "Unity Moss/Models/SM_Leaf.fbx";
+        add_file(&f, leaf, &fixture_bytes("Unity Moss/Models/SM_Log.fbx")).await;
+        let facts = Facts::fixture().with(
+            leaf,
+            Ok(serde_json::from_value(json!({
+                "slots": [{"name": "Frond", "textures": {"normal": [
+                    {"file": null, "relative": "../Textures/T_LeafAtlas.png"}
+                ]}}],
+                "kept_meshes": ["SM_Leaf"], "dropped_meshes": [], "has_kept_mesh": true,
+                "kept_mesh_without_material": false, "bones": [], "takes": [],
+            }))
+            .unwrap()),
+        );
+        let report = check_domain_with(&f, &[leaf, "Unity Moss/Models/SM_Log.fbx"], &facts).await;
+
+        assert_eq!(materials_of(&report, leaf)[0].5, []);
+        let leaves = &materials_of(&report, "Unity Moss/Models/SM_Log.fbx")[1];
+        assert_eq!(
+            leaves.5,
+            [(Role::BaseColor, "LogLeaves".to_string(), Via::Unity)]
+        );
+        for asset in &report.assets {
+            for material in &asset.materials {
+                for binding in material.textures.values() {
+                    assert!(!binding.files.is_empty(), "{}", asset.asset.file_path);
+                }
+            }
+        }
     }
 
     #[tokio::test]
