@@ -253,6 +253,12 @@ pub async fn build_first(
     let root = env.library.root_path.clone();
     let live = root.join(&recipe.target);
     let build_id = uuid::Uuid::new_v4().to_string();
+    if !plainly_inside(&root, &live) {
+        return Err(Stop::Failed(format!(
+            "A folder on the way to {} is a link: a pack is built only inside the library",
+            recipe.target
+        )));
+    }
     let created = missing_folders(&root, &live);
     let staging = fs_swap::create_staging(&live, STAGING, &build_id).map_err(|e| {
         remove_created(&created);
@@ -326,6 +332,9 @@ async fn swap_in(
     }
 
     // ── 2. Re-check ─────────────────────────────────────────────────────
+    if !plainly_inside(&env.library.root_path, &live) {
+        return Err(cleanup.run(Stop::Failed(CHANGED.to_string())).await);
+    }
     if let Err(stop) = recheck(pool, recipe, queued_rev, &live, staging, build_id, outputs).await {
         return Err(cleanup.run(stop).await);
     }
@@ -480,6 +489,19 @@ async fn swap_in(
         tracing::warn!("Settling the records of {}: {e}", recipe.target);
     }
     Ok(())
+}
+
+/// Whether the pack folder `live` stays where it says, inside the library at `root`: no folder
+/// between them that exists is a symlink, so staging, the swap and a rollback never reach
+/// outside the library or into another folder of it.
+pub(crate) fn plainly_inside(root: &Path, live: &Path) -> bool {
+    let (Ok(root_real), Ok(rel)) = (root.canonicalize(), live.strip_prefix(root)) else {
+        return false;
+    };
+    live.ancestors()
+        .find(|dir| dir.symlink_metadata().is_ok())
+        .and_then(|dir| Some((dir.canonicalize().ok()?, dir.strip_prefix(root).ok()?)))
+        .is_some_and(|(real, below)| real == root_real.join(below) && rel.starts_with(below))
 }
 
 /// The folders between `root` and `live` (exclusive) that don't exist yet, deepest first, so a

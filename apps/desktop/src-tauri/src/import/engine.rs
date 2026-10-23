@@ -264,7 +264,12 @@ impl Engine {
         self.updated(library, &run.id).await;
 
         let latest: Arc<Mutex<Option<Progress>>> = Default::default();
-        let heartbeat = tokio::spawn(beat(library.pool.clone(), run.id.clone(), latest.clone()));
+        // Aborted on drop, so a panicking build doesn't leave it beating.
+        let heartbeat = AbortOnDrop(tokio::spawn(beat(
+            library.pool.clone(),
+            run.id.clone(),
+            latest.clone(),
+        )));
         let mut warnings = Vec::new();
         let mut outcome = Ok(());
         for pack in &run.packs {
@@ -311,7 +316,7 @@ impl Engine {
                 break;
             }
         }
-        heartbeat.abort();
+        drop(heartbeat);
 
         let (status, error) = match &outcome {
             Ok(()) => ("done", None),
@@ -473,6 +478,15 @@ struct Queued {
     packs: Vec<QueuedPack>,
 }
 
+/// Aborts its task when dropped, unlike a bare `JoinHandle`.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Rewrites a running run's heartbeat, with its latest progress, every 30 s until aborted.
 async fn beat(pool: Pool<Sqlite>, run_id: String, latest: Arc<Mutex<Option<Progress>>>) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
@@ -543,6 +557,11 @@ fn original(path: &str, root: &Path) -> Result<PathBuf, String> {
 async fn check_target(pool: &Pool<Sqlite>, root: &Path, target: &str) -> Result<(), String> {
     if root.join(target).symlink_metadata().is_ok() {
         return Err(format!("{target} already exists in the library"));
+    }
+    if !build::plainly_inside(root, &root.join(target)) {
+        return Err(format!(
+            "A folder on the way to {target} is a link: a pack is built only inside the library"
+        ));
     }
     let targets: Vec<String> = sqlx::query_scalar("SELECT target FROM import_packs")
         .fetch_all(pool)
@@ -1036,6 +1055,20 @@ mod tests {
         assert_eq!(error, "Name the pack's publisher");
         assert_eq!(s.count("SELECT COUNT(*) FROM imports").await, 0);
 
+        // A folder on the way that is a link, out of the library or into another of its folders.
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), s.dir.path().join("Linked")).unwrap();
+        std::os::unix::fs::symlink(s.dir.path().join("Other"), s.dir.path().join("Inner")).unwrap();
+        for target in ["Linked/Pack", "Inner/Pack"] {
+            let error = refused(target).await.unwrap_err();
+            assert_eq!(
+                error,
+                format!("A folder on the way to {target} is a link: a pack is built only inside the library")
+            );
+        }
+        assert_eq!(s.count("SELECT COUNT(*) FROM imports").await, 0);
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+
         // A pack recorded at Kits/Rock, with nothing on disk yet.
         for sql in [
             "INSERT INTO imports (id, original_path, original_size, original_mtime_ns,
@@ -1260,5 +1293,38 @@ mod tests {
         assert!(!s.dir.path().join("Pub").exists());
         s.no_leftovers();
         assert_eq!(s.count("SELECT COUNT(*) FROM import_outputs").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_link_made_on_the_way_to_the_target_after_the_import_fails_the_build() {
+        let s = setup_with(false).await;
+        let mut request = s.golden_request();
+        request.target = "Late/Pack".into();
+        let run = s.engine.start_import(request).await.unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), s.dir.path().join("Late")).unwrap();
+
+        tokio::spawn(s.engine.clone().start());
+        let failed = s.wait_for(&run.id, "failed").await;
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("A folder on the way to Late/Pack is a link: a pack is built only inside the library")
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert_eq!(s.count("SELECT COUNT(*) FROM import_outputs").await, 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_heartbeat_guard_stops_its_task() {
+        let (alive, stopped) = tokio::sync::oneshot::channel::<()>();
+        let guard = AbortOnDrop(tokio::spawn(async move {
+            let _alive = alive;
+            std::future::pending::<()>().await
+        }));
+        drop(guard);
+        let ended = tokio::time::timeout(Duration::from_secs(5), stopped)
+            .await
+            .expect("the task still runs");
+        assert!(ended.is_err(), "the task let its sender go");
     }
 }
