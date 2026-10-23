@@ -6593,6 +6593,58 @@ mod tests {
         assert_eq!(kinds, Vec::<&Value>::new());
     }
 
+    /// An animation follows its model's result, so when that model's Blender job fails in the
+    /// same Check, the animation is a problem naming both, and its own job never runs.
+    #[tokio::test]
+    async fn an_animation_whose_model_s_job_fails_is_refused_without_a_job_of_its_own() {
+        let f = fixture().await;
+        collection(&f, "domain", "Props", "dg", &[GUARD, IDLE]).await;
+        // Answers its version, and leaves no result for any job
+        let dir = tempfile::tempdir().unwrap();
+        set_blender(&f, &stub_blender(dir.path(), "5.2.2")).await;
+
+        let (inspection, progress) = normalize_domain(&f, &Facts::fixture()).await;
+
+        let report = &inspection.report;
+        assert_eq!(
+            messages(report),
+            [
+                format!("{GUARD}: Blender exited without a result: Blender 5.2.2"),
+                format!(
+                    "{IDLE}: the model it follows, {GUARD}, wasn't normalized, so it can't \
+                     follow it"
+                ),
+            ]
+        );
+        let named: Vec<Vec<&str>> = (report.problems.iter())
+            .map(|p| p.assets.iter().map(|a| a.file_path.as_str()).collect())
+            .collect();
+        assert_eq!(named, [[GUARD], [IDLE]]);
+        // Asked its version, then the guard's job: the animation's never ran
+        let runs = std::fs::read_to_string(dir.path().join("ran")).unwrap();
+        assert_eq!(runs.lines().count(), 2, "{runs}");
+        // Both jobs are counted, the animation's ending without Blender
+        let ended: Vec<(usize, Option<&str>)> = (progress.iter())
+            .map(|p| (p.done, p.asset.as_deref()))
+            .collect();
+        assert_eq!(ended, [(0, None), (1, Some(GUARD)), (2, Some(IDLE))]);
+        assert_eq!(progress[0].total, 2);
+        let row = (report.assets.iter())
+            .find(|a| a.asset.file_path == IDLE)
+            .unwrap();
+        assert_eq!((row.kind, row.status), (Kind::Animation, Status::Problem));
+        let kinds: Vec<&Value> = (report.manifest["assets"].as_array().unwrap().iter())
+            .map(|a| &a["kind"])
+            .filter(|k| *k != "texture")
+            .collect();
+        assert_eq!(
+            kinds,
+            Vec::<&Value>::new(),
+            "a model or animation was listed"
+        );
+        assert_valid(report);
+    }
+
     /// AC6 with the Blender in `OPENDAM_BLENDER`: the fixture's animations export following their
     /// model, the one whose bones don't match is refused, the FBX whose only mesh is a `UCX_` hull
     /// exports as an animation, and turning the model re-runs the animations' jobs, whose clips
