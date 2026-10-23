@@ -6003,6 +6003,44 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_commands_pass_still_runs_while_another_machine_holds_the_advisory_lock() {
+        let dir = tempfile::Builder::new()
+            .prefix("opendam-lib-")
+            .tempdir()
+            .unwrap();
+        let lock_file = dir.path().join(".opendam/index.lock");
+        std::fs::create_dir_all(dir.path().join(".opendam")).unwrap();
+        let pool = memory_library_pool().await;
+        let library = LibraryHandle {
+            root_path: dir.path().to_path_buf(),
+            ..crate::db::memory_library("lib", pool.clone())
+        };
+        let db = crate::db::memory_database(vec![library.clone()]).await;
+        insert_path(&pool, "kits/kit/model.glb").await;
+        insert_path(&pool, "kits/other/rock.glb").await;
+        rebuild(&pool, &library.root_path).await.unwrap();
+
+        // Another machine's fresh lock, and a command that changed the indexed paths.
+        std::fs::write(&lock_file, "another machine").unwrap();
+        sqlx::query("DELETE FROM assets WHERE file_path = 'kits/other/rock.glb'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        rebuild_library(&db, &library).await;
+
+        assert_eq!(
+            derived_rows(&pool).await,
+            fresh_pass(&["kits/kit/model.glb"]).await,
+            "the pass ran, as it always has"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock_file).unwrap(),
+            "another machine",
+            "the other machine's lock is left alone"
+        );
+    }
+
+    #[tokio::test]
     async fn a_commands_pass_waits_for_the_index_run_holding_the_lock() {
         let pool = memory_library_pool().await;
         let library = crate::db::memory_library("lib", pool.clone());
