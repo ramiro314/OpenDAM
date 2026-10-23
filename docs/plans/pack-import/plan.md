@@ -1,6 +1,33 @@
 # Pack import: prepare packs from their originals, recorded and reversible
 
-Status: shaped 2026-10-22 in a four-round interview (D1-D30 below). Awaiting final review.
+Status: shaped 2026-10-22 in a four-round interview (D1-D30 below), approved at final review
+(revision 1).
+
+Revised 2026-10-22 (revision 2) after the workflow's Plan Feasibility review. These are design
+repairs within the decisions. One decision is narrowed: D29's committed binary `.mat` fixture
+isn't possible, as R6 explains.
+
+- **R1 - Hidden Unity `.mat`.** The structure pass can't see `.mat.meta`, since `.meta` files
+  aren't indexed. The rule now reads the import's output manifest, a DB table the pass already
+  reads like `pack_overrides`, so `structure::derive` stays pure (Unity-only files).
+- **R2 - The swap's commit point.** A build id, a swap journal in the DB, one commit transaction,
+  rollback when indexing fails, recovery for each crash point, `_locked` variants of the index and
+  structure passes so the held lock doesn't deadlock, and no lost edits during a long run
+  (Flow, Runs, A11).
+- **R3 - Edits to generated files.** `rename` and `exclude` steps name extracted files by their
+  path in the original. A generated GLB follows its source model, and `datapackage.json` is
+  edited through the metadata step, never by a step of its own (Edits after an import, A5).
+- **R4 - Absolute original paths.** These are now an explicit exception to the relative-paths
+  invariant (Changes to the invariants).
+- **R5 - Layouts.** The Kenney layout is checked against the extracted bundle (246 packs, each
+  `<Category>/<Pack>/License*.txt`). The Fab Unity layout is unverified on this machine, so
+  detection no longer assumes one, and A16 checks a real download by hand. The Unreal preview's
+  content is now defined.
+- **R6 - Fixtures and goldens.** A committed generator builds them, and the goldens come from
+  running your scripts once (Fixtures and goldens, A3, A7, A8).
+  - **D29 is narrowed.** The synthetic package can't hold a binary `.mat`: a real one would be
+    Asset Store content, which can't be committed, and nothing available writes the format. The
+    binary path is tested by an env-gated worker test and by hand instead (A17, Known gaps).
 
 ## Problem
 
@@ -22,9 +49,20 @@ Facts that shape the design:
 
 - **The originals.**
   - 21 `.unitypackage` files sit in `~/.local/share/unity3d/Asset Store-5.x/<Publisher>/<Category>/`.
-  - Fab downloads are zips holding one `.unitypackage` per render pipeline, or an Unreal project.
-  - The Kenney All-in-1 is a zip from itch.io: about 200 packs, under category folders
-    (`2D assets`, `3D assets`, `Audio`, `UI assets`), each holding a `License*.txt`.
+  - Fab downloads are zips holding a Unity package or an Unreal project. The Unity zips' inner
+    layout is unverified (below).
+  - The Kenney All-in-1 is a zip from itch.io. Its extracted copy in `~/Documents/Assets/Kenney`
+    holds 246 packs, each a folder directly holding a `License*.txt`, all exactly two levels
+    down: `<Category>/<Pack>/License.txt`. The categories are `2D assets` (151), `3D assets`
+    (54), `Audio` (16), `UI assets` (10), `Icons` (8), `Archive` (3), `Early access` (2) and
+    `Other` (2). Whether the zip wraps them in one more top folder is unknown, so detection
+    strips a top folder that every entry shares, as `extract_unity.py` does.
+  - **No Fab Unity download is on this machine.** AGENTS.md says a Fab zip holds a
+    `.unitypackage` that `extract_unity.py --package` extracts, and the Stylarts packs came "in
+    their Unity Built-in version", which suggests a download per render pipeline. The extracted
+    Spooky Cemetery Crypt shows `Built-In/Built-In_SpookyCemeteryCyrpt/`, which suggests pipeline
+    folders inside a package. Neither layout is confirmed, so detection handles both (Presets),
+    and A16 checks a real download.
   - `~/Downloads/Waterways.zip` is a Fab Unreal original: 3 GB, a content-only project with
     `Feif.uproject` at its root (named unlike the pack), 874 `.uasset` files, plus levels and
     blueprints.
@@ -36,6 +74,12 @@ Facts that shape the design:
   beside the target is never indexed.
 - **`.mat` is indexed** as a Material (`SUPPORTED_EXTENSIONS`), but `.meta`, `.prefab`, `.unity`
   and `.cs` are not.
+- **The structure pass reads DB state as inputs.** `structure::derive` (`structure.rs:492`) is
+  pure: it takes the indexed paths and sizes plus `Overrides`, read from `pack_overrides` by
+  `read_overrides` (`structure.rs:319`), and reads no file on a rerun.
+- **`index_lock` isn't re-entrant.** It is a `tokio::sync::Mutex` per library (`db.rs:670`).
+  `watcher::index_paths` takes it (`watcher.rs:164`), and so does `structure::rebuild_library`
+  (`structure.rs:2307`). A caller that already holds it and calls either one deadlocks.
 - **Reusable pieces:**
   - `export/bundle.rs`: `stage`, `swap` and `recover`, which stage beside a folder and swap it
     in by rename. `swap` deletes the old folder.
@@ -81,7 +125,7 @@ Facts that shape the design:
 | D26 | UI | A new **Imports view** (each import's original, status, progress, errors and packs, plus the Import pack button) and a **Preparation** section in a pack's details that opens the same step editor. |
 | D27 | Removing an import | **Delete exactly the files the recipe produced** (after confirming, and listing any outside changes it would lose) and drop the record. Your tags and ratings go with the assets, as on delete. |
 | D28 | Porting the scripts | File work (tar/zip extraction, flatten, hoist, `datapackage.json`) **in Rust**. `unity_gltf.py` and `ue_gltf_export.py` **embedded as versioned scripts** like `normalize.py`, with their heuristics kept as they are. `unity_binary_to_text` in the preview worker. |
-| D29 | Testing | Small committed fixtures (a synthetic `.unitypackage` with nested and binary files, a Fab-style zip, a Kenney-style zip); the Unity GLB step under CI's Blender; the Unreal step with a stub editor in CI, plus a manual run on `Waterways.zip` as an acceptance item. |
+| D29 | Testing | Small committed fixtures (a synthetic `.unitypackage` with nested and binary files, a Fab-style zip, a Kenney-style zip); the Unity GLB step under CI's Blender; the Unreal step with a stub editor in CI, plus a manual run on `Waterways.zip` as an acceptance item. Revision 2 narrows this: the binary files can't be a committed fixture (R6). |
 | D30 | The scripts in `~/Documents/Assets` | **Untouched** by this work. You retire them after your re-import. |
 
 ## Design
@@ -94,7 +138,7 @@ Facts that shape the design:
 - **Pack recipe:** for one pack, a *source* inside the original (the whole `.unitypackage`, a
   variant `.unitypackage` inside a zip, a sub-folder of a zip, or the Unreal project), a
   *target* folder relative to the library root, and an ordered list of **steps**.
-- **Output manifest:** every file the last successful build wrote into the target: its path,
+- **Output manifest:** every file the committed build wrote into the target: its path,
   size, mtime, sha256, its **origin** (`extracted`, `generated` or `kept`), and for an
   extracted or generated file, its path in the original.
 - **Run:** one import or rebuild of one or more packs, executed in the background.
@@ -104,35 +148,68 @@ Facts that shape the design:
 ```mermaid
 flowchart LR
   O[Original<br/>.unitypackage / .zip<br/>read only] --> X[Extract]
-  subgraph S[Staging: library/.Pack.import-uuid]
+  subgraph S[Staging: library/.Pack.import-build-id]
     X --> P[Place: flatten, hoist,<br/>rename, exclude]
     P --> C[Convert: Unity GLB<br/>or Unreal GLB]
     C --> M[Metadata:<br/>datapackage.json]
   end
   C <--> K[(Conversion cache<br/>~/.cache/opendam/import)]
   C -.-> T[Blender / UE editor<br/>systemd scope, MemoryMax]
-  M --> D{Drift check vs<br/>last manifest}
-  D --> W[Swap by rename<br/>keep previous until indexed]
+  M --> D{Drift check vs<br/>current manifest}
+  D --> W[Under index_lock: re-check,<br/>journal, swap by rename]
   W --> L[Library folder]
-  L --> I[index_paths +<br/>structure pass]
+  L --> I[index_paths_locked +<br/>rebuild_library_locked]
+  I --> CM[Commit: flip current_build<br/>else roll back to .prev]
 ```
 
-A build never writes into the live pack folder. It builds the whole pack in a staging folder
-beside the target, on the same filesystem, so the swap is a rename. Then:
+A build never writes into the live pack folder. Each build has a new **build id**. It builds
+the whole pack in a staging folder (`.<Pack>.import-<build id>`) beside the target, on the same
+filesystem, so the swap is a rename. It writes the staged files' manifest rows under that build
+id while staging, in 200-row transactions. Those rows mean nothing until the commit, because
+`import_packs.current_build` still names the previous build. Then:
 
-1. It checks the live folder against the last manifest (drift, below).
-2. It takes the library's `Database::index_lock`, so no refresh indexes the moment between the
-   two renames (OpenDAM has no live file watcher; indexing is always an explicit run), and it
-   holds the lock through step 4.
-3. It renames the live folder to `.<Pack>.prev-<uuid>` and the staged folder into place.
-4. It runs `watcher::index_paths` over the pack and the structure pass, under the library's
-   index lock.
-5. It deletes the previous folder only after indexing succeeds.
+1. **Lock.** It takes the library's `Database::index_lock` and holds the guard through step 6.
+   OpenDAM has no live file watcher, so no other index run or structure pass can touch the
+   library meanwhile.
+2. **Re-check under the lock.** It compares the pack's `recipe_rev` with the one the run started
+   from, and the live folder with the current manifest plus the drift choices the run was queued
+   with. On any difference it stops: it deletes the staging folder and its rows, and fails the
+   run with "the pack changed during the build; Rebuild again". Cached conversions make the
+   retry cheap.
+3. **Journal.** It sets `import_packs.swap_state = 'swapping'` with the build id, in one
+   transaction.
+4. **Swap.** It renames the live folder to `.<Pack>.prev-<build id>`, then the staging folder to
+   the live name. A pack's first build has no live folder and skips the first rename.
+5. **Index.** It runs `watcher::index_paths_locked` over the pack folder, then
+   `structure::rebuild_library_locked`. These are new variants of `index_paths` and
+   `rebuild_library` that take the held guard (`&tokio::sync::MutexGuard<'_, ()>`) as proof
+   instead of locking. The existing functions take the lock and call them.
+6. **Commit.** In one transaction it sets `current_build` to the new build id, `status = 'built'`
+   and `swap_state = NULL`. This is the **commit point**. The lock is released after it.
+7. **Clean up.** It deletes the previous folder and the old build's manifest rows. A crash here
+   leaves only garbage that recovery deletes.
 
-Startup recovery handles a crash mid-swap as `bundle::recover` does: leftover staging is
-deleted, and a `.prev` folder without its successor is restored. The swap, staging and recovery
-code moves out of `export/bundle.rs` into a shared `fs_swap` module that both features use, with
-a flag that keeps the old folder.
+**Indexing fails** (step 5): the build rolls back while still holding the lock. It renames the
+live folder to `.<Pack>.failed-<build id>` and the previous folder back. It reruns
+`index_paths_locked` and `rebuild_library_locked` so the rows match the restored folder, clears
+`swap_state`, deletes the failed folder and the new build's rows, and fails the run. A path that
+existed in both builds keeps its asset row throughout, because rows are matched by path.
+
+**Startup recovery** runs for each imported pack before any run starts, under the library's
+lock. It goes by `swap_state` and what is on disk:
+
+| State found | Meaning | Recovery |
+|---|---|---|
+| `swap_state` NULL, a `.import-*` staging folder | Crashed while staging | Delete the folder and that build's rows. |
+| `'swapping'`, `.prev-<id>` present, live folder missing | Crashed between the two renames | Rename `.prev` back to live. |
+| `'swapping'`, `.prev-<id>` and live both present | Swapped, not committed | Roll back as for a failed index: set the live folder aside, restore `.prev`, re-index the pack, delete the new build's rows. |
+| `'swapping'`, staging present, no `.prev` (first build) | Crashed before or during the swap | Delete the staging folder and its rows. |
+| `swap_state` NULL, a `.prev-*` folder, `current_build` is newer | Committed, not cleaned up | Delete `.prev` and rows of builds other than `current_build`. |
+
+Then it clears `swap_state` and marks the run `interrupted`. Recovery never rolls forward: an
+uncommitted build is always discarded, and the cached conversions make its rerun cheap. The swap,
+staging and recovery code moves out of `export/bundle.rs` into a shared `fs_swap` module that both
+features use, with a flag that keeps the old folder until the caller commits.
 
 ### Steps
 
@@ -141,22 +218,32 @@ they run in recipe order. Each step has `enabled` and JSON `options`.
 
 | Step | Phase | Options | Behavior (ported from) |
 |---|---|---|---|
-| `extract_unitypackage` | extract | `variant` (the inner path of the chosen `.unitypackage` in a zip) | Unpacks the tar.gz by GUID, rebuilds `pathname`s, drops `Assets/` and a top folder every file shares, refuses paths that escape the target, **keeps every file and each `.meta`**, and unpacks nested packages into a folder named after each (`extract_unity.py`). |
+| `extract_unitypackage` | extract | `variant` (the inner path of the chosen `.unitypackage` in a zip), `subpath` (a pipeline folder inside the package, else all of it) | Unpacks the tar.gz by GUID, rebuilds `pathname`s, drops `Assets/` and a top folder every file shares, refuses paths that escape the target, **keeps every file and each `.meta`**, and unpacks nested packages into a folder named after each (`extract_unity.py`). |
 | `extract_zip` | extract | `subpath` | Copies one sub-folder of a zip, or all of it. Refuses absolute and `..` entries and symlinks. |
 | `export_unreal` | extract | `batch` (30) | The Unreal pack's producer (below). Its GLBs are the extracted files. |
 | `flatten` | place | none | Merges the root's only folder into the root while nothing else there is an asset (docs, `.meta` and `datapackage.json` don't count), repeatedly. Moves each `.meta` with its file, and stops the build on a name clash (`flatten_pack.py`). |
 | `hoist` | place | `folder` | Moves one folder's contents up to the pack root, with the same clash rule. |
-| `rename` | place | `from`, `to` | Recorded by an in-app rename (D10). |
-| `exclude` | place | `path` | Recorded by an in-app delete (D10). Drops the file and its `.meta`. |
+| `rename` | place | `source` (the file's path in the original), `name` (the new file name) | Recorded by an in-app rename (D10). Renames the extracted file wherever earlier steps put it, and its `.meta` with it. |
+| `exclude` | place | `source` (the file's path in the original) | Recorded by an in-app delete (D10). Drops the extracted file and its `.meta`. |
 | `unity_glb` | convert | `max_texture` (1024), `force` | Runs the embedded `unity_glb.py` (ported `unity_gltf.py`) in Blender on a work copy, then writes `X.glb` beside each `X.fbx`/`X.obj` that doesn't already ship a `.glb` (D13). |
 | `metadata` | metadata | `preset` (`unity`, `fab`, `kenney`, `none`), `title`, `version`, `publisher`, `authors`, `license`, `sources`, `lookup_store_page` | Writes `datapackage.json` at the pack root (`gen_datapackage.py`, `gen_kenney_datapackage.py`). Its `resources` names the first model in the final tree. |
 
-- **Clashes stop the build.** A step that would overwrite a file, or a `rename` whose `from` no
-  longer exists after an earlier step changed, fails the build with the step and path named.
+- **Clashes stop the build.** These fail the build with the step and path named:
+  - a step that would overwrite a file;
+  - a `rename` or `exclude` whose `source` the extract step no longer produces, for example
+    after you change the variant.
+
   The live folder is untouched, and you edit or turn off the step.
+
 - **Paths through placement.** Every staged file keeps its path in the original, and the
-  manifest records it, so a conversion's cache key and a `rename` or `exclude` don't depend on
-  where flatten and hoist put the file.
+  manifest records it. A conversion's cache key, a `rename` and an `exclude` name the file by
+  that path, so they don't depend on where flatten and hoist put it.
+- **Only extracted files get `rename` and `exclude` steps.** Files made by a later phase never
+  get a step of their own (Edits after an import):
+  - generated GLBs (convert phase) follow their source model;
+  - `datapackage.json` (metadata phase) is edited through the metadata step.
+
+  So a place-phase step never names a file that doesn't exist yet.
 
 ### Presets and candidate detection
 
@@ -166,16 +253,28 @@ gives each a preset:
 | Original | Candidates | Default target | Default steps |
 |---|---|---|---|
 | `.unitypackage` from the Unity cache | One pack, named after the file. The publisher comes from `<Publisher>/<Category>/`. | `<Publisher>/<Pack>` | `extract_unitypackage`, `flatten`, `unity_glb`, `metadata(unity)` |
-| Fab zip with `.unitypackage` files | One pack. Its variants are found by name (`URP`, `Built-in`/`BiRP`/`Standard`, `HDRP`), and URP is ticked (D15). | `<Publisher>/<Pack>` (the publisher is typed, defaulting to the last one used in this library) | `extract_unitypackage(variant)`, `flatten`, `hoist Art`, `unity_glb`, `metadata(fab)` |
-| Fab zip with a `.uproject` | One Unreal pack, named after the zip | `<Publisher>/<Pack>` | `export_unreal`, `flatten`, `hoist Meshes`, `metadata(fab)` |
-| Kenney All-in-1 zip | One per folder holding a `License*.txt`. Its category is its top folder (D25). | `<Category>/<Pack>` | `extract_zip(subpath)`, `metadata(kenney, lookup_store_page)` |
+| Zip holding one or more `.unitypackage` files, at any depth (Fab) | One pack, named after the zip. Every `.unitypackage` in it is a variant, and so is each top folder inside a package whose name names a pipeline (`URP`/`Universal`, `Built-In`/`BiRP`/`Standard`, `HDRP`), whichever layout the download has. A URP match is ticked (D15). With no URP match, a lone variant is ticked; otherwise none is, and Import waits for you to tick one. | `<Publisher>/<Pack>` (the publisher is typed, defaulting to the last one used in this library) | `extract_unitypackage(variant, subpath)`, `flatten`, `hoist Art`, `unity_glb`, `metadata(fab)` |
+| Zip holding a `.uproject`, at any depth (Fab Unreal) | One Unreal pack, named after the zip (`Waterways`, not `Feif`) | `<Publisher>/<Pack>` | `export_unreal`, `flatten`, `hoist Meshes`, `metadata(fab)` |
+| Zip whose folders hold `License*.txt` files (the Kenney All-in-1) | One per folder directly holding a `License*.txt` (246 in today's bundle). Its category is the folder above it, after a top folder every entry shares is stripped (D25). Packs under `Archive` and `Early access` are listed unticked. |  `<Category>/<Pack>` | `extract_zip(subpath)`, `metadata(kenney, lookup_store_page)` |
 | Any other zip | One pack | `<Pack>` | `extract_zip`, `flatten`, `metadata(none)` |
 
-Before **Import**, the dialog shows each ticked pack's step list and its resulting tree, with
-file counts per folder and the conversion count. To build that preview, it runs the extract and
-place steps over the archive's index in memory, and runs no conversion (D23). Every option can
-be edited there or later. A target that already exists in the library and isn't this import's
-output is refused.
+A zip that matches more than one row is offered as each match, and you pick one. Before
+**Import**, the dialog shows each ticked pack's step list and its resulting tree, with file
+counts per folder and the conversion count (D23).
+
+- **Unity and zip packs.** The dialog runs the extract and place steps over the archive's
+  index in memory: the tar or zip entry list and the `pathname` entries, with no file bodies
+  read. It runs no conversion, and counts one GLB per `.fbx` and `.obj` with no `.glb` beside
+  it.
+- **Unreal packs.** Only the Unreal Editor knows which `.uasset` is a mesh or an animation, so
+  the dialog can't run `export_unreal`. It shows the `.uproject`'s name, the refusal when a
+  `Source/` folder exists, and the folder tree of `Content/`. In that tree, each `.uasset`
+  counts as an **upper bound** of GLBs ("at most N models"). The place steps are applied to that
+  tree (`Content/Waterways/Meshes/` under `hoist Meshes`), and the tree is labeled as an
+  estimate.
+
+Every option can be edited there or later. A target that already exists in the library and
+isn't this import's output is refused.
 
 ### Unity conversion
 
@@ -226,9 +325,19 @@ output is refused.
 
 - **Kept on disk.** They stay on disk (D5).
 - **Not indexed.** `.meta`, `.prefab`, `.unity`, `.cs` and the rest are not indexed.
-- **A hidden `.mat`.** An indexed `.mat` with a `.mat.meta` beside it is a Unity material, which
-  the structure pass gives a new support role, `unity` (`SupportRole::Unity`), so the grid hides
-  it unless `showHidden` is on. This rule applies in any library, imported or not.
+- **A hidden `.mat`.** A Unity material is an indexed `.mat` whose `.mat.meta` is in the current
+  build's output manifest (`import_outputs`).
+  - **Inputs.** The pass reads that set (`structure::read_unity_materials`, one query) before
+    `derive`, as it reads `pack_overrides`, and passes it to `derive` as one more input. `derive`
+    stays pure and reads no file.
+  - **The role.** `derive` gives each such `.mat` a new support role, `unity`
+    (`SupportRole::Unity`), so the grid hides it unless `showHidden` is on.
+  - **Scope.** The rule applies to imported packs only. A `.mat` in a folder that wasn't imported
+    keeps its kind, so a non-Unity material never hides. Your libraries will all be re-imported
+    (D6), so every Unity pack is covered.
+  - **Which build.** During a swap (Flow, step 5) the pass reads the rows of the build being
+    swapped in, named by `swap_state`'s build id. At other times it reads `current_build`'s, so
+    it always sees the files on disk.
 
 ### Records (library DB)
 
@@ -239,16 +348,22 @@ open):
   `original_sha256`, `kind` (`unitypackage`, `zip`), `created_at`.
 - `import_packs`: `id`, `import_id`, `source` (variant path, sub-path or project), `target`
   (relative to the library root, unique), `preset`, `built_at`, `status` (`built`, `failed`,
-  `never_built`).
+  `never_built`), `current_build` (the committed build id, `NULL` before the first),
+  `recipe_rev` (incremented by every change to the pack's steps, in the same transaction), and
+  `swap_state` (`NULL`, or `'swapping'` with `swap_build`).
 - `import_steps`: `pack_id`, `position`, `kind`, `enabled`, `options` (JSON).
-- `import_outputs`: `pack_id`, `path` (relative to the library root), `size`, `mtime_ns`,
-  `sha256`, `origin` (`extracted`, `generated`, `kept`), `source_path` (in the original, or
-  `NULL` for `kept`).
-- `import_runs`: `id`, `kind` (`import`, `rebuild`, `remove`), pack ids, `status` (`queued`,
-  `running`, `done`, `failed`, `cancelled`, `interrupted`), `phase`, `progress`, `error`,
-  `started_at`, `finished_at`.
+- `import_outputs`: `pack_id`, `build_id`, `path` (relative to the library root), `size`,
+  `mtime_ns`, `sha256`, `origin` (`extracted`, `generated`, `kept`), `source_path` (in the
+  original; for a generated file, its source model's; `NULL` for `kept`). A pack's manifest is its
+  rows with `build_id = current_build`.
+- `import_runs`: `id`, `kind` (`import`, `rebuild`, `remove`), pack ids, the `recipe_rev` each
+  pack was queued at, the drift choices you made (JSON), `status` (`queued`, `running`, `done`,
+  `failed`, `cancelled`, `interrupted`), `phase`, `progress`, `error`, `started_at`,
+  `finished_at`.
 
-`import_outputs` is written in 200-row transactions.
+`import_outputs` is written in 200-row transactions under the new build id. They take effect
+only at the commit (Flow, step 6), so a crash mid-write leaves rows recovery deletes, never a
+half manifest.
 
 ### The original's state
 
@@ -264,10 +379,25 @@ open):
 ### Edits after an import
 
 - **In-app rename and delete.** `rename_asset`, `delete_asset` and `delete_assets` look up each
-  path they touch in `import_outputs`. Inside an imported pack, in the same transaction as their
-  own change, they append a `rename` or `exclude` step per file (every group member and its
-  `.meta` included) and update the manifest row. A rebuild then reproduces your rename and your
-  delete.
+  path they touch in the current manifest. Inside an imported pack, in the same transaction as
+  their own change, they record steps, bump `recipe_rev`, and update the manifest rows. Each kind
+  of file is handled differently:
+  - **Extracted file:** a `rename` (by `source` and new name) or an `exclude` (by `source`). Its
+    `.meta` moves or goes with it, and the step covers that too.
+  - **Generated GLB:** no step of its own. It is always in a format group with its source model
+    (same stem, same folder), and rename and delete reach every member, so the source model's
+    step covers it. The convert phase names each GLB after its source model's final name and
+    makes none for an excluded model.
+  - **`datapackage.json`:** a rename inside an imported pack is refused ("edit the pack's
+    metadata step instead"). A delete turns the metadata step off (`enabled = false`), so a
+    rebuild doesn't write the file back.
+
+  A rebuild then reproduces your rename and your delete, for every member of a group.
+
+- **No edits during a run.** While a run for a pack is queued or running, rename and delete
+  inside it are refused ("an import run is building this pack"). Editing its steps is refused
+  too. Changes made outside OpenDAM during a run are caught by the re-check under the lock
+  (Flow, step 2).
 - **Outside changes (drift).** Before a Rebuild or a Remove, the live pack folder is compared
   with its manifest by size and mtime, hashing only on a mismatch. The dialog lists the
   differences:
@@ -287,8 +417,8 @@ open):
 - **Progress.** It emits `import:progress` (run id, pack, step, done/total) and `import:updated`.
 - **Cancel.** Cancel kills child processes (`kill_on_drop`) and deletes the staging and work
   folders. The live folder never changed.
-- **Startup.** Runs found `running` become `interrupted`, and swap recovery runs for each
-  imported pack.
+- **Startup.** Swap recovery (Flow) runs for each imported pack, and runs found `running`
+  become `interrupted`.
 - **Capped processes.** A shared `capped_command` helper runs Blender and the UE editor through
   `systemd-run --user --scope -p MemoryMax=<cap> -p MemorySwapMax=0`, mirroring
   `scripts/memory-cap.sh`. It warns and runs uncapped when `systemd-run --user` is unavailable,
@@ -324,23 +454,74 @@ open):
 
 ### Remove import
 
-The confirmation lists the pack's files and any drift that removing would lose. Removing
-deletes exactly the manifest's files and the folders left empty, then the import's records,
-then runs `structure::rebuild_library`. Asset rows of deleted files go with their tags,
+The confirmation lists the pack's files and any drift that removing would lose. Removing runs as
+a `remove` run under the library's `index_lock`, after the same re-check as a build (Flow, step
+2). It deletes exactly the current manifest's files and the folders left empty, then the
+import's records, then runs `structure::rebuild_library_locked`. Removing is idempotent: a
+remove interrupted by a crash is marked `interrupted` and finished at the next startup, since
+deleting a file that is already gone is not an error. Asset rows of deleted files go with their tags,
 ratings and collections, as on any delete (D27). Kept files are deleted too, and the
 confirmation names them.
 
 ## Changes to the invariants (CLAUDE.md)
 
+- **Relative paths, one exception.** Every path in `.opendam/library.sqlite` stays relative to
+  the library root, except `imports.original_path`. An original lives outside every library, so
+  it is stored by absolute path, size, mtime and sha256 (D2, D12). Moving the library doesn't
+  touch it, and moving the original marks the import Original missing until **Locate original**
+  re-points it at a file with the same sha256.
 - **Originals are read-only.** Nothing writes to an import's original or to the directory it
   sits in. Unreal projects and binary Unity files are changed only in work copies under
   `~/.cache/opendam/import`.
 - **An imported pack changes on disk only by a swap.** A build stages the whole pack beside it
-  and swaps it in by rename. Only in-app rename and delete change it otherwise, and they record
-  a step in the same transaction.
+  and swaps it in by rename, under the library's `index_lock`. It commits by flipping
+  `import_packs.current_build`, and an uncommitted swap is always rolled back. Only in-app rename
+  and delete change it otherwise, and they record a step in the same transaction. They are
+  refused while a run for the pack is queued or running.
+- **Locked variants.** `watcher::index_paths_locked` and `structure::rebuild_library_locked`
+  take a held `index_lock` guard. Code that holds the lock calls these, never the locking
+  functions.
 - **Zero telemetry.** The list of outbound calls gains the Kenney store-page HEAD requests, made
   only for an import with "Look up store page" ticked.
 - **Layout.** CLAUDE.md gains `src/import/` (engine, steps, presets, embedded scripts).
+
+## Fixtures and goldens
+
+- **The generator.** Fixtures live in `apps/desktop/src-tauri/tests/fixtures/pack-import/`,
+  written by a committed `make_fixtures.py`. It uses only the Python standard library (`tarfile`,
+  `zipfile`) and writes byte for byte, so a rerun gives the same bytes. Its output is committed,
+  like `tests/fixtures/game-export/`. It writes:
+  - `synthetic.unitypackage`:
+    - GUID folders with `pathname`, `asset` and `asset.meta` entries, under `Assets/` and one
+      shared top folder;
+    - three wrapper levels (`Pack/Built-In/Built-In_Pack/Pack/`) and an `Art/` folder;
+    - a nested `.unitypackage`;
+    - text-format `.mat`, `.prefab` and `.meta` files written by the script;
+    - `Models/SM_Log.fbx`, copied from `tests/fixtures/game-export/library/Unity Moss/`, with a
+      PNG base color its `.mat` names by GUID;
+    - one `pathname` that escapes the target (`../escape.txt`).
+  - `fab-unity.zip`: two `.unitypackage` variants, `URP` and `Built-In`.
+  - `fab-unity-folders.zip`: one package with `URP/` and `Built-In/` folders inside.
+  - `kenney.zip`: a shared top folder, then `<Category>/<Pack>/License.txt` with a Kenney header
+    and CC0 text, including one pack under `Archive/`.
+  - `unreal.zip`: a `.uproject` and `Content/Meshes/SM_A.uasset`. `unreal-source.zip` adds a
+    `Source/` folder.
+- **The goldens.** Expected outputs in `expected/` come from running your scripts once on these
+  fixtures:
+  - `extract_unity.py --package ... --keep-all`, then `flatten_pack.py --hoist Art`, written as
+    sorted file lists (A2, A3);
+  - `gen_datapackage.py` and `gen_kenney_datapackage.py`, written as the `datapackage.json`
+    files (A7).
+
+  `expected/README.md` names each script with its sha256 and the command. The scripts
+  themselves are not copied into the repo (D30). The Kenney fixture's pack title has no
+  kenney.nl page, so the golden has no `sources`. A7's lookup test injects the HTTP answer
+  instead.
+
+- **Binary Unity files.** No binary `.mat` can be committed: it would be Asset Store content,
+  and nothing here writes the format. The worker's `unity_binary_to_text` test reads a sample
+  named by `OPENDAM_UNITY_BINARY_SAMPLE`, and skips with a message without it, in CI too. A17
+  checks it by hand on a cached Unity 4 or 5 package.
 
 ## Acceptance criteria
 
@@ -349,23 +530,33 @@ confirmation names them.
 - **A2 - Unity extraction.** The synthetic `.unitypackage` fixture extracts with `Assets/` and
   the shared top folder dropped, nested packages as folders, and every `.meta`, `.mat` and
   `.prefab` present. A path escaping the target is refused.
-- **A3 - Flatten and hoist.** They produce the same tree as `flatten_pack.py` on a fixture with
-  three wrapper levels and an `Art` hoist. A clash fails the build naming the path, and the live
-  folder is unchanged.
+- **A3 - Flatten and hoist.** On `synthetic.unitypackage`, `extract_unitypackage`, `flatten` and
+  `hoist Art` give exactly the golden file list from `extract_unity.py --keep-all` and
+  `flatten_pack.py --hoist Art`. A clash fails the build naming the path, and the live folder is
+  unchanged.
 - **A4 - Reversible steps.** Turning `hoist` off and rebuilding restores the unhoisted tree, and
   turning it back on restores the hoisted one. Asset ids for paths present in both builds are
   unchanged, so a tag on such an asset survives.
-- **A5 - In-app edits recorded.** An in-app rename and a delete inside an imported pack append
-  `rename` and `exclude` steps, and a rebuild keeps the new name and doesn't bring the file back.
+- **A5 - In-app edits recorded.**
+  - An in-app rename and a delete inside an imported pack append `rename` and `exclude` steps.
+    A rebuild keeps the new name and doesn't bring the file back.
+  - Renaming the group of `SM_Log.fbx` and its generated `SM_Log.glb` records one `rename` for
+    the FBX, and a rebuild produces both files under the new stem, with the `.meta`.
+  - Deleting that group records one `exclude`, and a rebuild produces neither file.
+  - Deleting `datapackage.json` turns the metadata step off, and a rebuild doesn't write it.
+    Renaming it is refused.
+  - While a run for the pack is queued, rename and delete inside it are refused.
 - **A6 - Drift.** A file added, changed and removed outside OpenDAM is listed before Rebuild, and
   each choice (keep or discard, keep yours or use the recipe's, exclude or restore) has the
   stated effect.
-- **A7 - Metadata.** For the Unity, Fab and Kenney fixtures, `datapackage.json` equals what the
-  scripts write. A publisher set at import survives a rebuild. With "Look up store page" off, no
+- **A7 - Metadata.** For the Unity, Fab and Kenney fixtures, `datapackage.json` equals the golden
+  written by `gen_datapackage.py` and `gen_kenney_datapackage.py`. A publisher set at import
+  survives a rebuild. With the HTTP answer injected as 200, the Kenney file gains the
+  `sources` entry the script would write. With "Look up store page" off, no
   network request is made (tested with the HTTP call injected).
-- **A8 - Unity GLB.** Under CI's Blender, the fixture's FBX gets a textured `X.glb` beside it. A
-  rebuild after toggling `hoist` reuses the cached GLB, with no Blender run. Binary `.mat`
-  fixtures convert, and the library keeps their original bytes.
+- **A8 - Unity GLB.** Under CI's Blender, `synthetic.unitypackage`'s `SM_Log.fbx` gets a textured
+  `SM_Log.glb` beside it, whose material carries the fixture's PNG. A rebuild after toggling
+  `hoist` reuses the cached GLB, with no Blender run.
 - **A9 - Unreal, stub editor.** With a stub editor script that writes GLBs in batches and once
   makes no progress, the step loops, resumes from cache, and fails the step with the
   no-progress message. The work copy's `.uproject` has the plugins enabled, and the zip is
@@ -373,17 +564,37 @@ confirmation names them.
 - **A10 - Unreal, manual.** Importing `~/Downloads/Waterways.zip` into the Fab library produces
   `<Publisher>/Waterways/` holding GLBs, docs and `datapackage.json`, under the 20G cap, and
   the pack browses with textured models. This item is checked by hand.
-- **A11 - Interruption.** Killing the app mid-build leaves the live folder as it was. On
-  restart, the run is `interrupted` and no staging folder remains. A swap interrupted between
-  its two renames is recovered.
+- **A11 - Interruption and the commit point.** Each case runs with crash points injected (as
+  autotag undo's tests do) and with a failing `index_paths_locked`:
+  - Killed while staging: the live folder is as it was. On restart the run is `interrupted`,
+    and no staging folder or uncommitted manifest row remains.
+  - Killed between the two renames: `.prev` is renamed back.
+  - Killed after the swap, before the commit: the swap is rolled back. The previous build's
+    files and manifest are current again, and asset ids of paths in both builds are unchanged.
+  - Killed after the commit, before clean-up: `.prev` and the old rows are deleted, and the new
+    build stays.
+  - Indexing fails: the swap is rolled back as above, and the run fails.
+  - A file changed outside OpenDAM, or a step edited, while the build stages: the re-check
+    under the lock fails the run, and the live folder is unchanged.
+  - No call path takes `index_lock` while holding it: a test runs a whole build with a timeout,
+    which a deadlock would hit.
 - **A12 - Memory cap.** A capped process killed with status 137 fails its step with "killed by
   the memory cap".
 - **A13 - Remove import.** Removing deletes exactly the manifest's files and empty folders, and
   the confirmation lists any drift first.
-- **A14 - Unity-only files hidden.** A `.mat` with a `.mat.meta` is a hidden `unity` support
-  file, and shows with `showHidden`.
+- **A14 - Unity-only files hidden.** In an imported pack, a `.mat` whose `.mat.meta` is in the
+  current manifest is a hidden `unity` support file, and shows with `showHidden`. A `.mat` in a
+  folder that wasn't imported keeps its kind and stays visible. `derive` reads no file for this,
+  which a test with the file system unavailable checks.
 - **A15 - Original state.** A moved original marks its import Original missing and disables
   Rebuild. Locating it again by matching sha256 re-enables Rebuild.
+- **A16 - A real Fab Unity download, by hand.** Importing a Fab Unity download you choose
+  detects its variants, whichever layout it has (several `.unitypackage` files, or pipeline
+  folders inside one), ticks URP when present, and produces a pack that browses with textured
+  GLBs. Record the layout found in this plan's Known gaps.
+- **A17 - Binary Unity files, by hand.** Importing a cached Unity 4 or 5 package whose `.mat`
+  files are binary gives textured GLBs, and the library keeps the `.mat` files' original bytes.
+  This sample also feeds the env-gated worker test.
 
 ## Known gaps
 
@@ -391,6 +602,13 @@ confirmation names them.
   but nothing can recreate them if they're lost.
 - **The Unreal step's real run is manual.** The Unreal Editor isn't in CI, so only the stub
   covers the step there (A9, A10).
+- **The Fab Unity layout is unverified** until A16 runs. Detection accepts both plausible
+  layouts, and asks you to tick a variant when it can't tell.
+- **Binary Unity files aren't tested in CI.** No binary sample can be committed, so their
+  conversion is checked by the env-gated test and by hand (A17).
+- **The hidden `.mat` covers imported packs only** (R1). A Unity `.mat` in a folder you didn't
+  import through OpenDAM stays visible.
+- **The Unreal preview is an estimate.** It counts every `.uasset` as a possible GLB.
 - **Conversion heuristics are unchanged.** Smoothness maps (`_MetallicGlossMap`, HDRP
   `_MaskMap`) still aren't converted. HDRP-only packs convert less well than URP and Built-in.
 - **No bulk import.** There's no Unity-cache scan and no watched inbox. Each original is
