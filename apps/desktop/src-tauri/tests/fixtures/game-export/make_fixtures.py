@@ -10,8 +10,9 @@ plan's build order: each fixture lands in the first step whose tests use it.
 Step 1 (domains, default names, packs and licences, and the build-order guards):
 
 - `Dungeon Props/`: a `datapackage.json` with a `LicenseRef-` licence, pass-through PNG
-  textures, and one file for each guard and refusal: an ORM map, a DirectX normal map, a JPG, an
-  EXR, a format group of an FBX and an OBJ, a lone OBJ and a Markdown note.
+  textures, and one file for each guard and refusal: a DirectX normal map, a JPG, an EXR, a
+  format group of an FBX and an OBJ, a lone OBJ and a Markdown note. (Step 1's ORM map left
+  `Textures/` in step 4, where it would join the `StoneFloor` set: `Rocks/T_Slate_ORM.png`.)
 - `Kenney Crates/`: a CC0 Kenney license file, a `banner.png` whose default name and role
   collide with `Dungeon Props/Textures/T_Banner_BaseColor.png`, and a `___.png` whose stem gives
   no PascalCase name.
@@ -37,6 +38,22 @@ Step 4 (`fbx_facts`, and the Check telling models from animations), in `Dungeon 
 - `SM_Stool.fbx`: one material named `Material`. `SM_Bench.fbx`: two materials named `Wood`,
   which is refused. `SM_Lamp.fbx`: a real `DefaultMaterial` beside a mesh with no material.
   `SM_Shelf.fbx`: a slot named `OpenDAMDefault` beside a mesh with no material.
+
+Step 4 (C7's material inference and C8's texture sets):
+
+- `Dungeon Props/Textures/`: the maps the models' slots find by suffix. `T_Iron_D`, `T_Iron_R`
+  and `T_Iron_M` for `SM_Gate`'s `Iron` slot (a Roughness and Metallic pair), `T_Guard_D` with a
+  cut-out alpha and `T_Guard_AORM` for `SK_Guard` by its name, and `T_Stool_D.jpg` for
+  `SM_Stool`.
+- `Dungeon Props/Models/SM_Boulder.png`: an image with the model's stem, its BaseColor.
+- `Dungeon Props/Models/SM_Crate.fbx`, whose slot `Planks` finds `T_Crate_N.png` by the model's
+  name in both `Textures/1K/` and `Textures/4K/`, so the folder rule picks `1K`.
+- `Dungeon Props/Rocks/`: standalone sets used by no model: `T_Rock_R`, `T_Rock_M` and
+  `T_Rock_N_DX` (the `Rock` set), a lone metallic map `T_Ore_M` and an ORM map `T_Slate_ORM`.
+- `Unity Moss/`: `Models/SM_Log.fbx` with the slots `Bark` and `Leaves` and no texture reference.
+  Its `.fbx.meta` remaps `Bark` to `Materials/M_LogBark.mat`, and `Materials/Leaves.mat` is found
+  by the slot's name and clips alpha. Every texture and material has a `.meta` with its GUID. A
+  `Models/T_Bark_D.png` that the suffix lookup would pick shows the Unity material winning.
 
 Step 6 (Blender normalization of models), in `Dungeon Props/Models/`:
 
@@ -77,8 +94,11 @@ def write(path: str, data: bytes | str) -> Path:
     return target
 
 
-def png(path: str, rgba: tuple[int, int, int, int], size: int = 4) -> None:
-    """A `size` x `size` RGBA PNG of one colour, with no metadata chunk."""
+def png(
+    path: str, rgba: tuple[int, int, int, int], size: int = 4, cut_alpha: bool = False
+) -> None:
+    """A `size` x `size` RGBA PNG of one colour, with no metadata chunk. With `cut_alpha`, its
+    top half is fully transparent, as a cut-out base color's leaves are."""
 
     def chunk(kind: bytes, body: bytes) -> bytes:
         return (
@@ -88,7 +108,11 @@ def png(path: str, rgba: tuple[int, int, int, int], size: int = 4) -> None:
             + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
         )
 
-    rows = b"".join(b"\x00" + bytes(rgba) * size for _ in range(size))
+    clear = bytes((*rgba[:3], 0))
+    rows = b"".join(
+        b"\x00" + (clear if cut_alpha and y < size // 2 else bytes(rgba)) * size
+        for y in range(size)
+    )
     header = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
     write(
         path,
@@ -304,6 +328,86 @@ def models() -> None:
     box("SM_Shelf_Board", size=(0.9, 0.28, 0.05), location=(0, 0, 1))
     export_fbx(f"{models}/SM_Shelf.fbx")
 
+    # Its slot finds T_Crate_N.png by the model's name in Textures/1K and Textures/4K
+    bpy.ops.wm.read_homefile(use_empty=True)
+    box("SM_Crate", size=(0.8, 0.8, 0.8), materials=[material("Planks")])
+    export_fbx(f"{models}/SM_Crate.fbx")
+
+    # A Unity pack's model, whose slots its .fbx.meta and .mat files describe
+    bpy.ops.wm.read_homefile(use_empty=True)
+    box("SM_Log", size=(2, 0.4, 0.4), materials=[material("Bark"), material("Leaves")])
+    export_fbx("Unity Moss/Models/SM_Log.fbx")
+
+
+def meta(path: str, guid: str, importer: str = "TextureImporter:\n  serializedVersion: 12\n") -> None:
+    write(f"{path}.meta", f"fileFormatVersion: 2\nguid: {guid}\n{importer}")
+
+
+def unity_material(path: str, guid: str, textures: dict[str, str], floats: dict[str, float]) -> None:
+    """A URP Lit `.mat` at `path` and its `.meta`, with `textures` by property and GUID."""
+    tex_envs = "".join(
+        f"    - {prop}:\n        m_Texture: {{fileID: 2800000, guid: {tex}, type: 3}}\n"
+        f"        m_Scale: {{x: 1, y: 1}}\n        m_Offset: {{x: 0, y: 0}}\n"
+        for prop, tex in textures.items()
+    )
+    tex_envs += (
+        "    - _EmissionMap:\n        m_Texture: {fileID: 0}\n"
+        "        m_Scale: {x: 1, y: 1}\n        m_Offset: {x: 0, y: 0}\n"
+    )
+    float_lines = "".join(f"    - {prop}: {value:g}\n" for prop, value in floats.items())
+    name = Path(path).stem
+    write(
+        path,
+        "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!21 &2100000\nMaterial:\n"
+        f"  serializedVersion: 8\n  m_Name: {name}\n"
+        "  m_Shader: {fileID: 4800000, guid: 933532a4fcc9baf4fa0491de14d08ed7, type: 3}\n"
+        "  m_SavedProperties:\n    serializedVersion: 3\n"
+        f"    m_TexEnvs:\n{tex_envs}    m_Ints: []\n    m_Floats:\n{float_lines}"
+        "    m_Colors:\n    - _BaseColor: {r: 1, g: 1, b: 1, a: 1}\n",
+    )
+    meta(path, guid, "NativeFormatImporter:\n  mainObjectFileID: 2100000\n")
+
+
+def unity_log() -> None:
+    """`Unity Moss/Models/SM_Log.fbx`'s Unity materials and textures (step 4)."""
+    bark, normal, atlas = (
+        "b0000000000000000000000000000001",
+        "b0000000000000000000000000000002",
+        "b0000000000000000000000000000003",
+    )
+    png("Unity Moss/Textures/T_Bark_Albedo.png", (110, 80, 50, 255))
+    meta("Unity Moss/Textures/T_Bark_Albedo.png", bark)
+    png("Unity Moss/Textures/T_Bark_Normal.png", (128, 128, 255, 255))
+    meta("Unity Moss/Textures/T_Bark_Normal.png", normal)
+    # No suffix: only the material says it is a base color
+    png("Unity Moss/Textures/T_LeafAtlas.png", (60, 140, 50, 255), cut_alpha=True)
+    meta("Unity Moss/Textures/T_LeafAtlas.png", atlas)
+    # The suffix lookup would pick this one, in the model's own folder
+    png("Unity Moss/Models/T_Bark_D.png", (255, 0, 0, 255))
+    meta("Unity Moss/Models/T_Bark_D.png", "b0000000000000000000000000000004")
+
+    mat_bark = "c0000000000000000000000000000001"
+    unity_material(
+        "Unity Moss/Materials/M_LogBark.mat",
+        mat_bark,
+        {"_BaseMap": bark, "_BumpMap": normal},
+        {"_AlphaClip": 0, "_Cutoff": 0.5},
+    )
+    unity_material(
+        "Unity Moss/Materials/Leaves.mat",
+        "c0000000000000000000000000000002",
+        {"_BaseMap": atlas},
+        {"_AlphaClip": 1, "_Cutoff": 0.5},
+    )
+    meta(
+        "Unity Moss/Models/SM_Log.fbx",
+        "d0000000000000000000000000000001",
+        "ModelImporter:\n  serializedVersion: 22200\n  externalObjects:\n"
+        "  - first:\n      type: UnityEngine:Material\n      assembly: UnityEngine.CoreModule\n"
+        f"      name: Bark\n    second: {{fileID: 2100000, guid: {mat_bark}, type: 2}}\n"
+        "  materials:\n    materialImportMode: 2\n",
+    )
+
     # A take that turns the model's own object, which would undo its normalization
     bpy.ops.wm.read_homefile(use_empty=True)
     spinner = box(
@@ -442,7 +546,6 @@ def main() -> None:
     png("Dungeon Props/Textures/T_Rune_AO.png", (200, 200, 200, 255))
     png("Dungeon Props/Textures/mattress_01.png", (230, 220, 200, 255))
     # Each refused, by a build-order guard or for good
-    png("Dungeon Props/Textures/T_StoneFloor_ORM.png", (255, 128, 0, 255))
     png("Dungeon Props/Textures/T_Wall_N_DX.png", (128, 128, 255, 255))
     blender_image("Dungeon Props/Textures/T_Wall_D.jpg", (0.4, 0.35, 0.3, 1.0), "JPEG")
     blender_image("Dungeon Props/Textures/T_Sky.exr", (0.2, 0.4, 0.8, 1.0), "OPEN_EXR")
@@ -452,6 +555,22 @@ def main() -> None:
     write("Dungeon Props/Models/SM_Barrel.obj", OBJ_TRIANGLE)
     write("Dungeon Props/Docs/notes.md", "# Notes\n\nNot an asset the game takes.\n")
 
+    # Step 4: the maps the models' slots find, and standalone sets
+    png("Dungeon Props/Textures/T_Iron_D.png", (90, 90, 95, 255))
+    png("Dungeon Props/Textures/T_Iron_R.png", (100, 100, 100, 255))
+    png("Dungeon Props/Textures/T_Iron_M.png", (255, 255, 255, 255))
+    png("Dungeon Props/Textures/T_Guard_D.png", (70, 60, 140, 255), cut_alpha=True)
+    png("Dungeon Props/Textures/T_Guard_AORM.png", (255, 140, 20, 255))
+    blender_image("Dungeon Props/Textures/T_Stool_D.jpg", (0.5, 0.3, 0.1, 1.0), "JPEG")
+    png("Dungeon Props/Models/SM_Boulder.png", (130, 125, 120, 255))
+    png("Dungeon Props/Textures/1K/T_Crate_N.png", (128, 128, 255, 255))
+    png("Dungeon Props/Textures/4K/T_Crate_N.png", (128, 128, 255, 255), size=8)
+    png("Dungeon Props/Rocks/T_Rock_R.png", (180, 180, 180, 255))
+    png("Dungeon Props/Rocks/T_Rock_M.png", (0, 0, 0, 255))
+    png("Dungeon Props/Rocks/T_Rock_N_DX.png", (128, 127, 255, 255))
+    png("Dungeon Props/Rocks/T_Ore_M.png", (255, 255, 255, 255))
+    png("Dungeon Props/Rocks/T_Slate_ORM.png", (255, 128, 0, 255))
+
     write("Kenney Crates/License.txt", KENNEY_LICENSE)
     png("Kenney Crates/crate_wood.png", (150, 100, 50, 255))
     png("Kenney Crates/banner.png", (20, 20, 160, 255))
@@ -460,10 +579,8 @@ def main() -> None:
 
     write("Unity Moss/License.txt", MIT_LICENSE)
     png("Unity Moss/T_Moss_D.png", (40, 120, 40, 255))
-    write(
-        "Unity Moss/T_Moss_D.png.meta",
-        "fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n",
-    )
+    write("Unity Moss/T_Moss_D.png.meta", "fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n")
+    unity_log()
 
     conversion(
         "Converted/conversion.json",

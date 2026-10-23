@@ -473,6 +473,29 @@ export interface ExportCheckAsset extends ExportAssetRef {
    * doesn't, `problem` when a problem names it
    */
   status: 'ready' | 'changed' | 'new' | 'problem';
+  /** In the domain itself, rather than joined through a material or its texture set */
+  member: boolean;
+  /** A texture's layout (plan C8): a role, or ORM, MaskMap, Roughness, Gloss or Metallic */
+  layout?: string;
+  /** A normal map's convention */
+  normalConvention?: NormalConvention;
+  /** A model's materials, as inferred (plan C7) */
+  materials?: ExportMaterial[];
+}
+
+/** Where an inferred texture came from (plan D11) */
+export type TextureVia = 'fbx' | 'unity' | 'suffix' | 'stem';
+
+/** A model's material slot, as inferred (plan C7) */
+export interface ExportMaterial {
+  slot: string;
+  name: string;
+  surface: 'opaque' | 'cutout';
+  /** Its base color has alpha below 0.5: a suggestion, which exports opaque until accepted */
+  cutoutSuggested: boolean;
+  /** The slot the export adds for a mesh with no material */
+  added: boolean;
+  textures: Partial<Record<TextureRole, { via: TextureVia; assetName: string; files: string[] }>>;
 }
 
 /** An asset of a manifest, as the export's diff names it */

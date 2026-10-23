@@ -8,6 +8,24 @@ const TYPE_PREFIXES: [&str; 11] = [
     "SM_", "SK_", "S_", "T_", "M_", "MI_", "MAT_", "A_", "AN_", "P_", "BP_",
 ];
 
+/// The material the export adds for a kept mesh with no material (C9 step 2), when no kept
+/// slot already has this name.
+pub const ADDED_MATERIAL: &str = "OpenDAMDefault";
+
+/// The name of the material the export adds beside the kept slots `slots`: `ADDED_MATERIAL`, or
+/// the lowest `OpenDAMDefault2`, `OpenDAMDefault3`, ... no slot has. Picked from the slot names
+/// alone, so renaming a file never changes it.
+pub fn added_material<'a>(slots: impl IntoIterator<Item = &'a str> + Clone) -> String {
+    let taken = |name: &str| slots.clone().into_iter().any(|s| s == name);
+    if !taken(ADDED_MATERIAL) {
+        return ADDED_MATERIAL.into();
+    }
+    (2..)
+        .map(|n| format!("{ADDED_MATERIAL}{n}"))
+        .find(|name| !taken(name))
+        .expect("some name is free")
+}
+
 /// `stem` without its leading type prefix, if it has one and something follows it.
 pub fn strip_type_prefix(stem: &str) -> &str {
     TYPE_PREFIXES
@@ -18,22 +36,6 @@ pub fn strip_type_prefix(stem: &str) -> &str {
                 .then(|| &stem[prefix.len()..])
         })
         .unwrap_or(stem)
-}
-
-/// The material the export adds to a model whose kept mesh has none (plan C9 step 2).
-pub const ADDED_MATERIAL: &str = "OpenDAMDefault";
-
-/// The name of the material the export adds to a model whose kept slots are `slots`:
-/// `ADDED_MATERIAL`, or the lowest `OpenDAMDefault2`, `OpenDAMDefault3`, ... that no slot holds.
-/// It depends only on the slots, so renaming the file doesn't change it.
-pub fn added_material<'a>(slots: impl IntoIterator<Item = &'a str> + Clone) -> String {
-    (1..)
-        .map(|n| match n {
-            1 => ADDED_MATERIAL.to_string(),
-            n => format!("{ADDED_MATERIAL}{n}"),
-        })
-        .find(|name| !slots.clone().into_iter().any(|slot| slot == name))
-        .expect("a free name")
 }
 
 /// The default name for `stem`: one type prefix dropped, then words split on `_`, `-`, spaces
@@ -135,15 +137,20 @@ mod tests {
     }
 
     #[test]
-    fn the_added_material_takes_the_lowest_free_name() {
+    fn the_added_material_takes_the_first_free_name() {
         assert_eq!(added_material([]), "OpenDAMDefault");
-        assert_eq!(added_material(["Stone", "Material"]), "OpenDAMDefault");
+        assert_eq!(added_material(["DefaultMaterial"]), "OpenDAMDefault");
         assert_eq!(added_material(["OpenDAMDefault"]), "OpenDAMDefault2");
+        assert_eq!(
+            added_material(["OpenDAMDefault2", "OpenDAMDefault", "OpenDAMDefault3"]),
+            "OpenDAMDefault4"
+        );
+        // The lowest free name, even below a taken one
         assert_eq!(
             added_material(["OpenDAMDefault2", "OpenDAMDefault", "OpenDAMDefault4"]),
             "OpenDAMDefault3"
         );
-        // Only an exact name is taken
+        // Names are compared exactly, as Blender compares them
         assert_eq!(added_material(["opendamdefault"]), "OpenDAMDefault");
     }
 

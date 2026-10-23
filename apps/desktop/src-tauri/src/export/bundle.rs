@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -15,6 +16,7 @@ use crate::db::Database;
 use crate::export::check::{self, BundleFile, CheckReport, Inspection, Problem, Status};
 use crate::export::fbx_facts;
 use crate::export::fingerprint::Fingerprint;
+use crate::export::infer;
 use crate::export::{contract, hashes};
 
 const MANIFEST: &str = "manifest.json";
@@ -455,10 +457,12 @@ pub enum ExportOutcome {
 }
 
 /// The staged bundles of the open Export views, by domain id. Its lock serializes every Check
-/// and Export, so no two touch one domain's folder at once.
+/// and Export, so no two touch one domain's folder at once. It owns what material inference has
+/// read from files for the session, which every Check and Export's re-read go through.
 #[derive(Default)]
 pub struct Exports {
     staged: Mutex<HashMap<String, Staged>>,
+    memo: Arc<infer::Memo>,
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
@@ -485,7 +489,7 @@ impl Exports {
             mut report,
             files,
             fingerprint,
-        } = check::inspect(db, domain_id, facts).await?;
+        } = check::inspect(db, domain_id, facts, &self.memo).await?;
         let Some(bundle) = report.bundle_path.clone().map(PathBuf::from) else {
             return Ok(report);
         };
@@ -550,7 +554,7 @@ impl Exports {
                 changes: vec!["nothing is checked: the Check was discarded or never run".into()],
             });
         };
-        let now = check::inspect(db, domain_id, facts).await;
+        let now = check::inspect(db, domain_id, facts, &self.memo).await;
         let mut changes = match &now {
             Ok(now) => checked.fingerprint.changes(&now.fingerprint),
             Err(e) => vec![e.clone()],
@@ -802,34 +806,42 @@ mod tests {
             ExportOutcome::Exported { .. }
         ));
 
-        // The crate's pixels change, the moss joins and the normal map leaves
+        // The crate's pixels change, the moss joins and the stone floor leaves. A member brings
+        // in its whole texture set, so its base color and normal map leave together
         std::fs::write(
             f.library.root_path.join("Kenney Crates/crate_wood.png"),
             std::fs::read(f.library.root_path.join("Foo A/tile_a.png")).unwrap(),
         )
         .unwrap();
         add_members(&f.db, &f.library, "props", &[TEXTURES[3]]).await;
-        sqlx::query("DELETE FROM collection_assets WHERE asset_id = ?")
-            .bind(id_of(&f.library.pool, TEXTURES[1]).await)
-            .execute(&f.library.pool)
-            .await
-            .unwrap();
+        for texture in &TEXTURES[..2] {
+            sqlx::query("DELETE FROM collection_assets WHERE asset_id = ?")
+                .bind(id_of(&f.library.pool, texture).await)
+                .execute(&f.library.pool)
+                .await
+                .unwrap();
+        }
 
         let report = exports.check(&f.db, "props", &NoFbx).await.unwrap();
         let diff = report.diff.as_ref().unwrap();
         assert_eq!(names(&diff.added), [("Moss", Some("BaseColor"))]);
         assert_eq!(names(&diff.changed), [("CrateWood", Some("BaseColor"))]);
-        assert_eq!(names(&diff.removed), [("StoneFloor", Some("Normal"))]);
+        assert_eq!(
+            names(&diff.removed),
+            [
+                ("StoneFloor", Some("BaseColor")),
+                ("StoneFloor", Some("Normal"))
+            ]
+        );
         assert_eq!(
             statuses(&report),
             [
                 ("Kenney Crates/crate_wood.png", Status::Changed),
                 ("Unity Moss/T_Moss_D.png", Status::New),
-                (TEXTURES[0], Status::Ready),
             ]
         );
         assert_eq!(
-            json!(diff.removed[0]),
+            json!(diff.removed[1]),
             json!({"kind": "texture", "assetName": "StoneFloor", "role": "Normal"})
         );
     }
