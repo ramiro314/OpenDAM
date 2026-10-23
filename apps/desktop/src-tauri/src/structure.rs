@@ -6209,6 +6209,92 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_flag_set_during_a_pass_outlives_it_for_the_release() {
+        let (dir, _db, library) = locked_library().await;
+        let pool = &library.pool;
+        insert_path(pool, "kits/kit/model.glb").await;
+        mark_pending(pool).await;
+        // Another machine's command leaves a pass pending while this one writes its folders.
+        sqlx::query(
+            "CREATE TRIGGER pending_during_the_pass AFTER INSERT ON folders BEGIN
+                 INSERT OR REPLACE INTO library_meta (key, value) VALUES ('structure_pending', '1');
+             END",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        rebuild(pool, dir.path()).await.unwrap();
+        assert!(
+            is_pending(pool).await,
+            "the pass cleared a flag set while it ran"
+        );
+
+        sqlx::query("DROP TRIGGER pending_during_the_pass")
+            .execute(pool)
+            .await
+            .unwrap();
+        IndexLock::try_acquire(dir.path())
+            .await
+            .unwrap()
+            .release(pool)
+            .await;
+        assert!(!is_pending(pool).await, "the release left the pass pending");
+    }
+
+    #[tokio::test]
+    async fn a_commands_pass_takes_the_lock_once_its_holder_lets_go_within_the_wait() {
+        let (dir, db, library) = locked_library().await;
+        let lock_file = dir.path().join(".opendam/index.lock");
+        insert_path(&library.pool, "kits/kit/model.glb").await;
+        std::fs::write(&lock_file, "another machine").unwrap();
+        tokio::spawn({
+            let lock_file = lock_file.clone();
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                std::fs::remove_file(lock_file).unwrap();
+            }
+        });
+
+        let started = Instant::now();
+        rebuild_library(&db, &library).await;
+
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(1),
+            "it waited only {waited:?}"
+        );
+        assert!(waited < COMMAND_WAIT, "it waited {waited:?}");
+        assert_eq!(
+            derived_rows(&library.pool).await,
+            fresh_pass(&["kits/kit/model.glb"]).await
+        );
+        assert!(!is_pending(&library.pool).await);
+        assert!(!lock_file.exists());
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_task_leaves_an_offline_librarys_pass_pending() {
+        let (dir, db, library) = locked_library().await;
+        insert_path(&library.pool, "kits/kit/model.glb").await;
+        std::fs::write(dir.path().join(".opendam/index.lock"), "another machine").unwrap();
+        let mut late = db.late_passes.subscribe();
+        rebuild_library(&db, &library).await;
+        assert!(is_pending(&library.pool).await);
+
+        // The share goes away before the follow-up task's first try.
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        let ran = tokio::time::timeout(FOLLOW_UP_RETRY * 2, late.recv()).await;
+
+        assert!(ran.is_err(), "the follow-up task ran a pass: {ran:?}");
+        assert!(derived_rows(&library.pool).await.folders.is_empty());
+        assert!(
+            is_pending(&library.pool).await,
+            "the next open or index run has no pass left to run"
+        );
+    }
+
+    #[tokio::test]
     async fn a_commands_pass_waits_for_the_index_run_holding_the_lock() {
         let pool = memory_library_pool().await;
         let library = crate::db::memory_library("lib", pool.clone());
