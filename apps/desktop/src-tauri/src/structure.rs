@@ -2303,21 +2303,19 @@ pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassR
 }
 
 /// Reruns the pass for `library` once any index run on it has finished, for a command that
-/// changed its paths: takes its `index_lock`, then the advisory lock, and runs
-/// `rebuild_library_locked`. A failed pass is logged, not returned: the change itself went
-/// through, and the next index run derives the structure again.
+/// changed its paths: takes its `index_lock` and runs the pass. A failed pass is logged, not
+/// returned: the change itself went through, and the next index run derives the structure again.
+///
+/// It takes no advisory lock: an index run on another machine that finds one skips its whole
+/// run rather than waiting, so a command holding it would lose that machine's run. Taking it,
+/// with a wait and a pass that is late but never lost, is the pack import's next step.
 pub async fn rebuild_library(db: &Database, library: &LibraryHandle) {
     let lock = db.index_lock(&library.id);
-    let index_guard = lock.lock().await;
-    match IndexLock::try_acquire(&library.root_path) {
-        Some(advisory) => rebuild_library_locked(db, library, &index_guard, &advisory).await,
-        // Another machine is indexing. The pass runs anyway, as it always has: holding off and
-        // catching up later is the pack import's advisory lock work (plan pack-import).
-        None => log_failure(library, rebuild(&library.pool, &library.root_path).await),
-    }
+    let _index_guard = lock.lock().await;
+    log_failure(library, rebuild(&library.pool, &library.root_path).await);
 }
 
-/// `rebuild_library` for a caller that holds `library`'s `index_lock` and advisory lock, passed
+/// The structure pass for a caller that holds `library`'s `index_lock` and advisory lock, passed
 /// as proof: it never locks either again.
 pub async fn rebuild_library_locked(
     db: &Database,
@@ -6037,6 +6035,45 @@ pub(crate) mod tests {
             std::fs::read_to_string(&lock_file).unwrap(),
             "another machine",
             "the other machine's lock is left alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commands_pass_never_takes_the_advisory_lock() {
+        let dir = tempfile::Builder::new()
+            .prefix("opendam-lib-")
+            .tempdir()
+            .unwrap();
+        let lock_file = dir.path().join(".opendam/index.lock");
+        std::fs::create_dir_all(dir.path().join(".opendam")).unwrap();
+        // A dead holder's lock, stale for an hour: taking the lock would write over it and
+        // delete it on release.
+        std::fs::write(&lock_file, "a dead holder").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&lock_file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        let pool = memory_library_pool().await;
+        let library = LibraryHandle {
+            root_path: dir.path().to_path_buf(),
+            ..crate::db::memory_library("lib", pool.clone())
+        };
+        let db = crate::db::memory_database(vec![library.clone()]).await;
+        insert_path(&pool, "kits/kit/model.glb").await;
+
+        rebuild_library(&db, &library).await;
+
+        assert_eq!(
+            derived_rows(&pool).await,
+            fresh_pass(&["kits/kit/model.glb"]).await
+        );
+        // An index run on another machine that found the lock held would skip its whole run.
+        assert_eq!(
+            std::fs::read_to_string(&lock_file).unwrap(),
+            "a dead holder",
+            "the command's pass took the advisory lock"
         );
     }
 

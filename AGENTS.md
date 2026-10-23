@@ -143,8 +143,10 @@ docs/plans                    Plans for this fork
   the library root covers every row, as it always has.
 - **Locked variants.** `watcher::index_paths_locked` and `structure::rebuild_library_locked` take
   the held `index_lock` guard and the held advisory `watcher::IndexLock` guard as proof and never
-  lock again. Code that holds the locks calls these, never `index_paths` or `rebuild_library`,
-  which lock and then call them (`index_lock` isn't re-entrant). Under both sit lock-free cores,
+  lock again. Code that holds the locks calls these, never `index_paths` or `rebuild_library`
+  (`index_lock` isn't re-entrant). `index_paths` takes both locks and calls `index_paths_locked`
+  with `Prune::Now`. `rebuild_library` takes only `index_lock`: another machine's index run that
+  finds the advisory lock held skips its run instead of waiting, so a command must not hold it. Under both sit lock-free cores,
   `watcher::index_pool` and `structure::rebuild`, for a pool that isn't registered yet. An index
   run takes a `watcher::Prune`: `Now` deletes the rows of files it didn't find and ends with the
   structure pass, and `Defer` deletes no row, runs no pass, and reports each row it inserts to an
