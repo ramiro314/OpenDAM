@@ -1554,20 +1554,42 @@ async fn normalize(
                 });
             }
             Ok(blender) => {
+                // One job per entry: models whose jobs share a key (identical FBX files with
+                // the same settings in one library) share its output file, so they share the
+                // job, which names them all
+                let mut shared: Vec<Vec<usize>> = Vec::new();
+                for i in &misses {
+                    let entry = (planned[*i].library, &jobs[*i].1);
+                    match shared
+                        .iter_mut()
+                        .find(|g| (planned[g[0]].library, &jobs[g[0]].1) == entry)
+                    {
+                        Some(group) => group.push(*i),
+                        None => shared.push(vec![*i]),
+                    }
+                }
                 let runner = Runner::new(blender);
-                let total = misses.len();
+                let total = shared.len();
                 let done = std::sync::atomic::AtomicUsize::new(0);
                 progress(Progress {
                     done: 0,
                     total,
                     asset: None,
                 });
-                let runs = misses.iter().map(|i| {
-                    let (job, key) = &jobs[*i];
-                    let root = roots[planned[*i].library].clone();
+                let runs = shared.iter().map(|group| {
+                    let (job, key) = &jobs[group[0]];
+                    let names: Vec<String> = group
+                        .iter()
+                        .map(|i| asset(&planned[*i]).file_path)
+                        .collect();
+                    let job = Job {
+                        asset: names.join(", "),
+                        ..job.clone()
+                    };
+                    let root = roots[planned[group[0]].library].clone();
                     let (runner, done) = (&runner, &done);
                     async move {
-                        let result = match runner.run(job).await {
+                        let result = match runner.run(&job).await {
                             Ok(normalized) => {
                                 let key = key.clone();
                                 tokio::task::spawn_blocking(move || {
@@ -1586,15 +1608,19 @@ async fn normalize(
                             total,
                             asset: Some(job.asset.clone()),
                         });
-                        (*i, result)
+                        (group, result)
                     }
                 });
-                for (i, result) in futures_util::future::join_all(runs).await {
+                for (group, result) in futures_util::future::join_all(runs).await {
                     match result {
-                        Ok(entry) => cached[i] = Some(entry),
+                        Ok(entry) => {
+                            for i in group {
+                                cached[*i] = Some(entry.clone());
+                            }
+                        }
                         Err(message) => problems.push(Problem {
                             message,
-                            assets: vec![asset(&planned[i])],
+                            assets: group.iter().map(|i| asset(&planned[*i])).collect(),
                         }),
                     }
                 }
@@ -4783,8 +4809,8 @@ mod tests {
         );
     }
 
-    /// A Blender at `dir/blender` that reports `version` and leaves `dir/ran` when anything
-    /// runs it.
+    /// A Blender at `dir/blender` that reports `version` and adds a line to `dir/ran` each time
+    /// anything runs it.
     fn stub_blender(dir: &Path, version: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("blender");
@@ -4792,7 +4818,7 @@ mod tests {
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\ntouch '{}'\nprintf 'Blender {version}\\n'\n",
+                "#!/bin/sh\necho run >> '{}'\nprintf 'Blender {version}\\n'\n",
                 ran.display()
             ),
         )
@@ -5107,6 +5133,53 @@ mod tests {
             .collect();
         ended.sort();
         assert_eq!(ended, [stool, totem]);
+    }
+
+    #[tokio::test]
+    async fn models_whose_jobs_share_a_cache_entry_share_one_blender_job() {
+        let f = fixture().await;
+        let stool = "Dungeon Props/Models/SM_Stool.fbx";
+        // A byte-identical copy in the same pack: the same key, so the same output file
+        let copy = "Dungeon Props/Models/SM_StoolCopy.fbx";
+        add_file(&f, copy, &fixture_bytes(stool)).await;
+        let facts = Facts::fixture().with(copy, Facts::fixture().by_path[stool].clone());
+        collection(&f, "domain", "Props", "dg", &[stool, copy]).await;
+        let dir = tempfile::tempdir().unwrap();
+        set_blender(&f, &stub_blender(dir.path(), "5.2.2")).await;
+
+        let (inspection, progress) = normalize_domain(&f, &facts).await;
+
+        // Asked its version once, then one job, which names both models
+        let runs = std::fs::read_to_string(dir.path().join("ran")).unwrap();
+        assert_eq!(runs.lines().count(), 2, "{runs}");
+        let report = &inspection.report;
+        assert_eq!(
+            messages(report),
+            [format!(
+                "{stool}, {copy}: Blender exited without a result: Blender 5.2.2"
+            )]
+        );
+        let named: Vec<&str> = report.problems[0]
+            .assets
+            .iter()
+            .map(|a| a.file_path.as_str())
+            .collect();
+        assert_eq!(named, [stool, copy]);
+        assert_eq!(
+            progress,
+            [
+                Progress {
+                    done: 0,
+                    total: 1,
+                    asset: None
+                },
+                Progress {
+                    done: 1,
+                    total: 1,
+                    asset: Some(format!("{stool}, {copy}"))
+                },
+            ]
+        );
     }
 
     #[tokio::test]

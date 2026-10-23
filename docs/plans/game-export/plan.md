@@ -1045,6 +1045,9 @@ later. Where they differ from C9:
   for converted textures, and the memo row is corrected when it was stale.
 - **The gate's refusal is one problem** naming every model the cache doesn't hold, with why
   Blender can't run.
+- **Models whose jobs share a cache key share one job.** The key holds no path, so identical FBX
+  files in one library with the same settings would write one output file. They get one Blender
+  job, whose problem or entry belongs to all of them, and progress counts jobs, not models.
 - **Progress is sent once before the jobs and once as each ends** (`export:progress`, with the
   domain's id), not as each starts, since jobs queue for the runner's `job_limit` permits. The
   Export view shows "Normalizing models in Blender: 2 of 5 models done, last SM_Chest.fbx".
