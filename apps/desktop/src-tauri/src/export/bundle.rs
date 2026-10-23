@@ -962,6 +962,17 @@ mod tests {
                 std::fs::write(root.join("Unity Moss/T_Moss_D.png"), "changed").unwrap();
                 "Unity Moss/T_Moss_D.png in Fixture"
             }
+            "a source touched" => {
+                // Same bytes and size, a later mtime
+                let file = std::fs::File::options()
+                    .write(true)
+                    .open(root.join("Unity Moss/T_Moss_D.png"))
+                    .unwrap();
+                let later = file.metadata().unwrap().modified().unwrap()
+                    + std::time::Duration::from_secs(3600);
+                file.set_modified(later).unwrap();
+                "Unity Moss/T_Moss_D.png in Fixture"
+            }
             "a member renamed" => {
                 let pack = root.join("Unity Moss");
                 std::fs::rename(pack.join("T_Moss_D.png"), pack.join("T_Moss_N.png")).unwrap();
@@ -1014,6 +1025,7 @@ mod tests {
             "a .meta beside a pack file",
             "a new image in a pack",
             "a source's bytes",
+            "a source touched",
             "a member renamed",
             "a pack override",
             "the domain renamed",
