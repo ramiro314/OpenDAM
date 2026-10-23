@@ -185,7 +185,9 @@ docs/plans                    Plans for this fork
   `Database::late_passes`, which the app turns into `library:updated`. A library open that finds
   the lock held sets the flag too. The holder's release, the follow-up task, or the next open or
   index run, whichever comes first, runs it. Each pass clears the flag as it starts, so a flag set
-  during a pass is caught at the release, and sets it again when it fails. Known gap: until then
+  during a pass is caught at the release, and sets it again when it fails, to `failed`, which the
+  failing holder's own release leaves to the next entry point (`structure::owed_to_release`).
+  Known gap: until then
   `group_id`, `folders` and support roles lag the indexed paths, a few seconds behind another
   machine's refresh and as long as a build's swap behind a build, and a machine running an older
   OpenDAM never runs a pending pass.

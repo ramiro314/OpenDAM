@@ -2133,7 +2133,16 @@ pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassR
         .await?;
     let run = derive_and_apply(pool, root).await;
     if run.is_err() {
-        mark_pending(pool).await;
+        // Unless a command left it pending meanwhile, the flag says the pass failed, so the
+        // release that follows doesn't retry it at once (`owed_to_release`).
+        let marked = sqlx::query("INSERT OR IGNORE INTO library_meta (key, value) VALUES (?, ?)")
+            .bind(PENDING_KEY)
+            .bind(FAILED)
+            .execute(pool)
+            .await;
+        if let Err(e) = marked {
+            tracing::error!(target: "structure", "Could not leave a failed structure pass pending: {e}");
+        }
     }
     run
 }
@@ -2320,6 +2329,9 @@ async fn derive_and_apply(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<Pass
 /// The `library_meta` key set while a structure pass is owed: a command's pass that couldn't take
 /// the advisory lock, or a library open that couldn't. Every pass clears it as it starts.
 const PENDING_KEY: &str = "structure_pending";
+/// `PENDING_KEY`'s value after a failed pass: still owed to the next entry point, but not to the
+/// release of the holder whose pass just failed.
+const FAILED: &str = "failed";
 /// How long a command's pass waits for another holder's advisory lock before it leaves the pass
 /// pending (`rebuild_library`).
 const COMMAND_WAIT: Duration = Duration::from_secs(5);
@@ -2349,6 +2361,16 @@ pub(crate) async fn is_pending(pool: &Pool<Sqlite>) -> bool {
         .fetch_optional(pool)
         .await
         .map_or(true, |found| found.is_some())
+}
+
+/// Whether a holder's release owes the library DB at `pool` a pass: one is pending, and not
+/// because the holder's own pass just failed. An unreadable flag counts as owed, like `is_pending`.
+pub(crate) async fn owed_to_release(pool: &Pool<Sqlite>) -> bool {
+    sqlx::query_scalar::<_, String>("SELECT value FROM library_meta WHERE key = ?")
+        .bind(PENDING_KEY)
+        .fetch_optional(pool)
+        .await
+        .map_or(true, |value| value.is_some_and(|v| v != FAILED))
 }
 
 /// Reruns the pass for `library`, for a command that changed its paths. It takes the library's
@@ -6191,7 +6213,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_pass_leaves_its_pass_pending() {
+    async fn a_failed_pass_leaves_its_pass_pending_but_not_for_its_own_release() {
         let (dir, _db, library) = locked_library().await;
         let pool = &library.pool;
         insert_path(pool, "kits/kit/model.glb").await;
@@ -6203,25 +6225,30 @@ pub(crate) mod tests {
         .execute(pool)
         .await
         .unwrap();
+        let lock = IndexLock::try_acquire(dir.path()).await.unwrap();
 
         assert!(rebuild(pool, dir.path()).await.is_err());
         assert!(is_pending(pool).await, "a failed pass cleared the flag");
-        IndexLock::try_acquire(dir.path())
-            .await
-            .unwrap()
-            .release(pool, dir.path())
-            .await;
-        assert!(
-            is_pending(pool).await,
-            "a failed pass at release cleared the flag"
-        );
 
+        // The share is back, but the holder whose pass just failed doesn't retry it at release.
         sqlx::query("DROP TRIGGER the_share_went_away")
             .execute(pool)
             .await
             .unwrap();
+        lock.release(pool, dir.path()).await;
+        assert!(
+            derived_rows(pool).await.folders.is_empty(),
+            "the release retried its own failed pass"
+        );
+        assert!(is_pending(pool).await);
+
+        // The next entry point runs it.
         rebuild(pool, dir.path()).await.unwrap();
         assert!(!is_pending(pool).await);
+        assert_eq!(
+            derived_rows(pool).await,
+            fresh_pass(&["kits/kit/model.glb"]).await
+        );
     }
 
     #[tokio::test]

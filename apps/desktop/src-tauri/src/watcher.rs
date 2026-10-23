@@ -242,10 +242,12 @@ impl IndexLock {
 
     /// Lets go of the lock, first running the structure pass on the library DB at `pool`, whose
     /// files lie below `root`, when one is pending (`structure::mark_pending`) and the file still
-    /// holds this guard's token. The caller still holds the library's `index_lock`.
+    /// holds this guard's token. A pass pending only because this holder's own pass just failed is
+    /// left to the next entry point (`structure::owed_to_release`). The caller still holds the
+    /// library's `index_lock`.
     pub async fn release(self, pool: &Pool<Sqlite>, root: &Path) {
         debug_assert!(self.path == Self::path(root));
-        if self.still_held() && crate::structure::is_pending(pool).await {
+        if self.still_held() && crate::structure::owed_to_release(pool).await {
             if let Err(e) = crate::structure::rebuild(pool, root).await {
                 tracing::error!(target: "structure", "Pending structure pass failed for library at {root:?}: {e}");
             }
