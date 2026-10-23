@@ -67,6 +67,23 @@ Revised again 2026-10-23 (revision 4) after the review's third round. No decisio
   deliberately differs there, and the escaping entry moves to its own fixture (Steps, Fixtures,
   A2).
 
+Revised again 2026-10-23 (revision 5) after the review's fourth round. No decision changed:
+
+- **R14 - No pruning index reaches a pack mid-swap.**
+  - **Cancel** takes effect only before step 1. After that the build always finishes in-process,
+    by committing or by rolling back.
+  - **Library open.** Swap recovery runs when a library opens, in `connect_library_sqlite`, before
+    its structure pass and before the library can be indexed.
+  - **Every index run.** Every locking `index_paths` and `rebuild_library` also recovers any pack
+    still marked `swapping` before it touches a row.
+
+  So a dropped run task, a crash or a late-opening library can't let a pruning index delete
+  previous-only rows (Flow, Runs, A11).
+
+- **R15 - `.meta` files have their own source path.** A `.meta` file's source path is its asset's,
+  with `.meta` appended to the last element, so `(source_path, origin)` stays unique when a
+  pack keeps its `.meta` files (Steps, A2).
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -284,8 +301,20 @@ holding the lock:
 
 So a rollback loses nothing of the previous build, including paths it alone had.
 
-**Startup recovery** runs for each imported pack before any run starts, under the library's
-lock. With `swap_state = 'swapping'` and build id B, it checks these rows in order, by what is on
+**Swap recovery** runs for every imported pack whose `swap_state` is set. Two places trigger it,
+so no pruning index can reach a pack mid-swap:
+
+- **When a library opens.** In `connect_library_sqlite`, before the structure pass it runs today
+  (`db.rs:412-422`). At that point nothing else holds the new pool, and the library isn't
+  registered for index runs yet. That covers startup and a library that comes online later.
+- **At the start of every locking index or structure entry point.** `index_paths` and
+  `rebuild_library`, after taking `index_lock`, first recover any pack still marked `swapping`.
+  A build holds the lock from step 1 through step 7 or the end of its rollback. So a locking
+  caller that gets the lock and finds a pack `swapping` knows its build is gone, for example
+  because the run task panicked and released the guard. Only the build itself and recovery call
+  the `_locked` variants, which skip this check.
+
+With `swap_state = 'swapping'` and build id B, recovery checks these rows in order, by what is on
 disk. "Live" is the pack folder.
 
 | Staging `.import-B` | `.prev-B` | Live | `.failed-B` | Meaning | Recovery |
@@ -351,6 +380,13 @@ they run in recipe order. Each step has `enabled` and JSON `options`.
   Within one package each `pathname` is unique, so the chain is unique across nesting, even when a
   nested package repeats the outer package's paths. A second entry with the same `pathname` in one
   package (a malformed package) is skipped and reported like an unsafe entry.
+
+  - **A `.meta` file.** A package stores an asset's `.meta` as a second entry (`<guid>/asset.meta`)
+    under the same `pathname`. Its source path is the asset's chain with `.meta` appended to the
+    last element, for example `["Assets/Pack/Models/Rock.fbx.meta"]`. Unity never stores a
+    `.meta` as an asset of its own, and an entry whose `pathname` already ends in `.meta` would
+    collide with one. Such an entry is skipped and reported as a duplicate.
+  - **Zip entries.** A `.meta` in a zip is just another entry, with its own path.
 
   A generated GLB has its source model's source path with origin `generated`. So
   `(source_path, origin)` is unique within a build, and the manifest enforces it.
@@ -547,10 +583,17 @@ half manifest.
 - **The engine.** The import engine (`import/engine.rs`), modeled on the autotag engine, runs
   one run at a time from a queue in `import_runs` (D19).
 - **Progress.** It emits `import:progress` (run id, pack, step, done/total) and `import:updated`.
-- **Cancel.** Cancel kills child processes (`kill_on_drop`) and deletes the staging and work
-  folders. The live folder never changed.
-- **Startup.** Swap recovery (Flow) runs for each imported pack, and runs found `running`
-  become `interrupted`.
+- **Cancel.** Cancel takes effect only **before Flow step 1** (while extracting, placing,
+  converting or writing metadata in staging). It kills child processes (`kill_on_drop`) and deletes
+  the staging and work folders. The live folder hasn't changed at that point.
+  - **After step 1** the build holds the lock and finishes in-process: it commits, or any failure
+    rolls it back. The Cancel button then reads "Finishing, can't cancel now". A `remove` run
+    likewise can't be cancelled once it holds the lock.
+  - **A dropped task.** The build's steps 1-7 and its rollback run in one task that holds the
+    guard and never awaits a cancellation signal. If that task dies anyway (a panic), the pack
+    stays `swapping`, and the next library open or locking index run recovers it first (Flow).
+- **Startup.** Swap recovery runs as each library opens (Flow), and runs found `running` become
+  `interrupted`.
 - **Capped processes.** A shared `capped_command` helper runs Blender and the UE editor through
   `systemd-run --user --scope -p MemoryMax=<cap> -p MemorySwapMax=0`, mirroring
   `scripts/memory-cap.sh`. It warns and runs uncapped when `systemd-run --user` is unavailable,
@@ -622,6 +665,9 @@ confirmation names them.
   path, matched by `source_path` and `origin`, and journals the move in `import_moves`, along
   with every row its index inserts. A rollback deletes the inserted rows, then reverses the moves,
   so neither a rebuild nor its rollback loses metadata (D31).
+- **No pruning index reaches a pack mid-swap.** Cancel takes effect only before a build takes the
+  lock. Swap recovery runs when a library opens, before its structure pass, and at the start of
+  every locking `index_paths` and `rebuild_library` for any pack still marked `swapping`.
 - **A rollback clears its journal before its folder.** `swap_state` and the failed build's
   records go in one transaction, before `.failed-*` is deleted. Recovery acts only on the states
   the tables list, and changes nothing on disk for any other.
@@ -679,6 +725,9 @@ confirmation names them.
   - `synthetic.unitypackage` extracts exactly as its golden: `Assets/` and the shared top folder
     dropped, nested packages as folders, and every `.meta`, `.mat` and `.prefab` present.
   - Its two `T_Rock.png` files (outer and nested) get distinct source paths.
+  - Every `.meta` row in the manifest has a source path distinct from its asset's: the asset's
+    with `.meta` appended. The build inserts the manifest with
+    `UNIQUE (pack_id, build_id, source_path, origin)` in force and doesn't fail.
   - On `escape.unitypackage`:
     - the escaping, absolute and duplicate entries are skipped, and nothing is written outside the
       target;
@@ -766,6 +815,19 @@ confirmation names them.
     `.failed-B` is deleted. On restart, recovery deletes `.failed-B`, and the restored previous
     build's folder, rows and tags are untouched. Recovery is also given the impossible state
     (`swapping`, only the live folder, `current_build` set), and changes nothing on disk.
+  - **Cancel during step 5.** Tag `Old.png`, a path only the previous build has. Press Cancel while
+    step 5 runs: the build is not interrupted, and finishes by committing. A second case makes
+    its index fail, so it rolls back instead. After the rollback, `Old.png`'s row has its id and
+    tag. Cancel pressed before step 1 deletes the staging folder and leaves the live folder and
+    every row untouched.
+  - **A refresh after a crash mid-swap.** Tag `Old.png`, kill the app between the swap and the
+    commit, restart, and trigger a library refresh at once. Recovery runs when the library opens,
+    before the refresh can prune. `Old.png`'s row keeps its id and tag.
+  - **A dropped run task.** Release the guard during step 5 without a rollback (simulated
+    panic), then run `index_paths` on the library. It recovers the pack before indexing, and
+    `Old.png`'s row keeps its tag.
+  - **A library that opens late** with a pack left `swapping` (an offline library reconnecting)
+    is recovered as it opens.
   - **A mid-run change:** a file changed outside OpenDAM, or a step edited, while the build
     stages. The re-check under the lock fails the run, and the live folder is unchanged.
   - **No deadlock:** no call path takes `index_lock` while holding it. A test runs a whole build
