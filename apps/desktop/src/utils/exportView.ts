@@ -1,4 +1,4 @@
-import type { Collection, ExportCheck, ExportSettings } from '../types';
+import type { Collection, ExportCheck, ExportMaterial, ExportSettings } from '../types';
 
 /**
  * Why "Export to game…" is disabled for `collection`, or null when it is a domain: a direct,
@@ -34,4 +34,26 @@ export function checkSummary(check: ExportCheck): string {
   else if (ready === total) assets = `All ${plural(total, 'asset')} ready`;
   if (problems === 0) return `${assets}. Nothing refuses the export`;
   return `${assets}. ${plural(problems, 'problem')} ${problems === 1 ? 'refuses' : 'refuse'} the export`;
+}
+
+const VIA: Record<string, string> = {
+  fbx: 'from the FBX',
+  unity: 'from its Unity material',
+  suffix: 'by file name',
+  stem: 'by the model’s name',
+};
+
+/**
+ * One line for a model's material in the Export view: its slot, name and surface, then each
+ * role's texture and where it was found. `Stone → Stone, opaque: BaseColor Pillar (from the
+ * FBX)`.
+ */
+export function materialLine(material: ExportMaterial): string {
+  let head = `${material.slot} → ${material.name}, ${material.surface}`;
+  if (material.cutoutSuggested) head += ' (cutout suggested)';
+  if (material.added) head += ', added at export';
+  const textures = Object.entries(material.textures).map(
+    ([role, t]) => `${role} ${t.assetName} (${VIA[t.via] ?? t.via})`
+  );
+  return textures.length ? `${head}: ${textures.join(', ')}` : `${head}: no textures`;
 }

@@ -876,6 +876,39 @@ from the contracts above:
   which reads them. `fbx_facts.json` beside the library holds the facts the worker reads from
   each FBX, so the Check's Rust tests read them without Python.
 
+### What the material inference ticket built differently
+
+- **Each role takes the first source that answers it** (D11), not each slot. So a slot whose FBX
+  references only its base color still finds its normal map by suffix. A role never mixes sets.
+- **FBX references resolve against the pack's indexed images,** never the file system: the given
+  path under the library root, the relative path with each component ignoring case, then the
+  file name ignoring case and extension, by C7's folder rule and then the reference's own
+  extension. `textures.py`'s naming heuristics aren't used.
+- **The watcher already indexes `.mat` files,** so a Unity material is one of the pack's files,
+  and a `.mat` named like the slot is matched by file stem, ignoring case, nearest the model
+  first. Each pack file's `.meta` is read for its GUID. A Unity property's layout wins over an
+  image's suffix, and an FBX reference's type only fills in for an image with no suffix.
+- **Stems are compared by their default name lowercased** (`infer::match_key`), in sets and in
+  the suffix lookup, so case, word separators and one type prefix don't count. Only images with
+  a role or layout suffix take part in the suffix lookup. The same-stem lookup reads the folders
+  of the main item and the exported FBX: images never join a model's format group.
+- **D24 per set:** a set used by one model is `<AssetName><MaterialName>` when that model has
+  more than one set in a role this set fills for it, `MaterialName` being the first material
+  that uses it.
+- **Textures a model's materials bring in are listed while the model is refused** (every model
+  is, until step 6), and those that pass through are in the Check's manifest.
+- **The report carries the inference:** a model row has its `materials` (slot, name, surface,
+  the cutout suggestion, whether the export adds it, and each role's set name, source and
+  files), and a texture row its layout, normal-map convention and whether it is a member. The
+  Export view shows one line per material. The Game tab's material and texture editors wait
+  for the Game tab (step 2).
+- **The cutout suggestion decodes the BaseColor with the `image` crate.** A PSD, or an image it
+  can't decode, suggests nothing.
+- **Fixtures:** `T_StoneFloor_ORM.png` moved to `Rocks/T_Slate_ORM.png`, since it would have
+  joined the `StoneFloor` set. The Unity material fixtures are `Unity Moss/Models/SM_Log.fbx`
+  with its `.fbx.meta`, `Materials/M_LogBark.mat` (by remap) and `Materials/Leaves.mat` (by
+  name, alpha clip).
+
 ## Acceptance criteria
 
 - **AC1.** The copied schema matches `SOURCE.md`'s sha256 (a test). `sync-asset-contract.sh`

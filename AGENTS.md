@@ -47,7 +47,9 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               (names, packs, textures, conversion and hashes, memoized in file_hashes,
                               and FBX models and animations by fbx_facts, which asks the preview
                               worker and caches its answers, with collision::PATTERNS, the one list
-                              of collision meshes the export drops)
+                              of collision meshes the export drops), infer, which groups a
+                              pack's images into texture sets and infers each model's materials,
+                              and unity, which reads a Unity pack's .meta and .mat files
     tests/fixtures/game-export/  The export's fixture library, made by make_fixtures.py under Blender and
                               committed with its output, and fbx_facts.json, its FBX files' facts,
                               which test_fbx_facts.py checks and the Check's tests read

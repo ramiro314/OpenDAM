@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { ExportCheck, ExportCheckAsset } from '../types';
-import { checkSummary, exportMenuReason } from './exportView';
+import { checkSummary, exportMenuReason, materialLine } from './exportView';
 
 const settings = { rootCollection: 'dg' };
 const collections = [{ id: 'dg', name: 'DungeonGame' }];
@@ -38,6 +38,8 @@ const asset = (status: ExportCheckAsset['status']): ExportCheckAsset => ({
   role: 'BaseColor',
   pack: 'pack',
   status,
+  member: true,
+  layout: 'BaseColor',
 });
 
 const check = (statuses: ExportCheckAsset['status'][], problems: number): ExportCheck => ({
@@ -57,5 +59,40 @@ describe('checkSummary', () => {
       '1 of 3 assets ready. 2 problems refuse the export'
     );
     expect(checkSummary(check([], 1))).toBe('No assets. 1 problem refuses the export');
+  });
+});
+
+describe('materialLine', () => {
+  test('names the slot, its textures and where each was found', () => {
+    expect(
+      materialLine({
+        slot: 'M_Stone',
+        name: 'Stone',
+        surface: 'opaque',
+        cutoutSuggested: false,
+        added: false,
+        textures: {
+          BaseColor: { via: 'fbx', assetName: 'Pillar', files: ['Kit/T_Stone_D.png'] },
+          Normal: { via: 'suffix', assetName: 'Pillar', files: ['Kit/T_Stone_N.png'] },
+        },
+      })
+    ).toBe(
+      'M_Stone → Stone, opaque: BaseColor Pillar (from the FBX), Normal Pillar (by file name)'
+    );
+  });
+
+  test('marks a cutout suggestion and the slot the export adds', () => {
+    expect(
+      materialLine({
+        slot: 'OpenDAMDefault',
+        name: 'OpenDAMDefault',
+        surface: 'opaque',
+        cutoutSuggested: true,
+        added: true,
+        textures: {},
+      })
+    ).toBe(
+      'OpenDAMDefault → OpenDAMDefault, opaque (cutout suggested), added at export: no textures'
+    );
   });
 });
