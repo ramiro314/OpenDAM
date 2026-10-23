@@ -564,4 +564,44 @@ mod tests {
         let err = place(tmp.path(), &mut files, &steps).unwrap_err();
         assert!(err.to_string().contains("invalid folder"), "{err}");
     }
+
+    #[test]
+    fn rename_fails_when_only_the_meta_would_overwrite_a_file() {
+        let layout = ["a.png", "a.png.meta", "b.png.meta"];
+        let (tmp, mut files) = tree(&layout);
+        let step = PlaceStep::Rename {
+            source: source(&["a.png"]),
+            name: "b.png".into(),
+        };
+        let err = place(tmp.path(), &mut files, &[step]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "rename [\"a.png\"] to b.png: b.png.meta already exists"
+        );
+        assert_eq!(paths(&files), layout);
+        assert_eq!(on_disk(tmp.path()), layout);
+        assert_eq!(
+            fs::read(tmp.path().join("b.png.meta")).unwrap(),
+            b"b.png.meta"
+        );
+    }
+
+    #[test]
+    fn rename_refuses_a_name_that_is_not_a_plain_file_name() {
+        let layout = ["Art/a.png", "Art/a.png.meta"];
+        for name in ["", ".", "..", "x/y.png", "../a.png"] {
+            let (tmp, mut files) = tree(&layout);
+            let step = PlaceStep::Rename {
+                source: source(&["Art/a.png"]),
+                name: name.into(),
+            };
+            let err = place(tmp.path(), &mut files, &[step]).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("rename [\"Art/a.png\"] to {name}: invalid file name {name:?}")
+            );
+            assert_eq!(paths(&files), layout);
+            assert_eq!(on_disk(tmp.path()), layout);
+        }
+    }
 }
