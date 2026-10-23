@@ -53,8 +53,8 @@ Revised again 2026-10-23 (revision 4) after the review's third round. No decisio
 - **R10 - A late crash in a rollback can't touch the restored build.** Rollback step 4 clears
   `swap_state` and deletes the failed build's records in one transaction, before it deletes
   `.failed-B`. A leftover `.failed-*` with `swap_state` `NULL` is plain garbage. The first-build
-  recovery row now requires `current_build IS NULL` as a condition, and a state matching no row
-  changes nothing on disk (Flow, A11).
+  recovery row now requires `current_build IS NULL` as a condition (R33 replaces it with
+  `swap_prev`), and a state matching no row changes nothing on disk (Flow, A11).
 - **R11 - Reversing a move can't collide.** Step 5 journals every row its index inserts. A
   rollback deletes those rows first, then reverses the moves newest first, so each row's old path
   is free again when it moves back (Flow, Records, A11). Revision 9 replaces the newest-first
@@ -165,8 +165,9 @@ decision changed:
 
 - **R27 - An unchanged file keeps its mtime.** A staged file whose source path, origin, size and
   sha256 match the previous build's row gets that row's mtime. The index then sees it unchanged
-  and requeues no preview, and the export Check's `file_hashes` memo stays valid. A toggled hoist
-  no longer sends the whole pack back to the preview queue (Steps, A4).
+  and requeues no preview, and the export Check's `file_hashes` memo stays valid for files whose
+  path didn't change (R34 narrows this). A toggled hoist no longer sends the whole pack back to
+  the preview queue (Steps, A4).
 - **R28 - One GLB per model stem.** When a folder holds `X.fbx` and `X.obj`, `unity_glb` converts
   one of them, chosen in format-group order (FBX before OBJ), instead of failing the build on two
   `X.glb` (Steps, A8).
@@ -194,7 +195,29 @@ decision changed:
 - **R32 - The recovery table covers step 4's failure path.** A crash after step 4 put the previous
   folder back, or after the journal with the staging folder already gone, leaves B's journal with
   nothing of B on disk. The row that called this impossible now names it, and a new row covers
-  the first-build version, where no folder exists at all (Flow, A11).
+  the first-build version, where no folder exists at all (Flow, A11). Revision 15 makes both rows
+  branch on `swap_prev` instead of `current_build` (R33).
+
+Revised again 2026-10-23 (revision 15) after GitHub Inspector's sixth review of PR #199. No
+decision changed:
+
+- **R33 - The journal records whether a live folder was moved aside.** A later build can find no
+  live folder, when you deleted the pack folder outside OpenDAM and chose "restore" at drift.
+  Step 4 now decides the first rename by whether the live folder exists, not by whether this is a
+  first build, and step 3 journals that fact in `import_packs.swap_prev`. The recovery rows that
+  branched on `current_build` branch on `swap_prev`, so such a build, swapped and not committed,
+  is rolled back with its carried rows reversed, never taken for a build that left nothing on
+  disk. A failed first rename is covered too (Flow, Records, A11).
+- **R34 - The `file_hashes` memo stays valid only where the path did.** `file_hashes` is keyed by
+  path and only the export Check writes it, so a carried file has no memo row at its new path,
+  and its next Check hashes it again. The old path's row stays as a harmless orphan, as for any
+  file that goes away. R27 and A4 now claim the memo only for files whose path didn't change
+  (Steps, A4).
+- **R35 - Only regular files and folders are written.** A tar can hold hardlinks, devices, FIFOs
+  and other special entries, and a hardlink's target can point anywhere. Extraction now writes
+  regular files and directories only, and skips and reports every other entry type like an
+  unsafe entry, as `extract_unity.py` reads only `member.isfile()` entries. The
+  `escape.unitypackage` fixture gains a hardlink (Steps, Fixtures, A2).
 
 ## Problem
 
@@ -362,13 +385,18 @@ id while staging, in 200-row transactions. Those rows mean nothing until the com
    On any difference it stops: it deletes the staging folder and its rows, and fails the run with
    "the pack changed during the build; Rebuild again". Cached conversions make the retry cheap.
 
-3. **Journal.** It sets `import_packs.swap_state = 'swapping'` and `swap_build` to the build id,
-   in one transaction.
-4. **Swap.** It renames the live folder to `.<Pack>.prev-<build id>`, then the staging folder to
-   the live name. A pack's first build has no live folder and skips the first rename. If the
-   second rename fails (the staging folder vanished after the re-check), it renames
-   `.prev-<build id>` back to the live name, deletes the build's rows, clears `swap_state` and
-   fails the run.
+3. **Journal.** In one transaction it sets `import_packs.swap_state = 'swapping'`, `swap_build`
+   to the build id, and `swap_prev` to whether the live folder exists now. A first build has no
+   live folder, and neither has a later build whose pack folder you deleted outside OpenDAM and
+   chose to restore at drift. Recovery reads `swap_prev`, never `current_build`, to know whether
+   a previous folder was moved aside.
+4. **Swap.** When `swap_prev` is set, it renames the live folder to `.<Pack>.prev-<build id>`;
+   otherwise it skips that rename. Then it renames the staging folder to the live name.
+   - **The first rename fails.** Nothing has moved: it deletes the build's rows, clears
+     `swap_state` and fails the run.
+   - **The second rename fails** (the staging folder vanished after the re-check). It renames
+     `.prev-<build id>` back to the live name when `swap_prev` is set, deletes the build's rows,
+     clears `swap_state` and fails the run.
 5. **Carry moved rows, then index without pruning.**
    - **Carry.** It joins the previous build's manifest with the new one on `(source_path, origin)`.
      Matching by `origin` too means a GLB follows its own row, not its model's. A file the new build
@@ -440,8 +468,8 @@ derive roles from a build that never committed.
 holding the lock:
 
 1. Rename the live folder to `.<Pack>.failed-<build id>`.
-2. If a `.prev-<build id>` folder exists, rename it back to the live name. A first build has none,
-   so its pack folder is simply gone.
+2. If a `.prev-<build id>` folder exists, rename it back to the live name. A build journaled
+   without `swap_prev` has none, so its pack folder is simply gone, as it was before the build.
 3. Undo the failed build's rows:
    - **Inserted rows.** Delete every asset row journaled as `inserted`. They were made by step 5
      for the failed build's files, during the locked window, and hold no metadata of yours.
@@ -540,15 +568,15 @@ disk. "Live" is the pack folder.
 
 | Staging `.import-B` | `.prev-B` | Live | `.failed-B` | Meaning | Recovery |
 |---|---|---|---|---|---|
-| present | absent | any | absent | Crashed after the journal, before any rename. With a live folder, a later build; without one, a first build. | Delete the staging folder and B's rows. |
+| present | absent | any | absent | Crashed after the journal, before any rename, or after a failed first rename. With a live folder, a later build; without one, a first build or a deleted pack folder. | Delete the staging folder and B's rows. |
 | present | present | absent | absent | Crashed between the two renames | Rename `.prev-B` back to live. Delete the staging folder and B's rows. |
 | absent | present | absent | absent | Crashed after the first rename, with the staging folder gone (removed outside the build) | Rename `.prev-B` back to live. Delete B's rows. |
 | absent | present | present | absent | A later build swapped, not committed | Roll back (steps 1-4). |
-| absent | absent | present | absent | **and `current_build IS NULL`**: a first build swapped, not committed | Roll back (steps 1, 3, 4: no `.prev` to restore). |
+| absent | absent | present | absent | **and `swap_prev` is false**: B swapped in where no live folder was (a first build, or a later build restoring a deleted pack folder), not committed | Roll back (steps 1, 3, 4: no `.prev` to restore). Carried rows are reversed and inserted rows deleted. |
 | absent | present | absent | present | Crashed in a rollback, between its renames | Rename `.prev-B` back to live, then finish the rollback (steps 3-4). |
 | absent | absent | any | present | Crashed in a rollback, after its renames | Finish the rollback (steps 3-4). |
-| absent | absent | present | absent | **and `current_build` is not `NULL`**: nothing of B is on disk. Step 4's second rename failed and the previous folder was renamed back, or the staging folder was gone before the first rename, then the app crashed before `swap_state` was cleared. No row was carried yet. | Change nothing on disk. Clear `swap_state`, delete B's manifest and journal rows, run a `Prune::Now` index of the pack, and log it. |
-| absent | absent | absent | absent | **and `current_build IS NULL`**: the same for a first build, which has no previous folder | Change nothing on disk. Delete B's manifest and journal rows, clear `swap_state`, and log it. |
+| absent | absent | present | absent | **and `swap_prev` is true**: nothing of B is on disk, since swapping B in always leaves `.prev-B`. Step 4's second rename failed and the previous folder was renamed back, or the staging folder was gone before the first rename, then the app crashed before `swap_state` was cleared. No row was carried yet. | Change nothing on disk. Clear `swap_state`, delete B's manifest and journal rows, run a `Prune::Now` index of the pack, and log it. |
+| absent | absent | absent | absent | **and `swap_prev` is false**: the same where no live folder was, a first build or a deleted pack folder | Change nothing on disk. Delete B's manifest and journal rows, clear `swap_state`, and log it. |
 | any | any | any | any | Any other combination, not produced by any step | Change nothing on disk. Leave `swap_state` set, mark the pack `failed` with the state found, and block its runs until you act. |
 
 With `swap_state` `NULL`:
@@ -573,7 +601,7 @@ they run in recipe order. Each step has `enabled` and JSON `options`.
 | Step | Phase | Options | Behavior (ported from) |
 |---|---|---|---|
 | `extract_unitypackage` | extract | `variant` (the inner path of the chosen `.unitypackage` in a zip), `subpath` (a pipeline folder inside the package, else all of it) | Unpacks the tar.gz by GUID, rebuilds `pathname`s, drops `Assets/` and a top folder every file shares, skips and reports a path that would escape the target (below), **keeps every file and each `.meta`**, and unpacks nested packages into a folder named after each (`extract_unity.py`). |
-| `extract_zip` | extract | `subpath` | Copies one sub-folder of a zip, or all of it. Skips and reports absolute and `..` entries and symlinks (below). |
+| `extract_zip` | extract | `subpath` | Copies one sub-folder of a zip, or all of it. Writes regular files and folders only, and skips and reports absolute and `..` entries, symlinks and every other entry type (below). |
 | `export_unreal` | extract | `batch` (30) | The Unreal pack's producer (below). Its GLBs are the extracted files. |
 | `flatten` | place | none | Merges the root's only folder into the root while nothing else there is an asset (docs, `.meta` and `datapackage.json` don't count), repeatedly. Moves each `.meta` with its file, and stops the build on a name clash (`flatten_pack.py`). |
 | `hoist` | place | `folder` | Moves one folder's contents up to the pack root, with the same clash rule. |
@@ -582,10 +610,16 @@ they run in recipe order. Each step has `enabled` and JSON `options`.
 | `unity_glb` | convert | `max_texture` (1024), `force` | Runs the embedded `unity_glb.py` (ported `unity_gltf.py`) in Blender on a work copy, then writes one `X.glb` per model stem in a folder that doesn't already ship a `.glb` (D13). When the folder holds both `X.fbx` and `X.obj`, it converts the FBX, as the format group would pick it, and the OBJ gets no GLB. |
 | `metadata` | metadata | `preset` (`unity`, `fab`, `kenney`, `none`), `title`, `version`, `publisher`, `authors`, `license`, `sources`, `lookup_store_page` | Writes `datapackage.json` at the pack root (`gen_datapackage.py`, `gen_kenney_datapackage.py`). Its `resources` names the first model in the final tree. |
 
-- **Unsafe entries are skipped and reported.** An archive entry that is absolute, climbs out with
-  `..`, resolves outside the target, or is a symlink is never written. It is skipped, as
-  `extract_unity.py` skips it, and listed as a warning on the run and in the Preparation panel
-  (path and reason). The build goes on, and the manifest doesn't hold the entry.
+- **Unsafe entries are skipped and reported.** Extraction writes only regular files and
+  directories, each as a new file it creates and fills from the entry's bytes. It never asks the
+  archive library to extract an entry as it is, so no link is ever created. Every other entry is
+  skipped, as `extract_unity.py` skips them (it reads only `member.isfile()` entries), and listed
+  as a warning on the run and in the Preparation panel (path and reason). The build goes on, and
+  the manifest doesn't hold the entry.
+  - **What is skipped.** An entry that is absolute, climbs out with `..` or resolves outside the
+    target, and any entry that isn't a regular file or a directory: a symlink, a hardlink (whose
+    link name can point anywhere), a character or block device, a FIFO, or any other tar or zip
+    type.
   - **Dropped before the layout is decided.** Unsafe entries are removed *before* the shared top
     folder is found, so a skipped entry never changes the layout.
   - **A deliberate difference from the script.** `extract_unity.py` decides the shared top folder
@@ -775,7 +809,8 @@ open):
   `never_built`), `current_build` (the committed build id, `NULL` before the first),
   `recipe_rev` (incremented by every change to the pack's steps, in the same transaction),
   `store_page` (the Kenney lookup's answer, outside the recipe; Pack metadata), and
-  `swap_state` (`NULL`, or `'swapping'` with `swap_build`).
+  `swap_state` (`NULL`, or `'swapping'` with `swap_build` and `swap_prev`, whether step 4 moved a
+  live folder aside).
 - `import_steps`: `pack_id`, `position`, `kind`, `enabled`, `options` (JSON).
 - `import_outputs`: `pack_id`, `build_id`, `path` (relative to the library root), `size`,
   `mtime_ns`, `sha256`, `origin` (`extracted`, `generated`, `kept`), `source_path` (Steps:
@@ -976,9 +1011,10 @@ confirmation names them.
     - `Models/SM_Log.fbx`, copied from `tests/fixtures/game-export/library/Unity Moss/`, with a
       PNG base color its `.mat` names by GUID;
     - no unsafe entry, so its golden from `extract_unity.py` is exact.
-  - `escape.unitypackage`: a shared top folder plus `../escape.txt`, an absolute pathname and
-    a duplicate `pathname`. It is used only by A2's unsafe-entry checks, against no golden,
-    because the script and this port differ there by design (R13).
+  - `escape.unitypackage`: a shared top folder plus `../escape.txt`, an absolute pathname, a
+    duplicate `pathname`, and a hardlink entry whose link name points outside the target. It is
+    used only by A2's unsafe-entry checks, against no golden, because the script and this port
+    differ there by design (R13).
   - `fab-unity.zip`: two `.unitypackage` variants, `URP` and `Built-In`.
   - `fab-unity-folders.zip`: one package with `URP/` and `Built-In/` folders inside.
   - `kenney.zip`: a shared top folder, then `<Category>/<Pack>/License.txt` with a Kenney header
@@ -1014,8 +1050,8 @@ confirmation names them.
     with `.meta` appended. The build inserts the manifest with
     `UNIQUE (pack_id, build_id, source_path, origin)` in force and doesn't fail.
   - On `escape.unitypackage`:
-    - the escaping, absolute and duplicate entries are skipped, and nothing is written outside the
-      target;
+    - the escaping, absolute, duplicate and hardlink entries are skipped, no link is created, and
+      nothing is written outside the target;
     - the build succeeds, and the run lists one warning per skipped entry, naming it;
     - the shared top folder is still dropped.
 - **A3 - Flatten and hoist.** On `synthetic.unitypackage`, `extract_unitypackage`, `flatten` and
@@ -1034,8 +1070,9 @@ confirmation names them.
   - When the new path holds the row of a previous-only file (here, an excluded file at that
     path), that row is moved aside and deleted at step 7, and the carried file keeps its own id
     and tags at the path. No tag of the excluded file appears on it.
-  - A rebuild that only toggles `hoist` leaves every file's `preview_status`, thumbnail and
-    `file_hashes` row as they were: no preview job is queued for an unchanged file, moved or not.
+  - A rebuild that only toggles `hoist` leaves every file's `preview_status` and thumbnail as they
+    were: no preview job is queued for an unchanged file, moved or not. Files whose path didn't
+    change keep their `file_hashes` row valid; a moved file is hashed again at the next Check.
 - **A5 - In-app edits recorded.**
   - An in-app rename and a delete inside an imported pack append `rename` and `exclude` steps.
     A rebuild keeps the new name and doesn't bring the file back.
@@ -1118,7 +1155,7 @@ confirmation names them.
   - **Killed late in a rollback:** for a later build, after step 4's transaction and before
     `.failed-B` is deleted. On restart, library-open recovery deletes `.failed-B`, and the restored previous
     build's folder, rows and tags are untouched. Recovery is also given the state with only the
-    live folder (`swapping`, `current_build` set), and changes nothing on disk.
+    live folder (`swapping`, `swap_prev` true), and changes nothing on disk.
   - **Cancel during step 5.** Tag `Old.png`, a path only the previous build has. Press Cancel while
     step 5 runs: the build is not interrupted, and finishes by committing. A second case makes
     its index fail, so it rolls back instead. After the rollback, `Old.png`'s row has its id and
@@ -1177,9 +1214,16 @@ confirmation names them.
   - **Killed in step 4's failure path.** Make the second rename fail, and kill the app after
     `.prev-B` is renamed back and before `swap_state` is cleared, for a later build and for a
     first build (where no folder exists). Separately, delete the staging folder after the journal
-    and kill the app before the first rename. On restart each state matches its row: B's rows are
-    deleted, `swap_state` is cleared, the live folder (if any) and every previous row are
-    untouched, and the pack's runs aren't blocked.
+    and kill the app before the first rename, and make the first rename fail. On restart each
+    state matches its row: B's rows are deleted, `swap_state` is cleared, the live folder (if
+    any) and every previous row are untouched, and the pack's runs aren't blocked.
+  - **A deleted pack folder, restored.** Tag a file of a built pack, delete the whole pack folder
+    outside OpenDAM, and Rebuild with "restore" chosen for every missing file. Step 3 journals
+    `swap_prev` false and step 4 skips the first rename. With a hoist toggled too, step 5 carries
+    the tagged row. The build commits, and the file keeps its id and tag. Then repeat it and kill
+    the app after step 5: recovery rolls back, the carried row is back at its old path with its
+    tag, inserted rows are gone, `current_build` still names the previous build, and the pack
+    folder is absent again, as before the build.
   - **A mid-run change:** a file changed outside OpenDAM, or a step edited, while the build
     stages. The re-check under the lock fails the run, and the live folder is unchanged.
   - **No deadlock:** no call path takes `index_lock` while holding it. A test runs a whole build
