@@ -155,9 +155,10 @@ decision changed:
   pack's target is refused, in the dialog and when a target is edited. One pack's rebuild or
   Remove could otherwise move or delete another pack's files (Presets, invariants, A18).
 - **R26 - The GLB cache key covers file names.** `unity_gltf.py` falls back to matching
-  materials and textures by file name, so the inputs hash adds each input's final file name. A
-  `rename` of a texture now reconverts, and a hoist, which changes folders and not names, still
-  reuses every GLB (Unity conversion, A8).
+  materials and textures by file name, so the inputs hash adds each input's final file name.
+  Where two inputs share a name, the script keeps the first by path, so the hash also records
+  their order. A `rename` of a texture now reconverts, and a hoist, which changes folders and not
+  names, still reuses every GLB unless it reorders same-named files (Unity conversion, A8).
 
 ## Problem
 
@@ -645,13 +646,17 @@ whenever a target is edited:
     sorted, then hashed.
   - **Why file names count.** `unity_gltf.py` resolves materials and textures by GUID through
     the `.meta` files first, then falls back to file names (`by_name`, its `images` map by stem,
-    `named_material`). It never matches by folder. So a `rename` can change what Blender
-    produces, and a folder change can't.
+    `named_material`). It never matches by folder, but when two files share a name it keeps the
+    first by path (`setdefault` over a path-sorted list, `unity_gltf.py:458-464`). So a `rename`
+    can change what Blender produces, and so can a folder change that reorders same-named files.
+  - **Same-named inputs.** For each name that more than one input has, the inputs hash also lists
+    those inputs' source paths in the order of their final paths in the pack.
   - **What changes it.** An `exclude` or `rename` of a texture or `.mat`, or a kept, changed
     texture, changes what Blender reads, so the key changes and Blender runs again. Such a change
     reconverts every model of the pack, not just the ones that used the file.
   - **What doesn't.** A hoist or flatten moves files between folders without changing their
-    source paths, names or bytes, so a rebuild that only toggled a hoist reuses every GLB (D18).
+    source paths, names or bytes, so a rebuild that only toggled a hoist reuses every GLB (D18),
+    unless it changes which of two same-named files comes first.
 
   Settings shows the cache's size, with a Clear button.
 
@@ -999,7 +1004,8 @@ confirmation names them.
   and one after keeping a changed copy of it (drift, keep yours), each run Blender again, and
   the new GLB carries no PNG or the changed one. A rebuild after a `rename` of that PNG also runs
   Blender again, and its GLB matches a conversion made from scratch with the PNG under its new
-  name.
+  name. With two same-named PNGs in different folders, a hoist that changes which comes first by
+  path also reconverts.
 - **A9 - Unreal, stub editor.** With a stub editor script that writes GLBs in batches and once
   makes no progress, the step loops, resumes from cache, and fails the step with the
   no-progress message. The work copy's `.uproject` has the plugins enabled, and the zip is
