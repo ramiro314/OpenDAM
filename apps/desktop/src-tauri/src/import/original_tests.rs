@@ -397,6 +397,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rebuild_waits_only_for_a_check_of_its_own_original() {
+        let s = setup().await;
+        let (first, first_pack) = s.import_copy().await;
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other.unitypackage");
+        std::fs::copy(fixture("synthetic.unitypackage"), &other).unwrap();
+        let mut request = s.golden_request();
+        request.original_path = other.to_string_lossy().into_owned();
+        request.target = "Pub/Other".into();
+        let run = s.engine.start_import(request).await.unwrap();
+        s.wait_for(&run.id, "done").await;
+        let other_pack = run.packs[0].pack_id.clone();
+
+        // A check hashing the first original, as a startup check over a touched multi-GB file does
+        let held = s.engine.checking.lock(&first.path.to_string_lossy()).await;
+        let other_rebuild = tokio::time::timeout(
+            Duration::from_secs(10),
+            s.engine.rebuild_pack("lib", &other_pack),
+        )
+        .await
+        .expect("a rebuild of another original's pack doesn't wait for that check");
+        s.wait_for(&other_rebuild.unwrap().id, "done").await;
+        let first_rebuild = tokio::time::timeout(
+            Duration::from_millis(300),
+            s.engine.rebuild_pack("lib", &first_pack),
+        )
+        .await;
+        assert!(
+            first_rebuild.is_err(),
+            "the original's own rebuild waits for its check"
+        );
+        drop(held);
+        let run = s.engine.rebuild_pack("lib", &first_pack).await.unwrap();
+        s.wait_for(&run.id, "done").await;
+    }
+
+    #[tokio::test]
     async fn locate_original_is_refused_while_a_pack_of_it_is_building() {
         let s = setup_with(false).await;
         let mut request = s.golden_request();

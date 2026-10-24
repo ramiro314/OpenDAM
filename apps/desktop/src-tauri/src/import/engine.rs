@@ -140,8 +140,9 @@ pub struct Engine {
     /// Runs whose Cancel was accepted while their claim failed. Their next attempt starts
     /// cancelled, so the build stops before it changes anything.
     pending_cancels: Mutex<HashSet<String>>,
-    /// Held by a check of the originals, so two never hash the same file at once.
-    checking: tokio::sync::Mutex<()>,
+    /// Each original path's lock, held by a check of it and by a Locate of it, so two never
+    /// hash the same file at once and a scoped check never waits for another original's.
+    pub(super) checking: original::PathLocks,
 }
 
 impl Engine {
@@ -172,7 +173,7 @@ impl Engine {
             wake: Notify::new(),
             active: Mutex::new(None),
             pending_cancels: Mutex::new(HashSet::new()),
-            checking: tokio::sync::Mutex::new(()),
+            checking: original::PathLocks::default(),
             owner: crate::watcher::this_process(),
             hooks: Hooks::default(),
             lock_wait,
@@ -258,8 +259,7 @@ impl Engine {
         library: &LibraryHandle,
         only: Option<&str>,
     ) -> sqlx::Result<()> {
-        let _checking = self.checking.lock().await;
-        if original::check_library(&library.pool, only).await? {
+        if original::check_library(&library.pool, &self.checking, only).await? {
             (self.events)(ImportEvent::OriginalsChanged(library.id.clone()));
         }
         Ok(())
@@ -323,7 +323,7 @@ impl Engine {
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("The file {path} can't be read: {e}"))?;
-        let _checking = self.checking.lock().await;
+        let _checking = self.checking.lock(original_path).await;
         let located = original::locate(
             &library.pool,
             original_path,

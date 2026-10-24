@@ -6,7 +6,9 @@
 //! keep working. Locate original re-points the import at a file with the same sha256, and at a
 //! different file only once it is named by its sha256 (Use this file).
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use sqlx::{Pool, Sqlite};
 
@@ -96,54 +98,88 @@ pub fn check(path: &Path, imports: &[Recorded]) -> Vec<Found> {
         .collect()
 }
 
+/// One lock per original path, so two checks never hash the same file at once, while a check of
+/// one original never waits for another's hashing.
+#[derive(Default)]
+pub struct PathLocks(std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>);
+
+impl PathLocks {
+    pub async fn lock(&self, path: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            // Paths no check holds or waits for are dropped, so the map stays as small as the
+            // checks under way
+            locks.retain(|_, l| Arc::strong_count(l) > 1);
+            locks.entry(path.to_string()).or_default().clone()
+        };
+        lock.lock_owned().await
+    }
+}
+
 /// Checks every import's original in the library, or only import `only`'s, and records what
-/// each check found. Returns whether any import's state changed.
-pub async fn check_library(pool: &Pool<Sqlite>, only: Option<&str>) -> sqlx::Result<bool> {
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(
-        String,
-        String,
-        i64,
-        i64,
-        String,
-        String,
-        Option<i64>,
-        Option<i64>,
-        Option<String>,
-    )> = sqlx::query_as(
-        "SELECT id, original_path, original_size, original_mtime_ns, original_sha256,
-         original_state, seen_size, seen_mtime_ns, seen_sha256 FROM imports
-         WHERE ?1 IS NULL OR id = ?1 ORDER BY original_path",
+/// each check found, holding each original path's lock from reading its imports to recording
+/// them. Returns whether any import's state changed.
+pub async fn check_library(
+    pool: &Pool<Sqlite>,
+    locks: &PathLocks,
+    only: Option<&str>,
+) -> sqlx::Result<bool> {
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT original_path FROM imports WHERE ?1 IS NULL OR id = ?1
+         ORDER BY original_path",
     )
     .bind(only)
     .fetch_all(pool)
     .await?;
-    let mut by_path: Vec<(String, Vec<(Recorded, String)>)> = Vec::new();
-    for (id, path, size, mtime_ns, sha256, state, seen_size, seen_mtime, seen_sha) in rows {
-        let seen = match (seen_size, seen_mtime, seen_sha) {
-            (Some(size), Some(mtime), Some(sha)) => Some(((size, mtime), sha)),
-            _ => None,
-        };
-        let recorded = Recorded {
-            id,
-            stamp: (size, mtime_ns),
-            sha256,
-            seen,
-        };
-        match by_path.last_mut() {
-            Some((p, imports)) if *p == path => imports.push((recorded, state)),
-            _ => by_path.push((path, vec![(recorded, state)])),
-        }
-    }
     let mut changed = false;
-    for (path, imports) in by_path {
+    for path in paths {
+        let _held = locks.lock(&path).await;
+        // Read under the lock, so a check that waited for another of the same file sees the
+        // stamp it recorded and hashes nothing again
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            String,
+            i64,
+            i64,
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT id, original_size, original_mtime_ns, original_sha256, original_state,
+             seen_size, seen_mtime_ns, seen_sha256 FROM imports
+             WHERE original_path = ?1 AND (?2 IS NULL OR id = ?2)",
+        )
+        .bind(&path)
+        .bind(only)
+        .fetch_all(pool)
+        .await?;
+        let imports: Vec<(Recorded, String)> = rows
+            .into_iter()
+            .map(
+                |(id, size, mtime_ns, sha256, state, seen_size, seen_mtime, seen_sha)| {
+                    let seen = match (seen_size, seen_mtime, seen_sha) {
+                        (Some(size), Some(mtime), Some(sha)) => Some(((size, mtime), sha)),
+                        _ => None,
+                    };
+                    let recorded = Recorded {
+                        id,
+                        stamp: (size, mtime_ns),
+                        sha256,
+                        seen,
+                    };
+                    (recorded, state)
+                },
+            )
+            .collect();
         let recorded: Vec<Recorded> = imports.iter().map(|(r, _)| r.clone()).collect();
         let at = path.clone();
         let found = tokio::task::spawn_blocking(move || check(Path::new(&at), &recorded))
             .await
             .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
         for ((import, state), found) in imports.iter().zip(found) {
-            if record(pool, &path, import, &found).await? && state != found.state() {
+            if record(pool, &path, import, &found).await? && *state != found.state() {
                 changed = true;
             }
         }
