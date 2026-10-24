@@ -330,7 +330,7 @@ struct Leftover {
 /// The second table, for every pack whose `swap_state` is `NULL`: deletes a staging folder and
 /// its build's rows, deletes a `.failed-*` folder, and settles a `.prev-*` one (step 7). A pack
 /// with a live run is skipped. Its folders are listed before its runs are read, so a build that
-/// starts meanwhile never has its staging folder deleted.
+/// starts meanwhile never has its staging folder deleted, nor its rows (`settle_records`).
 async fn leftovers(pool: &Pool<Sqlite>, root: &Path, advisory: &IndexLock) -> sqlx::Result<()> {
     let packs: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT id, target, current_build FROM import_packs WHERE swap_state IS NULL
@@ -366,24 +366,53 @@ async fn leftovers(pool: &Pool<Sqlite>, root: &Path, advisory: &IndexLock) -> sq
                 _ => {
                     index_pack(pool, root, advisory, &live).await;
                     fs_swap::discard(&left.folder);
-                    let mut tx = pool.begin().await?;
-                    sqlx::query(
-                        "DELETE FROM import_outputs WHERE pack_id = ? AND build_id IS NOT ?",
-                    )
-                    .bind(&pack_id)
-                    .bind(&current_build)
-                    .execute(&mut *tx)
-                    .await?;
-                    sqlx::query("DELETE FROM import_moves WHERE pack_id = ?")
-                        .bind(&pack_id)
-                        .execute(&mut *tx)
-                        .await?;
-                    tx.commit().await?;
+                    settle_records(pool, &pack_id, current_build.as_deref(), &live).await?;
                 }
             }
         }
     }
     Ok(())
+}
+
+/// A `.prev-*` settle's records: deletes the manifest rows of every build of pack `pack_id` but
+/// `current` and those still staging, and the pack's journal. A build that started staging after
+/// the live-run check (staging takes no lock) keeps its rows: the transaction's first write takes
+/// the database's write lock, and only then are the staging folders beside `live` listed. A build
+/// creates its folder before it writes its rows, so a build whose rows were written by then has
+/// its folder listed, and one that writes them later waits for this commit. The journal is written
+/// only under the locks this recovery holds, so no other build has one.
+async fn settle_records(
+    pool: &Pool<Sqlite>,
+    pack_id: &str,
+    current: Option<&str>,
+    live: &Path,
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM import_moves WHERE pack_id = ?")
+        .bind(pack_id)
+        .execute(&mut *tx)
+        .await?;
+    let staging: Vec<String> = left_beside(live)
+        .into_iter()
+        .filter(|left| left.tag == STAGING)
+        .map(|left| left.build_id)
+        .collect();
+    let builds: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT build_id FROM import_outputs WHERE pack_id = ?")
+            .bind(pack_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    for build in builds {
+        if Some(build.as_str()) == current || staging.contains(&build) {
+            continue;
+        }
+        sqlx::query("DELETE FROM import_outputs WHERE pack_id = ? AND build_id = ?")
+            .bind(pack_id)
+            .bind(&build)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
 }
 
 /// The staging, failed and previous folders beside the pack folder `live`, in that order. Only a
@@ -433,4 +462,65 @@ async fn live_run(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<bool> {
     Ok(runs.iter().any(|(machine, boot, pid, started, heartbeat)| {
         !owner_gone(&me, machine, boot, *pid, *started, *heartbeat, now)
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn insert_output(pool: &Pool<Sqlite>, build_id: &str) {
+        sqlx::query(
+            "INSERT INTO import_outputs (pack_id, build_id, path, size, mtime_ns, sha256, origin,
+             source_path) VALUES ('p', ?, 'Pub/Pack/a.png', 1, 0, '', 'extracted', '[\"a\"]')",
+        )
+        .bind(build_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_prev_settle_keeps_the_rows_of_a_build_that_started_staging_meanwhile() {
+        let pool = crate::db::memory_library_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("Pub/Pack");
+        std::fs::create_dir_all(&live).unwrap();
+        let (current, old, staging) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        // A rebuild that began staging after the live-run check: its folder, then its rows.
+        fs_swap::create_staging(&live, STAGING, &staging).unwrap();
+        for build in [&current, &old, &staging] {
+            insert_output(&pool, build).await;
+        }
+        sqlx::query(
+            "INSERT INTO import_moves (pack_id, build_id, seq, kind, asset_id, to_path)
+             VALUES ('p', ?, 1, 'inserted', 'x', 'Pub/Pack/a.png')",
+        )
+        .bind(&current)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        settle_records(&pool, "p", Some(&current), &live)
+            .await
+            .unwrap();
+
+        let mut left: Vec<String> =
+            sqlx::query_scalar("SELECT build_id FROM import_outputs WHERE pack_id = 'p'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        left.sort();
+        let mut kept = vec![current, staging];
+        kept.sort();
+        assert_eq!(left, kept, "only the old build's rows go");
+        let moves: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM import_moves")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(moves, 0);
+    }
 }
