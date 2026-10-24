@@ -90,8 +90,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               rename, shared by the export's bundles and the import's builds
     tests/fixtures/pack-import/  Its fixture originals, made by make_fixtures.py (stdlib only) and
                               committed with its output, and expected/, goldens from the owner's
-                              scripts (the extraction's, and flatten and hoist Art's after it), each
-                              named with its sha256 in expected/README.md
+                              scripts (the extraction's, flatten and hoist Art's after it, and the
+                              Unity, Fab and Kenney datapackage.json files gen_datapackage.py and
+                              gen_kenney_datapackage.py write), each named with its sha256 in
+                              expected/README.md
     tests/fixtures/game-export/  The export's fixture library, made by make_fixtures.py under Blender and
                               committed with its output, and fbx_facts.json, its FBX files' facts,
                               which test_fbx_facts.py checks and the Check's tests read
