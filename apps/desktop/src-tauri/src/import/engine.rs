@@ -496,7 +496,9 @@ impl Engine {
             return Err("Name the pack's publisher".into());
         }
         let (original, kind) = original(&request.original_path, &root)?;
-        let variant = request.variant.as_deref().map(str::trim);
+        let variant = inner_path(request.variant.as_deref(), "variant")?;
+        let subpath = inner_path(request.subpath.as_deref(), "sub-folder")?;
+        let variant = variant.as_deref();
         if kind == "unitypackage" && variant.is_some() {
             return Err("A .unitypackage original has no variant: only a zip holds them".into());
         }
@@ -523,7 +525,7 @@ impl Engine {
         if let Some(variant) = variant {
             extract.insert("variant".into(), variant.into());
         }
-        if let Some(subpath) = &request.subpath {
+        if let Some(subpath) = &subpath {
             extract.insert("subpath".into(), subpath.as_str().into());
         }
         let extract_kind = if kind == "zip" && variant.is_none() {
@@ -550,7 +552,7 @@ impl Engine {
             kind: "metadata".into(),
             options: json!({ "preset": preset, "publisher": publisher }),
         });
-        let source = [variant, request.subpath.as_deref()]
+        let source = [variant, subpath.as_deref()]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
@@ -660,6 +662,20 @@ fn original(path: &str, root: &Path) -> Result<(PathBuf, &'static str), String> 
         ));
     }
     Ok((original, kind))
+}
+
+/// A variant or sub-folder option in its clean form, or `None` when it is left out or blank.
+/// One that names no path, or climbs out with `..`, is refused before anything is recorded.
+fn inner_path(raw: Option<&str>, what: &str) -> Result<Option<String>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    match super::unitypackage::clean(raw) {
+        Ok(parts) if !parts.is_empty() => Ok(Some(parts.join("/"))),
+        _ => Err(format!(
+            "{raw:?} isn't a {what} in the original: give a relative path inside it"
+        )),
+    }
 }
 
 fn nests(target: &str, other: &str) -> String {
@@ -1235,6 +1251,32 @@ mod tests {
         request.preset = Some("kenny".into());
         let error = s.engine.start_import(request).await.unwrap_err();
         assert_eq!(error, r#""kenny" isn't a preset"#);
+        for (variant, subpath) in [(Some("../V.unitypackage"), None), (None, Some("/Kenney"))] {
+            let request = s.zip_request("kenney.zip", variant, subpath, "K");
+            let error = s.engine.start_import(request).await.unwrap_err();
+            assert!(error.contains("give a relative path inside it"), "{error}");
+        }
+        assert_eq!(s.count("SELECT COUNT(*) FROM imports").await, 0);
+
+        // A blank variant or sub-folder is left out: a blank variant on a `.unitypackage` is
+        // accepted, and on a zip the whole zip is copied with the `none` preset.
+        let mut request = s.golden_request();
+        request.variant = Some("  ".into());
+        request.subpath = Some("".into());
+        let run = s.engine.start_import(request).await.unwrap();
+        s.wait_for(&run.id, "done").await;
+        let request = s.zip_request("kenney.zip", Some(" "), Some(" "), "K");
+        let run = s.engine.start_import(request).await.unwrap();
+        s.wait_for(&run.id, "done").await;
+        assert_eq!(
+            s.strings(
+                "SELECT s.kind || ' ' || s.options || ' ' || p.preset || ' [' || p.source || ']'
+                 FROM import_steps s JOIN import_packs p ON p.id = s.pack_id
+                 WHERE s.kind LIKE 'extract%' ORDER BY p.target"
+            )
+            .await,
+            ["extract_zip {} none []", "extract_unitypackage {} unity []"]
+        );
 
         // A variant or a folder the zip doesn't hold fails the build and leaves nothing.
         let missing = [
