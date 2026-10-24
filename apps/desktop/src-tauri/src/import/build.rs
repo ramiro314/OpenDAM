@@ -1130,3 +1130,40 @@ async fn rollback(
     remove_created(swap.created);
     Stop::Failed(error)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn step(kind: &str, enabled: bool, options: serde_json::Value) -> records::Step {
+        records::Step {
+            kind: kind.into(),
+            enabled,
+            options,
+        }
+    }
+
+    #[test]
+    fn a_pack_runs_at_most_one_unity_glb_step() {
+        let extract = step("extract_unitypackage", true, json!({}));
+        let convert = |enabled| step("unity_glb", enabled, json!({"max_texture": 1024}));
+        assert_eq!(
+            check_steps(
+                "unitypackage",
+                &[extract.clone(), convert(true), convert(true)]
+            ),
+            Err("A pack runs at most one unity_glb step".into())
+        );
+        assert_eq!(
+            check_steps(
+                "unitypackage",
+                &[extract.clone(), convert(true), convert(false)]
+            ),
+            Ok(())
+        );
+        // A step that is off still needs options it could run with.
+        let invalid = step("unity_glb", false, json!({"max_texture": 1}));
+        assert!(check_steps("unitypackage", &[extract, invalid]).is_err());
+    }
+}

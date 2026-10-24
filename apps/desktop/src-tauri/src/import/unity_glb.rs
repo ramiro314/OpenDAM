@@ -622,11 +622,7 @@ impl Conversion<'_> {
             &self.tools.memory_max,
         )
         .await;
-        if capped.cap().is_none() {
-            tracing::warn!(
-                "Blender runs without a memory cap: systemd-run --user is unavailable or refused it"
-            );
-        }
+        // Uncapped, `capped_command_with` has warned.
         let mut child = capped
             .command
             .current_dir(dir)

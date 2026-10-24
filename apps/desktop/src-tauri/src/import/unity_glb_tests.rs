@@ -365,7 +365,7 @@ mod tests {
                 ("Shipped/Rock.glb", b"glTF shipped with the pack"),
             ],
         );
-        s.import_zip_converted(&zip).await;
+        let pack_id = s.import_zip_converted(&zip).await;
 
         assert_eq!(runs(&log), 1);
         assert_eq!(
@@ -390,6 +390,22 @@ mod tests {
             std::fs::read(s.live().join("Shipped/Rock.glb")).unwrap(),
             b"glTF shipped with the pack"
         );
+
+        // A plain rebuild takes the GLB from the cache; `force` converts it again regardless.
+        s.rebuilt(&pack_id).await;
+        assert_eq!(runs(&log), 1, "cached");
+        let set_force = |force: bool| {
+            move |steps: &mut Vec<Step>| {
+                let convert = steps.iter_mut().find(|s| s.kind == "unity_glb").unwrap();
+                convert.options = json!({ "force": force });
+            }
+        };
+        s.edit(&pack_id, set_force(true)).await;
+        s.rebuilt(&pack_id).await;
+        assert_eq!(runs(&log), 2, "force runs Blender despite the cache");
+        s.edit(&pack_id, set_force(false)).await;
+        s.rebuilt(&pack_id).await;
+        assert_eq!(runs(&log), 2, "cached again");
     }
 
     /// An ASCII FBX, which Blender can't import, converts through a binary copy `assimp` makes.
@@ -432,26 +448,19 @@ mod tests {
         s.no_work_left();
     }
 
-    /// A12: Blender killed with status 137 under the cap fails its step, naming the cap, and the
-    /// build changes nothing.
-    #[tokio::test]
-    async fn blender_killed_by_the_memory_cap_fails_the_step() {
-        let s = setup().await;
+    /// A first import of the synthetic package with `flatten`, with Settings' Blender a stub that
+    /// answers `--version` as 5.2.2 and otherwise runs `body`, under a user manager that accepts
+    /// every scope and runs its command, as on a desktop. Returns the run's error, once it
+    /// checked the build changed nothing: no pack folder, folder beside it or work folder.
+    async fn failed_with_stub_blender(s: &Setup, body: &str) -> String {
         let bin = s.cache.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let blender = bin.join("blender");
         executable(
             &blender,
-            "[ \"$1\" = --version ] && { echo 'Blender 5.2.2'; exit 0; }\nexit 137",
+            &format!("[ \"$1\" = --version ] && {{ echo 'Blender 5.2.2'; exit 0; }}\n{body}"),
         );
         s.set_blender(&blender).await;
-        crate::import::settings::update(
-            &s.engine.db.master_pool,
-            json!({"blenderMemoryMax": "3G"}),
-        )
-        .await
-        .unwrap();
-        // A user manager that accepts every scope and runs its command, as on a desktop.
         executable(&bin.join("systemctl"), "exit 0");
         executable(
             &bin.join("systemd-run"),
@@ -468,13 +477,92 @@ mod tests {
             .await
             .unwrap();
         let failed = s.wait_for(&run.id, "failed").await;
-        assert_eq!(
-            failed.error.as_deref(),
-            Some("Converting to GLB failed: Blender was killed by the memory cap (3G)")
-        );
         assert!(!s.live().exists());
+        assert_eq!(s.count("SELECT COUNT(*) FROM import_outputs").await, 0);
         s.no_leftovers();
         s.no_work_left();
+        failed.error.unwrap()
+    }
+
+    /// A stub body that writes `result` as the script's result file, its last argument, and
+    /// exits 0.
+    fn answering(result: Value) -> String {
+        format!("for last; do :; done\nprintf '%s' '{result}' > \"$last\"")
+    }
+
+    /// A12: Blender killed with status 137 under the cap fails its step, naming the cap, and the
+    /// build changes nothing.
+    #[tokio::test]
+    async fn blender_killed_by_the_memory_cap_fails_the_step() {
+        let s = setup().await;
+        crate::import::settings::update(
+            &s.engine.db.master_pool,
+            json!({"blenderMemoryMax": "3G"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            failed_with_stub_blender(&s, "exit 137").await,
+            "Converting to GLB failed: Blender was killed by the memory cap (3G)"
+        );
+    }
+
+    /// Blender exiting with another status fails the step with its status and last lines.
+    #[tokio::test]
+    async fn blender_crashing_fails_the_step_with_what_it_printed() {
+        let s = setup().await;
+        assert_eq!(
+            failed_with_stub_blender(&s, "echo 'Error: no GPU here' >&2\nexit 1").await,
+            "Converting to GLB failed: Blender crashed (exit status: 1): Error: no GPU here"
+        );
+    }
+
+    /// A model the script reports failed fails the step, naming the model and why.
+    #[tokio::test]
+    async fn a_model_the_script_fails_on_fails_the_step_naming_it() {
+        let s = setup().await;
+        let result = json!({
+            "version": crate::import::unity_glb::UNITY_GLB_VERSION,
+            "blenderVersion": "5.2.2",
+            "models": [{"model": "Art/Models/SM_Log.fbx", "ok": false, "error": "no mesh in it"}],
+        });
+        assert_eq!(
+            failed_with_stub_blender(&s, &answering(result)).await,
+            "Converting Art/Models/SM_Log.fbx to GLB failed: no mesh in it"
+        );
+    }
+
+    /// A result from another version of the script, one that leaves a model out, and a model
+    /// reported converted with no GLB written each fail the step.
+    #[tokio::test]
+    async fn a_result_that_doesn_t_hold_up_fails_the_step() {
+        let version = crate::import::unity_glb::UNITY_GLB_VERSION;
+        let converted = json!([{"model": "Art/Models/SM_Log.fbx", "ok": true, "note": "1/1"}]);
+        let cases = [
+            (
+                json!({"version": "opendam-unity-glb/0", "models": converted}),
+                format!(
+                    "Converting to GLB failed: the script reported version opendam-unity-glb/0, \
+                     not {version}"
+                ),
+            ),
+            (
+                json!({"version": version, "models": []}),
+                "Converting to GLB failed: Blender reported nothing for Art/Models/SM_Log.fbx"
+                    .to_string(),
+            ),
+            (
+                json!({"version": version, "models": converted}),
+                "Converting Art/Models/SM_Log.fbx to GLB failed: Blender wrote no GLB".to_string(),
+            ),
+        ];
+        for (result, error) in cases {
+            let s = setup().await;
+            assert_eq!(
+                failed_with_stub_blender(&s, &answering(result)).await,
+                error
+            );
+        }
     }
 
     /// Without Blender an import leaves the step off and says why, and a build with it on fails

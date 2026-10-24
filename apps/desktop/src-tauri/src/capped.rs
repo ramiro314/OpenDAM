@@ -202,6 +202,44 @@ mod tests {
         }
     }
 
+    /// What `tracing` logs while the guard lives, on this thread (a `tokio::test` runs on one).
+    #[derive(Clone, Default)]
+    struct Logged(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logged {
+        type Writer = Logged;
+
+        fn make_writer(&'a self) -> Logged {
+            self.clone()
+        }
+    }
+
+    impl Logged {
+        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logged = Logged::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logged.clone())
+                .with_ansi(false)
+                .finish();
+            (logged, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
     async fn status(capped: &mut Capped) -> ExitStatus {
         capped.command.stdin(Stdio::null()).status().await.unwrap()
     }
@@ -245,7 +283,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_systemd_run_user_it_runs_uncapped() {
+    async fn without_systemd_run_user_it_warns_and_runs_uncapped() {
+        let (logged, _guard) = Logged::capture();
         let dir = tempfile::tempdir().unwrap();
         // No user manager to reach, as in a CI container.
         let systemd = Systemd {
@@ -261,6 +300,13 @@ mod tests {
             None,
             "an uncapped run has no cap"
         );
+        let warned = logged.text();
+        assert!(
+            warned.contains("WARN")
+                && warned
+                    .contains("systemd-run --user is unavailable, running sh without a memory cap"),
+            "{warned}"
+        );
 
         // Nor without the tools at all.
         let missing = Systemd {
@@ -270,6 +316,13 @@ mod tests {
         let mut capped = capped_command_with(&missing, "true", [] as [&str; 0], "12G").await;
         assert_eq!(capped.cap(), None);
         assert!(status(&mut capped).await.success());
+        assert!(
+            logged
+                .text()
+                .contains("systemd-run --user is unavailable, running true without a memory cap"),
+            "{}",
+            logged.text()
+        );
     }
 
     #[tokio::test]
