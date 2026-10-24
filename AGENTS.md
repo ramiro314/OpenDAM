@@ -171,9 +171,8 @@ docs/plans                    Plans for this fork
   changes nothing on disk for a state no step leaves: it marks the pack `failed` and leaves
   `swap_state` set, which refuses its runs and step edits. A pack recovery leaves journaled, that
   way or because a step of it failed, is spared by the `index_paths` run that follows
-  (`Prune::Sparing`): it neither walks, writes nor prunes anything at or under the pack's target,
-  and the next recovery tries again. A `removing` pack is left as found until Remove import is
-  built.
+  (`Prune::Sparing`, see "Locked variants"), and the next recovery tries again. A `removing`
+  pack is left as found until Remove import is built.
 - **`DELETE` journaling on library DBs.** Library DBs use rollback journaling because WAL's `-shm`
   locking is unreliable on network shares. Keep `SqliteJournalMode::Delete` in `db.rs`.
 - **Batched writes.** Database writes go in transactions of about 200 rows, as `watcher.rs` does.
@@ -242,13 +241,16 @@ docs/plans                    Plans for this fork
 - **Locked variants.** `watcher::index_paths_locked` and `structure::rebuild_library_locked` take
   the held `index_lock` guard and the held advisory `watcher::IndexLock` guard as proof and never
   lock again. Code that holds the locks calls these, never `index_paths` or `rebuild_library`
-  (`index_lock` isn't re-entrant). `index_paths` takes both locks and calls `index_paths_locked`
-  with `Prune::Now`. `rebuild_library` takes `index_lock`, then the advisory lock, waiting up to
+  (`index_lock` isn't re-entrant). `index_paths` takes both locks, runs swap recovery, and calls
+  `index_paths_locked` with `Prune::Now`, or with `Prune::Sparing` over the targets of packs still
+  journaled after it. `rebuild_library` takes `index_lock`, then the advisory lock, waiting up to
   5 s for it (`IndexLock::acquire_within`). Under both sit lock-free cores,
   `watcher::index_pool` and `structure::rebuild`, for a pool that isn't registered yet. An index
   run takes a `watcher::Prune`: `Now` deletes the rows of files it didn't find and ends with the
-  structure pass, and `Defer` deletes no row, runs no pass, and reports each row it inserts to an
-  `InsertJournal` inside the inserting transaction. Every run but a pack import build's is `Now`.
+  structure pass; `Sparing` does the same except that it walks, writes and prunes nothing at or
+  under its folders; and `Defer` deletes no row, runs no pass, and reports each row it inserts to
+  an `InsertJournal` inside the inserting transaction. A pack import build runs `Defer`,
+  `index_paths` runs `Now` or `Sparing`, and every other run is `Now`.
 - **The advisory lock keeps itself fresh.** `watcher::IndexLock` writes a token naming its holder
   (a keyed hash of the machine id, boot id and pid namespace, then pid, process start time and a
   nonce), re-reads it after 100 ms, and rewrites its timestamp every 30 s while held. A lock is
