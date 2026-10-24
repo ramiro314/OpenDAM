@@ -492,6 +492,13 @@ interface ImportStore {
 }
 
 export const useImportStore = create<ImportStore>()((set, get) => {
+  /**
+   * Each library's latest `fetchLibrary` request. Fetches overlap (a run's queue and its end
+   * both fetch), so an imports answer older than the latest request is dropped: one read before
+   * a build committed would otherwise show its pack Not built after a newer read showed it Built.
+   */
+  const fetches = new Map<string, number>();
+
   /** The draft, when it is still the one of `libraryId` and `originalPath` */
   const sameDraft = (libraryId: string, originalPath: string) => {
     const draft = get().draft;
@@ -532,13 +539,18 @@ export const useImportStore = create<ImportStore>()((set, get) => {
     },
 
     fetchLibrary: async (libraryId) => {
+      const request = (fetches.get(libraryId) ?? 0) + 1;
+      fetches.set(libraryId, request);
       try {
         const [imports, runs] = await Promise.all([
           api.listImports(libraryId),
           api.listImportRuns(libraryId),
         ]);
+        const latest = fetches.get(libraryId) === request;
+        // Runs merge safely whatever their age (`mergeRun`); imports are replaced, so only the
+        // latest request's answer is kept
         set((s) => ({
-          imports: { ...s.imports, [libraryId]: imports },
+          ...(latest ? { imports: { ...s.imports, [libraryId]: imports } } : {}),
           runs: runs.reduce(mergeRun, s.runs),
         }));
       } catch (err) {

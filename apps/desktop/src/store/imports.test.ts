@@ -340,6 +340,37 @@ describe('Cancel', () => {
     expect(useImportStore.getState().finishing.size).toBe(0);
   });
 
+  test("an imports answer older than the library's latest request is dropped", async () => {
+    const pack = (status: 'built' | 'never_built') =>
+      [
+        {
+          id: 'i',
+          libraryId: 'lib',
+          originalPath: '/o.unitypackage',
+          kind: 'unitypackage',
+          createdAt: 1,
+          packs: [{ id: 'p', target: 'Pub/Pack', preset: 'unity', status, builtAt: null }],
+        },
+      ] as ImportSummary[];
+    // The queued run's fetch reads before the build commits and answers last
+    const answers: ((imports: ImportSummary[]) => void)[] = [];
+    api.listImports = () => new Promise((resolve) => answers.push(resolve));
+    api.listImportRuns = async () => [];
+    const store = useImportStore.getState();
+    const queuedFetch = store.fetchLibrary('lib');
+    const endFetch = store.fetchLibrary('lib');
+    answers[1](pack('built'));
+    await endFetch;
+    answers[0](pack('never_built'));
+    await queuedFetch;
+    expect(useImportStore.getState().imports.lib[0].packs[0].status).toBe('built');
+
+    // Another library's fetch is its own
+    api.listImports = async () => pack('never_built');
+    await store.fetchLibrary('other');
+    expect(useImportStore.getState().imports.other[0].packs[0].status).toBe('never_built');
+  });
+
   test("a run's end refetches its library's imports, for its packs' status", async () => {
     const fetched: string[] = [];
     api.listImports = async (libraryId) => {
