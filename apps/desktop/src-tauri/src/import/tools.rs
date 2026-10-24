@@ -45,6 +45,14 @@ pub struct CacheStatus {
 
 /// `assimp` at `configured` (an absolute path), else on `PATH`, and its version.
 pub async fn assimp_status(configured: Option<&str>) -> ToolStatus {
+    assimp_status_on(configured, std::env::var_os("PATH").as_deref()).await
+}
+
+/// `assimp_status`, looking for `assimp` on `path_var` when no path is configured.
+async fn assimp_status_on(
+    configured: Option<&str>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> ToolStatus {
     if let Some(path) = configured {
         if let Err(problem) = super::settings::check("assimpPath", path) {
             return ToolStatus {
@@ -53,7 +61,7 @@ pub async fn assimp_status(configured: Option<&str>) -> ToolStatus {
             };
         }
     }
-    let Some(program) = program(configured, ASSIMP, std::env::var_os("PATH").as_deref()) else {
+    let Some(program) = program(configured, ASSIMP, path_var) else {
         return ToolStatus {
             problem: Some(match configured {
                 Some(path) => format!("No assimp at {path}"),
@@ -235,6 +243,57 @@ mod tests {
         assert!(relative.problem.unwrap().contains("absolute path"));
     }
 
+    /// A fake `assimp` in `dir` whose `version` prints `output`.
+    fn fake_assimp(dir: &Path, output: &str) -> PathBuf {
+        let fake = dir.join("assimp");
+        std::fs::write(&fake, format!("#!/bin/sh\necho '{output}'\n")).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fake
+    }
+
+    #[tokio::test]
+    async fn unset_assimp_is_looked_up_on_path() {
+        let empty = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let fake = fake_assimp(bin.path(), "Version 6.0 -shared -st (GIT commit 0)");
+
+        let path_var = std::env::join_paths([empty.path(), bin.path()]).unwrap();
+        assert_eq!(
+            assimp_status_on(None, Some(&path_var)).await,
+            ToolStatus {
+                path: Some(fake.display().to_string()),
+                version: Some("6.0".into()),
+                problem: None,
+            }
+        );
+
+        let without = std::env::join_paths([empty.path()]).unwrap();
+        for path_var in [Some(without.as_os_str()), None] {
+            assert_eq!(
+                assimp_status_on(None, path_var).await,
+                ToolStatus {
+                    problem: Some("assimp isn't on PATH: install assimp or set its path".into()),
+                    ..Default::default()
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_assimp_that_reports_no_version_is_found_but_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_assimp(dir.path(), "Open Asset Import Library");
+        let status = assimp_status(Some(fake.to_str().unwrap())).await;
+        assert_eq!(
+            status,
+            ToolStatus {
+                path: Some(fake.display().to_string()),
+                version: None,
+                problem: Some(format!("{} didn't report a version", fake.display())),
+            }
+        );
+    }
+
     #[test]
     fn the_unreal_editor_is_checked_below_its_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -292,5 +351,36 @@ mod tests {
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
         assert_eq!(cache_size(&cache), 0);
         assert!(outside.join("keep.bin").exists());
+    }
+
+    #[test]
+    fn an_entry_clear_can_t_delete_fails_it_by_name_after_the_rest_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("import");
+        let stuck = cache.join("work");
+        std::fs::create_dir_all(&stuck).unwrap();
+        std::fs::write(stuck.join("held.fbx"), [0u8; 10]).unwrap();
+        std::fs::create_dir_all(cache.join("glb")).unwrap();
+        std::fs::write(cache.join("glb/a.glb"), [0u8; 100]).unwrap();
+        std::fs::write(cache.join("loose.json"), "{}").unwrap();
+        // A folder whose files can't be unlinked
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let failed = clear_cache(&cache);
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = failed.unwrap_err();
+        assert!(
+            error.starts_with(&format!("Could not delete {} (", stuck.display())),
+            "{error}"
+        );
+        assert!(cache.is_dir());
+        let mut left: Vec<_> = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["work"], "the rest are deleted");
+        assert!(stuck.join("held.fbx").exists());
+        assert_eq!(cache_size(&cache), 10);
     }
 }
