@@ -169,6 +169,9 @@ pub fn run(render_choice: render::RenderChoice) {
                         }
                         ImportEvent::Updated(run) => import_events.emit("import:updated", run),
                         ImportEvent::LibraryUpdated => import_events.emit("library:updated", ()),
+                        ImportEvent::OriginalsChanged(library_id) => {
+                            import_events.emit("import:originals", library_id)
+                        }
                     };
                 }),
                 worker_requests.clone(),
@@ -331,6 +334,8 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::import::preview_import,
             commands::import::check_import_target,
             commands::import::list_imports,
+            commands::import::check_import_originals,
+            commands::import::locate_import_original,
             commands::import::start_import,
             commands::import::set_import_target,
             commands::import::cancel_import_run,

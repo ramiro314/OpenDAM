@@ -7,7 +7,7 @@ import type {
   ImportStepRecord,
   ImportSummary,
 } from '../types';
-import { cleanTarget, isLive, upsertRun, useImportStore } from './imports';
+import { cleanTarget, isLive, rebuildRefusal, upsertRun, useImportStore } from './imports';
 
 // An imported pack's Preparation (plan pack-import, UI): its steps with their toggles and
 // options, its target, and Rebuild. The pack's details and the Imports view open the same
@@ -462,7 +462,8 @@ export const usePreparationStore = create<PreparationStore>()((set, get) => {
     rebuild: async (packId) => {
       const editor = get().editors[packId];
       if (!editor?.draft || editor.saving) return false;
-      const reason = busy(editor);
+      const imports = useImportStore.getState().imports;
+      const reason = busy(editor) ?? rebuildRefusal(imports, editor.libraryId, packId);
       if (reason) {
         patch(packId, { error: reason });
         return false;

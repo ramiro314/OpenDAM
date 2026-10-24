@@ -27,6 +27,7 @@ use tokio::sync::{mpsc, Notify};
 
 use super::build::{self, BuildEnv, Hooks, Point, Progress, RunControl, Stop};
 use super::metadata::LicenseOption;
+use super::original::{self, LocateRefused, Located};
 use super::place::PlaceStep;
 use super::records::{
     self, ImportSummary, NewImport, Owner, PackSteps, QueuedPack, RunSummary, Step, StepRecord,
@@ -74,6 +75,9 @@ pub enum ImportEvent {
     Updated(RunSummary),
     /// `library:updated`: a build changed the library.
     LibraryUpdated,
+    /// `import:originals`: a check or a Locate original changed the state of an import's
+    /// original in this library.
+    OriginalsChanged(String),
 }
 
 pub type EventSink = Arc<dyn Fn(ImportEvent) + Send + Sync>;
@@ -142,6 +146,9 @@ pub struct Engine {
     /// Runs whose Cancel was accepted while their claim failed. Their next attempt starts
     /// cancelled, so the build stops before it changes anything.
     pending_cancels: Mutex<HashSet<String>>,
+    /// Each original path's lock, held by a check of it and by a Locate of it, so two never
+    /// hash the same file at once and a scoped check never waits for another original's.
+    pub(super) checking: original::PathLocks,
 }
 
 impl Engine {
@@ -172,6 +179,7 @@ impl Engine {
             wake: Notify::new(),
             active: Mutex::new(None),
             pending_cancels: Mutex::new(HashSet::new()),
+            checking: original::PathLocks::default(),
             owner: crate::watcher::this_process(),
             hooks: Hooks::default(),
             lock_wait,
@@ -192,13 +200,21 @@ impl Engine {
         *self.systemd.lock().unwrap() = Some(systemd);
     }
 
-    /// Marks the runs of gone owners `interrupted`, then runs queued runs one at a time, for good.
+    /// Marks the runs of gone owners `interrupted`, starts checking every import's original,
+    /// then runs queued runs one at a time, for good.
     pub async fn start(self: Arc<Self>) {
-        for library in self.db.get_all_libraries().await {
-            if let Err(e) = self.interrupt_dead_runs(&library).await {
+        let libraries = self.db.get_all_libraries().await;
+        for library in &libraries {
+            if let Err(e) = self.interrupt_dead_runs(library).await {
                 tracing::error!("Could not check the import runs of {}: {e}", library.id);
             }
         }
+        let this = self.clone();
+        tokio::spawn(async move {
+            for library in libraries {
+                this.check_in_background(&library).await;
+            }
+        });
         loop {
             match self.next_run().await {
                 Some((library, run)) => {
@@ -229,15 +245,114 @@ impl Engine {
     }
 
     /// A library opened after the engine started (added, re-added, or back online): marks its
-    /// runs whose owner is gone `interrupted`, as startup does for the libraries open then, and
-    /// wakes the queue for any of its queued runs this engine may claim.
-    pub async fn library_opened(&self, library_id: &str) {
+    /// runs whose owner is gone `interrupted` and starts checking its originals, as startup does
+    /// for the libraries open then, and wakes the queue for any of its queued runs this engine
+    /// may claim.
+    pub async fn library_opened(self: &Arc<Self>, library_id: &str) {
         if let Some(library) = self.db.get_library_handle(library_id).await {
             if let Err(e) = self.interrupt_dead_runs(&library).await {
                 tracing::error!("Could not check the import runs of {library_id}: {e}");
             }
+            let this = self.clone();
+            tokio::spawn(async move { this.check_in_background(&library).await });
         }
         self.wake.notify_one();
+    }
+
+    /// Checks the library's originals, or only import `only`'s, announcing a changed state.
+    async fn check_originals_of(
+        &self,
+        library: &LibraryHandle,
+        only: Option<&str>,
+    ) -> sqlx::Result<()> {
+        if original::check_library(&library.pool, &self.checking, only).await? {
+            (self.events)(ImportEvent::OriginalsChanged(library.id.clone()));
+        }
+        Ok(())
+    }
+
+    async fn check_in_background(&self, library: &LibraryHandle) {
+        if let Err(e) = self.check_originals_of(library, None).await {
+            tracing::error!(
+                "Could not check the import originals of {}: {e}",
+                library.id
+            );
+        }
+    }
+
+    /// Checks each import's original in library `library_id` by size and mtime, hashing it
+    /// again only when either changed, and returns the imports with their state, as the Imports
+    /// view shows them when it opens.
+    pub async fn check_originals(&self, library_id: &str) -> Result<Vec<ImportSummary>, String> {
+        let library = self.library(library_id).await?;
+        self.check_originals_of(&library, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.list_imports(library_id).await
+    }
+
+    /// Locate original: re-points every import of library `library_id` recorded at
+    /// `original_path` at the file `path`, when its sha256 is the original's, or when `named` is
+    /// its sha256 (Use this file), which makes it the new original that every pack's next build
+    /// reads. A file with another sha256 changes nothing and comes back as `Differs`, with the
+    /// sha256 Use this file names.
+    pub async fn locate_original(
+        &self,
+        library_id: &str,
+        original_path: &str,
+        path: &str,
+        named: Option<&str>,
+    ) -> Result<Located, String> {
+        let library = self.library(library_id).await?;
+        let root = library
+            .root_path
+            .canonicalize()
+            .map_err(|e| format!("The library folder can't be read: {e}"))?;
+        let (file, kind) = self::original(path, &root)?;
+        let kinds: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT kind FROM imports WHERE original_path = ?")
+                .bind(original_path)
+                .fetch_all(&library.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        if let Some(other) = kinds.iter().find(|k| *k != kind) {
+            return Err(format!(
+                "The original is a .{other}: locate a .{other} file"
+            ));
+        }
+        let at = file.clone();
+        let (size, mtime_ns, sha256) = tokio::task::spawn_blocking(move || {
+            let (size, mtime_ns) = build::file_stamp(&at)?;
+            let sha256 = crate::export::hashes::sha256_file(&at)?;
+            Ok::<_, std::io::Error>((size, mtime_ns, sha256))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("The file {path} can't be read: {e}"))?;
+        let _checking = self.checking.lock(original_path).await;
+        let located = original::locate(
+            &library.pool,
+            original_path,
+            &file.to_string_lossy(),
+            (size as i64, mtime_ns),
+            &sha256,
+            named,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|refused| match refused {
+            LocateRefused::NoImport => {
+                format!("Library {library_id} has no import of {original_path}")
+            }
+            LocateRefused::Busy => BUSY.to_string(),
+            LocateRefused::NotNamed => {
+                format!("The file {path} changed since it was checked: locate it again")
+            }
+        })?;
+        if located == Located::Located {
+            (self.events)(ImportEvent::OriginalsChanged(library.id.clone()));
+        }
+        Ok(located)
     }
 
     async fn interrupt_dead_runs(&self, library: &LibraryHandle) -> sqlx::Result<()> {
@@ -928,13 +1043,32 @@ impl Engine {
     }
 
     /// Queues a rebuild of pack `pack_id` from its current steps. Refused while a run for the
-    /// pack is queued or running.
+    /// pack is queued or running, and while its original is missing or changed, which it checks
+    /// first.
     pub async fn rebuild_pack(
         &self,
         library_id: &str,
         pack_id: &str,
     ) -> Result<RunSummary, String> {
         let library = self.library(library_id).await?;
+        let import_id: Option<String> =
+            sqlx::query_scalar("SELECT import_id FROM import_packs WHERE id = ?")
+                .bind(pack_id)
+                .fetch_optional(&library.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        let import_id = import_id.ok_or_else(|| refused(records::Refused::NoPack))?;
+        self.check_originals_of(&library, Some(&import_id))
+            .await
+            .map_err(|e| e.to_string())?;
+        let state: String = sqlx::query_scalar("SELECT original_state FROM imports WHERE id = ?")
+            .bind(&import_id)
+            .fetch_one(&library.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(why) = original::refusal(&state) {
+            return Err(why.into());
+        }
         let run_id = records::queue_rebuild(&library.pool, pack_id, &self.owner, now_ms())
             .await
             .map_err(|e| e.to_string())?
@@ -1178,6 +1312,10 @@ mod recovery_tests;
 #[cfg(test)]
 #[path = "edits_tests.rs"]
 mod edits_tests;
+
+#[cfg(test)]
+#[path = "original_tests.rs"]
+mod original_tests;
 
 #[cfg(test)]
 mod tests {

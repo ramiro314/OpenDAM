@@ -7,7 +7,7 @@ import type {
   ImportStepRecord,
   ImportSummary,
 } from '../types';
-import { useImportStore } from './imports';
+import { MISSING, useImportStore } from './imports';
 import {
   BUSY,
   STALE,
@@ -102,6 +102,8 @@ describe('finding a pack folder’s import', () => {
           originalPath: '/dl/pack.unitypackage',
           kind: 'unitypackage',
           createdAt: 0,
+          originalState: 'ok',
+          changedSha256: null,
           packs: [pack()],
         },
       ],
@@ -432,6 +434,34 @@ describe('the editor store', () => {
     expect(await store().rebuild('p1')).toBe(false);
     expect(editor().error).toContain('Name the folder to move up');
     expect(calls).toBe(0);
+  });
+
+  test('Rebuild sends nothing while the original is missing, and goes once it is located', async () => {
+    api.getImportSteps = async () => read();
+    let rebuilds = 0;
+    api.rebuildImportPack = async () => {
+      rebuilds++;
+      return run('r', 'p1');
+    };
+    const imported = (originalState: ImportSummary['originalState']): ImportSummary => ({
+      id: 'i1',
+      libraryId: 'lib',
+      originalPath: '/dl/pack.unitypackage',
+      kind: 'unitypackage',
+      createdAt: 0,
+      originalState,
+      changedSha256: null,
+      packs: [pack()],
+    });
+    useImportStore.setState({ imports: { lib: [imported('missing')] } });
+    await store().open('lib', 'p1');
+    expect(await store().rebuild('p1')).toBe(false);
+    expect(editor().error).toBe(MISSING);
+    expect(rebuilds).toBe(0);
+
+    useImportStore.setState({ imports: { lib: [imported('ok')] } });
+    expect(await store().rebuild('p1')).toBe(true);
+    expect(rebuilds).toBe(1);
   });
 
   test('library:updated reads unedited editors again and leaves edited ones alone', async () => {

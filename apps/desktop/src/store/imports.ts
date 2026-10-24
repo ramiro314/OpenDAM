@@ -12,6 +12,7 @@ import type {
   ImportSummary,
   ImportTree,
   ImportVariant,
+  OriginalState,
   PlaceStep,
   SkippedEntry,
 } from '../types';
@@ -67,7 +68,60 @@ export interface ImportRow {
   libraryId: string;
   originalPath: string;
   name: string;
+  kind: ImportSummary['kind'];
+  /** The worst of its imports' states: missing, then changed, then ok */
+  originalState: OriginalState;
+  /** While changed, the sha256 of the file at the original's path, which Use this file names */
+  changedSha256: string | null;
   packs: PackRow[];
+}
+
+/** The key of the Imports view's row of an original in a library */
+export function rowKey(libraryId: string, originalPath: string): string {
+  return `${libraryId}\n${originalPath}`;
+}
+
+// What Rebuild answers while the original is missing or changed (`import::original`)
+export const MISSING = 'The original is missing: locate it to rebuild';
+export const CHANGED =
+  'The original changed since it was imported: locate it, or use the changed file, to rebuild';
+
+/** Why the original's state disables Rebuild, or null */
+export function originalRefusal(state: OriginalState): string | null {
+  if (state === 'missing') return MISSING;
+  if (state === 'changed') return CHANGED;
+  return null;
+}
+
+const ORIGINAL_LABELS: Record<OriginalState, string> = {
+  ok: 'OK',
+  missing: 'Original missing',
+  changed: 'Original changed',
+};
+
+export function originalLabel(state: OriginalState): string {
+  return ORIGINAL_LABELS[state] ?? state;
+}
+
+const SEVERITY: Record<OriginalState, number> = { ok: 0, changed: 1, missing: 2 };
+
+/** Why pack `packId`'s original disables its Rebuild, or null */
+export function rebuildRefusal(
+  imports: Record<string, ImportSummary[]>,
+  libraryId: string,
+  packId: string
+): string | null {
+  const original = importOfPack(imports, libraryId, packId);
+  return original ? originalRefusal(original.originalState) : null;
+}
+
+/** The import holding pack `packId` in library `libraryId`, or null */
+export function importOfPack(
+  imports: Record<string, ImportSummary[]>,
+  libraryId: string,
+  packId: string
+): ImportSummary | null {
+  return (imports[libraryId] ?? []).find((i) => i.packs.some((p) => p.id === packId)) ?? null;
 }
 
 /**
@@ -83,7 +137,7 @@ export function importRows(
   const rows = new Map<string, ImportRow>();
   const sorted = [...imports].sort((a, b) => b.createdAt - a.createdAt);
   for (const imp of sorted) {
-    const key = `${imp.libraryId}\n${imp.originalPath}`;
+    const key = rowKey(imp.libraryId, imp.originalPath);
     let row = rows.get(key);
     if (!row) {
       row = {
@@ -91,9 +145,15 @@ export function importRows(
         libraryId: imp.libraryId,
         originalPath: imp.originalPath,
         name: originalName(imp.originalPath),
+        kind: imp.kind,
+        originalState: imp.originalState,
+        changedSha256: imp.changedSha256,
         packs: [],
       };
       rows.set(key, row);
+    } else if (SEVERITY[imp.originalState] > SEVERITY[row.originalState]) {
+      row.originalState = imp.originalState;
+      row.changedSha256 = imp.changedSha256;
     }
     for (const pack of imp.packs) {
       const run =
@@ -452,6 +512,11 @@ export function importRequest(draft: ImportDraft, c: DraftCandidate): ImportRequ
 
 // ── The store ─────────────────────────────────────────────────────────────
 
+export type LocateState =
+  | { kind: 'locating' }
+  | { kind: 'differs'; path: string; sha256: string }
+  | { kind: 'error'; error: string };
+
 interface ImportStore {
   /** Each open library's imports */
   imports: Record<string, ImportSummary[]>;
@@ -463,6 +528,11 @@ interface ImportStore {
   finishing: Set<string>;
   /** Why the last Cancel or list failed */
   error: string | null;
+  /**
+   * Locate original by row key (`rowKey`): in flight, or a located file that isn't the original,
+   * waiting for Use this file, or why the last try failed
+   */
+  locating: Record<string, LocateState>;
   panelOpen: boolean;
   /** The open Import pack dialog: its original and library, while scanning or after */
   dialog: { originalPath: string; libraryId: string } | null;
@@ -473,6 +543,20 @@ interface ImportStore {
 
   fetch: (libraryIds: string[]) => Promise<void>;
   fetchLibrary: (libraryId: string) => Promise<void>;
+  /** As `fetch`, once each library's originals were checked: the Imports view's read on opening */
+  check: (libraryIds: string[]) => Promise<void>;
+  /**
+   * Locate original: re-points the imports of `originalPath` at `path`, or, given the `sha256`
+   * Use this file names, at a file that isn't the original
+   */
+  locate: (
+    libraryId: string,
+    originalPath: string,
+    path: string,
+    sha256?: string | null
+  ) => Promise<void>;
+  /** Forgets a located file waiting for Use this file, or the last Locate's error */
+  dismissLocate: (key: string) => void;
   /** Takes an `import:updated` run, refetching its library's imports once it ends */
   applyUpdate: (run: ImportRun) => void;
   applyProgress: (progress: ImportProgress) => void;
@@ -511,6 +595,33 @@ export const useImportStore = create<ImportStore>()((set, get) => {
       : null;
   };
 
+  /** Reads a library's imports and runs, its originals checked first when `check` is set */
+  const read = async (libraryId: string, check: boolean) => {
+    const request = (fetches.get(libraryId) ?? 0) + 1;
+    fetches.set(libraryId, request);
+    try {
+      const [imports, runs] = await Promise.all([
+        check ? api.checkImportOriginals(libraryId) : api.listImports(libraryId),
+        api.listImportRuns(libraryId),
+      ]);
+      const latest = fetches.get(libraryId) === request;
+      // Runs merge safely whatever their age (`mergeRun`); imports are replaced, so only the
+      // latest request's answer is kept
+      set((s) => ({
+        ...(latest ? { imports: { ...s.imports, [libraryId]: imports } } : {}),
+        runs: runs.reduce(mergeRun, s.runs),
+      }));
+    } catch (err) {
+      set({ error: String(err) });
+    }
+  };
+
+  const setLocating = (key: string, state: LocateState | null) =>
+    set((s) => {
+      const { [key]: _, ...rest } = s.locating;
+      return { locating: state ? { ...rest, [key]: state } : rest };
+    });
+
   const scan = async (originalPath: string, libraryId: string) => {
     set({ dialog: { originalPath, libraryId }, scanning: true, scanError: null, draft: null });
     try {
@@ -531,6 +642,7 @@ export const useImportStore = create<ImportStore>()((set, get) => {
     progress: {},
     finishing: new Set(),
     error: null,
+    locating: {},
     panelOpen: false,
     dialog: null,
     scanning: false,
@@ -542,25 +654,28 @@ export const useImportStore = create<ImportStore>()((set, get) => {
       await Promise.all(libraryIds.map((id) => get().fetchLibrary(id)));
     },
 
-    fetchLibrary: async (libraryId) => {
-      const request = (fetches.get(libraryId) ?? 0) + 1;
-      fetches.set(libraryId, request);
+    fetchLibrary: (libraryId) => read(libraryId, false),
+
+    check: async (libraryIds) => {
+      await Promise.all(libraryIds.map((id) => read(id, true)));
+    },
+
+    locate: async (libraryId, originalPath, path, sha256 = null) => {
+      const key = rowKey(libraryId, originalPath);
+      setLocating(key, { kind: 'locating' });
       try {
-        const [imports, runs] = await Promise.all([
-          api.listImports(libraryId),
-          api.listImportRuns(libraryId),
-        ]);
-        const latest = fetches.get(libraryId) === request;
-        // Runs merge safely whatever their age (`mergeRun`); imports are replaced, so only the
-        // latest request's answer is kept
-        set((s) => ({
-          ...(latest ? { imports: { ...s.imports, [libraryId]: imports } } : {}),
-          runs: runs.reduce(mergeRun, s.runs),
-        }));
+        const located = await api.locateImportOriginal(libraryId, originalPath, path, sha256);
+        if (located.kind === 'differs') setLocating(key, located);
+        else {
+          setLocating(key, null);
+          await get().fetchLibrary(libraryId);
+        }
       } catch (err) {
-        set({ error: String(err) });
+        setLocating(key, { kind: 'error', error: String(err) });
       }
     },
+
+    dismissLocate: (key) => setLocating(key, null),
 
     applyUpdate: (run) => {
       set((s) => {
