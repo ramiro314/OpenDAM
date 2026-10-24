@@ -1517,8 +1517,9 @@ async fn delete_rows(pool: &sqlx::Pool<sqlx::Sqlite>, ids: &[&str]) -> sqlx::Res
 }
 
 /// `delete_rows`, recording `changes` in imported packs (`edits::record`) in the same
-/// transaction. When a run was queued for a pack since the delete's check, its files are gone
-/// all the same: the rows go without the steps, and the run's re-check stops it.
+/// transaction. The files are already gone, so when the steps can't be recorded (a run was
+/// queued for a pack since the delete's check, or the write failed), the rows go without them,
+/// and the next build's check of the pack folder stops on the missing files.
 async fn delete_rows_recording(
     pool: &sqlx::Pool<sqlx::Sqlite>,
     ids: &[&str],
@@ -1526,12 +1527,14 @@ async fn delete_rows_recording(
 ) -> sqlx::Result<()> {
     let mut tx = pool.begin().await?;
     delete_rows_in(&mut tx, ids).await?;
-    if edits::record(&mut tx, changes).await?.is_err() {
-        tracing::warn!("A run was queued for the pack of {ids:?} during its delete");
-        tx.rollback().await?;
-        return delete_rows(pool, ids).await;
-    }
-    tx.commit().await
+    let why = match edits::record(&mut tx, changes).await {
+        Ok(Ok(())) => return tx.commit().await,
+        Ok(Err(_)) => "a run was queued for its pack".to_string(),
+        Err(e) => e.to_string(),
+    };
+    tracing::warn!("The delete of {ids:?} recorded no import steps: {why}");
+    tx.rollback().await?;
+    delete_rows(pool, ids).await
 }
 
 async fn delete_rows_in(tx: &mut sqlx::SqliteConnection, ids: &[&str]) -> sqlx::Result<()> {

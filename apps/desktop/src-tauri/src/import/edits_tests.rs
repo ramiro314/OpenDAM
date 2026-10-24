@@ -494,4 +494,27 @@ mod tests {
         s.with_meta("Materials/M_LogBark.mat", false).await;
         s.settled().await;
     }
+
+    /// A delete whose steps fail to write (a DB error in `edits::record`) still drops the rows
+    /// of the files it trashed, recording nothing, so the grid shows no item whose files are gone.
+    #[tokio::test]
+    async fn a_delete_whose_steps_fail_to_write_still_drops_the_rows() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        let before = s.steps_of(&pack_id).await;
+        sqlx::query(
+            "CREATE TRIGGER refuse BEFORE INSERT ON import_steps
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&s.lib.pool)
+        .await
+        .unwrap();
+
+        s.delete("Materials/M_LogBark.mat").await.unwrap();
+        assert!(!s.exists("Materials/M_LogBark.mat"));
+        assert!(!s.exists("Materials/M_LogBark.mat.meta"));
+        assert!(!s.has_row("Materials/M_LogBark.mat").await);
+        assert!(s.listed("Materials/M_LogBark.mat").await);
+        assert_eq!(s.steps_of(&pack_id).await, before);
+    }
 }
