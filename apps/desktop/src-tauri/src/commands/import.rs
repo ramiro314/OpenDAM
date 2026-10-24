@@ -24,7 +24,8 @@ pub async fn scan_import(
 }
 
 /// The folder tree one source of an original would build with the place steps `place`, for the
-/// import dialog once a candidate's steps change. Nothing is written.
+/// import dialog once a candidate's steps change. Nothing is written. With `unreal`, it is the
+/// estimate of the zip's Unreal project.
 #[tauri::command]
 pub async fn preview_import(
     library_id: String,
@@ -32,6 +33,7 @@ pub async fn preview_import(
     variant: Option<String>,
     subpath: Option<String>,
     place: Vec<PlaceStep>,
+    unreal: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Tree> {
     state
@@ -42,6 +44,7 @@ pub async fn preview_import(
             variant.as_deref(),
             subpath.as_deref(),
             place,
+            unreal.unwrap_or(false),
         )
         .await
 }

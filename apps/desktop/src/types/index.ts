@@ -951,6 +951,8 @@ export interface ImportTree {
   skipped: SkippedEntry[];
   /** Why the build would fail, when it would */
   error: string | null;
+  /** An Unreal pack's tree: its `glbs` are at most so many */
+  estimate?: boolean;
 }
 
 /** A step as the scan proposes it: its kind and its options */
@@ -991,6 +993,8 @@ export interface ImportCandidate {
   /** The target is `<Publisher>/<Pack>`, so it moves with the publisher */
   targetFollowsPublisher: boolean;
   variants: ImportVariant[];
+  /** An Unreal pack's `.uproject`, by its path in the zip */
+  project?: string | null;
   steps: ImportStepRecord[];
   /** null while a Fab pack has no variant ticked */
   tree: ImportTree | null;
@@ -998,7 +1002,7 @@ export interface ImportCandidate {
 
 /** One row of the plan's detection table the original matches */
 export interface ImportOffer {
-  layout: 'unity' | 'fab' | 'kenney' | 'zip';
+  layout: 'unity' | 'fab' | 'unreal' | 'kenney' | 'zip';
   candidates: ImportCandidate[];
 }
 
@@ -1024,6 +1028,8 @@ export interface ImportRequest {
   version?: string;
   license?: string;
   lookupStorePage?: boolean;
+  /** Builds the zip's Unreal project to GLBs (`export_unreal`) rather than copying the zip */
+  unreal?: boolean;
 }
 
 export type ImportRunStatus =

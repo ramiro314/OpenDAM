@@ -217,6 +217,8 @@ export interface DraftCandidate {
   followsPublisher: boolean;
   /** Whether the preset converts models to GLB (`unity_glb`) */
   converts: boolean;
+  /** An Unreal pack's `.uproject`, whose meshes its build exports (`export_unreal`), else null */
+  unreal: string | null;
   title: string;
   version: string;
   license: string;
@@ -313,6 +315,7 @@ function draftCandidate(c: ImportCandidate): DraftCandidate {
     scannedPlace,
     followsPublisher: c.targetFollowsPublisher,
     converts: c.steps.some((s) => s.kind === 'unity_glb'),
+    unreal: c.steps.some((s) => s.kind === 'export_unreal') ? (c.project ?? '') : null,
     title: '',
     version: '',
     license: '',
@@ -443,6 +446,7 @@ export function importRequest(draft: ImportDraft, c: DraftCandidate): ImportRequ
   if (c.version.trim()) request.version = c.version.trim();
   if (c.license.trim()) request.license = c.license.trim();
   if (c.preset === 'kenney') request.lookupStorePage = c.lookupStorePage;
+  if (c.unreal !== null) request.unreal = true;
   return request;
 }
 
@@ -659,7 +663,8 @@ export const useImportStore = create<ImportStore>()((set, get) => {
           draft.originalPath,
           variant,
           subpath,
-          placeSteps(c)
+          placeSteps(c),
+          c.unreal !== null
         );
       } catch (err) {
         tree = { folders: [], files: 0, glbs: 0, skipped: [], error: String(err) };

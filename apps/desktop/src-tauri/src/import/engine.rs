@@ -611,6 +611,7 @@ impl Engine {
         variant: Option<&str>,
         subpath: Option<&str>,
         place: Vec<PlaceStep>,
+        unreal: bool,
     ) -> Result<scan::Tree, String> {
         let library = self.library(library_id).await?;
         let root = library
@@ -627,6 +628,7 @@ impl Engine {
                 variant.as_deref(),
                 subpath.as_deref(),
                 &place,
+                unreal,
             )
         })
         .await
@@ -2922,6 +2924,7 @@ mod tests {
                 Some(&ticked.variant),
                 ticked.subpath.as_deref(),
                 place,
+                false,
             )
         };
         let hoisted = vec![
@@ -2938,7 +2941,7 @@ mod tests {
 
         let error = s
             .engine
-            .preview_import("lib", "/no/such.zip", None, None, vec![])
+            .preview_import("lib", "/no/such.zip", None, None, vec![], false)
             .await
             .unwrap_err();
         assert!(error.contains("can't be read"), "{error}");
@@ -2952,7 +2955,7 @@ mod tests {
             let engine = s.engine.clone();
             async move {
                 engine
-                    .preview_import("lib", &original, None, subpath.as_deref(), place)
+                    .preview_import("lib", &original, None, subpath.as_deref(), place, false)
                     .await
                     .unwrap()
             }

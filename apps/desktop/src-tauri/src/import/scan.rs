@@ -219,14 +219,30 @@ fn preview(listing: Result<Extraction>, place: &[PlaceStep], convert: bool) -> T
 /// The tree of one source of `original`, of kind `kind`, placed by `place`: what the import
 /// dialog shows once you change a candidate's place steps. The source is a `.unitypackage`'s
 /// `subpath`, or a zip's `variant` package (and its `subpath`), else the zip's `subpath`. A
-/// package's tree counts the GLBs `unity_glb` would write, as `detect`'s do.
+/// package's tree counts the GLBs `unity_glb` would write, as `detect`'s do. With `unreal`, it is
+/// the estimate of the zip's Unreal project, as `detect` gives an Unreal pack's.
 pub fn preview_source(
     original: &Path,
     kind: &str,
     variant: Option<&str>,
     subpath: Option<&str>,
     place: &[PlaceStep],
+    unreal: bool,
 ) -> Tree {
+    if unreal {
+        let found = index_zip(original).and_then(|index| {
+            let zip = index.list(None)?;
+            Ok(unreal_preview(&index, &zip, place))
+        });
+        return match found {
+            Ok(Some((_, tree))) => tree,
+            Ok(None) => Tree::failed(
+                anyhow::anyhow!("the zip holds no Unreal project (.uproject)"),
+                Vec::new(),
+            ),
+            Err(err) => Tree::failed(err, Vec::new()),
+        };
+    }
     let listing = match (kind, variant) {
         ("unitypackage", _) => list_unitypackage(original, subpath),
         (_, Some(variant)) => list_variant(original, variant, subpath),
@@ -515,29 +531,7 @@ pub fn unreal_place() -> Vec<PlaceStep> {
 /// project's estimate (`Project::estimate`), placed and counted as a build's would be.
 fn unreal(index: &ZipIndex, zip: &Extraction, name: &str, publisher: &str) -> Option<Offer> {
     let place = unreal_place();
-    let found = Project::find(zip).transpose()?;
-    let (project, tree) = match found {
-        Ok(project) => {
-            // The entries an export would skip are those of the project's folder.
-            let skipped = index
-                .list(project.dir.as_deref())
-                .map(|listing| listing.skipped)
-                .unwrap_or_default();
-            let estimate = Extraction {
-                files: project.estimate(),
-                skipped,
-            };
-            let mut tree = preview(Ok(estimate), &place, false);
-            if tree.error.is_none() {
-                // At most one per `.uasset`: "at most N models".
-                tree.glbs = project.assets.len() as u64;
-            }
-            tree.error = project.refusal().or(tree.error);
-            tree.estimate = true;
-            (Some(project), tree)
-        }
-        Err(error) => (None, Tree::failed(anyhow::anyhow!(error), Vec::new())),
-    };
+    let (project, tree) = unreal_preview(index, zip, &place)?;
     let mut steps = vec![step(
         "export_unreal",
         super::unreal_glb::Options::default_json(),
@@ -552,12 +546,45 @@ fn unreal(index: &ZipIndex, zip: &Extraction, name: &str, publisher: &str) -> Op
             preset: "fab",
             publisher: publisher.to_string(),
             target: publisher_target(publisher, name),
+            target_follows_publisher: true,
             target_error: None,
             variants: Vec::new(),
             project: project.map(|p| p.path()),
             steps,
             tree: Some(tree),
         }],
+    })
+}
+
+/// The project of a zip whose index is `index` and listing `zip`, with its estimated tree placed
+/// by `place` (`Project::estimate`), or `None` when the zip holds no `.uproject`. A project the
+/// editor can't export has its reason as the tree's error.
+fn unreal_preview(
+    index: &ZipIndex,
+    zip: &Extraction,
+    place: &[PlaceStep],
+) -> Option<(Option<Project>, Tree)> {
+    Some(match Project::find(zip).transpose()? {
+        Ok(project) => {
+            // The entries an export would skip are those of the project's folder.
+            let skipped = index
+                .list(project.dir.as_deref())
+                .map(|listing| listing.skipped)
+                .unwrap_or_default();
+            let estimate = Extraction {
+                files: project.estimate(),
+                skipped,
+            };
+            let mut tree = preview(Ok(estimate), place, false);
+            if tree.error.is_none() {
+                // At most one per `.uasset`: "at most N models".
+                tree.glbs = project.assets.len() as u64;
+            }
+            tree.error = project.refusal().or(tree.error);
+            tree.estimate = true;
+            (Some(project), tree)
+        }
+        Err(error) => (None, Tree::failed(anyhow::anyhow!(error), Vec::new())),
     })
 }
 
@@ -1042,6 +1069,7 @@ mod tests {
             ("unreal", "fab", "Fab/unreal", true)
         );
         assert_eq!(pack.project.as_deref(), Some("Feif/Feif.uproject"));
+        assert!(pack.target_follows_publisher);
         assert_eq!(
             kinds(&pack.steps),
             [
@@ -1080,6 +1108,29 @@ mod tests {
             )
         };
         assert_eq!(tree, &expected);
+    }
+
+    #[test]
+    fn an_unreal_preview_is_the_scan_s_estimate_placed_by_the_steps_given() {
+        let original = fixture("unreal.zip");
+        let offers = detect(&original, "zip", "Fab").unwrap();
+        let scanned = offers[0].candidates[0].tree.clone().unwrap();
+        let preview =
+            |place: &[PlaceStep]| preview_source(&original, "zip", None, None, place, true);
+        assert_eq!(preview(&unreal_place()), scanned);
+        // Without hoist Meshes, the meshes stay in their folder, still an estimate.
+        let flat = preview(&[PlaceStep::Flatten]);
+        assert!(flat.estimate);
+        assert_eq!((flat.files, flat.glbs), (scanned.files, scanned.glbs));
+        assert!(flat.folders.iter().any(|f| f.path == "Meshes"), "{flat:?}");
+        // The project's refusal, and a zip without one, show as the tree's error.
+        let source = preview_source(&fixture("unreal-source.zip"), "zip", None, None, &[], true);
+        assert!(source.error.unwrap().contains("has a Source/ folder"));
+        let none = preview_source(&fixture("kenney.zip"), "zip", None, None, &[], true);
+        assert_eq!(
+            none.error.as_deref(),
+            Some("the zip holds no Unreal project (.uproject)")
+        );
     }
 
     #[test]
