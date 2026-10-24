@@ -41,6 +41,7 @@ export function Preparation({ libraryId, pack, originalPath, runShown = false }:
   const store = usePreparationStore.getState();
   useEffect(() => {
     void usePreparationStore.getState().open(libraryId, pack.id);
+    return () => usePreparationStore.getState().close(pack.id);
   }, [libraryId, pack.id]);
 
   const busy = busyReason(runs, libraryId, pack.id);

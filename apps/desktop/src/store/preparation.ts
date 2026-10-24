@@ -289,14 +289,21 @@ export interface Editor {
   /** A save, a Rebuild or a target move is in flight */
   saving: boolean;
   target: TargetDraft | null;
+  /** How many mounted editors show it: the pack's details, its Imports view row, or both */
+  mounts: number;
 }
 
 interface PreparationStore {
-  /** Each opened pack's editor, by pack id */
+  /**
+   * Each pack's editor, by pack id: every mounted one, and an unmounted one only while it holds
+   * edits not saved yet, so closing the details doesn't lose them
+   */
   editors: Record<string, Editor>;
-  /** Reads the pack's steps, keeping edits not saved yet */
+  /** Mounts an editor of the pack and reads its steps, keeping edits not saved yet */
   open: (libraryId: string, packId: string) => Promise<void>;
-  /** Reads every open editor's steps again, but those with edits, for `library:updated` */
+  /** Unmounts one editor of the pack, dropping its entry once none shows it and it holds no edits */
+  close: (packId: string) => void;
+  /** Reads every mounted editor's steps again, but those with edits, for `library:updated` */
   refetch: () => Promise<void>;
   edit: (packId: string, change: (draft: StepsDraft) => StepsDraft) => void;
   /** Puts the steps back as read */
@@ -347,7 +354,8 @@ export const usePreparationStore = create<PreparationStore>()((set, get) => {
 
     open: async (libraryId, packId) => {
       const held = get().editors[packId];
-      if (!held || held.libraryId !== libraryId) {
+      if (held && held.libraryId === libraryId) patch(packId, { mounts: held.mounts + 1 });
+      else {
         const editor: Editor = {
           libraryId,
           packId,
@@ -356,14 +364,28 @@ export const usePreparationStore = create<PreparationStore>()((set, get) => {
           error: null,
           saving: false,
           target: null,
+          mounts: 1,
         };
         set((s) => ({ editors: { ...s.editors, [packId]: editor } }));
       }
       await read(libraryId, packId, true);
     },
 
+    close: (packId) => {
+      const editor = get().editors[packId];
+      if (!editor) return;
+      const mounts = Math.max(0, editor.mounts - 1);
+      if (mounts > 0 || (editor.draft && isDirty(editor.draft))) patch(packId, { mounts });
+      else
+        set((s) => {
+          const { [packId]: _, ...editors } = s.editors;
+          return { editors };
+        });
+    },
+
     refetch: async () => {
-      await Promise.all(Object.values(get().editors).map((e) => read(e.libraryId, e.packId, true)));
+      const mounted = Object.values(get().editors).filter((e) => e.mounts > 0);
+      await Promise.all(mounted.map((e) => read(e.libraryId, e.packId, true)));
     },
 
     edit: (packId, change) => {

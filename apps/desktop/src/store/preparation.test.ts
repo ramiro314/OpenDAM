@@ -434,6 +434,40 @@ describe('the editor store', () => {
     expect(store().editors.p2.draft?.steps[hoistAt(golden())].enabled).toBe(false);
   });
 
+  test('an editor nobody shows is dropped, unless it holds edits, and never read again', async () => {
+    const reads: string[] = [];
+    api.getImportSteps = async (_libraryId, packId) => {
+      reads.push(packId);
+      return read();
+    };
+    // The pack's details and its Imports view row both show p1
+    await store().open('lib', 'p1');
+    await store().open('lib', 'p1');
+    await store().open('lib', 'p2');
+    expect(editor().mounts).toBe(2);
+
+    store().close('p1');
+    expect(editor().mounts).toBe(1);
+    store().close('p1');
+    expect(store().editors.p1).toBeUndefined();
+
+    // Closed with edits, p2 keeps them for its next open but isn't read on library:updated
+    store().edit('p2', (d) => toggleStep(d, hoistAt(d.steps), false));
+    store().close('p2');
+    expect(store().editors.p2.mounts).toBe(0);
+    reads.length = 0;
+    await store().refetch();
+    expect(reads).toEqual([]);
+    await store().open('lib', 'p2');
+    expect(store().editors.p2.mounts).toBe(1);
+    expect(isDirty(store().editors.p2.draft!)).toBe(true);
+
+    // Once its edits are reverted, closing it drops it
+    store().revert('p2');
+    store().close('p2');
+    expect(store().editors).toEqual({});
+  });
+
   test('a typed target is checked as the pack’s own and moved, then imports are read again', async () => {
     api.getImportSteps = async () => read();
     const checks: unknown[] = [];
