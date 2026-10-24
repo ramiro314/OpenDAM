@@ -7,6 +7,7 @@ import {
   claudePlanLines,
   exportSettingsPatch,
   ignoredOverridesNote,
+  importBlenderLine,
   importSettingsPatch,
   importSettingsProblem,
   isKnownModel,
@@ -261,5 +262,27 @@ describe('cacheLine', () => {
     const path = '/home/me/.cache/opendam/import';
     expect(cacheLine({ path, bytes: 0 })).toBe(`Conversion cache: Empty, at ${path}`);
     expect(cacheLine({ path, bytes: 3 * 1024 * 1024 })).toBe(`Conversion cache: 3.0MB, at ${path}`);
+  });
+});
+
+describe('importBlenderLine', () => {
+  const found = {
+    series: '5.2',
+    path: '/usr/bin/blender',
+    version: '5.2.2',
+    accepted: true,
+    problem: null,
+  };
+
+  test("shows the check's answer, else its error", () => {
+    expect(importBlenderLine(found, null, null)).toBe('Blender 5.2.2 at /usr/bin/blender');
+    expect(importBlenderLine(null, 'IPC failed', null)).toBe('IPC failed');
+  });
+
+  test('waits for the check, unless Blender’s path never loaded, which it says', () => {
+    expect(importBlenderLine(null, null, null)).toBe('Checking Blender…');
+    expect(importBlenderLine(null, null, 'database is locked')).toBe(
+      "Not checked: Blender's path couldn't be loaded (database is locked)"
+    );
   });
 });

@@ -28,6 +28,7 @@ import {
   claudePlanLines,
   exportSettingsPatch,
   ignoredOverridesNote,
+  importBlenderLine,
   importSettingsPatch,
   importSettingsProblem,
   isKnownModel,
@@ -356,6 +357,7 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
             onChange={setImportDraft}
             error={importError}
             blender={blender}
+            blenderPathError={exportDraft ? null : exportError}
           />
         </div>
 
@@ -522,6 +524,8 @@ interface ImportSectionProps {
   onChange: (draft: ImportSettings) => void;
   error: string | null;
   blender: BlenderCheck;
+  /** Why Blender's path, a Game export setting, couldn't be loaded, so Blender isn't checked */
+  blenderPathError: string | null;
 }
 
 /**
@@ -529,7 +533,7 @@ interface ImportSectionProps {
  * Editor, both memory caps and UnityPy, then the conversion cache with Clear, which acts at once.
  * The tools are checked as their paths are typed, saved or not.
  */
-function ImportSection({ draft, onChange, error, blender }: ImportSectionProps) {
+function ImportSection({ draft, onChange, error, blender, blenderPathError }: ImportSectionProps) {
   const [tools, setTools] = useState<ImportTools | null>(null);
   const [toolsError, setToolsError] = useState<string | null>(null);
   const [checks, setChecks] = useState(0);
@@ -600,20 +604,16 @@ function ImportSection({ draft, onChange, error, blender }: ImportSectionProps) 
           <span className={styles.label}>Blender</span>
           <span className={styles.cliStatus}>
             <span className={styles.cliLine} id="settings-import-blender-status">
-              {!blenderStatus && !blender.error && 'Checking Blender…'}
               {blenderStatus && (
-                <>
-                  <span
-                    className={clsx(
-                      styles.dot,
-                      blenderStatus.accepted ? styles.dotOn : styles.dotOff
-                    )}
-                    aria-hidden
-                  />
-                  {blenderLine(blenderStatus)}
-                </>
+                <span
+                  className={clsx(
+                    styles.dot,
+                    blenderStatus.accepted ? styles.dotOn : styles.dotOff
+                  )}
+                  aria-hidden
+                />
               )}
-              {blender.error}
+              {importBlenderLine(blenderStatus, blender.error, blenderPathError)}
             </span>
           </span>
         </div>
@@ -692,8 +692,11 @@ function ImportSection({ draft, onChange, error, blender }: ImportSectionProps) 
             type="button"
             className={clsx(styles.btn, styles.secondaryBtn)}
             disabled={checking}
-            onClick={() => setChecks((n) => n + 1)}
-            title="Check assimp, the Unreal Editor and UnityPy again"
+            onClick={() => {
+              setChecks((n) => n + 1);
+              blender.checkAgain();
+            }}
+            title="Check Blender, assimp, the Unreal Editor and UnityPy again"
           >
             Check again
           </button>

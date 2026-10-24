@@ -124,6 +124,21 @@ export function blenderLine(status: BlenderStatus): string {
   return status.problem ?? 'Blender not found';
 }
 
+/**
+ * The Import tools section's Blender line: what the check found, why it failed, or why it hasn't
+ * answered. Without Blender's path, which Game export failed to load, nothing is checked.
+ */
+export function importBlenderLine(
+  status: BlenderStatus | null,
+  checkError: string | null,
+  pathError: string | null
+): string {
+  if (status) return blenderLine(status);
+  if (checkError) return checkError;
+  if (pathError) return `Not checked: Blender's path couldn't be loaded (${pathError})`;
+  return 'Checking Blender…';
+}
+
 /** What Settings says about Claude-plan access: where `claude` is, and which login it uses. */
 export function claudePlanLines(status: ClaudePlanStatus): { found: string; login: string } {
   const found = status.path
