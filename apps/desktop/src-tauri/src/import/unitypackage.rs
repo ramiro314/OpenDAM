@@ -12,6 +12,10 @@
 //! duplicate ones are skipped and reported, and dropped before the shared top folder is found, so
 //! they never change the layout. `extract_unity.py` counts an escaping pathname as a second top
 //! folder instead (plan R13).
+//!
+//! `list_unitypackage` and `list_variant` read a package the same way and lay it out with the
+//! same code, but keep only each entry's size: an import's scan previews a build from them
+//! without writing anything (`super::scan`).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -146,10 +150,43 @@ pub(super) fn into_empty(
     result
 }
 
+/// Lists the files `extract_unitypackage` would write for `package`, with their source paths,
+/// sizes and the entries it would skip, from the package's index alone: its `pathname` entries
+/// and its entry headers. No asset's bytes are kept and nothing is written. A nested package is
+/// listed from its stream as the outer one is read. It fails where the extraction would.
+pub fn list_unitypackage(package: &Path, subpath: Option<&str>) -> Result<Extraction> {
+    let subpath = clean_subpath(subpath)?;
+    let mut original =
+        File::open(package).with_context(|| format!("opening {}", package.display()))?;
+    run(
+        &mut Listing::default(),
+        &mut original,
+        &[],
+        subpath.as_deref(),
+    )
+}
+
+/// Lists the variant `.unitypackage` at `variant` inside the zip `original`, as
+/// `list_unitypackage` does, reading it straight from the zip.
+pub fn list_variant(original: &Path, variant: &str, subpath: Option<&str>) -> Result<Extraction> {
+    let subpath = clean_subpath(subpath)?;
+    let mut zip = zipfile::open(original)?;
+    let (index, name) = zipfile::variant(&mut zip, variant)?;
+    let mut package = zip
+        .by_index(index)
+        .with_context(|| format!("reading {name} in the zip"))?;
+    run(
+        &mut Listing::default(),
+        &mut package,
+        &[name],
+        subpath.as_deref(),
+    )
+}
+
 /// Unpacks the package read from `package`, whose own source path is `chain` (empty for the
 /// original itself), into `target`.
 fn extract_into(
-    package: impl Read,
+    mut package: impl Read,
     chain: &[String],
     target: &Path,
     subpath: Option<&str>,
@@ -158,7 +195,7 @@ fn extract_into(
     let scratch = tempfile::Builder::new()
         .prefix(".extract-")
         .tempdir_in(target)?;
-    let mut job = Job {
+    let mut disk = Disk {
         target,
         scratch: scratch.path(),
         scratch_name: scratch
@@ -168,11 +205,22 @@ fn extract_into(
             .to_string_lossy()
             .into_owned(),
         blobs: 0,
-        out: Extraction::default(),
     };
-    unpack(&mut job, package, chain, subpath, "")?;
-    let mut out = job.out;
+    let out = run(&mut disk, &mut package, chain, subpath)?;
     scratch.close()?;
+    Ok(out)
+}
+
+/// Reads the package and lays it out through `sink`, sorted by path.
+fn run<S: Sink>(
+    sink: &mut S,
+    package: &mut dyn Read,
+    chain: &[String],
+    subpath: Option<&str>,
+) -> Result<Extraction> {
+    let mut out = Extraction::default();
+    let read = read_package(sink, package)?;
+    lay_out(sink, read, chain, subpath, "", &mut out)?;
     if let (Some(subpath), true) = (subpath, out.files.is_empty()) {
         bail!("the package holds no file under {subpath}");
     }
@@ -196,12 +244,26 @@ fn clear(target: &Path, remove: bool) -> io::Result<()> {
     Ok(())
 }
 
-struct Job<'a> {
+/// Where a package's entries go: written below a target (`Disk`), or only listed (`Listing`).
+/// The reading and the layout are the same for both, so a listing names exactly the files an
+/// extraction writes.
+trait Sink: Sized {
+    /// An asset's or `.meta`'s bytes, as the sink keeps them.
+    type Blob;
+    fn take(&mut self, data: &mut dyn Read, size: u64, mtime: u64) -> Result<Self::Blob>;
+    fn size(blob: &Self::Blob) -> u64;
+    /// The nested package whose bytes are `blob`, read.
+    fn nested(&mut self, blob: Self::Blob) -> Result<Package<Self::Blob>>;
+    /// Puts `blob` at `rel` below the target, refusing to replace anything there.
+    fn put(&mut self, blob: Self::Blob, rel: &str) -> Result<()>;
+}
+
+/// Writes each entry into a scratch folder, then renames it into place.
+struct Disk<'a> {
     target: &'a Path,
     scratch: &'a Path,
     scratch_name: String,
     blobs: u64,
-    out: Extraction,
 }
 
 /// An entry's bytes, staged in the scratch folder with the entry's mtime.
@@ -210,40 +272,143 @@ struct Blob {
     size: u64,
 }
 
-#[derive(Default)]
-struct Guid {
-    pathname: Option<String>,
-    asset: Option<Blob>,
-    meta: Option<Blob>,
+impl Sink for Disk<'_> {
+    type Blob = Blob;
+
+    fn take(&mut self, data: &mut dyn Read, _size: u64, mtime: u64) -> Result<Blob> {
+        self.blobs += 1;
+        let file = self.scratch.join(self.blobs.to_string());
+        let mut staged = File::create_new(&file)?;
+        let size = io::copy(data, &mut staged)?;
+        if let Some(mtime) = UNIX_EPOCH.checked_add(Duration::from_secs(mtime)) {
+            staged.set_modified(mtime)?;
+        }
+        Ok(Blob { file, size })
+    }
+
+    fn size(blob: &Blob) -> u64 {
+        blob.size
+    }
+
+    fn nested(&mut self, blob: Blob) -> Result<Package<Blob>> {
+        let mut file = File::open(&blob.file)?;
+        let package = read_package(self, &mut file)?;
+        fs::remove_file(&blob.file)?;
+        Ok(package)
+    }
+
+    fn put(&mut self, blob: Blob, rel: &str) -> Result<()> {
+        if rel.split('/').next() == Some(self.scratch_name.as_str()) {
+            bail!("{rel} would land in the extraction's scratch folder");
+        }
+        let to = self.target.join(rel);
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating the folder of {rel}"))?;
+        }
+        if to.symlink_metadata().is_ok() {
+            bail!("{rel} would overwrite a file the package already wrote");
+        }
+        fs::rename(&blob.file, &to).with_context(|| format!("writing {rel}"))
+    }
 }
 
-/// A file of one package, after the unsafe and duplicate ones are dropped.
-struct Item {
+/// Keeps each entry's size, and lists a gzipped entry as a nested package while it is read,
+/// since its `pathname` may come later and the stream can't be read again.
+#[derive(Default)]
+struct Listing {
+    taken: Taken,
+}
+
+struct Listed {
+    size: u64,
+    /// The entry read as a package, when it is gzipped.
+    nested: Option<Result<Package<Listed>>>,
+}
+
+impl Sink for Listing {
+    type Blob = Listed;
+
+    fn take(&mut self, data: &mut dyn Read, size: u64, _mtime: u64) -> Result<Listed> {
+        let mut magic = [0u8; 2];
+        let mut read = 0;
+        while read < magic.len() {
+            match data.read(&mut magic[read..])? {
+                0 => break,
+                n => read += n,
+            }
+        }
+        let nested = (magic[..read] == [0x1f, 0x8b]).then(|| {
+            let mut whole = io::Cursor::new(magic).chain(data);
+            read_package(self, &mut whole)
+        });
+        Ok(Listed { size, nested })
+    }
+
+    fn size(blob: &Listed) -> u64 {
+        blob.size
+    }
+
+    fn nested(&mut self, blob: Listed) -> Result<Package<Listed>> {
+        match blob.nested {
+            Some(package) => package,
+            None => bail!("it isn't a gzipped package"),
+        }
+    }
+
+    fn put(&mut self, _blob: Listed, rel: &str) -> Result<()> {
+        self.taken.claim(rel, "package")
+    }
+}
+
+/// The paths a listing has placed, to refuse what an extraction couldn't write: a file where
+/// one already is, or below a file.
+#[derive(Default)]
+pub(super) struct Taken {
+    files: HashSet<String>,
+    folders: HashSet<String>,
+}
+
+impl Taken {
+    pub(super) fn claim(&mut self, rel: &str, what: &str) -> Result<()> {
+        let folders: Vec<&str> = rel.match_indices('/').map(|(i, _)| &rel[..i]).collect();
+        if folders.iter().any(|f| self.files.contains(*f)) {
+            bail!("creating the folder of {rel}: a file is in the way");
+        }
+        if self.files.contains(rel) || self.folders.contains(rel) {
+            bail!("{rel} would overwrite a file the {what} already wrote");
+        }
+        self.folders.extend(folders.into_iter().map(str::to_string));
+        self.files.insert(rel.to_string());
+        Ok(())
+    }
+}
+
+struct Guid<B> {
+    pathname: Option<String>,
+    asset: Option<B>,
+    meta: Option<B>,
+}
+
+/// One package's files, after the unsafe and duplicate ones are dropped, and its skipped entries
+/// as `(name, reason)`, the name not yet chained to the package's own source path.
+struct Package<B> {
+    items: Vec<Item<B>>,
+    skipped: Vec<(String, SkipReason)>,
+}
+
+struct Item<B> {
     pathname: String,
     /// Its layout below the package's destination: `Assets/` dropped, and later the shared top.
     parts: Vec<String>,
-    asset: Blob,
-    meta: Option<Blob>,
+    asset: B,
+    meta: Option<B>,
 }
 
-/// Unpacks one package (the original, or a nested one) into `dest` below the target. `chain` is
-/// the source path of the package itself, empty for the original.
-fn unpack(
-    job: &mut Job,
-    reader: impl Read,
-    chain: &[String],
-    subpath: Option<&str>,
-    dest: &str,
-) -> Result<()> {
-    let source = |name: &str| -> Vec<String> {
-        let mut path = chain.to_vec();
-        path.push(name.to_string());
-        path
-    };
-
+/// Reads one package's entries through `sink`.
+fn read_package<S: Sink>(sink: &mut S, reader: &mut dyn Read) -> Result<Package<S::Blob>> {
     // Read every entry first: a GUID's `pathname` can come after its `asset`.
     let mut order: Vec<String> = Vec::new();
-    let mut guids: HashMap<String, Guid> = HashMap::new();
+    let mut guids: HashMap<String, Guid<S::Blob>> = HashMap::new();
     let mut members = HashSet::new();
     let mut odd: Vec<(String, SkipReason)> = Vec::new();
     let mut archive = tar::Archive::new(MultiGzDecoder::new(reader));
@@ -284,7 +449,11 @@ fn unpack(
         if !guids.contains_key(guid) {
             order.push(guid.to_string());
         }
-        let slot = guids.entry(guid.to_string()).or_default();
+        let slot = guids.entry(guid.to_string()).or_insert(Guid {
+            pathname: None,
+            asset: None,
+            meta: None,
+        });
         if part == "pathname" {
             let mut data = Vec::new();
             entry.read_to_end(&mut data)?;
@@ -292,14 +461,8 @@ fn unpack(
             slot.pathname = Some(text.lines().next().unwrap_or("").trim().to_string());
             continue;
         }
-        job.blobs += 1;
-        let file = job.scratch.join(job.blobs.to_string());
-        let mut staged = File::create_new(&file)?;
-        let size = io::copy(&mut entry, &mut staged)?;
-        if let Some(mtime) = UNIX_EPOCH.checked_add(Duration::from_secs(entry.header().mtime()?)) {
-            staged.set_modified(mtime)?;
-        }
-        let blob = Some(Blob { file, size });
+        let (size, mtime) = (entry.size(), entry.header().mtime()?);
+        let blob = Some(sink.take(&mut entry, size, mtime)?);
         if part == "asset" {
             slot.asset = blob;
         } else {
@@ -308,6 +471,7 @@ fn unpack(
     }
 
     // A member's source path is its GUID's pathname when the package names one.
+    let mut skipped = Vec::new();
     for (name, reason) in odd {
         let named = member_parts(&name).and_then(|(guid, part)| {
             let pathname = guids.get(guid)?.pathname.as_ref()?;
@@ -317,10 +481,7 @@ fn unpack(
                 _ => None,
             }
         });
-        job.out.skipped.push(SkippedEntry {
-            source_path: source(named.as_deref().unwrap_or(&name)),
-            reason,
-        });
+        skipped.push((named.unwrap_or(name), reason));
     }
 
     // A GUID with no asset is a folder, and an asset with no pathname has nowhere to go.
@@ -346,14 +507,36 @@ fn unpack(
                 asset,
                 meta: slot.meta,
             }),
-            Err(reason) => job.out.skipped.push(SkippedEntry {
-                source_path: source(&pathname),
-                reason,
-            }),
+            Err(reason) => skipped.push((pathname, reason)),
         }
+    }
+    Ok(Package { items, skipped })
+}
+
+/// Lays one package (the original, or a nested one) out into `dest` below the target, through
+/// `sink`. `chain` is the source path of the package itself, empty for the original.
+fn lay_out<S: Sink>(
+    sink: &mut S,
+    package: Package<S::Blob>,
+    chain: &[String],
+    subpath: Option<&str>,
+    dest: &str,
+    out: &mut Extraction,
+) -> Result<()> {
+    let source = |name: &str| -> Vec<String> {
+        let mut path = chain.to_vec();
+        path.push(name.to_string());
+        path
+    };
+    for (name, reason) in package.skipped {
+        out.skipped.push(SkippedEntry {
+            source_path: source(&name),
+            reason,
+        });
     }
 
     // Drop a top folder every file shares.
+    let mut items = package.items;
     let top = items.first().map(|item| item.parts[0].clone());
     if items
         .iter()
@@ -379,16 +562,13 @@ fn unpack(
                     },
                 },
             };
-            let nested = File::open(&item.asset.file)?;
-            unpack(
-                job,
-                nested,
-                &source(&item.pathname),
-                inner_subpath,
-                &join(dest, &inner_dest),
-            )
-            .with_context(|| format!("unpacking the nested package {}", item.pathname))?;
-            fs::remove_file(&item.asset.file)?;
+            let inner_chain = source(&item.pathname);
+            sink.nested(item.asset)
+                .and_then(|nested| {
+                    let dest = join(dest, &inner_dest);
+                    lay_out(sink, nested, &inner_chain, inner_subpath, &dest, out)
+                })
+                .with_context(|| format!("unpacking the nested package {}", item.pathname))?;
             continue;
         }
         let rel = match subpath {
@@ -399,38 +579,25 @@ fn unpack(
             },
         };
         let rel = join(dest, rel);
-        place(job, &item.asset, &rel)?;
-        job.out.files.push(ExtractedFile {
+        let size = S::size(&item.asset);
+        sink.put(item.asset, &rel)?;
+        out.files.push(ExtractedFile {
             path: rel.clone(),
             source_path: source(&item.pathname),
-            size: item.asset.size,
+            size,
         });
         if let Some(meta) = item.meta {
             let rel = format!("{rel}.meta");
-            place(job, &meta, &rel)?;
-            job.out.files.push(ExtractedFile {
+            let size = S::size(&meta);
+            sink.put(meta, &rel)?;
+            out.files.push(ExtractedFile {
                 path: rel,
                 source_path: source(&format!("{}.meta", item.pathname)),
-                size: meta.size,
+                size,
             });
         }
     }
     Ok(())
-}
-
-/// Moves a staged entry to `rel` below the target, refusing to replace anything there.
-fn place(job: &Job, blob: &Blob, rel: &str) -> Result<()> {
-    if rel.split('/').next() == Some(job.scratch_name.as_str()) {
-        bail!("{rel} would land in the extraction's scratch folder");
-    }
-    let to = job.target.join(rel);
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating the folder of {rel}"))?;
-    }
-    if to.symlink_metadata().is_ok() {
-        bail!("{rel} would overwrite a file the package already wrote");
-    }
-    fs::rename(&blob.file, &to).with_context(|| format!("writing {rel}"))
 }
 
 /// A tar member's GUID and file name, when it has exactly those two parts.

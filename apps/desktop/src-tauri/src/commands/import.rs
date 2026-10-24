@@ -3,9 +3,38 @@ use tauri::State;
 
 use crate::import::engine::ImportRequest;
 use crate::import::records::{PackSteps, RunSummary, Step};
+use crate::import::scan::Scan;
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
+
+/// Scans a `.unitypackage` or `.zip` original for an import into a library: its candidate
+/// packs, each with its preset, default target (with the reason the library refuses it, if it
+/// does), default steps and the folder tree its build would produce, with per-folder file counts
+/// and the GLB count. Nothing is written.
+#[tauri::command]
+pub async fn scan_import(
+    library_id: String,
+    original_path: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Scan> {
+    state.imports.scan(&library_id, &original_path).await
+}
+
+/// Moves a pack's target, refusing one that exists in the library or nests with another pack's
+/// target, and any move of a built pack or one with a run queued or running.
+#[tauri::command]
+pub async fn set_import_target(
+    library_id: String,
+    pack_id: String,
+    target: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<()> {
+    state
+        .imports
+        .set_target(&library_id, &pack_id, &target)
+        .await
+}
 
 /// Imports a `.unitypackage` or `.zip` original as a new pack from an explicit source in it (a
 /// zip's variant `.unitypackage` or folder, a package's pipeline folder), at an explicit target
