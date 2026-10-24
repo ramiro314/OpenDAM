@@ -53,12 +53,47 @@ mod tests {
 
         /// Deletes the item at `path` in the pack, as `delete_assets` does with the trash.
         async fn delete(&self, path: &str) -> Result<(), String> {
+            self.delete_with(path, |p: &Path| std::fs::remove_file(p))
+                .await
+        }
+
+        /// Deletes the item at `path` in the pack, trashing files with `trash`.
+        async fn delete_with(
+            &self,
+            path: &str,
+            trash: impl Fn(&Path) -> std::io::Result<()>,
+        ) -> Result<(), String> {
             let id = self.id_at(path).await;
-            delete_assets_with(&self.engine.db, &[id], true, |p: &Path| {
-                std::fs::remove_file(p)
-            })
+            delete_assets_with(&self.engine.db, &[id], true, trash)
+                .await
+                .map_err(|e| format!("{e:?}"))
+        }
+
+        /// Whether the library holds an asset row at `path` in the pack.
+        async fn has_row(&self, path: &str) -> bool {
+            self.count(&format!(
+                "SELECT COUNT(*) FROM assets WHERE file_path = '{}'",
+                in_pack(path)
+            ))
             .await
-            .map_err(|e| format!("{e:?}"))
+                == 1
+        }
+
+        /// Queues another machine's rebuild of the pack, `race`, whenever `event` (`UPDATE OF
+        /// file_path` or `DELETE`) touches an asset row: a run queued between a command's check
+        /// and its transaction, which the command's own transaction then sees.
+        async fn queue_a_run_on(&self, event: &str) {
+            sqlx::query(&format!(
+                "CREATE TRIGGER race AFTER {event} ON assets BEGIN
+                 INSERT OR IGNORE INTO import_runs (id, kind, packs, status, created_at,
+                 owner_machine, owner_boot, owner_pid, owner_started, heartbeat_at)
+                 SELECT 'race', 'rebuild',
+                 json_array(json_object('packId', id, 'recipeRev', recipe_rev)), 'queued', 0,
+                 'another machine', 'boot', 1, 1, 9000000000000000 FROM import_packs; END"
+            ))
+            .execute(&self.lib.pool)
+            .await
+            .unwrap();
         }
 
         fn exists(&self, path: &str) -> bool {
@@ -367,6 +402,96 @@ mod tests {
 
         s.rebuild_until(&pack_id, "done").await;
         assert!(!s.exists("Models"), "neither file comes back");
+        s.settled().await;
+    }
+
+    /// A run queued after a rename's check, seen only by its transaction (`edits::record`):
+    /// the rename is refused and undone, every file and `.meta` under its old name, and nothing
+    /// is recorded, the run's row going with the rolled-back transaction.
+    #[tokio::test]
+    async fn a_run_queued_during_a_rename_refuses_it_and_puts_the_files_back() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        let before = s.steps_of(&pack_id).await;
+        let rock = s.id_at("T_Rock.png").await;
+        s.queue_a_run_on("UPDATE OF file_path").await;
+
+        let refused = s.rename("T_Rock.png", "T_Stone.png").await;
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains(BUSY)),
+            "{refused:?}"
+        );
+        unrenamed(&s, &pack_id, &before).await;
+        assert_eq!(s.id_at("T_Rock.png").await, rock);
+        assert_eq!(
+            s.count("SELECT COUNT(*) FROM import_runs WHERE id = 'race'")
+                .await,
+            0
+        );
+    }
+
+    /// A run queued after a delete's check, seen only by its transaction: the files are already
+    /// in the trash, so their rows go all the same, but no step is recorded and `recipe_rev`
+    /// stays, the manifest still listing the files for the run's re-check to stop on.
+    #[tokio::test]
+    async fn a_run_queued_during_a_delete_drops_the_rows_but_records_no_step() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        let before = s.steps_of(&pack_id).await;
+        s.queue_a_run_on("DELETE").await;
+
+        s.delete("Materials/M_LogBark.mat").await.unwrap();
+        assert!(!s.exists("Materials/M_LogBark.mat"));
+        assert!(!s.exists("Materials/M_LogBark.mat.meta"));
+        assert!(!s.has_row("Materials/M_LogBark.mat").await);
+        assert!(s.listed("Materials/M_LogBark.mat").await);
+        assert!(s.listed("Materials/M_LogBark.mat.meta").await);
+        assert_eq!(s.steps_of(&pack_id).await, before);
+        assert_eq!(
+            s.count("SELECT COUNT(*) FROM import_runs WHERE id = 'race'")
+                .await,
+            1
+        );
+    }
+
+    /// A delete whose `.meta` fails to go to the trash: the file is gone, with its row and its
+    /// manifest row, and its `exclude` is recorded; the `.meta` stays on disk and in the
+    /// manifest, the error naming it; and the rebuild, whose step drops both, succeeds.
+    #[tokio::test]
+    async fn a_delete_whose_meta_fails_to_trash_keeps_the_meta_and_records_the_file() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        let before = s.steps_of(&pack_id).await;
+
+        let failed = s
+            .delete_with("Materials/M_LogBark.mat", |p: &Path| {
+                if p.extension().is_some_and(|e| e == "meta") {
+                    return Err(std::io::Error::other("injected"));
+                }
+                std::fs::remove_file(p)
+            })
+            .await;
+        assert!(
+            failed
+                .as_ref()
+                .is_err_and(|e| e.contains("M_LogBark.mat.meta") && e.contains("injected")),
+            "{failed:?}"
+        );
+        assert!(!s.exists("Materials/M_LogBark.mat"));
+        assert!(!s.listed("Materials/M_LogBark.mat").await);
+        assert!(!s.has_row("Materials/M_LogBark.mat").await);
+        assert!(s.exists("Materials/M_LogBark.mat.meta"));
+        assert!(s.listed("Materials/M_LogBark.mat.meta").await);
+        assert_eq!(
+            s.recorded(&pack_id, &before).await,
+            [step(
+                "exclude",
+                json!({"source": wrapped("Art/Materials/M_LogBark.mat")})
+            )]
+        );
+
+        s.rebuild_until(&pack_id, "done").await;
+        s.with_meta("Materials/M_LogBark.mat", false).await;
         s.settled().await;
     }
 }
