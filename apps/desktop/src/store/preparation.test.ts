@@ -273,10 +273,12 @@ describe('editing the draft', () => {
 });
 
 describe('the target', () => {
-  test('a built pack’s folder doesn’t move; a pack never built or failed can', () => {
+  test('a built pack’s folder doesn’t move; a pack never built, or whose first build failed, can', () => {
     expect(targetLocked(pack())).toContain("can't move yet");
-    expect(targetLocked(pack({ status: 'never_built' }))).toBeNull();
-    expect(targetLocked(pack({ status: 'failed' }))).toBeNull();
+    expect(targetLocked(pack({ status: 'never_built', builtAt: null }))).toBeNull();
+    expect(targetLocked(pack({ status: 'failed', builtAt: null }))).toBeNull();
+    // Marked failed by a swap recovery, it still has its committed build
+    expect(targetLocked(pack({ status: 'failed', builtAt: 1 }))).toContain("can't move yet");
   });
 
   test('a typed target waits for its check and shows the library’s reason', () => {

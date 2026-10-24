@@ -254,9 +254,15 @@ export function draftProblem(draft: StepsDraft): string | null {
 
 // ── Target ────────────────────────────────────────────────────────────────
 
-/** Why a pack's target can't be edited, or null: a built pack's folder doesn't move yet */
+/**
+ * Why a pack's target can't be edited, or null: a built pack's folder doesn't move yet. A pack
+ * has a committed build once `builtAt` is set, which the commit sets with `current_build`, even
+ * when its status reads `failed` (a swap recovery couldn't settle), as `set_target` judges it.
+ */
 export function targetLocked(pack: ImportPackSummary): string | null {
-  return pack.status === 'built' ? "A built pack's folder can't move yet" : null;
+  return pack.builtAt !== null || pack.status === 'built'
+    ? "A built pack's folder can't move yet"
+    : null;
 }
 
 export interface TargetDraft {
