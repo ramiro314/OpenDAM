@@ -27,6 +27,19 @@ impl Default for Systemd {
     }
 }
 
+/// How much of a child's stdout, and of its stderr, `Capped::watch` keeps: their ends, which
+/// say why a run failed. An editor session can log hundreds of MB, outside the child's cap.
+const KEPT: usize = 64 * 1024;
+
+/// Appends `bytes` to `buffer`, keeping its last `KEPT` bytes at least. It grows to twice
+/// that before its start is dropped, so a long log isn't copied at every line.
+fn keep_tail(buffer: &mut Vec<u8>, bytes: &[u8]) {
+    buffer.extend_from_slice(bytes);
+    if buffer.len() > 2 * KEPT {
+        buffer.drain(..buffer.len() - KEPT);
+    }
+}
+
 /// How long `Capped::watch` goes on reading a child's output once it has exited.
 const DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -150,8 +163,8 @@ impl Capped {
 
     /// Spawns the command and waits for it, its stdin closed and its output piped: `line` sees
     /// each line it prints to stdout as it prints it, and `cancelled` is polled every 200 ms.
-    /// When that turns true the child is killed and the result is `None`. Every line of stdout
-    /// and all of stderr come back in the output, and the scope is `finish`ed. However it ends,
+    /// When that turns true the child is killed and the result is `None`. The end of stdout and
+    /// of stderr (`KEPT`) come back in the output, and the scope is `finish`ed. However it ends,
     /// whatever the child left running is killed (`stop_leftovers`).
     pub async fn watch(
         &mut self,
@@ -178,7 +191,7 @@ impl Capped {
                 let mut chunk = [0u8; 8192];
                 while let Ok(n @ 1..) = stderr.read(&mut chunk).await {
                     let mut errors = errors.lock().unwrap_or_else(|e| e.into_inner());
-                    errors.extend_from_slice(&chunk[..n]);
+                    keep_tail(&mut errors, &chunk[..n]);
                 }
             }
         });
@@ -193,8 +206,8 @@ impl Capped {
                 read = lines.next_segment(), if reading => match read {
                     Ok(Some(read)) => {
                         line(&read);
-                        printed.extend_from_slice(&read);
-                        printed.push(b'\n');
+                        keep_tail(&mut printed, &read);
+                        keep_tail(&mut printed, b"\n");
                     }
                     _ => reading = false,
                 },
@@ -219,8 +232,8 @@ impl Capped {
         // long after the child exited, and the run must end with the child.
         let drained = async {
             while let Ok(Some(read)) = lines.next_segment().await {
-                printed.extend_from_slice(&read);
-                printed.push(b'\n');
+                keep_tail(&mut printed, &read);
+                keep_tail(&mut printed, b"\n");
             }
             let _ = (&mut reader).await;
         };
@@ -582,6 +595,40 @@ mod tests {
             "{}",
             calls()
         );
+    }
+
+    /// A long log keeps only its end, on both streams: what says why a run failed.
+    #[tokio::test]
+    async fn watch_keeps_the_end_of_a_long_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let uncapped = Systemd {
+            run: dir.path().join("none-run"),
+            ctl: dir.path().join("none-ctl"),
+        };
+        // About 2 MB on each stream, then a last line.
+        let script = "i=0; while [ $i -lt 40000 ]; do \
+                      echo \"line $i of a long editor log, padded out\"; \
+                      echo \"error line $i of a long editor log\" >&2; i=$((i+1)); done; \
+                      echo last; echo last error >&2";
+        let mut capped = capped_command_with(&uncapped, "sh", ["-c", script], "1G").await;
+        let mut lines = 0;
+        let output = capped
+            .watch(|_| lines += 1, || false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lines, 40001, "every line still reaches the callback");
+        for stream in [&output.stdout, &output.stderr] {
+            assert!(
+                (KEPT..=2 * KEPT).contains(&stream.len()),
+                "{}",
+                stream.len()
+            );
+        }
+        assert!(output
+            .stdout
+            .ends_with(b"line 39999 of a long editor log, padded out\nlast\n"));
+        assert!(output.stderr.ends_with(b"last error\n"));
     }
 
     #[test]
