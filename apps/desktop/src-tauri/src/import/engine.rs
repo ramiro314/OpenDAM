@@ -1445,6 +1445,7 @@ mod tests {
                 "writing metadata",
                 "hashing",
                 "waiting for the library",
+                "re-checking",
                 "swapping",
                 "indexing",
                 "settling"
