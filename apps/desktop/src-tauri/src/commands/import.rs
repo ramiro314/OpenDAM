@@ -94,6 +94,17 @@ pub async fn set_import_steps(
         .await
 }
 
+/// Forgets an imported Kenney pack's store page answer, so its next build looks the page up
+/// again with HEAD requests to kenney.nl. Refused while a run for the pack is queued or running.
+#[tauri::command]
+pub async fn clear_import_store_page(
+    library_id: String,
+    pack_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<()> {
+    state.imports.clear_store_page(&library_id, &pack_id).await
+}
+
 /// Queues a rebuild of an imported pack from its current steps. Its new output replaces the pack
 /// folder only once fully built and indexed, and every asset row and its metadata is kept.
 /// Refused while a run for the pack is queued or running.
