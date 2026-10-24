@@ -353,9 +353,13 @@ plan as written:
   - **The project's own code.** The editor opens the project as you, with its Python plugin on.
     So besides a root `Source/`, a project that ships compiled code is refused: any file below a
     `Binaries/` folder, or below a plugin's `Source/`. Before the editor starts, the work copy
-    loses every `Python/` folder directly below a `Content/` folder (an `init_unreal.py` runs
-    at startup) and the `StartupScripts` entries of its `.ini` files. What stays trusted is
-    the editor reading the project's assets.
+    loses the startup hooks the editor would run with Python on: every `Python/` folder
+    directly below a `Content/` folder (an `init_unreal.py` runs at startup), and in every
+    `.ini` file the Python plugin's settings sections (`StartupScripts`, `AdditionalPaths`)
+    and the editor utility subsystem's (`StartupObjects`), with any stray `StartupScripts`
+    entry. This disarms the known hooks; it is no sandbox. The editor still loads the
+    project's assets and its startup map, whose Blueprints run as in any editor that opens the
+    project, so a project you don't trust shouldn't be imported.
   - **The fixtures.** `unreal.zip` holds `Feif/Feif.uproject` (named unlike the zip) with three
     meshes, a texture, a level and docs, so the batches and the hoist can be tested;
     `unreal-source.zip` adds `Source/`.

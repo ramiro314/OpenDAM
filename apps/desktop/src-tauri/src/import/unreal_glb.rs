@@ -804,10 +804,20 @@ async fn failed_in(out: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// Removes from the work copy `copy` what the Python plugin, which the export turns on, would
-/// run of the project's own as the editor starts: every `Python/` folder directly below a
-/// `Content/` folder (its `init_unreal.py`, the project's or a plugin's), and the
-/// `StartupScripts` entries of its `.ini` files.
+/// The `.ini` sections through which a project names code for the editor to run as it starts,
+/// with the Python plugin on: the plugin's settings (`StartupScripts`, and `AdditionalPaths`,
+/// whose folders' `init_unreal.py` would run and could shadow the modules the export imports),
+/// and the editor utility subsystem's `StartupObjects`, a Blueprint that can run Python.
+const STARTUP_SECTIONS: [&str; 3] = [
+    "/Script/PythonScriptPlugin.PythonScriptPluginSettings",
+    "/Script/PythonScriptPlugin.PythonScriptPluginUserSettings",
+    "/Script/Blutility.EditorUtilitySubsystem",
+];
+
+/// Removes from the work copy `copy` the startup hooks the editor would run of the project's
+/// own once the export turns its Python plugin on: every `Python/` folder directly below a
+/// `Content/` folder (its `init_unreal.py`, the project's or a plugin's), and in every `.ini`
+/// file, the `STARTUP_SECTIONS` and any `StartupScripts` entry.
 fn disarm_python(copy: &Path) -> Result<(), String> {
     let failed = |e: String| format!("Could not prepare the work copy: {e}");
     let mut python = Vec::new();
@@ -828,18 +838,36 @@ fn disarm_python(copy: &Path) -> Result<(), String> {
     }
     for ini in inis.into_iter().filter(|ini| ini.exists()) {
         let text = std::fs::read_to_string(&ini).map_err(|e| failed(e.to_string()))?;
-        let startup = |line: &str| {
-            let key = line.trim_start().trim_start_matches(['+', '-', '!', '.']);
-            key.split('=')
-                .next()
-                .is_some_and(|k| k.trim().eq_ignore_ascii_case("StartupScripts"))
-        };
-        if text.lines().any(startup) {
-            let kept: Vec<&str> = text.lines().filter(|l| !startup(l)).collect();
-            std::fs::write(&ini, kept.join("\n") + "\n").map_err(|e| failed(e.to_string()))?;
+        let kept = without_startup_hooks(&text);
+        if kept != text {
+            std::fs::write(&ini, kept).map_err(|e| failed(e.to_string()))?;
         }
     }
     Ok(())
+}
+
+/// The `.ini` text `text` without its `STARTUP_SECTIONS` (header and entries) and without any
+/// `StartupScripts` entry elsewhere, every other line kept as it is.
+fn without_startup_hooks(text: &str) -> String {
+    let mut dropping = false;
+    let mut kept = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if let Some(section) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            dropping = STARTUP_SECTIONS
+                .iter()
+                .any(|hook| section.trim().eq_ignore_ascii_case(hook));
+        }
+        let key = trimmed.trim_start_matches(['+', '-', '!', '.']);
+        let startup = key
+            .split('=')
+            .next()
+            .is_some_and(|k| k.trim().eq_ignore_ascii_case("StartupScripts"));
+        if !dropping && !startup {
+            kept.push_str(line);
+        }
+    }
+    kept
 }
 
 /// Enables `PLUGINS` in the `.uproject` at `path`, a work copy: an entry it lists is turned on,
@@ -1096,9 +1124,22 @@ pub(crate) mod tests {
         );
         write(
             "Config/DefaultEngine.ini",
-            "[/Script/PythonScriptPlugin.PythonScriptPluginSettings]\n\
-             +StartupScripts=/tmp/evil.py\nStartupScripts = other.py\n\
-             bDeveloperMode=False\n",
+            "[/Script/Engine.RendererSettings]\nr.Nanite=False\n\n\
+             [/Script/PythonScriptPlugin.PythonScriptPluginSettings]\n\
+             +StartupScripts=/tmp/evil.py\n+AdditionalPaths=(Path=\"/tmp/anywhere\")\n\
+             bDeveloperMode=False\n\n\
+             [ /script/pythonscriptplugin.pythonscriptpluginsettings ]\n\
+             +AdditionalPaths=(Path=\"x\")\n\
+             [CoreRedirects]\n+ClassRedirects=(OldName=\"A\",NewName=\"B\")\n\
+             StartupScripts=stray.py\n",
+        );
+        write(
+            "Config/DefaultEditorPerProjectUserSettings.ini",
+            "[/Script/Blutility.EditorUtilitySubsystem]\n+StartupObjects=/Game/EUW_Run.EUW_Run\n",
+        );
+        write(
+            "Plugins/Water/Config/DefaultWater.ini",
+            "[/Script/PythonScriptPlugin.PythonScriptPluginUserSettings]\nbDeveloperMode=True\n",
         );
         write(
             "Config/DefaultGame.ini",
@@ -1109,10 +1150,15 @@ pub(crate) mod tests {
         assert!(!copy.join("Plugins/Water/Content/Python").exists());
         assert!(copy.join("Content/Meshes/SM_A.uasset").exists());
         assert!(copy.join("Content/Meshes/Python/SM_Snake.uasset").exists());
+        let read = |rel: &str| std::fs::read_to_string(copy.join(rel)).unwrap();
+        // The startup sections go whole, however spelled; every other section stays.
         assert_eq!(
-            std::fs::read_to_string(copy.join("Config/DefaultEngine.ini")).unwrap(),
-            "[/Script/PythonScriptPlugin.PythonScriptPluginSettings]\nbDeveloperMode=False\n"
+            read("Config/DefaultEngine.ini"),
+            "[/Script/Engine.RendererSettings]\nr.Nanite=False\n\n\
+             [CoreRedirects]\n+ClassRedirects=(OldName=\"A\",NewName=\"B\")\n"
         );
+        assert_eq!(read("Config/DefaultEditorPerProjectUserSettings.ini"), "");
+        assert_eq!(read("Plugins/Water/Config/DefaultWater.ini"), "");
         assert_eq!(
             std::fs::read_to_string(copy.join("Config/DefaultGame.ini")).unwrap(),
             "[/Script/EngineSettings.GeneralProjectSettings]\n"
