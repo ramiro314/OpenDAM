@@ -370,12 +370,27 @@ pub struct Export<'a> {
 /// Deletes a work folder when the step ends, however it ends.
 struct WorkFolder(PathBuf);
 
+impl WorkFolder {
+    /// Deletes the folder off the async runtime, as an unzipped project can be gigabytes. The
+    /// `Drop` below is the fallback for a step that panicked.
+    async fn remove(mut self) {
+        let path = std::mem::take(&mut self.0);
+        let _ = tokio::task::spawn_blocking(move || remove_work_folder(&path)).await;
+    }
+}
+
 impl Drop for WorkFolder {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_dir_all(&self.0) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!("Could not delete the work folder {}: {e}", self.0.display());
-            }
+        if !self.0.as_os_str().is_empty() {
+            remove_work_folder(&self.0);
+        }
+    }
+}
+
+fn remove_work_folder(path: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("Could not delete the work folder {}: {e}", path.display());
         }
     }
 }
@@ -492,13 +507,14 @@ impl Export<'_> {
 
     /// Exports the project in editor sessions over a work copy, until a session reports nothing
     /// left, starting from the GLBs `record` and the cache already hold. Each session's new
-    /// GLBs go into the cache, and the record is rewritten, as soon as it ends.
+    /// GLBs go into the cache, and the record is rewritten, as soon as it ends. The work folder
+    /// is deleted however the export ends.
     async fn export(
         &self,
         editor: &Editor,
         project: &Project,
         listing: &Extraction,
-        mut record: Record,
+        record: Record,
         record_file: &Path,
     ) -> Result<Record, Stop> {
         let work = WorkFolder(
@@ -507,8 +523,25 @@ impl Export<'_> {
                 .join("work")
                 .join(uuid::Uuid::new_v4().to_string()),
         );
-        let copy = work.0.join("project");
-        let out = work.0.join("out");
+        let exported = self
+            .export_in(&work.0, editor, project, listing, record, record_file)
+            .await;
+        work.remove().await;
+        exported
+    }
+
+    /// `export`, in the work folder `work`.
+    async fn export_in(
+        &self,
+        work: &Path,
+        editor: &Editor,
+        project: &Project,
+        listing: &Extraction,
+        mut record: Record,
+        record_file: &Path,
+    ) -> Result<Record, Stop> {
+        let copy = work.join("project");
+        let out = work.join("out");
         let needed: u64 = listing.files.iter().map(|f| f.size).sum();
         (self.progress)(Progress {
             step: "unzipping the Unreal project",
@@ -554,7 +587,7 @@ impl Export<'_> {
             Ok(())
         })
         .await?;
-        let script = work.0.join("unreal_glb.py");
+        let script = work.join("unreal_glb.py");
         tokio::fs::write(&script, SCRIPT)
             .await
             .map_err(|e| format!("Could not write the export script: {e}"))?;
@@ -568,9 +601,7 @@ impl Export<'_> {
             // However the session ends (killed by the cap, cancelled, done), the GLBs it
             // finished are whole: the script renames each into place once written. They go
             // into the cache before the step stops, so the next run resumes after them.
-            let ended = self
-                .session(editor, &uproject, &script, &out, &work.0)
-                .await;
+            let ended = self.session(editor, &uproject, &script, &out, work).await;
             let after = exported_in(&out).await?;
             for game in after.difference(&before) {
                 super::unity_glb::publish(

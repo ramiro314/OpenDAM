@@ -202,7 +202,12 @@ impl Capped {
                 _ = tick.tick() => {
                     if cancelled() {
                         let _ = child.start_kill();
+                        let killed = child.wait().await;
                         self.stop_leftovers(pid).await;
+                        // A scope killed by a signal stays failed until it is reset.
+                        if let Ok(status) = killed {
+                            self.finish(status).await;
+                        }
                         return Ok(None);
                     }
                 }
@@ -562,10 +567,20 @@ mod tests {
         let systemd = stub_systemd(dir.path());
         let mut capped = capped_command_with(&systemd, "true", [] as [&str; 0], "1G").await;
         capped.watch(|_| {}, || false).await.unwrap();
-        let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+        let calls = || std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
         assert!(
-            calls.contains("ctl --user kill --signal=SIGKILL opendam-capped-"),
-            "{calls}"
+            calls().contains("ctl --user kill --signal=SIGKILL opendam-capped-"),
+            "{}",
+            calls()
+        );
+        // A clean exit leaves no failed scope to reset; a cancelled run's killed scope is reset.
+        assert!(!calls().contains("reset-failed"), "{}", calls());
+        let mut capped = capped_command_with(&systemd, "sleep", ["30"], "1G").await;
+        assert!(capped.watch(|_| {}, || true).await.unwrap().is_none());
+        assert!(
+            calls().contains("ctl --user reset-failed opendam-capped-"),
+            "{}",
+            calls()
         );
     }
 
