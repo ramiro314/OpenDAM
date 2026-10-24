@@ -326,7 +326,8 @@ fn delete_files(live: &Path, paths: &[PathBuf]) -> Result<(), String> {
 }
 
 /// Deletes the folders between the files `paths` and the pack folder `live`, `live` included,
-/// that are empty now, deepest first. A folder holding anything else stays.
+/// that are empty now, deepest first. A folder holding anything else stays, and so does one a
+/// link on the way reaches (or that is a link), which may lie outside the pack.
 fn remove_empty_folders(live: &Path, paths: &[PathBuf]) {
     let mut folders: BTreeSet<(usize, PathBuf)> = BTreeSet::new();
     for path in paths {
@@ -338,6 +339,9 @@ fn remove_empty_folders(live: &Path, paths: &[PathBuf]) {
         }
     }
     for (_, dir) in folders.into_iter().rev() {
+        if !plainly_inside(live, &dir) {
+            continue;
+        }
         // Fails, as it should, while anything is in it, or once it's gone
         let _ = std::fs::remove_dir(&dir);
     }
@@ -395,6 +399,30 @@ mod tests {
         assert!(outside.join("a.png").exists());
         assert!(live.join("link.png").symlink_metadata().is_ok());
         assert!(!live.join("own.png").exists());
+    }
+
+    #[test]
+    fn an_empty_folder_reached_through_a_link_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (live, outside) = (dir.path().join("Pack"), dir.path().join("Outside"));
+        std::fs::create_dir_all(live.join("Own/sub")).unwrap();
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        // A folder of the pack replaced by a link to an empty folder elsewhere
+        std::os::unix::fs::symlink(&outside, live.join("Linked")).unwrap();
+        let paths = [live.join("Linked/sub/a.png"), live.join("Own/sub/b.png")];
+        remove_empty_folders(&live, &paths);
+        assert!(
+            outside.join("sub").is_dir(),
+            "nothing outside the pack goes"
+        );
+        assert!(
+            live.join("Linked").symlink_metadata().is_ok(),
+            "nor the link"
+        );
+        assert!(
+            !live.join("Own").exists(),
+            "the pack's own empty folders go"
+        );
     }
 
     #[test]
