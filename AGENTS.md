@@ -87,8 +87,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               Fab, Kenney, none) and the Kenney store page lookup, build, a pack's build, first or later (stage beside the target,
                               lock, re-check, journal, swap, carry, index with Prune::Defer,
                               commit current_build, settle, or roll back), with test hooks to
-                              pause or fail it, carry, which moves rows to their files' new paths
-                              and back, and engine, the durable run queue (one run at a time,
+                              pause, fail or crash it, carry, which moves rows to their files' new
+                              paths and back, recovery, which finishes or undoes a swap a crash or
+                              a dropped task left (recover_swaps), and engine, the durable run
+                              queue (one run at a time,
                               owner and heartbeat, import:progress and import:updated, Cancel
                               before the lock), behind commands/import.rs, and unity_glb, the
                               convert phase: one textured X.glb per model stem (FBX over OBJ,
@@ -143,8 +145,7 @@ docs/plans                    Plans for this fork
   it a run finishes. Step edits (`records::set_steps`, which bumps `recipe_rev`) and Rebuild are
   refused while a run for the pack is queued or running. A staged file the previous build had,
   by file key, size and sha256, gets that build's mtime, so the index sees it unchanged, moved or
-  not, and queues no preview. Swap recovery at library open and in-app edits recording steps
-  come with the plan's later tickets: until then a pack left `swapping` by a crash stays so.
+  not, and queues no preview. In-app edits recording steps come with the plan's later tickets.
 - **Rows follow their files.** A rebuild carries each moved file's asset row to the file's new
   path (`import::carry`), matched by its file key (`source_path` and whether it is generated),
   keeping its id, metadata and `modified_at`. It runs in two passes, so the order of the moves
@@ -167,6 +168,25 @@ docs/plans                    Plans for this fork
   structure pass). Then `swap_state` and the failed build's records (`import_outputs` and
   `import_moves`) go in one transaction, and only then is `.failed-*` deleted. A rollback step
   that fails leaves the journal set, for recovery.
+- **No pruning index reaches a pack mid-swap.** A build holds both the library's `index_lock` and
+  its advisory lock from its lock step to the end of its settle or rollback, and sets and clears
+  `swap_state` only inside that window, so a caller holding both locks that finds a pack
+  `swapping` knows its build is gone, on any machine. `import::recover_swaps` then puts the pack
+  back by what is on disk (the plan's first table): it deletes an uncommitted staging folder,
+  renames `.prev-<build id>` back, or finishes the rollback, and never rolls a build forward. It
+  runs, holding both locks, when a library opens (`db::open_library_db`, before the library is
+  registered and before its structure pass) and at the start of `watcher::index_paths` and
+  `structure::rebuild_library`, and a caller that can't take both skips it. Only a library open
+  also clears the leftovers of packs whose `swap_state` is `NULL` (a staging folder and its rows,
+  a `.failed-*` folder, and a `.prev-*` one, which it settles), skipping every pack with a live
+  run, judged by its owner and heartbeat (`engine::owner_gone`), not by its status alone, so no
+  refresh or startup deletes a live build's staging folder. Recovery indexes only a pack folder
+  that exists, never prunes after a rollback with no previous folder (`swap_prev` false), and
+  changes nothing on disk for a state no step leaves: it marks the pack `failed` and leaves
+  `swap_state` set, which refuses its runs and step edits. A pack recovery leaves journaled, that
+  way or because a step of it failed, is spared by the `index_paths` run that follows
+  (`Prune::Sparing`, see "Locked variants"), and the next recovery tries again. A `removing`
+  pack is left as found until Remove import is built.
 - **Pack targets never nest.** No pack's target is an ancestor or a descendant of another's, on
   whole path components (`Pub/Pack` holds `Pub/Pack/Sub` but not `Pub/Package`), so every build,
   swap and Remove touches only its own pack's files. The scan, the import
@@ -242,13 +262,16 @@ docs/plans                    Plans for this fork
 - **Locked variants.** `watcher::index_paths_locked` and `structure::rebuild_library_locked` take
   the held `index_lock` guard and the held advisory `watcher::IndexLock` guard as proof and never
   lock again. Code that holds the locks calls these, never `index_paths` or `rebuild_library`
-  (`index_lock` isn't re-entrant). `index_paths` takes both locks and calls `index_paths_locked`
-  with `Prune::Now`. `rebuild_library` takes `index_lock`, then the advisory lock, waiting up to
+  (`index_lock` isn't re-entrant). `index_paths` takes both locks, runs swap recovery, and calls
+  `index_paths_locked` with `Prune::Now`, or with `Prune::Sparing` over the targets of packs still
+  journaled after it. `rebuild_library` takes `index_lock`, then the advisory lock, waiting up to
   5 s for it (`IndexLock::acquire_within`). Under both sit lock-free cores,
   `watcher::index_pool` and `structure::rebuild`, for a pool that isn't registered yet. An index
   run takes a `watcher::Prune`: `Now` deletes the rows of files it didn't find and ends with the
-  structure pass, and `Defer` deletes no row, runs no pass, and reports each row it inserts to an
-  `InsertJournal` inside the inserting transaction. Every run but a pack import build's is `Now`.
+  structure pass; `Sparing` does the same except that it walks, writes and prunes nothing at or
+  under its folders; and `Defer` deletes no row, runs no pass, and reports each row it inserts to
+  an `InsertJournal` inside the inserting transaction. A pack import build runs `Defer`,
+  `index_paths` runs `Now` or `Sparing`, and every other run is `Now`.
 - **The advisory lock keeps itself fresh.** `watcher::IndexLock` writes a token naming its holder
   (a keyed hash of the machine id, boot id and pid namespace, then pid, process start time and a
   nonce), re-reads it after 100 ms, and rewrites its timestamp every 30 s while held. A lock is

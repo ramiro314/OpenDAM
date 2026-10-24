@@ -24,6 +24,7 @@ use std::path::Path;
 
 use sqlx::{Pool, Sqlite, SqliteConnection};
 
+use super::build::{Hooks, Point};
 use crate::models::AssetKind;
 
 /// Rows per transaction, as `watcher.rs` writes them.
@@ -46,13 +47,15 @@ struct Move {
 
 /// Carries the rows of the files build `build_id` places at other paths than build `prev` did,
 /// journaling each move under pack `pack_id`'s build `build_id`, from `seq` 1. Run it before
-/// the build's index, whose journal of inserted rows continues after these.
+/// the build's index, whose journal of inserted rows continues after these. `hooks` lets a test
+/// stop it between its passes.
 pub async fn carry(
     pool: &Pool<Sqlite>,
     pack_id: &str,
     target: &str,
     prev: &str,
     build_id: &str,
+    hooks: &Hooks,
 ) -> sqlx::Result<()> {
     // Each moved file's row.
     let carried: Vec<(String, String, String)> = sqlx::query_as(
@@ -126,6 +129,7 @@ pub async fn carry(
         }
         tx.commit().await?;
     }
+    hooks.stop(Point::CarryAside).await;
     let placed: Vec<&Move> = moves.iter().filter(|m| m.placed).collect();
     for chunk in placed.chunks(BATCH) {
         let mut tx = pool.begin().await?;
