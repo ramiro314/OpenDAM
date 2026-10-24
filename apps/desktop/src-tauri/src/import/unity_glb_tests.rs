@@ -408,6 +408,87 @@ mod tests {
         assert_eq!(runs(&log), 2, "cached again");
     }
 
+    /// A 4 x 4 opaque PNG of one colour.
+    fn png(rgb: [u8; 3]) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    fn near(color: [u8; 3], want: [u8; 3]) -> bool {
+        color
+            .iter()
+            .zip(want)
+            .all(|(got, want)| got.abs_diff(want) <= 4)
+    }
+
+    /// A texture the importer finds by path, relative to the model, is found by its name in the
+    /// pack instead, so a hoist that moves only the model away from it reuses the cached GLB,
+    /// and that GLB is what a fresh conversion in the new layout makes.
+    #[tokio::test]
+    async fn an_importer_s_texture_is_found_by_name_whatever_the_layout() {
+        let s = setup().await;
+        let Some(log) = s.logged_blender().await else {
+            return;
+        };
+        let blue = [40, 120, 200];
+        let originals = tempfile::tempdir().unwrap();
+        // No .mat, prefab or name rule matches "Wood" or "Barrel": the importer's material stays.
+        let obj =
+            b"mtllib Barrel.mtl\no Barrel\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\n\
+                    usemtl Wood\nf 1/1 2/2 3/3\n";
+        let mtl = b"newmtl Wood\nKd 1 1 1\nmap_Kd ../Textures/wood_planks.png\n";
+        let missing = b"newmtl Gone\nKd 1 1 1\nmap_Kd ../Textures/not_in_the_pack.png\n";
+        let obj_gone =
+            b"mtllib Stump.mtl\no Stump\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\n\
+                         usemtl Gone\nf 1/1 2/2 3/3\n";
+        let zip = zip_of(
+            originals.path(),
+            "barrel.zip",
+            &[
+                ("Models/Barrel.obj", obj),
+                ("Models/Barrel.mtl", mtl),
+                ("Models/Stump.obj", obj_gone),
+                ("Models/Stump.mtl", missing),
+                ("Textures/wood_planks.png", &png(blue)),
+            ],
+        );
+        let pack_id = s.import_zip_converted(&zip).await;
+        assert_eq!(runs(&log), 1);
+        let colors = base_colors(&s.live().join("Models/Barrel.glb"));
+        assert!(colors.len() == 1 && near(colors[0], blue), "{colors:?}");
+        // A texture no file of the pack is named after is dropped, whatever the importer found.
+        assert_eq!(
+            base_colors(&s.live().join("Models/Stump.glb")),
+            Vec::<[u8; 3]>::new()
+        );
+        let cached = sha(&s.live().join("Models/Barrel.glb"));
+
+        // Hoisting Models takes Barrel.obj out of reach of `../Textures/`: still the same GLB.
+        s.edit(&pack_id, |steps| insert(steps, hoist("Models")))
+            .await;
+        s.rebuilt(&pack_id).await;
+        assert_eq!(runs(&log), 1, "a hoist reuses the cache");
+        assert_eq!(sha(&s.live().join("Barrel.glb")), cached);
+
+        // And converting afresh in that layout makes the same textured GLB.
+        s.edit(&pack_id, |steps| {
+            let convert = steps.iter_mut().find(|s| s.kind == "unity_glb").unwrap();
+            convert.options = json!({ "force": true });
+        })
+        .await;
+        s.rebuilt(&pack_id).await;
+        assert_eq!(runs(&log), 2);
+        let fresh = base_colors(&s.live().join("Barrel.glb"));
+        assert!(fresh.len() == 1 && near(fresh[0], blue), "{fresh:?}");
+        assert_eq!(
+            base_colors(&s.live().join("Stump.glb")),
+            Vec::<[u8; 3]>::new()
+        );
+        s.no_work_left();
+    }
+
     /// An ASCII FBX, which Blender can't import, converts through a binary copy `assimp` makes.
     /// Skips without `assimp` on `PATH`, as in CI.
     #[tokio::test]

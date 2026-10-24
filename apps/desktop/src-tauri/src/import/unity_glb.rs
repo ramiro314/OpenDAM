@@ -31,7 +31,7 @@ use crate::export::hashes::sha256_bytes;
 
 /// The script's version, which every GLB's cache key holds. The script declares it as
 /// `VERSION`, which a test keeps equal: bump both when the GLBs it writes change.
-pub const UNITY_GLB_VERSION: &str = "opendam-unity-glb/1";
+pub const UNITY_GLB_VERSION: &str = "opendam-unity-glb/2";
 
 /// The conversion script, embedded so the installed app needs no file beside it.
 const SCRIPT: &str = include_str!("unity_glb.py");
@@ -638,16 +638,18 @@ impl Conversion<'_> {
             let _ = stderr.read_to_end(&mut text).await;
             text
         });
-        let mut lines = tokio::io::BufReader::new(child.stdout.take().expect("piped")).lines();
+        // Read as bytes: a line that isn't UTF-8 must not stop the reading, or a full pipe
+        // would block Blender.
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().expect("piped")).split(b'\n');
         let mut printed = Vec::new();
         let mut converted = done;
         let mut tick = tokio::time::interval(Duration::from_millis(200));
         let mut reading = true;
         let status = loop {
             tokio::select! {
-                line = lines.next_line(), if reading => match line {
+                line = lines.next_segment(), if reading => match line {
                     Ok(Some(line)) => {
-                        if line.starts_with("[unity-glb] model ") {
+                        if line.starts_with(b"[unity-glb] model ") {
                             converted += 1;
                             (self.progress)(Progress {
                                 step: "converting",
@@ -655,7 +657,7 @@ impl Conversion<'_> {
                                 total: total as u64,
                             });
                         }
-                        printed.extend_from_slice(line.as_bytes());
+                        printed.extend_from_slice(&line);
                         printed.push(b'\n');
                     }
                     _ => reading = false,
@@ -670,8 +672,8 @@ impl Conversion<'_> {
             }
         }
         .map_err(|e| converting(format!("Blender's job failed: {e}")))?;
-        while let Ok(Some(line)) = lines.next_line().await {
-            printed.extend_from_slice(line.as_bytes());
+        while let Ok(Some(line)) = lines.next_segment().await {
+            printed.extend_from_slice(&line);
             printed.push(b'\n');
         }
         capped.finish(status).await;

@@ -40,6 +40,12 @@ and the order of their paths, which OpenDAM's cache key covers:
   the GUID index included, where the script kept whichever `.meta` `rglob` found last.
 - Its JPEG copies and `assimp` conversions go to the job's scratch folder, named by a counter,
   not to `~/.cache/unity-gltf` by Python's per-process `hash()`.
+- A texture the FBX or OBJ importer loaded for a material the script leaves as imported is found
+  again by its file name in the pack, as the script's own name fallback finds textures, and
+  dropped when no file of the pack has that name. The importers look for it by path, relative to
+  the model (an FBX's `RelativeFilename`, its folder's subtree, an `.mtl`'s `map_Kd`), so where it
+  sat relative to the model would decide the GLB, which a hoist changes. Textures embedded in the
+  FBX are kept as they are.
 """
 
 import json
@@ -54,7 +60,7 @@ import bpy
 
 # OpenDAM records it with each GLB and keys its cache by it: `import::unity_glb::UNITY_GLB_VERSION`,
 # which a test keeps equal. Bump both when the GLBs this writes change.
-VERSION = "opendam-unity-glb/1"
+VERSION = "opendam-unity-glb/2"
 
 MODEL_EXTENSIONS = {".fbx", ".obj"}
 # Property names are matched lowercased, without underscores: `_Base_Map` is `basemap`.
@@ -303,6 +309,23 @@ def binary_fbx(model: Path, assimp: str, scratch: Scratch) -> Path:
     return out
 
 
+def rebind_imported_textures(images: dict[str, Path], max_size: int, scratch: Scratch) -> None:
+    """Points every texture the importer loaded at the pack's file of that name, through
+    `image` like the script's own, or drops it when the pack has none. Embedded ones stay."""
+    for mat in bpy.data.materials:
+        if not mat.use_nodes:
+            continue
+        for node in mat.node_tree.nodes:
+            img = node.image if node.type == "TEX_IMAGE" else None
+            if img is None or img.packed_file is not None:
+                continue
+            raw = (img.filepath_raw or img.filepath or img.name).replace("\\", "/")
+            found = images.get(alnum(Path(raw.rsplit("/", 1)[-1]).stem))
+            keep_alpha = node.outputs["Alpha"].is_linked
+            non_color = img.colorspace_settings.name == "Non-Color"
+            node.image = image(found, max_size, non_color, scratch, keep_alpha) if found else None
+
+
 def clear_scene() -> None:
     for coll in (bpy.data.objects, bpy.data.meshes, bpy.data.materials, bpy.data.armatures,
                  bpy.data.actions, bpy.data.collections):
@@ -317,9 +340,12 @@ def convert(model: Path, target: Path, guids, by_mesh, by_name, images, max_size
             assimp: str, scratch: Scratch) -> str:
     clear_scene()
     if model.suffix.lower() == ".fbx":
-        bpy.ops.import_scene.fbx(filepath=str(binary_fbx(model, assimp, scratch)))
+        bpy.ops.import_scene.fbx(
+            filepath=str(binary_fbx(model, assimp, scratch)), use_image_search=False
+        )
     else:
         bpy.ops.wm.obj_import(filepath=str(model))
+    rebind_imported_textures(images, max_size, scratch)
     meta = Path(str(model) + ".meta")
     fbx_guid = None
     names: dict[str, str] = {}
