@@ -49,6 +49,8 @@ const CLAIM_RETRY: Duration = if cfg!(test) {
 };
 /// What an edit or a Rebuild answers while a run for the pack is queued or running.
 pub const BUSY: &str = "An import run is building this pack";
+/// What a step edit answers once the steps changed since they were read.
+pub const STALE: &str = "The pack's steps changed since they were read: read them again";
 /// How long a build waits for another machine's advisory lock.
 const LOCK_WAIT: Duration = Duration::from_secs(5 * 60);
 
@@ -635,23 +637,37 @@ impl Engine {
         .map_err(|e| e.to_string())
     }
 
-    /// Why the library would refuse `target` for a new pack, as `start_import` checks it: it
-    /// exists, or nests with another pack's target, naming that pack. `None` when it is free.
+    /// Why the library would refuse `target` for a new pack, as `start_import` checks it, or,
+    /// given `pack_id`, as that pack's new target, as `set_target` checks it: it exists, or nests
+    /// with another pack's target, naming that pack. `None` when it is free, or is the pack's own.
     pub async fn check_import_target(
         &self,
         library_id: &str,
         target: &str,
+        pack_id: Option<&str>,
     ) -> Result<Option<String>, String> {
         let library = self.library(library_id).await?;
         let root = library
             .root_path
             .canonicalize()
             .map_err(|e| format!("The library folder can't be read: {e}"))?;
-        let checked = match clean_target(target) {
-            Ok(target) => check_target(&library.pool, &root, &target).await,
-            Err(error) => Err(error),
+        let target = match clean_target(target) {
+            Ok(target) => target,
+            Err(error) => return Ok(Some(error)),
         };
-        Ok(checked.err())
+        if let Some(pack_id) = pack_id {
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT target FROM import_packs WHERE id = ?")
+                    .bind(pack_id)
+                    .fetch_optional(&library.pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            if current.as_deref() == Some(target.as_str()) {
+                return Ok(None);
+            }
+        }
+        let targets = pack_targets(&library.pool, pack_id).await?;
+        Ok(refuse_target(&root, &target, &targets).err())
     }
 
     /// Moves pack `pack_id`'s target to `target`, refusing one that exists in the library or
@@ -875,13 +891,15 @@ impl Engine {
     }
 
     /// Replaces pack `pack_id`'s steps (turning one off or on, changing its options) and bumps
-    /// its `recipe_rev`. Refused while a run for the pack is queued or running. Returns the new
-    /// `recipe_rev`. The pack changes on disk only at its next Rebuild.
+    /// its `recipe_rev`. Refused while a run for the pack is queued or running, and, given
+    /// `read_at`, once the steps moved on from that `recipe_rev`. Returns the new `recipe_rev`.
+    /// The pack changes on disk only at its next Rebuild.
     pub async fn set_pack_steps(
         &self,
         library_id: &str,
         pack_id: &str,
         steps: Vec<Step>,
+        read_at: Option<i64>,
     ) -> Result<i64, String> {
         let library = self.library(library_id).await?;
         let kind: Option<String> = sqlx::query_scalar(
@@ -893,7 +911,7 @@ impl Engine {
         .map_err(|e| e.to_string())?;
         let kind = kind.ok_or_else(|| refused(records::Refused::NoPack))?;
         build::check_steps(&kind, &steps)?;
-        records::set_steps(&library.pool, pack_id, &steps)
+        records::set_steps(&library.pool, pack_id, &steps, read_at)
             .await
             .map_err(|e| e.to_string())?
             .map_err(refused)
@@ -935,6 +953,7 @@ fn refused(refusal: records::Refused) -> String {
     match refusal {
         records::Refused::NoPack => "The pack isn't an imported pack of this library".into(),
         records::Refused::Busy => BUSY.into(),
+        records::Refused::Stale => STALE.into(),
     }
 }
 
@@ -2891,7 +2910,7 @@ mod tests {
         assert!(pack.built_at.is_some());
 
         // A target the dialog checks gets start_import's reason, naming the other pack.
-        let check = |target: &'static str| s.engine.check_import_target("lib", target);
+        let check = |target: &'static str| s.engine.check_import_target("lib", target, None);
         for target in ["Pub/Pack/Sub", "Pub"] {
             assert_eq!(
                 check(target).await.unwrap().as_deref(),
@@ -2908,6 +2927,18 @@ mod tests {
             .unwrap()
             .contains("isn't a folder"));
         assert_eq!(check("Pub/Package").await.unwrap(), None);
+
+        // Checked as the pack's own new target, its target is free and nests with nothing.
+        let check_for = |target: &'static str| {
+            s.engine
+                .check_import_target("lib", target, Some(pack.id.as_str()))
+        };
+        assert_eq!(check_for("Pub/Pack").await.unwrap(), None);
+        assert_eq!(check_for("Pub/Pack/Sub").await.unwrap(), None);
+        assert_eq!(
+            check_for("Pub").await.unwrap().as_deref(),
+            Some("Pub already exists in the library")
+        );
     }
 
     #[tokio::test]

@@ -963,6 +963,15 @@ export interface ImportStepRecord {
   options: Record<string, unknown>;
 }
 
+/** An imported pack's steps in order, as `get_import_steps` reads them */
+export interface ImportPackSteps {
+  /** Bumped by every step edit; `set_import_steps` given it refuses steps that moved on */
+  recipeRev: number;
+  steps: ImportStepRecord[];
+  /** Why a step kind can't run here, by kind: `unity_glb` without an accepted Blender */
+  unavailable: Record<string, string>;
+}
+
 /** A place step as `start_import` and `preview_import` take it */
 export type PlaceStep =
   | { kind: 'flatten' }

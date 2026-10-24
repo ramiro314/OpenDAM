@@ -82,7 +82,8 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               reads no file body and writes nothing,
                               records, the import tables (imports, import_packs, import_steps,
                               import_outputs, import_moves, import_runs) and the step edits and
-                              rebuilds they refuse while a run for the pack is queued or running,
+                              rebuilds they refuse while a run for the pack is queued or running
+                              (and a step edit read at an older `recipe_rev`),
                               edits, which records an in-app rename or delete in a pack as
                               its steps and moves its `.meta` with it,
                               metadata, the metadata step's `datapackage.json` by preset (Unity,
@@ -158,7 +159,9 @@ docs/plans                    Plans for this fork
   flipping `import_packs.current_build` in one transaction. A failure before the commit rolls the
   swap back in-run, and `current_build` stays as it was. Cancel works only before the lock; after
   it a run finishes. Step edits (`records::set_steps`, which bumps `recipe_rev`) and Rebuild are
-  refused while a run for the pack is queued or running. A staged file the previous build had,
+  refused while a run for the pack is queued or running. A step edit given the `recipe_rev` its
+  steps were read at (the Preparation editor's) is also refused once `recipe_rev` moved on, so
+  an in-app rename's or delete's step is never overwritten (`Refused::Stale`). A staged file the previous build had,
   by file key, size and sha256, gets that build's mtime, so the index sees it unchanged, moved or
   not, and queues no preview.
 - **In-app edits inside a pack become steps.** `rename_asset`, `delete_asset` and `delete_assets`
@@ -216,7 +219,9 @@ docs/plans                    Plans for this fork
   (`import::engine::start_import`) and a target edit (`set_target`) refuse such a target naming
   the other pack, and one that already exists in the library, and the insert or update itself
   checks the nesting again in the same statement (`records::create_import`,
-  `records::set_target`). A built pack's target doesn't move yet.
+  `records::set_target`). `check_import_target` answers the same check ahead of time: for a new
+  pack, or, given a pack id, for that pack's new target, against every other pack's (the
+  pack's own target is free). A built pack's target doesn't move yet.
 - **`DELETE` journaling on library DBs.** Library DBs use rollback journaling because WAL's `-shm`
   locking is unreliable on network shares. Keep `SqliteJournalMode::Delete` in `db.rs`.
 - **Batched writes.** Database writes go in transactions of about 200 rows, as `watcher.rs` does.

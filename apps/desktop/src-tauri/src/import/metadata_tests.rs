@@ -304,7 +304,7 @@ mod tests {
             .unwrap();
         steps[at].options["title"] = "Car Kit".into();
         s.engine
-            .set_pack_steps("lib", &pack_id, steps.clone())
+            .set_pack_steps("lib", &pack_id, steps.clone(), None)
             .await
             .unwrap();
         s.rebuild_done(&pack_id).await;
@@ -331,7 +331,7 @@ mod tests {
         // Back to the header's title: the page found for the other title isn't reused.
         steps[at].options["title"] = serde_json::Value::Null;
         s.engine
-            .set_pack_steps("lib", &pack_id, steps)
+            .set_pack_steps("lib", &pack_id, steps, None)
             .await
             .unwrap();
         s.rebuild_done(&pack_id).await;
@@ -355,7 +355,7 @@ mod tests {
         steps[at].options["lookup"] = true.into();
         let refused = s
             .engine
-            .set_pack_steps("lib", &pack_id, steps.clone())
+            .set_pack_steps("lib", &pack_id, steps.clone(), None)
             .await;
         assert!(
             refused
@@ -366,7 +366,7 @@ mod tests {
         steps[at].options = serde_json::json!({"preset": "unity"});
         steps[at].enabled = false;
         s.engine
-            .set_pack_steps("lib", &pack_id, steps)
+            .set_pack_steps("lib", &pack_id, steps, None)
             .await
             .unwrap();
         s.rebuild_done(&pack_id).await;
@@ -431,7 +431,7 @@ mod tests {
             },
         );
         s.engine
-            .set_pack_steps("lib", &pack_id, steps)
+            .set_pack_steps("lib", &pack_id, steps, None)
             .await
             .unwrap();
         let run = s.engine.rebuild_pack("lib", &pack_id).await.unwrap();
