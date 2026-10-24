@@ -2447,6 +2447,14 @@ mod tests {
         import("d", 4, r#"{"preset":"fab","publisher":"Third"}"#).await;
         import("e", 4, r#"{"preset":"fab","publisher":"Fourth"}"#).await;
         assert_eq!(publisher().await.0, "Fourth");
+        // A Kenney import's publisher is the preset's, not one you chose.
+        import(
+            "f",
+            5,
+            r#"{"preset":"kenney","publisher":"Kenney","lookup_store_page":true}"#,
+        )
+        .await;
+        assert_eq!(publisher().await.0, "Fourth");
     }
 
     #[tokio::test]

@@ -33,7 +33,7 @@ use super::records::StepRecord;
 use super::unitypackage::{
     below, list_unitypackage, list_variant, ExtractedFile, Extraction, SkippedEntry,
 };
-use super::zipfile::list_zip;
+use super::zipfile::{index_zip, ZipIndex};
 
 /// What scanning an original found.
 #[derive(Debug, Clone, Serialize)]
@@ -329,12 +329,13 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
         }]);
     }
 
-    let zip = list_zip(original, None)?;
+    let index = index_zip(original)?;
+    let zip = index.list(None)?;
     let mut offers = Vec::new();
     if let Some(fab) = fab(original, &zip, &name, publisher) {
         offers.push(fab);
     }
-    if let Some(kenney) = kenney(original, &zip, &name) {
+    if let Some(kenney) = kenney(&index, &zip, &name) {
         offers.push(kenney);
     }
     let place = [PlaceStep::Flatten];
@@ -454,9 +455,10 @@ const UNTICKED: [&str; 2] = ["archive", "early access"];
 
 /// A zip whose folders hold `License*.txt` files: one pack per folder directly holding one, the
 /// outermost where they nest, at its path below a top folder every file shares (so
-/// `<Category>/<Pack>` in the Kenney All-in-1). `zip` is the whole zip `original`'s listing, and
-/// each pack's preview lists its folder as its build's `extract_zip` would.
-fn kenney(original: &Path, zip: &Extraction, name: &str) -> Option<Offer> {
+/// `<Category>/<Pack>` in the Kenney All-in-1). `zip` is the whole zip's listing from `index`,
+/// and each pack's preview lists its folder from `index` as its build's `extract_zip` would,
+/// without reading the zip again.
+fn kenney(index: &ZipIndex, zip: &Extraction, name: &str) -> Option<Offer> {
     let mut packs: Vec<&str> = zip
         .files
         .iter()
@@ -511,7 +513,7 @@ fn kenney(original: &Path, zip: &Extraction, name: &str) -> Option<Offer> {
                 .any(|c| UNTICKED.contains(&c.to_ascii_lowercase().as_str()));
             let subpath = (!folder.is_empty()).then_some(folder);
             let files = match subpath {
-                Some(folder) => list_zip(original, Some(folder)),
+                Some(folder) => index.list(Some(folder)),
                 None => Ok(Extraction {
                     files: zip.files.clone(),
                     skipped: zip.skipped.clone(),
@@ -549,7 +551,7 @@ mod tests {
     use crate::import::place::place;
     use crate::import::unitypackage::tests::{fixture, on_disk};
     use crate::import::unitypackage::{extract_unitypackage, extract_variant};
-    use crate::import::zipfile::extract_zip;
+    use crate::import::zipfile::{extract_zip, list_zip};
 
     fn flatten() -> Vec<PlaceStep> {
         vec![PlaceStep::Flatten]
@@ -919,8 +921,8 @@ mod tests {
                 .collect(),
             skipped: Vec::new(),
         };
-        // Only the targets are checked here: the previews list no real zip.
-        let none = Path::new("/no/such.zip");
+        // Only the targets are checked here: the previews list another zip's folders.
+        let index = index_zip(&fixture("escape.zip")).unwrap();
         let targets = |offer: Offer| -> Vec<(String, Option<String>, bool)> {
             offer
                 .candidates
@@ -939,7 +941,7 @@ mod tests {
             "Top/Other/a.png",
         ]);
         assert_eq!(
-            targets(kenney(none, &nested, "bundle").unwrap()),
+            targets(kenney(&index, &nested, "bundle").unwrap()),
             [
                 (
                     "Early Access/New".into(),
@@ -951,16 +953,16 @@ mod tests {
         );
         let single = zip(&["car-kit/License.txt", "car-kit/Models/car.glb"]);
         assert_eq!(
-            targets(kenney(none, &single, "kenney_car-kit").unwrap()),
+            targets(kenney(&index, &single, "kenney_car-kit").unwrap()),
             [("car-kit".into(), Some("car-kit".into()), true)]
         );
         let flat = zip(&["License.txt", "car.glb"]);
         assert_eq!(
-            targets(kenney(none, &flat, "kenney_car-kit").unwrap()),
+            targets(kenney(&index, &flat, "kenney_car-kit").unwrap()),
             [("kenney_car-kit".into(), None, true)]
         );
         assert!(kenney(
-            none,
+            &index,
             &zip(&["Pack/Readme.txt", "Pack/LicenseNotes.md"]),
             "x"
         )

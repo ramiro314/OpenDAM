@@ -229,12 +229,14 @@ pub async fn create_import(
     Ok(Ok(run_id))
 }
 
-/// The publisher of the library's latest import, or `""` before its first.
+/// The publisher of the library's latest import, or `""` before its first. A Kenney import's
+/// publisher is the preset's own, never one you chose, so it is passed over.
 pub async fn last_publisher(pool: &Pool<Sqlite>) -> sqlx::Result<String> {
     let publisher: Option<Option<String>> = sqlx::query_scalar(
         "SELECT json_extract(s.options, '$.publisher') FROM import_steps s
          JOIN import_packs p ON p.id = s.pack_id JOIN imports i ON i.id = p.import_id
          WHERE s.kind = 'metadata' AND json_extract(s.options, '$.publisher') IS NOT NULL
+         AND json_extract(s.options, '$.preset') IS NOT 'kenney'
          ORDER BY i.created_at DESC, i.rowid DESC LIMIT 1",
     )
     .fetch_optional(pool)
