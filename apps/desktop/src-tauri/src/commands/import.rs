@@ -2,8 +2,9 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::import::engine::ImportRequest;
-use crate::import::records::{PackSteps, RunSummary, Step};
-use crate::import::scan::Scan;
+use crate::import::place::PlaceStep;
+use crate::import::records::{ImportSummary, PackSteps, RunSummary, Step};
+use crate::import::scan::{Scan, Tree};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -19,6 +20,43 @@ pub async fn scan_import(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Scan> {
     state.imports.scan(&library_id, &original_path).await
+}
+
+/// The folder tree one source of an original would build with the place steps `place`, for the
+/// import dialog once a candidate's steps change. Nothing is written.
+#[tauri::command]
+pub async fn preview_import(
+    library_id: String,
+    original_path: String,
+    variant: Option<String>,
+    subpath: Option<String>,
+    place: Vec<PlaceStep>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Tree> {
+    state
+        .imports
+        .preview_import(
+            &library_id,
+            &original_path,
+            variant.as_deref(),
+            subpath.as_deref(),
+            place,
+        )
+        .await
+}
+
+/// Why the library would refuse `target` for a new pack (it exists, or nests with another pack's
+/// target, naming it), or `None` when it is free.
+#[tauri::command]
+pub async fn check_import_target(
+    library_id: String,
+    target: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<String>> {
+    state
+        .imports
+        .check_import_target(&library_id, &target)
+        .await
 }
 
 /// Moves a pack's target, refusing one that exists in the library or nests with another pack's
@@ -57,6 +95,15 @@ pub async fn cancel_import_run(
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
     state.imports.cancel_run(&library_id, &run_id).await
+}
+
+/// A library's imports, newest first, each with its original and its packs.
+#[tauri::command]
+pub async fn list_imports(
+    library_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<ImportSummary>> {
+    state.imports.list_imports(&library_id).await
 }
 
 /// A library's import runs, newest first.

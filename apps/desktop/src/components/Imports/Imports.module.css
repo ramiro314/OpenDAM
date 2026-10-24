@@ -1,0 +1,362 @@
+/* The modal chrome comes from SettingsDialog.module.css; these are the Imports view's specifics. */
+
+.dialog {
+  max-width: 820px;
+}
+
+.headerActions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.smallBtn {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.empty,
+.hint {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.path {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-muted);
+  word-break: break-all;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-base);
+}
+
+.cardHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  word-break: break-all;
+}
+
+.library {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
+.packs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.pack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 6px;
+  border-top: 1px solid var(--color-border);
+}
+
+.packLine {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.target {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  color: var(--color-text-primary);
+  word-break: break-all;
+}
+
+.status {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  background: var(--color-bg-elevated);
+  color: var(--color-text-secondary);
+  flex-shrink: 0;
+}
+
+.statusLive {
+  color: var(--color-brand-300);
+}
+
+.statusDone {
+  color: var(--color-success);
+}
+
+.statusFailed {
+  color: var(--color-danger);
+}
+
+.bar {
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: var(--color-bg-elevated);
+  overflow: hidden;
+}
+
+.barFill {
+  height: 100%;
+  background: var(--color-brand-500);
+  transition: width var(--transition-fast);
+}
+
+.barBusy {
+  width: 30%;
+  animation: busy 1.2s ease-in-out infinite;
+}
+
+@keyframes busy {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(340%);
+  }
+}
+
+.progressText {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.errorText {
+  font-size: 12px;
+  color: var(--color-danger);
+  word-break: break-word;
+}
+
+.warningText {
+  font-size: 12px;
+  color: var(--color-warning);
+  word-break: break-word;
+}
+
+.details summary {
+  font-size: 12px;
+  color: var(--color-warning);
+  cursor: pointer;
+}
+
+.details ul {
+  margin: 4px 0 0;
+  padding-left: var(--space-4);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+/* The Import pack dialog */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.fieldRow {
+  display: flex;
+  gap: var(--space-3);
+}
+
+.fieldRow > .field {
+  flex: 1;
+  min-width: 0;
+}
+
+.offers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.offer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.offerSelected {
+  border-color: var(--color-brand-500);
+  color: var(--color-text-primary);
+}
+
+.candidateHeader {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 13px;
+  color: var(--color-text-primary);
+}
+
+.candidateHeader input[type='checkbox'],
+.check input,
+.variant input,
+.offer input {
+  accent-color: var(--color-brand-500);
+}
+
+.candidateName {
+  flex: 1;
+  min-width: 0;
+  font-weight: 500;
+  word-break: break-all;
+}
+
+.preset {
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
+.expand {
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.expand:hover {
+  color: var(--color-text-primary);
+}
+
+.imported {
+  color: var(--color-success);
+  font-size: 12px;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sectionLabel {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+}
+
+.variant,
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.variant code,
+.step code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-primary);
+}
+
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding-left: var(--space-4);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.step {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.stepDisabled {
+  opacity: 0.6;
+}
+
+.inlineInput {
+  width: 140px;
+  padding: 2px 6px;
+  font-size: 12px;
+}
+
+.tree {
+  max-height: 220px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 6px var(--space-2);
+  list-style: none;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+.treeRow {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.treeCount {
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.footerNote {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--color-warning);
+}

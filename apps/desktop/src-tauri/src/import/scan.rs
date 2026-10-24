@@ -198,6 +198,25 @@ fn preview(listing: Result<Extraction>, place: &[PlaceStep], convert: bool) -> T
     }
 }
 
+/// The tree of one source of `original`, of kind `kind`, placed by `place`: what the import
+/// dialog shows once you change a candidate's place steps. The source is a `.unitypackage`'s
+/// `subpath`, or a zip's `variant` package (and its `subpath`), else the zip's `subpath`. A
+/// package's tree counts the GLBs `unity_glb` would write, as `detect`'s do.
+pub fn preview_source(
+    original: &Path,
+    kind: &str,
+    variant: Option<&str>,
+    subpath: Option<&str>,
+    place: &[PlaceStep],
+) -> Tree {
+    let listing = match (kind, variant) {
+        ("unitypackage", _) => list_unitypackage(original, subpath),
+        (_, Some(variant)) => list_variant(original, variant, subpath),
+        (_, None) => index_zip(original).and_then(|index| index.list(subpath)),
+    };
+    preview(listing, place, kind == "unitypackage" || variant.is_some())
+}
+
 /// The files of `extraction` below `folder`, relative to it, as a listing with that sub-folder
 /// would give them, and every skipped entry. A package listed with a sub-folder reports every
 /// skipped entry too, but a nested package's only when it lies in the sub-folder (plan Known

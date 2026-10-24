@@ -4,6 +4,7 @@ import { CollectionsSection } from './CollectionsSection';
 import { TagsSection } from './TagsSection';
 import { SmartFiltersSection } from './SmartFiltersSection';
 import { FiltersSection } from './FiltersSection';
+import { ImportsSection } from './ImportsSection';
 import styles from './Sidebar.module.css';
 
 export function Sidebar() {
@@ -14,6 +15,7 @@ export function Sidebar() {
   return (
     <aside className={styles.sidebar} id="sidebar">
       <LibrariesSection clearSmartFilter={clearSmartFilter} />
+      <ImportsSection />
       <CollectionsSection clearSmartFilter={clearSmartFilter} />
       <TagsSection clearSmartFilter={clearSmartFilter} />
       <SmartFiltersSection activeId={activeSmartFilterId} setActiveId={setActiveSmartFilterId} />

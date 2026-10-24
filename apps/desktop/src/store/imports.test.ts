@@ -1,0 +1,563 @@
+import { afterEach, describe, expect, test } from 'bun:test';
+import { api } from '../api';
+import type {
+  ImportCandidate,
+  ImportProgress,
+  ImportRequest,
+  ImportRun,
+  ImportScan,
+  ImportSummary,
+  ImportTree,
+} from '../types';
+import {
+  FINISHING,
+  cancelState,
+  candidateProblem,
+  draftFromScan,
+  draftProblem,
+  editPublisher,
+  editTarget,
+  importRequest,
+  importRows,
+  mergeRun,
+  packStatus,
+  patchCandidate,
+  pickVariant,
+  progressText,
+  skippedText,
+  treeCurrent,
+  useImportStore,
+} from './imports';
+
+const real = { ...api };
+const initial = useImportStore.getState();
+
+afterEach(() => {
+  Object.assign(api, real);
+  useImportStore.setState(initial, true);
+});
+
+const tree = (files: number, error: string | null = null): ImportTree => ({
+  folders: [{ path: '', files, total: files }],
+  files,
+  glbs: 0,
+  skipped: [],
+  error,
+});
+
+function run(id: string, packIds: string[], patch: Partial<ImportRun> = {}): ImportRun {
+  return {
+    id,
+    libraryId: 'lib',
+    kind: 'import',
+    packs: packIds.map((packId) => ({ packId, recipeRev: 0 })),
+    status: 'running',
+    phase: null,
+    progressDone: 0,
+    progressTotal: 0,
+    error: null,
+    warnings: [],
+    createdAt: 0,
+    startedAt: null,
+    finishedAt: null,
+    ...patch,
+  };
+}
+
+function progress(runId: string, step: string, done = 0, total = 0): ImportProgress {
+  return { runId, libraryId: 'lib', packId: 'p', step, done, total };
+}
+
+const fabSteps = (variant: string | null) => [
+  { kind: 'extract_unitypackage', options: variant ? { variant } : {} },
+  { kind: 'flatten', options: {} },
+  { kind: 'hoist', options: { folder: 'Art' } },
+  { kind: 'unity_glb', options: { max_texture: 1024 } },
+  { kind: 'metadata', options: { preset: 'fab', publisher: 'Studio' } },
+];
+
+const fab: ImportCandidate = {
+  name: 'Forest',
+  ticked: true,
+  preset: 'fab',
+  publisher: 'Studio',
+  target: 'Studio/Forest',
+  targetError: null,
+  variants: [
+    {
+      variant: 'Forest_BiRP.unitypackage',
+      subpath: null,
+      pipeline: 'built-in',
+      ticked: false,
+      tree: tree(3),
+    },
+    {
+      variant: 'Forest_URP.unitypackage',
+      subpath: null,
+      pipeline: 'urp',
+      ticked: true,
+      tree: tree(4),
+    },
+  ],
+  steps: fabSteps('Forest_URP.unitypackage'),
+  tree: tree(4),
+};
+
+const kenney = (name: string, category: string, ticked = true): ImportCandidate => ({
+  name,
+  ticked,
+  preset: 'kenney',
+  publisher: 'Kenney',
+  target: `${category}/${name}`,
+  targetError: null,
+  variants: [],
+  steps: [
+    { kind: 'extract_zip', options: { subpath: `Kenney/${category}/${name}` } },
+    {
+      kind: 'metadata',
+      options: { preset: 'kenney', publisher: 'Kenney', lookup_store_page: true },
+    },
+  ],
+  tree: tree(2),
+});
+
+const zipCandidate: ImportCandidate = {
+  name: 'bundle',
+  ticked: true,
+  preset: 'none',
+  publisher: 'Studio',
+  target: 'bundle',
+  targetError: null,
+  variants: [],
+  steps: [
+    { kind: 'extract_zip', options: {} },
+    { kind: 'flatten', options: {} },
+    { kind: 'metadata', options: { preset: 'none', publisher: 'Studio' } },
+  ],
+  tree: tree(9),
+};
+
+const fabScan: ImportScan = {
+  originalPath: '/dl/Forest.zip',
+  kind: 'zip',
+  offers: [
+    { layout: 'fab', candidates: [fab] },
+    { layout: 'zip', candidates: [zipCandidate] },
+  ],
+};
+
+const kenneyScan: ImportScan = {
+  originalPath: '/dl/Kenney.zip',
+  kind: 'zip',
+  offers: [
+    {
+      layout: 'kenney',
+      candidates: [kenney('Car Kit', '3D assets'), kenney('Old Kit', 'Archive', false)],
+    },
+  ],
+};
+
+describe('importRows', () => {
+  const imports: ImportSummary[] = [
+    {
+      id: 'i1',
+      libraryId: 'lib',
+      originalPath: '/dl/Kenney.zip',
+      kind: 'zip',
+      createdAt: 1,
+      packs: [
+        { id: 'p2', target: '3D assets/Car Kit', preset: 'kenney', status: 'built', builtAt: 5 },
+      ],
+    },
+    {
+      id: 'i2',
+      libraryId: 'lib',
+      originalPath: '/dl/Kenney.zip',
+      kind: 'zip',
+      createdAt: 2,
+      packs: [
+        {
+          id: 'p1',
+          target: '2D assets/Tiles',
+          preset: 'kenney',
+          status: 'never_built',
+          builtAt: null,
+        },
+      ],
+    },
+    {
+      id: 'i3',
+      libraryId: 'lib',
+      originalPath: '/cache/Rocks.unitypackage',
+      kind: 'unitypackage',
+      createdAt: 3,
+      packs: [{ id: 'p3', target: 'Pub/Rocks', preset: 'unity', status: 'failed', builtAt: null }],
+    },
+  ];
+
+  test("gathers one original's imports in one row, each pack with its latest run", () => {
+    const runs = [
+      run('r3', ['p1'], { createdAt: 3 }),
+      run('r2', ['p2'], { createdAt: 2, status: 'done' }),
+      run('r1', ['p2'], { createdAt: 1, status: 'failed', error: 'old' }),
+    ];
+    const rows = importRows(imports, runs, { r3: progress('r3', 'hashing', 2, 5) });
+    expect(rows.map((r) => [r.name, r.originalPath])).toEqual([
+      ['Rocks.unitypackage', '/cache/Rocks.unitypackage'],
+      ['Kenney.zip', '/dl/Kenney.zip'],
+    ]);
+    const kenneyRow = rows[1];
+    expect(kenneyRow.packs.map((p) => [p.pack.target, p.run?.id, p.progress?.step])).toEqual([
+      ['2D assets/Tiles', 'r3', 'hashing'],
+      ['3D assets/Car Kit', 'r2', undefined],
+    ]);
+    expect(rows[0].packs[0].run).toBeNull();
+    expect(kenneyRow.packs.map(packStatus)).toEqual(['Running', 'Built']);
+    expect(packStatus(rows[0].packs[0])).toBe('Failed');
+  });
+
+  test('keeps the same original apart in two libraries', () => {
+    const other = { ...imports[2], id: 'i4', libraryId: 'other' };
+    expect(importRows([imports[2], other], [], {}).map((r) => r.libraryId)).toEqual([
+      'lib',
+      'other',
+    ]);
+  });
+});
+
+describe('mergeRun', () => {
+  test('keeps every held run, and an ended one over a stale listing of it live', () => {
+    const held = [run('a', [], { status: 'done', createdAt: 2 }), run('b', [], { createdAt: 1 })];
+    expect(mergeRun(held, run('a', [], { status: 'running', createdAt: 2 }))).toBe(held);
+    const merged = mergeRun(held, run('b', [], { status: 'failed', createdAt: 1 }));
+    expect(merged.map((r) => [r.id, r.status])).toEqual([
+      ['a', 'done'],
+      ['b', 'failed'],
+    ]);
+    expect(mergeRun(held, run('c', [], { createdAt: 3 })).map((r) => r.id)).toEqual([
+      'c',
+      'a',
+      'b',
+    ]);
+  });
+});
+
+describe('progress and warnings', () => {
+  test('a live run shows its step with counts, a queued one that it waits', () => {
+    expect(progressText(run('r', []), progress('r', 'hashing', 3, 1200))).toBe('Hashing 3 / 1,200');
+    expect(progressText(run('r', []), progress('r', 'swapping'))).toBe('Swapping');
+    expect(progressText(run('r', [], { status: 'queued' }), null)).toBe(
+      'Waiting for the run before it'
+    );
+  });
+
+  test('a skipped entry is named by its path in the original', () => {
+    expect(
+      skippedText({ sourcePath: ['Inner.unitypackage', '../evil.txt'], reason: 'escapes' })
+    ).toBe('Inner.unitypackage > ../evil.txt: climbs out of the pack');
+  });
+});
+
+describe('Cancel', () => {
+  test('works while a run is queued or staging, and reads Finishing once the build holds the lock', () => {
+    const none = new Set<string>();
+    expect(cancelState(run('r', [], { status: 'queued' }), null, none)).toBe('cancel');
+    expect(cancelState(run('r', []), progress('r', 'extracting'), none)).toBe('cancel');
+    expect(cancelState(run('r', []), progress('r', 'waiting for the library'), none)).toBe(
+      'cancel'
+    );
+    for (const step of ['re-checking', 'swapping', 'indexing', 'settling'])
+      expect(cancelState(run('r', []), progress('r', step), none)).toBe('finishing');
+    expect(cancelState(run('r', []), progress('r', 'extracting'), new Set(['r']))).toBe(
+      'finishing'
+    );
+    expect(cancelState(run('r', [], { status: 'done' }), null, new Set(['r']))).toBe('none');
+  });
+
+  test("a Cancel answered with Finishing marks the run, and the run's end clears it", async () => {
+    const calls: string[] = [];
+    api.cancelImportRun = async (libraryId, runId) => {
+      calls.push(`${libraryId} ${runId}`);
+      throw FINISHING;
+    };
+    api.listImports = async () => [];
+    api.listImportRuns = async () => [];
+    const live = run('r', ['p']);
+    useImportStore.getState().applyUpdate(live);
+    useImportStore.getState().applyProgress(progress('r', 'hashing', 1, 2));
+    await useImportStore.getState().cancel(live);
+    expect(calls).toEqual(['lib r']);
+    let s = useImportStore.getState();
+    expect(s.error).toBeNull();
+    expect(cancelState(live, s.progress.r, s.finishing)).toBe('finishing');
+
+    useImportStore.getState().applyUpdate({ ...live, status: 'done' });
+    s = useImportStore.getState();
+    expect(s.finishing.has('r')).toBe(false);
+    expect(s.progress.r).toBeUndefined();
+    expect(s.runs.map((r) => r.status)).toEqual(['done']);
+  });
+
+  test('another refusal shows as the error', async () => {
+    api.cancelImportRun = async () => {
+      throw 'The run is neither queued nor running';
+    };
+    await useImportStore.getState().cancel(run('r', []));
+    expect(useImportStore.getState().error).toBe('The run is neither queued nor running');
+    expect(useImportStore.getState().finishing.size).toBe(0);
+  });
+
+  test("a run's end refetches its library's imports, for its packs' status", async () => {
+    const fetched: string[] = [];
+    api.listImports = async (libraryId) => {
+      fetched.push(libraryId);
+      return [];
+    };
+    api.listImportRuns = async () => [];
+    useImportStore.getState().applyUpdate(run('r', [], { status: 'running' }));
+    expect(fetched).toEqual([]);
+    useImportStore.getState().applyUpdate(run('r', [], { status: 'failed', error: 'clash' }));
+    await Promise.resolve();
+    expect(fetched).toEqual(['lib']);
+  });
+});
+
+describe('the draft', () => {
+  test("starts from the scan's first offer, its URP variant ticked and its place steps read", () => {
+    const draft = draftFromScan('lib', fabScan);
+    expect(draft.offer).toBe(0);
+    expect(draft.publisher).toBe('Studio');
+    const c = draft.candidates[0];
+    expect([c.variant, c.flatten, c.hoist, c.converts]).toEqual([1, true, 'Art', true]);
+    expect(treeCurrent(c)).toBe(true);
+    expect(draftProblem(draft)).toBeNull();
+    expect(draftFromScan('lib', fabScan, 1).candidates[0].preset).toBe('none');
+  });
+
+  test("ticking another variant shows the scan's tree while the steps are the preset's", () => {
+    let draft = pickVariant(draftFromScan('lib', fabScan), 0, 0);
+    expect(draft.candidates[0].variants.map((v) => v.ticked)).toEqual([true, false]);
+    expect(draft.candidates[0].tree?.files).toBe(3);
+    expect(treeCurrent(draft.candidates[0])).toBe(true);
+
+    // With hoist off the tree waits for a preview
+    draft = patchCandidate(draft, 0, { hoist: '' });
+    expect(treeCurrent(draft.candidates[0])).toBe(false);
+    expect(candidateProblem(draft, 0)).toBe('Previewing the steps…');
+    draft = pickVariant(draft, 0, 1);
+    expect(treeCurrent(draft.candidates[0])).toBe(false);
+  });
+
+  test('a Fab pack with no variant ticked waits for one', () => {
+    const untouched = {
+      ...fab,
+      variants: fab.variants.map((v) => ({ ...v, ticked: false })),
+      tree: null,
+    };
+    const draft = draftFromScan('lib', {
+      ...fabScan,
+      offers: [{ layout: 'fab', candidates: [untouched] }],
+    });
+    expect(candidateProblem(draft, 0)).toBe('Tick the variant to import');
+    expect(draftProblem(draft)).toBe('Forest: Tick the variant to import');
+  });
+
+  test("the publisher moves the targets you didn't type, never a Kenney pack's", () => {
+    let draft = editPublisher(draftFromScan('lib', fabScan), 'Woods Inc');
+    expect(draft.candidates[0].target).toBe('Woods Inc/Forest');
+    draft = editTarget(draft, 0, 'Mine/Forest');
+    draft = editPublisher(draft, 'Other');
+    expect(draft.candidates[0].target).toBe('Mine/Forest');
+    // A target that moved waits for the library's check
+    expect(candidateProblem(draft, 0)).toBe('Checking the target…');
+
+    const k = editPublisher(draftFromScan('lib', kenneyScan), 'Someone');
+    expect(k.candidates.map((c) => c.target)).toEqual(['3D assets/Car Kit', 'Archive/Old Kit']);
+    expect(editPublisher(draftFromScan('lib', fabScan), '').candidates[0].target).toBe('Forest');
+  });
+
+  test("a refused target shows the library's reason, naming the other pack", () => {
+    const refused = {
+      ...fab,
+      targetError: 'Studio/Forest would nest with the pack imported to Studio',
+    };
+    const draft = draftFromScan('lib', {
+      ...fabScan,
+      offers: [{ layout: 'fab', candidates: [refused] }],
+    });
+    expect(candidateProblem(draft, 0)).toBe(
+      'Studio/Forest would nest with the pack imported to Studio'
+    );
+    expect(draftProblem(draft)).toContain('nest with the pack imported to Studio');
+  });
+
+  test('ticked candidates that nest with each other are refused naming the other', () => {
+    let draft = draftFromScan('lib', kenneyScan);
+    draft = patchCandidate(draft, 1, { ticked: true });
+    expect(candidateProblem(draft, 1)).toBeNull();
+    draft = editTarget(draft, 1, '3D assets');
+    draft = patchCandidate(draft, 1, { checkedTarget: '3D assets', targetError: null });
+    expect(candidateProblem(draft, 1)).toBe(
+      '3D assets would nest with 3D assets/Car Kit, also ticked'
+    );
+    expect(candidateProblem(draft, 0)).toBe(
+      '3D assets/Car Kit would nest with 3D assets, also ticked'
+    );
+    // Unticked, it no longer blocks
+    draft = patchCandidate(draft, 1, { ticked: false });
+    expect(draftProblem(draft)).toBeNull();
+  });
+
+  test('Import waits for a ticked pack and a publisher, and a build that would fail', () => {
+    let draft = draftFromScan('lib', kenneyScan);
+    expect(draftProblem(patchCandidate(draft, 0, { ticked: false }))).toBe('Tick a pack to import');
+    expect(draftProblem({ ...draft, publisher: ' ' })).toBe('Name the publisher');
+    draft = patchCandidate(draft, 0, { tree: tree(0, 'two files at Rock.png') });
+    expect(candidateProblem(draft, 0)).toBe('The build would fail: two files at Rock.png');
+  });
+
+  test("each candidate's request names its source, place steps and metadata", () => {
+    let draft = draftFromScan('lib', fabScan);
+    draft = patchCandidate(draft, 0, {
+      title: ' Forest Pack ',
+      version: '1.2',
+      license: 'Standard EULA',
+    });
+    expect(importRequest(draft, draft.candidates[0])).toEqual({
+      libraryId: 'lib',
+      originalPath: '/dl/Forest.zip',
+      target: 'Studio/Forest',
+      publisher: 'Studio',
+      preset: 'fab',
+      variant: 'Forest_URP.unitypackage',
+      place: [{ kind: 'flatten' }, { kind: 'hoist', folder: 'Art' }],
+      title: 'Forest Pack',
+      version: '1.2',
+      license: 'Standard EULA',
+    });
+
+    const k = patchCandidate(draftFromScan('lib', kenneyScan), 0, { lookupStorePage: false });
+    expect(importRequest(k, k.candidates[0])).toEqual({
+      libraryId: 'lib',
+      originalPath: '/dl/Kenney.zip',
+      target: '3D assets/Car Kit',
+      publisher: 'Kenney',
+      preset: 'kenney',
+      subpath: 'Kenney/3D assets/Car Kit',
+      place: [],
+      lookupStorePage: false,
+    });
+  });
+});
+
+describe('the dialog', () => {
+  /** Opens the dialog over `scan`, answered by the stand-in API */
+  async function open(scan: ImportScan) {
+    api.scanImport = async () => scan;
+    api.listImports = async () => [];
+    api.listImportRuns = async () => [];
+    await useImportStore.getState().openDialog(scan.originalPath, 'lib');
+  }
+
+  test('scans the original for the library, and a scan error shows', async () => {
+    await open(fabScan);
+    expect(useImportStore.getState().draft?.candidates[0].name).toBe('Forest');
+    api.scanImport = async () => {
+      throw 'The original /x.zip is inside the library: an original stays outside it';
+    };
+    await useImportStore.getState().setLibrary('other');
+    const s = useImportStore.getState();
+    expect(s.draft).toBeNull();
+    expect(s.scanError).toContain('inside the library');
+    expect(s.dialog).toEqual({ originalPath: '/dl/Forest.zip', libraryId: 'other' });
+  });
+
+  test('an edited target is checked by the library, and a late answer for an older value is dropped', async () => {
+    await open(fabScan);
+    let answer: (error: string | null) => void = () => {};
+    api.checkImportTarget = (_lib, target) =>
+      new Promise((resolve) => {
+        answer = (error) => resolve(target === 'Pub' ? error : null);
+      });
+    const store = useImportStore.getState();
+    store.edit((d) => editTarget(d, 0, 'Pub'));
+    const first = store.checkTarget(0);
+    store.edit((d) => editTarget(d, 0, 'Pub/Pack/Sub'));
+    answer('Pub would nest with the pack imported to Pub/Pack');
+    await first;
+    // The answer for 'Pub' came after the target moved on, so the scan's check stands
+    expect(useImportStore.getState().draft?.candidates[0].checkedTarget).toBe('Studio/Forest');
+
+    api.checkImportTarget = async (_lib, target) =>
+      `${target} would nest with the pack imported to Pub/Pack`;
+    await store.checkTarget(0);
+    const c = useImportStore.getState().draft!.candidates[0];
+    expect([c.checkedTarget, c.targetError]).toEqual([
+      'Pub/Pack/Sub',
+      'Pub/Pack/Sub would nest with the pack imported to Pub/Pack',
+    ]);
+    expect(candidateProblem(useImportStore.getState().draft!, 0)).toContain('Pub/Pack');
+  });
+
+  test('a step edit previews the tree of the new steps', async () => {
+    await open(fabScan);
+    const calls: unknown[] = [];
+    api.previewImport = async (libraryId, originalPath, variant, subpath, place) => {
+      calls.push({ libraryId, originalPath, variant, subpath, place });
+      return tree(7);
+    };
+    const store = useImportStore.getState();
+    await store.refreshTree(0);
+    expect(calls).toEqual([]);
+    store.edit((d) => patchCandidate(d, 0, { hoist: '' }));
+    await store.refreshTree(0);
+    expect(calls).toEqual([
+      {
+        libraryId: 'lib',
+        originalPath: '/dl/Forest.zip',
+        variant: 'Forest_URP.unitypackage',
+        subpath: null,
+        place: [{ kind: 'flatten' }],
+      },
+    ]);
+    const c = useImportStore.getState().draft!.candidates[0];
+    expect([c.tree?.files, treeCurrent(c)]).toEqual([7, true]);
+  });
+
+  test('Import queues each ticked pack and keeps a refused one in the dialog with its reason', async () => {
+    await open(kenneyScan);
+    const store = useImportStore.getState();
+    store.edit((d) => patchCandidate(d, 1, { ticked: true }));
+    const requests: ImportRequest[] = [];
+    api.startImport = async (request) => {
+      requests.push(request);
+      if (request.target === 'Archive/Old Kit')
+        throw 'Archive/Old Kit would nest with the pack imported to Archive';
+      return run('r1', ['p1'], { status: 'queued', createdAt: 1 });
+    };
+    expect(await store.submit()).toBe(false);
+    expect(requests.map((r) => r.target)).toEqual(['3D assets/Car Kit', 'Archive/Old Kit']);
+    let s = useImportStore.getState();
+    expect(s.dialog).not.toBeNull();
+    expect(s.draft!.candidates.map((c) => [c.imported, c.error])).toEqual([
+      [true, null],
+      [false, 'Archive/Old Kit would nest with the pack imported to Archive'],
+    ]);
+    expect(s.runs.map((r) => r.id)).toEqual(['r1']);
+
+    // Another target goes through, and only the pack not yet imported is sent
+    s.edit((d) => editTarget(d, 1, 'Old/Old Kit'));
+    api.checkImportTarget = async () => null;
+    await s.checkTarget(1);
+    requests.length = 0;
+    api.startImport = async (request) => {
+      requests.push(request);
+      return run('r2', ['p2'], { status: 'queued', createdAt: 2 });
+    };
+    expect(await useImportStore.getState().submit()).toBe(true);
+    expect(requests.map((r) => r.target)).toEqual(['Old/Old Kit']);
+    s = useImportStore.getState();
+    expect(s.dialog).toBeNull();
+    expect(s.runs.map((r) => r.id)).toEqual(['r2', 'r1']);
+  });
+});
