@@ -98,7 +98,6 @@ export function RemoveDialog({ packId, draft, saving, folder }: Props) {
             label="Changed outside OpenDAM: your changes are lost"
             marker="data-remove-lost"
             paths={summary.lost.map(short)}
-            danger
           />
           <RemoveList
             label="Added outside OpenDAM: left in the folder"
@@ -150,21 +149,11 @@ export function RemoveDialog({ packId, draft, saving, folder }: Props) {
   );
 }
 
-function RemoveList({
-  label,
-  marker,
-  paths,
-  danger = false,
-}: {
-  label: string;
-  marker: string;
-  paths: string[];
-  danger?: boolean;
-}) {
+function RemoveList({ label, marker, paths }: { label: string; marker: string; paths: string[] }) {
   if (paths.length === 0) return null;
   return (
     <div className={styles.section} {...{ [marker]: '' }}>
-      <span className={clsx(styles.sectionLabel, danger && styles.errorText)}>{label}</span>
+      <span className={styles.sectionLabel}>{label}</span>
       <ul className={styles.kept}>
         {paths.map((path) => (
           <li key={path} className={styles.path}>
