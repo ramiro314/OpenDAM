@@ -13,25 +13,26 @@ mod tests {
 
     use crate::fs_swap;
     use crate::import::build::FINISHING;
-    use crate::import::engine::tests::{setup, setup_with, Setup, TARGET};
+    use crate::import::engine::tests::{built, setup, setup_with, Setup, TARGET};
     use crate::import::engine::*;
+    use crate::import::metadata;
     use crate::import::unitypackage::tests::{golden, on_disk};
 
     const CHANGED: &str = "The pack changed during the build; Rebuild again";
     /// The nested package's `Art` folder, below the pack root once flattened.
     const HOUSES_ART: &str = "Houses/Built-In/Built-In_Pack/Pack/Art";
 
-    /// The golden tree with `hoist Art` off: the extraction with its wrapper folders merged.
+    /// The golden tree with `hoist Art` off: the extraction with its wrapper folders merged, and
+    /// the metadata step's `datapackage.json`.
     fn unhoisted() -> Vec<String> {
-        let mut files: Vec<String> = golden("synthetic.extract.txt")
+        let files: Vec<String> = golden("synthetic.extract.txt")
             .into_iter()
             .map(|p| {
                 p.strip_prefix("Built-In/Built-In_Pack/Pack/")
                     .map_or(p.clone(), str::to_string)
             })
             .collect();
-        files.sort();
-        files
+        built(files)
     }
 
     fn in_pack(path: &str) -> String {
@@ -269,15 +270,19 @@ mod tests {
         ] {
             sqlx::query(sql).execute(&s.lib.pool).await.unwrap();
         }
-        let modified: Vec<(String, i64, String, Option<String>)> = sqlx::query_as(
-            "SELECT id, modified_at, preview_status, thumbnail_path FROM assets ORDER BY id",
-        )
-        .fetch_all(&s.lib.pool)
-        .await
-        .unwrap();
+        // Its `datapackage.json` names the model where the hoist puts it, so it changes.
+        let unchanged_rows = "SELECT id, modified_at, preview_status, thumbnail_path FROM assets
+            WHERE file_path NOT LIKE '%/datapackage.json' ORDER BY id";
+        let modified: Vec<(String, i64, String, Option<String>)> = sqlx::query_as(unchanged_rows)
+            .fetch_all(&s.lib.pool)
+            .await
+            .unwrap();
 
         let mut rows = s.rows().await;
-        for (on, tree) in [(false, unhoisted()), (true, golden("synthetic.place.txt"))] {
+        for (on, tree) in [
+            (false, unhoisted()),
+            (true, built(golden("synthetic.place.txt"))),
+        ] {
             let before = s.manifest_paths().await;
             let rev = s
                 .edit_steps(&pack_id, |steps| toggle(steps, "hoist", on))
@@ -297,15 +302,21 @@ mod tests {
             s.settled().await;
             s.tree_untouched().await;
             assert_eq!(s.pack().await.0, "built");
-            for file in &tree {
+            for file in tree.iter().filter(|f| *f != metadata::FILE) {
                 assert_eq!(file_mtime(&s.live().join(file)), written, "{file}");
             }
-            let now: Vec<(String, i64, String, Option<String>)> = sqlx::query_as(
-                "SELECT id, modified_at, preview_status, thumbnail_path FROM assets ORDER BY id",
-            )
-            .fetch_all(&s.lib.pool)
-            .await
-            .unwrap();
+            let package = std::fs::read_to_string(s.live().join(metadata::FILE)).unwrap();
+            let package: serde_json::Value = serde_json::from_str(&package).unwrap();
+            let model = if on {
+                "Models/SM_Log.fbx"
+            } else {
+                "Art/Models/SM_Log.fbx"
+            };
+            assert_eq!(package["resources"][0]["path"], model, "hoist {on}");
+            let now: Vec<(String, i64, String, Option<String>)> = sqlx::query_as(unchanged_rows)
+                .fetch_all(&s.lib.pool)
+                .await
+                .unwrap();
             assert_eq!(now, modified, "no row changed, and no preview was queued");
             assert_eq!(s.count("SELECT COUNT(*) FROM preview_jobs").await, 0);
         }
@@ -500,7 +511,7 @@ mod tests {
     /// After a rollback: the golden tree and the build that made it are current again, with every
     /// row as `rows` had it, and nothing of the failed build is left.
     async fn rolled_back(s: &Setup, build: &Option<String>, rows: &Rows) {
-        assert_eq!(on_disk(&s.live()), golden("synthetic.place.txt"));
+        assert_eq!(on_disk(&s.live()), built(golden("synthetic.place.txt")));
         assert_eq!(&s.current_build().await, build);
         assert_eq!(s.pack().await.0, "built");
         assert_eq!(&s.rows().await, rows);
@@ -684,7 +695,7 @@ mod tests {
                     "edited outside",
                     "the live folder is unchanged"
                 ),
-                _ => assert_eq!(on_disk(&s.live()), golden("synthetic.place.txt")),
+                _ => assert_eq!(on_disk(&s.live()), built(golden("synthetic.place.txt"))),
             }
         }
     }
@@ -816,7 +827,7 @@ mod tests {
         s.rebuild_until(&pack_id, "failed").await;
         assert_eq!(on_disk(&s.live()), unhoisted());
         assert_eq!(plus_rows(&s.rows().await), outside);
-        assert_eq!(on_disk(&plus), golden("synthetic.place.txt"));
+        assert_eq!(on_disk(&plus), built(golden("synthetic.place.txt")));
     }
 
     #[tokio::test]

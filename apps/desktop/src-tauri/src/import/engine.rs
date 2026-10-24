@@ -26,6 +26,7 @@ use sqlx::{Pool, Sqlite};
 use tokio::sync::Notify;
 
 use super::build::{self, BuildEnv, Hooks, Point, Progress, RunControl, Stop};
+use super::metadata::LicenseOption;
 use super::place::PlaceStep;
 use super::records::{self, NewImport, Owner, PackSteps, QueuedPack, RunSummary, Step, StepRecord};
 use crate::db::{Database, LibraryHandle};
@@ -94,6 +95,17 @@ pub struct ImportRequest {
     /// `none`, `flatten` then `hoist Art` for `fab`, and none for `kenney`.
     #[serde(default)]
     pub place: Option<Vec<PlaceStep>>,
+    /// The pack's title, version and license, written into its `datapackage.json` by every
+    /// build. Left out, the preset's (plan Pack metadata).
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub license: Option<LicenseOption>,
+    /// "Look up store page": the Kenney preset's HEAD requests to kenney.nl, on when left out.
+    #[serde(default)]
+    pub lookup_store_page: Option<bool>,
 }
 
 pub struct Engine {
@@ -550,9 +562,21 @@ impl Engine {
             _ => vec![PlaceStep::Flatten],
         });
         steps.extend(place.iter().map(StepRecord::place));
+        let mut metadata = json!({ "preset": preset, "publisher": publisher });
+        for (key, value) in [("title", &request.title), ("version", &request.version)] {
+            if let Some(value) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                metadata[key] = value.into();
+            }
+        }
+        if let Some(license) = &request.license {
+            metadata["license"] = json!(license);
+        }
+        if preset == "kenney" {
+            metadata["lookup_store_page"] = request.lookup_store_page.unwrap_or(true).into();
+        }
         steps.push(StepRecord {
             kind: "metadata".into(),
-            options: json!({ "preset": preset, "publisher": publisher }),
+            options: metadata,
         });
         let source = [variant, subpath.as_deref()]
             .into_iter()
@@ -613,6 +637,16 @@ impl Engine {
         let kind = kind.ok_or_else(|| refused(records::Refused::NoPack))?;
         build::check_steps(&kind, &steps)?;
         records::set_steps(&library.pool, pack_id, &steps)
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(refused)
+    }
+
+    /// Forgets pack `pack_id`'s Kenney store page answer, so its next build looks the page up
+    /// again. Refused while a run for the pack is queued or running.
+    pub async fn clear_store_page(&self, library_id: &str, pack_id: &str) -> Result<(), String> {
+        let library = self.library(library_id).await?;
+        records::clear_store_page(&library.pool, pack_id)
             .await
             .map_err(|e| e.to_string())?
             .map_err(refused)
@@ -776,6 +810,10 @@ async fn check_target(pool: &Pool<Sqlite>, root: &Path, target: &str) -> Result<
 mod rebuild_tests;
 
 #[cfg(test)]
+#[path = "metadata_tests.rs"]
+mod metadata_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::{memory_database, memory_library_pool};
@@ -810,11 +848,15 @@ mod tests {
                 subpath: None,
                 preset: None,
                 place: Some(place),
+                title: None,
+                version: None,
+                license: None,
+                lookup_store_page: None,
             }
         }
 
         /// An import of the zip fixture `name` with the preset's place steps.
-        fn zip_request(
+        pub(super) fn zip_request(
             &self,
             name: &str,
             variant: Option<&str>,
@@ -1007,6 +1049,13 @@ mod tests {
         }
     }
 
+    /// A pack's tree once built: `files` and the metadata step's `datapackage.json`, sorted.
+    pub(super) fn built(mut files: Vec<String>) -> Vec<String> {
+        files.push(crate::import::metadata::FILE.into());
+        files.sort();
+        files
+    }
+
     fn stamp(path: &Path) -> (String, std::time::SystemTime) {
         (
             crate::export::hashes::sha256_file(path).unwrap(),
@@ -1026,7 +1075,7 @@ mod tests {
         assert_eq!(run.status, "queued");
         s.wait_for(&run.id, "done").await;
 
-        let expected = golden("synthetic.place.txt");
+        let expected = built(golden("synthetic.place.txt"));
         assert_eq!(on_disk(&s.live()), expected);
         let in_pack: Vec<String> = expected.iter().map(|p| format!("{TARGET}/{p}")).collect();
         assert_eq!(
@@ -1046,7 +1095,7 @@ mod tests {
             .iter()
             .filter(|p| {
                 let ext = p.rsplit_once('.').map_or("", |(_, e)| e);
-                crate::watcher::is_supported(ext)
+                crate::watcher::is_supported(ext) || p.ends_with("/datapackage.json")
             })
             .cloned()
             .collect();
@@ -1118,6 +1167,7 @@ mod tests {
             [
                 "extracting",
                 "placing",
+                "writing metadata",
                 "hashing",
                 "waiting for the library",
                 "swapping",
@@ -1143,11 +1193,13 @@ mod tests {
         assert!(run.warnings.is_empty(), "{:?}", run.warnings);
 
         let files = ["License.txt", "Models/car.glb", "Preview.png"];
-        assert_eq!(on_disk(&s.dir.path().join(target)), files);
-        let expected: Vec<(String, Vec<String>)> = files
+        let mut expected: Vec<(String, Vec<String>)> = files
             .iter()
             .map(|f| (f.to_string(), vec![format!("{subpath}/{f}")]))
             .collect();
+        expected.push(("datapackage.json".into(), vec![]));
+        let tree: Vec<String> = expected.iter().map(|(f, _)| f.clone()).collect();
+        assert_eq!(on_disk(&s.dir.path().join(target)), tree);
         assert_eq!(s.manifest(target).await, expected);
         let license = std::fs::read_to_string(s.dir.path().join(target).join("License.txt"));
         assert!(license.unwrap().contains("Fixture Car Kit (1.0)"));
@@ -1159,7 +1211,8 @@ mod tests {
             .await,
             [
                 format!("{target}/Models/car.glb"),
-                format!("{target}/Preview.png")
+                format!("{target}/Preview.png"),
+                format!("{target}/datapackage.json")
             ]
         );
         // The Kenney preset: the zip's folder, no place step, and its metadata preset.
@@ -1168,7 +1221,8 @@ mod tests {
                 .await,
             [
                 format!(r#"extract_zip {{"subpath":"{subpath}"}}"#),
-                r#"metadata {"preset":"kenney","publisher":"Kenney"}"#.to_string(),
+                r#"metadata {"lookup_store_page":true,"preset":"kenney","publisher":"Kenney"}"#
+                    .to_string(),
             ]
         );
         assert_eq!(
@@ -1217,12 +1271,16 @@ mod tests {
         ];
         let crypt = s.dir.path().join("Fab/Crypt");
         let with_readme = [&hoisted[..], &["Readme.txt", "Readme.txt.meta"]].concat();
-        let mut sorted = with_readme.clone();
-        sorted.sort();
-        assert_eq!(on_disk(&crypt), sorted);
+        assert_eq!(
+            on_disk(&crypt),
+            built(with_readme.iter().map(|f| f.to_string()).collect())
+        );
         // The pipeline folder leaves out the package's shared `Readme.txt`.
         let folders = s.dir.path().join("Fab/Folders");
-        assert_eq!(on_disk(&folders), hoisted);
+        assert_eq!(
+            on_disk(&folders),
+            built(hoisted.iter().map(|f| f.to_string()).collect())
+        );
         for pack in [&crypt, &folders] {
             let pipeline = std::fs::read_to_string(pack.join("Pipeline.txt")).unwrap();
             assert_eq!(pipeline, "URP\n", "{}", pack.display());
@@ -1296,7 +1354,10 @@ mod tests {
         );
         // The `none` preset's `flatten` merged the zip's top folder, then `Keep/`, which sat
         // beside nothing but a doc.
-        assert_eq!(on_disk(&s.dir.path().join("Esc")), ["a.txt", "b.txt"]);
+        assert_eq!(
+            on_disk(&s.dir.path().join("Esc")),
+            ["a.txt", "b.txt", "datapackage.json"]
+        );
         let library = on_disk(s.dir.path());
         assert!(
             library.iter().all(|p| p.starts_with("Esc/")
@@ -1416,7 +1477,7 @@ mod tests {
         pause.release.notify_one();
         s.wait_for(&run.id, "done").await;
 
-        assert_eq!(on_disk(&s.live()), golden("synthetic.place.txt"));
+        assert_eq!(on_disk(&s.live()), built(golden("synthetic.place.txt")));
         assert_eq!(s.pack().await.0, "built");
     }
 
@@ -1947,7 +2008,7 @@ mod tests {
         let done = s.wait_for(&run.id, "done").await;
         assert_eq!(done.error, None);
         assert_eq!(s.pack().await.0, "built", "the record agrees with the disk");
-        assert_eq!(on_disk(&s.live()), golden("synthetic.place.txt"));
+        assert_eq!(on_disk(&s.live()), built(golden("synthetic.place.txt")));
     }
 
     #[tokio::test]

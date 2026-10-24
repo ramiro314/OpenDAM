@@ -1,0 +1,26 @@
+{
+  "$schema": "https://datapackage.org/profiles/2.0/datapackage.json",
+  "name": "synthetic",
+  "title": "Synthetic",
+  "contributors": [
+    {
+      "title": "Synthetic Studio",
+      "roles": [
+        "publisher"
+      ]
+    }
+  ],
+  "licenses": [
+    {
+      "name": "LicenseRef-Unity-Asset-Store-EULA",
+      "title": "Standard Unity Asset Store EULA",
+      "path": "https://unity.com/legal/as-terms"
+    }
+  ],
+  "resources": [
+    {
+      "name": "sm_log.fbx",
+      "path": "Art/Models/SM_Log.fbx"
+    }
+  ]
+}

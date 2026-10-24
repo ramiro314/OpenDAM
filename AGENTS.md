@@ -78,7 +78,8 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               records, the import tables (imports, import_packs, import_steps,
                               import_outputs, import_moves, import_runs) and the step edits and
                               rebuilds they refuse while a run for the pack is queued or running,
-                              build, a pack's build, first or later (stage beside the target,
+                              metadata, the metadata step's `datapackage.json` by preset (Unity,
+                              Fab, Kenney, none) and the Kenney store page lookup, build, a pack's build, first or later (stage beside the target,
                               lock, re-check, journal, swap, carry, index with Prune::Defer,
                               commit current_build, settle, or roll back), with test hooks to
                               pause or fail it, carry, which moves rows to their files' new paths
@@ -169,9 +170,14 @@ docs/plans                    Plans for this fork
   Other parts of the app, such as the game export's `fbx_facts`, send a `preview::WorkerRequest`
   to the queue, which serves it on that process between jobs.
 - **Zero telemetry.** The app makes no network calls to analytics or tracking services. The only
-  outbound calls are AI tagging requests to the provider you configured (the Anthropic API, your
-  local `claude` CLI, or TypeSafe's Jev). They are made only for runs you start, and nothing is
-  sent until a provider is set up.
+  outbound calls are:
+  - AI tagging requests to the provider you configured (the Anthropic API, your local `claude`
+    CLI, or TypeSafe's Jev). They are made only for runs you start, and nothing is sent until a
+    provider is set up.
+  - The Kenney store page lookup: one or two HEAD requests to `https://kenney.nl/assets/<slug>`
+    per pack, made only by a Kenney pack's build with "Look up store page" ticked
+    (`import::metadata`). The answer is kept in `import_packs.store_page`, so a rebuild sends
+    none until you clear it.
 - **Claude-plan access is personal use only.** Anthropic's "Claude plan" access runs the owner's
   own installed, logged-in `claude` CLI (`autotag/claude_cli.rs`). Anthropic doesn't let
   third-party products offer claude.ai login or plan limits, so this access mode must be removed
