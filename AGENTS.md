@@ -83,6 +83,8 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               records, the import tables (imports, import_packs, import_steps,
                               import_outputs, import_moves, import_runs) and the step edits and
                               rebuilds they refuse while a run for the pack is queued or running,
+                              edits, which records an in-app rename or delete in a pack as
+                              its steps and moves its `.meta` with it,
                               metadata, the metadata step's `datapackage.json` by preset (Unity,
                               Fab, Kenney, none) and the Kenney store page lookup, build, a pack's build, first or later (stage beside the target,
                               lock, re-check, journal, swap, carry, index with Prune::Defer,
@@ -145,7 +147,15 @@ docs/plans                    Plans for this fork
   it a run finishes. Step edits (`records::set_steps`, which bumps `recipe_rev`) and Rebuild are
   refused while a run for the pack is queued or running. A staged file the previous build had,
   by file key, size and sha256, gets that build's mtime, so the index sees it unchanged, moved or
-  not, and queues no preview. In-app edits recording steps come with the plan's later tickets.
+  not, and queues no preview.
+- **In-app edits inside a pack become steps.** `rename_asset`, `delete_asset` and `delete_assets`
+  are the one other way a built pack changes on disk (`import::edits`). Refused while a run for
+  the pack is queued or running, they rename or trash each file's `.meta` (one in the current
+  manifest) right after it, put it back with the rest when a rename fails, and in the
+  transaction that moves or deletes the asset rows, bump `recipe_rev`, move or drop each file's
+  manifest row, and append a `rename` or `exclude` by source path for each file that has one,
+  except a generated file (its model's step covers it) and a `.meta` (its file's step covers
+  it). The pack's `datapackage.json` can't be renamed, and a delete turns the metadata step off.
 - **Rows follow their files.** A rebuild carries each moved file's asset row to the file's new
   path (`import::carry`), matched by its file key (`source_path` and whether it is generated),
   keeping its id, metadata and `modified_at`. It runs in two passes, so the order of the moves

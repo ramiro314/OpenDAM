@@ -513,7 +513,7 @@ pub enum Refused {
 }
 
 /// The `import_packs` row is busy: a run for it is queued or running, or its `swap_state` is set.
-const BUSY: &str = "(import_packs.swap_state IS NOT NULL OR EXISTS (
+pub(super) const BUSY: &str = "(import_packs.swap_state IS NOT NULL OR EXISTS (
     SELECT 1 FROM import_runs r, json_each(r.packs) j
     WHERE r.status IN ('queued', 'running')
     AND json_extract(j.value, '$.packId') = import_packs.id))";
