@@ -2487,15 +2487,16 @@ pub async fn rebuild_library(db: &Database, library: &LibraryHandle) {
 }
 
 /// A locking entry point's work once it holds both locks: swap recovery, the pass when `pass` is
-/// set, then the release, which runs a pass left pending meanwhile. False when the pass failed.
-async fn locked_pass(
+/// set or recovery changed anything (it leaves its pass to its caller), then the release, which
+/// runs a pass left pending meanwhile. False when the pass failed.
+pub(crate) async fn locked_pass(
     library: &LibraryHandle,
     index_guard: &tokio::sync::MutexGuard<'_, ()>,
     advisory: IndexLock,
     pass: bool,
 ) -> bool {
     let (pool, root) = (&library.pool, library.root_path.as_path());
-    crate::import::recover_swaps(
+    let recovered = crate::import::recover_swaps(
         pool,
         root,
         crate::import::Recovery::Entry,
@@ -2503,7 +2504,7 @@ async fn locked_pass(
         &advisory,
     )
     .await;
-    let ran = !pass || log_failure(library, rebuild(pool, root).await);
+    let ran = !(pass || recovered) || log_failure(library, rebuild(pool, root).await);
     advisory.release(pool, root).await;
     ran
 }

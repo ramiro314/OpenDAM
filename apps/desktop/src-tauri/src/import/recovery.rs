@@ -59,13 +59,17 @@ impl Liveness {
 /// and call it before they touch a row: the library open (`db::open_library_db`),
 /// `watcher::index_paths` and `structure::rebuild_library`, its follow-up task included. A pack
 /// it can't recover keeps its journal, for the next caller, and the failure is logged.
+///
+/// True when it may have changed rows or the folders beside a pack (any recovery tried, even one
+/// that failed partway, or a leftover cleared): its caller then runs the structure pass, which
+/// recovery itself leaves to it, whatever `structure_pending` says.
 pub async fn recover_swaps(
     pool: &Pool<Sqlite>,
     root: &Path,
     tables: Recovery,
     index_guard: &tokio::sync::MutexGuard<'_, ()>,
     advisory: &IndexLock,
-) {
+) -> bool {
     recover_swaps_with(pool, root, tables, index_guard, advisory, &Liveness::now()).await
 }
 
@@ -77,7 +81,7 @@ pub(super) async fn recover_swaps_with(
     index_guard: &tokio::sync::MutexGuard<'_, ()>,
     advisory: &IndexLock,
     liveness: &Liveness,
-) {
+) -> bool {
     let journaled: Vec<Journal> = match sqlx::query_as(
         "SELECT id, target, swap_state, swap_build, swap_prev FROM import_packs
          WHERE swap_state IS NOT NULL ORDER BY target",
@@ -88,9 +92,10 @@ pub(super) async fn recover_swaps_with(
         Ok(rows) => rows,
         Err(e) => {
             tracing::error!("Could not read the swap journals of the library at {root:?}: {e}");
-            return;
+            return false;
         }
     };
+    let mut changed = false;
     for pack in &journaled {
         if pack.swap_state != "swapping" {
             // Remove import isn't built yet, so nothing journals `removing`: its recovery comes
@@ -102,18 +107,27 @@ pub(super) async fn recover_swaps_with(
             );
             continue;
         }
-        if let Err(e) = recover_swap(pool, root, index_guard, advisory, pack).await {
-            tracing::error!(
-                "Recovering the swap of pack {}: {e}. Its journal stays for the next try",
-                pack.target
-            );
+        match recover_swap(pool, root, index_guard, advisory, pack).await {
+            Ok(recovered) => changed |= recovered,
+            Err(e) => {
+                changed = true;
+                tracing::error!(
+                    "Recovering the swap of pack {}: {e}. Its journal stays for the next try",
+                    pack.target
+                );
+            }
         }
     }
     if tables == Recovery::Open {
-        if let Err(e) = leftovers(pool, root, advisory, liveness).await {
-            tracing::error!("Clearing the build leftovers of the library at {root:?}: {e}");
+        match leftovers(pool, root, advisory, liveness).await {
+            Ok(cleared) => changed |= cleared,
+            Err(e) => {
+                changed = true;
+                tracing::error!("Clearing the build leftovers of the library at {root:?}: {e}");
+            }
         }
     }
+    changed
 }
 
 /// A pack whose `swap_state` is set.
@@ -153,7 +167,7 @@ async fn recover_swap(
     index_guard: &tokio::sync::MutexGuard<'_, ()>,
     advisory: &IndexLock,
     pack: &Journal,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let live = root.join(&pack.target);
     let (Some(build_id), Some(swap_prev)) = (&pack.swap_build, pack.swap_prev) else {
         return unrecognised(pool, pack, "its journal names no build").await;
@@ -171,7 +185,10 @@ async fn recover_swap(
         exists(&failed),
     );
     let found = match on_disk {
-        (true, false, _, false) => Found::Staged,
+        // A swap moves a live folder aside only to `.prev`: with `swap_prev` set and neither
+        // there, a folder vanished, and the staging folder may hold the last copy.
+        (true, false, true, false) => Found::Staged,
+        (true, false, false, false) if !swap_prev => Found::Staged,
         (true, true, false, false) => Found::Aside { staging: true },
         (false, true, false, false) => Found::Aside { staging: false },
         (false, true, true, false) => Found::Swapped { prev: true },
@@ -261,7 +278,7 @@ async fn recover_swap(
         }
     }
     interrupt_runs(pool, &pack.id).await;
-    Ok(())
+    Ok(true)
 }
 
 fn present(found: bool) -> &'static str {
@@ -340,8 +357,8 @@ async fn end_runs(
 
 /// The last row of the first table: a state no step leaves. Changes nothing on disk and leaves
 /// `swap_state` set, which refuses the pack's runs and step edits, marks the pack `failed`, and
-/// ends its running runs naming the state found.
-async fn unrecognised(pool: &Pool<Sqlite>, pack: &Journal, state: &str) -> Result<(), String> {
+/// ends its running runs naming the state found. False: no row or folder of the pack changed.
+async fn unrecognised(pool: &Pool<Sqlite>, pack: &Journal, state: &str) -> Result<bool, String> {
     let message = format!(
         "The pack {} was left mid-swap in a state no step leaves ({state}). It is left as found",
         pack.target
@@ -352,7 +369,8 @@ async fn unrecognised(pool: &Pool<Sqlite>, pack: &Journal, state: &str) -> Resul
         .execute(pool)
         .await
         .map_err(|e| format!("could not mark the pack failed: {e}"))?;
-    end_runs(pool, &pack.id, "failed", &message).await
+    end_runs(pool, &pack.id, "failed", &message).await?;
+    Ok(false)
 }
 
 /// What a folder left beside a pack whose `swap_state` is `NULL` is, by its `fs_swap` tag.
@@ -389,13 +407,15 @@ struct Leftover {
 /// The second table, for every pack whose `swap_state` is `NULL`: deletes a staging folder and
 /// its build's rows, deletes a `.failed-*` folder, and settles a `.prev-*` one (step 7). A pack
 /// with a live run is skipped. Its folders are listed before its runs are read, so a build that
-/// starts meanwhile never has its staging folder deleted, nor its rows (`settle_records`).
+/// starts meanwhile never has its staging folder deleted, nor its rows (`settle_records`). True
+/// when it cleared anything.
 async fn leftovers(
     pool: &Pool<Sqlite>,
     root: &Path,
     advisory: &IndexLock,
     liveness: &Liveness,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<bool> {
+    let mut cleared = false;
     let packs: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT id, target, current_build FROM import_packs WHERE swap_state IS NULL
          ORDER BY target",
@@ -416,6 +436,7 @@ async fn leftovers(
             continue;
         }
         for left in found {
+            cleared = true;
             tracing::warn!("Clearing {} beside pack {target}", left.folder.display());
             match left.kind {
                 Left::Staging => {
@@ -435,7 +456,7 @@ async fn leftovers(
             }
         }
     }
-    Ok(())
+    Ok(cleared)
 }
 
 /// A `.prev-*` settle's records: deletes the manifest rows of every build of pack `pack_id` but

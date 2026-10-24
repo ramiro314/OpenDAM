@@ -690,6 +690,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_staged_build_whose_live_folder_vanished_is_left_as_found() {
+        let s = disk().await;
+        let pack_id = later(&s).await;
+        s.engine.hooks().crash(Point::Journaled);
+        let run = rebuild_killed(&s, &pack_id).await;
+        // The live folder, journaled as moved aside next, went before the first rename: the
+        // staging folder may now be the last copy of the pack's files.
+        std::fs::remove_dir_all(s.live()).unwrap();
+        let (files, rows) = staged(&s).await;
+        let assets = s.rows().await;
+
+        reopen(&s).await;
+        refresh(&s).await;
+        assert_eq!(
+            staged(&s).await,
+            (files, rows),
+            "the staging and its rows stay"
+        );
+        assert_eq!(s.rows().await, assets, "no row is pruned");
+        assert_eq!(s.pack().await.0, "failed");
+        assert_eq!(s.pack().await.2.as_deref(), Some("swapping"));
+        assert_eq!(status(&s, &run).await, "failed");
+    }
+
+    #[tokio::test]
+    async fn a_recovery_in_a_locked_pass_runs_the_structure_pass_though_none_is_pending() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = disk().await;
+        s.engine.hooks().crash(Point::Indexed);
+        import_killed(&s).await;
+        // The rollback's first rename fails while the folder holding the pack is read-only, so
+        // the refresh's pass runs over the failed build's rows, sparing only the pack.
+        let parent = s.live().parent().unwrap().to_path_buf();
+        let mode = |m: u32| std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(m));
+        mode(0o555).unwrap();
+        if std::fs::create_dir(parent.join("probe")).is_ok() {
+            mode(0o755).unwrap();
+            eprintln!("Permissions don't stop this user (root?): skipped");
+            return;
+        }
+        refresh(&s).await;
+        mode(0o755).unwrap();
+        let pack_folders = format!("SELECT COUNT(*) FROM folders WHERE path LIKE '{TARGET}%'");
+        assert!(
+            s.count(&pack_folders).await > 0,
+            "the pass saw the failed build"
+        );
+        assert!(!structure::is_pending(&s.lib.pool).await);
+
+        // A follow-up task's pass, with none pending: recovery rolls the build back with no
+        // index of its own, so the pass runs anyway.
+        let lock = s.engine.db.index_lock("lib");
+        let index_guard = lock.lock().await;
+        let advisory = watcher::IndexLock::try_acquire(s.dir.path()).await.unwrap();
+        assert!(structure::locked_pass(&s.lib, &index_guard, advisory, false).await);
+        drop(index_guard);
+        nothing_built(&s).await;
+        assert_eq!(
+            s.count(&pack_folders).await,
+            0,
+            "the folder tree matches the rows"
+        );
+    }
+
+    #[tokio::test]
     async fn a_rollback_whose_restored_folder_vanished_is_left_as_found() {
         let s = disk().await;
         let pack_id = later(&s).await;
