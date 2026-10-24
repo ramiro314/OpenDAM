@@ -98,8 +98,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               unity_glb.py (versioned by UNITY_GLB_VERSION) in Blender on a work
                               copy, whose binary .mat, .prefab and .unity files the preview
                               worker's unity_binary_to_text rewrites as text, under the memory
-                              cap in settings (import.blenderMemoryMax), and cached in ~/.cache/opendam/import/glb by a key over every
-                              input's source path, final name and sha256
+                              cap in settings (import.blenderMemoryMax), and cached in
+                              ~/.cache/opendam/import/glb by a key over every input's source
+                              path, final name and sha256 (and, with binary Unity files,
+                              unity_text.py's VERSION and the locked UnityPy)
     src/capped.rs             capped_command: a child process in a systemd user scope with
                               MemoryMax (as scripts/memory-cap.sh), uncapped with a warning
                               without systemd-run --user, and exit 137 reported as killed by the cap
