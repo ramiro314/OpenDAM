@@ -309,7 +309,7 @@ the step's deviations from `unity_gltf.py` and from this plan as written:
     `scripts/memory-cap.sh` does, and a SIGKILL under the cap counts as a cap kill, like 137.
   - **Without Blender.** A Unity import adds `unity_glb` turned off, and `get_import_steps`
     gives the reason (`unavailable`). A build with it on fails with that reason.
-  - **assimp.** It is `assimp` on `PATH`, with no setting yet.
+  - **assimp.** It is `assimp` on `PATH`, with no setting yet (R51 adds `import.assimpPath`).
 
 Revised again 2026-10-23 (revision 21) while building the `export_unreal` step (ticket 9). No
 decision changed. These are the step's deviations from `ue_gltf_export.sh/.py` and from this
@@ -363,6 +363,35 @@ plan as written:
   - **The fixtures.** `unreal.zip` holds `Feif/Feif.uproject` (named unlike the zip) with three
     meshes, a texture, a level and docs, so the batches and the hoist can be tested;
     `unreal-source.zip` adds `Source/`.
+
+Revised again 2026-10-24 (revision 22) while building Settings' Import tools section (ticket
+22). No decision changed. These are the section's deviations from this plan as written:
+
+- **R51 - The section, assimp and Clear.**
+  - **assimp's setting.** It is `import.assimpPath`, an absolute path, unset for `assimp` on
+    `PATH` (replacing R46's "no setting yet"). `unity_glb` runs the saved program.
+  - **A missing assimp disables nothing.** Only an ASCII or pre-7.1 FBX needs it, and that
+    model's conversion already fails naming assimp. Settings shows where assimp is, its version,
+    or why it can't be used, but `unity_glb` stays available without it, so packs that never
+    need it still convert.
+  - **Blender.** Its path stays the export's `export.blenderPath`, set under Game export. The
+    section shows the same status, from one check both sections share.
+  - **UnityPy.** The queue keeps the `unitypy` answer of the worker's `engine_info` beside its
+    version (`AppState::engine_unitypy`), so Settings reads it without asking the worker again.
+    It shows "not known yet" until a worker has answered.
+  - **The tools are checked as typed.** `get_import_tools` checks assimp and the Unreal Editor
+    at the paths in the form, saved or not, as Game export checks Blender.
+  - **Clear.** `get_import_cache` gives the cache folder's size (every file below it, following
+    no symlink), and `clear_import_cache` deletes everything below the folder, keeping it, and
+    returns the size after. Clear is refused while a run of this process executes: each run
+    holds the engine's `cache_use` lock shared, and Clear takes it exclusively without waiting.
+    An entry it can't delete fails the clear, naming it, after the rest are deleted.
+  - **Known gap: one process.** Clear sees only its own process's runs. Another OpenDAM
+    process on the same machine shares `~/.cache/opendam/import`, so clearing in one can remove
+    files a build in the other is reading.
+  - **Missing tools, as built before.** The import dialog and the step editor already show a
+    step whose tool is missing with the reason: `unity_glb` off and locked off (R46), and
+    `export_unreal` locked on, its build failing with the reason (R47).
 
 ## Problem
 
@@ -1104,12 +1133,14 @@ half manifest.
 ### Settings
 
 - **Import tools section.** It holds Blender (the existing setting and status), the assimp
-  path (default `assimp` on `PATH`), the Unreal Editor root (`import.unrealEditorRoot`, R47,
-  default `~/Applications/UnrealEngine`, checked for `Engine/Binaries/Linux/UnrealEditor`), the
-  two memory caps, and the conversion cache's size with Clear.
+  path (`import.assimpPath`, R51, default `assimp` on `PATH`), the Unreal Editor root
+  (`import.unrealEditorRoot`, R47, default `~/Applications/UnrealEngine`, checked for
+  `Engine/Binaries/Linux/UnrealEditor`), the two memory caps, and the conversion cache's size
+  with Clear, refused while an import run executes (R51).
 - **UnityPy.** It ships in the preview engine, and the worker's `engine_info` reports whether
   it imports.
 - **Missing tools.** A step whose tool is missing is shown disabled, with the reason (D17).
+  assimp is the exception: only some FBX files need it, so it disables no step (R51).
 
 ### UI
 

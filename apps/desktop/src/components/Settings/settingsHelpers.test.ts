@@ -1,15 +1,23 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  absoluteProblem,
   blenderLine,
+  cacheLine,
+  capProblem,
   claudePlanLines,
   exportSettingsPatch,
   ignoredOverridesNote,
+  importBlenderLine,
+  importSettingsPatch,
+  importSettingsProblem,
   isKnownModel,
   parseNumberInput,
   rootCollectionOptions,
   settingsPatch,
+  toolLine,
+  unityPyLine,
 } from './settingsHelpers';
-import type { AiSettings, ClaudePlanStatus, Collection } from '../../types';
+import type { AiSettings, ClaudePlanStatus, Collection, ImportSettings } from '../../types';
 
 const saved: AiSettings = {
   anthropic: {
@@ -161,5 +169,120 @@ describe('rootCollectionOptions', () => {
     ]);
 
     expect(options.map((c) => c.id)).toEqual(['art', 'dg']);
+  });
+});
+
+const importSaved: ImportSettings = {
+  blenderMemoryMax: null,
+  unrealMemoryMax: '24G',
+  unrealEditorRoot: null,
+  assimpPath: null,
+};
+
+describe('importSettingsPatch', () => {
+  test('is null when nothing changed, blanks included', () => {
+    expect(importSettingsPatch(importSaved, { ...importSaved })).toBeNull();
+    expect(importSettingsPatch(importSaved, { ...importSaved, assimpPath: '  ' })).toBeNull();
+  });
+
+  test('holds the changed fields trimmed, and clears an emptied one', () => {
+    const draft = {
+      ...importSaved,
+      blenderMemoryMax: ' 16G ',
+      unrealMemoryMax: '',
+      unrealEditorRoot: '/opt/UnrealEngine',
+    };
+    expect(importSettingsPatch(importSaved, draft)).toEqual({
+      blenderMemoryMax: '16G',
+      unrealMemoryMax: null,
+      unrealEditorRoot: '/opt/UnrealEngine',
+    });
+  });
+});
+
+describe('capProblem', () => {
+  test('accepts what systemd reads, and an empty field for the default', () => {
+    for (const ok of [null, '', ' ', '12G', '512M', '1T', '2048', '010K']) {
+      expect(capProblem(ok)).toBeNull();
+    }
+  });
+
+  test('refuses a zero cap, a unit alone, decimals and other words', () => {
+    for (const bad of ['0G', '000', 'G', '1.5G', '12GB', '12g', 'lots', '-1G']) {
+      expect(capProblem(bad)).toBe('Give a size such as 12G (K, M, G or T)');
+    }
+  });
+});
+
+describe('absoluteProblem', () => {
+  test('accepts an absolute path or nothing', () => {
+    expect(absoluteProblem(null)).toBeNull();
+    expect(absoluteProblem('')).toBeNull();
+    expect(absoluteProblem(' /usr/bin/assimp ')).toBeNull();
+    expect(absoluteProblem('bin/assimp')).toBe('Give an absolute path, starting with /');
+    expect(absoluteProblem('~/Applications/UnrealEngine')).not.toBeNull();
+  });
+});
+
+describe('importSettingsProblem', () => {
+  test('names the first field that cannot be saved', () => {
+    expect(importSettingsProblem(importSaved)).toBeNull();
+    expect(
+      importSettingsProblem({ ...importSaved, unrealMemoryMax: '0G', assimpPath: 'assimp' })
+    ).toBe("The Unreal Editor's memory cap: Give a size such as 12G (K, M, G or T)");
+    expect(importSettingsProblem({ ...importSaved, assimpPath: 'assimp' })).toBe(
+      "assimp's path: Give an absolute path, starting with /"
+    );
+  });
+});
+
+describe('toolLine', () => {
+  test('names the version and path, else why there is none', () => {
+    expect(toolLine('assimp', { path: '/usr/bin/assimp', version: '6.0', problem: null })).toBe(
+      'assimp 6.0 at /usr/bin/assimp'
+    );
+    const why = 'Exporting from Unreal needs the Unreal Editor: no editor at /x';
+    expect(toolLine('Unreal Editor', { path: null, version: null, problem: why })).toBe(why);
+    expect(toolLine('assimp', { path: null, version: null, problem: null })).toBe(
+      'assimp not found'
+    );
+  });
+});
+
+describe('unityPyLine', () => {
+  test('says whether UnityPy imports, or that the engine has not said yet', () => {
+    expect(unityPyLine(true)).toBe('UnityPy imports in the preview engine');
+    expect(unityPyLine(false)).toContain("UnityPy can't be imported");
+    expect(unityPyLine(null)).toContain('Not known yet');
+  });
+});
+
+describe('cacheLine', () => {
+  test('gives the size and where the cache is', () => {
+    const path = '/home/me/.cache/opendam/import';
+    expect(cacheLine({ path, bytes: 0 })).toBe(`Conversion cache: Empty, at ${path}`);
+    expect(cacheLine({ path, bytes: 3 * 1024 * 1024 })).toBe(`Conversion cache: 3.0MB, at ${path}`);
+  });
+});
+
+describe('importBlenderLine', () => {
+  const found = {
+    series: '5.2',
+    path: '/usr/bin/blender',
+    version: '5.2.2',
+    accepted: true,
+    problem: null,
+  };
+
+  test("shows the check's answer, else its error", () => {
+    expect(importBlenderLine(found, null, null)).toBe('Blender 5.2.2 at /usr/bin/blender');
+    expect(importBlenderLine(null, 'IPC failed', null)).toBe('IPC failed');
+  });
+
+  test('waits for the check, unless Blender’s path never loaded, which it says', () => {
+    expect(importBlenderLine(null, null, null)).toBe('Checking Blender…');
+    expect(importBlenderLine(null, null, 'database is locked')).toBe(
+      "Not checked: Blender's path couldn't be loaded (database is locked)"
+    );
   });
 });

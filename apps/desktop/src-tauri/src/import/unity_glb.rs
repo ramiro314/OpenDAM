@@ -118,6 +118,7 @@ pub struct Tools {
     pub memory_max: String,
     /// The import's cache folder: `glb/` for the GLBs, `work/` for the work copies.
     pub cache_dir: PathBuf,
+    /// `import.assimpPath`, else `assimp` on `PATH`.
     pub assimp: String,
     /// The systemd tools Blender's scope runs through.
     pub systemd: capped::Systemd,
@@ -138,18 +139,15 @@ impl Tools {
                 None
             }
         };
-        let memory_max = match super::settings::load(master).await {
-            Ok(settings) => settings.blender_memory_max(),
-            Err(e) => {
-                tracing::warn!("Could not read the import settings: {e}");
-                DEFAULT_MEMORY_MAX.to_string()
-            }
-        };
+        let settings = super::settings::load(master).await.unwrap_or_else(|e| {
+            tracing::warn!("Could not read the import settings: {e}");
+            Default::default()
+        });
         Tools {
             blender_path,
-            memory_max,
+            memory_max: settings.blender_memory_max(),
             cache_dir,
-            assimp: "assimp".into(),
+            assimp: settings.assimp(),
             systemd: capped::Systemd::default(),
             worker,
         }

@@ -34,6 +34,7 @@ use super::records::{
     TargetRefused,
 };
 use super::scan::{self, Scan};
+use super::tools;
 use super::unity_glb;
 use super::unreal_glb;
 use crate::db::{Database, LibraryHandle};
@@ -138,6 +139,9 @@ pub struct Engine {
     lock_wait: Duration,
     /// The conversion cache (`unity_glb::default_cache_dir`).
     cache_dir: PathBuf,
+    /// Held shared by each run while it executes, and exclusively by Clear, so the cache is
+    /// never cleared under a run.
+    cache_use: tokio::sync::RwLock<()>,
     /// The preview queue's worker, which rewrites binary Unity files for the convert phase.
     worker: mpsc::Sender<WorkerRequest>,
     /// The systemd tools a test runs Blender's scope through.
@@ -184,6 +188,7 @@ impl Engine {
             hooks: Hooks::default(),
             lock_wait,
             cache_dir,
+            cache_use: tokio::sync::RwLock::new(()),
             worker,
             #[cfg(test)]
             systemd: Mutex::new(None),
@@ -430,6 +435,7 @@ impl Engine {
     }
 
     async fn execute(&self, library: &LibraryHandle, run: Queued) {
+        let _cache = self.cache_use.read().await;
         let control = Arc::new(RunControl::default());
         let cancelled_before = self
             .pending_cancels
@@ -976,6 +982,35 @@ impl Engine {
             }
         }
         Ok(steps)
+    }
+
+    /// The conversion cache's folder and size.
+    pub async fn conversion_cache(&self) -> Result<tools::CacheStatus, String> {
+        let dir = self.cache_dir.clone();
+        let bytes = tokio::task::spawn_blocking({
+            let dir = dir.clone();
+            move || tools::cache_size(&dir)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(tools::CacheStatus {
+            path: dir.display().to_string(),
+            bytes,
+        })
+    }
+
+    /// Empties the conversion cache, refused while a run executes, and returns its size after.
+    pub async fn clear_conversion_cache(&self) -> Result<tools::CacheStatus, String> {
+        let _clearing = self.cache_use.try_write().map_err(|_| {
+            "An import is running, and its build reads the conversion cache: clear it once the \
+             run ends"
+                .to_string()
+        })?;
+        let dir = self.cache_dir.clone();
+        tokio::task::spawn_blocking(move || tools::clear_cache(&dir))
+            .await
+            .map_err(|e| e.to_string())??;
+        self.conversion_cache().await
     }
 
     /// What a run's convert phase runs with, from Settings now.
@@ -1983,6 +2018,41 @@ mod tests {
         );
         assert!(!s.dir.path().join("A").exists() && !s.dir.path().join("B").exists());
         s.other_asset_untouched().await;
+    }
+
+    #[tokio::test]
+    async fn clear_empties_the_conversion_cache_but_never_under_a_run() {
+        let s = setup().await;
+        let glb = s.cache.path().join("glb");
+        std::fs::create_dir_all(&glb).unwrap();
+        std::fs::write(glb.join("k.glb"), [0u8; 64]).unwrap();
+        let cache = s.engine.conversion_cache().await.unwrap();
+        assert_eq!(
+            (cache.path.as_str(), cache.bytes),
+            (s.cache.path().to_str().unwrap(), 64)
+        );
+
+        let pause = s.engine.hooks().pause(Point::Staged);
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        pause.reached.notified().await;
+        let refused = s.engine.clear_conversion_cache().await.unwrap_err();
+        assert!(refused.contains("An import is running"), "{refused}");
+        assert!(glb.join("k.glb").exists());
+        pause.release.notify_one();
+        s.wait_for(&run.id, "done").await;
+
+        // The run records `done` just before its `execute` lets go of the cache
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let cleared = loop {
+            match s.engine.clear_conversion_cache().await {
+                Ok(cleared) => break cleared,
+                Err(e) if std::time::Instant::now() > deadline => panic!("{e}"),
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        assert_eq!(cleared.bytes, 0);
+        assert!(s.cache.path().is_dir());
+        assert_eq!(std::fs::read_dir(s.cache.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

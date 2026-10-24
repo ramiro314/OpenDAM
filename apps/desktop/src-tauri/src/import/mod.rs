@@ -11,6 +11,7 @@ pub mod records;
 pub mod recovery;
 pub mod scan;
 pub mod settings;
+pub mod tools;
 pub mod unity_glb;
 pub mod unitypackage;
 pub mod unreal_glb;

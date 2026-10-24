@@ -134,45 +134,51 @@ impl Tools {
     /// The editor below the root, with its version from `Engine/Build/Build.version`, or why
     /// the step can't run here.
     pub fn editor(&self) -> Result<Editor, String> {
-        use std::os::unix::fs::PermissionsExt;
-        let needs = |why: String| format!("Exporting from Unreal needs the Unreal Editor: {why}");
-        let program = self.editor_root.join(EDITOR);
-        let runs = std::fs::metadata(&program)
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
-        if !runs {
-            return Err(needs(format!(
-                "no editor at {} (set its folder in Settings)",
-                program.display()
-            )));
-        }
-        let file = self.editor_root.join(BUILD_VERSION);
-        let read = std::fs::read(&file)
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| {
-                serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string())
-            });
-        let version = read.ok().and_then(|v| {
-            let part = |key: &str| v[key].as_u64();
-            let mut version = format!(
-                "{}.{}.{}",
-                part("MajorVersion")?,
-                part("MinorVersion")?,
-                part("PatchVersion")?
-            );
-            if let Some(change) = part("Changelist") {
-                version.push_str(&format!("+{change}"));
-            }
-            Some(version)
-        });
-        let version = version
-            .ok_or_else(|| needs(format!("its version can't be read from {}", file.display())))?;
-        Ok(Editor { program, version })
+        editor(&self.editor_root)
     }
 
     /// Why the step can't run here, `None` when it can.
     pub fn unavailable(&self) -> Option<String> {
         self.editor().err()
     }
+}
+
+/// The editor below `root`, with its version from `Engine/Build/Build.version`, or why the
+/// step can't run with it.
+pub fn editor(root: &Path) -> Result<Editor, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let needs = |why: String| format!("Exporting from Unreal needs the Unreal Editor: {why}");
+    let program = root.join(EDITOR);
+    let runs = std::fs::metadata(&program)
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+    if !runs {
+        return Err(needs(format!(
+            "no editor at {} (set its folder in Settings)",
+            program.display()
+        )));
+    }
+    let file = root.join(BUILD_VERSION);
+    let read = std::fs::read(&file)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string())
+        });
+    let version = read.ok().and_then(|v| {
+        let part = |key: &str| v[key].as_u64();
+        let mut version = format!(
+            "{}.{}.{}",
+            part("MajorVersion")?,
+            part("MinorVersion")?,
+            part("PatchVersion")?
+        );
+        if let Some(change) = part("Changelist") {
+            version.push_str(&format!("+{change}"));
+        }
+        Some(version)
+    });
+    let version = version
+        .ok_or_else(|| needs(format!("its version can't be read from {}", file.display())))?;
+    Ok(Editor { program, version })
 }
 
 fn extension(path: &str) -> Option<&str> {
