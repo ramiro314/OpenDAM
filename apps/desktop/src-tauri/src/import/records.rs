@@ -113,6 +113,67 @@ pub async fn runs(pool: &Pool<Sqlite>, library_id: &str) -> sqlx::Result<Vec<Run
     Ok(rows.into_iter().map(|r| summary(library_id, r)).collect())
 }
 
+/// An import as the Imports view lists it: its original and its packs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSummary {
+    pub id: String,
+    pub library_id: String,
+    /// Absolute.
+    pub original_path: String,
+    pub kind: String,
+    pub created_at: i64,
+    pub packs: Vec<PackSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackSummary {
+    pub id: String,
+    /// Relative to the library root.
+    pub target: String,
+    pub preset: String,
+    /// `built`, `failed` or `never_built`.
+    pub status: String,
+    pub built_at: Option<i64>,
+}
+
+/// The library's imports, newest first, each with its packs by target.
+pub async fn imports(pool: &Pool<Sqlite>, library_id: &str) -> sqlx::Result<Vec<ImportSummary>> {
+    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT id, original_path, kind, created_at FROM imports
+         ORDER BY created_at DESC, rowid DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    let packs: Vec<(String, String, String, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT import_id, id, target, preset, status, built_at FROM import_packs ORDER BY target",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, original_path, kind, created_at)| ImportSummary {
+            packs: packs
+                .iter()
+                .filter(|p| p.0 == id)
+                .map(|(_, id, target, preset, status, built_at)| PackSummary {
+                    id: id.clone(),
+                    target: target.clone(),
+                    preset: preset.clone(),
+                    status: status.clone(),
+                    built_at: *built_at,
+                })
+                .collect(),
+            id,
+            library_id: library_id.to_string(),
+            original_path,
+            kind,
+            created_at,
+        })
+        .collect())
+}
+
 /// A run's owner: the process that queued it, then the one that runs it.
 pub type Owner = crate::watcher::ProcessIdentity;
 

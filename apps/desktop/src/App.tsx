@@ -11,6 +11,8 @@ import { RunsPanel } from './components/Autotag/RunsPanel';
 import { AutotagDialog } from './components/Autotag/AutotagDialog';
 import { ReviewModal } from './components/Autotag/ReviewModal';
 import { FolderActionDialog } from './components/FolderActions';
+import { ImportsPanel } from './components/Imports/ImportsPanel';
+import { ImportDialog } from './components/Imports/ImportDialog';
 import { IconCheck } from './components/Icons';
 import { PanelResizer } from './components/PanelResizer/PanelResizer';
 import { useUIStore } from './store';
@@ -27,7 +29,8 @@ import {
   useFolderActionStore,
   lookupAsset,
 } from './store';
-import type { AutotagUpdate } from './types';
+import { useImportStore } from './store/imports';
+import type { AutotagUpdate, ImportProgress, ImportRun } from './types';
 import { api } from './api';
 import { startModelThumbnailer } from './preview/modelThumbnailer';
 import { onPreviewDone, type PreviewDone } from './preview/previewDone';
@@ -47,6 +50,7 @@ export default function App() {
   const fetchCollections = useCollectionStore((s) => s.fetchCollections);
   const search = useAssetStore((s) => s.search);
   const runsPanelOpen = useAutotagStore((s) => s.runsPanelOpen);
+  const importsPanelOpen = useImportStore((s) => s.panelOpen);
   const autotagTarget = useAutotagStore((s) => s.dialogTarget);
   const openAutotagDialog = useAutotagStore((s) => s.openAutotagDialog);
   const folderFailure = useFolderActionStore((s) => s.failure);
@@ -62,7 +66,11 @@ export default function App() {
 
   useEffect(() => {
     // Bootstrap data on mount
-    Promise.all([fetchLibraries(), fetchTags(), fetchCollections()]).then(() => search());
+    Promise.all([fetchLibraries(), fetchTags(), fetchCollections()]).then(() => {
+      search();
+      const libraryIds = useLibraryStore.getState().libraries.map((l) => l.id);
+      useImportStore.getState().fetch(libraryIds).catch(console.error);
+    });
 
     // Real-time preview updates from background engine
     const unlistenDone = listen<PreviewDone>('preview:done', (event) =>
@@ -83,6 +91,14 @@ export default function App() {
     const unlistenAutotag = listen<AutotagUpdate>('autotag:updated', (event) => {
       useAutotagStore.getState().applyUpdate(event.payload);
     });
+
+    // Import runs: each run's changes, and its build's progress
+    const unlistenImport = listen<ImportRun>('import:updated', (event) =>
+      useImportStore.getState().applyUpdate(event.payload)
+    );
+    const unlistenImportProgress = listen<ImportProgress>('import:progress', (event) =>
+      useImportStore.getState().applyProgress(event.payload)
+    );
 
     // Live counts follow the results: once per search or refresh, like the total
     const stopLiveCounts = useAssetStore.subscribe((s, prev) => {
@@ -228,6 +244,8 @@ export default function App() {
       unlistenError.then((fn) => fn());
       unlistenLib.then((fn) => fn());
       unlistenAutotag.then((fn) => fn());
+      unlistenImport.then((fn) => fn());
+      unlistenImportProgress.then((fn) => fn());
       stopModelThumbnailer();
       stopLiveCounts();
       window.removeEventListener('keydown', handleKeyDown);
@@ -283,6 +301,8 @@ export default function App() {
       {/* Spacebar Quick Look Modal */}
       <QuickLookModal asset={focusedAsset} isOpen={quickLookOpen} />
       {runsPanelOpen && <RunsPanel />}
+      {importsPanelOpen && <ImportsPanel />}
+      <ImportDialog />
       {reviewRunId && <ReviewModal key={reviewRunId} runId={reviewRunId} />}
       {autotagTarget && (
         <AutotagDialog target={autotagTarget} onClose={() => openAutotagDialog(null)} />

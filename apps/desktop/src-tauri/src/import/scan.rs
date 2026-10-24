@@ -69,6 +69,9 @@ pub struct Candidate {
     pub publisher: String,
     /// The default target, relative to the library root.
     pub target: String,
+    /// Whether the default target is `<Publisher>/<Pack>`, so it moves when you change the
+    /// publisher (Unity and Fab), or stays as it is (Kenney's `<Category>/<Pack>`, a zip's `<Pack>`).
+    pub target_follows_publisher: bool,
     /// Why the library refuses the target, if it does: it exists, or nests with another pack's.
     pub target_error: Option<String>,
     /// A Fab pack's variants, else none. At most one is ticked.
@@ -201,6 +204,25 @@ fn preview(listing: Result<Extraction>, place: &[PlaceStep], convert: bool) -> T
     }
 }
 
+/// The tree of one source of `original`, of kind `kind`, placed by `place`: what the import
+/// dialog shows once you change a candidate's place steps. The source is a `.unitypackage`'s
+/// `subpath`, or a zip's `variant` package (and its `subpath`), else the zip's `subpath`. A
+/// package's tree counts the GLBs `unity_glb` would write, as `detect`'s do.
+pub fn preview_source(
+    original: &Path,
+    kind: &str,
+    variant: Option<&str>,
+    subpath: Option<&str>,
+    place: &[PlaceStep],
+) -> Tree {
+    let listing = match (kind, variant) {
+        ("unitypackage", _) => list_unitypackage(original, subpath),
+        (_, Some(variant)) => list_variant(original, variant, subpath),
+        (_, None) => index_zip(original).and_then(|index| index.list(subpath)),
+    };
+    preview(listing, place, kind == "unitypackage" || variant.is_some())
+}
+
 /// The files of `extraction` below `folder`, relative to it, as a listing with that sub-folder
 /// would give them, and every skipped entry. A package listed with a sub-folder reports every
 /// skipped entry too, but a nested package's only when it lies in the sub-folder (plan Known
@@ -330,6 +352,7 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
                 preset: "unity",
                 publisher,
                 target_error: None,
+                target_follows_publisher: true,
                 variants: Vec::new(),
                 steps,
             }],
@@ -359,6 +382,7 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
             preset: "none",
             publisher: publisher.to_string(),
             target_error: None,
+            target_follows_publisher: false,
             variants: Vec::new(),
             steps,
         }],
@@ -450,6 +474,7 @@ fn fab(original: &Path, zip: &Extraction, name: &str, publisher: &str) -> Option
             publisher: publisher.to_string(),
             target: publisher_target(publisher, name),
             target_error: None,
+            target_follows_publisher: true,
             variants,
             steps,
             tree,
@@ -533,6 +558,7 @@ fn kenney(index: &ZipIndex, zip: &Extraction, name: &str) -> Option<Offer> {
                 publisher: "Kenney".into(),
                 target: target.to_string(),
                 target_error: None,
+                target_follows_publisher: false,
                 variants: Vec::new(),
                 steps: vec![
                     step("extract_zip", source(None, subpath)),
@@ -1161,5 +1187,30 @@ mod tests {
         ] {
             assert_eq!(pipeline(name), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn only_unity_and_fab_targets_follow_the_publisher() {
+        let follows = |name: &str, kind: &str| {
+            detect(&fixture(name), kind, "Pub")
+                .unwrap()
+                .into_iter()
+                .flat_map(|o| {
+                    o.candidates
+                        .into_iter()
+                        .map(move |c| (o.layout, c.target_follows_publisher, c.target))
+                })
+                .collect::<Vec<_>>()
+        };
+        let unity = follows("synthetic.unitypackage", "unitypackage");
+        assert_eq!(unity, [("unity", true, "Pub/synthetic".to_string())]);
+        let fab = follows("fab-unity.zip", "zip");
+        assert_eq!(fab[0], ("fab", true, "Pub/fab-unity".to_string()));
+        assert_eq!(fab[1], ("zip", false, "fab-unity".to_string()));
+        let kenney = follows("kenney.zip", "zip");
+        assert!(kenney.iter().all(|(_, f, _)| !f), "{kenney:?}");
+        assert!(kenney
+            .iter()
+            .any(|(l, _, t)| *l == "kenney" && t == "3D assets/Fixture Car Kit"));
     }
 }

@@ -534,6 +534,12 @@ async fn swap_in(
     if !env.control.lock() {
         return Err(cleanup.run(Stop::Cancelled).await);
     }
+    // Past Cancel: the Imports view's Cancel reads "Finishing, can't cancel now" from here on.
+    (env.progress)(Progress {
+        step: "re-checking",
+        done: 0,
+        total: 0,
+    });
 
     // ── 2. Re-check ─────────────────────────────────────────────────────
     if !plainly_inside(&env.library.root_path, &live) {
