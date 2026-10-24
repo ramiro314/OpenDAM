@@ -403,6 +403,88 @@ async fn a_carried_file_takes_a_displaced_previous_only_row_s_path_but_not_its_t
     s.tree_untouched().await;
 }
 
+/// The newly-included cases: the nested package's `T_Rock.png` (C) excluded and built, the
+/// root's `T_Rock.png` (A) tagged `a`, then an edit that turns C's exclude off, excludes A and
+/// hoists C to the root, where A's row is. C is new to that build, so no row is carried to it.
+/// Returns A's id.
+async fn include_over(s: &Setup, pack_id: &str) -> String {
+    let c = s.source_of(&format!("{HOUSES_ART}/T_Rock.png")).await;
+    s.edit_steps(pack_id, |steps| {
+        add(steps, PlaceStep::Exclude { source: c })
+    })
+    .await;
+    s.rebuild_until(pack_id, "done").await;
+    let a = s.tag("T_Rock.png", "a").await;
+    let rock = s.source_of("T_Rock.png").await;
+    s.edit_steps(pack_id, |steps| {
+        toggle(steps, "exclude", false);
+        toggle(steps, "hoist", false);
+        add(steps, PlaceStep::Exclude { source: rock });
+        add(
+            steps,
+            PlaceStep::Hoist {
+                folder: HOUSES_ART.into(),
+            },
+        );
+    })
+    .await;
+    a
+}
+
+#[tokio::test]
+async fn a_newly_included_file_takes_a_previous_only_row_s_path_but_not_its_row() {
+    let s = setup().await;
+    let pack_id = s.import_golden().await;
+    let a = include_over(&s, &pack_id).await;
+    s.rebuild_until(&pack_id, "done").await;
+
+    let rows = s.rows().await;
+    assert!(!rows.contains_key(&a), "the excluded file's row is pruned");
+    let at_root = s.id_at("T_Rock.png").await;
+    assert_ne!(at_root, a);
+    assert_eq!(
+        rows[&at_root].1,
+        Vec::<String>::new(),
+        "a fresh row, no tags"
+    );
+    assert_eq!(
+        s.count(
+            "SELECT COUNT(*) FROM asset_tags t JOIN assets a ON a.id = t.asset_id
+             WHERE t.tag_id = 'a'"
+        )
+        .await,
+        0
+    );
+    s.settled().await;
+    s.tree_untouched().await;
+}
+
+#[tokio::test]
+async fn a_newly_included_file_then_a_failing_index_puts_the_displaced_row_back() {
+    let s = setup().await;
+    let pack_id = s.import_golden().await;
+    let a = include_over(&s, &pack_id).await;
+    let (build, rows, tree) = (s.current_build().await, s.rows().await, on_disk(&s.live()));
+
+    let pause = fail_at_index(&s).await;
+    let run = s.rebuild(&pack_id).await;
+    reached(&pause).await;
+    assert_ne!(
+        s.rows().await[&a].0,
+        in_pack("T_Rock.png"),
+        "moved aside before the index"
+    );
+    pause.release.notify_one();
+
+    s.wait_for(&run.id, "failed").await;
+    assert_eq!(on_disk(&s.live()), tree);
+    assert_eq!(s.current_build().await, build);
+    assert_eq!(s.rows().await, rows);
+    assert_eq!(rows[&a], (in_pack("T_Rock.png"), vec!["a".to_string()]));
+    s.settled().await;
+    s.tree_untouched().await;
+}
+
 /// Pauses the next build at step 5 after its index, then fails it there, so it rolls back.
 async fn fail_at_index(s: &Setup) -> Arc<build::Pause> {
     let pause = s.engine.hooks().pause(Point::Indexed);

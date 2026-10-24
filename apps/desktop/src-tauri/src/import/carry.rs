@@ -11,9 +11,12 @@
 //!   in the transaction of its aside, 200 at a time, before any row is placed.
 //! - **Place.** Each row then goes from its holding path to its new path.
 //!
-//! A row already at a carried file's new path belongs to a file the new build doesn't have there,
-//! which the settle would prune anyway. It is moved aside too (journaled as `moved` to its holding
-//! path) and stays there, so the settle deletes it and a rollback puts it back. So no carry is
+//! A row at a path of the new build whose file there has another file key than the previous
+//! build's file there, or where the previous build had none, belongs to a file the new build
+//! doesn't have there: a previous-only file, or one that moved and is carried itself. One that
+//! isn't moving is moved aside too (journaled as `moved` to its holding path) and stays there, so
+//! the settle deletes it and a rollback puts it back. That covers the paths of carried files and
+//! of files new to this build alike (one whose `exclude` was turned off, say). So no carry is
 //! skipped, and no file takes over another file's row.
 
 use std::collections::HashSet;
@@ -51,14 +54,13 @@ pub async fn carry(
     prev: &str,
     build_id: &str,
 ) -> sqlx::Result<()> {
-    // Each moved file's row, and the row now at its new path, if any.
-    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT a.id, p.path, n.path, d.id FROM import_outputs p
+    // Each moved file's row.
+    let carried: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT a.id, p.path, n.path FROM import_outputs p
          JOIN import_outputs n ON n.pack_id = p.pack_id AND n.build_id = ?3
              AND n.source_path = p.source_path
              AND (n.origin = 'generated') = (p.origin = 'generated')
          JOIN assets a ON a.file_path = p.path
-         LEFT JOIN assets d ON d.file_path = n.path
          WHERE p.pack_id = ?1 AND p.build_id = ?2 AND p.source_path IS NOT NULL
              AND p.path != n.path
          ORDER BY p.path",
@@ -68,24 +70,40 @@ pub async fn carry(
     .bind(build_id)
     .fetch_all(pool)
     .await?;
-    let moving: HashSet<&str> = rows.iter().map(|(id, ..)| id.as_str()).collect();
-    let mut moves = Vec::with_capacity(rows.len());
-    for (asset_id, from, to, at_to) in &rows {
-        if let Some(displaced) = at_to.as_deref().filter(|d| !moving.contains(d)) {
-            moves.push(Move {
-                asset_id: displaced.to_string(),
-                from: to.clone(),
-                to: holding(target, displaced),
-                placed: false,
-            });
-        }
-        moves.push(Move {
-            asset_id: asset_id.clone(),
+    // Each row at a path of the new build that the previous build's same file didn't hold.
+    let occupied: Vec<(String, String)> = sqlx::query_as(
+        "SELECT d.id, n.path FROM import_outputs n
+         JOIN assets d ON d.file_path = n.path
+         LEFT JOIN import_outputs p ON p.pack_id = n.pack_id AND p.build_id = ?2
+             AND p.path = n.path
+         WHERE n.pack_id = ?1 AND n.build_id = ?3
+             AND (p.path IS NULL OR p.source_path IS NOT n.source_path
+                 OR (p.origin = 'generated') != (n.origin = 'generated'))
+         ORDER BY n.path",
+    )
+    .bind(pack_id)
+    .bind(prev)
+    .bind(build_id)
+    .fetch_all(pool)
+    .await?;
+    let moving: HashSet<&str> = carried.iter().map(|(id, ..)| id.as_str()).collect();
+    let displaced = occupied
+        .iter()
+        .filter(|(id, _)| !moving.contains(id.as_str()))
+        .map(|(id, path)| Move {
+            asset_id: id.clone(),
+            from: path.clone(),
+            to: holding(target, id),
+            placed: false,
+        });
+    let moves: Vec<Move> = displaced
+        .chain(carried.iter().map(|(id, from, to)| Move {
+            asset_id: id.clone(),
             from: from.clone(),
             to: to.clone(),
             placed: true,
-        });
-    }
+        }))
+        .collect();
 
     let mut seq = 0;
     for chunk in moves.chunks(BATCH) {

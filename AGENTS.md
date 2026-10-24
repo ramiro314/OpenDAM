@@ -130,9 +130,11 @@ docs/plans                    Plans for this fork
   keeping its id, metadata and `modified_at`. It runs in two passes, so the order of the moves
   never matters, not even for a swap of two names: every moving row goes aside to
   `<pack>/.opendam-carry/<asset id>`, journaled as `moved` in `import_moves` in the same
-  transaction, then each is placed. A row already at a carried file's new path belongs to a file
-  the new build doesn't have there: it is moved aside too and stays there, so the settle prunes
-  it and a rollback puts it back, and no file takes over another file's row. The index's inserted
+  transaction, then each is placed. A row at any path of the new build that the previous build's
+  same file didn't hold (a carried file's new path, or that of a file new to this build) belongs
+  to a file the new build doesn't have there: unless it is moving itself, it is moved aside too
+  and stays there, so the settle prunes it and a rollback puts it back, and no file takes over
+  another file's row. The index's inserted
   rows are journaled as `inserted`. A rollback deletes the inserted rows, then reverses the moves
   by asset id in the same two passes, so neither a rebuild nor its rollback loses metadata.
 - **Pruning waits for the commit.** `Prune::Defer` deletes no row, runs no structure pass, and
