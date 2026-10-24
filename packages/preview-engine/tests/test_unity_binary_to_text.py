@@ -231,6 +231,25 @@ def test_a_file_unitypy_can_t_read_answers_why_and_writes_nothing(tmp_path):
     assert not output.exists()
 
 
+def test_an_error_without_a_message_is_named_by_its_type(tmp_path, monkeypatch):
+    def fail(source):
+        raise KeyError()
+
+    monkeypatch.setattr(unity_text, "to_text", fail)
+    monkeypatch.setitem(sys.modules, "unity_text", unity_text)
+
+    result = worker.unity_binary_to_text(str(tmp_path / "M.mat"), str(tmp_path / "0.txt"))
+
+    assert result == {"ok": False, "error": "UnityPy can't read it: KeyError"}
+
+
+def test_engine_info_finds_unitypy_without_importing_it(monkeypatch):
+    monkeypatch.delitem(sys.modules, "UnityPy", raising=False)
+
+    assert worker.engine_info()["unitypy"] is True
+    assert "UnityPy" not in sys.modules
+
+
 def test_without_unitypy_the_request_and_engine_info_say_so(tmp_path, monkeypatch):
     # A `None` entry makes `import UnityPy` raise ImportError.
     monkeypatch.setitem(sys.modules, "UnityPy", None)

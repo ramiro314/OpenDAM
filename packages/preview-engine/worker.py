@@ -23,6 +23,7 @@ Phase 2 will add:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import subprocess
@@ -1278,21 +1279,22 @@ def unity_binary_to_text(source: str, output: str) -> dict:
         Path(output).write_text(text, encoding="utf-8")
         return {"ok": True, "output": output}
     except Exception as e:
-        return {"ok": False, "error": f"UnityPy can't read it: {e or type(e).__name__}"}
+        return {"ok": False, "error": f"UnityPy can't read it: {str(e) or type(e).__name__}"}
 
 
 # ── JSON-RPC loop ─────────────────────────────────────────────────────────
 def unitypy_imports() -> bool:
+    """Whether UnityPy can be imported, found without running the import, so `engine_info`
+    still loads nothing within the app's deadline for it."""
     try:
-        import UnityPy  # noqa: F401
-    except Exception:
+        return importlib.util.find_spec("UnityPy") is not None
+    except ImportError, ValueError:
         return False
-    return True
 
 
 def engine_info() -> dict:
     """The engine's version, which the app asks each new worker process, and whether UnityPy,
-    which `unity_binary_to_text` needs, imports."""
+    which `unity_binary_to_text` needs, is installed. Loads nothing."""
     return {"preview_version": PREVIEW_VERSION, "unitypy": unitypy_imports()}
 
 
