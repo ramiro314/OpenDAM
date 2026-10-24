@@ -814,4 +814,63 @@ mod tests {
             0
         );
     }
+
+    /// After a run that recorded "Leave it out" for a file and its `.meta` failed, a Restore of
+    /// both turns its own exclude back and brings both back; a Restore of the file with its
+    /// `.meta` left out records the `.meta`'s own exclude, so the `.meta` stays out.
+    #[tokio::test]
+    async fn restore_after_a_failed_rebuild_judges_a_meta_by_the_excludes_it_leaves() {
+        for meta_choice in [Choice::Restore, Choice::Exclude] {
+            let s = setup().await;
+            let pack_id = s.import_golden().await;
+            let log = s.source_of("Textures/T_Log_D.png").await;
+            let meta = s.source_of("Textures/T_Log_D.png.meta").await;
+            for path in ["Textures/T_Log_D.png", "Textures/T_Log_D.png.meta"] {
+                std::fs::remove_file(s.live().join(path)).unwrap();
+            }
+            s.engine.hooks().fail_once(Point::Staged);
+            let run = s.rebuild_choosing(&pack_id, first).await;
+            s.wait_for(&run.id, "failed").await;
+
+            let meta_path = in_pack("Textures/T_Log_D.png.meta");
+            let run = s
+                .rebuild_choosing(&pack_id, |d| {
+                    if d.path == meta_path {
+                        meta_choice
+                    } else {
+                        Choice::Restore
+                    }
+                })
+                .await;
+            s.wait_for(&run.id, "done").await;
+            assert!(
+                s.live().join("Textures/T_Log_D.png").is_file(),
+                "{meta_choice:?}"
+            );
+            assert_eq!(
+                s.live().join("Textures/T_Log_D.png.meta").is_file(),
+                meta_choice == Choice::Restore,
+                "{meta_choice:?}"
+            );
+            let steps = s.engine.pack_steps("lib", &pack_id).await.unwrap().steps;
+            let excludes = |source: &Vec<String>| {
+                steps.iter().any(|st| {
+                    st.kind == "exclude"
+                        && st.enabled
+                        && st.options["source"] == serde_json::json!(source)
+                })
+            };
+            assert!(
+                !excludes(&log),
+                "{meta_choice:?}: the failed run's exclude is turned back"
+            );
+            assert_eq!(
+                excludes(&meta),
+                meta_choice == Choice::Exclude,
+                "{meta_choice:?}"
+            );
+            assert!(s.drift(&pack_id).await.is_empty(), "{meta_choice:?}");
+            s.settled().await;
+        }
+    }
 }

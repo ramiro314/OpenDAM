@@ -695,6 +695,21 @@ pub struct DriftEdits {
 }
 
 impl DriftEdits {
+    /// The source paths (JSON arrays) of the enabled `exclude` steps once these edits are made,
+    /// given the ones enabled now: without those turned back, with those recorded.
+    pub fn excluded_after(
+        &self,
+        now: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        let back: std::collections::HashSet<String> =
+            self.includes.iter().map(|s| source_json(s)).collect();
+        now.iter()
+            .filter(|s| !back.contains(*s))
+            .cloned()
+            .chain(self.excludes.iter().map(|s| source_json(s)))
+            .collect()
+    }
+
     fn is_empty(&self) -> bool {
         self.excludes.is_empty()
             && self.includes.is_empty()
@@ -773,14 +788,18 @@ async fn record_drift_edits(
         .iter()
         .filter_map(|s| serde_json::from_str(s).ok())
         .collect();
-    let all: Vec<&Vec<String>> = excluded.iter().chain(&edits.excludes).collect();
+    // A `.meta` is covered by its asset's exclude as the steps will be: one this Rebuild turns
+    // back covers nothing.
+    let now = excluded.iter().map(|s| source_json(s)).collect();
+    let after = edits.excluded_after(&now);
     let covered = |source: &Vec<String>| {
-        all.iter().any(|other| {
-            let mut meta = (*other).clone();
-            if let Some(last) = meta.last_mut() {
-                last.push_str(".meta");
-            }
-            meta == *source
+        let Some((last, rest)) = source.split_last() else {
+            return false;
+        };
+        last.strip_suffix(".meta").is_some_and(|asset| {
+            let mut asset_source = rest.to_vec();
+            asset_source.push(asset.to_string());
+            after.contains(&source_json(&asset_source))
         })
     };
     let new: Vec<Vec<String>> = edits

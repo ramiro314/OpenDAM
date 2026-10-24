@@ -137,15 +137,22 @@ struct Writes<'a> {
 impl<'a> Writes<'a> {
     fn of(recipe: &'a Recipe, manifest: &[ManifestRow]) -> Self {
         let on = |kind: &str| recipe.steps.iter().any(|(k, _)| k == kind);
-        let models = manifest
-            .iter()
-            .filter(|row| !row.origin.generated())
-            .filter_map(|row| {
-                let (folder, stem, ext) = split(&row.path);
-                ["fbx", "obj"]
-                    .contains(&ext.as_str())
-                    .then(|| (folder.to_string(), stem))
-            })
+        // `unity_glb` writes no GLB where the folder ships one of the model's stem.
+        let stems = |exts: &[&str]| -> HashSet<(String, String)> {
+            manifest
+                .iter()
+                .filter(|row| !row.origin.generated())
+                .filter_map(|row| {
+                    let (folder, stem, ext) = split(&row.path);
+                    exts.contains(&ext.as_str())
+                        .then(|| (folder.to_string(), stem))
+                })
+                .collect()
+        };
+        let shipped = stems(&["glb"]);
+        let models = stems(&["fbx", "obj"])
+            .into_iter()
+            .filter(|stem| !shipped.contains(stem))
             .collect();
         let excluded = recipe
             .steps
@@ -182,8 +189,7 @@ impl<'a> Writes<'a> {
     /// Whether an enabled `exclude` drops the file with the source path `source` (a JSON
     /// array): one of its own, or for a `.meta`, its asset's, which drops the `.meta` too.
     fn leaves_out(&self, source: &str) -> bool {
-        self.excluded.contains(source)
-            || asset_of_meta(source).is_some_and(|a| self.excluded.contains(&a))
+        leaves_out(&self.excluded, source)
     }
 
     fn writes(&self, path: &str) -> bool {
@@ -193,6 +199,12 @@ impl<'a> Writes<'a> {
         let (folder, stem, ext) = split(path);
         self.convert && ext == "glb" && self.models.contains(&(folder.to_string(), stem))
     }
+}
+
+/// Whether the `exclude` steps of the source paths `excluded` (JSON arrays) drop the file with the
+/// source path `source`: its own, or for a `.meta`, its asset's, which drops the `.meta` too.
+fn leaves_out(excluded: &HashSet<String>, source: &str) -> bool {
+    excluded.contains(source) || asset_of_meta(source).is_some_and(|a| excluded.contains(&a))
 }
 
 /// The source path (a JSON array) of the asset whose `.meta` has the source path `source`: its
@@ -468,6 +480,10 @@ pub fn edits(
             .any(|r| r.path == d.path && choices.contains(&r.choice))
     };
     let mut edits = DriftEdits::default();
+    // First the excludes this Rebuild records and the ones it turns back (only its own, one an
+    // uncommitted run recorded), then whether each file restored is left out by the excludes as
+    // they will be: so a `.meta` restored with its asset, whose exclude goes, is restored.
+    let mut restoring = Vec::new();
     for (difference, choice) in pairs(found, chosen) {
         let source = difference.source_path.as_deref();
         match (difference.kind, choice) {
@@ -477,19 +493,13 @@ pub fn edits(
                 }
             }
             (Kind::Extracted, Choice::Restore | Choice::Recipe) => {
-                let Some(source) = source.filter(|s| writes.leaves_out(s)) else {
-                    continue;
-                };
-                if !writes.excluded.contains(source) || !made(difference, &[Choice::Exclude]) {
-                    return Err(format!(
-                        "An exclude step leaves {} out, so it can't be restored: turn that \
-                         step off first, or leave the file out",
-                        difference.path
-                    ));
+                let Some(source) = source else { continue };
+                if writes.excluded.contains(source) && made(difference, &[Choice::Exclude]) {
+                    edits
+                        .includes
+                        .extend(serde_json::from_str::<Vec<String>>(source).ok());
                 }
-                edits
-                    .includes
-                    .extend(serde_json::from_str::<Vec<String>>(source).ok());
+                restoring.push((difference, source));
             }
             (Kind::Package, Choice::MetadataOff | Choice::Keep) => edits.metadata_off = true,
             (Kind::Package, Choice::Restore | Choice::Recipe) if !writes.metadata => {
@@ -504,6 +514,14 @@ pub fn edits(
             }
             _ => {}
         }
+    }
+    let after = edits.excluded_after(&writes.excluded);
+    if let Some((difference, _)) = restoring.iter().find(|(_, s)| leaves_out(&after, s)) {
+        return Err(format!(
+            "An exclude step leaves {} out, so it can't be restored: turn that step off \
+             first, or leave the file out",
+            difference.path
+        ));
     }
     Ok(edits)
 }
@@ -664,5 +682,20 @@ mod tests {
         assert!(!writes.writes("P/Models/Tree.glb"));
         assert!(!writes.writes("P/Rock.glb"));
         assert!(!writes.writes("P/Models/datapackage.json"));
+
+        // A folder that ships the model's GLB gets none from `unity_glb`.
+        let model = |path: &str| ManifestRow {
+            path: path.into(),
+            size: 1,
+            mtime_ns: 1,
+            sha256: String::new(),
+            source_path: Some("[]".into()),
+            origin: Origin::Extracted,
+        };
+        let shipped = Writes::of(
+            &recipe,
+            &[model("P/Models/Rock.fbx"), model("P/Models/rock.glb")],
+        );
+        assert!(!shipped.writes("P/Models/Rock.glb"));
     }
 }
