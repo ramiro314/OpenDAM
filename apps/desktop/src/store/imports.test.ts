@@ -155,6 +155,35 @@ const fabScan: ImportScan = {
   unavailable: {},
 };
 
+const unrealCandidate: ImportCandidate = {
+  name: 'Waterways',
+  ticked: true,
+  preset: 'fab',
+  publisher: 'Studio',
+  target: 'Studio/Waterways',
+  targetError: null,
+  targetFollowsPublisher: true,
+  variants: [],
+  project: 'Feif/Feif.uproject',
+  steps: [
+    { kind: 'export_unreal', enabled: true, options: { batch: 30 } },
+    { kind: 'flatten', enabled: true, options: {} },
+    { kind: 'hoist', enabled: true, options: { folder: 'Meshes' } },
+    { kind: 'metadata', enabled: true, options: { preset: 'fab', publisher: 'Studio' } },
+  ],
+  tree: { ...tree(7), glbs: 4, estimate: true },
+};
+
+const unrealScan: ImportScan = {
+  originalPath: '/dl/Waterways.zip',
+  kind: 'zip',
+  offers: [
+    { layout: 'unreal', candidates: [unrealCandidate] },
+    { layout: 'zip', candidates: [zipCandidate] },
+  ],
+  unavailable: {},
+};
+
 const kenneyScan: ImportScan = {
   originalPath: '/dl/Kenney.zip',
   kind: 'zip',
@@ -570,6 +599,23 @@ describe('the draft', () => {
       license: 'Standard EULA',
     });
 
+    // An Unreal pack asks for its project's export, with no variant or sub-folder.
+    const u = draftFromScan('lib', unrealScan);
+    expect(u.candidates[0].unreal).toBe('Feif/Feif.uproject');
+    expect(importRequest(u, u.candidates[0])).toEqual({
+      libraryId: 'lib',
+      originalPath: '/dl/Waterways.zip',
+      target: 'Studio/Waterways',
+      publisher: 'Studio',
+      preset: 'fab',
+      place: [{ kind: 'flatten' }, { kind: 'hoist', folder: 'Meshes' }],
+      unreal: true,
+    });
+    // The same zip as any other zip is copied, as before.
+    const z = draftFromScan('lib', unrealScan, 1);
+    expect(z.candidates[0].unreal).toBeNull();
+    expect(importRequest(z, z.candidates[0]).unreal).toBeUndefined();
+
     const k = patchCandidate(draftFromScan('lib', kenneyScan), 0, { lookupStorePage: false });
     expect(importRequest(k, k.candidates[0])).toEqual({
       libraryId: 'lib',
@@ -784,6 +830,21 @@ describe('the dialog', () => {
     ]);
     const c = useImportStore.getState().draft!.candidates[0];
     expect([c.tree?.files, treeCurrent(c)]).toEqual([7, true]);
+  });
+
+  test("an Unreal pack's step edit previews its project's estimate", async () => {
+    await open(unrealScan);
+    const calls: unknown[] = [];
+    api.previewImport = async (_libraryId, _originalPath, variant, subpath, place, unreal) => {
+      calls.push({ variant, subpath, place, unreal });
+      return { ...tree(7), glbs: 4, estimate: true };
+    };
+    const store = useImportStore.getState();
+    store.edit((d) => patchCandidate(d, 0, { hoistOn: false }));
+    await store.refreshTree(0);
+    expect(calls).toEqual([
+      { variant: null, subpath: null, place: [{ kind: 'flatten' }], unreal: true },
+    ]);
   });
 
   test('Import queues each ticked pack and keeps a refused one in the dialog with its reason', async () => {

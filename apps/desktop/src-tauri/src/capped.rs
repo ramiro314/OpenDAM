@@ -27,6 +27,22 @@ impl Default for Systemd {
     }
 }
 
+/// How much of a child's stdout, and of its stderr, `Capped::watch` keeps: their ends, which
+/// say why a run failed. An editor session can log hundreds of MB, outside the child's cap.
+const KEPT: usize = 64 * 1024;
+
+/// Appends `bytes` to `buffer`, keeping its last `KEPT` bytes at least. It grows to twice
+/// that before its start is dropped, so a long log isn't copied at every line.
+fn keep_tail(buffer: &mut Vec<u8>, bytes: &[u8]) {
+    buffer.extend_from_slice(bytes);
+    if buffer.len() > 2 * KEPT {
+        buffer.drain(..buffer.len() - KEPT);
+    }
+}
+
+/// How long `Capped::watch` goes on reading a child's output once it has exited.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A command ready to spawn, capped or not, and what its exit status means.
 pub struct Capped {
     pub command: tokio::process::Command,
@@ -143,6 +159,119 @@ impl Capped {
         let (max, _) = self.scope.as_ref()?;
         (status.code() == Some(137) || status.signal() == Some(9))
             .then(|| format!("killed by the memory cap ({max})"))
+    }
+
+    /// Spawns the command and waits for it, its stdin closed and its output piped: `line` sees
+    /// each line it prints to stdout as it prints it, and `cancelled` is polled every 200 ms.
+    /// When that turns true the child is killed and the result is `None`. The end of stdout and
+    /// of stderr (`KEPT`) come back in the output, and the scope is `finish`ed. However it ends,
+    /// whatever the child left running is killed (`stop_leftovers`).
+    pub async fn watch(
+        &mut self,
+        mut line: impl FnMut(&[u8]),
+        cancelled: impl Fn() -> bool,
+    ) -> std::io::Result<Option<std::process::Output>> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        let mut child = self
+            .command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            // A group of its own, so its descendants can be killed with it
+            .process_group(0)
+            .spawn()?;
+        let pid = child.id();
+        let mut stderr = child.stderr.take().expect("piped");
+        // Kept as it arrives, so what came before a drain that timed out isn't lost.
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut reader = tokio::spawn({
+            let errors = errors.clone();
+            async move {
+                let mut chunk = [0u8; 8192];
+                while let Ok(n @ 1..) = stderr.read(&mut chunk).await {
+                    let mut errors = errors.lock().unwrap_or_else(|e| e.into_inner());
+                    keep_tail(&mut errors, &chunk[..n]);
+                }
+            }
+        });
+        // Read as bytes: a line that isn't UTF-8 must not stop the reading, or a full pipe
+        // would block the child.
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().expect("piped")).split(b'\n');
+        let mut printed = Vec::new();
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
+        let mut reading = true;
+        let status = loop {
+            tokio::select! {
+                read = lines.next_segment(), if reading => match read {
+                    Ok(Some(read)) => {
+                        line(&read);
+                        keep_tail(&mut printed, &read);
+                        keep_tail(&mut printed, b"\n");
+                    }
+                    _ => reading = false,
+                },
+                status = child.wait() => break status?,
+                _ = tick.tick() => {
+                    if cancelled() {
+                        let _ = child.start_kill();
+                        let killed = child.wait().await;
+                        self.stop_leftovers(pid).await;
+                        // A scope killed by a signal stays failed until it is reset.
+                        if let Ok(status) = killed {
+                            self.finish(status).await;
+                        }
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+        self.stop_leftovers(pid).await;
+        // What the child printed last is read to the pipes' end, but only for `DRAIN`: a
+        // descendant that inherited them (the Unreal Editor's shader workers) can hold them open
+        // long after the child exited, and the run must end with the child.
+        let drained = async {
+            while let Ok(Some(read)) = lines.next_segment().await {
+                keep_tail(&mut printed, &read);
+                keep_tail(&mut printed, b"\n");
+            }
+            let _ = (&mut reader).await;
+        };
+        if tokio::time::timeout(DRAIN, drained).await.is_err() {
+            tracing::warn!("A process kept the output of a finished child open; reading stopped");
+        }
+        reader.abort();
+        self.finish(status).await;
+        let stderr = std::mem::take(&mut *errors.lock().unwrap_or_else(|e| e.into_inner()));
+        Ok(Some(std::process::Output {
+            status,
+            stdout: printed,
+            stderr,
+        }))
+    }
+
+    /// Kills what the child with pid `pid` left running: its process group, and under a cap
+    /// everything left in its scope, which also holds the descendants that left the group. A
+    /// helper that outlived the child (the Unreal Editor's shader workers) would otherwise run
+    /// on outside the next session's cap, or on a work folder being deleted. Nothing left to
+    /// kill is no error.
+    async fn stop_leftovers(&self, pid: Option<u32>) {
+        let quiet = |command: &mut tokio::process::Command| {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+        };
+        if let Some(pid) = pid {
+            let group = format!("-{pid}");
+            let _ = quiet(tokio::process::Command::new("kill").args(["-KILL", "--", &group])).await;
+        }
+        if let Some((_, unit)) = &self.scope {
+            let mut kill = tokio::process::Command::new(&self.systemd.ctl);
+            kill.args(["--user", "kill", "--signal=SIGKILL", unit]);
+            let _ = quiet(&mut kill).await;
+        }
     }
 
     /// Clears the scope's failed state, which systemd keeps until reset, after a run that
@@ -360,6 +489,146 @@ mod tests {
             Some("killed by the memory cap (64M)"),
             "{exited}"
         );
+    }
+
+    /// A descendant that keeps the pipes open past the child's exit, as an editor's helper can,
+    /// doesn't hold the run: the output is read for `DRAIN` at most, keeping what came.
+    #[tokio::test]
+    async fn watch_ends_with_the_child_whatever_keeps_its_pipes_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let uncapped = Systemd {
+            run: dir.path().join("none-run"),
+            ctl: dir.path().join("none-ctl"),
+        };
+        // Out of the child's process group, so the group kill doesn't reach it, and uncapped,
+        // with no scope to kill: only the drain's bound ends the run. The child exits only once
+        // the descendant, writing `left` from its own session, has left the group.
+        let left = dir.path().join("left");
+        let script = format!(
+            "echo out; echo err >&2; setsid sh -c 'echo $$ > {left}; exec sleep 20' & \
+             while [ ! -s {left} ]; do sleep 0.05; done; exit 0",
+            left = left.display()
+        );
+        let mut capped = capped_command_with(&uncapped, "sh", ["-c", script.as_str()], "1G").await;
+        let started = std::time::Instant::now();
+        let output = capped.watch(|_| {}, || false).await.unwrap().unwrap();
+        let took = started.elapsed();
+        assert!(took >= DRAIN && took < DRAIN * 3, "{took:?}");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+    }
+
+    /// Whether process `pid` is gone, or a zombie waiting to be reaped, within 3 s.
+    async fn ends(pid: u32) -> bool {
+        for _ in 0..30 {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => return true,
+                Ok(stat) if stat.rsplit(") ").next().is_some_and(|s| s.starts_with('Z')) => {
+                    return true
+                }
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
+        false
+    }
+
+    fn pids(file: &Path) -> Vec<u32> {
+        std::fs::read_to_string(file)
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(|p| p.parse().unwrap())
+            .collect()
+    }
+
+    /// What the child leaves running is killed once it exits, and with it on Cancel; under a
+    /// cap, the rest of its scope is killed too.
+    #[tokio::test]
+    async fn watch_kills_what_the_child_leaves_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let uncapped = Systemd {
+            run: dir.path().join("none-run"),
+            ctl: dir.path().join("none-ctl"),
+        };
+        let file = dir.path().join("pids");
+        let leave = format!(
+            "sleep 30 >/dev/null 2>&1 & echo $! > '{}'; exit 0",
+            file.display()
+        );
+        let mut capped = capped_command_with(&uncapped, "sh", ["-c", leave.as_str()], "1G").await;
+        let started = std::time::Instant::now();
+        assert!(capped.watch(|_| {}, || false).await.unwrap().is_some());
+        let [helper] = pids(&file)[..] else { panic!() };
+        assert!(ends(helper).await, "the helper {helper} still runs");
+        // Its pipes closed with it, so no drain waited for them.
+        assert!(started.elapsed() < DRAIN, "{:?}", started.elapsed());
+
+        // Cancelled mid-run, the child and what it started both end.
+        std::fs::remove_file(&file).unwrap();
+        let run = format!(
+            "sleep 30 >/dev/null 2>&1 & echo $$ $! > '{}'; sleep 30",
+            file.display()
+        );
+        let mut capped = capped_command_with(&uncapped, "sh", ["-c", run.as_str()], "1G").await;
+        let cancelled = || pids(&file).len() == 2;
+        assert!(capped.watch(|_| {}, cancelled).await.unwrap().is_none());
+        for pid in pids(&file) {
+            assert!(ends(pid).await, "{pid} still runs");
+        }
+
+        // Under a cap, the scope is killed as well.
+        let systemd = stub_systemd(dir.path());
+        let mut capped = capped_command_with(&systemd, "true", [] as [&str; 0], "1G").await;
+        capped.watch(|_| {}, || false).await.unwrap();
+        let calls = || std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+        assert!(
+            calls().contains("ctl --user kill --signal=SIGKILL opendam-capped-"),
+            "{}",
+            calls()
+        );
+        // A clean exit leaves no failed scope to reset; a cancelled run's killed scope is reset.
+        assert!(!calls().contains("reset-failed"), "{}", calls());
+        let mut capped = capped_command_with(&systemd, "sleep", ["30"], "1G").await;
+        assert!(capped.watch(|_| {}, || true).await.unwrap().is_none());
+        assert!(
+            calls().contains("ctl --user reset-failed opendam-capped-"),
+            "{}",
+            calls()
+        );
+    }
+
+    /// A long log keeps only its end, on both streams: what says why a run failed.
+    #[tokio::test]
+    async fn watch_keeps_the_end_of_a_long_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let uncapped = Systemd {
+            run: dir.path().join("none-run"),
+            ctl: dir.path().join("none-ctl"),
+        };
+        // About 2 MB on each stream, then a last line.
+        let script = "i=0; while [ $i -lt 40000 ]; do \
+                      echo \"line $i of a long editor log, padded out\"; \
+                      echo \"error line $i of a long editor log\" >&2; i=$((i+1)); done; \
+                      echo last; echo last error >&2";
+        let mut capped = capped_command_with(&uncapped, "sh", ["-c", script], "1G").await;
+        let mut lines = 0;
+        let output = capped
+            .watch(|_| lines += 1, || false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lines, 40001, "every line still reaches the callback");
+        for stream in [&output.stdout, &output.stderr] {
+            assert!(
+                (KEPT..=2 * KEPT).contains(&stream.len()),
+                "{}",
+                stream.len()
+            );
+        }
+        assert!(output
+            .stdout
+            .ends_with(b"line 39999 of a long editor log, padded out\nlast\n"));
+        assert!(output.stderr.ends_with(b"last error\n"));
     }
 
     #[test]

@@ -34,6 +34,7 @@ use super::records::{
 };
 use super::scan::{self, Scan};
 use super::unity_glb;
+use super::unreal_glb;
 use crate::db::{Database, LibraryHandle};
 use crate::preview::WorkerRequest;
 
@@ -115,6 +116,11 @@ pub struct ImportRequest {
     /// for Kenney as the plan decides (D22), so on when left out.
     #[serde(default)]
     pub lookup_store_page: Option<bool>,
+    /// Builds a zip's Unreal project to GLBs (`export_unreal`) instead of copying the zip. The
+    /// project is found in the zip, so no variant or sub-folder is given. The preset is then
+    /// `fab` and the place steps `flatten` then `hoist Meshes`, when left out.
+    #[serde(default)]
+    pub unreal: bool,
 }
 
 pub struct Engine {
@@ -372,6 +378,7 @@ impl Engine {
             latest.clone(),
         )));
         let tools = self.tools().await;
+        let unreal = self.unreal_tools().await;
         let mut warnings = Vec::new();
         let mut outcome = Ok(());
         for pack in &run.packs {
@@ -399,6 +406,7 @@ impl Engine {
                 progress,
                 lock_wait: self.lock_wait,
                 tools: tools.clone(),
+                unreal: unreal.clone(),
             };
             outcome = match run.kind.as_str() {
                 "import" | "rebuild" => {
@@ -576,6 +584,17 @@ impl Engine {
                 unavailable.insert("unity_glb".to_string(), why);
             }
         }
+        // An Unreal pack's only extract step stays on: its build fails with the reason.
+        let exports = offers
+            .iter()
+            .flat_map(|o| &o.candidates)
+            .flat_map(|c| &c.steps)
+            .any(|s| s.kind == "export_unreal");
+        if exports {
+            if let Some(why) = self.unreal_tools().await.unavailable() {
+                unavailable.insert("export_unreal".to_string(), why);
+            }
+        }
         Ok(Scan {
             original_path: original.to_string_lossy().into_owned(),
             kind,
@@ -594,6 +613,7 @@ impl Engine {
         variant: Option<&str>,
         subpath: Option<&str>,
         place: Vec<PlaceStep>,
+        unreal: bool,
     ) -> Result<scan::Tree, String> {
         let library = self.library(library_id).await?;
         let root = library
@@ -610,6 +630,7 @@ impl Engine {
                 variant.as_deref(),
                 subpath.as_deref(),
                 &place,
+                unreal,
             )
         })
         .await
@@ -718,11 +739,16 @@ impl Engine {
         if kind == "unitypackage" && variant.is_some() {
             return Err("A .unitypackage original has no variant: only a zip holds them".into());
         }
+        let project = if request.unreal {
+            Some(unreal_project(&original, kind, variant, subpath.as_deref()).await?)
+        } else {
+            None
+        };
         let preset = match request.preset.as_deref() {
             Some(preset @ ("unity" | "fab" | "kenney" | "none")) => preset,
             Some(other) => return Err(format!("{other:?} isn't a preset")),
             None if kind == "unitypackage" => "unity",
-            None if variant.is_some() => "fab",
+            None if variant.is_some() || project.is_some() => "fab",
             None => "none",
         };
         check_target(&library.pool, &root, &target).await?;
@@ -744,13 +770,16 @@ impl Engine {
         if let Some(subpath) = &subpath {
             extract.insert("subpath".into(), subpath.as_str().into());
         }
-        let extract_kind = if kind == "zip" && variant.is_none() {
-            "extract_zip"
+        let (extract_kind, extract) = if project.is_some() {
+            ("export_unreal", unreal_glb::Options::default_json())
+        } else if kind == "zip" && variant.is_none() {
+            ("extract_zip", extract.into())
         } else {
-            "extract_unitypackage"
+            ("extract_unitypackage", extract.into())
         };
-        let mut steps = vec![StepRecord::new(extract_kind, extract.into())];
+        let mut steps = vec![StepRecord::new(extract_kind, extract)];
         let place = request.place.unwrap_or_else(|| match preset {
+            _ if project.is_some() => scan::unreal_place(),
             "fab" => vec![
                 PlaceStep::Flatten,
                 PlaceStep::Hoist {
@@ -780,11 +809,14 @@ impl Engine {
             metadata["lookup_store_page"] = request.lookup_store_page.unwrap_or(true).into();
         }
         steps.push(StepRecord::new("metadata", metadata));
-        let source = [variant, subpath.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("/");
+        let source = match &project {
+            Some(project) => project.clone(),
+            None => [variant, subpath.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("/"),
+        };
         let original_path = original.to_string_lossy();
         let import = NewImport {
             original_path: &original_path,
@@ -823,6 +855,11 @@ impl Engine {
                 steps.unavailable.insert("unity_glb".into(), why);
             }
         }
+        if steps.steps.iter().any(|s| s.kind == "export_unreal") {
+            if let Some(why) = self.unreal_tools().await.unavailable() {
+                steps.unavailable.insert("export_unreal".into(), why);
+            }
+        }
         Ok(steps)
     }
 
@@ -835,6 +872,17 @@ impl Engine {
             self.worker.clone(),
         )
         .await;
+        #[cfg(test)]
+        if let Some(systemd) = self.systemd.lock().unwrap().clone() {
+            tools.systemd = systemd;
+        }
+        tools
+    }
+
+    /// What a run's `export_unreal` step runs with, from Settings now.
+    async fn unreal_tools(&self) -> unreal_glb::Tools {
+        #[allow(unused_mut)]
+        let mut tools = unreal_glb::Tools::load(&self.db.master_pool, self.cache_dir.clone()).await;
         #[cfg(test)]
         if let Some(systemd) = self.systemd.lock().unwrap().clone() {
             tools.systemd = systemd;
@@ -1021,6 +1069,35 @@ fn original(path: &str, root: &Path) -> Result<(PathBuf, &'static str), String> 
     Ok((original, kind))
 }
 
+/// The `.uproject` path in the zip original of an Unreal import, which takes no variant or
+/// sub-folder, refusing a zip without a project or with one the editor can't export.
+async fn unreal_project(
+    original: &Path,
+    kind: &str,
+    variant: Option<&str>,
+    subpath: Option<&str>,
+) -> Result<String, String> {
+    if kind != "zip" || variant.is_some() || subpath.is_some() {
+        return Err(
+            "An Unreal import builds the project in a zip: it takes no variant or sub-folder"
+                .into(),
+        );
+    }
+    let original = original.to_path_buf();
+    let project = tokio::task::spawn_blocking(move || {
+        let listing = super::zipfile::list_zip(&original, None)
+            .map_err(|e| format!("The original can't be read: {e:#}"))?;
+        unreal_glb::Project::find(&listing)
+    })
+    .await
+    .map_err(|e| e.to_string())??
+    .ok_or_else(|| "The zip holds no Unreal project (.uproject)".to_string())?;
+    match project.refusal() {
+        Some(why) => Err(why),
+        None => Ok(project.path()),
+    }
+}
+
 /// A variant or sub-folder option in its clean form, or `None` when it is left out or blank.
 /// One that names no path, or climbs out with `..`, is refused before anything is recorded.
 fn inner_path(raw: Option<&str>, what: &str) -> Result<Option<String>, String> {
@@ -1087,6 +1164,10 @@ mod rebuild_tests;
 mod unity_glb_tests;
 
 #[cfg(test)]
+#[path = "unreal_glb_tests.rs"]
+mod unreal_glb_tests;
+
+#[cfg(test)]
 #[path = "metadata_tests.rs"]
 mod metadata_tests;
 
@@ -1141,6 +1222,7 @@ mod tests {
                 version: None,
                 license: None,
                 lookup_store_page: None,
+                unreal: false,
             }
         }
 
@@ -1342,6 +1424,13 @@ mod tests {
         crate::export::settings::update(
             &db.master_pool,
             json!({"blenderPath": "/nonexistent/opendam-test/blender"}),
+        )
+        .await
+        .unwrap();
+        // Nor an Unreal Editor, unless a test gives one (`unreal_glb_tests`).
+        crate::import::settings::update(
+            &db.master_pool,
+            json!({"unrealEditorRoot": "/nonexistent/opendam-test/UnrealEngine"}),
         )
         .await
         .unwrap();
@@ -2866,6 +2955,7 @@ mod tests {
                 Some(&ticked.variant),
                 ticked.subpath.as_deref(),
                 place,
+                false,
             )
         };
         let hoisted = vec![
@@ -2882,7 +2972,7 @@ mod tests {
 
         let error = s
             .engine
-            .preview_import("lib", "/no/such.zip", None, None, vec![])
+            .preview_import("lib", "/no/such.zip", None, None, vec![], false)
             .await
             .unwrap_err();
         assert!(error.contains("can't be read"), "{error}");
@@ -2896,7 +2986,7 @@ mod tests {
             let engine = s.engine.clone();
             async move {
                 engine
-                    .preview_import("lib", &original, None, subpath.as_deref(), place)
+                    .preview_import("lib", &original, None, subpath.as_deref(), place, false)
                     .await
                     .unwrap()
             }

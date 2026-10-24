@@ -1,9 +1,10 @@
 //! A pack's build, first or later (plan pack-import, Flow). It stages the whole pack beside its
 //! target as `.<Pack>.import-<build id>`: extract, place, then convert (`unity_glb`, whose GLBs
 //! are `generated` rows with their models' source paths), writing the staged files' manifest
-//! rows under the new build id. A staged file the previous build also had, by file key, size and
-//! sha256, gets that build's mtime, so the index sees it unchanged, moved or not, and queues no
-//! preview. Then:
+//! rows under the new build id. An Unreal pack's extract step, `export_unreal` (`unreal_glb`),
+//! writes GLBs and docs, its extracted files. A staged file the previous build also had, by file
+//! key, size and sha256, gets that build's mtime, so the index sees it unchanged, moved or not,
+//! and queues no preview. Then:
 //!
 //! 1. **Lock.** Takes the library's `index_lock`, then the advisory `.opendam/index.lock`, and
 //!    holds both to the end. Cancel takes effect only before this point.
@@ -35,6 +36,7 @@ use super::place::{place, PlaceStep};
 use super::records::{self, InsertedRows, ManifestRow, Output, Recipe};
 use super::unity_glb::{self, Conversion};
 use super::unitypackage::{extract_unitypackage, extract_variant, ExtractedFile, SkippedEntry};
+use super::unreal_glb;
 use super::zipfile::extract_zip;
 use crate::db::{Database, LibraryHandle};
 use crate::fs_swap;
@@ -283,6 +285,8 @@ pub struct BuildEnv<'a> {
     pub lock_wait: Duration,
     /// What the convert phase runs with.
     pub tools: unity_glb::Tools,
+    /// What `export_unreal` runs with.
+    pub unreal: unreal_glb::Tools,
 }
 
 /// Why a build stopped.
@@ -331,6 +335,8 @@ enum Extract {
     },
     /// A zip original, or one folder of it.
     Zip { subpath: Option<String> },
+    /// A zip original's Unreal project, exported to GLBs.
+    Unreal(unreal_glb::Options),
 }
 
 /// Refuses steps a build of an original of `kind` couldn't run: an unknown step, invalid
@@ -402,6 +408,10 @@ impl Plan {
                     subpath: text("subpath"),
                 }),
                 "extract_zip" => return Err("The extract_zip step needs a zip original".into()),
+                "export_unreal" if zip => {
+                    extracts.push(Extract::Unreal(unreal_glb::Options::parse(options)?))
+                }
+                "export_unreal" => return Err("The export_unreal step needs a zip original".into()),
                 "flatten" | "hoist" | "rename" | "exclude" => {
                     let mut step = options.clone();
                     step["kind"] = kind.clone().into();
@@ -817,22 +827,40 @@ async fn stage(
         done: 0,
         total: 0,
     });
-    let (to, extract) = (staging.to_path_buf(), plan.extract.clone());
-    let extraction = blocking(move || {
-        match &extract {
-            Extract::Unitypackage {
-                variant: None,
-                subpath,
-            } => extract_unitypackage(&original, &to, subpath.as_deref()),
-            Extract::Unitypackage {
-                variant: Some(variant),
-                subpath,
-            } => extract_variant(&original, variant, &to, subpath.as_deref()),
-            Extract::Zip { subpath } => extract_zip(&original, &to, subpath.as_deref()),
+    let extraction = match &plan.extract {
+        Extract::Unreal(options) => {
+            unreal_glb::Export {
+                original: &original,
+                original_sha256: &recipe.original_sha256,
+                staging,
+                options,
+                tools: &env.unreal,
+                control: env.control.clone(),
+                progress: env.progress.clone(),
+            }
+            .run()
+            .await?
         }
-        .map_err(|e| format!("{e:#}"))
-    })
-    .await?;
+        extract => {
+            let (to, extract) = (staging.to_path_buf(), extract.clone());
+            blocking(move || {
+                match &extract {
+                    Extract::Unitypackage {
+                        variant: None,
+                        subpath,
+                    } => extract_unitypackage(&original, &to, subpath.as_deref()),
+                    Extract::Unitypackage {
+                        variant: Some(variant),
+                        subpath,
+                    } => extract_variant(&original, variant, &to, subpath.as_deref()),
+                    Extract::Zip { subpath } => extract_zip(&original, &to, subpath.as_deref()),
+                    Extract::Unreal(_) => unreachable!("exported above"),
+                }
+                .map_err(|e| format!("{e:#}"))
+            })
+            .await?
+        }
+    };
     warnings.extend(extraction.skipped);
     cancelled()?;
 

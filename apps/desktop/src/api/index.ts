@@ -232,14 +232,26 @@ export const api = {
   /** An original's candidate packs, each with its default target, steps and tree; writes nothing */
   scanImport: (libraryId: string, originalPath: string) =>
     invoke<ImportScan>('scan_import', { libraryId, originalPath }),
-  /** The tree one source of an original builds with these place steps; writes nothing */
+  /**
+   * The tree one source of an original builds with these place steps; writes nothing. With
+   * `unreal`, the estimate of the zip's Unreal project.
+   */
   previewImport: (
     libraryId: string,
     originalPath: string,
     variant: string | null,
     subpath: string | null,
-    place: PlaceStep[]
-  ) => invoke<ImportTree>('preview_import', { libraryId, originalPath, variant, subpath, place }),
+    place: PlaceStep[],
+    unreal = false
+  ) =>
+    invoke<ImportTree>('preview_import', {
+      libraryId,
+      originalPath,
+      variant,
+      subpath,
+      place,
+      unreal,
+    }),
   /**
    * Why the library would refuse this target for a new pack, or with `packId` as that pack's new
    * target, or null when it is free
