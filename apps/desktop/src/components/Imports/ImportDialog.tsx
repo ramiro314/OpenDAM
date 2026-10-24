@@ -9,6 +9,7 @@ import {
   originalName,
   patchCandidate,
   pickVariant,
+  setHoist,
   skippedText,
   treeKey,
   useImportStore,
@@ -200,8 +201,8 @@ function Candidate({
                 <label className={styles.check}>
                   <input
                     type="checkbox"
-                    checked={c.hoist.trim() !== ''}
-                    onChange={(e) => set({ hoist: e.target.checked ? 'Art' : '' })}
+                    checked={c.hoistOn}
+                    onChange={(e) => edit((d) => setHoist(d, index, e.target.checked))}
                   />
                   Move up the contents of
                 </label>

@@ -986,6 +986,8 @@ export interface ImportCandidate {
   target: string;
   /** Why the library refuses the target: it exists, or nests with another pack's */
   targetError: string | null;
+  /** The target is `<Publisher>/<Pack>`, so it moves with the publisher */
+  targetFollowsPublisher: boolean;
   variants: ImportVariant[];
   steps: ImportStepRecord[];
   /** null while a Fab pack has no variant ticked */

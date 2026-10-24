@@ -53,7 +53,7 @@ function Pack({ row }: { row: PackRow }) {
   const cancel = useImportStore((s) => s.cancel);
   const { run, progress } = row;
   const live = run !== null && isLive(run);
-  const cancelShown = run ? cancelState(run, progress, finishing) : 'none';
+  const cancelShown = run ? cancelState(run, finishing) : 'none';
   const percent = progressPercent(progress);
   return (
     <li className={styles.pack} data-pack-id={row.pack.id}>

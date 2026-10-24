@@ -11,6 +11,7 @@ import type {
 } from '../types';
 import {
   FINISHING,
+  LOCKED_STEP,
   cancelState,
   candidateProblem,
   draftFromScan,
@@ -24,7 +25,9 @@ import {
   packStatus,
   patchCandidate,
   pickVariant,
+  placeSteps,
   progressText,
+  setHoist,
   skippedText,
   treeCurrent,
   useImportStore,
@@ -84,6 +87,7 @@ const fab: ImportCandidate = {
   publisher: 'Studio',
   target: 'Studio/Forest',
   targetError: null,
+  targetFollowsPublisher: true,
   variants: [
     {
       variant: 'Forest_BiRP.unitypackage',
@@ -111,6 +115,7 @@ const kenney = (name: string, category: string, ticked = true): ImportCandidate 
   publisher: 'Kenney',
   target: `${category}/${name}`,
   targetError: null,
+  targetFollowsPublisher: false,
   variants: [],
   steps: [
     { kind: 'extract_zip', options: { subpath: `Kenney/${category}/${name}` } },
@@ -129,6 +134,7 @@ const zipCandidate: ImportCandidate = {
   publisher: 'Studio',
   target: 'bundle',
   targetError: null,
+  targetFollowsPublisher: false,
   variants: [],
   steps: [
     { kind: 'extract_zip', options: {} },
@@ -279,18 +285,23 @@ describe('progress and warnings', () => {
 
 describe('Cancel', () => {
   test('works while a run is queued or staging, and reads Finishing once the build holds the lock', () => {
-    const none = new Set<string>();
-    expect(cancelState(run('r', [], { status: 'queued' }), null, none)).toBe('cancel');
-    expect(cancelState(run('r', []), progress('r', 'extracting'), none)).toBe('cancel');
-    expect(cancelState(run('r', []), progress('r', 'waiting for the library'), none)).toBe(
-      'cancel'
-    );
-    for (const step of ['re-checking', 'swapping', 'indexing', 'settling'])
-      expect(cancelState(run('r', []), progress('r', step), none)).toBe('finishing');
-    expect(cancelState(run('r', []), progress('r', 'extracting'), new Set(['r']))).toBe(
-      'finishing'
-    );
-    expect(cancelState(run('r', [], { status: 'done' }), null, new Set(['r']))).toBe('none');
+    const live = run('r', ['p']);
+    const store = useImportStore.getState();
+    const state = () => cancelState(live, useImportStore.getState().finishing);
+    expect(cancelState(run('r', [], { status: 'queued' }), new Set())).toBe('cancel');
+    for (const step of ['extracting', 'hashing', 'waiting for the library']) {
+      store.applyProgress(progress('r', step));
+      expect(state()).toBe('cancel');
+    }
+    // The build's marker right after the lock latches it, whatever steps follow
+    store.applyProgress(progress('r', LOCKED_STEP));
+    expect(state()).toBe('finishing');
+    for (const step of ['swapping', 'indexing', 'a step added later', 'settling']) {
+      store.applyProgress(progress('r', step));
+      expect(state()).toBe('finishing');
+    }
+    expect(useImportStore.getState().finishing.has('other')).toBe(false);
+    expect(cancelState(run('r', [], { status: 'done' }), new Set(['r']))).toBe('none');
   });
 
   test("a Cancel answered with Finishing marks the run, and the run's end clears it", async () => {
@@ -308,7 +319,7 @@ describe('Cancel', () => {
     expect(calls).toEqual(['lib r']);
     let s = useImportStore.getState();
     expect(s.error).toBeNull();
-    expect(cancelState(live, s.progress.r, s.finishing)).toBe('finishing');
+    expect(cancelState(live, s.finishing)).toBe('finishing');
 
     useImportStore.getState().applyUpdate({ ...live, status: 'done' });
     s = useImportStore.getState();
@@ -359,7 +370,14 @@ describe('the draft', () => {
     expect(draft.offer).toBe(0);
     expect(draft.publisher).toBe('Studio');
     const c = draft.candidates[0];
-    expect([c.variant, c.flatten, c.hoist, c.converts]).toEqual([1, true, 'Art', true]);
+    expect([c.variant, c.flatten, c.hoistOn, c.hoist, c.converts]).toEqual([
+      1,
+      true,
+      true,
+      'Art',
+      true,
+    ]);
+    expect(c.scannedPlace).toEqual([{ kind: 'flatten' }, { kind: 'hoist', folder: 'Art' }]);
     expect(treeCurrent(c)).toBe(true);
     expect(draftProblem(draft)).toBeNull();
     expect(draftFromScan('lib', fabScan, 1).candidates[0].preset).toBe('none');
@@ -372,11 +390,45 @@ describe('the draft', () => {
     expect(treeCurrent(draft.candidates[0])).toBe(true);
 
     // With hoist off the tree waits for a preview
-    draft = patchCandidate(draft, 0, { hoist: '' });
+    draft = patchCandidate(draft, 0, { hoistOn: false });
     expect(treeCurrent(draft.candidates[0])).toBe(false);
     expect(candidateProblem(draft, 0)).toBe('Previewing the steps…');
     draft = pickVariant(draft, 0, 1);
     expect(treeCurrent(draft.candidates[0])).toBe(false);
+  });
+
+  test("a variant's scanned tree is used only for the place steps the scan proposed", () => {
+    // A scan whose Fab preset hoisted another folder: its variant trees are for that one
+    const steps = fab.steps.map((s) =>
+      s.kind === 'hoist' ? { ...s, options: { folder: 'Content' } } : s
+    );
+    let draft = draftFromScan('lib', {
+      ...fabScan,
+      offers: [{ layout: 'fab', candidates: [{ ...fab, steps }] }],
+    });
+    expect(draft.candidates[0].hoist).toBe('Content');
+    draft = pickVariant(draft, 0, 0);
+    expect([draft.candidates[0].tree?.files, treeCurrent(draft.candidates[0])]).toEqual([3, true]);
+    // Hoisting Art instead, which isn't what the scan proposed, waits for a preview
+    draft = patchCandidate(draft, 0, { hoist: 'Art' });
+    draft = pickVariant(draft, 0, 1);
+    expect(treeCurrent(draft.candidates[0])).toBe(false);
+  });
+
+  test("turning hoist off and on keeps its folder, and an emptied one takes the scan's again", () => {
+    let draft = draftFromScan('lib', fabScan);
+    draft = setHoist(draft, 0, false);
+    expect(placeSteps(draft.candidates[0])).toEqual([{ kind: 'flatten' }]);
+    draft = patchCandidate(setHoist(draft, 0, true), 0, { hoist: 'Meshes' });
+    draft = setHoist(setHoist(draft, 0, false), 0, true);
+    expect(draft.candidates[0].hoist).toBe('Meshes');
+    draft = setHoist(patchCandidate(setHoist(draft, 0, false), 0, { hoist: ' ' }), 0, true);
+    expect(draft.candidates[0].hoist).toBe('Art');
+    // A pack whose scan proposed no hoist needs a folder named
+    let zip = draftFromScan('lib', fabScan, 1);
+    zip = setHoist(zip, 0, true);
+    expect([zip.candidates[0].hoistOn, zip.candidates[0].hoist]).toEqual([true, '']);
+    expect(candidateProblem(zip, 0)).toBe('Name the folder to move up');
   });
 
   test('a Fab pack with no variant ticked waits for one', () => {
@@ -404,6 +456,10 @@ describe('the draft', () => {
 
     const k = editPublisher(draftFromScan('lib', kenneyScan), 'Someone');
     expect(k.candidates.map((c) => c.target)).toEqual(['3D assets/Car Kit', 'Archive/Old Kit']);
+    // Nor an "Any other zip" pack's, which the scan says stays <Pack>
+    expect(editPublisher(draftFromScan('lib', fabScan, 1), 'Someone').candidates[0].target).toBe(
+      'bundle'
+    );
     expect(editPublisher(draftFromScan('lib', fabScan), '').candidates[0].target).toBe('Forest');
   });
 
@@ -592,7 +648,7 @@ describe('the dialog', () => {
       throw "The original /dl/Forest.zip can't be read: gone";
     };
     const store = useImportStore.getState();
-    store.edit((d) => patchCandidate(d, 0, { hoist: '' }));
+    store.edit((d) => patchCandidate(d, 0, { hoistOn: false }));
     await store.refreshTree(0);
     const draft = useImportStore.getState().draft!;
     expect(treeCurrent(draft.candidates[0])).toBe(true);
@@ -667,7 +723,7 @@ describe('the dialog', () => {
     const store = useImportStore.getState();
     await store.refreshTree(0);
     expect(calls).toEqual([]);
-    store.edit((d) => patchCandidate(d, 0, { hoist: '' }));
+    store.edit((d) => patchCandidate(d, 0, { hoistOn: false }));
     await store.refreshTree(0);
     expect(calls).toEqual([
       {

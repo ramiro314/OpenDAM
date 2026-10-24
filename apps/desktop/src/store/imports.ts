@@ -22,8 +22,11 @@ import type {
 /** What Cancel answers once a build holds the library's lock (`import::build::FINISHING`) */
 export const FINISHING = "Finishing, can't cancel now";
 
-/** The steps a build reports once it holds the library's lock, where Cancel no longer works */
-const LOCKED_STEPS = new Set(['re-checking', 'swapping', 'indexing', 'settling']);
+/**
+ * The step a build reports right after it takes the library's lock (`import::build`), past which
+ * Cancel no longer works. The run is marked finishing from here to its end, whatever steps follow.
+ */
+export const LOCKED_STEP = 're-checking';
 
 export function isLive(run: ImportRun): boolean {
   return run.status === 'queued' || run.status === 'running';
@@ -108,18 +111,15 @@ export function importRows(
 
 /**
  * What a run's Cancel button shows: nothing once the run ended, Cancel while it is queued or
- * building in staging, and "Finishing, can't cancel now" once its build holds the lock, which
- * its progress says (`re-checking` on), or a Cancel already answered.
+ * building in staging, and "Finishing, can't cancel now" once its build holds the lock: `finishing`
+ * holds the runs that reported `LOCKED_STEP`, or whose Cancel was answered so.
  */
 export function cancelState(
   run: ImportRun,
-  progress: ImportProgress | null,
   finishing: ReadonlySet<string>
 ): 'none' | 'cancel' | 'finishing' {
   if (!isLive(run)) return 'none';
-  if (finishing.has(run.id)) return 'finishing';
-  if (run.status === 'running' && progress && LOCKED_STEPS.has(progress.step)) return 'finishing';
-  return 'cancel';
+  return finishing.has(run.id) ? 'finishing' : 'cancel';
 }
 
 const STATUS_LABELS: Record<ImportRun['status'], string> = {
@@ -207,8 +207,14 @@ export interface DraftCandidate {
   /** The extract step's sub-folder of a zip, for a Kenney pack */
   subpath: string | null;
   flatten: boolean;
-  /** The folder `hoist` moves up, or '' for no hoist */
+  /** Whether the `hoist` step is on */
+  hoistOn: boolean;
+  /** The folder `hoist` moves up */
   hoist: string;
+  /** The place steps the scan proposed, which its trees were made with */
+  scannedPlace: PlaceStep[];
+  /** The scan's target is `<Publisher>/<Pack>`, so it moves with the publisher */
+  followsPublisher: boolean;
   /** Whether the preset converts models to GLB (`unity_glb`), a later step of the plan */
   converts: boolean;
   title: string;
@@ -241,17 +247,25 @@ export function publisherTarget(publisher: string, name: string): string {
   return p ? `${p}/${name}` : name;
 }
 
-/** Whether a preset's default target is `<Publisher>/<Pack>` */
-function publisherTargeted(preset: ImportPreset): boolean {
-  return preset === 'unity' || preset === 'fab';
-}
-
 /** A candidate's place steps, in the order the build runs them */
-export function placeSteps(c: Pick<DraftCandidate, 'flatten' | 'hoist'>): PlaceStep[] {
+export function placeSteps(c: Pick<DraftCandidate, 'flatten' | 'hoistOn' | 'hoist'>): PlaceStep[] {
   const steps: PlaceStep[] = [];
   if (c.flatten) steps.push({ kind: 'flatten' });
-  if (c.hoist.trim()) steps.push({ kind: 'hoist', folder: c.hoist.trim() });
+  if (c.hoistOn && c.hoist.trim()) steps.push({ kind: 'hoist', folder: c.hoist.trim() });
   return steps;
+}
+
+/** The folder the scan's `hoist` step moved up, or '' when it proposed none */
+function scannedHoist(c: DraftCandidate): string {
+  const hoist = c.scannedPlace.find((s) => s.kind === 'hoist');
+  return hoist?.kind === 'hoist' ? hoist.folder : '';
+}
+
+/** Turns candidate `i`'s hoist on or off; on with no folder named, it takes the scan's */
+export function setHoist(draft: ImportDraft, i: number, on: boolean): ImportDraft {
+  const c = draft.candidates[i];
+  const folder = on && !c.hoist.trim() ? scannedHoist(c) : c.hoist;
+  return patchCandidate(draft, i, { hoistOn: on, hoist: folder });
 }
 
 /** The source of a candidate's tree: its ticked variant and sub-folder */
@@ -275,6 +289,10 @@ function draftCandidate(c: ImportCandidate): DraftCandidate {
   const extract = c.steps.find((s) => s.kind.startsWith('extract'));
   const metadata = c.steps.find((s) => s.kind === 'metadata')?.options ?? {};
   const hoist = c.steps.find((s) => s.kind === 'hoist')?.options.folder;
+  const flatten = c.steps.some((s) => s.kind === 'flatten');
+  const scannedPlace: PlaceStep[] = [];
+  if (flatten) scannedPlace.push({ kind: 'flatten' });
+  if (typeof hoist === 'string') scannedPlace.push({ kind: 'hoist', folder: hoist });
   const variant = c.variants.findIndex((v) => v.ticked);
   const draft: DraftCandidate = {
     name: c.name,
@@ -287,8 +305,11 @@ function draftCandidate(c: ImportCandidate): DraftCandidate {
     variants: c.variants,
     variant: variant >= 0 ? variant : null,
     subpath: c.variants.length ? null : ((extract?.options.subpath as string | undefined) ?? null),
-    flatten: c.steps.some((s) => s.kind === 'flatten'),
+    flatten,
+    hoistOn: typeof hoist === 'string',
     hoist: typeof hoist === 'string' ? hoist : '',
+    scannedPlace,
+    followsPublisher: c.targetFollowsPublisher,
     converts: c.steps.some((s) => s.kind === 'unity_glb'),
     title: '',
     version: '',
@@ -335,7 +356,7 @@ export function editTarget(draft: ImportDraft, i: number, target: string): Impor
 /** Changes the publisher, moving each `<Publisher>/<Pack>` target you didn't type with it */
 export function editPublisher(draft: ImportDraft, publisher: string): ImportDraft {
   const candidates = draft.candidates.map((c) =>
-    publisherTargeted(c.preset) && !c.targetEdited
+    c.followsPublisher && !c.targetEdited
       ? { ...c, target: publisherTarget(publisher, c.name), error: null }
       : c
   );
@@ -347,9 +368,8 @@ export function pickVariant(draft: ImportDraft, i: number, v: number): ImportDra
   const c = draft.candidates[i];
   const variants = c.variants.map((variant, j) => ({ ...variant, ticked: j === v }));
   const next = { ...c, variants, variant: v };
-  // The scan's variant tree is for the preset's place steps
-  const defaults = { ...next, flatten: true, hoist: 'Art' };
-  const scanned = treeKey(next) === treeKey(defaults);
+  // The scan's variant tree is for the place steps it proposed
+  const scanned = JSON.stringify(placeSteps(next)) === JSON.stringify(c.scannedPlace);
   return patchCandidate(draft, i, {
     variants,
     variant: v,
@@ -387,6 +407,7 @@ export function candidateProblem(draft: ImportDraft, i: number): string | null {
   );
   if (other) return `${target} would nest with ${cleanTarget(other.target)}, also ticked`;
   if (c.variants.length > 0 && c.variant === null) return 'Tick the variant to import';
+  if (c.hoistOn && !c.hoist.trim()) return 'Name the folder to move up';
   if (!treeCurrent(c)) return 'Previewing the steps…';
   if (c.tree?.error) return `The build would fail: ${c.tree.error}`;
   return null;
@@ -538,7 +559,12 @@ export const useImportStore = create<ImportStore>()((set, get) => {
     },
 
     applyProgress: (progress) =>
-      set((s) => ({ progress: { ...s.progress, [progress.runId]: progress } })),
+      set((s) => ({
+        progress: { ...s.progress, [progress.runId]: progress },
+        ...(progress.step === LOCKED_STEP
+          ? { finishing: new Set(s.finishing).add(progress.runId) }
+          : {}),
+      })),
 
     cancel: async (run) => {
       set({ error: null });
