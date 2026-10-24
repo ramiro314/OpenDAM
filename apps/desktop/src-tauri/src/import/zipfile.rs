@@ -13,6 +13,9 @@
 //!
 //! With a sub-folder, only the files below it are written, relative to it, and an entry elsewhere
 //! in the zip is neither written nor reported, unless its name is unsafe, which places it nowhere.
+//!
+//! `list_zip` lists what `extract_zip` would write from the zip's central directory, for an
+//! import's scan (`super::scan`).
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -26,6 +29,7 @@ use zip::{ExtraField, ZipArchive};
 
 use super::unitypackage::{
     below, clean, clean_subpath, into_empty, ExtractedFile, Extraction, SkipReason, SkippedEntry,
+    Taken,
 };
 
 /// Copies the zip `original` into `target`, which must be empty or missing, or with a `subpath`
@@ -37,57 +41,10 @@ pub fn extract_zip(original: &Path, target: &Path, subpath: Option<&str>) -> Res
     into_empty(target, |target| {
         let mut zip = open(original)?;
         let mut out = Extraction::default();
-        let mut seen = HashSet::new();
-        let mut wanted = Vec::new();
-        for index in 0..zip.len() {
-            let entry = zip.by_index_raw(index).context("reading the zip")?;
-            let name = name(&entry);
-            let mut skip = |reason| {
-                out.skipped.push(SkippedEntry {
-                    source_path: vec![name.clone()],
-                    reason,
-                })
-            };
-            let parts = match clean(&name) {
-                Ok(parts) => parts,
-                Err(reason) => {
-                    skip(reason);
-                    continue;
-                }
-            };
-            let kind = kind(&entry);
-            if kind == Kind::Folder {
-                continue;
-            }
-            if parts.is_empty() {
-                skip(SkipReason::NoName);
-                continue;
-            }
-            let path = parts.join("/");
-            let rel = match subpath.as_deref() {
-                None => path.clone(),
-                Some(sub) => match below(&path, sub) {
-                    Some(rel) if !rel.is_empty() => rel.to_string(),
-                    _ => continue,
-                },
-            };
-            if let Kind::Skip(reason) = kind {
-                skip(reason);
-                continue;
-            }
-            if !seen.insert(path) {
-                skip(SkipReason::Duplicate);
-                continue;
-            }
-            wanted.push((index, rel, name));
-        }
-        if let (Some(subpath), true) = (&subpath, wanted.is_empty()) {
-            bail!("the zip holds no file under {subpath}");
-        }
-
-        for (index, rel, name) in wanted {
+        for wanted in index(&mut zip, subpath.as_deref(), &mut out)? {
+            let (rel, name) = (wanted.rel, wanted.name);
             let mut entry = zip
-                .by_index(index)
+                .by_index(wanted.index)
                 .with_context(|| format!("reading {name} in the zip"))?;
             let to = target.join(&rel);
             if let Some(parent) = to.parent() {
@@ -112,6 +69,99 @@ pub fn extract_zip(original: &Path, target: &Path, subpath: Option<&str>) -> Res
         out.files.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     })
+}
+
+/// Lists the files `extract_zip` would write, with their sizes and the entries it would skip,
+/// from the zip's central directory alone: no entry is read and nothing is written. It fails
+/// where the extraction would.
+pub fn list_zip(original: &Path, subpath: Option<&str>) -> Result<Extraction> {
+    let subpath = clean_subpath(subpath)?;
+    let mut zip = open(original)?;
+    let mut out = Extraction::default();
+    let mut taken = Taken::default();
+    for wanted in index(&mut zip, subpath.as_deref(), &mut out)? {
+        taken.claim(&wanted.rel, "zip")?;
+        out.files.push(ExtractedFile {
+            path: wanted.rel,
+            source_path: vec![wanted.name],
+            size: wanted.size,
+        });
+    }
+    out.files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// A file of the zip the extraction writes.
+struct Wanted {
+    index: usize,
+    /// Its path below the target.
+    rel: String,
+    /// Its name in the zip.
+    name: String,
+    /// Its size as the central directory records it.
+    size: u64,
+}
+
+/// The files of the zip below `subpath`, else all of them, in the zip's order. Adds the entries
+/// it skips to `out`.
+fn index(
+    zip: &mut ZipArchive<File>,
+    subpath: Option<&str>,
+    out: &mut Extraction,
+) -> Result<Vec<Wanted>> {
+    let mut seen = HashSet::new();
+    let mut wanted = Vec::new();
+    for index in 0..zip.len() {
+        let entry = zip.by_index_raw(index).context("reading the zip")?;
+        let name = name(&entry);
+        let mut skip = |reason| {
+            out.skipped.push(SkippedEntry {
+                source_path: vec![name.clone()],
+                reason,
+            })
+        };
+        let parts = match clean(&name) {
+            Ok(parts) => parts,
+            Err(reason) => {
+                skip(reason);
+                continue;
+            }
+        };
+        let kind = kind(&entry);
+        if kind == Kind::Folder {
+            continue;
+        }
+        if parts.is_empty() {
+            skip(SkipReason::NoName);
+            continue;
+        }
+        let path = parts.join("/");
+        let rel = match subpath {
+            None => path.clone(),
+            Some(sub) => match below(&path, sub) {
+                Some(rel) if !rel.is_empty() => rel.to_string(),
+                _ => continue,
+            },
+        };
+        if let Kind::Skip(reason) = kind {
+            skip(reason);
+            continue;
+        }
+        if !seen.insert(path) {
+            skip(SkipReason::Duplicate);
+            continue;
+        }
+        wanted.push(Wanted {
+            index,
+            rel,
+            size: entry.size(),
+            name,
+        });
+    }
+    if let (Some(subpath), true) = (subpath, wanted.is_empty()) {
+        bail!("the zip holds no file under {subpath}");
+    }
+    Ok(wanted)
 }
 
 pub(super) fn open(original: &Path) -> Result<ZipArchive<File>> {

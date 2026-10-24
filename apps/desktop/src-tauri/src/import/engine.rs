@@ -27,7 +27,8 @@ use tokio::sync::Notify;
 
 use super::build::{self, BuildEnv, Hooks, Point, Progress, RunControl, Stop};
 use super::place::PlaceStep;
-use super::records::{self, NewImport, Owner, QueuedPack, RunSummary, StepRecord};
+use super::records::{self, NewImport, Owner, QueuedPack, RunSummary, StepRecord, TargetRefused};
+use super::scan::{self, Scan};
 use crate::db::{Database, LibraryHandle};
 
 const HEARTBEAT: Duration = Duration::from_secs(30);
@@ -482,6 +483,93 @@ impl Engine {
             .ok_or_else(|| format!("Library {library_id} isn't open"))
     }
 
+    /// Scans the original at `original_path` for an import into library `library_id`
+    /// (`scan`): its candidate packs with their presets, default targets and steps, and the tree
+    /// each would build, before anything is written. Each default target the library would
+    /// refuse carries the reason, and the publisher defaults to the last one used in the
+    /// library.
+    pub async fn scan(&self, library_id: &str, original_path: &str) -> Result<Scan, String> {
+        let library = self.library(library_id).await?;
+        let root = library
+            .root_path
+            .canonicalize()
+            .map_err(|e| format!("The library folder can't be read: {e}"))?;
+        let (original, kind) = original(original_path, &root)?;
+        let publisher = records::last_publisher(&library.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        let path = original.clone();
+        let mut offers = tokio::task::spawn_blocking(move || scan::detect(&path, kind, &publisher))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("The original {original_path} can't be read: {e:#}"))?;
+        let targets = pack_targets(&library.pool, None).await?;
+        for candidate in offers.iter_mut().flat_map(|o| o.candidates.iter_mut()) {
+            let checked = clean_target(&candidate.target).and_then(|target| {
+                refuse_target(&root, &target, &targets)?;
+                Ok(target)
+            });
+            match checked {
+                Ok(target) => candidate.target = target,
+                Err(error) => candidate.target_error = Some(error),
+            }
+        }
+        Ok(Scan {
+            original_path: original.to_string_lossy().into_owned(),
+            kind,
+            offers,
+        })
+    }
+
+    /// Moves pack `pack_id`'s target to `target`, refusing one that exists in the library or
+    /// nests with another pack's target, as an import does. A pack that is built, or has a run
+    /// queued or running, keeps its target: moving a built pack's folder is a rebuild's work.
+    pub async fn set_target(
+        &self,
+        library_id: &str,
+        pack_id: &str,
+        target: &str,
+    ) -> Result<(), String> {
+        let library = self.library(library_id).await?;
+        let root = library
+            .root_path
+            .canonicalize()
+            .map_err(|e| format!("The library folder can't be read: {e}"))?;
+        let target = clean_target(target)?;
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT target FROM import_packs WHERE id = ?")
+                .bind(pack_id)
+                .fetch_optional(&library.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        let Some(current) = current else {
+            return Err(format!("Library {library_id} has no pack {pack_id}"));
+        };
+        if current == target {
+            return Ok(());
+        }
+        refuse_target(
+            &root,
+            &target,
+            &pack_targets(&library.pool, Some(pack_id)).await?,
+        )?;
+        // Checked again in the update: an import or edit that overlapped this one may have got
+        // there.
+        records::set_target(&library.pool, pack_id, &target)
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|refused| match refused {
+                TargetRefused::NoPack => format!("Library {library_id} has no pack {pack_id}"),
+                TargetRefused::Nests(other) => nests(&target, &other),
+                TargetRefused::Running => {
+                    format!("An import run is building the pack at {current}")
+                }
+                TargetRefused::Built => {
+                    format!("The pack at {current} is built: a built pack's target can't move yet")
+                }
+            })
+    }
+
     /// Records a new import of `request.original_path` and queues its first build. Refuses a
     /// target that already exists in the library or nests with another pack's target.
     pub async fn start_import(&self, request: ImportRequest) -> Result<RunSummary, String> {
@@ -685,6 +773,31 @@ fn nests(target: &str, other: &str) -> String {
 /// Refuses a target that exists in the library, or that is another pack's target, or an
 /// ancestor or descendant of one, on whole path components.
 async fn check_target(pool: &Pool<Sqlite>, root: &Path, target: &str) -> Result<(), String> {
+    refuse_target(root, target, &pack_targets(pool, None).await?)
+}
+
+/// Every pack's target but pack `except`'s, oldest first.
+async fn pack_targets(pool: &Pool<Sqlite>, except: Option<&str>) -> Result<Vec<String>, String> {
+    sqlx::query_scalar("SELECT target FROM import_packs WHERE id IS NOT ? ORDER BY rowid")
+        .bind(except)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Refuses a target that exists in the library, has a link on the way to it, or is one of
+/// `targets` (the other packs'), or an ancestor or descendant of one, on whole path components
+/// (`Pub/Pack` holds `Pub/Pack/Sub` but not `Pub/Package`).
+/// A target that nests is refused naming the other pack even when it also exists, as the folder
+/// of a built pack's parent does.
+fn refuse_target(root: &Path, target: &str, targets: &[String]) -> Result<(), String> {
+    let within = |a: &str, b: &str| a == b || b.starts_with(&format!("{a}/"));
+    if let Some(other) = targets
+        .iter()
+        .find(|t| within(t, target) || within(target, t))
+    {
+        return Err(nests(target, other));
+    }
     if root.join(target).symlink_metadata().is_ok() {
         return Err(format!("{target} already exists in the library"));
     }
@@ -692,17 +805,6 @@ async fn check_target(pool: &Pool<Sqlite>, root: &Path, target: &str) -> Result<
         return Err(format!(
             "A folder on the way to {target} is a link: a pack is built only inside the library"
         ));
-    }
-    let targets: Vec<String> = sqlx::query_scalar("SELECT target FROM import_packs")
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    let within = |a: &str, b: &str| a == b || b.starts_with(&format!("{a}/"));
-    if let Some(other) = targets
-        .iter()
-        .find(|t| within(t, target) || within(target, t))
-    {
-        return Err(nests(target, other));
     }
     Ok(())
 }
@@ -1972,5 +2074,256 @@ mod tests {
         s.unchanged_after_cancel(&run.id, &assets).await;
         let ended = records::run(&s.lib.pool, "lib", &run.id).await.unwrap();
         assert_eq!(ended.started_at, None, "the retry never claimed it");
+    }
+
+    /// Every path below the library root, folders included, and the import and asset row counts.
+    async fn library_state(s: &Setup) -> (Vec<String>, Vec<i64>) {
+        let mut paths: Vec<String> = walkdir::WalkDir::new(s.dir.path())
+            .min_depth(1)
+            .into_iter()
+            .map(|e| e.unwrap().path().display().to_string())
+            .collect();
+        paths.sort();
+        let mut counts = Vec::new();
+        for table in [
+            "imports",
+            "import_packs",
+            "import_steps",
+            "import_runs",
+            "import_outputs",
+            "assets",
+        ] {
+            counts.push(s.count(&format!("SELECT COUNT(*) FROM {table}")).await);
+        }
+        (paths, counts)
+    }
+
+    /// Records a pack at `target` that was never built, as a failed first build leaves it.
+    async fn unbuilt_pack(s: &Setup, id: &str, target: &str) {
+        sqlx::query(
+            "INSERT INTO imports (id, original_path, original_size, original_mtime_ns,
+             original_sha256, kind, created_at) VALUES (?1, '/o.zip', 0, 0, '', 'zip', 0)",
+        )
+        .bind(id)
+        .execute(&s.lib.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO import_packs (id, import_id, target, preset, status)
+             VALUES (?1, ?1, ?2, 'none', 'failed')",
+        )
+        .bind(id)
+        .bind(target)
+        .execute(&s.lib.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scan_writes_nothing_and_previews_the_tree_the_build_produces() {
+        let s = setup().await;
+        let original = fixture("synthetic.unitypackage");
+        let before = (library_state(&s).await, stamp(&original));
+
+        let scan = s
+            .engine
+            .scan("lib", &original.to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!((library_state(&s).await, stamp(&original)), before);
+        assert_eq!(scan.kind, "unitypackage");
+        assert_eq!(scan.original_path, original.to_string_lossy());
+        let pack = &scan.offers[0].candidates[0];
+        // No import yet, so no publisher to default to.
+        assert_eq!(
+            (pack.publisher.as_str(), pack.target.as_str()),
+            ("", "synthetic")
+        );
+        assert_eq!(pack.target_error, None);
+
+        let mut request = s.request(vec![PlaceStep::Flatten]);
+        request.target = pack.target.clone();
+        let run = s.engine.start_import(request).await.unwrap();
+        let run = s.wait_for(&run.id, "done").await;
+        let built = scan::Tree {
+            skipped: run.warnings,
+            ..scan::Tree::of(
+                on_disk(&s.dir.path().join("synthetic"))
+                    .iter()
+                    .map(String::as_str),
+                true,
+            )
+        };
+        assert_eq!(pack.tree.as_ref(), Some(&built));
+
+        // The publisher now defaults to the last one used, and a target that exists is refused.
+        std::fs::create_dir_all(s.dir.path().join("Synthetic Studio/fab-unity")).unwrap();
+        let fab = fixture("fab-unity.zip");
+        let scan = s.engine.scan("lib", &fab.to_string_lossy()).await.unwrap();
+        let pack = &scan.offers[0].candidates[0];
+        assert_eq!(pack.publisher, "Synthetic Studio");
+        assert_eq!(pack.target, "Synthetic Studio/fab-unity");
+        assert_eq!(
+            pack.target_error.as_deref(),
+            Some("Synthetic Studio/fab-unity already exists in the library")
+        );
+        assert_eq!(
+            pack.steps.last().unwrap().options["publisher"],
+            "Synthetic Studio"
+        );
+
+        let error = s.engine.scan("lib", "/no/such.zip").await.unwrap_err();
+        assert!(
+            error.starts_with("The original /no/such.zip can't be read"),
+            "{error}"
+        );
+        let inside = s.dir.path().join("Other/Tree.png");
+        let error = s
+            .engine
+            .scan("lib", &inside.to_string_lossy())
+            .await
+            .unwrap_err();
+        assert!(
+            error.ends_with("isn't a .unitypackage or a .zip"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn targets_nesting_with_a_built_pack_are_refused_at_scan_import_and_edit() {
+        let s = setup().await;
+        let mut request = s.golden_request();
+        request.target = "Pub/Pack".into();
+        let run = s.engine.start_import(request).await.unwrap();
+        s.wait_for(&run.id, "done").await;
+        let built = library_state(&s).await;
+
+        // Importing into the pack, or around it, is refused naming it, and writes nothing.
+        for target in ["Pub/Pack/Sub", "Pub", "Pub/Pack"] {
+            let mut request = s.golden_request();
+            request.target = target.into();
+            let error = s.engine.start_import(request).await.unwrap_err();
+            assert_eq!(
+                error,
+                format!("{target} would nest with the pack imported to Pub/Pack")
+            );
+            assert_eq!(library_state(&s).await, built, "{target}");
+        }
+        // A sibling whose name only starts the same is no nesting.
+        let mut request = s.golden_request();
+        request.target = "Pub/Package".into();
+        let run = s.engine.start_import(request).await.unwrap();
+        s.wait_for(&run.id, "done").await;
+        assert!(s.dir.path().join("Pub/Package/Readme.txt").is_file());
+
+        // Editing a pack's target is refused the same way.
+        unbuilt_pack(&s, "q", "Elsewhere/Q").await;
+        let edit =
+            |pack: &'static str, target: &'static str| s.engine.set_target("lib", pack, target);
+        for target in ["Pub/Pack/Sub", "Pub"] {
+            assert_eq!(
+                edit("q", target).await.unwrap_err(),
+                format!("{target} would nest with the pack imported to Pub/Pack")
+            );
+        }
+        assert_eq!(
+            edit("q", "Pub/Package/Deeper").await.unwrap_err(),
+            "Pub/Package/Deeper would nest with the pack imported to Pub/Package"
+        );
+        assert_eq!(
+            edit("q", "Other").await.unwrap_err(),
+            "Other already exists in the library"
+        );
+        assert!(edit("q", "../Up").await.is_err());
+        let targets = || s.strings("SELECT target FROM import_packs ORDER BY rowid");
+        assert_eq!(targets().await, ["Pub/Pack", "Pub/Package", "Elsewhere/Q"]);
+        edit("q", "Pub/Packages").await.unwrap();
+        edit("q", "Pub/Packages").await.unwrap();
+        assert_eq!(targets().await, ["Pub/Pack", "Pub/Package", "Pub/Packages"]);
+        // A built pack keeps its target: moving its folder is a rebuild's work.
+        let p: String = s
+            .strings("SELECT id FROM import_packs WHERE target = 'Pub/Pack'")
+            .await
+            .remove(0);
+        let error = s
+            .engine
+            .set_target("lib", &p, "Pub/Moved")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "The pack at Pub/Pack is built: a built pack's target can't move yet"
+        );
+        assert_eq!(
+            s.engine.set_target("lib", "nope", "X").await.unwrap_err(),
+            "Library lib has no pack nope"
+        );
+
+        // A Kenney pack can't land under another pack's target, at the scan or the import.
+        unbuilt_pack(&s, "z", "3D assets").await;
+        let kenney = fixture("kenney.zip");
+        let scan = s
+            .engine
+            .scan("lib", &kenney.to_string_lossy())
+            .await
+            .unwrap();
+        let errors: Vec<_> = scan.offers[0]
+            .candidates
+            .iter()
+            .map(|c| (c.target.as_str(), c.target_error.as_deref()))
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                ("2D assets/Fixture Tiles", None),
+                (
+                    "3D assets/Fixture Car Kit",
+                    Some(
+                        "3D assets/Fixture Car Kit would nest with the pack imported to 3D assets"
+                    )
+                ),
+                ("Archive/Fixture Old Kit", None),
+            ]
+        );
+        let before = library_state(&s).await;
+        let request = s.zip_request(
+            "kenney.zip",
+            None,
+            Some("Kenney/3D assets/Fixture Car Kit"),
+            "3D assets/Fixture Car Kit",
+        );
+        let error = s.engine.start_import(request).await.unwrap_err();
+        assert_eq!(
+            error,
+            "3D assets/Fixture Car Kit would nest with the pack imported to 3D assets"
+        );
+        assert_eq!(library_state(&s).await, before);
+        s.other_asset_untouched().await;
+    }
+
+    #[tokio::test]
+    async fn a_pack_with_a_live_run_keeps_its_target() {
+        let s = setup_with(false).await;
+        unbuilt_pack(&s, "q", "Pub/Q").await;
+        sqlx::query(
+            "INSERT INTO import_runs (id, kind, packs, status, created_at, owner_machine,
+             owner_boot, owner_pid, owner_started, heartbeat_at)
+             VALUES ('r', 'import', '[{\"packId\":\"q\",\"recipeRev\":0}]', 'queued', 0,
+             'm', 'b', 1, 1, 0)",
+        )
+        .execute(&s.lib.pool)
+        .await
+        .unwrap();
+        let error = s.engine.set_target("lib", "q", "Pub/R").await.unwrap_err();
+        assert_eq!(error, "An import run is building the pack at Pub/Q");
+        sqlx::query("UPDATE import_runs SET status = 'failed'")
+            .execute(&s.lib.pool)
+            .await
+            .unwrap();
+        s.engine.set_target("lib", "q", "Pub/R").await.unwrap();
+        assert_eq!(
+            s.strings("SELECT target FROM import_packs").await,
+            ["Pub/R"]
+        );
     }
 }

@@ -4,6 +4,7 @@ pub mod build;
 pub mod engine;
 pub mod place;
 pub mod records;
+pub mod scan;
 pub mod unitypackage;
 pub mod zipfile;
 
