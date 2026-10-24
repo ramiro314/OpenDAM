@@ -288,6 +288,198 @@ pub async fn recipe(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Recipe> 
     })
 }
 
+/// A manifest row as a rebuild reads it: the previous build's files, to match its own against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestRow {
+    pub path: String,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub sha256: String,
+    /// The JSON array `import_outputs` stores, `NULL` for a kept file added outside OpenDAM.
+    pub source_path: Option<String>,
+    pub generated: bool,
+}
+
+/// Build `build_id`'s manifest rows, sorted by path.
+pub async fn manifest(
+    pool: &Pool<Sqlite>,
+    pack_id: &str,
+    build_id: &str,
+) -> sqlx::Result<Vec<ManifestRow>> {
+    let rows: Vec<(String, i64, i64, String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT path, size, mtime_ns, sha256, source_path, origin = 'generated'
+         FROM import_outputs WHERE pack_id = ? AND build_id = ? ORDER BY path",
+    )
+    .bind(pack_id)
+    .bind(build_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(path, size, mtime_ns, sha256, source_path, generated)| ManifestRow {
+                path,
+                size,
+                mtime_ns,
+                sha256,
+                source_path,
+                generated,
+            },
+        )
+        .collect())
+}
+
+/// A source path as `import_outputs` stores it, a JSON array.
+pub fn source_json(source_path: &[String]) -> String {
+    serde_json::to_string(source_path).expect("strings serialize")
+}
+
+/// One of a pack's steps, as the step editor reads and writes them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Step {
+    pub kind: String,
+    pub enabled: bool,
+    #[serde(default = "empty_options")]
+    pub options: Value,
+}
+
+fn empty_options() -> Value {
+    json!({})
+}
+
+/// A pack's steps in position order, with the `recipe_rev` they are at.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackSteps {
+    pub recipe_rev: i64,
+    pub steps: Vec<Step>,
+}
+
+pub async fn steps(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Option<PackSteps>> {
+    let Some(recipe_rev) = sqlx::query_scalar("SELECT recipe_rev FROM import_packs WHERE id = ?")
+        .bind(pack_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let rows: Vec<(String, bool, String)> = sqlx::query_as(
+        "SELECT kind, enabled, options FROM import_steps WHERE pack_id = ? ORDER BY position",
+    )
+    .bind(pack_id)
+    .fetch_all(pool)
+    .await?;
+    let steps = rows
+        .into_iter()
+        .map(|(kind, enabled, options)| Step {
+            kind,
+            enabled,
+            options: serde_json::from_str(&options).unwrap_or(Value::Null),
+        })
+        .collect();
+    Ok(Some(PackSteps { recipe_rev, steps }))
+}
+
+/// Why a pack's steps can't be edited, or it can't be rebuilt, now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    NoPack,
+    /// A run for the pack is queued or running, or a swap or Remove is journaled.
+    Busy,
+}
+
+/// The `import_packs` row is busy: a run for it is queued or running, or its `swap_state` is set.
+const BUSY: &str = "(import_packs.swap_state IS NOT NULL OR EXISTS (
+    SELECT 1 FROM import_runs r, json_each(r.packs) j
+    WHERE r.status IN ('queued', 'running')
+    AND json_extract(j.value, '$.packId') = import_packs.id))";
+
+async fn refusal(tx: &mut SqliteConnection, pack_id: &str) -> sqlx::Result<Refused> {
+    let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM import_packs WHERE id = ?")
+        .bind(pack_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    Ok(if exists.is_some() {
+        Refused::Busy
+    } else {
+        Refused::NoPack
+    })
+}
+
+/// Replaces pack `pack_id`'s steps with `steps` and bumps its `recipe_rev`, in one transaction
+/// whose first write checks that no run for the pack is queued or running. Returns the new
+/// `recipe_rev`.
+pub async fn set_steps(
+    pool: &Pool<Sqlite>,
+    pack_id: &str,
+    steps: &[Step],
+) -> sqlx::Result<Result<i64, Refused>> {
+    let mut tx = pool.begin().await?;
+    let bumped: Option<i64> = sqlx::query_scalar(&format!(
+        "UPDATE import_packs SET recipe_rev = recipe_rev + 1 WHERE id = ? AND NOT {BUSY}
+         RETURNING recipe_rev"
+    ))
+    .bind(pack_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(recipe_rev) = bumped else {
+        return Ok(Err(refusal(&mut tx, pack_id).await?));
+    };
+    sqlx::query("DELETE FROM import_steps WHERE pack_id = ?")
+        .bind(pack_id)
+        .execute(&mut *tx)
+        .await?;
+    for (position, step) in steps.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO import_steps (pack_id, position, kind, enabled, options)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(pack_id)
+        .bind(position as i64)
+        .bind(&step.kind)
+        .bind(step.enabled)
+        .bind(step.options.to_string())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(Ok(recipe_rev))
+}
+
+/// Queues a rebuild of pack `pack_id` at its current `recipe_rev`, owned by `owner`, unless a
+/// run for it is queued or running: one statement checks and inserts. Returns the run's id.
+pub async fn queue_rebuild(
+    pool: &Pool<Sqlite>,
+    pack_id: &str,
+    owner: &Owner,
+    now: i64,
+) -> sqlx::Result<Result<String, Refused>> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let mut tx = pool.begin().await?;
+    let queued = sqlx::query(&format!(
+        "INSERT INTO import_runs (id, kind, packs, status, created_at, owner_machine, owner_boot,
+         owner_pid, owner_started, heartbeat_at)
+         SELECT ?, 'rebuild', json_array(json_object('packId', id, 'recipeRev', recipe_rev)),
+         'queued', ?, ?, ?, ?, ?, ? FROM import_packs WHERE id = ? AND NOT {BUSY}"
+    ))
+    .bind(&run_id)
+    .bind(now)
+    .bind(&owner.machine)
+    .bind(&owner.boot)
+    .bind(owner.pid as i64)
+    .bind(owner.started as i64)
+    .bind(now)
+    .bind(pack_id)
+    .execute(&mut *tx)
+    .await?;
+    if queued.rows_affected() == 0 {
+        return Ok(Err(refusal(&mut tx, pack_id).await?));
+    }
+    tx.commit().await?;
+    Ok(Ok(run_id))
+}
+
 /// Writes `outputs` as build `build_id`'s manifest rows, all extracted, in 200-row transactions.
 /// They mean nothing until the build commits.
 pub async fn write_outputs(
@@ -309,7 +501,7 @@ pub async fn write_outputs(
             .bind(output.size as i64)
             .bind(output.mtime_ns)
             .bind(&output.sha256)
-            .bind(serde_json::to_string(&output.source_path).expect("strings serialize"))
+            .bind(source_json(&output.source_path))
             .execute(&mut *tx)
             .await?;
         }

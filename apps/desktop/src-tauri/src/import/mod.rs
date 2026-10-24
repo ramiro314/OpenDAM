@@ -1,6 +1,7 @@
 //! Pack import from originals (docs/plans/pack-import/plan.md).
 
 pub mod build;
+pub mod carry;
 pub mod engine;
 pub mod place;
 pub mod records;
