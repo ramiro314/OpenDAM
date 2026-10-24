@@ -85,7 +85,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               rebuilds they refuse while a run for the pack is queued or running
                               (and a step edit read at an older `recipe_rev`),
                               edits, which records an in-app rename or delete in a pack as
-                              its steps and moves its `.meta` with it,
+                              its steps and moves its `.meta` with it, drift, the outside
+                              changes a Rebuild answers (each file added, changed or missing
+                              against the manifest, with only the choices its origin can
+                              honour) and the kept files they carry,
                               metadata, the metadata step's `datapackage.json` by preset (Unity,
                               Fab, Kenney, none) and the Kenney store page lookup, build, a pack's build, first or later (stage beside the target,
                               lock, re-check, journal, swap, carry, index with Prune::Defer,
@@ -145,7 +148,8 @@ docs/plans                    Plans for this fork
   walks), writing its manifest rows under the new build id, then takes the library's `index_lock`
   and the advisory lock and holds both to the end. Under them it re-checks the recipe, the pack
   folder against the current manifest and the staging folder, journals
-  `import_packs.swap_state`, moves the live folder aside as `.<Pack>.prev-<build id>`, renames
+  `import_packs.swap_state`, moves the live folder aside as `.<Pack>.prev-<build id>` (unless
+  the folder is gone, deleted outside OpenDAM and restored at drift: `swap_prev` false), renames
   the staging folder in, carries moved rows, indexes the pack with `Prune::Defer`, and commits by
   flipping `import_packs.current_build` in one transaction. A failure before the commit rolls the
   swap back in-run, and `current_build` stays as it was. Cancel works only before the lock; after
@@ -172,7 +176,17 @@ docs/plans                    Plans for this fork
   same file didn't hold (a carried file's new path, or that of a file new to this build) belongs
   to a file the new build doesn't have there: unless it is moving itself, it is moved aside too
   and stays there, so the settle prunes it and a rollback puts it back, and no file takes over
-  another file's row. The index's inserted
+  another file's row. A kept file added outside OpenDAM (no source path) is copied from its own
+  path, so it is never carried and the row there, its own, never moved aside.
+- **Outside changes are answered before a Rebuild.** `import::drift` compares the pack folder
+  with the current manifest (size and mtime, hashing on a mismatch), and offers each file only
+  the choices its origin can honour. `rebuild_import_pack` refuses choices that don't answer the
+  folder now (`drift::STALE`), records the ones that edit the recipe (an `exclude`, the metadata
+  step off) in the transaction that queues the run, and stores the rest in `import_runs.drift`.
+  The build checks, before it stages and again under the lock, that the folder still differs
+  exactly so. A kept file (`origin = 'kept'`) is carried by every later rebuild: one that
+  replaced a recipe file keeps its source path, takes its bytes right after the extraction, and
+  goes where the steps put it; one added outside OpenDAM keeps its path (`source_path` `NULL`). The index's inserted
   rows are journaled as `inserted`. A rollback deletes the inserted rows, then reverses the moves
   by asset id in the same two passes, so neither a rebuild nor its rollback loses metadata.
 - **Pruning waits for the commit.** `Prune::Defer` deletes no row, runs no structure pass, and

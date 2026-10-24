@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { api } from '../api';
 import type {
+  DriftChosen,
+  DriftDifference,
   ImportPackSteps,
   ImportPackSummary,
   ImportRun,
@@ -10,8 +12,15 @@ import type {
 import { useImportStore } from './imports';
 import {
   BUSY,
+  DRIFT_STALE,
   STALE,
   busyReason,
+  chooseDrift,
+  choiceLabel,
+  chosenFrom,
+  differenceText,
+  driftDraft,
+  driftOpen,
   draftFromSteps,
   draftProblem,
   fieldValue,
@@ -56,10 +65,16 @@ const golden = (): ImportStepRecord[] => [
   step('metadata', { preset: 'unity', title: 'Pack' }),
 ];
 
-const read = (steps = golden(), recipeRev = 0, unavailable = {}): ImportPackSteps => ({
+const read = (
+  steps = golden(),
+  recipeRev = 0,
+  unavailable = {},
+  kept: string[] = []
+): ImportPackSteps => ({
   recipeRev,
   steps,
   unavailable,
+  kept,
 });
 
 function run(id: string, packId: string, patch: Partial<ImportRun> = {}): ImportRun {
@@ -397,14 +412,19 @@ describe('the editor store', () => {
       order.push(`save hoist=${steps[2].enabled}`);
       return 1;
     };
-    api.rebuildImportPack = async (libraryId, packId) => {
-      order.push(`rebuild ${libraryId}/${packId}`);
+    api.checkImportDrift = async () => {
+      order.push('check');
+      return [];
+    };
+    api.rebuildImportPack = async (libraryId, packId, drift) => {
+      order.push(`rebuild ${libraryId}/${packId} ${JSON.stringify(drift)}`);
       return run('r1', packId, { packs: [{ packId, recipeRev: 1 }] });
     };
     await store().open('lib', 'p1');
     store().edit('p1', (d) => toggleStep(d, hoistAt(d.steps), false));
     expect(await store().rebuild('p1')).toBe(true);
-    expect(order).toEqual(['save hoist=false', 'rebuild lib/p1']);
+    expect(order).toEqual(['save hoist=false', 'check', 'rebuild lib/p1 []']);
+    expect(editor().drift).toBeNull();
     expect(busyReason(useImportStore.getState().runs, 'lib', 'p1')).toBe(BUSY);
   });
 
@@ -505,5 +525,149 @@ describe('the editor store', () => {
     expect(moves).toEqual([['lib', 'p1', 'Pub/Other']]);
     expect(editor().target).toBeNull();
     expect(listed).toBe(1);
+  });
+});
+
+/** An outside change as `check_import_drift` gives it */
+const difference = (
+  path: string,
+  change: DriftDifference['change'],
+  kind: DriftDifference['kind'],
+  choices: DriftDifference['choices'],
+  reason: string | null = null
+): DriftDifference => ({
+  path: `Pub/Pack/${path}`,
+  change,
+  kind,
+  size: change === 'missing' ? null : 4,
+  sha256: change === 'missing' ? null : `sha-${path}`,
+  choices,
+  reason,
+});
+
+const outside = (): DriftDifference[] => [
+  difference('Notes.txt', 'added', 'outside', ['keep', 'discard']),
+  difference('Readme.txt', 'changed', 'extracted', ['keep', 'recipe']),
+  difference(
+    'Models/SM_Log.glb',
+    'missing',
+    'generated',
+    ['restore'],
+    'No step drops one GLB: delete its model in the app, or turn the convert step off'
+  ),
+];
+
+describe('outside changes', () => {
+  const editor = () => usePreparationStore.getState().editors.p1;
+  const store = () => usePreparationStore.getState();
+
+  test('each difference starts on its default, and takes only a choice it offers', () => {
+    const draft = driftDraft(outside());
+    expect(draft.choices).toEqual({
+      'Pub/Pack/Notes.txt': 'keep',
+      'Pub/Pack/Readme.txt': 'keep',
+      'Pub/Pack/Models/SM_Log.glb': 'restore',
+    });
+    const recipe = chooseDrift(draft, 'Pub/Pack/Readme.txt', 'recipe');
+    expect(recipe.choices['Pub/Pack/Readme.txt']).toBe('recipe');
+    // A generated GLB can't be kept, nor a file be answered that isn't listed
+    expect(chooseDrift(recipe, 'Pub/Pack/Models/SM_Log.glb', 'keep')).toBe(recipe);
+    expect(chooseDrift(recipe, 'Pub/Pack/Other.txt', 'keep')).toBe(recipe);
+    expect(chosenFrom(recipe)).toEqual<DriftChosen[]>([
+      { path: 'Pub/Pack/Notes.txt', change: 'added', sha256: 'sha-Notes.txt', choice: 'keep' },
+      {
+        path: 'Pub/Pack/Readme.txt',
+        change: 'changed',
+        sha256: 'sha-Readme.txt',
+        choice: 'recipe',
+      },
+      { path: 'Pub/Pack/Models/SM_Log.glb', change: 'missing', sha256: null, choice: 'restore' },
+    ]);
+  });
+
+  test('the dialog names each change and choice for the file it is about', () => {
+    const [added, changed, missing] = outside();
+    expect(differenceText(added)).toBe('Added, not from the original');
+    expect(differenceText(changed)).toBe('Changed, from the original');
+    expect(differenceText(missing)).toBe('Missing, a converted GLB');
+    expect(choiceLabel('keep', added)).toBe('Keep');
+    expect(choiceLabel('keep', changed)).toBe('Keep yours');
+    expect(choiceLabel('recipe', changed)).toBe("Use the recipe's");
+    expect(choiceLabel('exclude', missing)).toBe('Leave it out');
+    expect(choiceLabel('metadataOff', missing)).toBe('Turn the metadata step off');
+  });
+
+  test('Rebuild with outside changes opens the dialog, and its choices go with the run', async () => {
+    api.getImportSteps = async () => read();
+    api.checkImportDrift = async () => outside();
+    const sent: DriftChosen[][] = [];
+    api.rebuildImportPack = async (_l, packId, drift = []) => {
+      sent.push(drift);
+      return run('r1', packId);
+    };
+    await store().open('lib', 'p1');
+    expect(await store().rebuild('p1')).toBe(false);
+    expect(sent).toEqual([]);
+    expect(driftOpen()).toBe(true);
+    expect(editor().drift?.differences).toEqual(outside());
+
+    store().chooseDrift('p1', 'Pub/Pack/Notes.txt', 'discard');
+    expect(await store().confirmDrift('p1')).toBe(true);
+    expect(sent).toEqual([
+      chosenFrom(chooseDrift(driftDraft(outside()), 'Pub/Pack/Notes.txt', 'discard')),
+    ]);
+    expect(sent[0][0].choice).toBe('discard');
+    expect(editor().drift).toBeNull();
+    expect(busyReason(useImportStore.getState().runs, 'lib', 'p1')).toBe(BUSY);
+  });
+
+  test('Cancel closes the dialog and queues nothing', async () => {
+    api.getImportSteps = async () => read();
+    api.checkImportDrift = async () => outside();
+    let queued = 0;
+    api.rebuildImportPack = async () => {
+      queued++;
+      return run('r1', 'p1');
+    };
+    await store().open('lib', 'p1');
+    await store().rebuild('p1');
+    store().closeDrift('p1');
+    expect(editor().drift).toBeNull();
+    expect(driftOpen()).toBe(false);
+    expect(queued).toBe(0);
+  });
+
+  test('a folder that changed again since its check shows the dialog again with what it holds now', async () => {
+    api.getImportSteps = async () => read();
+    let found = outside().slice(0, 1);
+    api.checkImportDrift = async () => found;
+    api.rebuildImportPack = async () => {
+      throw `${DRIFT_STALE}: check it again`;
+    };
+    await store().open('lib', 'p1');
+    await store().rebuild('p1');
+    found = outside();
+    expect(await store().confirmDrift('p1')).toBe(false);
+    expect(editor().drift?.differences).toEqual(outside());
+    expect(editor().drift?.notice).toContain('changed again');
+    expect(editor().saving).toBe(false);
+  });
+
+  test('another refusal keeps the dialog and shows why', async () => {
+    api.getImportSteps = async () => read();
+    api.checkImportDrift = async () => outside();
+    api.rebuildImportPack = async () => {
+      throw BUSY;
+    };
+    await store().open('lib', 'p1');
+    await store().rebuild('p1');
+    expect(await store().confirmDrift('p1')).toBe(false);
+    expect(editor().drift?.notice).toBe(BUSY);
+  });
+
+  test("the kept files are read with the steps, for the panel's list", async () => {
+    api.getImportSteps = async () => read(golden(), 0, {}, ['Pub/Pack/Notes.txt']);
+    await store().open('lib', 'p1');
+    expect(editor().draft?.kept).toEqual(['Pub/Pack/Notes.txt']);
   });
 });

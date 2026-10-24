@@ -18,6 +18,9 @@
 //! the settle deletes it and a rollback puts it back. That covers the paths of carried files and
 //! of files new to this build alike (one whose `exclude` was turned off, say). So no carry is
 //! skipped, and no file takes over another file's row.
+//!
+//! A kept file added outside OpenDAM has no source path: the build copied it from its own path in
+//! the pack folder, so it is never carried, and the row at its path, its own, never displaced.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -73,13 +76,15 @@ pub async fn carry(
     .bind(build_id)
     .fetch_all(pool)
     .await?;
-    // Each row at a path of the new build that the previous build's same file didn't hold.
+    // Each row at a path of the new build that the previous build's same file didn't hold. A
+    // kept file of its own (no source path) was copied from that very path, so the row there is
+    // its own.
     let occupied: Vec<(String, String)> = sqlx::query_as(
         "SELECT d.id, n.path FROM import_outputs n
          JOIN assets d ON d.file_path = n.path
          LEFT JOIN import_outputs p ON p.pack_id = n.pack_id AND p.build_id = ?2
              AND p.path = n.path
-         WHERE n.pack_id = ?1 AND n.build_id = ?3
+         WHERE n.pack_id = ?1 AND n.build_id = ?3 AND n.source_path IS NOT NULL
              AND (p.path IS NULL OR p.source_path IS NOT n.source_path
                  OR (p.origin = 'generated') != (n.origin = 'generated'))
          ORDER BY n.path",

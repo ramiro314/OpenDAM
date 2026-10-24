@@ -13,6 +13,7 @@ pub(super) mod tests {
 
     use crate::fs_swap;
     use crate::import::build::FINISHING;
+    use crate::import::drift;
     use crate::import::engine::tests::{built, setup, setup_with, Setup, TARGET};
     use crate::import::engine::*;
     use crate::import::metadata;
@@ -69,12 +70,46 @@ pub(super) mod tests {
         }
 
         pub(crate) async fn rebuild(&self, pack_id: &str) -> RunSummary {
-            self.engine.rebuild_pack("lib", pack_id).await.unwrap()
+            self.engine
+                .rebuild_pack("lib", pack_id, Vec::new())
+                .await
+                .unwrap()
         }
 
         pub(crate) async fn rebuild_until(&self, pack_id: &str, status: &str) -> RunSummary {
             let run = self.rebuild(pack_id).await;
             self.wait_for(&run.id, status).await
+        }
+
+        /// The pack's outside changes, each answered by `choose`.
+        pub(crate) async fn choices(
+            &self,
+            pack_id: &str,
+            choose: impl Fn(&drift::Difference) -> drift::Choice,
+        ) -> Vec<drift::Chosen> {
+            let found = self.engine.check_drift("lib", pack_id).await.unwrap();
+            found
+                .iter()
+                .map(|d| drift::Chosen {
+                    path: d.path.clone(),
+                    change: d.change,
+                    sha256: d.sha256.clone(),
+                    choice: choose(d),
+                })
+                .collect()
+        }
+
+        /// Queues a rebuild with each outside change answered by `choose`.
+        pub(crate) async fn rebuild_choosing(
+            &self,
+            pack_id: &str,
+            choose: impl Fn(&drift::Difference) -> drift::Choice,
+        ) -> RunSummary {
+            let chosen = self.choices(pack_id, choose).await;
+            self.engine
+                .rebuild_pack("lib", pack_id, chosen)
+                .await
+                .unwrap()
         }
 
         /// The asset id at `path` in the pack.
@@ -708,10 +743,25 @@ pub(super) mod tests {
     async fn a_pack_folder_changed_outside_opendam_fails_the_rebuild_before_it_stages() {
         let s = setup().await;
         let pack_id = s.import_golden().await;
-        std::fs::write(s.live().join("Added.txt"), "mine").unwrap();
         let build = s.current_build().await;
+        // A Rebuild that answers no outside change is refused while there is one.
+        std::fs::write(s.live().join("Added.txt"), "mine").unwrap();
+        assert_eq!(
+            s.engine
+                .rebuild_pack("lib", &pack_id, Vec::new())
+                .await
+                .unwrap_err(),
+            crate::import::drift::STALE
+        );
+        std::fs::remove_file(s.live().join("Added.txt")).unwrap();
 
-        let failed = s.rebuild_until(&pack_id, "failed").await;
+        // A change after the Rebuild was queued fails its build before it stages.
+        let pause = s.engine.hooks().pause(Point::Claim);
+        let run = s.rebuild(&pack_id).await;
+        reached(&pause).await;
+        std::fs::write(s.live().join("Added.txt"), "mine").unwrap();
+        pause.release.notify_one();
+        let failed = s.wait_for(&run.id, "failed").await;
         assert_eq!(
             failed.error.as_deref(),
             Some(
@@ -852,7 +902,10 @@ pub(super) mod tests {
             refused
         );
         assert_eq!(
-            s.engine.rebuild_pack("lib", &pack_id).await.map(|_| ()),
+            s.engine
+                .rebuild_pack("lib", &pack_id, Vec::new())
+                .await
+                .map(|_| ()),
             refused
         );
 
@@ -868,7 +921,10 @@ pub(super) mod tests {
             refused
         );
         assert_eq!(
-            s.engine.rebuild_pack("lib", &pack_id).await.map(|_| ()),
+            s.engine
+                .rebuild_pack("lib", &pack_id, Vec::new())
+                .await
+                .map(|_| ()),
             refused
         );
         assert_eq!(
@@ -888,12 +944,19 @@ pub(super) mod tests {
                 .await,
             Ok(1)
         );
-        let rebuild = s.engine.rebuild_pack("lib", &pack_id).await.unwrap();
+        let rebuild = s
+            .engine
+            .rebuild_pack("lib", &pack_id, Vec::new())
+            .await
+            .unwrap();
         assert_eq!(rebuild.packs[0].recipe_rev, 1);
         assert_eq!(rebuild.kind, "rebuild");
         reached(&pause).await;
         assert_eq!(
-            s.engine.rebuild_pack("lib", &pack_id).await.map(|_| ()),
+            s.engine
+                .rebuild_pack("lib", &pack_id, Vec::new())
+                .await
+                .map(|_| ()),
             refused
         );
         assert_eq!(

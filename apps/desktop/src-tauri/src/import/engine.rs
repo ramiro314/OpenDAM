@@ -26,6 +26,7 @@ use sqlx::{Pool, Sqlite};
 use tokio::sync::{mpsc, Notify};
 
 use super::build::{self, BuildEnv, Hooks, Point, Progress, RunControl, Stop};
+use super::drift;
 use super::metadata::LicenseOption;
 use super::place::PlaceStep;
 use super::records::{
@@ -401,9 +402,13 @@ impl Engine {
                 tools: tools.clone(),
             };
             outcome = match run.kind.as_str() {
-                "import" | "rebuild" => {
-                    build::build(&env, &pack.pack_id, pack.recipe_rev, &mut warnings).await
-                }
+                "import" | "rebuild" => match queued_drift(library, &run.id, &pack.pack_id).await {
+                    Ok(chosen) => {
+                        build::build(&env, &pack.pack_id, pack.recipe_rev, &chosen, &mut warnings)
+                            .await
+                    }
+                    Err(e) => Err(Stop::Failed(e)),
+                },
                 other => Err(Stop::Failed(format!("{other} runs can't run yet"))),
             };
             if let Err(Stop::Failed(_)) = &outcome {
@@ -879,18 +884,45 @@ impl Engine {
             .map_err(refused)
     }
 
-    /// Queues a rebuild of pack `pack_id` from its current steps. Refused while a run for the
-    /// pack is queued or running.
+    /// Pack `pack_id`'s outside changes: how its folder differs from its current manifest, each
+    /// difference with the choices its file offers (plan pack-import, Edits after an import).
+    pub async fn check_drift(
+        &self,
+        library_id: &str,
+        pack_id: &str,
+    ) -> Result<Vec<drift::Difference>, String> {
+        let library = self.library(library_id).await?;
+        drift::check(&library.pool, &library.root_path, pack_id).await
+    }
+
+    /// Queues a rebuild of pack `pack_id` from its current steps, with `chosen`, an answer to
+    /// each of its outside changes. Refused while a run for the pack is queued or running, and
+    /// unless `chosen` answers exactly the differences its folder has now (`drift::STALE`). The
+    /// choices that edit the recipe (an `exclude`, the metadata step off) are recorded with the
+    /// run, in its transaction; the others travel with the run to its build.
     pub async fn rebuild_pack(
         &self,
         library_id: &str,
         pack_id: &str,
+        chosen: Vec<drift::Chosen>,
     ) -> Result<RunSummary, String> {
         let library = self.library(library_id).await?;
-        let run_id = records::queue_rebuild(&library.pool, pack_id, &self.owner, now_ms())
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(refused)?;
+        let found = drift::check(&library.pool, &library.root_path, pack_id).await?;
+        if drift::unmatched(&found, &chosen).is_some() {
+            return Err(drift::STALE.into());
+        }
+        let edits = drift::edits(&found, &chosen);
+        let run_id = records::queue_rebuild(
+            &library.pool,
+            pack_id,
+            &self.owner,
+            now_ms(),
+            &json!(chosen),
+            &edits,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(refused)?;
         let run = records::run(&library.pool, &library.id, &run_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -898,6 +930,18 @@ impl Engine {
         self.wake.notify_one();
         Ok(run)
     }
+}
+
+/// The drift choices run `run_id` was queued with for pack `pack_id`.
+async fn queued_drift(
+    library: &LibraryHandle,
+    run_id: &str,
+    pack_id: &str,
+) -> Result<Vec<drift::Chosen>, String> {
+    let drift = records::run_drift(&library.pool, run_id, pack_id)
+        .await
+        .map_err(|e| format!("Database error: {e}"))?;
+    serde_json::from_value(drift).map_err(|e| format!("The run's drift choices are invalid: {e}"))
 }
 
 /// Why an edit or a Rebuild is refused.
@@ -1097,6 +1141,10 @@ mod recovery_tests;
 #[cfg(test)]
 #[path = "edits_tests.rs"]
 mod edits_tests;
+
+#[cfg(test)]
+#[path = "drift_tests.rs"]
+mod drift_tests;
 
 #[cfg(test)]
 mod tests {

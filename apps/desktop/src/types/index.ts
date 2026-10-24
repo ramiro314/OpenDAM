@@ -968,6 +968,50 @@ export interface ImportPackSteps {
   steps: ImportStepRecord[];
   /** Why a step kind can't run here, by kind: `unity_glb` without an accepted Blender */
   unavailable: Record<string, string>;
+  /**
+   * The current build's files kept from outside changes, relative to the library root: not from
+   * the original, so a rebuild carries them but can't recreate them
+   */
+  kept: string[];
+}
+
+/** How a pack folder's file differs from its manifest (`drift::Change`) */
+export type DriftChange = 'added' | 'changed' | 'missing';
+
+/** What made the file a difference is about (`drift::Kind`) */
+export type DriftKind = 'extracted' | 'generated' | 'package' | 'kept' | 'outside';
+
+/** What to do about one difference (`drift::Choice`) */
+export type DriftChoice =
+  | 'keep'
+  | 'recipe'
+  | 'exclude'
+  | 'restore'
+  | 'metadataOff'
+  | 'forget'
+  | 'discard';
+
+/** One outside change to a pack folder, as `check_import_drift` finds it */
+export interface DriftDifference {
+  /** Relative to the library root */
+  path: string;
+  change: DriftChange;
+  kind: DriftKind;
+  /** The folder's file now, null for a missing one */
+  size: number | null;
+  sha256: string | null;
+  /** The choices its kind can honour, the default first */
+  choices: DriftChoice[];
+  /** Why it offers only one choice, when it does */
+  reason: string | null;
+}
+
+/** A choice as `rebuild_import_pack` takes it, with the difference it was made for */
+export interface DriftChosen {
+  path: string;
+  change: DriftChange;
+  sha256: string | null;
+  choice: DriftChoice;
 }
 
 /** A place step as `start_import` and `preview_import` take it */

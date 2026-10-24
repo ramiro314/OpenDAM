@@ -517,4 +517,78 @@ mod tests {
         assert!(s.listed("Materials/M_LogBark.mat").await);
         assert_eq!(s.steps_of(&pack_id).await, before);
     }
+
+    /// Keeps a changed `T_Rock.png` (keep yours) and `Notes.txt`, added outside OpenDAM, at a
+    /// Rebuild. Returns the pack id and the steps then.
+    async fn kept_rock_and_notes(s: &Setup) -> (String, PackSteps) {
+        let pack_id = s.import_golden().await;
+        std::fs::write(s.live().join("T_Rock.png"), "my rock").unwrap();
+        std::fs::write(s.live().join("Notes.txt"), "mine").unwrap();
+        let run = s
+            .rebuild_choosing(&pack_id, |_| crate::import::drift::Choice::Keep)
+            .await;
+        s.wait_for(&run.id, "done").await;
+        let steps = s.steps_of(&pack_id).await;
+        assert_eq!(steps.kept, [in_pack("Notes.txt"), in_pack("T_Rock.png")]);
+        (pack_id, steps)
+    }
+
+    /// A5: a kept copy that replaced `T_Rock.png` renamed in the app records a `rename` against
+    /// its source path, so a rebuild puts only the kept bytes under the new name; a kept file
+    /// added outside OpenDAM renamed records no step and is carried under its new name.
+    #[tokio::test]
+    async fn renaming_kept_files_records_a_step_only_for_a_replacement() {
+        let s = setup().await;
+        let (pack_id, before) = kept_rock_and_notes(&s).await;
+        s.rename("T_Rock.png", "T_Stone").await.unwrap();
+        s.rename("Notes.txt", "Memo").await.unwrap();
+        assert_eq!(
+            s.recorded(&pack_id, &before).await,
+            [step(
+                "rename",
+                json!({"source": wrapped("Art/T_Rock.png"), "name": "T_Stone.png"})
+            )]
+        );
+
+        s.rebuild_until(&pack_id, "done").await;
+        let read = |p: &str| std::fs::read_to_string(s.live().join(p)).unwrap();
+        assert_eq!(read("T_Stone.png"), "my rock");
+        assert!(
+            !s.exists("T_Rock.png"),
+            "the recipe's copy doesn't come back"
+        );
+        s.with_meta("T_Stone.png", true).await;
+        assert_eq!(read("Memo.txt"), "mine");
+        assert!(!s.exists("Notes.txt"));
+        assert_eq!(
+            s.steps_of(&pack_id).await.kept,
+            [in_pack("Memo.txt"), in_pack("T_Stone.png")]
+        );
+        s.settled().await;
+    }
+
+    /// A5: a kept replacement deleted in the app records an `exclude`, so a rebuild produces
+    /// neither copy; a kept file added outside OpenDAM deleted is dropped from the kept files and
+    /// doesn't come back.
+    #[tokio::test]
+    async fn deleting_kept_files_brings_neither_back() {
+        let s = setup().await;
+        let (pack_id, before) = kept_rock_and_notes(&s).await;
+        s.delete("T_Rock.png").await.unwrap();
+        s.delete("Notes.txt").await.unwrap();
+        assert_eq!(
+            s.recorded(&pack_id, &before).await,
+            [step(
+                "exclude",
+                json!({"source": wrapped("Art/T_Rock.png")})
+            )]
+        );
+        assert!(s.steps_of(&pack_id).await.kept.is_empty());
+
+        s.rebuild_until(&pack_id, "done").await;
+        s.with_meta("T_Rock.png", false).await;
+        assert!(!s.exists("Notes.txt"));
+        assert!(s.steps_of(&pack_id).await.kept.is_empty());
+        s.settled().await;
+    }
 }

@@ -13,6 +13,7 @@ import { ReviewModal } from './components/Autotag/ReviewModal';
 import { FolderActionDialog } from './components/FolderActions';
 import { ImportsPanel } from './components/Imports/ImportsPanel';
 import { ImportDialog } from './components/Imports/ImportDialog';
+import { DriftDialogs } from './components/Imports/DriftDialog';
 import { IconCheck } from './components/Icons';
 import { PanelResizer } from './components/PanelResizer/PanelResizer';
 import { useUIStore } from './store';
@@ -306,6 +307,7 @@ export default function App() {
       {runsPanelOpen && <RunsPanel />}
       {importsPanelOpen && <ImportsPanel />}
       <ImportDialog />
+      <DriftDialogs />
       {reviewRunId && <ReviewModal key={reviewRunId} runId={reviewRunId} />}
       {autotagTarget && (
         <AutotagDialog target={autotagTarget} onClose={() => openAutotagDialog(null)} />

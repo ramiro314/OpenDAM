@@ -22,7 +22,7 @@
 //! Step 5 or 6 failing rolls the swap back: the previous folder (if any) returns, the inserted
 //! rows go, the carried rows go back by asset id, and `current_build` stays as it was.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,9 +30,10 @@ use std::time::Duration;
 use sqlx::{Pool, Sqlite};
 
 use super::carry;
+use super::drift::{self, Chosen, KeptFile};
 use super::metadata::{self, KenneyLicense, Lookup, MetadataStep};
 use super::place::{place, PlaceStep};
-use super::records::{self, InsertedRows, ManifestRow, Output, Recipe};
+use super::records::{self, InsertedRows, ManifestRow, Origin, Output, Recipe};
 use super::unity_glb::{self, Conversion};
 use super::unitypackage::{extract_unitypackage, extract_variant, ExtractedFile, SkippedEntry};
 use super::zipfile::extract_zip;
@@ -422,12 +423,14 @@ impl Plan {
     }
 }
 
-/// Builds pack `pack_id`, queued at `queued_rev`: its first build, or a rebuild over the
-/// committed one. Fills `warnings` with the entries the extraction skipped.
+/// Builds pack `pack_id`, queued at `queued_rev` with the drift choices `chosen`: its first
+/// build, or a rebuild over the committed one. Fills `warnings` with the entries the extraction
+/// skipped.
 pub async fn build(
     env: &BuildEnv<'_>,
     pack_id: &str,
     queued_rev: i64,
+    chosen: &[Chosen],
     warnings: &mut Vec<SkippedEntry>,
 ) -> Result<(), Stop> {
     let pool = &env.library.pool;
@@ -451,12 +454,21 @@ pub async fn build(
             .map_err(db_error)?,
         None => Vec::new(),
     };
-    if let Some(changed) = live_changed(&live, &recipe, &previous).await {
-        return Err(Stop::Failed(match recipe.current_build {
-            None => format!("{} already exists in the library", recipe.target),
-            Some(_) => format!("{changed} changed outside OpenDAM since the pack's last build"),
-        }));
-    }
+    let kept = match outside(&root, &recipe, &previous, chosen).await {
+        Ok(kept) => kept,
+        Err(changed) => {
+            return Err(Stop::Failed(match recipe.current_build {
+                None => format!("{} already exists in the library", recipe.target),
+                Some(_) if chosen.is_empty() => {
+                    format!("{changed} changed outside OpenDAM since the pack's last build")
+                }
+                Some(_) => format!(
+                    "{changed} changed outside OpenDAM since the Rebuild was asked for; \
+                     Rebuild again"
+                ),
+            }))
+        }
+    };
     let created = missing_folders(&root, &live);
     let staging = fs_swap::create_staging(&live, STAGING, &build_id).map_err(|e| {
         remove_created(&created);
@@ -474,7 +486,7 @@ pub async fn build(
     };
 
     let outputs = match stage(
-        env, &recipe, &plan, &staging, &build_id, &previous, warnings,
+        env, &recipe, &plan, &staging, &build_id, &previous, &kept, warnings,
     )
     .await
     {
@@ -500,6 +512,7 @@ pub async fn build(
         &recipe,
         queued_rev,
         &previous,
+        (chosen, &kept),
         &staging,
         &build_id,
         &outputs,
@@ -520,6 +533,7 @@ async fn swap_in(
     recipe: &Recipe,
     queued_rev: i64,
     previous: &[ManifestRow],
+    drift: (&[Chosen], &[KeptFile]),
     staging: &Path,
     build_id: &str,
     outputs: &[Output],
@@ -546,7 +560,7 @@ async fn swap_in(
         return Err(cleanup.run(Stop::Failed(CHANGED.to_string())).await);
     }
     let checked = recheck(
-        pool, recipe, queued_rev, previous, &live, staging, build_id, outputs,
+        env, recipe, queued_rev, previous, drift, staging, build_id, outputs,
     )
     .await;
     if let Err(stop) = checked {
@@ -785,7 +799,11 @@ impl Cleanup<'_> {
 }
 
 /// Extracts and places the pack into `staging`, hashes its files and writes their manifest
-/// rows under `build_id`, checking for Cancel between steps.
+/// rows under `build_id`, checking for Cancel between steps. The `kept` files come from the
+/// pack folder: one that replaces a recipe file takes its bytes right after the extraction, so
+/// the steps place it and the conversion reads it, and one of its own joins at its path after
+/// the conversion.
+#[allow(clippy::too_many_arguments)]
 async fn stage(
     env: &BuildEnv<'_>,
     recipe: &Recipe,
@@ -793,6 +811,7 @@ async fn stage(
     staging: &Path,
     build_id: &str,
     previous: &[ManifestRow],
+    kept: &[KeptFile],
     warnings: &mut Vec<SkippedEntry>,
 ) -> Result<Vec<Output>, Stop> {
     let cancelled = || {
@@ -836,12 +855,25 @@ async fn stage(
     warnings.extend(extraction.skipped);
     cancelled()?;
 
+    let (root, to, mut files) = (
+        env.library.root_path.clone(),
+        staging.to_path_buf(),
+        extraction.files,
+    );
+    let replacing = kept.to_vec();
+    let (files, replaced, own) = blocking(move || {
+        let (replaced, own) = replace_kept(&root, &to, &mut files, &replacing)?;
+        Ok((files, replaced, own))
+    })
+    .await?;
+    cancelled()?;
+
     (env.progress)(Progress {
         step: "placing",
         done: 0,
         total: 0,
     });
-    let (to, steps, mut files) = (staging.to_path_buf(), plan.place.clone(), extraction.files);
+    let (to, steps, mut files) = (staging.to_path_buf(), plan.place.clone(), files);
     let files = blocking(move || {
         place(&to, &mut files, &steps).map_err(|e| format!("{e:#}"))?;
         Ok(files)
@@ -854,7 +886,7 @@ async fn stage(
         previous
             .iter()
             .filter_map(|row| {
-                let key = (row.source_path.clone()?, row.generated);
+                let key = (row.source_path.clone()?, row.origin.generated());
                 Some((key, (row.size, row.sha256.clone(), row.mtime_ns)))
             })
             .collect(),
@@ -862,7 +894,17 @@ async fn stage(
     // The phases after placing, in plan order: convert, then metadata, which sees the GLBs.
     // Files are hashed once at the end, except that a conversion needs its inputs' hashes first.
     let prefix = format!("{}/", recipe.target);
-    let mut pending: Vec<(ExtractedFile, bool)> = files.into_iter().map(|f| (f, false)).collect();
+    let mut pending: Vec<(ExtractedFile, Origin)> = files
+        .into_iter()
+        .map(|f| {
+            let origin = if replaced.contains(&f.source_path) {
+                Origin::Kept
+            } else {
+                Origin::Extracted
+            };
+            (f, origin)
+        })
+        .collect();
     let mut outputs = Vec::new();
     if let Some(options) = &plan.convert {
         outputs = hash_staged(
@@ -902,10 +944,22 @@ async fn stage(
                     source_path: m.source_path,
                     size: 0,
                 };
-                (glb, true)
+                (glb, Origin::Generated)
             })
             .collect();
         outputs.extend(hash_staged(env, recipe, staging, generated, &unchanged).await?);
+        cancelled()?;
+    }
+    if !own.is_empty() {
+        let mut taken: HashSet<String> = outputs.iter().map(|o| o.path.clone()).collect();
+        taken.extend(pending.iter().map(|(f, _)| format!("{prefix}{}", f.path)));
+        let (root, to, target) = (
+            env.library.root_path.clone(),
+            staging.to_path_buf(),
+            recipe.target.clone(),
+        );
+        let joined = blocking(move || add_kept(&root, &to, &target, &own, &taken)).await?;
+        pending.extend(joined.into_iter().map(|f| (f, Origin::Kept)));
         cancelled()?;
     }
     if let Some(step) = &plan.metadata {
@@ -919,12 +973,25 @@ async fn stage(
             .chain(pending.iter().map(|(f, _)| f.clone()))
             .collect();
         let package = write_package(env, recipe, step, staging, &files).await?;
-        pending.push((package, true));
+        pending.push((package, Origin::Generated));
         cancelled()?;
     }
     outputs.extend(hash_staged(env, recipe, staging, pending, &unchanged).await?);
     cancelled()?;
     outputs.sort_by(|a, b| a.path.cmp(&b.path));
+    // A kept file copied with other bytes than the drift check saw changed since: the re-check
+    // under the lock would refuse the build anyway.
+    let mut staged_kept: Vec<&str> = outputs
+        .iter()
+        .filter(|o| o.origin == Origin::Kept)
+        .map(|o| o.sha256.as_str())
+        .collect();
+    let mut expected: Vec<&str> = kept.iter().map(|k| k.sha256.as_str()).collect();
+    expected.sort_unstable();
+    staged_kept.sort_unstable();
+    if staged_kept != expected {
+        return Err(Stop::Failed(CHANGED.to_string()));
+    }
 
     records::write_outputs(&env.library.pool, &recipe.pack_id, build_id, &outputs)
         .await
@@ -937,14 +1004,14 @@ async fn stage(
 /// The previous build's rows by file key (source path, generated): size, sha256 and mtime.
 type Unchanged = HashMap<(String, bool), (i64, String, i64)>;
 
-/// Hashes the staged files `files`, each with whether it is generated, as their manifest rows
-/// (a file's size is read from disk). A file the previous build had, by file key, size and sha256, gets that
+/// Hashes the staged files `files`, each with its origin, as their manifest rows (a file's size
+/// is read from disk). A file the previous build had, by file key, size and sha256, gets that
 /// build's mtime, so the index sees it unchanged.
 async fn hash_staged(
     env: &BuildEnv<'_>,
     recipe: &Recipe,
     staging: &Path,
-    files: Vec<(ExtractedFile, bool)>,
+    files: Vec<(ExtractedFile, Origin)>,
     unchanged: &Arc<Unchanged>,
 ) -> Result<Vec<Output>, Stop> {
     let (to, target, control, progress, unchanged) = (
@@ -957,7 +1024,7 @@ async fn hash_staged(
     tokio::task::spawn_blocking(move || {
         let total = files.len() as u64;
         let mut outputs = Vec::with_capacity(files.len());
-        for (done, (file, generated)) in files.into_iter().enumerate() {
+        for (done, (file, origin)) in files.into_iter().enumerate() {
             let (rel, source_path) = (file.path, file.source_path);
             if control.cancelled() {
                 return Err(Stop::Cancelled);
@@ -971,9 +1038,11 @@ async fn hash_staged(
             let read = |e: std::io::Error| format!("The staged {rel} can't be read: {e}");
             let (size, mut mtime_ns) = file_stamp(&path).map_err(read)?;
             let sha256 = crate::export::hashes::sha256_file(&path).map_err(read)?;
-            let key = (records::source_json(&source_path), generated);
-            if let Some((_, _, before)) = unchanged
-                .get(&key)
+            // A kept file of its own has no file key, and keeps its own mtime.
+            let key = (origin != Origin::Kept || !source_path.is_empty())
+                .then(|| (records::source_json(&source_path), origin.generated()));
+            if let Some((_, _, before)) = key
+                .and_then(|key| unchanged.get(&key))
                 .filter(|(s, sha, _)| *s == size as i64 && *sha == sha256)
             {
                 if *before != mtime_ns {
@@ -988,7 +1057,7 @@ async fn hash_staged(
                 mtime_ns,
                 sha256,
                 source_path,
-                generated,
+                origin,
             });
         }
         Ok(outputs)
@@ -1144,20 +1213,22 @@ async fn both_locks<'l>(
     }
 }
 
-/// Step 2: the recipe and the committed build are as queued, the pack folder still holds the
-/// current manifest's files (or still doesn't exist before a first build), and the staging
-/// folder and the build's manifest rows hold exactly the files the build staged.
+/// Step 2: the recipe and the committed build are as queued, the pack folder still differs
+/// from the current manifest exactly as the drift choices were made for (or still doesn't exist
+/// before a first build), so it keeps the same files, and the staging folder and the build's
+/// manifest rows hold exactly the files the build staged.
 #[allow(clippy::too_many_arguments)]
 async fn recheck(
-    pool: &Pool<Sqlite>,
+    env: &BuildEnv<'_>,
     queued: &Recipe,
     queued_rev: i64,
     previous: &[ManifestRow],
-    live: &Path,
+    (chosen, kept): (&[Chosen], &[KeptFile]),
     staging: &Path,
     build_id: &str,
     outputs: &[Output],
 ) -> Result<(), Stop> {
+    let pool = &env.library.pool;
     let now = records::recipe(pool, &queued.pack_id)
         .await
         .map_err(db_error)?;
@@ -1180,8 +1251,9 @@ async fn recheck(
     let rows = records::output_sizes(pool, &queued.pack_id, build_id)
         .await
         .map_err(db_error)?;
+    let still = outside(&env.library.root_path, queued, previous, chosen).await;
     if !same_recipe
-        || live_changed(live, queued, previous).await.is_some()
+        || still.as_deref() != Ok(kept)
         || staged.ok().as_ref() != Some(&expected)
         || rows != expected
     {
@@ -1190,53 +1262,112 @@ async fn recheck(
     Ok(())
 }
 
-/// What changed in the pack folder `live` since the committed build: `None` when it holds exactly
-/// the files of `manifest` (that build's rows), compared by size and mtime and hashed only when
-/// the mtime differs, or, before a first build, when it doesn't exist.
-async fn live_changed(live: &Path, recipe: &Recipe, manifest: &[ManifestRow]) -> Option<String> {
+/// The files a build of `recipe` keeps from its pack folder, once the folder, in the library
+/// at `root`, still differs from `previous` (the committed build's rows) exactly as the drift
+/// choices `chosen` were made for. Otherwise the first path that doesn't. Before a first build
+/// the folder must not exist.
+async fn outside(
+    root: &Path,
+    recipe: &Recipe,
+    previous: &[ManifestRow],
+    chosen: &[Chosen],
+) -> Result<Vec<KeptFile>, String> {
     let folder = format!("The pack folder {}", recipe.target);
     if recipe.current_build.is_none() {
-        return live.symlink_metadata().is_ok().then_some(folder);
-    }
-    if !live.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-        return Some(folder);
-    }
-    let (live, prefix) = (live.to_path_buf(), format!("{}/", recipe.target));
-    let (manifest, stopped) = (manifest.to_vec(), folder.clone());
-    tokio::task::spawn_blocking(move || {
-        let Ok(files) = staged_sizes(&live) else {
-            return Some(folder);
+        let exists = root.join(&recipe.target).symlink_metadata().is_ok();
+        return if exists || !chosen.is_empty() {
+            Err(folder)
+        } else {
+            Ok(Vec::new())
         };
-        let listed: Vec<(String, i64)> = manifest
-            .iter()
-            .map(|row| (row.path.clone(), row.size))
-            .collect();
-        let found: Vec<(String, i64)> = files
-            .into_iter()
-            .map(|(path, size)| (format!("{prefix}{path}"), size))
-            .collect();
-        if found != listed {
-            // The first path that differs, in either list.
-            let differs = found
-                .iter()
-                .zip(&listed)
-                .find(|(a, b)| a != b)
-                .map(|(a, b)| a.0.as_str().min(b.0.as_str()).to_string());
-            let extra = found.get(listed.len()).or(listed.get(found.len()));
-            return differs.or(extra.map(|e| e.0.clone()));
+    }
+    let found = drift::scan(root, recipe, previous).await.map_err(|e| {
+        tracing::warn!("{e}");
+        folder
+    })?;
+    match drift::unmatched(&found, chosen) {
+        Some(path) => Err(path),
+        None => Ok(drift::kept(previous, &found, chosen)),
+    }
+}
+
+/// Puts the bytes of each kept file in `kept` that replaces a recipe file, found in the pack
+/// folder of the library at `root`, in place of the extracted file with its source path among
+/// `files` in `staging`. Returns the source paths replaced, and the kept files left to join at
+/// their own paths: those of their own, and any whose file the extract no longer produces.
+fn replace_kept(
+    root: &Path,
+    staging: &Path,
+    files: &mut [ExtractedFile],
+    kept: &[KeptFile],
+) -> Result<(HashSet<Vec<String>>, Vec<KeptFile>), String> {
+    let mut replaced = HashSet::new();
+    let mut own = Vec::new();
+    for file in kept {
+        let target = file.source_path.as_ref().and_then(|source| {
+            files
+                .iter_mut()
+                .find(|f| f.source_path == *source)
+                .map(|f| (f, source))
+        });
+        let Some((target, source)) = target else {
+            own.push(file.clone());
+            continue;
+        };
+        target.size = copy_kept(&root.join(&file.path), &staging.join(&target.path))
+            .map_err(|e| format!("The kept file {} can't be copied: {e}", file.path))?;
+        replaced.insert(source.clone());
+    }
+    Ok((replaced, own))
+}
+
+/// Copies each kept file of `own`, found in the pack folder `target` of the library at `root`,
+/// to its own path in `staging`, refusing one at a path the build already wrote (`taken`,
+/// relative to the library root). Returns them as staged files.
+fn add_kept(
+    root: &Path,
+    staging: &Path,
+    target: &str,
+    own: &[KeptFile],
+    taken: &HashSet<String>,
+) -> Result<Vec<ExtractedFile>, String> {
+    let prefix = format!("{target}/");
+    let mut staged = Vec::new();
+    for file in own {
+        let Some(rel) = file.path.strip_prefix(&prefix) else {
+            return Err(format!("The kept file {} isn't in the pack", file.path));
+        };
+        let to = staging.join(rel);
+        if taken.contains(&file.path) || to.symlink_metadata().is_ok() {
+            return Err(format!(
+                "{} is kept from outside changes where the build now writes its own file: \
+                 Rebuild again and discard it, or delete it in the app",
+                file.path
+            ));
         }
-        manifest.iter().find_map(|row| {
-            let path = live.join(&row.path[prefix.len()..]);
-            let same = match file_stamp(&path) {
-                Ok((_, mtime_ns)) if mtime_ns == row.mtime_ns => true,
-                Ok(_) => crate::export::hashes::sha256_file(&path).is_ok_and(|h| h == row.sha256),
-                Err(_) => false,
-            };
-            (!same).then(|| row.path.clone())
-        })
-    })
-    .await
-    .unwrap_or(Some(stopped))
+        let size = copy_kept(&root.join(&file.path), &to)
+            .map_err(|e| format!("The kept file {} can't be copied: {e}", file.path))?;
+        staged.push(ExtractedFile {
+            path: rel.to_string(),
+            source_path: file.source_path.clone().unwrap_or_default(),
+            size,
+        });
+    }
+    Ok(staged)
+}
+
+/// Copies the pack folder's file `from` to `to` in staging with its mtime, so the index sees an
+/// unchanged kept file as unchanged. Only a regular file is copied, never through a link.
+fn copy_kept(from: &Path, to: &Path) -> std::io::Result<u64> {
+    if !from.symlink_metadata()?.is_file() {
+        return Err(std::io::Error::other("it isn't a regular file"));
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let size = std::fs::copy(from, to)?;
+    set_mtime(to, file_stamp(from)?.1)?;
+    Ok(size)
 }
 
 /// Every file below `folder` as `(path, size)`, sorted. Anything but a regular file or a folder

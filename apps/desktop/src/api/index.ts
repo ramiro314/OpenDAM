@@ -45,6 +45,8 @@ import type {
   RunEstimate,
   ReviewProposal,
   ProposalDecision,
+  DriftChosen,
+  DriftDifference,
   ImportPackSteps,
   ImportRequest,
   ImportRun,
@@ -261,9 +263,15 @@ export const api = {
     steps: ImportStepRecord[],
     recipeRev: number
   ) => invoke<number>('set_import_steps', { libraryId, packId, steps, recipeRev }),
-  /** Queues a rebuild from the pack's current steps; refused while a run for it is live */
-  rebuildImportPack: (libraryId: string, packId: string) =>
-    invoke<ImportRun>('rebuild_import_pack', { libraryId, packId }),
+  /** How the pack's folder differs from its manifest, each difference with its choices */
+  checkImportDrift: (libraryId: string, packId: string) =>
+    invoke<DriftDifference[]>('check_import_drift', { libraryId, packId }),
+  /**
+   * Queues a rebuild from the pack's current steps, with a choice for each outside change;
+   * refused while a run for it is live, or when the choices don't answer the folder now
+   */
+  rebuildImportPack: (libraryId: string, packId: string, drift: DriftChosen[] = []) =>
+    invoke<ImportRun>('rebuild_import_pack', { libraryId, packId, drift }),
   /** Records one pack's import and queues its first build */
   startImport: (request: ImportRequest) => invoke<ImportRun>('start_import', { request }),
   /** Fails with "Finishing, can't cancel now" once the build holds the library's lock */

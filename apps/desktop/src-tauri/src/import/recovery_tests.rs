@@ -13,6 +13,7 @@ mod tests {
     use super::super::rebuild_tests::tests::{add, in_pack, reached, toggle, Rows};
     use crate::db::{self, Database, LibraryHandle};
     use crate::fs_swap;
+    use crate::import::drift::{Change, Choice};
     use crate::import::engine::tests::{setup_in, Setup, TARGET};
     use crate::import::engine::*;
     use crate::import::unitypackage::tests::on_disk;
@@ -575,6 +576,107 @@ mod tests {
         s.tree_untouched().await;
     }
 
+    /// The golden pack with `T_Rock.png` tagged, its whole folder deleted outside OpenDAM, and
+    /// `hoist` turned off, then a Rebuild restoring every missing file, queued once `hook` set
+    /// the test's hooks. Returns the run, the library as the build found it, and the tagged
+    /// row's id.
+    async fn restore_deleted(s: &Setup, hook: impl FnOnce()) -> (RunSummary, Before, String) {
+        let pack_id = s.import_golden().await;
+        let rock = s.tag("T_Rock.png", "rock").await;
+        std::fs::remove_dir_all(s.live()).unwrap();
+        let before = Before {
+            build: s.current_build().await,
+            rows: s.rows().await,
+            tree: Vec::new(),
+        };
+        s.edit_steps(&pack_id, |steps| toggle(steps, "hoist", false))
+            .await;
+        let chosen = s.choices(&pack_id, |_| Choice::Restore).await;
+        let manifest = s
+            .count(
+                "SELECT COUNT(*) FROM import_outputs o JOIN import_packs p ON p.id = o.pack_id
+                 AND o.build_id = p.current_build",
+            )
+            .await;
+        assert_eq!(chosen.len() as i64, manifest, "every file is missing");
+        assert!(chosen.iter().all(|c| c.change == Change::Missing));
+        hook();
+        let run = s
+            .engine
+            .rebuild_pack("lib", &pack_id, chosen)
+            .await
+            .unwrap();
+        (run, before, rock)
+    }
+
+    /// A11 "A deleted pack folder, restored": step 3 journals `swap_prev` false, step 4 skips
+    /// the first rename, step 5 carries the tagged row, and the build commits with the tag.
+    /// Killed after step 5, recovery rolls back with no pruning index: the carried row is back
+    /// at its old path, the inserted rows are gone and the folder is absent again, and a later
+    /// refresh prunes the rows, as for any deleted folder.
+    #[tokio::test]
+    async fn a_deleted_pack_folder_restored_at_drift_journals_no_previous_folder() {
+        let s = disk().await;
+        let mut pause = None;
+        let (run, _, rock) = restore_deleted(&s, || {
+            pause = Some(s.engine.hooks().pause(Point::Journaled))
+        })
+        .await;
+        let pause = pause.unwrap();
+        reached(&pause).await;
+        let journal: (Option<String>, Option<bool>) =
+            sqlx::query_as("SELECT swap_state, swap_prev FROM import_packs")
+                .fetch_one(&s.lib.pool)
+                .await
+                .unwrap();
+        assert_eq!(journal, (Some("swapping".into()), Some(false)));
+        pause.release.notify_one();
+        s.wait_for(&run.id, "done").await;
+        assert_eq!(
+            s.rows().await[&rock],
+            (in_pack("Art/T_Rock.png"), vec!["rock".to_string()])
+        );
+        assert!(s.live().join("Art/T_Rock.png").is_file());
+        assert!(
+            beside(&s, "prev").is_empty(),
+            "no previous folder was moved aside"
+        );
+        s.settled().await;
+        s.tree_untouched().await;
+
+        let s = disk().await;
+        let (run, before, rock) =
+            restore_deleted(&s, || s.engine.hooks().crash(Point::Indexed)).await;
+        killed(&s, &run.id).await;
+        assert_eq!(
+            s.rows().await[&rock].0,
+            in_pack("Art/T_Rock.png"),
+            "carried"
+        );
+
+        reopen(&s).await;
+        assert!(!s.live().exists(), "the pack folder is gone again");
+        assert_eq!(s.current_build().await, before.build);
+        assert_eq!(
+            s.rows().await,
+            before.rows,
+            "the carried row is back with its tag, the inserted rows are gone, and no index \
+             pruned the previous build's rows"
+        );
+        s.settled().await;
+
+        refresh(&s).await;
+        assert_eq!(
+            s.count(&format!(
+                "SELECT COUNT(*) FROM assets WHERE file_path LIKE '{TARGET}/%'"
+            ))
+            .await,
+            0,
+            "a refresh prunes them, as for any deleted folder"
+        );
+        s.tree_untouched().await;
+    }
+
     #[tokio::test]
     async fn killed_inside_a_rollback_recovery_finishes_it() {
         for point in [Point::RollbackAside, Point::RollbackRenamed] {
@@ -679,7 +781,10 @@ mod tests {
             "it names the state found"
         );
         assert!(
-            s.engine.rebuild_pack("lib", &pack_id).await.is_err(),
+            s.engine
+                .rebuild_pack("lib", &pack_id, Vec::new())
+                .await
+                .is_err(),
             "its runs are blocked"
         );
 

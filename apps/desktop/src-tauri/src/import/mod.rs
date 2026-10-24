@@ -2,6 +2,7 @@
 
 pub mod build;
 pub mod carry;
+pub mod drift;
 pub mod edits;
 pub mod engine;
 pub mod metadata;

@@ -17,6 +17,7 @@ import {
 } from '../../store/imports';
 import { IconInbox, IconX } from '../Icons';
 import { Preparation } from './Preparation';
+import { driftOpen } from '../../store/preparation';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './Imports.module.css';
 
@@ -148,7 +149,9 @@ export function ImportsPanel() {
   useEffect(() => {
     void useImportStore.getState().fetch(useLibraryStore.getState().libraries.map((l) => l.id));
     const onKeyDown = (e: KeyboardEvent) => {
-      if (escapeClosesPanel(e, useImportStore.getState().dialog !== null)) setPanelOpen(false);
+      // The Import pack and drift dialogs over the view take Escape themselves
+      const over = useImportStore.getState().dialog !== null || driftOpen();
+      if (escapeClosesPanel(e, over)) setPanelOpen(false);
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
