@@ -311,6 +311,49 @@ the step's deviations from `unity_gltf.py` and from this plan as written:
     gives the reason (`unavailable`). A build with it on fails with that reason.
   - **assimp.** It is `assimp` on `PATH`, with no setting yet.
 
+Revised again 2026-10-23 (revision 21) while building the `export_unreal` step (ticket 9). No
+decision changed. These are the step's deviations from `ue_gltf_export.sh/.py` and from this
+plan as written:
+
+- **R47 - Settings and the request.**
+  - **Names.** The cap is `import.unrealMemoryMax` (default `20G`), named like
+    `import.blenderMemoryMax` (R46), and the editor's folder `import.unrealEditorRoot` (default
+    `~/Applications/UnrealEngine`, an absolute path). The editor's version, which the cache
+    key holds, is read from `Engine/Build/Build.version` below it.
+  - **The import.** An Import pack request asks for the Unreal build with `unreal: true`; the
+    scan offers it as the `unreal` layout, with the `.uproject`'s path and a tree marked as an
+    estimate. A zip with two `.uproject` files is refused.
+  - **Without the editor.** `export_unreal` is a pack's only extract step, so it stays on: the
+    scan and the pack's steps give the reason (`unavailable`), and the build fails with it.
+- **R48 - The cache.**
+  - **The key.** A GLB's key leaves out `batch`, which changes how many sessions make the GLBs,
+    not what they hold.
+  - **A record per original.** `<cache>/unreal/<key>.json` (the key without the asset) lists
+    the GLBs exported so far, the assets that failed, and whether a session reported nothing
+    left. It is rewritten after every session. Its GLBs are put where the script looks first,
+    so a rerun exports only the rest, and a rebuild after a finished export, with every GLB
+    still cached, unzips nothing and runs no editor.
+- **R49 - When a session counts as progress.**
+  - **A failed asset.** The exporter failing on an asset doesn't fail the step, as in the
+    script. The asset gets no GLB and becomes a run warning (`notExported`, by its `/Game`
+    path). A session whose attempts all failed still made progress, since later sessions skip
+    those assets.
+  - **A cap kill.** Every session's finished GLBs are cached however it ends, killed by the
+    cap or cancelled included. A session the cap kills after exporting something is followed
+    by a fresh one, whose memory starts over; one it kills before fails the step, naming the
+    cap. The script also quits the editor in a `finally` block.
+  - **Exit status.** Otherwise the editor's exit status is ignored, as the wrapper does: only
+    progress and `.gltf-remaining` count.
+- **R50 - What the pack gets, and what is checked.**
+  - **Docs.** `txt`, `md`, `pdf` and `rtf` files at the project's root keep their names, and
+    those below `Content/` their paths below it, beside the GLBs. Nothing comes from `Config/`,
+    `Saved/` or elsewhere. Two docs landing at one path are refused.
+  - **Free space.** There is no check before the unzip: one that runs out of space fails the
+    step with the system's "No space left on device".
+  - **The fixtures.** `unreal.zip` holds `Feif/Feif.uproject` (named unlike the zip) with three
+    meshes, a texture, a level and docs, so the batches and the hoist can be tested;
+    `unreal-source.zip` adds `Source/`.
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -881,10 +924,12 @@ whenever a target is edited:
 - **The export.** `ue_gltf_export.py` is embedded as a versioned script (`UNREAL_GLB_VERSION`).
   The editor runs headless one session per `batch` assets, restarted until nothing is left or a
   session makes no progress. Each GLB is cached by: the original's sha256, its `/Game` path,
-  the options, the script version and the editor version. An interrupted run resumes from those
-  cached files.
+  the script version and the editor version (not `batch`, R48), as soon as its session ends,
+  however it ends (R49). An interrupted run resumes from those cached files, and a per-original
+  record lets a rebuild after a finished export skip the editor (R48). A failed asset becomes a
+  warning, and a session the cap kills after exporting something is followed by another (R49).
 - **What the pack gets.** GLBs at the project's `/Game/...` layout, the docs found in the
-  project, and `datapackage.json` (D21). The work folder is deleted when the step ends.
+  project (R50), and `datapackage.json` (D21). The work folder is deleted when the step ends.
 
 ### Pack metadata
 
@@ -1044,14 +1089,14 @@ half manifest.
   `systemd-run --user --scope -p MemoryMax=<cap> -p MemorySwapMax=0`, mirroring
   `scripts/memory-cap.sh`. It warns and runs uncapped when `systemd-run --user` is unavailable,
   and reports exit 137 as `killed by the memory cap (<cap>)` (D20). The caps are settings
-  (`import.blenderMemoryMax`, default `12G`, R46; `import.unreal_memory_max`, default `20G`).
+  (`import.blenderMemoryMax`, default `12G`, R46; `import.unrealMemoryMax`, default `20G`, R47).
 
 ### Settings
 
 - **Import tools section.** It holds Blender (the existing setting and status), the assimp
-  path (default `assimp` on `PATH`), the Unreal Editor root (default
-  `~/Applications/UnrealEngine`, checked for `Engine/Binaries/Linux/UnrealEditor`), the two
-  memory caps, and the conversion cache's size with Clear.
+  path (default `assimp` on `PATH`), the Unreal Editor root (`import.unrealEditorRoot`, R47,
+  default `~/Applications/UnrealEngine`, checked for `Engine/Binaries/Linux/UnrealEditor`), the
+  two memory caps, and the conversion cache's size with Clear.
 - **UnityPy.** It ships in the preview engine, and the worker's `engine_info` reports whether
   it imports.
 - **Missing tools.** A step whose tool is missing is shown disabled, with the reason (D17).
@@ -1496,6 +1541,10 @@ files go with their tags, ratings and collections, as on any delete (D27).
 - **The hidden `.mat` covers imported packs only** (R1). A Unity `.mat` in a folder you didn't
   import through OpenDAM stays visible.
 - **The Unreal preview is an estimate.** It counts every `.uasset` as a possible GLB.
+- **Unreal sessions have limits.** A session has no timeout: an editor that hangs holds the run
+  until you cancel it. Only a `Source/` folder at the project's root is refused, not one in a
+  plugin (`Plugins/*/Source/`), which the editor would then fail to build. A work folder left
+  by a crash is never swept, as for Unity (R48, R49).
 - **Some textures are dropped.** `.exr`, `.hdr` and `.gif` textures aren't copied into the work
   copy, so a `.mat` naming one by GUID gets none, where `unity_gltf.py` loaded it (R45).
 - **Unity GLB leftovers.** A work folder left by a crash is never swept, the GLB cache is never
