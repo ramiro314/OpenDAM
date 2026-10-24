@@ -1228,47 +1228,127 @@ async fn rollback(
     }
     env.hooks.crashes(Point::RollbackRenamed);
 
-    // 3. The rows the build's index inserted, which frees their paths, then the carried rows
-    //    back by asset id, then the structure of what is on disk now.
-    let deleted = sqlx::query(
+    // 3-4. Rows, index, journal, then the failed build's folder.
+    let rolled = Rollback {
+        pool,
+        pack_id,
+        target: swap.target,
+        build_id: swap.build_id,
+        live: swap.live,
+        failed: &failed,
+        reindex: swap.prev.is_some(),
+    };
+    let refresh = Refresh::Registered {
+        db: env.db,
+        library: env.library,
+    };
+    if let Err(step) = finish_rollback(&rolled, refresh, index_guard, advisory, env.hooks).await {
+        return unfinished(step);
+    }
+    // Only the build knows which folders it made on the way to the pack.
+    remove_created(swap.created);
+    Stop::Failed(error)
+}
+
+/// A swap being rolled back, its folders already in place: the failed build at `failed`, and the
+/// previous folder (if any) back at `live`.
+pub(super) struct Rollback<'a> {
+    pub pool: &'a Pool<Sqlite>,
+    pub pack_id: &'a str,
+    pub target: &'a str,
+    pub build_id: &'a str,
+    pub live: &'a Path,
+    pub failed: &'a Path,
+    /// A previous folder was moved aside and is back, so the pack is reindexed. Without one the
+    /// pack folder is gone again, as before the build, and an index would prune the rows just
+    /// moved back.
+    pub reindex: bool,
+}
+
+/// How `finish_rollback` brings the index and the structure up to date.
+pub(super) enum Refresh<'a> {
+    /// A build's own rollback, its library registered: `index_paths_locked`, which also stores
+    /// the asset count, or without a previous folder `rebuild_library_locked`.
+    Registered {
+        db: &'a Database,
+        library: &'a LibraryHandle,
+    },
+    /// Recovery, maybe before the library is registered: the lock-free index core over the
+    /// library at `root`. Its caller runs the structure pass right after it.
+    Core { root: &'a Path },
+}
+
+/// A rollback's steps 3 and 4 (plan Flow, Rollback), shared by a build's own rollback and swap
+/// recovery, which finishes one a crash interrupted. Holding both of the library's locks, it
+/// deletes the rows the build's index inserted, which frees their paths, moves the carried rows
+/// back by asset id, reindexes the restored pack (`Rollback::reindex`), then clears the journal
+/// and the build's records in one transaction, and only then deletes the failed build's folder.
+/// On failure it returns the step that failed, the journal still set, for recovery.
+pub(super) async fn finish_rollback(
+    rolled: &Rollback<'_>,
+    refresh: Refresh<'_>,
+    index_guard: &tokio::sync::MutexGuard<'_, ()>,
+    advisory: &IndexLock,
+    hooks: &Hooks,
+) -> Result<(), String> {
+    let pool = rolled.pool;
+    sqlx::query(
         "DELETE FROM assets WHERE id IN (SELECT asset_id FROM import_moves
          WHERE pack_id = ? AND build_id = ? AND kind = 'inserted')",
     )
-    .bind(pack_id)
-    .bind(swap.build_id)
+    .bind(rolled.pack_id)
+    .bind(rolled.build_id)
     .execute(pool)
-    .await;
-    if let Err(e) = deleted {
-        return unfinished(format!("deleting the rows it inserted: {e}"));
-    }
-    if let Err(e) = carry::reverse(pool, pack_id, swap.target, swap.build_id).await {
-        return unfinished(format!("moving the carried rows back: {e}"));
-    }
-    if swap.prev.is_some() {
-        let pack_path = [swap.live.to_string_lossy().into_owned()];
-        let indexed = watcher::index_paths_locked(
-            env.db,
-            &env.library.id,
-            &pack_path,
-            Prune::Now,
-            index_guard,
-            advisory,
-        )
-        .await;
-        if let Err(e) = indexed {
-            tracing::warn!("Re-indexing the restored pack: {e:#}");
+    .await
+    .map_err(|e| format!("deleting the rows it inserted: {e}"))?;
+    carry::reverse(pool, rolled.pack_id, rolled.target, rolled.build_id)
+        .await
+        .map_err(|e| format!("moving the carried rows back: {e}"))?;
+    match (refresh, rolled.reindex) {
+        (Refresh::Registered { db, library }, true) => {
+            let pack_path = [rolled.live.to_string_lossy().into_owned()];
+            let indexed = watcher::index_paths_locked(
+                db,
+                &library.id,
+                &pack_path,
+                Prune::Now,
+                index_guard,
+                advisory,
+            )
+            .await;
+            if let Err(e) = indexed {
+                tracing::warn!("Re-indexing the restored pack: {e:#}");
+            }
         }
-    } else {
-        // No pack folder now, as before the build: an index would prune rows it never should.
-        crate::structure::rebuild_library_locked(env.db, env.library, index_guard, advisory).await;
+        (Refresh::Registered { db, library }, false) => {
+            crate::structure::rebuild_library_locked(db, library, index_guard, advisory).await;
+        }
+        (Refresh::Core { root }, true) => index_pack(pool, root, advisory, rolled.live).await,
+        (Refresh::Core { .. }, false) => {}
     }
+    unjournal(pool, rolled.pack_id, rolled.build_id)
+        .await
+        .map_err(|e| format!("clearing its journal: {e}"))?;
+    hooks.stop(Point::RollbackCleared).await;
+    fs_swap::discard(rolled.failed);
+    Ok(())
+}
 
-    // 4. The journal and the build's records in one transaction, then its folder.
-    if let Err(e) = unjournal(pool, pack_id, swap.build_id).await {
-        return unfinished(format!("clearing its journal: {e}"));
+/// Indexes the pack folder `live` of the library at `root` with `Prune::Now` through the
+/// lock-free core, when it is a folder: walking a missing one would prune every row below it. A
+/// failure is logged, as a build's settle logs it: the next refresh indexes it again.
+pub(super) async fn index_pack(
+    pool: &Pool<Sqlite>,
+    root: &Path,
+    advisory: &IndexLock,
+    live: &Path,
+) {
+    if !live.is_dir() {
+        tracing::warn!("{} is no folder now, so it isn't indexed", live.display());
+        return;
     }
-    env.hooks.stop(Point::RollbackCleared).await;
-    fs_swap::discard(&failed);
-    remove_created(swap.created);
-    Stop::Failed(error)
+    let paths = [live.to_string_lossy().into_owned()];
+    if let Err(e) = watcher::index_pool(pool, root, &paths, Prune::Now, Some(advisory)).await {
+        tracing::warn!("Indexing the pack {}: {e:#}", live.display());
+    }
 }

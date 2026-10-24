@@ -543,7 +543,14 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
     };
 
     let (pool, root) = (&library.pool, library.root_path.as_path());
-    crate::import::recover_swaps(pool, root, crate::import::Recovery::Entry, &lock).await;
+    crate::import::recover_swaps(
+        pool,
+        root,
+        crate::import::Recovery::Entry,
+        &index_guard,
+        &lock,
+    )
+    .await;
     // A pack recovery couldn't put back keeps its journal: no index reaches it mid-swap.
     let journaled: Vec<String> = match sqlx::query_scalar(
         "SELECT target FROM import_packs WHERE swap_state IS NOT NULL",

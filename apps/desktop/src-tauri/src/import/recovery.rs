@@ -20,11 +20,11 @@ use std::path::{Path, PathBuf};
 
 use sqlx::{Pool, Sqlite};
 
-use super::build::{self, FAILED, PREV, STAGING};
+use super::build::{self, index_pack, Hooks, Refresh, Rollback, FAILED, PREV, STAGING};
 use super::engine::{now_ms, owner_gone};
-use super::{carry, records};
+use super::records::{self, Owner};
 use crate::fs_swap;
-use crate::watcher::{self, IndexLock, Prune};
+use crate::watcher::{self, IndexLock};
 
 /// Which swap recovery tables a caller runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,16 +38,45 @@ pub enum Recovery {
 /// What a run marked `interrupted` by recovery says, as the engine's startup does.
 const INTERRUPTED: &str = "OpenDAM stopped during the run";
 
+/// Who judges whether a run is live, and when: this process and the clock, outside tests.
+pub struct Liveness {
+    pub me: Owner,
+    /// Milliseconds since the epoch.
+    pub now: i64,
+}
+
+impl Liveness {
+    pub fn now() -> Self {
+        Liveness {
+            me: watcher::this_process(),
+            now: now_ms(),
+        }
+    }
+}
+
 /// Swap recovery for the library DB at `pool`, whose files lie below `root`. Its callers hold
-/// the library's `index_lock` and the advisory lock `advisory`, and call it before they touch a
-/// row: the library open (`db::open_library_db`), `watcher::index_paths` and
-/// `structure::rebuild_library`, its follow-up task included. A pack it can't recover keeps its
-/// journal, for the next caller, and the failure is logged.
+/// the library's `index_lock` and advisory lock, passed as proof (`index_guard`, `advisory`),
+/// and call it before they touch a row: the library open (`db::open_library_db`),
+/// `watcher::index_paths` and `structure::rebuild_library`, its follow-up task included. A pack
+/// it can't recover keeps its journal, for the next caller, and the failure is logged.
 pub async fn recover_swaps(
     pool: &Pool<Sqlite>,
     root: &Path,
     tables: Recovery,
+    index_guard: &tokio::sync::MutexGuard<'_, ()>,
     advisory: &IndexLock,
+) {
+    recover_swaps_with(pool, root, tables, index_guard, advisory, &Liveness::now()).await
+}
+
+/// `recover_swaps`, judging the leftovers table's live runs by `liveness`.
+pub(super) async fn recover_swaps_with(
+    pool: &Pool<Sqlite>,
+    root: &Path,
+    tables: Recovery,
+    index_guard: &tokio::sync::MutexGuard<'_, ()>,
+    advisory: &IndexLock,
+    liveness: &Liveness,
 ) {
     let journaled: Vec<Journal> = match sqlx::query_as(
         "SELECT id, target, swap_state, swap_build, swap_prev FROM import_packs
@@ -73,7 +102,7 @@ pub async fn recover_swaps(
             );
             continue;
         }
-        if let Err(e) = recover_swap(pool, root, advisory, pack).await {
+        if let Err(e) = recover_swap(pool, root, index_guard, advisory, pack).await {
             tracing::error!(
                 "Recovering the swap of pack {}: {e}. Its journal stays for the next try",
                 pack.target
@@ -81,7 +110,7 @@ pub async fn recover_swaps(
         }
     }
     if tables == Recovery::Open {
-        if let Err(e) = leftovers(pool, root, advisory).await {
+        if let Err(e) = leftovers(pool, root, advisory, liveness).await {
             tracing::error!("Clearing the build leftovers of the library at {root:?}: {e}");
         }
     }
@@ -121,6 +150,7 @@ fn exists(path: &Path) -> bool {
 async fn recover_swap(
     pool: &Pool<Sqlite>,
     root: &Path,
+    index_guard: &tokio::sync::MutexGuard<'_, ()>,
     advisory: &IndexLock,
     pack: &Journal,
 ) -> Result<(), String> {
@@ -192,13 +222,33 @@ async fn recover_swap(
             if aside {
                 rename(&prev, &live)?;
             }
-            finish_rollback(pool, root, advisory, pack, build_id, swap_prev, &failed).await?;
+            finish(
+                pool,
+                root,
+                index_guard,
+                advisory,
+                pack,
+                build_id,
+                swap_prev,
+                &failed,
+            )
+            .await?;
         }
         Found::RollingBack { prev: aside } => {
             if aside {
                 rename(&prev, &live)?;
             }
-            finish_rollback(pool, root, advisory, pack, build_id, swap_prev, &failed).await?;
+            finish(
+                pool,
+                root,
+                index_guard,
+                advisory,
+                pack,
+                build_id,
+                swap_prev,
+                &failed,
+            )
+            .await?;
         }
         Found::Nothing => {
             unjournal(pool, &pack.id, build_id).await?;
@@ -219,59 +269,41 @@ fn present(found: bool) -> &'static str {
     }
 }
 
-/// A rollback's steps 3 and 4 once its folders are in place: deletes the rows the build's index
-/// inserted, moves the carried rows back, reindexes the restored pack when a previous folder was
-/// moved aside (else the pack folder is gone again, as before the build, and an index would prune
-/// the rows just moved back), then clears the journal and the build's records in one transaction,
-/// and only then deletes `failed`.
-async fn finish_rollback(
+/// A rollback's steps 3 and 4 once its folders are in place, as a build's own rollback runs them
+/// (`build::finish_rollback`), through the lock-free core: the library may not be registered yet,
+/// and the structure pass is the caller's. The pack is reindexed only when a live folder was moved
+/// aside (`swap_prev`).
+#[allow(clippy::too_many_arguments)]
+async fn finish(
     pool: &Pool<Sqlite>,
     root: &Path,
+    index_guard: &tokio::sync::MutexGuard<'_, ()>,
     advisory: &IndexLock,
     pack: &Journal,
     build_id: &str,
     swap_prev: bool,
     failed: &Path,
 ) -> Result<(), String> {
-    sqlx::query(
-        "DELETE FROM assets WHERE id IN (SELECT asset_id FROM import_moves
-         WHERE pack_id = ? AND build_id = ? AND kind = 'inserted')",
-    )
-    .bind(&pack.id)
-    .bind(build_id)
-    .execute(pool)
-    .await
-    .map_err(|e| format!("could not delete the rows the build inserted: {e}"))?;
-    carry::reverse(pool, &pack.id, &pack.target, build_id)
-        .await
-        .map_err(|e| format!("could not move the carried rows back: {e}"))?;
     let live = root.join(&pack.target);
-    if swap_prev {
-        index_pack(pool, root, advisory, &live).await;
-    }
-    unjournal(pool, &pack.id, build_id).await?;
-    fs_swap::discard(failed);
-    Ok(())
+    let rolled = Rollback {
+        pool,
+        pack_id: &pack.id,
+        target: &pack.target,
+        build_id,
+        live: &live,
+        failed,
+        reindex: swap_prev,
+    };
+    let refresh = Refresh::Core { root };
+    build::finish_rollback(&rolled, refresh, index_guard, advisory, &Hooks::default())
+        .await
+        .map_err(|step| format!("finishing the rollback failed ({step})"))
 }
 
 async fn unjournal(pool: &Pool<Sqlite>, pack_id: &str, build_id: &str) -> Result<(), String> {
     build::unjournal(pool, pack_id, build_id)
         .await
         .map_err(|e| format!("could not clear the journal: {e}"))
-}
-
-/// Indexes the pack folder `live` with `Prune::Now`, when it is a folder: walking a missing one
-/// would prune every row below it. A failure is logged, as a build's settle logs it: the next
-/// refresh indexes it again.
-async fn index_pack(pool: &Pool<Sqlite>, root: &Path, advisory: &IndexLock, live: &Path) {
-    if !live.is_dir() {
-        tracing::warn!("{} is no folder now, so it isn't indexed", live.display());
-        return;
-    }
-    let paths = [live.to_string_lossy().into_owned()];
-    if let Err(e) = watcher::index_pool(pool, root, &paths, Prune::Now, Some(advisory)).await {
-        tracing::warn!("Indexing the recovered pack {}: {e:#}", live.display());
-    }
 }
 
 /// Marks pack `pack_id`'s `running` runs `interrupted`: their build is gone.
@@ -320,9 +352,33 @@ async fn unrecognised(pool: &Pool<Sqlite>, pack: &Journal, state: &str) -> Resul
     end_runs(pool, &pack.id, "failed", &message).await
 }
 
-/// A folder left beside a pack whose `swap_state` is `NULL`, by its tag, with its build id.
+/// What a folder left beside a pack whose `swap_state` is `NULL` is, by its `fs_swap` tag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Left {
+    /// `.import-*`: a build crashed while staging.
+    Staging,
+    /// `.failed-*`: a rollback finished its transaction, then crashed before deleting it.
+    Failed,
+    /// `.prev-*`: a build committed, then crashed before it settled.
+    Prev,
+}
+
+impl Left {
+    /// In the order they're cleared: the staging and failed folders before a settle's index.
+    const ALL: [Left; 3] = [Left::Staging, Left::Failed, Left::Prev];
+
+    fn tag(self) -> &'static str {
+        match self {
+            Left::Staging => STAGING,
+            Left::Failed => FAILED,
+            Left::Prev => PREV,
+        }
+    }
+}
+
+/// A folder left beside a pack whose `swap_state` is `NULL`, with its build id.
 struct Leftover {
-    tag: &'static str,
+    kind: Left,
     folder: PathBuf,
     build_id: String,
 }
@@ -331,7 +387,12 @@ struct Leftover {
 /// its build's rows, deletes a `.failed-*` folder, and settles a `.prev-*` one (step 7). A pack
 /// with a live run is skipped. Its folders are listed before its runs are read, so a build that
 /// starts meanwhile never has its staging folder deleted, nor its rows (`settle_records`).
-async fn leftovers(pool: &Pool<Sqlite>, root: &Path, advisory: &IndexLock) -> sqlx::Result<()> {
+async fn leftovers(
+    pool: &Pool<Sqlite>,
+    root: &Path,
+    advisory: &IndexLock,
+    liveness: &Liveness,
+) -> sqlx::Result<()> {
     let packs: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT id, target, current_build FROM import_packs WHERE swap_state IS NULL
          ORDER BY target",
@@ -347,14 +408,14 @@ async fn leftovers(pool: &Pool<Sqlite>, root: &Path, advisory: &IndexLock) -> sq
         if found.is_empty() {
             continue;
         }
-        if live_run(pool, &pack_id).await? {
+        if live_run(pool, &pack_id, liveness).await? {
             tracing::info!("Pack {target} has a live run, so its build folders stay");
             continue;
         }
         for left in found {
             tracing::warn!("Clearing {} beside pack {target}", left.folder.display());
-            match left.tag {
-                STAGING => {
+            match left.kind {
+                Left::Staging => {
                     fs_swap::discard(&left.folder);
                     if current_build.as_deref() != Some(left.build_id.as_str()) {
                         let mut tx = pool.begin().await?;
@@ -362,8 +423,8 @@ async fn leftovers(pool: &Pool<Sqlite>, root: &Path, advisory: &IndexLock) -> sq
                         tx.commit().await?;
                     }
                 }
-                FAILED => fs_swap::discard(&left.folder),
-                _ => {
+                Left::Failed => fs_swap::discard(&left.folder),
+                Left::Prev => {
                     index_pack(pool, root, advisory, &live).await;
                     fs_swap::discard(&left.folder);
                     settle_records(pool, &pack_id, current_build.as_deref(), &live).await?;
@@ -394,7 +455,7 @@ async fn settle_records(
         .await?;
     let staging: Vec<String> = left_beside(live)
         .into_iter()
-        .filter(|left| left.tag == STAGING)
+        .filter(|left| left.kind == Left::Staging)
         .map(|left| left.build_id)
         .collect();
     let builds: Vec<String> =
@@ -420,7 +481,8 @@ async fn settle_records(
 /// way is never taken for one.
 fn left_beside(live: &Path) -> Vec<Leftover> {
     let mut found = Vec::new();
-    for tag in [STAGING, FAILED, PREV] {
+    for kind in Left::ALL {
+        let tag = kind.tag();
         let folders = match fs_swap::leftovers(live, tag) {
             Ok(folders) => folders,
             Err(e) => {
@@ -434,7 +496,7 @@ fn left_beside(live: &Path) -> Vec<Leftover> {
             let build_id = name[prefix.len()..].to_string();
             if uuid::Uuid::parse_str(&build_id).is_ok() {
                 found.push(Leftover {
-                    tag,
+                    kind,
                     folder,
                     build_id,
                 });
@@ -446,8 +508,8 @@ fn left_beside(live: &Path) -> Vec<Leftover> {
 
 /// Whether pack `pack_id` has a live run: one `queued` or `running` whose owner is alive, judged
 /// by its process on this machine and by its heartbeat on another (plan Flow, Live runs), not by
-/// its status alone.
-async fn live_run(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<bool> {
+/// its status alone, as `liveness` sees it.
+async fn live_run(pool: &Pool<Sqlite>, pack_id: &str, liveness: &Liveness) -> sqlx::Result<bool> {
     #[allow(clippy::type_complexity)]
     let runs: Vec<(Option<String>, Option<String>, i64, i64, Option<i64>)> = sqlx::query_as(
         "SELECT owner_machine, owner_boot, owner_pid, owner_started, heartbeat_at
@@ -458,9 +520,9 @@ async fn live_run(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<bool> {
     .bind(pack_id)
     .fetch_all(pool)
     .await?;
-    let (me, now) = (watcher::this_process(), now_ms());
+    let Liveness { me, now } = liveness;
     Ok(runs.iter().any(|(machine, boot, pid, started, heartbeat)| {
-        !owner_gone(&me, machine, boot, *pid, *started, *heartbeat, now)
+        !owner_gone(me, machine, boot, *pid, *started, *heartbeat, *now)
     }))
 }
 
@@ -522,5 +584,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(moves, 0);
+    }
+
+    #[tokio::test]
+    async fn another_machine_s_staging_stays_while_its_heartbeat_is_fresh_by_the_test_clock() {
+        let pool = crate::db::memory_library_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".opendam")).unwrap();
+        let live = dir.path().join("Pub/Pack");
+        let build = uuid::Uuid::new_v4().to_string();
+        let staging = fs_swap::create_staging(&live, STAGING, &build).unwrap();
+        insert_output(&pool, &build).await;
+        let beat = 1_000_000_000_000_i64;
+        for sql in [
+            "INSERT INTO imports (id, original_path, original_size, original_mtime_ns,
+             original_sha256, kind, created_at) VALUES ('i', '/o.unitypackage', 1, 1, '',
+             'unitypackage', 0)",
+            "INSERT INTO import_packs (id, import_id, target, preset) VALUES ('p', 'i', 'Pub/Pack',
+             'unity')",
+            "INSERT INTO import_runs (id, kind, packs, status, created_at, owner_machine,
+             owner_boot, owner_pid, owner_started, heartbeat_at) VALUES ('r', 'import',
+             '[{\"packId\":\"p\",\"recipeRev\":0}]', 'running', 0, 'another machine', 'b',
+             1, 1, ?1)",
+        ] {
+            sqlx::query(sql).bind(beat).execute(&pool).await.unwrap();
+        }
+        let index_lock = tokio::sync::Mutex::new(());
+        let recover = |minutes: i64| {
+            let (pool, root, index_lock) = (&pool, dir.path(), &index_lock);
+            async move {
+                let index_guard = index_lock.lock().await;
+                let advisory = IndexLock::try_acquire(root).await.unwrap();
+                let liveness = Liveness {
+                    me: watcher::this_process(),
+                    now: beat + minutes * 60 * 1000,
+                };
+                recover_swaps_with(
+                    pool,
+                    root,
+                    Recovery::Open,
+                    &index_guard,
+                    &advisory,
+                    &liveness,
+                )
+                .await;
+            }
+        };
+        let rows = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM import_outputs")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+
+        recover(1).await;
+        assert!(staging.exists(), "a heartbeat a minute old is a live run's");
+        assert_eq!(rows().await, 1);
+
+        recover(11).await;
+        assert!(!staging.exists(), "one 11 minutes old is a dead run's");
+        assert_eq!(rows().await, 0);
     }
 }

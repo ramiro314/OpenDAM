@@ -2490,12 +2490,19 @@ pub async fn rebuild_library(db: &Database, library: &LibraryHandle) {
 /// set, then the release, which runs a pass left pending meanwhile. False when the pass failed.
 async fn locked_pass(
     library: &LibraryHandle,
-    _index_guard: &tokio::sync::MutexGuard<'_, ()>,
+    index_guard: &tokio::sync::MutexGuard<'_, ()>,
     advisory: IndexLock,
     pass: bool,
 ) -> bool {
     let (pool, root) = (&library.pool, library.root_path.as_path());
-    crate::import::recover_swaps(pool, root, crate::import::Recovery::Entry, &advisory).await;
+    crate::import::recover_swaps(
+        pool,
+        root,
+        crate::import::Recovery::Entry,
+        index_guard,
+        &advisory,
+    )
+    .await;
     let ran = !pass || log_failure(library, rebuild(pool, root).await);
     advisory.release(pool, root).await;
     ran
