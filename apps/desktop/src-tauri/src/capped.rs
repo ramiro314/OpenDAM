@@ -27,6 +27,9 @@ impl Default for Systemd {
     }
 }
 
+/// How long `Capped::watch` goes on reading a child's output once it has exited.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A command ready to spawn, capped or not, and what its exit status means.
 pub struct Capped {
     pub command: tokio::process::Command,
@@ -163,10 +166,17 @@ impl Capped {
             .kill_on_drop(true)
             .spawn()?;
         let mut stderr = child.stderr.take().expect("piped");
-        let errors = tokio::spawn(async move {
-            let mut text = Vec::new();
-            let _ = stderr.read_to_end(&mut text).await;
-            text
+        // Kept as it arrives, so what came before a drain that timed out isn't lost.
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut reader = tokio::spawn({
+            let errors = errors.clone();
+            async move {
+                let mut chunk = [0u8; 8192];
+                while let Ok(n @ 1..) = stderr.read(&mut chunk).await {
+                    let mut errors = errors.lock().unwrap_or_else(|e| e.into_inner());
+                    errors.extend_from_slice(&chunk[..n]);
+                }
+            }
         });
         // Read as bytes: a line that isn't UTF-8 must not stop the reading, or a full pipe
         // would block the child.
@@ -193,15 +203,26 @@ impl Capped {
                 }
             }
         };
-        while let Ok(Some(read)) = lines.next_segment().await {
-            printed.extend_from_slice(&read);
-            printed.push(b'\n');
+        // What the child printed last is read to the pipes' end, but only for `DRAIN`: a
+        // descendant that inherited them (the Unreal Editor's shader workers) can hold them open
+        // long after the child exited, and the run must end with the child.
+        let drained = async {
+            while let Ok(Some(read)) = lines.next_segment().await {
+                printed.extend_from_slice(&read);
+                printed.push(b'\n');
+            }
+            let _ = (&mut reader).await;
+        };
+        if tokio::time::timeout(DRAIN, drained).await.is_err() {
+            tracing::warn!("A process kept the output of a finished child open; reading stopped");
         }
+        reader.abort();
         self.finish(status).await;
+        let stderr = std::mem::take(&mut *errors.lock().unwrap_or_else(|e| e.into_inner()));
         Ok(Some(std::process::Output {
             status,
             stdout: printed,
-            stderr: errors.await.unwrap_or_default(),
+            stderr,
         }))
     }
 
@@ -420,6 +441,25 @@ mod tests {
             Some("killed by the memory cap (64M)"),
             "{exited}"
         );
+    }
+
+    /// A descendant that keeps the pipes open past the child's exit, as an editor's helper can,
+    /// doesn't hold the run: the output is read for `DRAIN` at most, keeping what came.
+    #[tokio::test]
+    async fn watch_ends_with_the_child_whatever_keeps_its_pipes_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let uncapped = Systemd {
+            run: dir.path().join("none-run"),
+            ctl: dir.path().join("none-ctl"),
+        };
+        let script = "echo out; echo err >&2; sleep 20 & exit 0";
+        let mut capped = capped_command_with(&uncapped, "sh", ["-c", script], "1G").await;
+        let started = std::time::Instant::now();
+        let output = capped.watch(|_| {}, || false).await.unwrap().unwrap();
+        assert!(started.elapsed() < DRAIN * 3, "{:?}", started.elapsed());
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
     }
 
     #[test]
