@@ -220,7 +220,7 @@ mod tests {
     async fn not_blocked(s: &Setup, pack_id: &str) {
         let steps = s.engine.pack_steps("lib", pack_id).await.unwrap().steps;
         s.engine
-            .set_pack_steps("lib", pack_id, steps)
+            .set_pack_steps("lib", pack_id, steps, None)
             .await
             .expect("the pack's step edits and runs aren't refused");
     }

@@ -571,6 +571,8 @@ pub enum Refused {
     NoPack,
     /// A run for the pack is queued or running, or a swap or Remove is journaled.
     Busy,
+    /// The pack's steps changed since the caller read them: its `recipe_rev` moved on.
+    Stale,
 }
 
 /// The `import_packs` row is busy: a run for it is queued or running, or its `swap_state` is set.
@@ -580,31 +582,35 @@ pub(super) const BUSY: &str = "(import_packs.swap_state IS NOT NULL OR EXISTS (
     AND json_extract(j.value, '$.packId') = import_packs.id))";
 
 async fn refusal(tx: &mut SqliteConnection, pack_id: &str) -> sqlx::Result<Refused> {
-    let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM import_packs WHERE id = ?")
-        .bind(pack_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    Ok(if exists.is_some() {
-        Refused::Busy
-    } else {
-        Refused::NoPack
+    let busy: Option<bool> =
+        sqlx::query_scalar(&format!("SELECT {BUSY} FROM import_packs WHERE id = ?"))
+            .bind(pack_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    Ok(match busy {
+        None => Refused::NoPack,
+        Some(true) => Refused::Busy,
+        Some(false) => Refused::Stale,
     })
 }
 
 /// Replaces pack `pack_id`'s steps with `steps` and bumps its `recipe_rev`, in one transaction
-/// whose first write checks that no run for the pack is queued or running. Returns the new
-/// `recipe_rev`.
+/// whose first write checks that no run for the pack is queued or running and, given `read_at`,
+/// that the steps are still at the `recipe_rev` they were read at, so an edit made since (an
+/// in-app rename's step) is never overwritten. Returns the new `recipe_rev`.
 pub async fn set_steps(
     pool: &Pool<Sqlite>,
     pack_id: &str,
     steps: &[Step],
+    read_at: Option<i64>,
 ) -> sqlx::Result<Result<i64, Refused>> {
     let mut tx = pool.begin().await?;
     let bumped: Option<i64> = sqlx::query_scalar(&format!(
         "UPDATE import_packs SET recipe_rev = recipe_rev + 1 WHERE id = ? AND NOT {BUSY}
-         RETURNING recipe_rev"
+         AND (?2 IS NULL OR recipe_rev = ?2) RETURNING recipe_rev"
     ))
     .bind(pack_id)
+    .bind(read_at)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(recipe_rev) = bumped else {

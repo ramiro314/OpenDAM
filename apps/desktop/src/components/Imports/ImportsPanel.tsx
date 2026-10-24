@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import clsx from 'clsx';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useLibraryStore, useUIStore } from '../../store';
@@ -16,6 +16,7 @@ import {
   type PackRow,
 } from '../../store/imports';
 import { IconInbox, IconX } from '../Icons';
+import { Preparation } from './Preparation';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './Imports.module.css';
 
@@ -48,9 +49,10 @@ function statusClass(row: PackRow) {
   return undefined;
 }
 
-function Pack({ row }: { row: PackRow }) {
+function Pack({ row, libraryId }: { row: PackRow; libraryId: string }) {
   const finishing = useImportStore((s) => s.finishing);
   const cancel = useImportStore((s) => s.cancel);
+  const [editing, setEditing] = useState(false);
   const { run, progress } = row;
   const live = run !== null && isLive(run);
   const cancelShown = run ? cancelState(run, finishing) : 'none';
@@ -63,6 +65,15 @@ function Pack({ row }: { row: PackRow }) {
         <span className={clsx(styles.status, statusClass(row))} data-pack-status>
           {packStatus(row)}
         </span>
+        <button
+          className={styles.expand}
+          aria-expanded={editing}
+          onClick={() => setEditing((e) => !e)}
+          title="The pack's steps, its folder and Rebuild"
+          data-import-steps
+        >
+          {editing ? 'Hide steps' : 'Steps'}
+        </button>
         {cancelShown !== 'none' && run && (
           <button
             className={clsx(dialog.btn, dialog.secondaryBtn, styles.smallBtn)}
@@ -114,6 +125,7 @@ function Pack({ row }: { row: PackRow }) {
           </ul>
         </details>
       )}
+      {editing && <Preparation libraryId={libraryId} pack={row.pack} runShown />}
     </li>
   );
 }
@@ -195,7 +207,7 @@ export function ImportsPanel() {
                   <span className={styles.path}>{row.originalPath}</span>
                   <ul className={styles.packs}>
                     {row.packs.map((pack) => (
-                      <Pack key={pack.pack.id} row={pack} />
+                      <Pack key={pack.pack.id} row={pack} libraryId={row.libraryId} />
                     ))}
                   </ul>
                 </li>

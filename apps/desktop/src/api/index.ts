@@ -45,9 +45,11 @@ import type {
   RunEstimate,
   ReviewProposal,
   ProposalDecision,
+  ImportPackSteps,
   ImportRequest,
   ImportRun,
   ImportScan,
+  ImportStepRecord,
   ImportSummary,
   ImportTree,
   PlaceStep,
@@ -238,9 +240,30 @@ export const api = {
     subpath: string | null,
     place: PlaceStep[]
   ) => invoke<ImportTree>('preview_import', { libraryId, originalPath, variant, subpath, place }),
-  /** Why the library would refuse this target for a new pack, or null when it is free */
-  checkImportTarget: (libraryId: string, target: string) =>
-    invoke<string | null>('check_import_target', { libraryId, target }),
+  /**
+   * Why the library would refuse this target for a new pack, or with `packId` as that pack's new
+   * target, or null when it is free
+   */
+  checkImportTarget: (libraryId: string, target: string, packId: string | null = null) =>
+    invoke<string | null>('check_import_target', { libraryId, target, packId }),
+  /** Moves a pack's target; refused for a built pack or one with a run queued or running */
+  setImportTarget: (libraryId: string, packId: string, target: string) =>
+    invoke<void>('set_import_target', { libraryId, packId, target }),
+  getImportSteps: (libraryId: string, packId: string) =>
+    invoke<ImportPackSteps>('get_import_steps', { libraryId, packId }),
+  /**
+   * Replaces a pack's steps, refused while a run for it is queued or running, or once its steps
+   * moved on from `recipeRev`; returns the new `recipeRev`
+   */
+  setImportSteps: (
+    libraryId: string,
+    packId: string,
+    steps: ImportStepRecord[],
+    recipeRev: number
+  ) => invoke<number>('set_import_steps', { libraryId, packId, steps, recipeRev }),
+  /** Queues a rebuild from the pack's current steps; refused while a run for it is live */
+  rebuildImportPack: (libraryId: string, packId: string) =>
+    invoke<ImportRun>('rebuild_import_pack', { libraryId, packId }),
   /** Records one pack's import and queues its first build */
   startImport: (request: ImportRequest) => invoke<ImportRun>('start_import', { request }),
   /** Fails with "Finishing, can't cancel now" once the build holds the library's lock */

@@ -63,7 +63,7 @@ mod tests {
             let mut steps = self.engine.pack_steps("lib", pack_id).await.unwrap().steps;
             edit(&mut steps);
             self.engine
-                .set_pack_steps("lib", pack_id, steps)
+                .set_pack_steps("lib", pack_id, steps, None)
                 .await
                 .unwrap();
         }
