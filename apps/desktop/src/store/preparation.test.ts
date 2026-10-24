@@ -153,6 +153,9 @@ describe('the steps', () => {
     expect(stepLabel(step('metadata', { preset: 'kenney' }))).toBe(
       'Write datapackage.json (kenney)'
     );
+    expect(stepLabel(step('export_unreal', { batch: 30 }))).toBe(
+      'Export the Unreal project’s meshes to GLB'
+    );
     expect(stepLabel(step('unreal'))).toBe('unreal');
   });
 
@@ -163,6 +166,7 @@ describe('the steps', () => {
     expect(keys(step('exclude', { source: ['a'] }))).toEqual([]);
     expect(keys(step('flatten'))).toEqual([]);
     expect(keys(step('unity_glb'))).toEqual(['max_texture', 'force']);
+    expect(keys(step('export_unreal', { batch: 30 }))).toEqual(['batch']);
     expect(keys(step('metadata', { preset: 'unity', license: 'CC0-1.0' }))).toEqual([
       'title',
       'version',
@@ -224,6 +228,9 @@ describe('the steps', () => {
       expect(stepProblem(step('unity_glb', { max_texture: max }))).toContain('16 to 16384');
     expect(stepProblem(step('unity_glb', { max_texture: '512' }))).toBeNull();
     expect(stepProblem(step('unity_glb'))).toBeNull();
+    for (const batch of ['0', '1001', '2.5', 'many'])
+      expect(stepProblem(step('export_unreal', { batch }))).toContain('1 to 1000');
+    expect(stepProblem(step('export_unreal', { batch: '10' }))).toBeNull();
 
     const draft = setOption(draftFromSteps(read()), hoistAt(golden()), 'folder', '');
     expect(draftProblem(draft)).toBe(
@@ -269,6 +276,10 @@ describe('editing the draft', () => {
     expect(toggleStep(draft, 3, false).steps[3].enabled).toBe(false);
     expect(toggleProblem(steps[5], unavailable)).toBe('Blender 5.2 is not installed');
     expect(toggleStep(draft, 5, true)).toBe(draft);
+    // An Unreal pack's export is its extract step, and stays on too
+    expect(toggleProblem(step('export_unreal', { batch: 30 }), {})).toBe(
+      'A pack is built from its extract step'
+    );
   });
 });
 

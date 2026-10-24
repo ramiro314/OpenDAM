@@ -65,6 +65,8 @@ export function stepLabel(step: ImportStepRecord): string {
       return subpath ? `Extract the package's ${subpath}` : 'Extract the package';
     case 'extract_zip':
       return subpath ? `Extract ${subpath} from the zip` : 'Extract the zip';
+    case 'export_unreal':
+      return 'Export the Unreal project’s meshes to GLB';
     case 'flatten':
       return 'Merge wrapper folders into the pack root';
     case 'hoist':
@@ -95,6 +97,10 @@ export function optionFields(step: ImportStepRecord): OptionField[] {
       return [{ key: 'folder', label: 'Folder', type: 'text' }];
     case 'rename':
       return [{ key: 'name', label: 'New name', type: 'text' }];
+    case 'export_unreal':
+      return [
+        { key: 'batch', label: 'Assets per editor session', type: 'number', min: 1, max: 1000 },
+      ];
     case 'unity_glb':
       return [
         { key: 'max_texture', label: 'Max texture (px)', type: 'number', min: 16, max: 16384 },
@@ -164,6 +170,13 @@ export function stepProblem(step: ImportStepRecord): string | null {
       if (!name) return 'Name the file';
       return name.includes('/') ? 'A new name is a file name, without a folder' : null;
     }
+    case 'export_unreal': {
+      const batch = o.batch;
+      if (batch === undefined) return null;
+      return typeof batch === 'number' && Number.isInteger(batch) && batch >= 1 && batch <= 1000
+        ? null
+        : 'The batch is a whole number of assets from 1 to 1000';
+    }
     case 'unity_glb': {
       const max = o.max_texture;
       if (max === undefined) return null;
@@ -181,7 +194,9 @@ export function toggleProblem(
   step: ImportStepRecord,
   unavailable: Record<string, string>
 ): string | null {
-  if (step.kind.startsWith('extract')) return 'A pack is built from its extract step';
+  // `export_unreal` is an Unreal pack's extract step
+  if (step.kind.startsWith('extract') || step.kind === 'export_unreal')
+    return 'A pack is built from its extract step';
   if (!step.enabled && unavailable[step.kind]) return unavailable[step.kind];
   return null;
 }
