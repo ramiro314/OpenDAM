@@ -999,10 +999,14 @@ async fn stage(
         .filter(|o| o.origin == Origin::Kept)
         .collect();
     if let Some(lost) = kept.iter().find(|k| {
-        !staged_kept.iter().any(|o| match &k.source_path {
-            Some(source) => o.source_path == *source,
-            None => o.path == k.path,
-        })
+        let source = k.source_path.as_deref().map(records::source_json);
+        !staged_kept
+            .iter()
+            .any(|o| match (&source, o.stored_source()) {
+                (Some(source), Some(staged)) => *source == staged,
+                (None, None) => o.path == k.path,
+                _ => false,
+            })
     }) {
         return Err(Stop::Failed(format!(
             "{}, kept from outside changes, is left out by the steps now: Rebuild again and \
@@ -1061,29 +1065,29 @@ async fn hash_staged(
             });
             let path = to.join(&rel);
             let read = |e: std::io::Error| format!("The staged {rel} can't be read: {e}");
-            let (size, mut mtime_ns) = file_stamp(&path).map_err(read)?;
+            let (size, mtime_ns) = file_stamp(&path).map_err(read)?;
             let sha256 = crate::export::hashes::sha256_file(&path).map_err(read)?;
-            // A kept file of its own has no file key, and keeps its own mtime.
-            let key = (origin != Origin::Kept || !source_path.is_empty())
-                .then(|| (records::source_json(&source_path), origin.generated()));
-            if let Some((_, _, before)) = key
-                .and_then(|key| unchanged.get(&key))
-                .filter(|(s, sha, _)| *s == size as i64 && *sha == sha256)
-            {
-                if *before != mtime_ns {
-                    set_mtime(&path, *before)
-                        .map_err(|e| format!("The staged {rel} can't be stamped: {e}"))?;
-                    mtime_ns = *before;
-                }
-            }
-            outputs.push(Output {
+            let mut output = Output {
                 path: format!("{target}/{rel}"),
                 size,
                 mtime_ns,
                 sha256,
                 source_path,
                 origin,
-            });
+            };
+            // A kept file of its own has no file key, and keeps its own mtime.
+            if let Some((_, _, before)) = output
+                .file_key()
+                .and_then(|key| unchanged.get(&key))
+                .filter(|(s, sha, _)| *s == size as i64 && *sha == output.sha256)
+            {
+                if *before != mtime_ns {
+                    set_mtime(&path, *before)
+                        .map_err(|e| format!("The staged {rel} can't be stamped: {e}"))?;
+                    output.mtime_ns = *before;
+                }
+            }
+            outputs.push(output);
         }
         Ok(outputs)
     })
@@ -1372,6 +1376,8 @@ fn add_kept(
         }
         let size = copy_kept(&root.join(&file.path), &to)
             .map_err(|e| format!("The kept file {} can't be copied: {e}", file.path))?;
+        // Without a source path it is a kept file of its own: `Output::stored_source` reads
+        // the empty one, as kept, as none.
         staged.push(ExtractedFile {
             path: rel.to_string(),
             source_path: file.source_path.clone().unwrap_or_default(),

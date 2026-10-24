@@ -27,6 +27,53 @@ pub struct Output {
     pub origin: Origin,
 }
 
+impl Output {
+    /// The source path as `import_outputs` stores it: `None` exactly for a kept file of its own
+    /// (added outside OpenDAM), which has no source path. A generated `datapackage.json` has
+    /// the empty array, from no entry. This is the one place the rule lives.
+    pub fn stored_source(&self) -> Option<String> {
+        (self.origin != Origin::Kept || !self.source_path.is_empty())
+            .then(|| source_json(&self.source_path))
+    }
+
+    /// The file key a rebuild matches the previous build's files by (`carry`, the unchanged
+    /// mtime): its stored source path and whether it is generated, `None` for a file without
+    /// a source path.
+    pub fn file_key(&self) -> Option<(String, bool)> {
+        Some((self.stored_source()?, self.origin.generated()))
+    }
+}
+
+/// The source path (a JSON array, as stored) of the asset whose `.meta` has the source path
+/// `source`: its last element without `.meta`, or `None` for a file that isn't a `.meta`. A
+/// `.meta`'s own source path is its asset's with `.meta` appended (`place::meta_source`).
+pub fn asset_of_meta(source: &str) -> Option<String> {
+    let mut source: Vec<String> = serde_json::from_str(source).ok()?;
+    let last = source.last_mut()?;
+    *last = last.strip_suffix(".meta")?.to_string();
+    Some(source_json(&source))
+}
+
+/// The source paths (JSON arrays, as stored) the enabled `exclude` steps among `steps` (as a
+/// `Recipe` holds them, `(kind, options)`) leave out.
+pub fn excluded_sources(steps: &[(String, Value)]) -> std::collections::HashSet<String> {
+    steps
+        .iter()
+        .filter(|(kind, _)| kind == "exclude")
+        .filter_map(|(_, options)| {
+            let source: Vec<String> = serde_json::from_value(options["source"].clone()).ok()?;
+            Some(source_json(&source))
+        })
+        .collect()
+}
+
+/// Whether `exclude` steps of the source paths `excluded` drop the file with the source path
+/// `source` (all JSON arrays, as stored): one of its own, or for a `.meta`, its asset's, which
+/// drops the `.meta` too.
+pub fn leaves_out(excluded: &std::collections::HashSet<String>, source: &str) -> bool {
+    excluded.contains(source) || asset_of_meta(source).is_some_and(|a| excluded.contains(&a))
+}
+
 /// Where a manifest's file comes from (`import_outputs.origin`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
@@ -793,14 +840,7 @@ async fn record_drift_edits(
     let now = excluded.iter().map(|s| source_json(s)).collect();
     let after = edits.excluded_after(&now);
     let covered = |source: &Vec<String>| {
-        let Some((last, rest)) = source.split_last() else {
-            return false;
-        };
-        last.strip_suffix(".meta").is_some_and(|asset| {
-            let mut asset_source = rest.to_vec();
-            asset_source.push(asset.to_string());
-            after.contains(&source_json(&asset_source))
-        })
+        asset_of_meta(&source_json(source)).is_some_and(|asset| after.contains(&asset))
     };
     let new: Vec<Vec<String>> = edits
         .excludes
@@ -915,10 +955,7 @@ pub async fn write_outputs(
             .bind(output.mtime_ns)
             .bind(&output.sha256)
             .bind(output.origin.as_str())
-            .bind(
-                (output.origin != Origin::Kept || !output.source_path.is_empty())
-                    .then(|| source_json(&output.source_path)),
-            )
+            .bind(output.stored_source())
             .execute(&mut *tx)
             .await?;
         }
@@ -1041,5 +1078,51 @@ impl InsertJournal for InsertedRows {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(origin: Origin, source: &[&str]) -> Output {
+        Output {
+            path: "P/a".into(),
+            size: 1,
+            mtime_ns: 1,
+            sha256: String::new(),
+            source_path: source.iter().map(|s| s.to_string()).collect(),
+            origin,
+        }
+    }
+
+    #[test]
+    fn only_a_kept_file_of_its_own_has_no_stored_source_nor_file_key() {
+        assert_eq!(output(Origin::Kept, &[]).stored_source(), None);
+        assert_eq!(output(Origin::Kept, &[]).file_key(), None);
+        // The metadata step's datapackage.json comes from no entry, and still has its key.
+        assert_eq!(
+            output(Origin::Generated, &[]).file_key(),
+            Some(("[]".into(), true))
+        );
+        assert_eq!(
+            output(Origin::Kept, &["Assets/a.png"]).file_key(),
+            Some((r#"["Assets/a.png"]"#.into(), false)),
+            "a kept copy has the replaced file's key"
+        );
+    }
+
+    #[test]
+    fn a_meta_is_left_out_by_its_own_exclude_or_its_asset_s() {
+        let meta = source_json(&["Pack.unitypackage".into(), "Assets/a.png.meta".into()]);
+        let asset = source_json(&["Pack.unitypackage".into(), "Assets/a.png".into()]);
+        assert_eq!(asset_of_meta(&meta), Some(asset.clone()));
+        assert_eq!(asset_of_meta(&asset), None);
+        assert!(leaves_out(&[asset.clone()].into(), &meta));
+        assert!(leaves_out(&[meta.clone()].into(), &meta));
+        assert!(
+            !leaves_out(&[meta].into(), &asset),
+            "a .meta's exclude drops only it"
+        );
     }
 }

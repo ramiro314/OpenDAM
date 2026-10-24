@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 
 use super::build::file_stamp;
-use super::records::{self, DriftEdits, ManifestRow, Origin, Recipe};
+use super::records::{self, asset_of_meta, leaves_out, DriftEdits, ManifestRow, Origin, Recipe};
 use crate::structure::is_package_file;
 
 /// What the folder holds against the manifest.
@@ -154,15 +154,7 @@ impl<'a> Writes<'a> {
             .into_iter()
             .filter(|stem| !shipped.contains(stem))
             .collect();
-        let excluded = recipe
-            .steps
-            .iter()
-            .filter(|(kind, _)| kind == "exclude")
-            .filter_map(|(_, options)| {
-                let source: Vec<String> = serde_json::from_value(options["source"].clone()).ok()?;
-                Some(records::source_json(&source))
-            })
-            .collect();
+        let excluded = records::excluded_sources(&recipe.steps);
         Writes {
             target: &recipe.target,
             metadata: on("metadata"),
@@ -203,21 +195,6 @@ impl<'a> Writes<'a> {
         let (folder, stem, ext) = split(path);
         self.convert && ext == "glb" && self.models.contains(&(folder.to_string(), stem))
     }
-}
-
-/// Whether the `exclude` steps of the source paths `excluded` (JSON arrays) drop the file with the
-/// source path `source`: its own, or for a `.meta`, its asset's, which drops the `.meta` too.
-fn leaves_out(excluded: &HashSet<String>, source: &str) -> bool {
-    excluded.contains(source) || asset_of_meta(source).is_some_and(|a| excluded.contains(&a))
-}
-
-/// The source path (a JSON array) of the asset whose `.meta` has the source path `source`: its
-/// last element without `.meta`, or `None` for a file that isn't a `.meta`.
-fn asset_of_meta(source: &str) -> Option<String> {
-    let mut source: Vec<String> = serde_json::from_str(source).ok()?;
-    let last = source.last_mut()?;
-    *last = last.strip_suffix(".meta")?.to_string();
-    Some(records::source_json(&source))
 }
 
 /// A path's folder, then its stem and extension, lowercased.
@@ -489,7 +466,8 @@ pub fn edits(
     chosen: &[Chosen],
     recorded: &[Chosen],
 ) -> Result<DriftEdits, String> {
-    let writes = Writes::of(recipe, &[]);
+    let excluded = records::excluded_sources(&recipe.steps);
+    let metadata_on = recipe.steps.iter().any(|(kind, _)| kind == "metadata");
     let made = |d: &Difference, choices: &[Choice]| {
         recorded
             .iter()
@@ -510,7 +488,7 @@ pub fn edits(
             }
             (Kind::Extracted, Choice::Restore | Choice::Recipe) => {
                 let Some(source) = source else { continue };
-                if writes.excluded.contains(source) && made(difference, &[Choice::Exclude]) {
+                if excluded.contains(source) && made(difference, &[Choice::Exclude]) {
                     edits
                         .includes
                         .extend(serde_json::from_str::<Vec<String>>(source).ok());
@@ -518,7 +496,7 @@ pub fn edits(
                 restoring.push((difference, source));
             }
             (Kind::Package, Choice::MetadataOff | Choice::Keep) => edits.metadata_off = true,
-            (Kind::Package, Choice::Restore | Choice::Recipe) if !writes.metadata => {
+            (Kind::Package, Choice::Restore | Choice::Recipe) if !metadata_on => {
                 if !made(difference, &[Choice::MetadataOff, Choice::Keep]) {
                     return Err(format!(
                         "The metadata step is off, so {} can't be restored: turn it on first, \
@@ -531,7 +509,7 @@ pub fn edits(
             _ => {}
         }
     }
-    let after = edits.excluded_after(&writes.excluded);
+    let after = edits.excluded_after(&excluded);
     if let Some((difference, _)) = restoring.iter().find(|(_, s)| leaves_out(&after, s)) {
         return Err(format!(
             "An exclude step leaves {} out, so it can't be restored: turn that step off \
@@ -560,7 +538,6 @@ pub fn kept(
     let source = |row: Option<&ManifestRow>| {
         row.and_then(|r| r.source_path.as_deref())
             .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
-            .filter(|s| !s.is_empty())
     };
     let mut kept = Vec::new();
     for row in manifest.iter().filter(|r| r.origin == Origin::Kept) {
@@ -589,7 +566,7 @@ pub fn kept(
             sha256: difference.sha256.clone().unwrap_or_default(),
         });
     }
-    let excluded = Writes::of(recipe, &[]).excluded;
+    let excluded = records::excluded_sources(&recipe.steps);
     kept.retain(|k| {
         let asset = k
             .source_path
