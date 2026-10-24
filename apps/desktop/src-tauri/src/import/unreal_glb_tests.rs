@@ -14,6 +14,7 @@ mod tests {
     use crate::import::engine::tests::{setup, setup_with, Setup};
     use crate::import::engine::*;
     use crate::import::unitypackage::tests::{fixture, on_disk};
+    use crate::import::unitypackage::SkipReason;
     use crate::import::unreal_glb::tests::{write_editor, write_version};
 
     const TARGET: &str = "Fab/unreal";
@@ -22,7 +23,9 @@ mod tests {
     /// `sessions.log`, keeps a copy of the `.uproject` it opened as `uproject.<n>`, then writes
     /// a GLB for at most `GLTF_BATCH` of the project's `SM_*.uasset` files that have none in
     /// `GLTF_OUT` yet, and the number left to `.gltf-remaining`. The session numbered in a
-    /// `stall` file, and every one after it, writes no GLB.
+    /// `stall` file, and every one after it, writes no GLB. An asset named in a `fail` file (by
+    /// its path below `Content/`) gets no GLB either: as the script does, the session counts it
+    /// in its batch, lists it in `.gltf-failed`, and later sessions skip it.
     fn stub_editor(root: &Path) {
         let r = root.display();
         write_editor(
@@ -40,16 +43,22 @@ for asset in $(cd "$content" && find . -name 'SM_*.uasset' | sort); do
   rel=${{asset#./}}; rel=${{rel%.uasset}}
   glb="$GLTF_OUT/$rel.glb"
   [ -e "$glb" ] && continue
+  grep -qx "/Game/$rel" "$GLTF_OUT/.gltf-failed" 2>/dev/null && continue
   if [ "$n" -lt "$stall" ] && [ "$made" -lt "$GLTF_BATCH" ]; then
-    mkdir -p "$(dirname "$glb")"
-    printf 'glTF %s' "$rel" > "$glb"
     made=$((made + 1))
-    echo "LogPython: [gltf] exported /Game/$rel"
+    if grep -qx "$rel" '{r}/fail' 2>/dev/null; then
+      echo "/Game/$rel" >> "$GLTF_OUT/.gltf-failed"
+      echo "LogPython: Warning: [gltf] no file written for /Game/$rel"
+    else
+      mkdir -p "$(dirname "$glb")"
+      printf 'glTF %s' "$rel" > "$glb"
+      echo "LogPython: [gltf] exported /Game/$rel"
+    fi
   else
     left=$((left + 1))
   fi
 done
-echo "LogPython: [gltf] exported $made, failed 0, remaining $left"
+echo "LogPython: [gltf] attempted $made, remaining $left"
 echo "$left" > "$GLTF_OUT/.gltf-remaining""#
             ),
         );
@@ -287,8 +296,73 @@ echo "$left" > "$GLTF_OUT/.gltf-remaining""#
         s.wait_for(&run.id, "done").await;
         assert_eq!(sessions(&root).len(), 4);
         assert_eq!(on_disk(&s.pack_dir()), built);
+
+        // A GLB gone from the cache is exported again, alone, in one session.
+        let glb_dir = s.cache.path().join("glb");
+        let evicted = std::fs::read_dir(&glb_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(evicted.path()).unwrap();
+        assert_eq!(s.cached_glbs(), 2);
+        let run = s.engine.rebuild_pack("lib", &pack_id).await.unwrap();
+        s.wait_for(&run.id, "done").await;
+        assert_eq!(sessions(&root).len(), 5);
+        assert_eq!(on_disk(&s.pack_dir()), built);
+        assert_eq!(s.cached_glbs(), 3);
+        s.no_work_folder();
         s.nothing_beside_the_pack();
         assert_eq!(stamp(&zip), before, "the zip is untouched");
+    }
+
+    /// An asset the exporter fails on gets no GLB and becomes a warning naming it, and the step
+    /// goes on: a session whose only attempt failed still made progress.
+    #[tokio::test]
+    async fn an_asset_the_exporter_fails_on_is_a_warning_and_the_export_goes_on() {
+        let s = setup_with(false).await;
+        let root = s.stub_unreal().await;
+        std::fs::write(root.join("fail"), "Fixture/Meshes/SM_B\n").unwrap();
+        let run = s
+            .engine
+            .start_import(s.unreal_request("unreal.zip"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE import_steps SET options = '{\"batch\":1}' WHERE kind = 'export_unreal'",
+        )
+        .execute(&s.lib.pool)
+        .await
+        .unwrap();
+        tokio::spawn(s.engine.clone().start());
+
+        let done = s.wait_for(&run.id, "done").await;
+        // SM_A, then SM_B failing alone, then SM_C.
+        assert_eq!(sessions(&root).len(), 3);
+        assert_eq!(
+            on_disk(&s.pack_dir()),
+            [
+                "README.md",
+                "Readme.txt",
+                "SM_A.glb",
+                "SM_C.glb",
+                "datapackage.json"
+            ]
+        );
+        let warned: Vec<(Vec<String>, SkipReason)> = done
+            .warnings
+            .iter()
+            .map(|w| (w.source_path.clone(), w.reason))
+            .collect();
+        assert_eq!(
+            warned,
+            [(
+                vec!["/Game/Fixture/Meshes/SM_B".to_string()],
+                SkipReason::NotExported
+            )]
+        );
+        assert_eq!(s.cached_glbs(), 2);
+        s.no_work_folder();
     }
 
     /// A project with a `Source/` folder is refused with the reason: by the scan, which offers

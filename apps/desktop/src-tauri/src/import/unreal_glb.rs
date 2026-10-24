@@ -547,6 +547,8 @@ impl Export<'_> {
             .await
             .map_err(|e| format!("Could not write the export script: {e}"))?;
 
+        // The work folder is new, so no asset has failed in it yet.
+        record.failed.clear();
         loop {
             self.cancelled()?;
             let before = exported_in(&out).await?;
@@ -564,11 +566,11 @@ impl Export<'_> {
                 .await
                 .map_err(|e| format!("Exporting {game} from Unreal failed: {e}"))?;
             }
-            let failed = tokio::fs::read_to_string(out.join(".gltf-failed"))
-                .await
-                .unwrap_or_default();
-            record.exported = after.clone();
-            record.failed = failed.split_whitespace().map(str::to_string).collect();
+            let failed = failed_in(&out).await;
+            // An asset the exporter failed on is done too: later sessions skip it.
+            let progressed = after.len() > before.len() || failed.len() > record.failed.len();
+            record.exported = after;
+            record.failed = failed;
             let remaining = tokio::fs::read_to_string(out.join(".gltf-remaining"))
                 .await
                 .ok()
@@ -578,7 +580,7 @@ impl Export<'_> {
             if record.complete {
                 return Ok(record);
             }
-            if after.len() <= before.len() {
+            if !progressed {
                 let left = match remaining {
                     Some(n) => format!("with {n} assets left"),
                     None => "without saying what is left".to_string(),
@@ -703,6 +705,14 @@ async fn exported_in(out: &Path) -> Result<BTreeSet<String>, Stop> {
         Ok(found)
     })
     .await
+}
+
+/// The `/Game` paths the script failed on in this work folder, from its `.gltf-failed`.
+async fn failed_in(out: &Path) -> BTreeSet<String> {
+    let failed = tokio::fs::read_to_string(out.join(".gltf-failed"))
+        .await
+        .unwrap_or_default();
+    failed.split_whitespace().map(str::to_string).collect()
 }
 
 /// Enables `PLUGINS` in the `.uproject` at `path`, a work copy: an entry it lists is turned on,
