@@ -5,7 +5,7 @@
 //! The preview runs the build's own extract and place code over the archive's index
 //! (`unitypackage::list_unitypackage`, `list_variant`, `zipfile::list_zip`, `place::place_listed`),
 //! so it reads no file body (a package's entries are read through, its `pathname` entries kept)
-//! and writes nothing. It runs no conversion: it counts one GLB per model stem `unity_glb` would
+//! and writes nothing. It adds the `datapackage.json` the metadata step writes. It runs no conversion: it counts one GLB per model stem `unity_glb` would
 //! convert.
 //!
 //! The rows of the plan's table it detects, each offered when it matches, so a zip matching
@@ -28,6 +28,7 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::json;
 
+use super::metadata;
 use super::place::{place_listed, PlaceStep};
 use super::records::StepRecord;
 use super::unitypackage::{
@@ -175,8 +176,9 @@ impl Tree {
     }
 }
 
-/// A source's listing, placed by `place` and counted. A listing or step that fails gives a tree
-/// naming the error, as the build would fail.
+/// A source's listing, placed by `place`, with the `datapackage.json` the metadata step writes
+/// at the pack root (every candidate's default steps end with it), and counted. A listing or
+/// step that fails gives a tree naming the error, as the build would fail.
 fn preview(listing: Result<Extraction>, place: &[PlaceStep], convert: bool) -> Tree {
     let mut extraction = match listing {
         Ok(extraction) => extraction,
@@ -185,9 +187,14 @@ fn preview(listing: Result<Extraction>, place: &[PlaceStep], convert: bool) -> T
     if let Err(err) = place_listed(&mut extraction.files, place) {
         return Tree::failed(err, extraction.skipped);
     }
+    if let Some(path) = metadata::clash(&extraction.files) {
+        let err = anyhow::anyhow!(metadata::clash_message(path));
+        return Tree::failed(err, extraction.skipped);
+    }
+    let files = extraction.files.iter().map(|f| f.path.as_str());
     Tree {
         skipped: extraction.skipped,
-        ..Tree::of(extraction.files.iter().map(|f| f.path.as_str()), convert)
+        ..Tree::of(files.chain([metadata::FILE]), convert)
     }
 }
 
@@ -566,7 +573,8 @@ mod tests {
         ]
     }
 
-    /// The tree a build makes on disk: `extract` into a fresh folder, then `steps`.
+    /// The tree a build makes on disk: `extract` into a fresh folder, then `steps`, then the
+    /// metadata step's `datapackage.json` (its content is the metadata tests' to check).
     fn built(
         extract: impl FnOnce(&Path) -> Result<Extraction>,
         steps: &[PlaceStep],
@@ -576,6 +584,7 @@ mod tests {
         let root = tmp.path().join("Pack");
         let mut extraction = extract(&root).unwrap();
         place(&root, &mut extraction.files, steps).unwrap();
+        std::fs::write(root.join(metadata::FILE), "{}").unwrap();
         Tree {
             skipped: extraction.skipped,
             ..Tree::of(on_disk(&root).iter().map(String::as_str), convert)
@@ -628,13 +637,14 @@ mod tests {
         );
         let tree = pack.tree.as_ref().unwrap();
         assert_eq!(tree, &expected);
-        assert_eq!((tree.files, tree.glbs), (16, 1), "{tree:?}");
+        // 16 extracted files and the metadata step's `datapackage.json`.
+        assert_eq!((tree.files, tree.glbs), (17, 1), "{tree:?}");
         assert_eq!(
             tree.folders.first(),
             Some(&FolderCount {
                 path: String::new(),
-                files: 2,
-                total: 16,
+                files: 3,
+                total: 17,
             })
         );
         assert!(tree
@@ -878,7 +888,7 @@ mod tests {
             assert_eq!(pack.tree.as_ref(), Some(&expected), "{}", pack.name);
         }
         let car = offers[0].candidates[1].tree.as_ref().unwrap();
-        assert_eq!((car.files, car.glbs), (3, 0));
+        assert_eq!((car.files, car.glbs), (4, 0));
 
         // Offered as any other zip too.
         let [zip] = &offers[1].candidates[..] else {
@@ -1014,8 +1024,24 @@ mod tests {
         );
         assert_eq!(tree.files, 0);
 
-        // An original that isn't what its name says fails the scan.
+        // An original holding its own datapackage.json where the metadata step writes one fails
+        // the preview as it fails the build.
         let tmp = tempfile::tempdir().unwrap();
+        let own = tmp.path().join("own.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&own).unwrap());
+        for name in ["Pack/DataPackage.json", "Pack/rock.fbx"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+        }
+        zip.finish().unwrap();
+        let offers = detect(&own, "zip", "").unwrap();
+        let tree = offers[0].candidates[0].tree.as_ref().unwrap();
+        assert_eq!(
+            tree.error.as_deref(),
+            Some(metadata::clash_message("DataPackage.json").as_str())
+        );
+
+        // An original that isn't what its name says fails the scan.
         let bogus = tmp.path().join("bogus.zip");
         std::fs::write(&bogus, b"not a zip").unwrap();
         assert!(detect(&bogus, "zip", "").is_err());

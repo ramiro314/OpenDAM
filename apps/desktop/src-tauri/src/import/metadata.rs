@@ -303,6 +303,15 @@ fn resource(files: &[ExtractedFile]) -> Option<Resource> {
     Some(Resource { name, path })
 }
 
+/// Why a build fails when the original holds its own `path` where the step writes
+/// `datapackage.json` (`clash`).
+pub fn clash_message(path: &str) -> String {
+    format!(
+        "The original holds its own {path} where the metadata step writes {FILE}: turn the step \
+         off to keep it"
+    )
+}
+
 /// A file the original put where the step writes `datapackage.json`, in any ASCII case.
 pub fn clash(files: &[ExtractedFile]) -> Option<&str> {
     files
