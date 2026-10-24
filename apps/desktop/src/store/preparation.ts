@@ -1,6 +1,9 @@
 import { create } from 'zustand';
 import { api } from '../api';
 import type {
+  DriftChoice,
+  DriftChosen,
+  DriftDifference,
   ImportPackSteps,
   ImportPackSummary,
   ImportRun,
@@ -10,7 +13,8 @@ import type {
 import { cleanTarget, isLive, rebuildRefusal, upsertRun, useImportStore } from './imports';
 
 // An imported pack's Preparation (plan pack-import, UI): its steps with their toggles and
-// options, its target, and Rebuild. The pack's details and the Imports view open the same
+// options, its target, its kept files, and Rebuild, which first asks what to do about each
+// outside change to the pack folder. The pack's details and the Imports view open the same
 // editor, kept here by pack id.
 
 /** What a step edit or a Rebuild answers while a run for the pack is live (`engine::BUSY`) */
@@ -207,6 +211,8 @@ export interface StepsDraft {
   saved: ImportStepRecord[];
   steps: ImportStepRecord[];
   unavailable: Record<string, string>;
+  /** The files kept from outside changes, as read */
+  kept: string[];
 }
 
 export function draftFromSteps(read: ImportPackSteps): StepsDraft {
@@ -215,6 +221,7 @@ export function draftFromSteps(read: ImportPackSteps): StepsDraft {
     saved: read.steps,
     steps: read.steps,
     unavailable: read.unavailable ?? {},
+    kept: read.kept ?? [],
   };
 }
 
@@ -267,6 +274,132 @@ export function draftProblem(draft: StepsDraft): string | null {
   return null;
 }
 
+// ── Outside changes ───────────────────────────────────────────────────────
+
+/** What a Rebuild answers once its choices don't match the folder any more (`drift::STALE`) */
+export const DRIFT_STALE = 'The pack changed outside OpenDAM since it was checked';
+
+/** The pack folder's outside changes as the drift dialog holds them, with a choice for each */
+export interface DriftDraft {
+  differences: DriftDifference[];
+  /** The choice for each difference, by path */
+  choices: Record<string, DriftChoice>;
+  /** Why the dialog shows again, or why the Rebuild failed */
+  notice: string | null;
+}
+
+/** The dialog for `differences`, each with its default choice, the first it offers */
+export function driftDraft(
+  differences: DriftDifference[],
+  notice: string | null = null
+): DriftDraft {
+  const choices: Record<string, DriftChoice> = {};
+  for (const d of differences) if (d.choices[0]) choices[d.path] = d.choices[0];
+  return { differences, choices, notice };
+}
+
+/** Chooses `choice` for the difference at `path`, unless it doesn't offer it */
+export function chooseDrift(draft: DriftDraft, path: string, choice: DriftChoice): DriftDraft {
+  const difference = draft.differences.find((d) => d.path === path);
+  if (!difference?.choices.includes(choice)) return draft;
+  return { ...draft, choices: { ...draft.choices, [path]: choice } };
+}
+
+/** Chooses `choice` for every difference that offers it, such as Restore for a deleted folder */
+export function chooseAllDrift(draft: DriftDraft, choice: DriftChoice): DriftDraft {
+  const choices = { ...draft.choices };
+  for (const d of draft.differences) if (d.choices.includes(choice)) choices[d.path] = choice;
+  return { ...draft, choices };
+}
+
+/** How many differences offer `choice` among others, so choosing it for all of them helps */
+export function choosableAll(draft: DriftDraft, choice: DriftChoice): number {
+  return draft.differences.filter((d) => d.choices.includes(choice) && d.choices.length > 1).length;
+}
+
+/**
+ * Whether the `.meta` difference `d` goes with its file, which the draft leaves out: the build
+ * then drops the `.meta` whatever is chosen for it, as an in-app delete takes it along
+ */
+export function followsItsFile(draft: DriftDraft, d: DriftDifference): boolean {
+  const asset = d.path.endsWith('.meta') ? d.path.slice(0, -'.meta'.length) : null;
+  return asset !== null && draft.choices[asset] === 'exclude';
+}
+
+/** The choices as `rebuild_import_pack` takes them */
+export function chosenFrom(draft: DriftDraft): DriftChosen[] {
+  return draft.differences.map((d) => ({
+    path: d.path,
+    change: d.change,
+    sha256: d.sha256,
+    choice: draft.choices[d.path] ?? d.choices[0],
+  }));
+}
+
+/** What happened to the file, and where it came from */
+export function differenceText(d: DriftDifference): string {
+  const what = {
+    added: 'Added',
+    changed: 'Changed',
+    missing: 'Missing',
+    clash: 'In the way of the recipe',
+  }[d.change];
+  const from = {
+    extracted: 'from the original',
+    generated: 'a converted GLB',
+    package: "the pack's metadata",
+    kept: 'a kept file',
+    outside: 'not from the original',
+  }[d.kind];
+  return `${what}, ${from}`;
+}
+
+/** A choice's button text, for the difference it answers */
+export function choiceLabel(choice: DriftChoice, d: DriftDifference): string {
+  switch (choice) {
+    case 'keep':
+      return d.change === 'added' ? 'Keep' : 'Keep yours';
+    case 'recipe':
+      return "Use the recipe's";
+    case 'exclude':
+      return 'Leave it out';
+    case 'restore':
+      return 'Restore';
+    case 'metadataOff':
+      return 'Turn the metadata step off';
+    case 'forget':
+      return 'Forget it';
+    case 'discard':
+      return 'Discard';
+  }
+}
+
+/** What a choice does, in a line */
+export function choiceHint(choice: DriftChoice, d: DriftDifference): string {
+  switch (choice) {
+    case 'keep':
+      if (d.kind === 'package')
+        return 'Turns the metadata step off and carries your file into every rebuild';
+      return d.change === 'added' || d.kind === 'kept'
+        ? 'Carries your file into every rebuild, as a kept file'
+        : "Carries your copy into every rebuild, in place of the recipe's";
+    case 'recipe':
+      return "The rebuild writes the recipe's file again";
+    case 'exclude':
+      return 'Records an exclude step, so no rebuild brings it back';
+    case 'restore':
+      return 'The rebuild writes it again';
+    case 'metadataOff':
+      return 'No rebuild writes datapackage.json, as deleting it in the app does';
+    case 'forget':
+      return 'Drops it from the kept files';
+    case 'discard':
+      return d.change === 'clash'
+        ? "Drops your copy from the kept files, so the recipe's steps decide the path"
+        : 'Removes it with the previous build';
+  }
+}
+
 // ── Target ────────────────────────────────────────────────────────────────
 
 /**
@@ -310,6 +443,8 @@ export interface Editor {
   /** A save, a Rebuild or a target move is in flight */
   saving: boolean;
   target: TargetDraft | null;
+  /** The drift dialog, open while a Rebuild waits for a choice about each outside change */
+  drift: DriftDraft | null;
   /** How many mounted editors show it: the pack's details, its Imports view row, or both */
   mounts: number;
 }
@@ -331,13 +466,29 @@ interface PreparationStore {
   revert: (packId: string) => void;
   /** Saves the edited steps; true once they are saved, or when there was nothing to save */
   save: (packId: string) => Promise<boolean>;
-  /** Saves any edits, then queues a rebuild; true once it is queued */
+  /**
+   * Saves any edits, then checks the pack folder for outside changes and queues a rebuild when
+   * there are none; true once it is queued. With outside changes it opens the drift dialog
+   */
   rebuild: (packId: string) => Promise<boolean>;
+  /** Chooses what the Rebuild does about the outside change at `path` */
+  chooseDrift: (packId: string, path: string, choice: DriftChoice) => void;
+  /** Chooses `choice` for every outside change that offers it */
+  chooseAllDrift: (packId: string, choice: DriftChoice) => void;
+  /** Closes the drift dialog, queuing nothing */
+  closeDrift: (packId: string) => void;
+  /** Queues the rebuild with the dialog's choices; true once it is queued */
+  confirmDrift: (packId: string) => Promise<boolean>;
   editTarget: (packId: string, value: string) => void;
   /** Asks the library about the typed target, unless it was asked already */
   checkTarget: (packId: string, current: string) => Promise<void>;
   /** Moves the pack's target to the typed one; true once it moved */
   moveTarget: (packId: string, current: string) => Promise<boolean>;
+}
+
+/** Whether a drift dialog is open, over whatever view asked for the Rebuild */
+export function driftOpen(): boolean {
+  return Object.values(usePreparationStore.getState().editors).some((e) => e.drift !== null);
 }
 
 export const usePreparationStore = create<PreparationStore>()((set, get) => {
@@ -352,6 +503,37 @@ export const usePreparationStore = create<PreparationStore>()((set, get) => {
 
   const busy = (editor: Editor) =>
     busyReason(useImportStore.getState().runs, editor.libraryId, editor.packId);
+
+  /**
+   * Queues the editor's rebuild with `chosen`. A refusal because the folder changed since its
+   * check checks it again, and shows the dialog with what it finds now
+   */
+  const queue = async (editor: Editor, chosen: DriftChosen[]): Promise<boolean> => {
+    const { libraryId, packId } = editor;
+    patch(packId, { saving: true, error: null });
+    try {
+      const run = await api.rebuildImportPack(libraryId, packId, chosen);
+      useImportStore.setState((s) => ({ runs: upsertRun(s.runs, run) }));
+      patch(packId, { saving: false, drift: null });
+      return true;
+    } catch (err) {
+      const message = String(err);
+      if (!message.includes(DRIFT_STALE)) {
+        const drift = get().editors[packId]?.drift;
+        if (drift) patch(packId, { saving: false, drift: { ...drift, notice: message } });
+        else patch(packId, { saving: false, error: message });
+        return false;
+      }
+      try {
+        const differences = await api.checkImportDrift(libraryId, packId);
+        const notice = 'The pack folder changed again: check what it holds now';
+        patch(packId, { saving: false, drift: driftDraft(differences, notice) });
+      } catch (again) {
+        patch(packId, { saving: false, drift: null, error: String(again) });
+      }
+      return false;
+    }
+  };
 
   /** Reads the pack's steps, replacing the draft unless `keepEdits` and it has edits */
   const read = async (libraryId: string, packId: string, keepEdits: boolean) => {
@@ -385,6 +567,7 @@ export const usePreparationStore = create<PreparationStore>()((set, get) => {
           error: null,
           saving: false,
           target: null,
+          drift: null,
           mounts: 1,
         };
         set((s) => ({ editors: { ...s.editors, [packId]: editor } }));
@@ -470,15 +653,48 @@ export const usePreparationStore = create<PreparationStore>()((set, get) => {
       }
       if (!(await get().save(packId))) return false;
       patch(packId, { saving: true, error: null });
+      let differences: DriftDifference[];
       try {
-        const run = await api.rebuildImportPack(editor.libraryId, packId);
-        useImportStore.setState((s) => ({ runs: upsertRun(s.runs, run) }));
-        patch(packId, { saving: false });
-        return true;
+        differences = await api.checkImportDrift(editor.libraryId, packId);
       } catch (err) {
         patch(packId, { saving: false, error: String(err) });
         return false;
       }
+      if (differences.length > 0) {
+        patch(packId, { saving: false, drift: driftDraft(differences) });
+        return false;
+      }
+      return queue(editor, []);
+    },
+
+    chooseDrift: (packId, path, choice) => {
+      const editor = get().editors[packId];
+      if (!editor?.drift || editor.saving) return;
+      patch(packId, { drift: chooseDrift(editor.drift, path, choice) });
+    },
+
+    chooseAllDrift: (packId, choice) => {
+      const editor = get().editors[packId];
+      if (!editor?.drift || editor.saving) return;
+      patch(packId, { drift: chooseAllDrift(editor.drift, choice) });
+    },
+
+    closeDrift: (packId) => {
+      const editor = get().editors[packId];
+      if (!editor?.drift || editor.saving) return;
+      patch(packId, { drift: null });
+    },
+
+    confirmDrift: async (packId) => {
+      const editor = get().editors[packId];
+      if (!editor?.drift || editor.saving) return false;
+      const reason = busy(editor);
+      if (reason) {
+        patch(packId, { drift: { ...editor.drift, notice: reason } });
+        return false;
+      }
+      patch(packId, { saving: true });
+      return queue(editor, chosenFrom(editor.drift));
     },
 
     editTarget: (packId, value) => {

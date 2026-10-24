@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tauri::State;
 
+use crate::import::drift::{Chosen, Difference};
 use crate::import::engine::ImportRequest;
 use crate::import::original::Located;
 use crate::import::place::PlaceStep;
@@ -189,16 +190,34 @@ pub async fn clear_import_store_page(
     state.imports.clear_store_page(&library_id, &pack_id).await
 }
 
-/// Queues a rebuild of an imported pack from its current steps. Its new output replaces the pack
-/// folder only once fully built and indexed, and every asset row and its metadata is kept.
-/// Refused while a run for the pack is queued or running.
+/// How an imported pack's folder differs from its current build's manifest, outside OpenDAM:
+/// each file added, changed or missing, with the choices its origin can honour, the default
+/// first. A Rebuild answers each of them.
+#[tauri::command]
+pub async fn check_import_drift(
+    library_id: String,
+    pack_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<Difference>> {
+    state.imports.check_drift(&library_id, &pack_id).await
+}
+
+/// Queues a rebuild of an imported pack from its current steps, with `drift`, a choice for each
+/// difference `check_import_drift` found. Its new output replaces the pack folder only once
+/// fully built and indexed, and every asset row and its metadata is kept. Refused while a run
+/// for the pack is queued or running, and when the choices don't answer the folder's
+/// differences now.
 #[tauri::command]
 pub async fn rebuild_import_pack(
     library_id: String,
     pack_id: String,
+    drift: Option<Vec<Chosen>>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<RunSummary> {
-    state.imports.rebuild_pack(&library_id, &pack_id).await
+    state
+        .imports
+        .rebuild_pack(&library_id, &pack_id, drift.unwrap_or_default())
+        .await
 }
 
 /// The import settings: the memory caps Blender and the Unreal Editor run under, the Unreal

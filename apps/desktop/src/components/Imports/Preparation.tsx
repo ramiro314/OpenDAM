@@ -142,6 +142,8 @@ export function Preparation({ libraryId, pack, originalPath, runShown = false }:
         )}
       </div>
 
+      {draft && <KeptFiles target={pack.target} kept={draft.kept} />}
+
       {run && run.status === 'failed' && run.error && (
         <span className={styles.errorText} data-prep-run-error>
           The last build failed: {run.error}
@@ -195,13 +197,33 @@ export function Preparation({ libraryId, pack, originalPath, runShown = false }:
           onClick={() => void store.rebuild(pack.id)}
           title={
             noRebuild ??
-            'Build the pack again from its steps. The pack stays as it is until the new build is done, and every file keeps its tags and metadata.'
+            'Build the pack again from its steps. Files changed outside OpenDAM are listed first, to keep or not. The pack stays as it is until the new build is done, and every file keeps its tags and metadata.'
           }
           data-prep-rebuild
         >
           {dirty ? 'Save and rebuild' : 'Rebuild'}
         </button>
       </div>
+    </div>
+  );
+}
+
+/** The pack's files kept from outside changes, which a rebuild carries but can't recreate */
+export function KeptFiles({ target, kept }: { target: string; kept: string[] }) {
+  if (kept.length === 0) return null;
+  return (
+    <div className={styles.section} data-prep-kept>
+      <span className={styles.sectionLabel}>Not from the original</span>
+      <span className={styles.hint}>
+        Kept from outside changes: a rebuild carries them, but can't recreate them.
+      </span>
+      <ul className={styles.kept}>
+        {kept.map((path) => (
+          <li key={path} className={styles.path}>
+            {path.startsWith(`${target}/`) ? path.slice(target.length + 1) : path}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

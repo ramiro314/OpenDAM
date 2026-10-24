@@ -21,11 +21,92 @@ pub struct Output {
     pub mtime_ns: i64,
     pub sha256: String,
     /// For a generated GLB, its source model's; empty for the metadata step's
-    /// `datapackage.json`, which comes from no entry.
+    /// `datapackage.json`, which comes from no entry, and for a kept file added outside
+    /// OpenDAM, which is stored as `NULL`.
     pub source_path: Vec<String>,
-    /// Made by a step (a `unity_glb` GLB, the metadata step's `datapackage.json`), not
-    /// extracted: `origin = 'generated'`.
-    pub generated: bool,
+    pub origin: Origin,
+}
+
+impl Output {
+    /// The source path as `import_outputs` stores it: `None` exactly for a kept file of its own
+    /// (added outside OpenDAM), which has no source path. A generated `datapackage.json` has
+    /// the empty array, from no entry. This is the one place the rule lives.
+    pub fn stored_source(&self) -> Option<String> {
+        (self.origin != Origin::Kept || !self.source_path.is_empty())
+            .then(|| source_json(&self.source_path))
+    }
+
+    /// The file key a rebuild matches the previous build's files by (`carry`, the unchanged
+    /// mtime): its stored source path and whether it is generated, `None` for a file without
+    /// a source path.
+    pub fn file_key(&self) -> Option<(String, bool)> {
+        Some((self.stored_source()?, self.origin.generated()))
+    }
+}
+
+/// The source path (a JSON array, as stored) of the asset whose `.meta` has the source path
+/// `source`: its last element without `.meta`, or `None` for a file that isn't a `.meta`. A
+/// `.meta`'s own source path is its asset's with `.meta` appended (`place::meta_source`).
+pub fn asset_of_meta(source: &str) -> Option<String> {
+    let mut source: Vec<String> = serde_json::from_str(source).ok()?;
+    let last = source.last_mut()?;
+    *last = last.strip_suffix(".meta")?.to_string();
+    Some(source_json(&source))
+}
+
+/// The source paths (JSON arrays, as stored) the enabled `exclude` steps among `steps` (as a
+/// `Recipe` holds them, `(kind, options)`) leave out.
+pub fn excluded_sources(steps: &[(String, Value)]) -> std::collections::HashSet<String> {
+    steps
+        .iter()
+        .filter(|(kind, _)| kind == "exclude")
+        .filter_map(|(_, options)| {
+            let source: Vec<String> = serde_json::from_value(options["source"].clone()).ok()?;
+            Some(source_json(&source))
+        })
+        .collect()
+}
+
+/// Whether `exclude` steps of the source paths `excluded` drop the file with the source path
+/// `source` (all JSON arrays, as stored): one of its own, or for a `.meta`, its asset's, which
+/// drops the `.meta` too.
+pub fn leaves_out(excluded: &std::collections::HashSet<String>, source: &str) -> bool {
+    excluded.contains(source) || asset_of_meta(source).is_some_and(|a| excluded.contains(&a))
+}
+
+/// Where a manifest's file comes from (`import_outputs.origin`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// From an entry of the original.
+    Extracted,
+    /// Made by a step: a `unity_glb` GLB, or the metadata step's `datapackage.json`.
+    Generated,
+    /// Kept from outside changes ("keep yours" or "keep" at drift): your bytes, carried by every
+    /// rebuild, in place of the recipe's file with its source path, or as a file of its own.
+    Kept,
+}
+
+impl Origin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Extracted => "extracted",
+            Origin::Generated => "generated",
+            Origin::Kept => "kept",
+        }
+    }
+
+    fn parse(origin: &str) -> Self {
+        match origin {
+            "generated" => Origin::Generated,
+            "kept" => Origin::Kept,
+            _ => Origin::Extracted,
+        }
+    }
+
+    /// Whether a file of this origin is generated, the second half of its file key.
+    pub fn generated(self) -> bool {
+        self == Origin::Generated
+    }
 }
 
 /// One pack of a run, with the `recipe_rev` it was queued at.
@@ -485,7 +566,7 @@ pub struct ManifestRow {
     pub sha256: String,
     /// The JSON array `import_outputs` stores, `NULL` for a kept file added outside OpenDAM.
     pub source_path: Option<String>,
-    pub generated: bool,
+    pub origin: Origin,
 }
 
 /// Build `build_id`'s manifest rows, sorted by path.
@@ -494,8 +575,8 @@ pub async fn manifest(
     pack_id: &str,
     build_id: &str,
 ) -> sqlx::Result<Vec<ManifestRow>> {
-    let rows: Vec<(String, i64, i64, String, Option<String>, bool)> = sqlx::query_as(
-        "SELECT path, size, mtime_ns, sha256, source_path, origin = 'generated'
+    let rows: Vec<(String, i64, i64, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT path, size, mtime_ns, sha256, source_path, origin
          FROM import_outputs WHERE pack_id = ? AND build_id = ? ORDER BY path",
     )
     .bind(pack_id)
@@ -505,13 +586,13 @@ pub async fn manifest(
     Ok(rows
         .into_iter()
         .map(
-            |(path, size, mtime_ns, sha256, source_path, generated)| ManifestRow {
+            |(path, size, mtime_ns, sha256, source_path, origin)| ManifestRow {
                 path,
                 size,
                 mtime_ns,
                 sha256,
                 source_path,
-                generated,
+                origin: Origin::parse(&origin),
             },
         )
         .collect())
@@ -544,6 +625,9 @@ pub struct PackSteps {
     pub steps: Vec<Step>,
     /// Why a step kind can't run here, by kind: `unity_glb` without an accepted Blender.
     pub unavailable: std::collections::BTreeMap<String, String>,
+    /// The current build's kept files, by path relative to the library root: not from the
+    /// original, so a rebuild carries them but can't recreate them.
+    pub kept: Vec<String>,
 }
 
 pub async fn steps(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Option<PackSteps>> {
@@ -568,10 +652,19 @@ pub async fn steps(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Option<Pa
             options: serde_json::from_str(&options).unwrap_or(Value::Null),
         })
         .collect();
+    let kept = sqlx::query_scalar(
+        "SELECT o.path FROM import_outputs o JOIN import_packs p ON p.id = o.pack_id
+         AND o.build_id = p.current_build WHERE o.pack_id = ? AND o.origin = 'kept'
+         ORDER BY o.path",
+    )
+    .bind(pack_id)
+    .fetch_all(pool)
+    .await?;
     Ok(Some(PackSteps {
         recipe_rev,
         steps,
         unavailable: Default::default(),
+        kept,
     }))
 }
 
@@ -647,23 +740,85 @@ pub async fn set_steps(
     Ok(Ok(recipe_rev))
 }
 
-/// Queues a rebuild of pack `pack_id` at its current `recipe_rev`, owned by `owner`, unless a
-/// run for it is queued or running: one statement checks and inserts. Returns the run's id.
+/// The recipe edits a Rebuild's drift choices make (`drift::edits`): an `exclude` for each
+/// missing file left out, the enabled `exclude` of each one restored turned off, and the
+/// metadata step turned off or on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DriftEdits {
+    pub excludes: Vec<Vec<String>>,
+    pub includes: Vec<Vec<String>>,
+    pub metadata_off: bool,
+    pub metadata_on: bool,
+}
+
+impl DriftEdits {
+    /// The source paths (JSON arrays) of the enabled `exclude` steps once these edits are made,
+    /// given the ones enabled now: without those turned back, with those recorded.
+    pub fn excluded_after(
+        &self,
+        now: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        let back: std::collections::HashSet<String> =
+            self.includes.iter().map(|s| source_json(s)).collect();
+        now.iter()
+            .filter(|s| !back.contains(*s))
+            .cloned()
+            .chain(self.excludes.iter().map(|s| source_json(s)))
+            .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.excludes.is_empty()
+            && self.includes.is_empty()
+            && !self.metadata_off
+            && !self.metadata_on
+    }
+}
+
+/// Queues a rebuild of pack `pack_id`, owned by `owner`, with its drift choices `drift` (the
+/// JSON array `import_runs.drift` holds under the pack's id), unless a run for it is queued or
+/// running. In the same transaction it first makes the choices' recipe `edits`, bumping
+/// `recipe_rev`, and the run is queued at the `recipe_rev` they leave. `read_at` is the
+/// `recipe_rev` the steps were read at to work out `edits` (and the drift they answer): both
+/// writes check it, so steps edited since refuse the Rebuild (`Refused::Stale`) rather than
+/// take edits made for other steps. Returns the run's id.
+#[allow(clippy::too_many_arguments)]
 pub async fn queue_rebuild(
     pool: &Pool<Sqlite>,
     pack_id: &str,
     owner: &Owner,
     now: i64,
+    drift: &Value,
+    edits: &DriftEdits,
+    read_at: i64,
 ) -> sqlx::Result<Result<String, Refused>> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let mut tx = pool.begin().await?;
+    let mut at = read_at;
+    if !edits.is_empty() {
+        let bumped: Option<i64> = sqlx::query_scalar(&format!(
+            "UPDATE import_packs SET recipe_rev = recipe_rev + 1
+             WHERE id = ? AND recipe_rev = ? AND NOT {BUSY} RETURNING recipe_rev"
+        ))
+        .bind(pack_id)
+        .bind(read_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(bumped) = bumped else {
+            return Ok(Err(refusal(&mut tx, pack_id).await?));
+        };
+        record_drift_edits(&mut tx, pack_id, edits).await?;
+        at = bumped;
+    }
     let queued = sqlx::query(&format!(
-        "INSERT INTO import_runs (id, kind, packs, status, created_at, owner_machine, owner_boot,
-         owner_pid, owner_started, heartbeat_at)
+        "INSERT INTO import_runs (id, kind, packs, drift, status, created_at, owner_machine,
+         owner_boot, owner_pid, owner_started, heartbeat_at)
          SELECT ?, 'rebuild', json_array(json_object('packId', id, 'recipeRev', recipe_rev)),
-         'queued', ?, ?, ?, ?, ?, ? FROM import_packs WHERE id = ? AND NOT {BUSY}"
+         json_object(id, json(?)), 'queued', ?, ?, ?, ?, ?, ? FROM import_packs
+         WHERE id = ? AND recipe_rev = ? AND NOT {BUSY}"
     ))
     .bind(&run_id)
+    .bind(drift.to_string())
     .bind(now)
     .bind(&owner.machine)
     .bind(&owner.boot)
@@ -671,6 +826,7 @@ pub async fn queue_rebuild(
     .bind(owner.started as i64)
     .bind(now)
     .bind(pack_id)
+    .bind(at)
     .execute(&mut *tx)
     .await?;
     if queued.rows_affected() == 0 {
@@ -680,8 +836,124 @@ pub async fn queue_rebuild(
     Ok(Ok(run_id))
 }
 
-/// Writes `outputs` as build `build_id`'s manifest rows, extracted or generated, in 200-row
-/// transactions. They mean nothing until the build commits.
+/// Appends an `exclude` for each source of `edits` no enabled `exclude` names yet, but a `.meta`
+/// whose asset is excluded too (its asset's step drops it), and turns the metadata step off.
+async fn record_drift_edits(
+    tx: &mut SqliteConnection,
+    pack_id: &str,
+    edits: &DriftEdits,
+) -> sqlx::Result<()> {
+    let existing: Vec<String> = sqlx::query_scalar(
+        "SELECT json_extract(options, '$.source') FROM import_steps
+         WHERE pack_id = ? AND kind = 'exclude' AND enabled = 1",
+    )
+    .bind(pack_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut excluded: Vec<Vec<String>> = existing
+        .iter()
+        .filter_map(|s| serde_json::from_str(s).ok())
+        .collect();
+    // A `.meta` is covered by its asset's exclude as the steps will be: one this Rebuild turns
+    // back covers nothing.
+    let now = excluded.iter().map(|s| source_json(s)).collect();
+    let after = edits.excluded_after(&now);
+    let covered = |source: &Vec<String>| {
+        asset_of_meta(&source_json(source)).is_some_and(|asset| after.contains(&asset))
+    };
+    let new: Vec<Vec<String>> = edits
+        .excludes
+        .iter()
+        .filter(|source| !covered(source))
+        .cloned()
+        .collect();
+    let mut position: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(position) + 1, 0) FROM import_steps WHERE pack_id = ?",
+    )
+    .bind(pack_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    for source in new {
+        if excluded.contains(&source) {
+            continue;
+        }
+        let step = StepRecord::place(&PlaceStep::Exclude {
+            source: source.clone(),
+        });
+        sqlx::query(
+            "INSERT INTO import_steps (pack_id, position, kind, enabled, options)
+             VALUES (?, ?, ?, 1, ?)",
+        )
+        .bind(pack_id)
+        .bind(position)
+        .bind(&step.kind)
+        .bind(step.options.to_string())
+        .execute(&mut *tx)
+        .await?;
+        position += 1;
+        excluded.push(source);
+    }
+    for source in &edits.includes {
+        sqlx::query(
+            "UPDATE import_steps SET enabled = 0 WHERE pack_id = ? AND kind = 'exclude'
+             AND enabled = 1 AND json_extract(options, '$.source') = ?",
+        )
+        .bind(pack_id)
+        .bind(source_json(source))
+        .execute(&mut *tx)
+        .await?;
+    }
+    if edits.metadata_off || edits.metadata_on {
+        sqlx::query("UPDATE import_steps SET enabled = ? WHERE pack_id = ? AND kind = 'metadata'")
+            .bind(edits.metadata_on)
+            .bind(pack_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// The drift choices of pack `pack_id`'s latest rebuild that never committed (failed,
+/// cancelled or interrupted), queued since the pack's last build and with its steps still at
+/// the `recipe_rev` that run left: the recipe edits those choices made are still its own, and a
+/// Restore may turn them back. Empty when there is no such run.
+pub async fn uncommitted(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Value> {
+    let drift: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT json_extract(r.drift, '$.' || json_quote(p.id))
+         FROM import_runs r, json_each(r.packs) j, import_packs p
+         WHERE p.id = ? AND json_extract(j.value, '$.packId') = p.id AND r.kind = 'rebuild'
+         AND r.status IN ('failed', 'cancelled', 'interrupted')
+         AND json_extract(j.value, '$.recipeRev') = p.recipe_rev
+         AND r.created_at >= COALESCE(p.built_at, 0)
+         ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1",
+    )
+    .bind(pack_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(drift
+        .flatten()
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .unwrap_or_else(|| json!([])))
+}
+
+/// The drift choices run `run_id` was queued with for pack `pack_id`, as the JSON array
+/// `queue_rebuild` stored (empty for an import's first build).
+pub async fn run_drift(pool: &Pool<Sqlite>, run_id: &str, pack_id: &str) -> sqlx::Result<Value> {
+    let drift: Option<String> = sqlx::query_scalar(
+        "SELECT json_extract(drift, '$.' || json_quote(?)) FROM import_runs WHERE id = ?",
+    )
+    .bind(pack_id)
+    .bind(run_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(drift
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .unwrap_or_else(|| json!([])))
+}
+
+/// Writes `outputs` as build `build_id`'s manifest rows in 200-row transactions. They mean
+/// nothing until the build commits. A kept file without a source path, one added outside
+/// OpenDAM, is stored with a `NULL` source path, so it is never carried by a file key.
 pub async fn write_outputs(
     pool: &Pool<Sqlite>,
     pack_id: &str,
@@ -701,12 +973,8 @@ pub async fn write_outputs(
             .bind(output.size as i64)
             .bind(output.mtime_ns)
             .bind(&output.sha256)
-            .bind(if output.generated {
-                "generated"
-            } else {
-                "extracted"
-            })
-            .bind(source_json(&output.source_path))
+            .bind(output.origin.as_str())
+            .bind(output.stored_source())
             .execute(&mut *tx)
             .await?;
         }
@@ -829,5 +1097,51 @@ impl InsertJournal for InsertedRows {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(origin: Origin, source: &[&str]) -> Output {
+        Output {
+            path: "P/a".into(),
+            size: 1,
+            mtime_ns: 1,
+            sha256: String::new(),
+            source_path: source.iter().map(|s| s.to_string()).collect(),
+            origin,
+        }
+    }
+
+    #[test]
+    fn only_a_kept_file_of_its_own_has_no_stored_source_nor_file_key() {
+        assert_eq!(output(Origin::Kept, &[]).stored_source(), None);
+        assert_eq!(output(Origin::Kept, &[]).file_key(), None);
+        // The metadata step's datapackage.json comes from no entry, and still has its key.
+        assert_eq!(
+            output(Origin::Generated, &[]).file_key(),
+            Some(("[]".into(), true))
+        );
+        assert_eq!(
+            output(Origin::Kept, &["Assets/a.png"]).file_key(),
+            Some((r#"["Assets/a.png"]"#.into(), false)),
+            "a kept copy has the replaced file's key"
+        );
+    }
+
+    #[test]
+    fn a_meta_is_left_out_by_its_own_exclude_or_its_asset_s() {
+        let meta = source_json(&["Pack.unitypackage".into(), "Assets/a.png.meta".into()]);
+        let asset = source_json(&["Pack.unitypackage".into(), "Assets/a.png".into()]);
+        assert_eq!(asset_of_meta(&meta), Some(asset.clone()));
+        assert_eq!(asset_of_meta(&asset), None);
+        assert!(leaves_out(&[asset.clone()].into(), &meta));
+        assert!(leaves_out(&[meta.clone()].into(), &meta));
+        assert!(
+            !leaves_out(&[meta].into(), &asset),
+            "a .meta's exclude drops only it"
+        );
     }
 }

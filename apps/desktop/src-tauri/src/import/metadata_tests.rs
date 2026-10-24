@@ -68,7 +68,11 @@ mod tests {
         }
 
         async fn rebuild_done(&self, pack_id: &str) {
-            let run = self.engine.rebuild_pack("lib", pack_id).await.unwrap();
+            let run = self
+                .engine
+                .rebuild_pack("lib", pack_id, Vec::new())
+                .await
+                .unwrap();
             self.wait_for(&run.id, "done").await;
         }
 
@@ -434,7 +438,11 @@ mod tests {
             .set_pack_steps("lib", &pack_id, steps, None)
             .await
             .unwrap();
-        let run = s.engine.rebuild_pack("lib", &pack_id).await.unwrap();
+        let run = s
+            .engine
+            .rebuild_pack("lib", &pack_id, Vec::new())
+            .await
+            .unwrap();
         let run = s.wait_for(&run.id, "failed").await;
         assert_eq!(
             run.error.as_deref(),

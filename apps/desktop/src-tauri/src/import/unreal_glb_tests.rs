@@ -245,7 +245,11 @@ echo "$left" > "$GLTF_OUT/.gltf-remaining""#
 
         // A rebuild resumes: its one session finds the cached GLBs and exports only SM_C.
         std::fs::remove_file(root.join("stall")).unwrap();
-        let run = s.engine.rebuild_pack("lib", &pack_id).await.unwrap();
+        let run = s
+            .engine
+            .rebuild_pack("lib", &pack_id, Vec::new())
+            .await
+            .unwrap();
         s.wait_for(&run.id, "done").await;
         assert_eq!(sessions(&root).len(), 4);
         let built = [
@@ -296,7 +300,11 @@ echo "$left" > "$GLTF_OUT/.gltf-remaining""#
         s.no_work_folder();
 
         // Once an export finished, a rebuild unzips nothing and runs no editor.
-        let run = s.engine.rebuild_pack("lib", &pack_id).await.unwrap();
+        let run = s
+            .engine
+            .rebuild_pack("lib", &pack_id, Vec::new())
+            .await
+            .unwrap();
         s.wait_for(&run.id, "done").await;
         assert_eq!(sessions(&root).len(), 4);
         assert_eq!(on_disk(&s.pack_dir()), built);
@@ -310,7 +318,11 @@ echo "$left" > "$GLTF_OUT/.gltf-remaining""#
             .unwrap();
         std::fs::remove_file(evicted.path()).unwrap();
         assert_eq!(s.cached_glbs(), 2);
-        let run = s.engine.rebuild_pack("lib", &pack_id).await.unwrap();
+        let run = s
+            .engine
+            .rebuild_pack("lib", &pack_id, Vec::new())
+            .await
+            .unwrap();
         s.wait_for(&run.id, "done").await;
         assert_eq!(sessions(&root).len(), 5);
         assert_eq!(on_disk(&s.pack_dir()), built);
@@ -352,7 +364,7 @@ echo "$left" > "$GLTF_OUT/.gltf-remaining""#
         std::fs::remove_file(root.join("stall")).unwrap();
         let run = s
             .engine
-            .rebuild_pack("lib", &run.packs[0].pack_id)
+            .rebuild_pack("lib", &run.packs[0].pack_id, Vec::new())
             .await
             .unwrap();
         s.wait_for(&run.id, "done").await;

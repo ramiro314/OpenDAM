@@ -18,6 +18,7 @@ import {
 import { IconInbox, IconX } from '../Icons';
 import { OriginalStatus } from './OriginalStatus';
 import { Preparation } from './Preparation';
+import { driftOpen } from '../../store/preparation';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './Imports.module.css';
 
@@ -150,7 +151,9 @@ export function ImportsPanel() {
     // Opening the view checks every original, rehashing only one whose size or mtime changed
     void useImportStore.getState().check(useLibraryStore.getState().libraries.map((l) => l.id));
     const onKeyDown = (e: KeyboardEvent) => {
-      if (escapeClosesPanel(e, useImportStore.getState().dialog !== null)) setPanelOpen(false);
+      // The Import pack and drift dialogs over the view take Escape themselves
+      const over = useImportStore.getState().dialog !== null || driftOpen();
+      if (escapeClosesPanel(e, over)) setPanelOpen(false);
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);

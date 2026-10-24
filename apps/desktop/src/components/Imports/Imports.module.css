@@ -420,6 +420,43 @@
   flex-wrap: wrap;
 }
 
+.kept {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* The drift dialog, before a Rebuild: each outside change with its choices */
+
+.drift {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-height: 420px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.driftItem {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.driftChoices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px var(--space-3);
+}
+
 .original {
   display: flex;
   flex-direction: column;

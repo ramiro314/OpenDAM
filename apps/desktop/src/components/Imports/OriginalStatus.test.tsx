@@ -128,6 +128,7 @@ describe("Preparation's Rebuild", () => {
       recipeRev: 0,
       steps: [{ kind: 'extract_unitypackage', enabled: true, options: {} }],
       unavailable: {},
+      kept: [],
     });
     for (const [state, reason] of [
       ['missing', MISSING],

@@ -137,7 +137,10 @@ mod tests {
             "the Imports view and the Preparation panel refetch"
         );
         assert_eq!(
-            s.engine.rebuild_pack("lib", &pack).await.unwrap_err(),
+            s.engine
+                .rebuild_pack("lib", &pack, Vec::new())
+                .await
+                .unwrap_err(),
             MISSING
         );
         // The pack keeps working: its files and rows are where the build put them.
@@ -183,7 +186,10 @@ mod tests {
             (at.clone(), "changed".into(), Some(after.clone()))
         );
         assert_eq!(
-            s.engine.rebuild_pack("lib", &pack).await.unwrap_err(),
+            s.engine
+                .rebuild_pack("lib", &pack, Vec::new())
+                .await
+                .unwrap_err(),
             CHANGED
         );
 
@@ -387,7 +393,10 @@ mod tests {
         let moved = original.path.with_extension("moved");
         std::fs::rename(&original.path, &moved).unwrap();
         assert_eq!(
-            s.engine.rebuild_pack("lib", &pack).await.unwrap_err(),
+            s.engine
+                .rebuild_pack("lib", &pack, Vec::new())
+                .await
+                .unwrap_err(),
             MISSING
         );
         assert_eq!(
@@ -414,14 +423,14 @@ mod tests {
         let held = s.engine.checking.lock(&first.path.to_string_lossy()).await;
         let other_rebuild = tokio::time::timeout(
             Duration::from_secs(10),
-            s.engine.rebuild_pack("lib", &other_pack),
+            s.engine.rebuild_pack("lib", &other_pack, Vec::new()),
         )
         .await
         .expect("a rebuild of another original's pack doesn't wait for that check");
         s.wait_for(&other_rebuild.unwrap().id, "done").await;
         let first_rebuild = tokio::time::timeout(
             Duration::from_millis(300),
-            s.engine.rebuild_pack("lib", &first_pack),
+            s.engine.rebuild_pack("lib", &first_pack, Vec::new()),
         )
         .await;
         assert!(
@@ -429,7 +438,11 @@ mod tests {
             "the original's own rebuild waits for its check"
         );
         drop(held);
-        let run = s.engine.rebuild_pack("lib", &first_pack).await.unwrap();
+        let run = s
+            .engine
+            .rebuild_pack("lib", &first_pack, Vec::new())
+            .await
+            .unwrap();
         s.wait_for(&run.id, "done").await;
     }
 

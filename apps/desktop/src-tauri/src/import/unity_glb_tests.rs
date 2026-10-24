@@ -15,6 +15,7 @@ mod tests {
     use std::sync::{Arc, LazyLock, Mutex};
 
     use crate::export::blender::test_blender;
+    use crate::import::drift;
     use crate::import::engine::tests::{setup, Setup, TARGET};
     use crate::import::engine::*;
     use crate::import::unitypackage::tests::fixture;
@@ -69,7 +70,11 @@ mod tests {
         }
 
         async fn rebuilt(&self, pack_id: &str) {
-            let run = self.engine.rebuild_pack("lib", pack_id).await.unwrap();
+            let run = self
+                .engine
+                .rebuild_pack("lib", pack_id, Vec::new())
+                .await
+                .unwrap();
             self.wait_for(&run.id, "done").await;
         }
 
@@ -285,6 +290,135 @@ mod tests {
         s.no_work_left();
     }
 
+    impl Setup {
+        /// The golden pack flattened and converted, with Blender logged. `None` without one.
+        async fn converted(&self) -> Option<(String, PathBuf)> {
+            let log = self.logged_blender().await?;
+            let run = self
+                .engine
+                .start_import(self.request(vec![PlaceStep::Flatten]))
+                .await
+                .unwrap();
+            self.wait_for(&run.id, "done").await;
+            assert_eq!(runs(&log), 1);
+            Some((run.packs[0].pack_id.clone(), log))
+        }
+
+        /// The pack's outside changes, as `(path in the pack, change, kind, choices)`.
+        async fn differences(
+            &self,
+            pack_id: &str,
+        ) -> Vec<(String, drift::Change, drift::Kind, Vec<drift::Choice>)> {
+            let found = self.engine.check_drift("lib", pack_id).await.unwrap();
+            found
+                .into_iter()
+                .map(|d| {
+                    let rel = d.path.strip_prefix(&format!("{TARGET}/")).unwrap();
+                    (rel.to_string(), d.change, d.kind, d.choices)
+                })
+                .collect()
+        }
+
+        /// Rebuilds with each outside change answered by its default, the first choice.
+        async fn rebuilt_choosing_defaults(&self, pack_id: &str) {
+            let found = self.engine.check_drift("lib", pack_id).await.unwrap();
+            let chosen = found
+                .iter()
+                .map(|d| drift::Chosen {
+                    path: d.path.clone(),
+                    change: d.change,
+                    sha256: d.sha256.clone(),
+                    choice: d.choices[0],
+                })
+                .collect();
+            let run = self
+                .engine
+                .rebuild_pack("lib", pack_id, chosen)
+                .await
+                .unwrap();
+            self.wait_for(&run.id, "done").await;
+        }
+    }
+
+    /// A6: a missing `SM_Log.glb` offers only restore, and the rebuild writes it again from the
+    /// cache; a changed one offers only use the recipe's, and the rebuild puts the recipe's back.
+    #[tokio::test]
+    async fn a_missing_or_changed_glb_offers_only_the_recipe_s() {
+        let s = setup().await;
+        let Some((pack_id, log)) = s.converted().await else {
+            return;
+        };
+        let glb = s.live().join("Art/Models/SM_Log.glb");
+        let bytes = sha(&glb);
+
+        std::fs::remove_file(&glb).unwrap();
+        assert_eq!(
+            s.differences(&pack_id).await,
+            [(
+                "Art/Models/SM_Log.glb".into(),
+                drift::Change::Missing,
+                drift::Kind::Generated,
+                vec![drift::Choice::Restore]
+            )]
+        );
+        s.rebuilt_choosing_defaults(&pack_id).await;
+        assert_eq!(sha(&glb), bytes, "written again");
+        assert_eq!(runs(&log), 1, "from the cache");
+
+        std::fs::write(&glb, b"not a glb").unwrap();
+        assert_eq!(
+            s.differences(&pack_id).await,
+            [(
+                "Art/Models/SM_Log.glb".into(),
+                drift::Change::Changed,
+                drift::Kind::Generated,
+                vec![drift::Choice::Recipe]
+            )]
+        );
+        s.rebuilt_choosing_defaults(&pack_id).await;
+        assert_eq!(sha(&glb), bytes, "the recipe's");
+        assert!(s
+            .engine
+            .check_drift("lib", &pack_id)
+            .await
+            .unwrap()
+            .is_empty());
+        s.no_work_left();
+    }
+
+    /// A8: keeping a changed copy of the PNG (keep yours) runs Blender again, and the new GLB
+    /// carries the changed texture.
+    #[tokio::test]
+    async fn keeping_a_changed_png_reconverts_and_the_glb_carries_it() {
+        let s = setup().await;
+        let Some((pack_id, log)) = s.converted().await else {
+            return;
+        };
+        let red = [200, 30, 30];
+        std::fs::write(s.live().join("Art/Textures/T_Log_D.png"), png(red)).unwrap();
+        assert_eq!(
+            s.differences(&pack_id).await,
+            [(
+                "Art/Textures/T_Log_D.png".into(),
+                drift::Change::Changed,
+                drift::Kind::Extracted,
+                vec![drift::Choice::Keep, drift::Choice::Recipe]
+            )]
+        );
+        s.rebuilt_choosing_defaults(&pack_id).await;
+        assert_eq!(runs(&log), 2, "a kept, changed texture reconverts");
+        let colors = base_colors(&s.live().join("Art/Models/SM_Log.glb"));
+        assert!(
+            colors.len() == 1 && near(colors[0], red),
+            "the GLB carries the kept PNG: {colors:?}"
+        );
+        assert_eq!(
+            s.engine.pack_steps("lib", &pack_id).await.unwrap().kept,
+            [format!("{TARGET}/Art/Textures/T_Log_D.png")]
+        );
+        s.no_work_left();
+    }
+
     fn step(place: &PlaceStep) -> Step {
         let record = crate::import::records::StepRecord::place(place);
         Step {
@@ -344,7 +478,11 @@ mod tests {
                 })
             })
             .await;
-            let run = self.engine.rebuild_pack("lib", &pack_id).await.unwrap();
+            let run = self
+                .engine
+                .rebuild_pack("lib", &pack_id, Vec::new())
+                .await
+                .unwrap();
             let run = self.wait_for(&run.id, status).await;
             (pack_id, run)
         }
@@ -897,7 +1035,11 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
             }
         })
         .await;
-        let run = s.engine.rebuild_pack("lib", &pack_id).await.unwrap();
+        let run = s
+            .engine
+            .rebuild_pack("lib", &pack_id, Vec::new())
+            .await
+            .unwrap();
         let failed = s.wait_for(&run.id, "failed").await;
         assert_eq!(failed.error.as_deref(), Some(why));
         s.no_leftovers();
