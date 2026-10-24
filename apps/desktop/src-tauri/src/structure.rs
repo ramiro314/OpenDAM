@@ -2154,6 +2154,11 @@ pub async fn rebuild(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<usize> {
 /// pending while it runs stays pending for the release that follows, and sets it again when it
 /// fails, so a failed pass is still owed.
 pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassRun> {
+    #[cfg(test)]
+    PASSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(root.to_path_buf());
     sqlx::query("DELETE FROM library_meta WHERE key = ?")
         .bind(PENDING_KEY)
         .execute(pool)
@@ -2172,6 +2177,17 @@ pub(crate) async fn pass(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<PassR
         }
     }
     run
+}
+
+/// The library root of every pass this process ran, for tests that check when passes run.
+#[cfg(test)]
+static PASSES: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// How many passes this process ran over the library at `root`.
+#[cfg(test)]
+pub(crate) fn passes_over(root: &Path) -> usize {
+    let passes = PASSES.lock().unwrap_or_else(|e| e.into_inner());
+    passes.iter().filter(|r| *r == root).count()
 }
 
 /// `pass` once the flag is cleared.
@@ -2479,7 +2495,7 @@ async fn locked_pass(
     pass: bool,
 ) -> bool {
     let (pool, root) = (&library.pool, library.root_path.as_path());
-    crate::import::recover_swaps(pool, root, crate::import::Recovery::Entry).await;
+    crate::import::recover_swaps(pool, root, crate::import::Recovery::Entry, &advisory).await;
     let ran = !pass || log_failure(library, rebuild(pool, root).await);
     advisory.release(pool, root).await;
     ran

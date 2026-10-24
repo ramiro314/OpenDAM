@@ -82,8 +82,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               Fab, Kenney, none) and the Kenney store page lookup, build, a pack's build, first or later (stage beside the target,
                               lock, re-check, journal, swap, carry, index with Prune::Defer,
                               commit current_build, settle, or roll back), with test hooks to
-                              pause or fail it, carry, which moves rows to their files' new paths
-                              and back, and engine, the durable run queue (one run at a time,
+                              pause, fail or crash it, carry, which moves rows to their files' new
+                              paths and back, recovery, which finishes or undoes a swap a crash or
+                              a dropped task left (recover_swaps), and engine, the durable run
+                              queue (one run at a time,
                               owner and heartbeat, import:progress and import:updated, Cancel
                               before the lock), behind commands/import.rs
     src/fs_swap.rs            Staging a folder beside the one it replaces and swapping it in by
@@ -129,8 +131,7 @@ docs/plans                    Plans for this fork
   it a run finishes. Step edits (`records::set_steps`, which bumps `recipe_rev`) and Rebuild are
   refused while a run for the pack is queued or running. A staged file the previous build had,
   by file key, size and sha256, gets that build's mtime, so the index sees it unchanged, moved or
-  not, and queues no preview. Swap recovery at library open and in-app edits recording steps
-  come with the plan's later tickets: until then a pack left `swapping` by a crash stays so.
+  not, and queues no preview. In-app edits recording steps come with the plan's later tickets.
 - **Rows follow their files.** A rebuild carries each moved file's asset row to the file's new
   path (`import::carry`), matched by its file key (`source_path` and whether it is generated),
   keeping its id, metadata and `modified_at`. It runs in two passes, so the order of the moves
@@ -153,6 +154,23 @@ docs/plans                    Plans for this fork
   structure pass). Then `swap_state` and the failed build's records (`import_outputs` and
   `import_moves`) go in one transaction, and only then is `.failed-*` deleted. A rollback step
   that fails leaves the journal set, for recovery.
+- **No pruning index reaches a pack mid-swap.** A build holds both the library's `index_lock` and
+  its advisory lock from its lock step to the end of its settle or rollback, and sets and clears
+  `swap_state` only inside that window, so a caller holding both locks that finds a pack
+  `swapping` knows its build is gone, on any machine. `import::recover_swaps` then puts the pack
+  back by what is on disk (the plan's first table): it deletes an uncommitted staging folder,
+  renames `.prev-<build id>` back, or finishes the rollback, and never rolls a build forward. It
+  runs, holding both locks, when a library opens (`db::open_library_db`, before the library is
+  registered and before its structure pass) and at the start of `watcher::index_paths` and
+  `structure::rebuild_library`, and a caller that can't take both skips it. Only a library open
+  also clears the leftovers of packs whose `swap_state` is `NULL` (a staging folder and its rows,
+  a `.failed-*` folder, and a `.prev-*` one, which it settles), skipping every pack with a live
+  run, judged by its owner and heartbeat (`engine::owner_gone`), not by its status alone, so no
+  refresh or startup deletes a live build's staging folder. Recovery indexes only a pack folder
+  that exists, never prunes after a rollback with no previous folder (`swap_prev` false), and
+  changes nothing on disk for a state no step leaves: it marks the pack `failed` and leaves
+  `swap_state` set, which refuses its runs and step edits. A `removing` pack is left as found
+  until Remove import is built.
 - **`DELETE` journaling on library DBs.** Library DBs use rollback journaling because WAL's `-shm`
   locking is unreliable on network shares. Keep `SqliteJournalMode::Delete` in `db.rs`.
 - **Batched writes.** Database writes go in transactions of about 200 rows, as `watcher.rs` does.

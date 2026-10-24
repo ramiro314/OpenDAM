@@ -440,7 +440,7 @@ pub async fn open_library_db(
         crate::structure::mark_pending(&pool).await;
         return Ok(pool);
     };
-    crate::import::recover_swaps(&pool, root, crate::import::Recovery::Open).await;
+    crate::import::recover_swaps(&pool, root, crate::import::Recovery::Open, &advisory).await;
     if let Err(e) = crate::structure::rebuild(&pool, root).await {
         tracing::warn!("Could not derive the folder tree of {db_path:?}: {e}");
     }

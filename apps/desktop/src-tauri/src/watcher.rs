@@ -83,6 +83,15 @@ impl LockEnv {
     }
 }
 
+/// A lock token naming the process `pid` started at `started` on this machine, as its holder
+/// writes it, or `None` when this machine's id is unknown.
+#[cfg(test)]
+pub(crate) fn token_naming(pid: u32, started: u64) -> Option<String> {
+    let env = LockEnv::system();
+    let machine = env.machine?;
+    Some(format!("{machine} {pid} {started} {}", Uuid::new_v4()))
+}
+
 /// A process as an import run records its owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessIdentity {
@@ -529,7 +538,7 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
     };
 
     let (pool, root) = (&library.pool, library.root_path.as_path());
-    crate::import::recover_swaps(pool, root, crate::import::Recovery::Entry).await;
+    crate::import::recover_swaps(pool, root, crate::import::Recovery::Entry, &lock).await;
     let run = index_paths_locked(db, library_id, paths, Prune::Now, &index_guard, &lock).await;
     lock.release(pool, root).await;
     run

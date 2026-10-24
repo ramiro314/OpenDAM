@@ -42,9 +42,9 @@ pub const FINISHING: &str = "Finishing, can't cancel now";
 const CHANGED: &str = "The pack changed during the build; Rebuild again";
 
 /// `fs_swap` tags of the folders beside the pack.
-const STAGING: &str = "import";
-const PREV: &str = "prev";
-const FAILED: &str = "failed";
+pub(super) const STAGING: &str = "import";
+pub(super) const PREV: &str = "prev";
+pub(super) const FAILED: &str = "failed";
 
 /// Whether a run was cancelled, and whether its build passed the point where Cancel stops
 /// working (step 1). One mutex for both, so a Cancel never lands after that point unnoticed.
@@ -76,15 +76,34 @@ impl RunControl {
     }
 }
 
-/// Where a test can pause a build or make it fail.
+/// Where a test can pause a build, make it fail or crash it (a panic, which leaves the disk and
+/// the records as a killed process would).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Point {
     /// Staged, its manifest rows written, before step 1.
     Staged,
-    /// Step 5, after the index.
-    Indexed,
+    /// Step 3's journal written, before step 4.
+    Journaled,
+    /// Step 4's rename of the live folder aside (failure only).
+    MoveAside,
+    /// Step 4, between its renames (crash only).
+    Aside,
     /// Step 4's rename of the staging folder to the live name (failure only).
     MoveIn,
+    /// Step 4 failed with nothing of the build in place, before its journal is cleared.
+    Unjournal,
+    /// Step 5's carry, between its aside and place passes.
+    CarryAside,
+    /// Step 5, after the index.
+    Indexed,
+    /// Step 6 committed, before step 7.
+    Committed,
+    /// A rollback, between its renames (crash only).
+    RollbackAside,
+    /// A rollback, after its renames (crash only).
+    RollbackRenamed,
+    /// A rollback, after its step 4 transaction and before it deletes `.failed-<build id>`.
+    RollbackCleared,
     /// The engine's claim of a queued run, before its `UPDATE`.
     Claim,
     /// A failed claim, after the engine cleared the active run and before it checks for Cancel.
@@ -110,6 +129,8 @@ enum Hook {
     Fail,
     /// Fails the first time only.
     FailOnce,
+    /// Panics the first time only, as a killed process stops: nothing after it runs.
+    Crash,
 }
 
 /// A paused build: it notifies `reached` and waits for `release`.
@@ -165,6 +186,11 @@ impl Hooks {
     }
 
     #[cfg(test)]
+    pub fn crash(&self, point: Point) {
+        self.points.lock().unwrap().push((point, Hook::Crash));
+    }
+
+    #[cfg(test)]
     fn hooks(&self, point: Point) -> Vec<Hook> {
         let points = self.points.lock().unwrap();
         points
@@ -195,8 +221,24 @@ impl Hooks {
         false
     }
 
-    /// Pauses at `point` if a test asked to, then fails if it asked to.
-    pub(crate) async fn at(&self, point: Point) -> Result<(), String> {
+    /// Panics at `point` if a test asked to, once, so the test's next build runs through.
+    pub(crate) fn crashes(&self, _point: Point) {
+        #[cfg(test)]
+        {
+            let mut points = self.points.lock().unwrap();
+            let crash = points
+                .iter()
+                .position(|(p, h)| *p == _point && matches!(h, Hook::Crash));
+            if let Some(crash) = crash {
+                points.remove(crash);
+                drop(points);
+                panic!("injected crash at {_point:?}");
+            }
+        }
+    }
+
+    /// Pauses at `point` if a test asked to, then panics if it asked to.
+    pub(crate) async fn stop(&self, point: Point) {
         #[cfg(test)]
         for hook in self.hooks(point) {
             if let Hook::Pause(pause) = hook {
@@ -204,6 +246,12 @@ impl Hooks {
                 pause.release.notified().await;
             }
         }
+        self.crashes(point);
+    }
+
+    /// Pauses at `point` if a test asked to, then panics or fails if it asked to.
+    pub(crate) async fn at(&self, point: Point) -> Result<(), String> {
+        self.stop(point).await;
         if self.fails(point) {
             return Err(format!("injected failure at {point:?}"));
         }
@@ -503,6 +551,7 @@ async fn swap_in(
     if !matches!(&journaled, Ok(done) if done.rows_affected() == 1) {
         return Err(cleanup.run(CHANGED.to_string().into()).await);
     }
+    env.hooks.stop(Point::Journaled).await;
 
     // ── 4. Swap ─────────────────────────────────────────────────────────
     (env.progress)(Progress {
@@ -517,7 +566,12 @@ async fn swap_in(
         prev.as_deref(),
         fs_swap::Old::Keep,
         |a, b| {
-            if a == staging && b == live && env.hooks.fails(Point::MoveIn) {
+            if a == staging && b == live {
+                env.hooks.crashes(Point::Aside);
+                if env.hooks.fails(Point::MoveIn) {
+                    return Err(std::io::Error::other("injected failure"));
+                }
+            } else if a == live && env.hooks.fails(Point::MoveAside) {
                 return Err(std::io::Error::other("injected failure"));
             }
             std::fs::rename(a, b)
@@ -540,6 +594,7 @@ async fn swap_in(
                 "Could not move the built pack to {}: {error}",
                 live.display()
             );
+            env.hooks.stop(Point::Unjournal).await;
             if let Err(e) = unjournal(pool, pack_id, build_id).await {
                 return Err(Stop::Failed(format!(
                     "{failed}. Clearing its journal failed: {e}"
@@ -558,9 +613,16 @@ async fn swap_in(
     let pack_path = [live.to_string_lossy().into_owned()];
     let committed = async {
         if let Some(prev_build) = &recipe.current_build {
-            carry::carry(pool, pack_id, &recipe.target, prev_build, build_id)
-                .await
-                .map_err(|e| format!("Carrying the moved files' rows failed: {e}"))?;
+            carry::carry(
+                pool,
+                pack_id,
+                &recipe.target,
+                prev_build,
+                build_id,
+                env.hooks,
+            )
+            .await
+            .map_err(|e| format!("Carrying the moved files' rows failed: {e}"))?;
         }
         let journal = InsertedRows::after(pool, pack_id, build_id)
             .await
@@ -599,6 +661,7 @@ async fn swap_in(
         };
         return Err(rollback(env, index_guard, advisory, pack_id, &swap, error).await);
     }
+    env.hooks.stop(Point::Committed).await;
 
     // ── 7. Settle ───────────────────────────────────────────────────────
     (env.progress)(Progress {
@@ -1108,7 +1171,11 @@ fn staged_sizes(folder: &Path) -> std::io::Result<Vec<(String, i64)>> {
 }
 
 /// Clears a swap's journal and the build's rows, when nothing of the build is in place.
-async fn unjournal(pool: &Pool<Sqlite>, pack_id: &str, build_id: &str) -> sqlx::Result<()> {
+pub(super) async fn unjournal(
+    pool: &Pool<Sqlite>,
+    pack_id: &str,
+    build_id: &str,
+) -> sqlx::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE import_packs SET swap_state = NULL, swap_build = NULL, swap_prev = NULL
@@ -1153,11 +1220,13 @@ async fn rollback(
     if let Err(e) = std::fs::rename(swap.live, &failed) {
         return unfinished(format!("moving the pack aside: {e}"));
     }
+    env.hooks.crashes(Point::RollbackAside);
     if let Some(prev) = swap.prev {
         if let Err(e) = std::fs::rename(prev, swap.live) {
             return unfinished(format!("moving the previous folder back: {e}"));
         }
     }
+    env.hooks.crashes(Point::RollbackRenamed);
 
     // 3. The rows the build's index inserted, which frees their paths, then the carried rows
     //    back by asset id, then the structure of what is on disk now.
@@ -1198,6 +1267,7 @@ async fn rollback(
     if let Err(e) = unjournal(pool, pack_id, swap.build_id).await {
         return unfinished(format!("clearing its journal: {e}"));
     }
+    env.hooks.stop(Point::RollbackCleared).await;
     fs_swap::discard(&failed);
     remove_created(swap.created);
     Stop::Failed(error)

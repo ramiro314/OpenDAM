@@ -4,7 +4,7 @@
 //! The tests sit in a `mod tests` block, as in every other file, so source scans that stop there
 //! (`structure::tests::metadata_writers`) read none of them.
 
-mod tests {
+pub(super) mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
     use std::time::{Duration, UNIX_EPOCH};
@@ -35,16 +35,16 @@ mod tests {
         built(files)
     }
 
-    fn in_pack(path: &str) -> String {
+    pub(crate) fn in_pack(path: &str) -> String {
         format!("{TARGET}/{path}")
     }
 
     /// A row's id, path and tags, as a rebuild must keep them.
-    type Rows = BTreeMap<String, (String, Vec<String>)>;
+    pub(crate) type Rows = BTreeMap<String, (String, Vec<String>)>;
 
     impl Setup {
         /// Imports the golden pack (flatten, hoist Art) and returns its id.
-        async fn import_golden(&self) -> String {
+        pub(crate) async fn import_golden(&self) -> String {
             let run = self
                 .engine
                 .start_import(self.golden_request())
@@ -55,7 +55,11 @@ mod tests {
         }
 
         /// Edits the pack's steps through `edit` and returns the new `recipe_rev`.
-        async fn edit_steps(&self, pack_id: &str, edit: impl FnOnce(&mut Vec<Step>)) -> i64 {
+        pub(crate) async fn edit_steps(
+            &self,
+            pack_id: &str,
+            edit: impl FnOnce(&mut Vec<Step>),
+        ) -> i64 {
             let mut steps = self.engine.pack_steps("lib", pack_id).await.unwrap().steps;
             edit(&mut steps);
             self.engine
@@ -64,22 +68,22 @@ mod tests {
                 .unwrap()
         }
 
-        async fn rebuild(&self, pack_id: &str) -> RunSummary {
+        pub(crate) async fn rebuild(&self, pack_id: &str) -> RunSummary {
             self.engine.rebuild_pack("lib", pack_id).await.unwrap()
         }
 
-        async fn rebuild_until(&self, pack_id: &str, status: &str) -> RunSummary {
+        pub(crate) async fn rebuild_until(&self, pack_id: &str, status: &str) -> RunSummary {
             let run = self.rebuild(pack_id).await;
             self.wait_for(&run.id, status).await
         }
 
         /// The asset id at `path` in the pack.
-        async fn id_at(&self, path: &str) -> String {
+        pub(crate) async fn id_at(&self, path: &str) -> String {
             self.id_of(&in_pack(path)).await
         }
 
         /// The asset id at `path` in the library.
-        async fn id_of(&self, path: &str) -> String {
+        pub(crate) async fn id_of(&self, path: &str) -> String {
             sqlx::query_scalar("SELECT id FROM assets WHERE file_path = ?")
                 .bind(path)
                 .fetch_one(&self.lib.pool)
@@ -88,12 +92,12 @@ mod tests {
         }
 
         /// Tags the row at `path` in the pack with a tag of its own, named `name`, and returns its id.
-        async fn tag(&self, path: &str, name: &str) -> String {
+        pub(crate) async fn tag(&self, path: &str, name: &str) -> String {
             self.tag_path(&in_pack(path), name).await
         }
 
         /// `tag`, for `path` in the library.
-        async fn tag_path(&self, path: &str, name: &str) -> String {
+        pub(crate) async fn tag_path(&self, path: &str, name: &str) -> String {
             let id = self.id_of(path).await;
             for sql in [
                 "INSERT OR IGNORE INTO tags (id, name) VALUES (?1, ?1)",
@@ -110,7 +114,7 @@ mod tests {
         }
 
         /// Every row of the library by id: its path and its tags.
-        async fn rows(&self) -> Rows {
+        pub(crate) async fn rows(&self) -> Rows {
             let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
                 "SELECT a.id, a.file_path, group_concat(t.tag_id) FROM assets a
                  LEFT JOIN (SELECT * FROM asset_tags ORDER BY tag_id) t ON t.asset_id = a.id
@@ -129,7 +133,7 @@ mod tests {
         }
 
         /// The current build's file at `path` in the pack: its source path.
-        async fn source_of(&self, path: &str) -> Vec<String> {
+        pub(crate) async fn source_of(&self, path: &str) -> Vec<String> {
             let source: String = sqlx::query_scalar(
                 "SELECT o.source_path FROM import_outputs o JOIN import_packs p ON p.id = o.pack_id
                  AND o.build_id = p.current_build WHERE o.path = ?",
@@ -155,7 +159,7 @@ mod tests {
 
         /// The rows the pack's builds left nothing of: no journal, no other build's manifest rows,
         /// no row at a holding path, no folder beside the pack, and the pack not swapping.
-        async fn settled(&self) {
+        pub(crate) async fn settled(&self) {
             assert_eq!(self.count("SELECT COUNT(*) FROM import_moves").await, 0);
             assert_eq!(
                 self.count(
@@ -178,12 +182,12 @@ mod tests {
             self.no_leftovers();
         }
 
-        async fn current_build(&self) -> Option<String> {
+        pub(crate) async fn current_build(&self) -> Option<String> {
             self.pack().await.1
         }
 
         /// `Other/Tree.png` keeps its id and tag.
-        async fn tree_untouched(&self) {
+        pub(crate) async fn tree_untouched(&self) {
             let rows = self.rows().await;
             assert_eq!(
                 rows.get("tree"),
@@ -193,14 +197,14 @@ mod tests {
     }
 
     /// Waits for a build to reach `pause`, failing the test rather than hanging when it never does.
-    async fn reached(pause: &build::Pause) {
+    pub(crate) async fn reached(pause: &build::Pause) {
         tokio::time::timeout(Duration::from_secs(30), pause.reached.notified())
             .await
             .expect("the build never reached its pause point");
     }
 
     /// Turns the step of `kind` on or off.
-    fn toggle(steps: &mut [Step], kind: &str, enabled: bool) {
+    pub(crate) fn toggle(steps: &mut [Step], kind: &str, enabled: bool) {
         steps
             .iter_mut()
             .find(|s| s.kind == kind)
@@ -209,7 +213,7 @@ mod tests {
     }
 
     /// Inserts place `step` before the metadata step.
-    fn add(steps: &mut Vec<Step>, step: PlaceStep) {
+    pub(crate) fn add(steps: &mut Vec<Step>, step: PlaceStep) {
         let mut options = serde_json::to_value(&step).unwrap();
         let kind = options
             .as_object_mut()
