@@ -350,6 +350,12 @@ plan as written:
     `Saved/` or elsewhere. Two docs landing at one path are refused.
   - **Free space.** There is no check before the unzip: one that runs out of space fails the
     step with the system's "No space left on device".
+  - **The project's own code.** The editor opens the project as you, with its Python plugin on.
+    So besides a root `Source/`, a project that ships compiled code is refused: any file below a
+    `Binaries/` folder, or below a plugin's `Source/`. Before the editor starts, the work copy
+    loses every `Python/` folder directly below a `Content/` folder (an `init_unreal.py` runs
+    at startup) and the `StartupScripts` entries of its `.ini` files. What stays trusted is
+    the editor reading the project's assets.
   - **The fixtures.** `unreal.zip` holds `Feif/Feif.uproject` (named unlike the zip) with three
     meshes, a texture, a level and docs, so the batches and the hoist can be tested;
     `unreal-source.zip` adds `Source/`.
@@ -1542,9 +1548,8 @@ files go with their tags, ratings and collections, as on any delete (D27).
   import through OpenDAM stays visible.
 - **The Unreal preview is an estimate.** It counts every `.uasset` as a possible GLB.
 - **Unreal sessions have limits.** A session has no timeout: an editor that hangs holds the run
-  until you cancel it. Only a `Source/` folder at the project's root is refused, not one in a
-  plugin (`Plugins/*/Source/`), which the editor would then fail to build. A work folder left
-  by a crash is never swept, as for Unity (R48, R49).
+  until you cancel it. The editor still reads a downloaded project's assets as you, a trust no
+  refusal removes (R50). A work folder left by a crash is never swept, as for Unity (R48, R49).
 - **Some textures are dropped.** `.exr`, `.hdr` and `.gif` textures aren't copied into the work
   copy, so a `.mat` naming one by GUID gets none, where `unity_gltf.py` loaded it (R45).
 - **Unity GLB leftovers.** A work folder left by a crash is never swept, the GLB cache is never

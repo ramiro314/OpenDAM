@@ -214,6 +214,9 @@ pub struct Project {
     pub file: String,
     /// Whether it has a `Source/` folder.
     pub has_source: bool,
+    /// Its first file of native code the editor would load, by its path in the project: one
+    /// below a `Binaries/` folder anywhere, or below a plugin's `Source/`.
+    pub native: Option<String>,
     /// The `/Game` path of every `.uasset` below `Content/`, sorted. Each may become one GLB.
     pub assets: Vec<String>,
     /// The docs it brings, at their paths in the pack, each with its name in the zip: those at
@@ -249,6 +252,7 @@ impl Project {
             dir,
             file,
             has_source: false,
+            native: None,
             assets: Vec::new(),
             docs: Vec::new(),
         };
@@ -263,6 +267,16 @@ impl Project {
             };
             if below_named(rel, "Source").is_some() {
                 project.has_source = true;
+            }
+            let folders: Vec<&str> = rel.split('/').collect();
+            let folders = &folders[..folders.len() - 1];
+            let binaries = folders.iter().any(|f| f.eq_ignore_ascii_case("Binaries"));
+            let plugin_source = folders
+                .first()
+                .is_some_and(|f| f.eq_ignore_ascii_case("Plugins"))
+                && folders.iter().any(|f| f.eq_ignore_ascii_case("Source"));
+            if (binaries || plugin_source) && project.native.is_none() {
+                project.native = Some(rel.to_string());
             }
             let content = below_named(rel, "Content");
             if let Some(asset) = content.filter(|c| has_extension(c, &["uasset"])) {
@@ -296,11 +310,23 @@ impl Project {
     }
 
     /// Why the project can't be exported: a `Source/` folder.
+    ///
+    /// The export opens the project in an editor running as you, with its Python plugin on, so
+    /// a project's own code must not run: one that ships compiled code, which the editor would
+    /// load, is refused too, and the work copy's Python startup scripts are removed
+    /// (`disarm_python`). What remains trusted is the editor's reading of the project's assets.
     pub fn refusal(&self) -> Option<String> {
-        self.has_source.then(|| {
-            format!(
+        if self.has_source {
+            return Some(format!(
                 "The Unreal project {} has a Source/ folder: the prebuilt editor can't compile \
                  its C++ code, so only a content-only project can be imported",
+                self.file
+            ));
+        }
+        self.native.as_ref().map(|path| {
+            format!(
+                "The Unreal project {} ships compiled code ({path}), which the editor would \
+                 load and run: only a content-only project can be imported",
                 self.file
             )
         })
@@ -560,6 +586,7 @@ impl Export<'_> {
             zipfile::extract_zip(&original, &to, dir.as_deref()).map_err(|e| {
                 format!("Unzipping the Unreal project into its work folder failed: {e:#}")
             })?;
+            disarm_python(edited.parent().expect("in the work copy"))?;
             enable_plugins(&edited)
         })
         .await?;
@@ -777,6 +804,44 @@ async fn failed_in(out: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+/// Removes from the work copy `copy` what the Python plugin, which the export turns on, would
+/// run of the project's own as the editor starts: every `Python/` folder directly below a
+/// `Content/` folder (its `init_unreal.py`, the project's or a plugin's), and the
+/// `StartupScripts` entries of its `.ini` files.
+fn disarm_python(copy: &Path) -> Result<(), String> {
+    let failed = |e: String| format!("Could not prepare the work copy: {e}");
+    let mut python = Vec::new();
+    let mut inis = Vec::new();
+    for entry in walkdir::WalkDir::new(copy).min_depth(1) {
+        let entry = entry.map_err(|e| failed(e.to_string()))?;
+        let name = entry.file_name().to_string_lossy();
+        let parent = entry.path().parent().and_then(|p| p.file_name());
+        let in_content = parent.is_some_and(|p| p.eq_ignore_ascii_case("Content"));
+        if entry.file_type().is_dir() && in_content && name.eq_ignore_ascii_case("Python") {
+            python.push(entry.into_path());
+        } else if entry.file_type().is_file() && has_extension(&name, &["ini"]) {
+            inis.push(entry.into_path());
+        }
+    }
+    for folder in python {
+        std::fs::remove_dir_all(&folder).map_err(|e| failed(e.to_string()))?;
+    }
+    for ini in inis.into_iter().filter(|ini| ini.exists()) {
+        let text = std::fs::read_to_string(&ini).map_err(|e| failed(e.to_string()))?;
+        let startup = |line: &str| {
+            let key = line.trim_start().trim_start_matches(['+', '-', '!', '.']);
+            key.split('=')
+                .next()
+                .is_some_and(|k| k.trim().eq_ignore_ascii_case("StartupScripts"))
+        };
+        if text.lines().any(startup) {
+            let kept: Vec<&str> = text.lines().filter(|l| !startup(l)).collect();
+            std::fs::write(&ini, kept.join("\n") + "\n").map_err(|e| failed(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Enables `PLUGINS` in the `.uproject` at `path`, a work copy: an entry it lists is turned on,
 /// and one it doesn't is added. A UTF-8 byte order mark is read and dropped.
 fn enable_plugins(path: &Path) -> Result<(), String> {
@@ -971,6 +1036,86 @@ pub(crate) mod tests {
         assert_eq!(
             failed_in(dir.path()).await.into_iter().collect::<Vec<_>>(),
             ["/Game/My Pack/SM_Rock", "/Game/Other/SM_Tree"]
+        );
+    }
+
+    #[test]
+    fn a_project_shipping_compiled_code_is_refused() {
+        let listing = |paths: &[&str]| Extraction {
+            files: paths
+                .iter()
+                .map(|p| ExtractedFile {
+                    path: p.to_string(),
+                    source_path: vec![p.to_string()],
+                    size: 1,
+                })
+                .collect(),
+            skipped: Vec::new(),
+        };
+        let refusal = |paths: &[&str]| {
+            let mut all = vec!["P/P.uproject", "P/Content/SM.uasset"];
+            all.extend_from_slice(paths);
+            Project::find(&listing(&all)).unwrap().unwrap().refusal()
+        };
+        for native in [
+            "Binaries/Linux/libUnrealEditor-P.so",
+            "Plugins/Water/Binaries/Linux/libWater.so",
+            "Plugins/Tools/Water/Source/Water/Water.Build.cs",
+        ] {
+            let why = refusal(&[&format!("P/{native}")]).unwrap();
+            assert!(
+                why.contains(&format!("ships compiled code ({native})")),
+                "{why}"
+            );
+        }
+        // A content-only plugin, and a level or doc, are fine.
+        assert_eq!(
+            refusal(&[
+                "P/Plugins/Water/Content/M_Water.uasset",
+                "P/Content/Maps/Demo.umap"
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn the_work_copy_loses_the_project_s_python_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = copy.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("Content/Python/init_unreal.py", "import os\n");
+        write("Plugins/Water/Content/Python/init_unreal.py", "import os\n");
+        write("Content/Meshes/SM_A.uasset", "mesh");
+        write(
+            "Content/Meshes/Python/SM_Snake.uasset",
+            "a folder only named Python",
+        );
+        write(
+            "Config/DefaultEngine.ini",
+            "[/Script/PythonScriptPlugin.PythonScriptPluginSettings]\n\
+             +StartupScripts=/tmp/evil.py\nStartupScripts = other.py\n\
+             bDeveloperMode=False\n",
+        );
+        write(
+            "Config/DefaultGame.ini",
+            "[/Script/EngineSettings.GeneralProjectSettings]\n",
+        );
+        disarm_python(copy).unwrap();
+        assert!(!copy.join("Content/Python").exists());
+        assert!(!copy.join("Plugins/Water/Content/Python").exists());
+        assert!(copy.join("Content/Meshes/SM_A.uasset").exists());
+        assert!(copy.join("Content/Meshes/Python/SM_Snake.uasset").exists());
+        assert_eq!(
+            std::fs::read_to_string(copy.join("Config/DefaultEngine.ini")).unwrap(),
+            "[/Script/PythonScriptPlugin.PythonScriptPluginSettings]\nbDeveloperMode=False\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(copy.join("Config/DefaultGame.ini")).unwrap(),
+            "[/Script/EngineSettings.GeneralProjectSettings]\n"
         );
     }
 
