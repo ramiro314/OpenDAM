@@ -681,6 +681,43 @@ mod tests {
             s.engine.rebuild_pack("lib", &pack_id).await.is_err(),
             "its runs are blocked"
         );
+
+        // A refresh recovers nothing either, and its index doesn't reach the pack.
+        refresh(&s).await;
+        assert_eq!(found(&s), on_disk_before);
+        assert_eq!(s.rows().await, rows, "the pack's rows survive a refresh");
+        assert_eq!(s.pack().await.2.as_deref(), Some("swapping"));
+    }
+
+    #[tokio::test]
+    async fn a_recovery_that_fails_leaves_the_pack_to_no_index_and_a_later_one_finishes_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = disk().await;
+        let pack_id = later(&s).await;
+        let before = before(&s).await;
+        s.engine.hooks().crash(Point::Aside);
+        rebuild_killed(&s, &pack_id).await;
+        // Renaming `.prev` back fails while the folder holding the pack is read-only.
+        let parent = s.live().parent().unwrap().to_path_buf();
+        let mode = |m: u32| std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(m));
+        mode(0o555).unwrap();
+        if std::fs::create_dir(parent.join("probe")).is_ok() {
+            mode(0o755).unwrap();
+            eprintln!("Permissions don't stop this user (root?): skipped");
+            return;
+        }
+
+        refresh(&s).await;
+        let left = (s.rows().await, s.pack().await.2);
+        mode(0o755).unwrap();
+        assert_eq!(left.1.as_deref(), Some("swapping"), "recovery failed");
+        assert_eq!(
+            left.0, before.rows,
+            "the refresh pruned none of the pack's rows, though its folder is aside"
+        );
+
+        refresh(&s).await;
+        restored(&s, &before).await;
     }
 
     // ── When recovery runs ──────────────────────────────────────────────────

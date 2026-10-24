@@ -169,8 +169,11 @@ docs/plans                    Plans for this fork
   refresh or startup deletes a live build's staging folder. Recovery indexes only a pack folder
   that exists, never prunes after a rollback with no previous folder (`swap_prev` false), and
   changes nothing on disk for a state no step leaves: it marks the pack `failed` and leaves
-  `swap_state` set, which refuses its runs and step edits. A `removing` pack is left as found
-  until Remove import is built.
+  `swap_state` set, which refuses its runs and step edits. A pack recovery leaves journaled, that
+  way or because a step of it failed, is spared by the `index_paths` run that follows
+  (`Prune::Sparing`): it neither walks, writes nor prunes anything at or under the pack's target,
+  and the next recovery tries again. A `removing` pack is left as found until Remove import is
+  built.
 - **`DELETE` journaling on library DBs.** Library DBs use rollback journaling because WAL's `-shm`
   locking is unreliable on network shares. Keep `SqliteJournalMode::Delete` in `db.rs`.
 - **Batched writes.** Database writes go in transactions of about 200 rows, as `watcher.rs` does.

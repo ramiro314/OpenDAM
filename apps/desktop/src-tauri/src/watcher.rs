@@ -485,6 +485,10 @@ struct PendingAsset {
 pub enum Prune<'a> {
     /// Delete them, then run the structure pass. Every run but an import build's.
     Now,
+    /// `Now`, except that the run neither walks, writes nor prunes anything at or under these
+    /// library-relative folders: the targets of packs still journaled mid-swap, which recovery
+    /// couldn't put back (`index_paths`). Their rows wait, untouched, for a recovery that can.
+    Sparing(&'a [String]),
     /// Delete no row and run no structure pass, and report each row the run inserts to the
     /// journal, inside the transaction that inserts it. An import build runs this between its
     /// swap and its commit (plan pack-import, "Pruning waits for the commit").
@@ -521,7 +525,8 @@ async fn mounted(db: &Database, library_id: &str) -> Option<LibraryHandle> {
 }
 
 /// Takes library `library_id`'s `index_lock`, then the advisory lock, runs swap recovery and
-/// `index_paths_locked` with `Prune::Now`, then releases. Yields when another machine holds the
+/// `index_paths_locked` with `Prune::Now`, sparing any pack recovery left journaled
+/// (`Prune::Sparing`), then releases. Yields when another machine holds the
 /// advisory lock.
 pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> Result<()> {
     let Some(library) = mounted(db, library_id).await else {
@@ -539,7 +544,29 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
 
     let (pool, root) = (&library.pool, library.root_path.as_path());
     crate::import::recover_swaps(pool, root, crate::import::Recovery::Entry, &lock).await;
-    let run = index_paths_locked(db, library_id, paths, Prune::Now, &index_guard, &lock).await;
+    // A pack recovery couldn't put back keeps its journal: no index reaches it mid-swap.
+    let journaled: Vec<String> = match sqlx::query_scalar(
+        "SELECT target FROM import_packs WHERE swap_state IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(targets) => targets,
+        Err(e) => {
+            tracing::error!("Could not read the swap journals of library {library_id}, so it isn't indexed: {e}");
+            lock.release(pool, root).await;
+            return Ok(());
+        }
+    };
+    let prune = if journaled.is_empty() {
+        Prune::Now
+    } else {
+        tracing::warn!(
+            "Indexing library {library_id} without the packs still mid-swap: {journaled:?}"
+        );
+        Prune::Sparing(&journaled)
+    };
+    let run = index_paths_locked(db, library_id, paths, prune, &index_guard, &lock).await;
     lock.release(pool, root).await;
     run
 }
@@ -593,6 +620,12 @@ pub async fn index_paths_locked(
         total_count
     );
     Ok(())
+}
+
+/// Whether the library-relative `path` is `folder` or lies below it, on whole path components.
+fn at_or_under(path: &str, folder: &str) -> bool {
+    path.strip_prefix(folder)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// The library-relative paths whose rows a run over `paths` reads and may prune, or `None` when
@@ -658,10 +691,12 @@ pub async fn index_pool(
         tracing::info!("Library root {:?} is missing, skipping indexing", root_path);
         return Ok(());
     }
-    let journal = match prune {
-        Prune::Now => None,
-        Prune::Defer(journal) => Some(journal),
+    let (journal, spared) = match prune {
+        Prune::Now => (None, &[][..]),
+        Prune::Sparing(spared) => (None, spared),
+        Prune::Defer(journal) => (Some(journal), &[][..]),
     };
+    let is_spared = |rel: &str| spared.iter().any(|folder| at_or_under(rel, folder));
     let now = Utc::now().timestamp_millis();
 
     // ── 1. Load existing assets in scope in ONE query per walked path ────
@@ -672,7 +707,9 @@ pub async fn index_pool(
     let mut existing_map: HashMap<String, (String, i64, i64, Option<String>)> =
         HashMap::with_capacity(existing_rows.len());
     for (id, file_path, modified_at, size_bytes, thumb) in existing_rows {
-        existing_map.insert(file_path, (id, modified_at, size_bytes, thumb));
+        if !is_spared(&file_path) {
+            existing_map.insert(file_path, (id, modified_at, size_bytes, thumb));
+        }
     }
 
     let mut seen_paths: HashSet<String> = HashSet::with_capacity(existing_map.len() + 100);
@@ -690,7 +727,7 @@ pub async fn index_pool(
                 if e.file_type().is_dir() && file_name.starts_with('.') {
                     return false;
                 }
-                true
+                spared.is_empty() || !is_spared(&make_relative_path(root_path, e.path()))
             });
 
         for entry in walker
@@ -1902,6 +1939,38 @@ mod tests {
         assert_eq!(
             paths_of(&lib.pool, "SELECT file_path FROM assets").await,
             ["Pub/Pack/Rock.txt"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sparing_run_neither_walks_writes_nor_prunes_a_spared_pack() {
+        let (dir, _db, lib) = temp_library_enforcing().await;
+        std::fs::create_dir_all(dir.path().join("Pub/Pack")).unwrap();
+        std::fs::write(dir.path().join("Pub/Pack/New.txt"), "new").unwrap();
+        for path in ["Pub/Pack/Gone.fbx", "Pub/Package/Gone.fbx"] {
+            seed_tagged(&lib.pool, path).await;
+        }
+
+        let root = dir.path().to_string_lossy().to_string();
+        let spared = ["Pub/Pack".to_string()];
+        index_pool(
+            &lib.pool,
+            dir.path(),
+            &[root],
+            Prune::Sparing(&spared),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            paths_of(&lib.pool, "SELECT file_path FROM assets").await,
+            ["Pub/Pack/Gone.fbx"],
+            "the spared pack's row stays, its new file isn't indexed, and Pub/Package is pruned"
+        );
+        assert_eq!(
+            paths_of(&lib.pool, "SELECT asset_id FROM asset_tags").await,
+            ["Pub/Pack/Gone.fbx"]
         );
     }
 
