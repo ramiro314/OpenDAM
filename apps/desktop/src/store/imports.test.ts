@@ -10,8 +10,10 @@ import type {
   ImportTree,
 } from '../types';
 import {
+  CHANGED,
   FINISHING,
   LOCKED_STEP,
+  MISSING,
   cancelState,
   candidateProblem,
   draftFromScan,
@@ -22,11 +24,14 @@ import {
   importRequest,
   importRows,
   mergeRun,
+  originalLabel,
   packStatus,
   patchCandidate,
   pickVariant,
   placeSteps,
   progressText,
+  rebuildRefusal,
+  rowKey,
   setHoist,
   skippedText,
   treeCurrent,
@@ -175,6 +180,8 @@ describe('importRows', () => {
       originalPath: '/dl/Kenney.zip',
       kind: 'zip',
       createdAt: 1,
+      originalState: 'ok',
+      changedSha256: null,
       packs: [
         { id: 'p2', target: '3D assets/Car Kit', preset: 'kenney', status: 'built', builtAt: 5 },
       ],
@@ -185,6 +192,8 @@ describe('importRows', () => {
       originalPath: '/dl/Kenney.zip',
       kind: 'zip',
       createdAt: 2,
+      originalState: 'ok',
+      changedSha256: null,
       packs: [
         {
           id: 'p1',
@@ -201,6 +210,8 @@ describe('importRows', () => {
       originalPath: '/cache/Rocks.unitypackage',
       kind: 'unitypackage',
       createdAt: 3,
+      originalState: 'ok',
+      changedSha256: null,
       packs: [{ id: 'p3', target: 'Pub/Rocks', preset: 'unity', status: 'failed', builtAt: null }],
     },
   ];
@@ -250,6 +261,104 @@ describe('importRows', () => {
       'lib',
       'other',
     ]);
+  });
+});
+
+describe("the original's state", () => {
+  const imp = (
+    id: string,
+    originalState: ImportSummary['originalState'],
+    changedSha256: string | null = null
+  ): ImportSummary => ({
+    id,
+    libraryId: 'lib',
+    originalPath: '/dl/Kenney.zip',
+    kind: 'zip',
+    createdAt: Number(id.slice(1)),
+    originalState,
+    changedSha256,
+    packs: [{ id: `p${id}`, target: `T/${id}`, preset: 'kenney', status: 'built', builtAt: 1 }],
+  });
+
+  test("a row shows the worst of its imports' states, and a changed one's file", () => {
+    const row = (imports: ImportSummary[]) => importRows(imports, [], {})[0];
+    expect(row([imp('i1', 'ok'), imp('i2', 'ok')]).originalState).toBe('ok');
+    const changed = row([imp('i1', 'ok'), imp('i2', 'changed', 'abc')]);
+    expect([changed.originalState, changed.changedSha256]).toEqual(['changed', 'abc']);
+    const missing = row([imp('i1', 'missing'), imp('i2', 'changed', 'abc')]);
+    expect([missing.originalState, missing.kind]).toEqual(['missing', 'zip']);
+    expect(originalLabel('ok')).toBe('OK');
+    expect(originalLabel('missing')).toBe('Original missing');
+    expect(originalLabel('changed')).toBe('Original changed');
+  });
+
+  test("a missing or changed original disables its packs' Rebuild with the reason", () => {
+    const imports = { lib: [imp('i1', 'ok'), imp('i2', 'missing'), imp('i3', 'changed', 'abc')] };
+    expect(rebuildRefusal(imports, 'lib', 'pi1')).toBeNull();
+    expect(rebuildRefusal(imports, 'lib', 'pi2')).toBe(MISSING);
+    expect(rebuildRefusal(imports, 'lib', 'pi3')).toBe(CHANGED);
+    expect(rebuildRefusal(imports, 'other', 'pi2')).toBeNull();
+  });
+
+  test('opening the Imports view checks the originals; a refetch only lists them', async () => {
+    const calls: string[] = [];
+    api.checkImportOriginals = async (libraryId) => {
+      calls.push(`check ${libraryId}`);
+      return [imp('i1', 'missing')];
+    };
+    api.listImports = async (libraryId) => {
+      calls.push(`list ${libraryId}`);
+      return [imp('i1', 'ok')];
+    };
+    api.listImportRuns = async () => [];
+    await useImportStore.getState().check(['lib']);
+    expect(useImportStore.getState().imports.lib[0].originalState).toBe('missing');
+    await useImportStore.getState().fetchLibrary('lib');
+    expect(calls).toEqual(['check lib', 'list lib']);
+  });
+
+  test('Locate original re-points a same file at once, and another only through Use this file', async () => {
+    const key = rowKey('lib', '/dl/Kenney.zip');
+    const sent: unknown[] = [];
+    api.locateImportOriginal = async (libraryId, originalPath, path, sha256 = null) => {
+      sent.push([libraryId, originalPath, path, sha256]);
+      return sha256 === null ? { kind: 'differs', path, sha256: 'other' } : { kind: 'located' };
+    };
+    let lists = 0;
+    api.listImports = async () => {
+      lists++;
+      return [];
+    };
+    api.listImportRuns = async () => [];
+    const store = useImportStore.getState();
+
+    await store.locate('lib', '/dl/Kenney.zip', '/new/Other.zip');
+    expect(useImportStore.getState().locating[key]).toEqual({
+      kind: 'differs',
+      path: '/new/Other.zip',
+      sha256: 'other',
+    });
+    expect(lists).toBe(0);
+
+    // Use this file names the sha256 it was shown
+    await store.locate('lib', '/dl/Kenney.zip', '/new/Other.zip', 'other');
+    expect(sent).toEqual([
+      ['lib', '/dl/Kenney.zip', '/new/Other.zip', null],
+      ['lib', '/dl/Kenney.zip', '/new/Other.zip', 'other'],
+    ]);
+    expect(useImportStore.getState().locating[key]).toBeUndefined();
+    expect(lists).toBe(1);
+
+    api.locateImportOriginal = async () => {
+      throw 'An import run is building this pack';
+    };
+    await store.locate('lib', '/dl/Kenney.zip', '/new/Kenney.zip');
+    expect(useImportStore.getState().locating[key]).toEqual({
+      kind: 'error',
+      error: 'An import run is building this pack',
+    });
+    store.dismissLocate(key);
+    expect(useImportStore.getState().locating).toEqual({});
   });
 });
 
@@ -349,6 +458,8 @@ describe('Cancel', () => {
           originalPath: '/o.unitypackage',
           kind: 'unitypackage',
           createdAt: 1,
+          originalState: 'ok',
+          changedSha256: null,
           packs: [{ id: 'p', target: 'Pub/Pack', preset: 'unity', status, builtAt: null }],
         },
       ] as ImportSummary[];

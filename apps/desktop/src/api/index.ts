@@ -51,6 +51,7 @@ import type {
   ImportScan,
   ImportStepRecord,
   ImportSummary,
+  ImportLocated,
   ImportTree,
   PlaceStep,
 } from '../types';
@@ -270,5 +271,18 @@ export const api = {
   cancelImportRun: (libraryId: string, runId: string) =>
     invoke<void>('cancel_import_run', { libraryId, runId }),
   listImports: (libraryId: string) => invoke<ImportSummary[]>('list_imports', { libraryId }),
+  /** The imports, once each original was checked by size and mtime (hashed only when changed) */
+  checkImportOriginals: (libraryId: string) =>
+    invoke<ImportSummary[]>('check_import_originals', { libraryId }),
+  /**
+   * Locate original: re-points the imports of `originalPath` at `path` when it is the same file
+   * by sha256; another file is used only once its `sha256` is passed back (Use this file)
+   */
+  locateImportOriginal: (
+    libraryId: string,
+    originalPath: string,
+    path: string,
+    sha256: string | null = null
+  ) => invoke<ImportLocated>('locate_import_original', { libraryId, originalPath, path, sha256 }),
   listImportRuns: (libraryId: string) => invoke<ImportRun[]>('list_import_runs', { libraryId }),
 };

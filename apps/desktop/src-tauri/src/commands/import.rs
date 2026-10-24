@@ -2,6 +2,7 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::import::engine::ImportRequest;
+use crate::import::original::Located;
 use crate::import::place::PlaceStep;
 use crate::import::records::{ImportSummary, PackSteps, RunSummary, Step};
 use crate::import::scan::{Scan, Tree};
@@ -106,6 +107,34 @@ pub async fn list_imports(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<ImportSummary>> {
     state.imports.list_imports(&library_id).await
+}
+
+/// A library's imports, as `list_imports`, once each original was checked by size and mtime
+/// and hashed again only when either changed: the Imports view's read when it opens.
+#[tauri::command]
+pub async fn check_import_originals(
+    library_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<ImportSummary>> {
+    state.imports.check_originals(&library_id).await
+}
+
+/// Locate original: re-points the imports of `original_path` at the file `path` when it is the
+/// same file by sha256. A file with another sha256 changes nothing and comes back as `differs`
+/// with its sha256, until it is passed back as `sha256` (Use this file), which makes it the new
+/// original that each pack's next build reads. Refused while a pack of the original is building.
+#[tauri::command]
+pub async fn locate_import_original(
+    library_id: String,
+    original_path: String,
+    path: String,
+    sha256: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Located> {
+    state
+        .imports
+        .locate_original(&library_id, &original_path, &path, sha256.as_deref())
+        .await
 }
 
 /// A library's import runs, newest first.

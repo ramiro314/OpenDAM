@@ -5,6 +5,7 @@ pub mod carry;
 pub mod edits;
 pub mod engine;
 pub mod metadata;
+pub mod original;
 pub mod place;
 pub mod records;
 pub mod recovery;

@@ -86,6 +86,8 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               (and a step edit read at an older `recipe_rev`),
                               edits, which records an in-app rename or delete in a pack as
                               its steps and moves its `.meta` with it,
+                              original, the original's state check and Locate
+                              original (`check_library`, `locate`),
                               metadata, the metadata step's `datapackage.json` by preset (Unity,
                               Fab, Kenney, none) and the Kenney store page lookup, build, a pack's build, first or later (stage beside the target,
                               lock, re-check, journal, swap, carry, index with Prune::Defer,
@@ -137,7 +139,12 @@ docs/plans                    Plans for this fork
 - **Relative paths in library DBs.** Every path stored in `.opendam/library.sqlite` is relative to
   the library root (`textures/rock.png`, `.opendam/thumbs/...`), so a library folder works wherever
   it is mounted. The one exception is `imports.original_path`: an import's original lives outside
-  every library, so it is stored by absolute path, with its size, mtime and sha256.
+  every library, so it is stored by absolute path, with its size, mtime and sha256. Its state
+  (`imports.original_state`, `import::original`) is checked at startup, when a library opens, when
+  the Imports view opens and before a Rebuild, by size and mtime, hashing the file only when
+  either changed (and a changed file it already hashed, kept in `seen_*`, not again). A missing or
+  changed original refuses Rebuild while its packs keep working, until Locate original re-points
+  the import at a file with the same sha256, or Use this file names another file's sha256.
 - **Originals are read-only.** Nothing writes to an import's original or to the folder it sits in.
   An original inside the library is refused (`import::engine::start_import`).
 - **An imported pack changes on disk only by a swap.** A build, first or a rebuild, stages the

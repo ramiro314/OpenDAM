@@ -1086,5 +1086,15 @@ export interface ImportSummary {
   originalPath: string;
   kind: 'unitypackage' | 'zip';
   createdAt: number;
+  /** What the last check of the original found */
+  originalState: OriginalState;
+  /** While `changed`, the sha256 of the file at the original's path, which Use this file names */
+  changedSha256: string | null;
   packs: ImportPackSummary[];
 }
+
+/** An import's original: the recorded file, gone, or another file at its path */
+export type OriginalState = 'ok' | 'missing' | 'changed';
+
+/** What Locate original did: re-pointed the imports, or found a file that isn't the original */
+export type ImportLocated = { kind: 'located' } | { kind: 'differs'; path: string; sha256: string };

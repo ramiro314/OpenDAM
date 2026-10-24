@@ -160,6 +160,9 @@ CREATE TABLE IF NOT EXISTS library_meta (
 -- ── Pack imports: packs built from their originals (docs/plans/pack-import/plan.md, Records) ──
 -- An original lives outside every library, so `original_path` is absolute: the one exception to
 -- relative paths in a library DB. Every other path here is relative to the library root.
+-- `original_state` is what the last check of the original found (import/original.rs): 'ok',
+-- 'missing', or 'changed', a file at `original_path` whose sha256 differs. That file's stamp and
+-- sha256 are kept in `seen_*`, so it is hashed again only once it changes again.
 CREATE TABLE IF NOT EXISTS imports (
     id                 TEXT PRIMARY KEY,
     original_path      TEXT NOT NULL,
@@ -167,7 +170,12 @@ CREATE TABLE IF NOT EXISTS imports (
     original_mtime_ns  INTEGER NOT NULL,
     original_sha256    TEXT NOT NULL,
     kind               TEXT NOT NULL CHECK (kind IN ('unitypackage', 'zip')),
-    created_at         INTEGER NOT NULL
+    created_at         INTEGER NOT NULL,
+    original_state     TEXT NOT NULL DEFAULT 'ok'
+                       CHECK (original_state IN ('ok', 'missing', 'changed')),
+    seen_size          INTEGER,
+    seen_mtime_ns      INTEGER,
+    seen_sha256        TEXT
 );
 
 -- One pack of an import. `current_build` names the committed build (its `import_outputs` rows are
