@@ -75,10 +75,16 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               phase's flatten, hoist, rename and exclude steps over that tree, which
                               name a file by source path, move or drop its .meta with it, and fail
                               naming the step and path on a clash or a source no longer produced,
+                              scan, an original's candidate packs (Unity cache, Fab variants,
+                              Kenney packs, any zip) with presets, default targets and steps and
+                              a preview of each build's tree, made by the same extract and place
+                              code run over the archive's index (`list_*`, `place_listed`), which
+                              reads no file body and writes nothing,
                               records, the import tables (imports, import_packs, import_steps,
                               import_outputs, import_moves, import_runs) and the step edits and
                               rebuilds they refuse while a run for the pack is queued or running,
-                              build, a pack's build, first or later (stage beside the target,
+                              metadata, the metadata step's `datapackage.json` by preset (Unity,
+                              Fab, Kenney, none) and the Kenney store page lookup, build, a pack's build, first or later (stage beside the target,
                               lock, re-check, journal, swap, carry, index with Prune::Defer,
                               commit current_build, settle, or roll back), with test hooks to
                               pause or fail it, carry, which moves rows to their files' new paths
@@ -98,8 +104,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               rename, shared by the export's bundles and the import's builds
     tests/fixtures/pack-import/  Its fixture originals, made by make_fixtures.py (stdlib only) and
                               committed with its output, and expected/, goldens from the owner's
-                              scripts (the extraction's, and flatten and hoist Art's after it), each
-                              named with its sha256 in expected/README.md
+                              scripts (the extraction's, flatten and hoist Art's after it, and the
+                              Unity, Fab and Kenney datapackage.json files gen_datapackage.py and
+                              gen_kenney_datapackage.py write), each named with its sha256 in
+                              expected/README.md
     tests/fixtures/game-export/  The export's fixture library, made by make_fixtures.py under Blender and
                               committed with its output, and fbx_facts.json, its FBX files' facts,
                               which test_fbx_facts.py checks and the Check's tests read
@@ -159,6 +167,13 @@ docs/plans                    Plans for this fork
   structure pass). Then `swap_state` and the failed build's records (`import_outputs` and
   `import_moves`) go in one transaction, and only then is `.failed-*` deleted. A rollback step
   that fails leaves the journal set, for recovery.
+- **Pack targets never nest.** No pack's target is an ancestor or a descendant of another's, on
+  whole path components (`Pub/Pack` holds `Pub/Pack/Sub` but not `Pub/Package`), so every build,
+  swap and Remove touches only its own pack's files. The scan, the import
+  (`import::engine::start_import`) and a target edit (`set_target`) refuse such a target naming
+  the other pack, and one that already exists in the library, and the insert or update itself
+  checks the nesting again in the same statement (`records::create_import`,
+  `records::set_target`). A built pack's target doesn't move yet.
 - **`DELETE` journaling on library DBs.** Library DBs use rollback journaling because WAL's `-shm`
   locking is unreliable on network shares. Keep `SqliteJournalMode::Delete` in `db.rs`.
 - **Batched writes.** Database writes go in transactions of about 200 rows, as `watcher.rs` does.
@@ -178,9 +193,17 @@ docs/plans                    Plans for this fork
   Other parts of the app, such as the game export's `fbx_facts`, send a `preview::WorkerRequest`
   to the queue, which serves it on that process between jobs.
 - **Zero telemetry.** The app makes no network calls to analytics or tracking services. The only
-  outbound calls are AI tagging requests to the provider you configured (the Anthropic API, your
-  local `claude` CLI, or TypeSafe's Jev). They are made only for runs you start, and nothing is
-  sent until a provider is set up.
+  outbound calls are:
+  - AI tagging requests to the provider you configured (the Anthropic API, your local `claude`
+    CLI, or TypeSafe's Jev). They are made only for runs you start, and nothing is sent until a
+    provider is set up.
+  - The Kenney store page lookup: one or two HEAD requests to `https://kenney.nl/assets/<slug>`
+    per pack, made only by a Kenney pack's build with "Look up store page" ticked, which a
+    Kenney import is unless it turns it off (`lookupStorePage: false`, plan D22;
+    `import::metadata`). An answer (the page, or a 404 or 410 for each URL) is kept in
+    `import_packs.store_page` with the URLs it was for, so a rebuild sends none until you
+    clear it or the title or folder its slugs come from changes. No answer, or another status,
+    keeps nothing, and the next build asks again.
 - **Claude-plan access is personal use only.** Anthropic's "Claude plan" access runs the owner's
   own installed, logged-in `claude` CLI (`autotag/claude_cli.rs`). Anthropic doesn't let
   third-party products offer claude.ai login or plan limits, so this access mode must be removed

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://datapackage.org/profiles/2.0/datapackage.json",
+  "name": "fixture-tiles",
+  "title": "Fixture Tiles",
+  "version": "1.0",
+  "contributors": [
+    {
+      "title": "Kenney",
+      "roles": [
+        "author",
+        "publisher"
+      ]
+    }
+  ],
+  "licenses": [
+    {
+      "name": "CC0-1.0",
+      "title": "Creative Commons Zero v1.0 Universal",
+      "path": "License.txt"
+    }
+  ],
+  "homepage": "https://kenney.nl/",
+  "resources": [
+    {
+      "name": "license.txt",
+      "path": "License.txt"
+    }
+  ]
+}

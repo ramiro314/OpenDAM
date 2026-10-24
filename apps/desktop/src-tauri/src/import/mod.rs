@@ -3,8 +3,10 @@
 pub mod build;
 pub mod carry;
 pub mod engine;
+pub mod metadata;
 pub mod place;
 pub mod records;
+pub mod scan;
 pub mod settings;
 pub mod unity_glb;
 pub mod unitypackage;

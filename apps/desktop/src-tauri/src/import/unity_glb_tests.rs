@@ -70,12 +70,13 @@ mod tests {
             self.wait_for(&run.id, "done").await;
         }
 
-        /// The current build's generated files, as `(path, source path)`.
+        /// The current build's generated GLBs (generated files with a source path, unlike the
+        /// metadata step's `datapackage.json`), as `(path, source path)`.
         async fn generated(&self) -> Vec<(String, Vec<String>)> {
             let rows: Vec<(String, String)> = sqlx::query_as(
                 "SELECT o.path, o.source_path FROM import_outputs o JOIN import_packs p
                  ON p.id = o.pack_id AND o.build_id = p.current_build
-                 WHERE o.origin = 'generated' ORDER BY o.path",
+                 WHERE o.origin = 'generated' AND o.source_path != '[]' ORDER BY o.path",
             )
             .fetch_all(&self.lib.pool)
             .await
@@ -798,6 +799,26 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
             "Converting to GLB needs Blender 5.2: No Blender at /nonexistent/opendam-test/blender";
         assert_eq!(
             steps.unavailable.get("unity_glb").map(String::as_str),
+            Some(why)
+        );
+        // The import dialog's scan proposes it the same way.
+        let original = fixture("synthetic.unitypackage");
+        let scan = s
+            .engine
+            .scan("lib", &original.to_string_lossy())
+            .await
+            .unwrap();
+        let proposed: Vec<bool> = scan
+            .offers
+            .iter()
+            .flat_map(|o| &o.candidates)
+            .flat_map(|c| &c.steps)
+            .filter(|s| s.kind == "unity_glb")
+            .map(|s| s.enabled)
+            .collect();
+        assert_eq!(proposed, [false]);
+        assert_eq!(
+            scan.unavailable.get("unity_glb").map(String::as_str),
             Some(why)
         );
         assert_eq!(s.generated().await, []);
