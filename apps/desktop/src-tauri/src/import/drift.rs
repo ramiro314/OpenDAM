@@ -224,13 +224,23 @@ pub async fn check(
     let recipe = records::recipe(pool, pack_id)
         .await
         .map_err(|e| format!("Database error: {e}"))?;
+    check_recipe(pool, root, &recipe).await
+}
+
+/// `check`, against `recipe` as already read, so a caller that works out the Rebuild's recipe
+/// edits from the same read judges both by one `recipe_rev`.
+pub async fn check_recipe(
+    pool: &Pool<Sqlite>,
+    root: &Path,
+    recipe: &Recipe,
+) -> Result<Vec<Difference>, String> {
     let Some(build) = &recipe.current_build else {
         return Ok(Vec::new());
     };
-    let manifest = records::manifest(pool, pack_id, build)
+    let manifest = records::manifest(pool, &recipe.pack_id, build)
         .await
         .map_err(|e| format!("Database error: {e}"))?;
-    scan(root, &recipe, &manifest).await
+    scan(root, recipe, &manifest).await
 }
 
 /// The differences between the pack folder of `recipe`, in the library at `root`, and

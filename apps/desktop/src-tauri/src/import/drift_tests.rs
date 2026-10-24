@@ -981,4 +981,71 @@ mod tests {
         assert!(s.drift(&pack_id).await.is_empty());
         s.settled().await;
     }
+
+    /// A Rebuild whose drift and recipe edits were worked out at one `recipe_rev` is refused once
+    /// the steps moved on (an editor mounted twice saving in between), with its edits and run
+    /// written neither on top of steps it never saw nor at all; at the current `recipe_rev` it
+    /// queues.
+    #[tokio::test]
+    async fn drift_edits_worked_out_at_an_older_recipe_rev_are_refused() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        let log = s.source_of("Textures/T_Log_D.png").await;
+        let read_at = s
+            .engine
+            .pack_steps("lib", &pack_id)
+            .await
+            .unwrap()
+            .recipe_rev;
+        let now = s
+            .edit_steps(&pack_id, |steps| toggle(steps, "hoist", false))
+            .await;
+        let steps = s.engine.pack_steps("lib", &pack_id).await.unwrap();
+        let owner = crate::watcher::this_process();
+        let edits = records::DriftEdits {
+            excludes: vec![log],
+            ..Default::default()
+        };
+        for edits in [edits.clone(), records::DriftEdits::default()] {
+            let queued = records::queue_rebuild(
+                &s.lib.pool,
+                &pack_id,
+                &owner,
+                0,
+                &serde_json::json!([]),
+                &edits,
+                read_at,
+            )
+            .await
+            .unwrap();
+            assert_eq!(queued, Err(records::Refused::Stale), "{edits:?}");
+        }
+        assert_eq!(s.engine.pack_steps("lib", &pack_id).await.unwrap(), steps);
+        assert_eq!(
+            s.count("SELECT COUNT(*) FROM import_runs WHERE kind = 'rebuild'")
+                .await,
+            0
+        );
+
+        let queued = records::queue_rebuild(
+            &s.lib.pool,
+            &pack_id,
+            &owner,
+            0,
+            &serde_json::json!([]),
+            &edits,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(queued.is_ok(), "{queued:?}");
+        assert_eq!(
+            s.engine
+                .pack_steps("lib", &pack_id)
+                .await
+                .unwrap()
+                .recipe_rev,
+            now + 1
+        );
+    }
 }

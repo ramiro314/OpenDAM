@@ -1124,13 +1124,15 @@ impl Engine {
         if let Some(why) = original::refusal(&state) {
             return Err(why.into());
         }
-        let found = drift::check(&library.pool, &library.root_path, pack_id).await?;
-        if drift::unmatched(&found, &chosen).is_some() {
-            return Err(drift::STALE.into());
-        }
+        // One read of the recipe for the drift and the edits: `queue_rebuild` refuses them both
+        // once the steps moved on from its `recipe_rev`.
         let recipe = records::recipe(&library.pool, pack_id)
             .await
             .map_err(|e| e.to_string())?;
+        let found = drift::check_recipe(&library.pool, &library.root_path, &recipe).await?;
+        if drift::unmatched(&found, &chosen).is_some() {
+            return Err(drift::STALE.into());
+        }
         let recorded = records::uncommitted(&library.pool, pack_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1143,10 +1145,15 @@ impl Engine {
             now_ms(),
             &json!(chosen),
             &edits,
+            recipe.recipe_rev,
         )
         .await
         .map_err(|e| e.to_string())?
-        .map_err(refused)?;
+        .map_err(|refusal| match refusal {
+            // The steps moved on since the drift was worked out against them: check again
+            records::Refused::Stale => drift::STALE.to_string(),
+            other => refused(other),
+        })?;
         let run = records::run(&library.pool, &library.id, &run_id)
             .await
             .map_err(|e| e.to_string())?;

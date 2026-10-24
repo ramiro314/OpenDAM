@@ -778,7 +778,11 @@ impl DriftEdits {
 /// Queues a rebuild of pack `pack_id`, owned by `owner`, with its drift choices `drift` (the
 /// JSON array `import_runs.drift` holds under the pack's id), unless a run for it is queued or
 /// running. In the same transaction it first makes the choices' recipe `edits`, bumping
-/// `recipe_rev`, and the run is queued at the `recipe_rev` they leave. Returns the run's id.
+/// `recipe_rev`, and the run is queued at the `recipe_rev` they leave. `read_at` is the
+/// `recipe_rev` the steps were read at to work out `edits` (and the drift they answer): both
+/// writes check it, so steps edited since refuse the Rebuild (`Refused::Stale`) rather than
+/// take edits made for other steps. Returns the run's id.
+#[allow(clippy::too_many_arguments)]
 pub async fn queue_rebuild(
     pool: &Pool<Sqlite>,
     pack_id: &str,
@@ -786,28 +790,32 @@ pub async fn queue_rebuild(
     now: i64,
     drift: &Value,
     edits: &DriftEdits,
+    read_at: i64,
 ) -> sqlx::Result<Result<String, Refused>> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let mut tx = pool.begin().await?;
+    let mut at = read_at;
     if !edits.is_empty() {
         let bumped: Option<i64> = sqlx::query_scalar(&format!(
-            "UPDATE import_packs SET recipe_rev = recipe_rev + 1 WHERE id = ? AND NOT {BUSY}
-             RETURNING recipe_rev"
+            "UPDATE import_packs SET recipe_rev = recipe_rev + 1
+             WHERE id = ? AND recipe_rev = ? AND NOT {BUSY} RETURNING recipe_rev"
         ))
         .bind(pack_id)
+        .bind(read_at)
         .fetch_optional(&mut *tx)
         .await?;
-        if bumped.is_none() {
+        let Some(bumped) = bumped else {
             return Ok(Err(refusal(&mut tx, pack_id).await?));
-        }
+        };
         record_drift_edits(&mut tx, pack_id, edits).await?;
+        at = bumped;
     }
     let queued = sqlx::query(&format!(
         "INSERT INTO import_runs (id, kind, packs, drift, status, created_at, owner_machine,
          owner_boot, owner_pid, owner_started, heartbeat_at)
          SELECT ?, 'rebuild', json_array(json_object('packId', id, 'recipeRev', recipe_rev)),
          json_object(id, json(?)), 'queued', ?, ?, ?, ?, ?, ? FROM import_packs
-         WHERE id = ? AND NOT {BUSY}"
+         WHERE id = ? AND recipe_rev = ? AND NOT {BUSY}"
     ))
     .bind(&run_id)
     .bind(drift.to_string())
@@ -818,6 +826,7 @@ pub async fn queue_rebuild(
     .bind(owner.started as i64)
     .bind(now)
     .bind(pack_id)
+    .bind(at)
     .execute(&mut *tx)
     .await?;
     if queued.rows_affected() == 0 {
