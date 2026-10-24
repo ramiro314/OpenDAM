@@ -4040,6 +4040,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_imported_unity_material_shows_only_with_show_hidden() {
+        let paths = ["Loose/Glass.mat", "Pub/Pack/Rock.fbx", "Pub/Pack/Rock.mat"];
+        let library = library_of("lib", &paths).await;
+        structure::tests::insert_import(
+            &library.pool,
+            "Pub/Pack",
+            Some("b1"),
+            &[
+                ("b1", "Pub/Pack/Rock.fbx"),
+                ("b1", "Pub/Pack/Rock.mat"),
+                ("b1", "Pub/Pack/Rock.mat.meta"),
+            ],
+        )
+        .await;
+        structure::rebuild(&library.pool, &library.root_path)
+            .await
+            .unwrap();
+        let libs = [library];
+        let visible = vec![paths[0].to_string(), paths[1].to_string()];
+        let all: Vec<String> = paths.map(String::from).into();
+
+        assert_eq!(
+            counted_search(&libs, serde_json::json!({})).await,
+            (visible, Some(2), Some(3))
+        );
+        assert_eq!(
+            counted_search(
+                &libs,
+                serde_json::json!({ "filter": { "showHidden": true } })
+            )
+            .await,
+            (all, Some(3), Some(3))
+        );
+    }
+
+    #[tokio::test]
     async fn the_files_total_follows_every_other_filter() {
         let libs = [library_with_packs("lib", &PACK_FILES).await];
         let folder = serde_json::json!({ "libraryId": "lib", "path": "3D assets/Car Kit" });

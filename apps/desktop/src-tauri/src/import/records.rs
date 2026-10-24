@@ -137,6 +137,8 @@ pub struct NewImport<'a> {
     pub original_mtime_ns: i64,
     pub original_sha256: &'a str,
     pub kind: &'a str,
+    /// The pack's source in the original: its variant and sub-folder, `/`-joined, or `""`.
+    pub source: &'a str,
     pub target: &'a str,
     pub preset: &'a str,
     pub steps: &'a [StepRecord],
@@ -176,13 +178,14 @@ pub async fn create_import(
     .execute(&mut *tx)
     .await?;
     let inserted = sqlx::query(&format!(
-        "INSERT INTO import_packs (id, import_id, target, preset)
-         SELECT ?2, ?3, ?1, ?4 WHERE NOT EXISTS ({NESTING})"
+        "INSERT INTO import_packs (id, import_id, target, preset, source)
+         SELECT ?2, ?3, ?1, ?4, ?5 WHERE NOT EXISTS ({NESTING})"
     ))
     .bind(import.target)
     .bind(&pack_id)
     .bind(&import_id)
     .bind(import.preset)
+    .bind(import.source)
     .execute(&mut *tx)
     .await?;
     if inserted.rows_affected() == 0 {

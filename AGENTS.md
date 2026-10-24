@@ -68,7 +68,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               the extract_unitypackage step, which unpacks a .unitypackage into a
                               folder tree (every file and .meta, nested packages as folders), gives
                               each file its source path and skips and reports unsafe and duplicate
-                              entries, writing only regular files and folders, and place, the place
+                              entries, writing only regular files and folders (also from a variant
+                              package read straight from a zip, `extract_variant`), zipfile, the
+                              extract_zip step, which copies a zip or one folder of it on the
+                              same terms, and place, the place
                               phase's flatten, hoist, rename and exclude steps over that tree, which
                               name a file by source path, move or drop its .meta with it, and fail
                               naming the step and path on a clash or a source no longer produced,
@@ -269,6 +272,11 @@ docs/plans                    Plans for this fork
   `structure::rebuild_library` before it returns, rather than patching rows, and that waits for
   any index run holding the locks. Searches hide support files (`support_role IS NOT NULL`) unless
   the filter's `showHidden` is set.
+  - An imported pack's Unity material, a `.mat` whose `.mat.meta` is in the manifest of its
+    pack's `current_build`, and of no other build, is a `unity` support file. The pass reads
+    that set in one query (`structure::read_unity_materials`), as it reads `pack_overrides`, and
+    `derive` reads no file for it. A `.mat` outside imported packs keeps its kind and stays
+    visible.
   - Your pack edits ("Mark as pack", "Not a pack", a pack's name, license, source URL and cover,
     and the game export's origin and normal-map convention) live only in `pack_overrides`, keyed by the folder's relative path, so they outlive the
     folder going away and coming back. The pass reads them (`structure::read_overrides`) and
