@@ -11,7 +11,8 @@ under a temporary name and renamed once complete, so a killed session leaves no 
 Exports at most GLTF_BATCH new files per editor session (default 30), because the editor's memory
 grows with every export. It writes the number still left to `$GLTF_OUT/.gltf-remaining`, and the
 packages it failed on to `$GLTF_OUT/.gltf-failed`, which later sessions skip. OpenDAM starts the
-editor again until nothing is left or a session makes no progress. Quits the editor when done.
+editor again until nothing is left or a session makes no progress. Quits the editor when done,
+or when anything fails.
 """
 
 import os
@@ -104,7 +105,10 @@ def main() -> None:
         f"[gltf] exported {done}, failed {failed}, remaining {remaining}, "
         f"total on disk {sum(t.exists() for _, t in targets)}/{len(targets)}"
     )
+
+
+try:
+    main()
+finally:
+    # Whatever went wrong, the editor quits: OpenDAM waits for it to exit.
     unreal.SystemLibrary.quit_editor()
-
-
-main()

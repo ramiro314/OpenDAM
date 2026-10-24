@@ -26,6 +26,8 @@ mod tests {
     /// `stall` file, and every one after it, writes no GLB. An asset named in a `fail` file (by
     /// its path below `Content/`) gets no GLB either: as the script does, the session counts it
     /// in its batch, lists it in `.gltf-failed`, and later sessions skip it.
+    /// With a `kill` file holding K, a session exits 137, as the memory cap kills it, once it
+    /// has written K GLBs.
     fn stub_editor(root: &Path) {
         let r = root.display();
         write_editor(
@@ -38,7 +40,7 @@ cp "$1" '{r}/uproject.'$n
 case "$2" in -ExecutePythonScript=*) [ -f "${{2#-ExecutePythonScript=}}" ] || exit 3;; *) exit 4;; esac
 stall=$(cat '{r}/stall' 2>/dev/null || echo 999)
 content="$(dirname "$1")/Content"
-made=0; left=0
+made=0; wrote=0; left=0
 for asset in $(cd "$content" && find . -name 'SM_*.uasset' | sort); do
   rel=${{asset#./}}; rel=${{rel%.uasset}}
   glb="$GLTF_OUT/$rel.glb"
@@ -53,6 +55,8 @@ for asset in $(cd "$content" && find . -name 'SM_*.uasset' | sort); do
       mkdir -p "$(dirname "$glb")"
       printf 'glTF %s' "$rel" > "$glb"
       echo "LogPython: [gltf] exported /Game/$rel"
+      wrote=$((wrote + 1))
+      [ -f '{r}/kill' ] && [ "$wrote" -ge "$(cat '{r}/kill')" ] && exit 137
     fi
   else
     left=$((left + 1))
@@ -314,6 +318,51 @@ echo "$left" > "$GLTF_OUT/.gltf-remaining""#
         s.no_work_folder();
         s.nothing_beside_the_pack();
         assert_eq!(stamp(&zip), before, "the zip is untouched");
+    }
+
+    /// The GLBs a session finished before the memory cap killed it are cached: the step starts
+    /// another session after a kill that exported something, and a rebuild after a failed run
+    /// exports only what is left.
+    #[tokio::test]
+    async fn a_session_killed_by_the_cap_keeps_the_glbs_it_finished() {
+        let s = setup().await;
+        let root = s.stub_unreal().await;
+        // Session 1 exports SM_A and is killed; session 2 exports nothing.
+        std::fs::write(root.join("kill"), "1").unwrap();
+        std::fs::write(root.join("stall"), "2").unwrap();
+        let run = s
+            .engine
+            .start_import(s.unreal_request("unreal.zip"))
+            .await
+            .unwrap();
+        let failed = s.wait_for(&run.id, "failed").await;
+        let error = failed.error.unwrap();
+        assert!(
+            error.starts_with(
+                "Exporting from Unreal failed: an editor session made no progress, with 2 assets \
+                 left"
+            ),
+            "{error}"
+        );
+        assert_eq!(sessions(&root).len(), 2);
+        assert_eq!(s.cached_glbs(), 1, "the killed session's GLB was kept");
+        s.no_work_folder();
+
+        // Killed after every GLB, the step goes on from the cache to the end.
+        std::fs::remove_file(root.join("stall")).unwrap();
+        let run = s
+            .engine
+            .rebuild_pack("lib", &run.packs[0].pack_id)
+            .await
+            .unwrap();
+        s.wait_for(&run.id, "done").await;
+        // SM_B and SM_C, each killed after its GLB, then one that finds nothing left.
+        assert_eq!(sessions(&root).len(), 5);
+        assert_eq!(s.cached_glbs(), 3);
+        for glb in ["SM_A.glb", "SM_B.glb", "SM_C.glb"] {
+            assert!(s.pack_dir().join(glb).is_file(), "{glb}");
+        }
+        s.no_work_folder();
     }
 
     /// An asset the exporter fails on gets no GLB and becomes a warning naming it, and the step

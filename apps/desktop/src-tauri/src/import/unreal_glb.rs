@@ -11,7 +11,8 @@
 //! - **Sessions.** The editor runs headless under the Unreal memory cap (`capped`), the embedded
 //!   `unreal_glb.py` (a port of `ue_gltf_export.py`) exporting at most `batch` assets per
 //!   session. It restarts until nothing is left, and fails the step when a session makes no
-//!   progress.
+//!   progress. A session the cap kills after exporting something is followed by another; one
+//!   it kills before fails the step, naming the cap.
 //! - **The cache.** Each GLB is kept at `<cache>/glb/<key>.glb` as soon as its session ends,
 //!   keyed by the original's sha256, its `/Game` path, `UNREAL_GLB_VERSION` and the editor's
 //!   version (`glb_key`), and a record of the run's exports so far (`Record`). The next run
@@ -553,9 +554,12 @@ impl Export<'_> {
             self.cancelled()?;
             let before = exported_in(&out).await?;
             let _ = tokio::fs::remove_file(out.join(".gltf-remaining")).await;
-            let output = self
+            // However the session ends (killed by the cap, cancelled, done), the GLBs it
+            // finished are whole: the script renames each into place once written. They go
+            // into the cache before the step stops, so the next run resumes after them.
+            let ended = self
                 .session(editor, &uproject, &script, &out, &work.0)
-                .await?;
+                .await;
             let after = exported_in(&out).await?;
             for game in after.difference(&before) {
                 super::unity_glb::publish(
@@ -577,8 +581,22 @@ impl Export<'_> {
                 .and_then(|text| text.trim().parse::<u64>().ok());
             record.complete = remaining == Some(0);
             write_record(record_file, &record).await?;
+            let (output, killed) = ended?;
             if record.complete {
                 return Ok(record);
+            }
+            // A session the cap killed after exporting something leaves the rest to a fresh
+            // editor, whose memory starts over.
+            if let (Some(killed), false) = (&killed, progressed) {
+                return Err(Stop::Failed(format!(
+                    "Exporting from Unreal failed: the Unreal Editor was {killed}"
+                )));
+            }
+            if let Some(killed) = killed {
+                tracing::warn!(
+                    "The Unreal Editor was {killed} mid-batch; starting another session"
+                );
+                continue;
             }
             if !progressed {
                 let left = match remaining {
@@ -596,7 +614,8 @@ impl Export<'_> {
     }
 
     /// One editor session over the work copy, under the memory cap, counting the assets it
-    /// reports for the progress, and stopped on Cancel.
+    /// reports for the progress, and stopped on Cancel. Returns its output, with why the cap
+    /// killed it when it did.
     async fn session(
         &self,
         editor: &Editor,
@@ -604,7 +623,7 @@ impl Export<'_> {
         script: &Path,
         out: &Path,
         dir: &Path,
-    ) -> Result<std::process::Output, Stop> {
+    ) -> Result<(std::process::Output, Option<String>), Stop> {
         let run_script = format!("-ExecutePythonScript={}", script.display());
         let args = [
             uproject.as_os_str(),
@@ -659,12 +678,8 @@ impl Export<'_> {
             .await
             .map_err(|e| format!("Exporting from Unreal failed: could not run the editor: {e}"))?
             .ok_or(Stop::Cancelled)?;
-        if let Some(killed) = capped.killed_by_cap(output.status) {
-            return Err(Stop::Failed(format!(
-                "Exporting from Unreal failed: the Unreal Editor was {killed}"
-            )));
-        }
-        Ok(output)
+        let killed = capped.killed_by_cap(output.status);
+        Ok((output, killed))
     }
 }
 
