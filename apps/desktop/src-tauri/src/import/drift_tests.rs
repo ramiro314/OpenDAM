@@ -717,9 +717,9 @@ mod tests {
         s.settled().await;
     }
 
-    /// A changed file from the original whose exclude is on can't be kept: it is a clash
-    /// offering only discard, which leaves the exclude as it is. A kept `.meta` whose asset's
-    /// exclude is on is no difference: it goes with its asset, and the Rebuild builds.
+    /// A changed file from the original whose exclude is on can't be kept, and neither can a
+    /// kept or changed `.meta` whose asset, still in the folder, an exclude leaves out: each is
+    /// a clash offering only discard, which leaves the exclude as it is, and the Rebuild builds.
     #[tokio::test]
     async fn a_file_an_exclude_now_leaves_out_offers_only_discard() {
         let s = setup().await;
@@ -744,12 +744,20 @@ mod tests {
         .await;
         assert_eq!(
             s.seen(&pack_id).await,
-            [(
-                "Readme.txt".into(),
-                Change::Clash,
-                Kind::Extracted,
-                vec![Choice::Discard]
-            )]
+            [
+                (
+                    "Readme.txt".into(),
+                    Change::Clash,
+                    Kind::Extracted,
+                    vec![Choice::Discard]
+                ),
+                (
+                    "Textures/T_Log_D.png.meta".into(),
+                    Change::Clash,
+                    Kind::Kept,
+                    vec![Choice::Discard]
+                ),
+            ]
         );
         let steps = s.engine.pack_steps("lib", &pack_id).await.unwrap();
         let run = s.rebuild_choosing(&pack_id, first).await;
@@ -940,5 +948,37 @@ mod tests {
             assert!(s.drift(&pack_id).await.is_empty(), "kept {kept_before}");
             s.settled().await;
         }
+    }
+
+    /// A `.meta` changed outside OpenDAM, not kept yet, whose asset an exclude already in the
+    /// steps leaves out is a clash offering only discard, never keep yours: the build drops it.
+    #[tokio::test]
+    async fn a_changed_meta_whose_asset_is_excluded_offers_only_discard() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        let log = s.source_of("Textures/T_Log_D.png").await;
+        s.write("Textures/T_Log_D.png.meta", "my meta");
+        s.edit_steps(&pack_id, |steps| {
+            add(steps, PlaceStep::Exclude { source: log })
+        })
+        .await;
+        let found = s.drift(&pack_id).await;
+        assert_eq!(
+            s.seen(&pack_id).await,
+            [(
+                "Textures/T_Log_D.png.meta".into(),
+                Change::Clash,
+                Kind::Extracted,
+                vec![Choice::Discard]
+            )]
+        );
+        assert!(found[0].reason.unwrap().contains("Goes with its file"));
+        let run = s.rebuild_choosing(&pack_id, first).await;
+        s.wait_for(&run.id, "done").await;
+        assert!(!s.live().join("Textures/T_Log_D.png").exists());
+        assert!(!s.live().join("Textures/T_Log_D.png.meta").exists());
+        assert!(s.kept(&pack_id).await.is_empty());
+        assert!(s.drift(&pack_id).await.is_empty());
+        s.settled().await;
     }
 }

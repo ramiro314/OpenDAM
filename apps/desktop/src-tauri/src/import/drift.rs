@@ -173,19 +173,27 @@ impl<'a> Writes<'a> {
     }
 
     /// Why the kept file `row` can't be carried as it is under the recipe now, if it can't.
-    fn clash(&self, row: &ManifestRow) -> Option<&'static str> {
+    ///
+    /// A `.meta` also goes with its asset when an exclude leaves the asset out, but only an
+    /// asset still in the folder (`asset_present`) decides it here: the Rebuild records or turns
+    /// back excludes only for missing files, so this answer is the same before and after its
+    /// edits. A `.meta` of a missing asset follows the asset's answer in `kept` instead.
+    fn clash(&self, row: &ManifestRow, asset_present: bool) -> Option<&'static str> {
         if self.writes(&row.path) {
             return Some(
                 "The build now writes its own file at this path: discard yours, or turn off \
                  the step that writes it to keep yours",
             );
         }
-        // Only the file's own exclude: a `.meta` goes with its asset (`kept`), whose exclude
-        // the Rebuild itself may record or turn back, so it never decides a difference.
-        row.source_path
-            .as_deref()
-            .filter(|source| self.excluded.contains(*source))
-            .map(|_| "An exclude step now leaves this file out, so your copy can't be kept")
+        let source = row.source_path.as_deref()?;
+        if self.excluded.contains(source) {
+            return Some("An exclude step now leaves this file out, so your copy can't be kept");
+        }
+        asset_of_meta(source)
+            .filter(|asset| asset_present && self.excluded.contains(asset))
+            .map(|_| {
+                "Goes with its file, which an exclude step leaves out, so your copy can't be kept"
+            })
     }
 
     fn writes(&self, path: &str) -> bool {
@@ -312,7 +320,19 @@ fn differences(
             Kind::Extracted => matches!(change, Some((Change::Changed, ..))),
             _ => false,
         };
-        let clash = would_keep.then(|| writes.clash(row)).flatten();
+        let asset_present = row
+            .source_path
+            .as_deref()
+            .and_then(asset_of_meta)
+            .and_then(|asset| {
+                manifest.iter().find(|r| {
+                    r.source_path.as_deref() == Some(asset.as_str()) && !r.origin.generated()
+                })
+            })
+            .is_some_and(|asset| on_disk.contains_key(&asset.path));
+        let clash = would_keep
+            .then(|| writes.clash(row, asset_present))
+            .flatten();
         if let Some(reason) = clash {
             let (size, sha256) = match change {
                 Some((_, size, sha256)) => (size, sha256),
