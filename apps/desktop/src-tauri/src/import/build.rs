@@ -75,7 +75,7 @@ impl RunControl {
     }
 
     /// Marks the build locked, past Cancel. False when it was cancelled first.
-    fn lock(&self) -> bool {
+    pub(super) fn lock(&self) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.1 = !state.0;
         state.1
@@ -116,6 +116,12 @@ pub enum Point {
     ClaimFailed,
     /// `Engine::cancel_run`, after it found the run isn't the active one.
     CancelLookup,
+    /// A Remove's journal written, before it deletes anything (`remove`).
+    RemoveJournaled,
+    /// A Remove, after its first batch of deleted files (crash only).
+    RemoveDeleting,
+    /// A Remove's prune done, before its records are deleted (crash only).
+    RemovePruned,
 }
 
 /// Test hooks, as autotag undo's `Crashes`. They do nothing outside tests.
@@ -1246,7 +1252,7 @@ pub(crate) fn file_stamp(path: &Path) -> std::io::Result<(u64, i64)> {
 /// another holder of the advisory lock. Between tries it lets `index_lock` go, so this app's own
 /// commands and index runs aren't held up by another machine. Cancel stops the wait. Locks taken
 /// are returned even when cancelled: `RunControl::lock` decides then.
-async fn both_locks<'l>(
+pub(super) async fn both_locks<'l>(
     env: &BuildEnv<'_>,
     index_lock: &'l tokio::sync::Mutex<()>,
     root: &Path,
@@ -1263,7 +1269,7 @@ async fn both_locks<'l>(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(Stop::Failed(
-                "Another machine is indexing this library; Rebuild again later".to_string(),
+                "Another machine is indexing this library; try again later".to_string(),
             ));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;

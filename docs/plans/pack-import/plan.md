@@ -439,6 +439,22 @@ are the drift's deviations from this plan as written (Edits after an import, A6)
 - **R58 - Remove's drift waits for Remove.** Remove import isn't built yet, so only Rebuild runs
   the drift check.
 
+Revised again 2026-10-24 (revision 24) while building Remove import. No decision
+changed. These are its deviations from the plan as written:
+
+- **R59 - A Remove's drift has no choices.** Its confirmation lists the folder's differences,
+  and the run carries them as seen (path, change, sha256), which its re-check under the lock
+  compares with the folder. A changed file is deleted with its changes, which the confirmation
+  names as lost, and an added file, not in the manifest, stays in the folder. A missing or
+  changed original doesn't refuse a Remove, which reads nothing of it.
+- **R60 - What a Remove deletes beyond the manifest.**
+  - **Build folders.** It deletes the pack's staging, previous and failed folders beside it,
+    since no later open could find them once the pack's records are gone.
+  - **Not above the pack.** Folders above the pack folder stay, even when left empty (the
+    publisher's folder, say).
+  - **Not through a link.** A manifest path that is no regular file now, or that a folder on the
+    way reaches through a link, is left alone.
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:

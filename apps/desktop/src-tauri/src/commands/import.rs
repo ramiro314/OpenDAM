@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use tauri::State;
 
-use crate::import::drift::{Chosen, Difference};
+use crate::import::drift::{Chosen, Difference, Seen};
 use crate::import::engine::ImportRequest;
 use crate::import::original::Located;
 use crate::import::place::PlaceStep;
 use crate::import::records::{ImportSummary, PackSteps, RunSummary, Step};
+use crate::import::remove::RemovePreview;
 use crate::import::scan::{Scan, Tree};
 use crate::import::settings::{self, ImportSettings};
 use crate::import::tools::{self, CacheStatus, ImportTools};
@@ -217,6 +218,36 @@ pub async fn rebuild_import_pack(
     state
         .imports
         .rebuild_pack(&library_id, &pack_id, drift.unwrap_or_default())
+        .await
+}
+
+/// What Remove import would delete in an imported pack, its current build's files with their
+/// origins (kept files among them), and how its folder differs from them now, for the
+/// confirmation. Refused while a run for the pack is queued or running.
+#[tauri::command]
+pub async fn check_import_remove(
+    library_id: String,
+    pack_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RemovePreview> {
+    state.imports.remove_preview(&library_id, &pack_id).await
+}
+
+/// Queues the Remove of an imported pack: it deletes exactly its current build's files and the
+/// folders they leave empty, prunes their rows, and drops the pack's records, and its import's
+/// once no pack is left. `drift` is the folder's differences as `check_import_remove` showed
+/// them. Refused while a run for the pack is queued or running, and when the folder differs
+/// otherwise now.
+#[tauri::command]
+pub async fn remove_import_pack(
+    library_id: String,
+    pack_id: String,
+    drift: Option<Vec<Seen>>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RunSummary> {
+    state
+        .imports
+        .remove_pack(&library_id, &pack_id, drift.unwrap_or_default())
         .await
 }
 

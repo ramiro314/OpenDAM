@@ -6,7 +6,7 @@
 //! The tests sit in a `mod tests` block, as in every other file, so source scans that stop there
 //! (`structure::tests::metadata_writers`) read none of them.
 
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -30,7 +30,7 @@ mod tests {
     const HOUSES_ART: &str = "Houses/Built-In/Built-In_Pack/Pack/Art";
 
     /// A library on disk, so it can be opened again, with an engine started over it.
-    async fn disk() -> Setup {
+    pub(crate) async fn disk() -> Setup {
         setup_in(true, true).await
     }
 
@@ -157,7 +157,7 @@ mod tests {
 
     /// Waits for run `run_id`'s build to crash, then leaves its record as a killed process does:
     /// `running`, owned by a process that is gone, with a heartbeat long stopped.
-    async fn killed(s: &Setup, run_id: &str) {
+    pub(crate) async fn killed(s: &Setup, run_id: &str) {
         let run = s.wait_for(run_id, "failed").await;
         assert_eq!(run.error.as_deref(), Some(STOPPED));
         sqlx::query(
@@ -186,19 +186,19 @@ mod tests {
 
     /// Opens the library again, as a restart or a reconnect does: `db::open_library_db`, which
     /// recovers before it registers anything.
-    async fn reopen(s: &Setup) {
+    pub(crate) async fn reopen(s: &Setup) {
         db::open_library_db(&Default::default(), s.dir.path())
             .await
             .unwrap();
     }
 
-    async fn refresh(s: &Setup) {
+    pub(crate) async fn refresh(s: &Setup) {
         watcher::index_paths(&s.engine.db, "lib", &[root(s)])
             .await
             .unwrap();
     }
 
-    async fn status(s: &Setup, run_id: &str) -> String {
+    pub(crate) async fn status(s: &Setup, run_id: &str) -> String {
         records::run(&s.lib.pool, "lib", run_id)
             .await
             .unwrap()

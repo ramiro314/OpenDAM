@@ -97,7 +97,9 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               commit current_build, settle, or roll back), with test hooks to
                               pause, fail or crash it, carry, which moves rows to their files' new
                               paths and back, recovery, which finishes or undoes a swap a crash or
-                              a dropped task left (recover_swaps), and engine, the durable run
+                              a dropped task left (recover_swaps), remove, Remove import's run
+                              (lock, re-check, journal `removing`, delete the manifest's files,
+                              prune, drop the records), which recovery finishes, and engine, the durable run
                               queue (one run at a time,
                               owner and heartbeat, import:progress and import:updated, Cancel
                               before the lock), behind commands/import.rs, and unity_glb, the
@@ -179,7 +181,8 @@ docs/plans                    Plans for this fork
   by file key, size and sha256, gets that build's mtime, so the index sees it unchanged, moved or
   not, and queues no preview.
 - **In-app edits inside a pack become steps.** `rename_asset`, `delete_asset` and `delete_assets`
-  are the one other way a built pack changes on disk (`import::edits`). Refused while a run for
+  are, with Remove import (below), the one other way a built pack changes on disk
+  (`import::edits`). Refused while a run for
   the pack is queued or running, they rename or trash each file's `.meta` (one in the current
   manifest) right after it, put it back with the rest when a rename fails, and in the
   transaction that moves or deletes the asset rows, bump `recipe_rev`, move or drop each file's
@@ -254,7 +257,17 @@ docs/plans                    Plans for this fork
   `swap_state` set, which refuses its runs and step edits. A pack recovery leaves journaled, that
   way or because a step of it failed, is spared by the `index_paths` run that follows
   (`Prune::Sparing`, see "Locked variants"), and the next recovery tries again. A `removing`
-  pack is left as found until Remove import is built.
+  pack is finished, never undone (below).
+- **A Remove is journaled and always finished.** Remove import queues a `remove` run with the
+  pack folder's outside changes as its confirmation showed them (`import::remove`). Holding both
+  locks, it re-checks that the folder still differs exactly so, then journals `swap_state =
+  'removing'`, deletes exactly the current manifest's files (a file already gone is no error, and
+  none through a link) and the folders they leave empty up to the pack folder, and the build
+  folders beside it, prunes the pack folder's rows with `Prune::Now`, and last, in one
+  transaction, deletes the pack's records and its import's row once no pack is left
+  (`records::delete_pack`). Files added outside OpenDAM stay. Recovery finds a `removing` pack
+  where it finds a `swapping` one and runs those steps again, with no re-check, from the records
+  the Remove kept. A missing or changed original doesn't refuse a Remove.
 - **Pack targets never nest.** No pack's target is an ancestor or a descendant of another's, on
   whole path components (`Pub/Pack` holds `Pub/Pack/Sub` but not `Pub/Package`), so every build,
   swap and Remove touches only its own pack's files. The scan, the import

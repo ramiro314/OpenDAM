@@ -50,6 +50,8 @@ import type {
   ReviewProposal,
   ProposalDecision,
   DriftChosen,
+  DriftSeen,
+  RemovePreview,
   DriftDifference,
   ImportPackSteps,
   ImportRequest,
@@ -301,6 +303,15 @@ export const api = {
    */
   rebuildImportPack: (libraryId: string, packId: string, drift: DriftChosen[] = []) =>
     invoke<ImportRun>('rebuild_import_pack', { libraryId, packId, drift }),
+  /** What Remove import would delete in the pack, and how its folder differs from that now */
+  checkImportRemove: (libraryId: string, packId: string) =>
+    invoke<RemovePreview>('check_import_remove', { libraryId, packId }),
+  /**
+   * Queues the pack's Remove, with its outside changes as the confirmation showed them; refused
+   * while a run for it is live, or when the folder differs otherwise now
+   */
+  removeImportPack: (libraryId: string, packId: string, drift: DriftSeen[]) =>
+    invoke<ImportRun>('remove_import_pack', { libraryId, packId, drift }),
   /** Records one pack's import and queues its first build */
   startImport: (request: ImportRequest) => invoke<ImportRun>('start_import', { request }),
   /** Fails with "Finishing, can't cancel now" once the build holds the library's lock */

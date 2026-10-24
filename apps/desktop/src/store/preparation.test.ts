@@ -8,6 +8,7 @@ import type {
   ImportRun,
   ImportStepRecord,
   ImportSummary,
+  RemovePreview,
 } from '../types';
 import { MISSING, useImportStore } from './imports';
 import {
@@ -32,6 +33,9 @@ import {
   normalizeStep,
   optionFields,
   preparationPack,
+  removeOpen,
+  removeSummary,
+  seenFrom,
   setOption,
   stepLabel,
   stepProblem,
@@ -746,5 +750,121 @@ describe('outside changes', () => {
     api.getImportSteps = async () => read(golden(), 0, {}, ['Pub/Pack/Notes.txt']);
     await store().open('lib', 'p1');
     expect(editor().draft?.kept).toEqual(['Pub/Pack/Notes.txt']);
+  });
+});
+
+describe('Remove import', () => {
+  const editor = () => usePreparationStore.getState().editors.p1;
+  const store = () => usePreparationStore.getState();
+
+  /** A pack of three files, one of them kept, with a changed, an added and a missing file */
+  const preview = (drift = outside()): RemovePreview => ({
+    files: [
+      { path: 'Pub/Pack/Kept.png', origin: 'kept' },
+      { path: 'Pub/Pack/Models/SM_Log.glb', origin: 'generated' },
+      { path: 'Pub/Pack/Readme.txt', origin: 'extracted' },
+    ],
+    drift,
+  });
+
+  test('the confirmation names the kept files, the changes lost and the files left', () => {
+    expect(removeSummary(preview())).toEqual({
+      kept: ['Pub/Pack/Kept.png'],
+      lost: ['Pub/Pack/Readme.txt'],
+      staying: ['Pub/Pack/Notes.txt'],
+      missing: 1,
+    });
+    expect(removeSummary(preview([]))).toEqual({
+      kept: ['Pub/Pack/Kept.png'],
+      lost: [],
+      staying: [],
+      missing: 0,
+    });
+    // The Remove carries each difference as shown, with no choice
+    expect(seenFrom(preview())).toEqual([
+      { path: 'Pub/Pack/Notes.txt', change: 'added', sha256: 'sha-Notes.txt' },
+      { path: 'Pub/Pack/Readme.txt', change: 'changed', sha256: 'sha-Readme.txt' },
+      { path: 'Pub/Pack/Models/SM_Log.glb', change: 'missing', sha256: null },
+    ]);
+  });
+
+  test('Remove import lists what it deletes first, then queues the run with what it showed', async () => {
+    api.getImportSteps = async () => read();
+    api.checkImportRemove = async () => preview();
+    const sent: unknown[] = [];
+    api.removeImportPack = async (libraryId, packId, drift) => {
+      sent.push({ libraryId, packId, drift });
+      return run('r1', packId, { kind: 'remove' });
+    };
+    await store().open('lib', 'p1');
+    store().edit('p1', (d) => toggleStep(d, hoistAt(d.steps), false));
+    await store().askRemove('p1');
+    expect(sent).toEqual([]);
+    expect(removeOpen()).toBe(true);
+    expect(editor().remove?.preview).toEqual(preview());
+
+    expect(await store().confirmRemove('p1')).toBe(true);
+    expect(sent).toEqual([{ libraryId: 'lib', packId: 'p1', drift: seenFrom(preview()) }]);
+    expect(editor().remove).toBeNull();
+    expect(isDirty(editor().draft!)).toBe(false);
+    expect(busyReason(useImportStore.getState().runs, 'lib', 'p1')).toBe(BUSY);
+  });
+
+  test('Cancel closes the confirmation and queues nothing', async () => {
+    api.getImportSteps = async () => read();
+    api.checkImportRemove = async () => preview();
+    let queued = 0;
+    api.removeImportPack = async () => {
+      queued++;
+      return run('r1', 'p1', { kind: 'remove' });
+    };
+    await store().open('lib', 'p1');
+    await store().askRemove('p1');
+    store().closeRemove('p1');
+    expect(removeOpen()).toBe(false);
+    expect(queued).toBe(0);
+  });
+
+  test('while a run for the pack is live, Remove reads nothing and shows why', async () => {
+    api.getImportSteps = async () => read();
+    let calls = 0;
+    api.checkImportRemove = async () => {
+      calls++;
+      return preview();
+    };
+    await store().open('lib', 'p1');
+    useImportStore.setState({ runs: [run('live', 'p1', { status: 'running' })] });
+    await store().askRemove('p1');
+    expect(calls).toBe(0);
+    expect(editor().remove).toBeNull();
+    expect(editor().error).toBe(BUSY);
+  });
+
+  test('a folder that changed since the confirmation shows it again with what it holds now', async () => {
+    api.getImportSteps = async () => read();
+    let found = outside().slice(0, 1);
+    api.checkImportRemove = async () => preview(found);
+    api.removeImportPack = async () => {
+      throw `${DRIFT_STALE}: check it again`;
+    };
+    await store().open('lib', 'p1');
+    await store().askRemove('p1');
+    found = outside();
+    expect(await store().confirmRemove('p1')).toBe(false);
+    expect(editor().remove?.preview).toEqual(preview());
+    expect(editor().remove?.notice).toContain('changed again');
+    expect(editor().saving).toBe(false);
+  });
+
+  test('another refusal keeps the confirmation and shows why', async () => {
+    api.getImportSteps = async () => read();
+    api.checkImportRemove = async () => preview();
+    api.removeImportPack = async () => {
+      throw BUSY;
+    };
+    await store().open('lib', 'p1');
+    await store().askRemove('p1');
+    expect(await store().confirmRemove('p1')).toBe(false);
+    expect(editor().remove?.notice).toBe(BUSY);
   });
 });

@@ -7,7 +7,8 @@
 //! Two tables, each with its own trigger:
 //!
 //! - **`swapping`**, at a library open and at the start of every locking index or structure entry
-//!   point (`watcher::index_paths`, `structure::rebuild_library`).
+//!   point (`watcher::index_paths`, `structure::rebuild_library`). A pack journaled `removing`
+//!   is found at the same points, and its Remove finished (`remove`), never undone.
 //! - **Leftovers** of packs whose `swap_state` is `NULL` (staging, `.failed-*` and `.prev-*`
 //!   folders), only at a library open, skipping every pack with a live run (`live_run`), so no
 //!   refresh deletes the staging folder of a build in progress.
@@ -23,6 +24,7 @@ use sqlx::{Pool, Sqlite};
 use super::build::{self, index_pack, Hooks, Refresh, Rollback, FAILED, PREV, STAGING};
 use super::engine::{now_ms, owner_gone};
 use super::records::{self, Owner};
+use super::remove::Removing;
 use crate::fs_swap;
 use crate::watcher::{self, IndexLock};
 
@@ -97,23 +99,18 @@ pub(super) async fn recover_swaps_with(
     };
     let mut changed = false;
     for pack in &journaled {
-        if pack.swap_state != "swapping" {
-            // Remove import isn't built yet, so nothing journals `removing`: its recovery comes
-            // with it. The pack stays as found, its runs refused.
-            tracing::error!(
-                "Pack {} is journaled {:?}, which this version doesn't recover",
-                pack.target,
-                pack.swap_state
-            );
-            continue;
-        }
-        match recover_swap(pool, root, index_guard, advisory, pack).await {
+        let recovered = match pack.swap_state.as_str() {
+            "removing" => finish_remove(pool, root, index_guard, advisory, pack).await,
+            _ => recover_swap(pool, root, index_guard, advisory, pack).await,
+        };
+        match recovered {
             Ok(recovered) => changed |= recovered,
             Err(e) => {
                 changed = true;
                 tracing::error!(
-                    "Recovering the swap of pack {}: {e}. Its journal stays for the next try",
-                    pack.target
+                    "Recovering pack {} ({}): {e}. Its journal stays for the next try",
+                    pack.target,
+                    pack.swap_state
                 );
             }
         }
@@ -281,6 +278,34 @@ async fn recover_swap(
     Ok(true)
 }
 
+/// A Remove a crash or a failed step interrupted after its journal: its steps 4-6 again, with no
+/// re-check, from the records it kept (`remove::Removing::finish`).
+async fn finish_remove(
+    pool: &Pool<Sqlite>,
+    root: &Path,
+    index_guard: &tokio::sync::MutexGuard<'_, ()>,
+    advisory: &IndexLock,
+    pack: &Journal,
+) -> Result<bool, String> {
+    tracing::warn!("Pack {} was left mid-Remove: finishing it", pack.target);
+    let removing = Removing {
+        pool,
+        root,
+        pack_id: &pack.id,
+        target: &pack.target,
+    };
+    removing
+        .finish(
+            Refresh::Core { root },
+            index_guard,
+            advisory,
+            &Hooks::default(),
+        )
+        .await?;
+    interrupt_runs(pool, &pack.id).await;
+    Ok(true)
+}
+
 fn present(found: bool) -> &'static str {
     if found {
         "present"
@@ -398,9 +423,9 @@ impl Left {
 }
 
 /// A folder left beside a pack whose `swap_state` is `NULL`, with its build id.
-struct Leftover {
+pub(super) struct Leftover {
     kind: Left,
-    folder: PathBuf,
+    pub(super) folder: PathBuf,
     build_id: String,
 }
 
@@ -503,7 +528,7 @@ async fn settle_records(
 /// The staging, failed and previous folders beside the pack folder `live`, in that order. Only a
 /// name ending in a build id (a UUID) counts, so another pack's folder whose name starts the same
 /// way is never taken for one.
-fn left_beside(live: &Path) -> Vec<Leftover> {
+pub(super) fn left_beside(live: &Path) -> Vec<Leftover> {
     let mut found = Vec::new();
     for kind in Left::ALL {
         let tag = kind.tag();
