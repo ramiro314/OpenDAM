@@ -8,7 +8,10 @@
 mod tests {
     use std::io::Read;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    use tokio::sync::mpsc;
 
     use crate::import::engine::tests::{setup, setup_with, Setup, TARGET};
     use crate::import::engine::*;
@@ -284,6 +287,65 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the open never checked the original");
+    }
+
+    #[tokio::test]
+    async fn startup_checks_every_original() {
+        let s = setup().await;
+        let (original, _) = s.import_copy().await;
+        std::fs::remove_file(&original.path).unwrap();
+
+        // The next start of OpenDAM: a new engine over the same libraries.
+        let events: Arc<Mutex<Vec<ImportEvent>>> = Default::default();
+        let sink = events.clone();
+        let (worker, _requests) = mpsc::channel(16);
+        let engine = Engine::with_options(
+            s.engine.db.clone(),
+            Arc::new(move |event| sink.lock().unwrap().push(event)),
+            Duration::from_secs(2),
+            s.cache.path().to_path_buf(),
+            worker,
+        );
+        tokio::spawn(engine.start());
+        for _ in 0..500 {
+            if s.strings("SELECT original_state FROM imports").await == ["missing"] {
+                let announced = ImportEvent::OriginalsChanged("lib".into());
+                assert!(events.lock().unwrap().contains(&announced));
+                assert!(!s.announced(), "only the new engine checked");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the start never checked the original");
+    }
+
+    #[tokio::test]
+    async fn rebuild_checks_its_original_first() {
+        let s = setup().await;
+        let (original, pack) = s.import_copy().await;
+
+        // Recorded missing, but back at its path: the Rebuild's own check finds it.
+        sqlx::query("UPDATE imports SET original_state = 'missing'")
+            .execute(&s.lib.pool)
+            .await
+            .unwrap();
+        s.rebuild_until(&pack, "done").await;
+        assert_eq!(
+            s.strings("SELECT original_state FROM imports").await,
+            ["ok"]
+        );
+
+        // Recorded ok, but gone since: refused without the Imports view's check.
+        let moved = original.path.with_extension("moved");
+        std::fs::rename(&original.path, &moved).unwrap();
+        assert_eq!(
+            s.engine.rebuild_pack("lib", &pack).await.unwrap_err(),
+            MISSING
+        );
+        assert_eq!(
+            s.strings("SELECT original_state FROM imports").await,
+            ["missing"]
+        );
     }
 
     #[tokio::test]
