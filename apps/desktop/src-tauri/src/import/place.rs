@@ -50,12 +50,22 @@ impl fmt::Display for PlaceStep {
 /// Runs `steps` in order over the tree at `root`, whose files `files` lists, and keeps `files`
 /// in step with it, sorted by path.
 pub fn place(root: &Path, files: &mut Vec<ExtractedFile>, steps: &[PlaceStep]) -> Result<()> {
+    place_in(Tree::Disk(root), files, steps)
+}
+
+/// Runs `steps` over `files` alone, as `place` would over a tree holding exactly those files,
+/// moving nothing on disk: an import's scan previews a build with it (`super::scan`).
+pub fn place_listed(files: &mut Vec<ExtractedFile>, steps: &[PlaceStep]) -> Result<()> {
+    place_in(Tree::Listed, files, steps)
+}
+
+fn place_in(tree: Tree, files: &mut Vec<ExtractedFile>, steps: &[PlaceStep]) -> Result<()> {
     for step in steps {
         let result = match step {
-            PlaceStep::Flatten => flatten(root, files),
-            PlaceStep::Hoist { folder } => hoist(root, files, folder),
-            PlaceStep::Rename { source, name } => rename(root, files, source, name),
-            PlaceStep::Exclude { source } => exclude(root, files, source),
+            PlaceStep::Flatten => flatten(tree, files),
+            PlaceStep::Hoist { folder } => hoist(tree, files, folder),
+            PlaceStep::Rename { source, name } => rename(tree, files, source, name),
+            PlaceStep::Exclude { source } => exclude(tree, files, source),
         };
         result.map_err(|err| anyhow!("{step}: {err:#}"))?;
     }
@@ -63,26 +73,119 @@ pub fn place(root: &Path, files: &mut Vec<ExtractedFile>, steps: &[PlaceStep]) -
     Ok(())
 }
 
-fn flatten(root: &Path, files: &mut Vec<ExtractedFile>) -> Result<()> {
-    while let Some(folder) = wrapper(root)? {
-        merge(root, files, &folder)?;
+/// The tree a place step works on: on disk below a folder, or only the file list (`Listed`),
+/// whose folders are those holding a file. Its moves are no-ops: the steps keep the list.
+#[derive(Clone, Copy)]
+enum Tree<'a> {
+    Disk(&'a Path),
+    Listed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    File,
+    Folder,
+    /// A link or another special file, on disk.
+    Other,
+}
+
+impl Tree<'_> {
+    /// The names directly in `folder` (`""` for the root), with their kinds.
+    fn entries(self, files: &[ExtractedFile], folder: &str) -> Result<Vec<(String, Kind)>> {
+        let root = match self {
+            Tree::Disk(root) => root,
+            Tree::Listed => {
+                let mut names = std::collections::BTreeMap::new();
+                for file in files {
+                    let rest = if folder.is_empty() {
+                        Some(file.path.as_str())
+                    } else {
+                        below(&file.path, folder).filter(|r| !r.is_empty())
+                    };
+                    match rest.map(|rest| rest.split_once('/')) {
+                        Some(Some((dir, _))) => names.insert(dir.to_string(), Kind::Folder),
+                        Some(None) => names.insert(rest.unwrap().to_string(), Kind::File),
+                        None => None,
+                    };
+                }
+                return Ok(names.into_iter().collect());
+            }
+        };
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(root.join(folder))? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let kind = if kind.is_dir() {
+                Kind::Folder
+            } else if kind.is_file() {
+                Kind::File
+            } else {
+                Kind::Other
+            };
+            entries.push((entry.file_name().to_string_lossy().into_owned(), kind));
+        }
+        Ok(entries)
+    }
+
+    /// What is at `path`, if anything.
+    fn kind(self, files: &[ExtractedFile], path: &str) -> Option<Kind> {
+        match self {
+            Tree::Disk(root) => {
+                let meta = root.join(path).symlink_metadata().ok()?;
+                Some(if meta.is_dir() {
+                    Kind::Folder
+                } else if meta.is_file() {
+                    Kind::File
+                } else {
+                    Kind::Other
+                })
+            }
+            Tree::Listed => files.iter().find_map(|f| match below(&f.path, path)? {
+                "" => Some(Kind::File),
+                _ => Some(Kind::Folder),
+            }),
+        }
+    }
+
+    fn rename(self, from: &str, to: &str) -> std::io::Result<()> {
+        match self {
+            Tree::Disk(root) => fs::rename(root.join(from), root.join(to)),
+            Tree::Listed => Ok(()),
+        }
+    }
+
+    fn remove_file(self, path: &str) -> std::io::Result<()> {
+        match self {
+            Tree::Disk(root) => fs::remove_file(root.join(path)),
+            Tree::Listed => Ok(()),
+        }
+    }
+
+    fn remove_dir(self, path: &str) -> std::io::Result<()> {
+        match self {
+            Tree::Disk(root) => fs::remove_dir(root.join(path)),
+            Tree::Listed => Ok(()),
+        }
+    }
+}
+
+fn flatten(tree: Tree, files: &mut Vec<ExtractedFile>) -> Result<()> {
+    while let Some(folder) = wrapper(tree, files)? {
+        merge(tree, files, &folder)?;
     }
     Ok(())
 }
 
 /// The root's only folder, when nothing else there is an asset. Hidden entries don't count.
-fn wrapper(root: &Path) -> Result<Option<String>> {
+fn wrapper(tree: Tree, files: &[ExtractedFile]) -> Result<Option<String>> {
     let mut folders = Vec::new();
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for (name, kind) in tree.entries(files, "")? {
         if name.starts_with('.') {
             continue;
         }
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
+        if kind == Kind::Folder {
             folders.push(name);
-        } else if kind.is_file() && !is_loose(&name) {
+        } else if kind == Kind::File && !is_loose(&name) {
             return Ok(None);
         }
     }
@@ -100,37 +203,35 @@ fn is_loose(name: &str) -> bool {
     is_package_file(name) || LOOSE.iter().any(|l| ext.eq_ignore_ascii_case(l))
 }
 
-fn hoist(root: &Path, files: &mut Vec<ExtractedFile>, folder: &str) -> Result<()> {
+fn hoist(tree: Tree, files: &mut Vec<ExtractedFile>, folder: &str) -> Result<()> {
     let folder = match clean(folder) {
         Ok(parts) if !parts.is_empty() => parts.join("/"),
         _ => bail!("invalid folder {folder:?}"),
     };
-    match root.join(&folder).symlink_metadata() {
-        Ok(meta) if meta.is_dir() => merge(root, files, &folder),
+    match tree.kind(files, &folder) {
+        Some(Kind::Folder) => merge(tree, files, &folder),
         _ => Ok(()),
     }
 }
 
-/// Moves the contents of `folder` (relative to `root`) into `root`, then removes it and its own
-/// `.meta`. It checks every name first and moves nothing when one would land on an existing file
-/// or folder.
-fn merge(root: &Path, files: &mut Vec<ExtractedFile>, folder: &str) -> Result<()> {
-    let from = root.join(folder);
+/// Moves the contents of `folder` into the root, then removes it and its own `.meta`. It checks
+/// every name first and moves nothing when one would land on an existing file or folder.
+fn merge(tree: Tree, files: &mut Vec<ExtractedFile>, folder: &str) -> Result<()> {
     let own_meta = format!("{folder}.meta");
-    let mut kids = Vec::new();
-    for entry in fs::read_dir(&from)? {
-        kids.push(entry?.file_name());
-    }
+    let mut kids: Vec<String> = tree
+        .entries(files, folder)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
     kids.sort();
     // A kid named like the folder itself lands where the folder was, once it has moved aside.
     let mut self_named = false;
     let mut clashes = Vec::new();
     for kid in &kids {
-        let to = root.join(kid);
-        if to == from {
+        if *kid == folder {
             self_named = true;
-        } else if to != root.join(&own_meta) && to.symlink_metadata().is_ok() {
-            clashes.push(kid.to_string_lossy().into_owned());
+        } else if *kid != own_meta && tree.kind(files, kid).is_some() {
+            clashes.push(kid.clone());
         }
     }
     if !clashes.is_empty() {
@@ -140,32 +241,33 @@ fn merge(root: &Path, files: &mut Vec<ExtractedFile>, folder: &str) -> Result<()
         );
     }
 
-    if root.join(&own_meta).is_file() {
-        fs::remove_file(root.join(&own_meta))?;
+    if tree.kind(files, &own_meta) == Some(Kind::File) {
+        tree.remove_file(&own_meta)?;
         files.retain(|f| f.path != own_meta);
     }
-    let mut src = from.clone();
+    let mut src = folder.to_string();
     if self_named {
         src = (0..)
-            .map(|n| root.join(format!(".opendam-merge-{n}")))
-            .find(|p| p.symlink_metadata().is_err())
+            .map(|n| format!(".opendam-merge-{n}"))
+            .find(|p| tree.kind(files, p).is_none())
             .unwrap();
-        fs::rename(&from, &src).with_context(|| format!("moving {folder} aside"))?;
+        tree.rename(folder, &src)
+            .with_context(|| format!("moving {folder} aside"))?;
     }
     for kid in &kids {
-        fs::rename(src.join(kid), root.join(kid))
-            .with_context(|| format!("moving {}", kid.to_string_lossy()))?;
+        tree.rename(&join(&src, kid), kid)
+            .with_context(|| format!("moving {kid}"))?;
     }
-    fs::remove_dir(&src)?;
+    tree.remove_dir(&src)?;
     for file in files.iter_mut() {
         if let Some(rest) = below(&file.path, folder).filter(|r| !r.is_empty()) {
             file.path = rest.to_string();
         }
     }
-    remove_empty_parents(root, parent(folder))
+    remove_empty_parents(tree, parent(folder))
 }
 
-fn rename(root: &Path, files: &mut [ExtractedFile], source: &[String], name: &str) -> Result<()> {
+fn rename(tree: Tree, files: &mut [ExtractedFile], source: &[String], name: &str) -> Result<()> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') {
         bail!("invalid file name {name:?}");
     }
@@ -180,18 +282,19 @@ fn rename(root: &Path, files: &mut [ExtractedFile], source: &[String], name: &st
         moves.push((meta, files[meta].path.clone(), format!("{new}.meta")));
     }
     for (_, _, new) in &moves {
-        if root.join(new).symlink_metadata().is_ok() {
+        if tree.kind(files, new).is_some() {
             bail!("{new} already exists");
         }
     }
     for (i, old, new) in moves {
-        fs::rename(root.join(&old), root.join(&new)).with_context(|| format!("moving {old}"))?;
+        tree.rename(&old, &new)
+            .with_context(|| format!("moving {old}"))?;
         files[i].path = new;
     }
     Ok(())
 }
 
-fn exclude(root: &Path, files: &mut Vec<ExtractedFile>, source: &[String]) -> Result<()> {
+fn exclude(tree: Tree, files: &mut Vec<ExtractedFile>, source: &[String]) -> Result<()> {
     let file = find(files, source)?;
     let meta = find(files, &meta_source(source)).ok();
     let gone: Vec<String> = [Some(file), meta]
@@ -200,10 +303,11 @@ fn exclude(root: &Path, files: &mut Vec<ExtractedFile>, source: &[String]) -> Re
         .map(|i| files[i].path.clone())
         .collect();
     for path in &gone {
-        fs::remove_file(root.join(path)).with_context(|| format!("removing {path}"))?;
+        tree.remove_file(path)
+            .with_context(|| format!("removing {path}"))?;
     }
     files.retain(|f| !gone.contains(&f.path));
-    remove_empty_parents(root, parent(&gone[0]))
+    remove_empty_parents(tree, parent(&gone[0]))
 }
 
 /// The index of the file with this source path.
@@ -227,8 +331,12 @@ fn parent(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
-/// Removes `folder` and each folder above it, below `root`, while it is empty.
-fn remove_empty_parents(root: &Path, mut folder: &str) -> Result<()> {
+/// Removes `folder` and each folder above it, below the root, while it is empty. A listed tree
+/// has no empty folder.
+fn remove_empty_parents(tree: Tree, mut folder: &str) -> Result<()> {
+    let Tree::Disk(root) = tree else {
+        return Ok(());
+    };
     while !folder.is_empty() {
         let path = root.join(folder);
         if !fs::read_dir(&path).is_ok_and(|mut entries| entries.next().is_none()) {
@@ -605,6 +713,70 @@ mod tests {
             );
             assert_eq!(paths(&files), layout);
             assert_eq!(on_disk(tmp.path()), layout);
+        }
+    }
+
+    #[test]
+    fn a_listed_tree_places_exactly_as_the_disk() {
+        let rename = |src: &str, name: &str| PlaceStep::Rename {
+            source: source(&[src]),
+            name: name.into(),
+        };
+        let hoist = |folder: &str| PlaceStep::Hoist {
+            folder: folder.into(),
+        };
+        let exclude = |src: &str| PlaceStep::Exclude {
+            source: source(&[src]),
+        };
+        let synthetic_cases = vec![
+            flatten_and_hoist_art(),
+            vec![hoist("Meshes"), PlaceStep::Flatten],
+            vec![
+                rename(ROCK, "T_Boulder.png"),
+                PlaceStep::Flatten,
+                hoist("Art"),
+            ],
+            vec![
+                PlaceStep::Flatten,
+                rename(README, "T_Rock.png"),
+                hoist("Art"),
+            ],
+            vec![exclude(README), PlaceStep::Flatten, exclude(ROCK)],
+            vec![exclude("Assets/Pack/Gone.png")],
+            vec![PlaceStep::Flatten, hoist("../x")],
+        ];
+        let mut cases: Vec<(Option<&[&str]>, Vec<PlaceStep>)> =
+            synthetic_cases.into_iter().map(|s| (None, s)).collect();
+        let layouts: [&[&str]; 5] = [
+            &["Readme.txt", "Wrap/Readme.txt", "Wrap/x.fbx"],
+            &["Pack.meta", "Pack/Pack.meta", "Pack/Pack/x.fbx"],
+            &[
+                "Readme.md",
+                "DataPackage.json",
+                ".hidden.fbx",
+                "Wrap.meta",
+                "Wrap/Inner/x.fbx",
+            ],
+            &["Docs/a.txt", "Wrap/x.fbx"],
+            &["a.png", "a.png.meta", "b.png.meta"],
+        ];
+        for layout in layouts {
+            cases.push((Some(layout), vec![PlaceStep::Flatten]));
+            cases.push((Some(layout), vec![rename("a.png", "b.png")]));
+        }
+
+        for (layout, steps) in cases {
+            let (tmp, mut on_disk) = match layout {
+                Some(layout) => tree(layout),
+                None => synthetic(),
+            };
+            let mut listed = on_disk.clone();
+            let disk = place(tmp.path(), &mut on_disk, &steps).map_err(|e| e.to_string());
+            let list = place_listed(&mut listed, &steps).map_err(|e| e.to_string());
+            assert_eq!(list, disk, "{layout:?} {steps:?}");
+            if disk.is_ok() {
+                assert_eq!(listed, on_disk, "{layout:?} {steps:?}");
+            }
         }
     }
 }

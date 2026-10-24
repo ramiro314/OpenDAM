@@ -6,6 +6,7 @@ pub mod engine;
 pub mod metadata;
 pub mod place;
 pub mod records;
+pub mod scan;
 pub mod unitypackage;
 pub mod zipfile;
 

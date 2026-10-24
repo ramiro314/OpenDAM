@@ -856,11 +856,7 @@ async fn write_package(
         total: 0,
     });
     if let Some(path) = metadata::clash(files) {
-        return Err(Stop::Failed(format!(
-            "The original holds its own {path} where the metadata step writes {}: turn the step \
-             off to keep it",
-            metadata::FILE
-        )));
+        return Err(Stop::Failed(metadata::clash_message(path)));
     }
     let kenney = match metadata::license_file(files) {
         Some(file) if step.preset == metadata::Preset::Kenney => {

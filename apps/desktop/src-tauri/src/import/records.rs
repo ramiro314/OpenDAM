@@ -115,7 +115,7 @@ pub async fn runs(pool: &Pool<Sqlite>, library_id: &str) -> sqlx::Result<Vec<Run
 pub type Owner = crate::watcher::ProcessIdentity;
 
 /// A step as the caller gives it, before it is stored.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StepRecord {
     pub kind: String,
     pub options: Value,
@@ -230,6 +230,89 @@ pub async fn create_import(
     .await?;
     tx.commit().await?;
     Ok(Ok(run_id))
+}
+
+/// The publisher of the library's latest import, or `""` before its first. A Kenney import's
+/// publisher is the preset's own, never one you chose, so it is passed over.
+pub async fn last_publisher(pool: &Pool<Sqlite>) -> sqlx::Result<String> {
+    let publisher: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT json_extract(s.options, '$.publisher') FROM import_steps s
+         JOIN import_packs p ON p.id = s.pack_id JOIN imports i ON i.id = p.import_id
+         WHERE s.kind = 'metadata' AND json_extract(s.options, '$.publisher') IS NOT NULL
+         AND json_extract(s.options, '$.preset') IS NOT 'kenney'
+         ORDER BY i.created_at DESC, i.rowid DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(publisher.flatten().unwrap_or_default())
+}
+
+/// Why `set_target` left a pack's target as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetRefused {
+    /// The library has no such pack.
+    NoPack,
+    /// Another pack's target nests with the new one.
+    Nests(String),
+    /// A run for the pack is queued or running.
+    Running,
+    /// The pack has a committed build, or a swap or Remove under way.
+    Built,
+}
+
+/// Another pack than `?2` whose target is `?1`, or an ancestor or descendant of it.
+const NESTING_OTHER: &str = "SELECT target FROM import_packs WHERE id <> ?2 AND (target = ?1
+    OR substr(?1, 1, length(target) + 1) = target || '/'
+    OR substr(target, 1, length(?1) + 1) = ?1 || '/')";
+
+/// A queued or running run of pack `?2`.
+const LIVE_RUN: &str = "SELECT 1 FROM import_runs r, json_each(r.packs) j
+    WHERE r.status IN ('queued', 'running') AND json_extract(j.value, '$.packId') = ?2";
+
+/// Moves pack `pack_id`'s target to `target`, in one statement that checks it nests with no
+/// other pack's, no run for the pack is queued or running, and the pack has never been built:
+/// moving a built pack's folder is a rebuild's work.
+pub async fn set_target(
+    pool: &Pool<Sqlite>,
+    pack_id: &str,
+    target: &str,
+) -> sqlx::Result<Result<(), TargetRefused>> {
+    let moved = sqlx::query(&format!(
+        "UPDATE import_packs SET target = ?1 WHERE id = ?2 AND current_build IS NULL
+         AND swap_state IS NULL AND NOT EXISTS ({NESTING_OTHER}) AND NOT EXISTS ({LIVE_RUN})"
+    ))
+    .bind(target)
+    .bind(pack_id)
+    .execute(pool)
+    .await?;
+    if moved.rows_affected() == 1 {
+        return Ok(Ok(()));
+    }
+    let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM import_packs WHERE id = ?")
+        .bind(pack_id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_none() {
+        return Ok(Err(TargetRefused::NoPack));
+    }
+    let other: Option<String> = sqlx::query_scalar(NESTING_OTHER)
+        .bind(target)
+        .bind(pack_id)
+        .fetch_optional(pool)
+        .await?;
+    if let Some(other) = other {
+        return Ok(Err(TargetRefused::Nests(other)));
+    }
+    let running: Option<i64> = sqlx::query_scalar(LIVE_RUN)
+        .bind(target)
+        .bind(pack_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(Err(if running.is_some() {
+        TargetRefused::Running
+    } else {
+        TargetRefused::Built
+    }))
 }
 
 /// A pack's recipe as a build reads it.
