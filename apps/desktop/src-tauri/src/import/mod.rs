@@ -5,6 +5,8 @@ pub mod carry;
 pub mod engine;
 pub mod place;
 pub mod records;
+pub mod settings;
+pub mod unity_glb;
 pub mod unitypackage;
 pub mod zipfile;
 

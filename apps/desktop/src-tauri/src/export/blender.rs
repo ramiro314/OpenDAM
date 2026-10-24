@@ -615,7 +615,7 @@ async fn publish(staged: &Path, output: &Path) -> Result<(), String> {
 }
 
 /// Why a Blender job left no result: its status and the last lines it printed.
-fn crashed(output: &std::process::Output) -> String {
+pub(crate) fn crashed(output: &std::process::Output) -> String {
     let printed = [&output.stderr, &output.stdout]
         .into_iter()
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())

@@ -28,6 +28,7 @@ use tokio::sync::Notify;
 use super::build::{self, BuildEnv, Hooks, Point, Progress, RunControl, Stop};
 use super::place::PlaceStep;
 use super::records::{self, NewImport, Owner, PackSteps, QueuedPack, RunSummary, Step, StepRecord};
+use super::unity_glb;
 use crate::db::{Database, LibraryHandle};
 
 const HEARTBEAT: Duration = Duration::from_secs(30);
@@ -105,6 +106,11 @@ pub struct Engine {
     owner: Owner,
     hooks: Hooks,
     lock_wait: Duration,
+    /// The conversion cache (`unity_glb::default_cache_dir`).
+    cache_dir: PathBuf,
+    /// The systemd tools a test runs Blender's scope through.
+    #[cfg(test)]
+    systemd: Mutex<Option<crate::capped::Systemd>>,
     /// Runs whose Cancel was accepted while their claim failed. Their next attempt starts
     /// cancelled, so the build stops before it changes anything.
     pending_cancels: Mutex<HashSet<String>>,
@@ -112,10 +118,15 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(db: Arc<Database>, events: EventSink) -> Arc<Self> {
-        Self::with_lock_wait(db, events, LOCK_WAIT)
+        Self::with_options(db, events, LOCK_WAIT, unity_glb::default_cache_dir())
     }
 
-    fn with_lock_wait(db: Arc<Database>, events: EventSink, lock_wait: Duration) -> Arc<Self> {
+    fn with_options(
+        db: Arc<Database>,
+        events: EventSink,
+        lock_wait: Duration,
+        cache_dir: PathBuf,
+    ) -> Arc<Self> {
         Arc::new(Engine {
             db,
             events,
@@ -125,12 +136,20 @@ impl Engine {
             owner: crate::watcher::this_process(),
             hooks: Hooks::default(),
             lock_wait,
+            cache_dir,
+            #[cfg(test)]
+            systemd: Mutex::new(None),
         })
     }
 
     #[cfg(test)]
     pub fn hooks(&self) -> &Hooks {
         &self.hooks
+    }
+
+    #[cfg(test)]
+    pub fn set_systemd(&self, systemd: crate::capped::Systemd) {
+        *self.systemd.lock().unwrap() = Some(systemd);
     }
 
     /// Marks the runs of gone owners `interrupted`, then runs queued runs one at a time, for good.
@@ -336,6 +355,7 @@ impl Engine {
             run.id.clone(),
             latest.clone(),
         )));
+        let tools = self.tools().await;
         let mut warnings = Vec::new();
         let mut outcome = Ok(());
         for pack in &run.packs {
@@ -362,6 +382,7 @@ impl Engine {
                 hooks: &self.hooks,
                 progress,
                 lock_wait: self.lock_wait,
+                tools: tools.clone(),
             };
             outcome = match run.kind.as_str() {
                 "import" | "rebuild" => {
@@ -535,10 +556,7 @@ impl Engine {
         } else {
             "extract_unitypackage"
         };
-        let mut steps = vec![StepRecord {
-            kind: extract_kind.into(),
-            options: extract.into(),
-        }];
+        let mut steps = vec![StepRecord::new(extract_kind, extract.into())];
         let place = request.place.unwrap_or_else(|| match preset {
             "fab" => vec![
                 PlaceStep::Flatten,
@@ -550,10 +568,16 @@ impl Engine {
             _ => vec![PlaceStep::Flatten],
         });
         steps.extend(place.iter().map(StepRecord::place));
-        steps.push(StepRecord {
-            kind: "metadata".into(),
-            options: json!({ "preset": preset, "publisher": publisher }),
-        });
+        // A Unity pack's GLBs, off with the reason shown when there's no Blender to make them.
+        if extract_kind == "extract_unitypackage" {
+            let mut convert = StepRecord::new("unity_glb", unity_glb::Options::default_json());
+            convert.enabled = self.tools().await.unavailable().await.is_none();
+            steps.push(convert);
+        }
+        steps.push(StepRecord::new(
+            "metadata",
+            json!({ "preset": preset, "publisher": publisher }),
+        ));
         let source = [variant, subpath.as_deref()]
             .into_iter()
             .flatten()
@@ -585,12 +609,30 @@ impl Engine {
     }
 
     /// Pack `pack_id`'s steps in order, with its `recipe_rev`.
+    /// Names each step kind that can't run here, with why.
     pub async fn pack_steps(&self, library_id: &str, pack_id: &str) -> Result<PackSteps, String> {
         let library = self.library(library_id).await?;
-        records::steps(&library.pool, pack_id)
+        let mut steps = records::steps(&library.pool, pack_id)
             .await
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| refused(records::Refused::NoPack))
+            .ok_or_else(|| refused(records::Refused::NoPack))?;
+        if steps.steps.iter().any(|s| s.kind == "unity_glb") {
+            if let Some(why) = self.tools().await.unavailable().await {
+                steps.unavailable.insert("unity_glb".into(), why);
+            }
+        }
+        Ok(steps)
+    }
+
+    /// What a run's convert phase runs with, from Settings now.
+    async fn tools(&self) -> unity_glb::Tools {
+        #[allow(unused_mut)]
+        let mut tools = unity_glb::Tools::load(&self.db.master_pool, self.cache_dir.clone()).await;
+        #[cfg(test)]
+        if let Some(systemd) = self.systemd.lock().unwrap().clone() {
+            tools.systemd = systemd;
+        }
+        tools
     }
 
     /// Replaces pack `pack_id`'s steps (turning one off or on, changing its options) and bumps
@@ -776,6 +818,10 @@ async fn check_target(pool: &Pool<Sqlite>, root: &Path, target: &str) -> Result<
 mod rebuild_tests;
 
 #[cfg(test)]
+#[path = "unity_glb_tests.rs"]
+mod unity_glb_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::{memory_database, memory_library_pool};
@@ -788,6 +834,8 @@ mod tests {
 
     pub(super) struct Setup {
         pub(super) dir: tempfile::TempDir,
+        /// The engine's conversion cache.
+        pub(super) cache: tempfile::TempDir,
         pub(super) lib: LibraryHandle,
         pub(super) engine: Arc<Engine>,
         pub(super) events: Arc<Mutex<Vec<ImportEvent>>>,
@@ -989,18 +1037,31 @@ mod tests {
         ] {
             sqlx::query(sql).execute(&lib.pool).await.unwrap();
         }
+        // No Blender, unless a test gives one (`unity_glb_tests`): imports leave `unity_glb` off.
+        crate::export::settings::update(
+            &db.master_pool,
+            json!({"blenderPath": "/nonexistent/opendam-test/blender"}),
+        )
+        .await
+        .unwrap();
+        let cache = tempfile::Builder::new()
+            .prefix("opendam-import-cache-")
+            .tempdir()
+            .unwrap();
         let events: Arc<Mutex<Vec<ImportEvent>>> = Default::default();
         let sink = events.clone();
-        let engine = Engine::with_lock_wait(
+        let engine = Engine::with_options(
             db,
             Arc::new(move |event| sink.lock().unwrap().push(event)),
             Duration::from_secs(2),
+            cache.path().to_path_buf(),
         );
         if start {
             tokio::spawn(engine.clone().start());
         }
         Setup {
             dir,
+            cache,
             lib,
             engine,
             events,
