@@ -348,6 +348,8 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::import::set_import_steps,
             commands::import::check_import_drift,
             commands::import::rebuild_import_pack,
+            commands::import::check_import_remove,
+            commands::import::remove_import_pack,
             commands::import::get_import_settings,
             commands::import::set_import_settings,
             commands::import::get_import_tools,

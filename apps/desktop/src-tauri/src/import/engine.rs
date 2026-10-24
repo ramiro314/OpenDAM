@@ -34,6 +34,7 @@ use super::records::{
     self, ImportSummary, NewImport, Owner, PackSteps, QueuedPack, RunSummary, Step, StepRecord,
     TargetRefused,
 };
+use super::remove;
 use super::scan::{self, Scan};
 use super::tools;
 use super::unity_glb;
@@ -538,9 +539,13 @@ impl Engine {
                     }
                     Err(e) => Err(Stop::Failed(e)),
                 },
+                "remove" => match queued_seen(library, &run.id, &pack.pack_id).await {
+                    Ok(seen) => remove::remove(&env, &pack.pack_id, pack.recipe_rev, &seen).await,
+                    Err(e) => Err(Stop::Failed(e)),
+                },
                 other => Err(Stop::Failed(format!("{other} runs can't run yet"))),
             };
-            if let Err(Stop::Failed(_)) = &outcome {
+            if let (Err(Stop::Failed(_)), false) = (&outcome, run.kind == "remove") {
                 let _ = sqlx::query(
                     "UPDATE import_packs SET status = 'failed'
                      WHERE id = ? AND current_build IS NULL",
@@ -1161,6 +1166,89 @@ impl Engine {
         self.wake.notify_one();
         Ok(run)
     }
+
+    /// What a Remove of pack `pack_id` would delete, its current manifest's files, and how its
+    /// folder differs from them now, for the confirmation.
+    pub async fn remove_preview(
+        &self,
+        library_id: &str,
+        pack_id: &str,
+    ) -> Result<remove::RemovePreview, String> {
+        let library = self.library(library_id).await?;
+        busy(&library, pack_id).await?;
+        Ok(remove::preview(&library.pool, &library.root_path, pack_id)
+            .await?
+            .0)
+    }
+
+    /// Queues a Remove of pack `pack_id` with `seen`, the outside changes its confirmation
+    /// showed. Refused while a run for the pack is queued or running, and unless `seen` lists
+    /// exactly the differences its folder has now (`drift::STALE`). A missing or changed
+    /// original doesn't refuse it: a Remove reads nothing of the original.
+    pub async fn remove_pack(
+        &self,
+        library_id: &str,
+        pack_id: &str,
+        seen: Vec<drift::Seen>,
+    ) -> Result<RunSummary, String> {
+        let library = self.library(library_id).await?;
+        // A pack mid-Remove reads as busy, not as changed outside OpenDAM.
+        if busy(&library, pack_id).await? {
+            return Err(refused(records::Refused::Busy));
+        }
+        let (preview, read_at) =
+            remove::preview(&library.pool, &library.root_path, pack_id).await?;
+        if drift::unseen(&preview.drift, &seen).is_some() {
+            return Err(drift::STALE.into());
+        }
+        let run_id = records::queue_remove(
+            &library.pool,
+            pack_id,
+            &self.owner,
+            now_ms(),
+            &json!(seen),
+            read_at,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|refusal| match refusal {
+            // The manifest may have moved with the steps (an in-app rename): check again
+            records::Refused::Stale => drift::STALE.to_string(),
+            other => refused(other),
+        })?;
+        let run = records::run(&library.pool, &library.id, &run_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        (self.events)(ImportEvent::Updated(run.clone()));
+        self.wake.notify_one();
+        Ok(run)
+    }
+}
+
+/// Whether pack `pack_id` is busy: a run for it is queued or running, or a swap or Remove is
+/// journaled. Refused when the library has no such pack.
+async fn busy(library: &LibraryHandle, pack_id: &str) -> Result<bool, String> {
+    let busy: Option<bool> = sqlx::query_scalar(&format!(
+        "SELECT {} FROM import_packs WHERE id = ?",
+        records::BUSY
+    ))
+    .bind(pack_id)
+    .fetch_optional(&library.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    busy.ok_or_else(|| refused(records::Refused::NoPack))
+}
+
+/// The outside changes Remove run `run_id` was queued with for pack `pack_id`.
+async fn queued_seen(
+    library: &LibraryHandle,
+    run_id: &str,
+    pack_id: &str,
+) -> Result<Vec<drift::Seen>, String> {
+    let drift = records::run_drift(&library.pool, run_id, pack_id)
+        .await
+        .map_err(|e| format!("Database error: {e}"))?;
+    serde_json::from_value(drift).map_err(|e| format!("The run's outside changes are invalid: {e}"))
 }
 
 /// The drift choices run `run_id` was queued with for pack `pack_id`.
@@ -1401,6 +1489,10 @@ mod metadata_tests;
 #[cfg(test)]
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
+
+#[cfg(test)]
+#[path = "remove_tests.rs"]
+mod remove_tests;
 
 #[cfg(test)]
 #[path = "edits_tests.rs"]

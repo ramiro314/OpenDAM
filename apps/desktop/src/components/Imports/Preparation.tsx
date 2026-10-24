@@ -33,7 +33,7 @@ interface Props {
 
 /**
  * An imported pack's Preparation: its original, its target, its steps in order with their
- * toggles and options, the latest run's warnings, and Rebuild. The pack's details and the
+ * toggles and options, the latest run's warnings, Rebuild and Remove import. The pack's details and the
  * Imports view open this same editor, which holds its edits by pack id.
  */
 export function Preparation({ libraryId, pack, originalPath, runShown = false }: Props) {
@@ -146,7 +146,7 @@ export function Preparation({ libraryId, pack, originalPath, runShown = false }:
 
       {run && run.status === 'failed' && run.error && (
         <span className={styles.errorText} data-prep-run-error>
-          The last build failed: {run.error}
+          {run.kind === 'remove' ? 'The Remove failed' : 'The last build failed'}: {run.error}
         </span>
       )}
       {run && run.warnings.length > 0 && (
@@ -191,6 +191,15 @@ export function Preparation({ libraryId, pack, originalPath, runShown = false }:
             </button>
           </>
         )}
+        <button
+          className={clsx(dialog.btn, dialog.secondaryBtn, styles.smallBtn)}
+          disabled={locked}
+          onClick={() => void store.askRemove(pack.id)}
+          title="Delete the files the import put in this folder, kept files included, and drop its import records. Files added outside OpenDAM stay. What it deletes is listed first."
+          data-prep-remove
+        >
+          Remove import
+        </button>
         <button
           className={clsx(dialog.btn, dialog.primaryBtn, styles.smallBtn)}
           disabled={!draft || locked || problem !== null || noRebuild !== null}

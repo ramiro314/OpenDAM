@@ -1055,6 +1055,21 @@ export interface DriftChosen {
   choice: DriftChoice;
 }
 
+/** An outside change as `remove_import_pack` takes it: the difference the confirmation showed */
+export interface DriftSeen {
+  path: string;
+  change: DriftChange;
+  sha256: string | null;
+}
+
+/** What Remove import would delete, as `check_import_remove` reads it */
+export interface RemovePreview {
+  /** The current build's files, by path (relative to the library root) */
+  files: { path: string; origin: 'extracted' | 'generated' | 'kept' }[];
+  /** How the pack folder differs from them now */
+  drift: DriftDifference[];
+}
+
 /** A place step as `start_import` and `preview_import` take it */
 export type PlaceStep =
   | { kind: 'flatten' }

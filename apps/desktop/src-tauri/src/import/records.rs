@@ -810,30 +810,117 @@ pub async fn queue_rebuild(
         record_drift_edits(&mut tx, pack_id, edits).await?;
         at = bumped;
     }
-    let queued = sqlx::query(&format!(
-        "INSERT INTO import_runs (id, kind, packs, drift, status, created_at, owner_machine,
-         owner_boot, owner_pid, owner_started, heartbeat_at)
-         SELECT ?, 'rebuild', json_array(json_object('packId', id, 'recipeRev', recipe_rev)),
-         json_object(id, json(?)), 'queued', ?, ?, ?, ?, ?, ? FROM import_packs
-         WHERE id = ? AND recipe_rev = ? AND NOT {BUSY}"
-    ))
-    .bind(&run_id)
-    .bind(drift.to_string())
-    .bind(now)
-    .bind(&owner.machine)
-    .bind(&owner.boot)
-    .bind(owner.pid as i64)
-    .bind(owner.started as i64)
-    .bind(now)
-    .bind(pack_id)
-    .bind(at)
-    .execute(&mut *tx)
-    .await?;
-    if queued.rows_affected() == 0 {
+    let queued = Queue {
+        kind: "rebuild",
+        pack_id,
+        owner,
+        now,
+        drift,
+        at,
+    };
+    if !queued.insert(&mut tx, &run_id).await? {
         return Ok(Err(refusal(&mut tx, pack_id).await?));
     }
     tx.commit().await?;
     Ok(Ok(run_id))
+}
+
+/// Queues a Remove of pack `pack_id`, owned by `owner`, with `seen`, the outside changes its
+/// confirmation showed (the JSON array `import_runs.drift` holds under the pack's id), unless a
+/// run for it is queued or running, or its steps moved on from `read_at`, the `recipe_rev` the
+/// changes were found at. Returns the run's id.
+pub async fn queue_remove(
+    pool: &Pool<Sqlite>,
+    pack_id: &str,
+    owner: &Owner,
+    now: i64,
+    seen: &Value,
+    read_at: i64,
+) -> sqlx::Result<Result<String, Refused>> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let mut tx = pool.begin().await?;
+    let queued = Queue {
+        kind: "remove",
+        pack_id,
+        owner,
+        now,
+        drift: seen,
+        at: read_at,
+    };
+    if !queued.insert(&mut tx, &run_id).await? {
+        return Ok(Err(refusal(&mut tx, pack_id).await?));
+    }
+    tx.commit().await?;
+    Ok(Ok(run_id))
+}
+
+/// A run of one pack to queue, at the pack's `recipe_rev` `at`.
+struct Queue<'a> {
+    kind: &'static str,
+    pack_id: &'a str,
+    owner: &'a Owner,
+    now: i64,
+    drift: &'a Value,
+    at: i64,
+}
+
+impl Queue<'_> {
+    /// Inserts the run as `run_id`, unless the pack is busy or its steps moved on from `at`.
+    /// False when it inserted nothing.
+    async fn insert(&self, tx: &mut SqliteConnection, run_id: &str) -> sqlx::Result<bool> {
+        let owner = self.owner;
+        let queued = sqlx::query(&format!(
+            "INSERT INTO import_runs (id, kind, packs, drift, status, created_at, owner_machine,
+             owner_boot, owner_pid, owner_started, heartbeat_at)
+             SELECT ?, ?, json_array(json_object('packId', id, 'recipeRev', recipe_rev)),
+             json_object(id, json(?)), 'queued', ?, ?, ?, ?, ?, ? FROM import_packs
+             WHERE id = ? AND recipe_rev = ? AND NOT {BUSY}"
+        ))
+        .bind(run_id)
+        .bind(self.kind)
+        .bind(self.drift.to_string())
+        .bind(self.now)
+        .bind(&owner.machine)
+        .bind(&owner.boot)
+        .bind(owner.pid as i64)
+        .bind(owner.started as i64)
+        .bind(self.now)
+        .bind(self.pack_id)
+        .bind(self.at)
+        .execute(&mut *tx)
+        .await?;
+        Ok(queued.rows_affected() == 1)
+    }
+}
+
+/// The end of a Remove: deletes pack `pack_id`'s records (its row, steps, every build's manifest
+/// rows and its journal), and its import's row when no other pack is left, in one transaction.
+/// Only a pack journaled `removing` is deleted. Its runs stay, as the Imports view's history.
+pub async fn delete_pack(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    let import_id: Option<String> = sqlx::query_scalar(
+        "DELETE FROM import_packs WHERE id = ? AND swap_state = 'removing' RETURNING import_id",
+    )
+    .bind(pack_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(import_id) = import_id else {
+        return Err(sqlx::Error::RowNotFound);
+    };
+    for table in ["import_steps", "import_outputs", "import_moves"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE pack_id = ?"))
+            .bind(pack_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(
+        "DELETE FROM imports WHERE id = ?
+         AND NOT EXISTS (SELECT 1 FROM import_packs WHERE import_id = imports.id)",
+    )
+    .bind(&import_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
 }
 
 /// Appends an `exclude` for each source of `edits` no enabled `exclude` names yet, but a `.meta`

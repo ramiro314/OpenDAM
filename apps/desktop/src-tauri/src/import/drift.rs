@@ -460,6 +460,47 @@ pub fn unmatched(found: &[Difference], chosen: &[Chosen]) -> Option<String> {
         .map(|c| c.path.clone())
 }
 
+/// A difference as a Remove's confirmation showed it: by path, change and the bytes seen. A
+/// Remove offers no choice, since it deletes the manifest's files whatever they hold now: its
+/// run checks, under the lock, that the folder still differs exactly so.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Seen {
+    pub path: String,
+    pub change: Change,
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+impl From<&Difference> for Seen {
+    fn from(d: &Difference) -> Self {
+        Seen {
+            path: d.path.clone(),
+            change: d.change,
+            sha256: d.sha256.clone(),
+        }
+    }
+}
+
+/// Checks that `seen` lists exactly the differences `found`. Returns the first path that
+/// doesn't match, if any.
+pub fn unseen(found: &[Difference], seen: &[Seen]) -> Option<String> {
+    let mut by_path: HashMap<&str, &Seen> = HashMap::new();
+    for s in seen {
+        if by_path.insert(s.path.as_str(), s).is_some() {
+            return Some(s.path.clone());
+        }
+    }
+    for difference in found {
+        if by_path.remove(difference.path.as_str()) != Some(&Seen::from(difference)) {
+            return Some(difference.path.clone());
+        }
+    }
+    seen.iter()
+        .find(|s| by_path.contains_key(s.path.as_str()))
+        .map(|s| s.path.clone())
+}
+
 /// What `chosen`, matched against `found`, asks of `recipe` at the Rebuild, so each choice is
 /// honoured whatever an earlier Rebuild that never committed recorded: an `exclude` for each
 /// missing extracted file left out, and none (the enabled one turned off) for one restored or

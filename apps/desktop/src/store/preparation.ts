@@ -4,17 +4,19 @@ import type {
   DriftChoice,
   DriftChosen,
   DriftDifference,
+  DriftSeen,
   ImportPackSteps,
   ImportPackSummary,
   ImportRun,
   ImportStepRecord,
   ImportSummary,
+  RemovePreview,
 } from '../types';
 import { cleanTarget, isLive, rebuildRefusal, upsertRun, useImportStore } from './imports';
 
 // An imported pack's Preparation (plan pack-import, UI): its steps with their toggles and
-// options, its target, its kept files, and Rebuild, which first asks what to do about each
-// outside change to the pack folder. The pack's details and the Imports view open the same
+// options, its target, its kept files, Rebuild, which first asks what to do about each
+// outside change to the pack folder, and Remove import, which first lists what it deletes. The pack's details and the Imports view open the same
 // editor, kept here by pack id.
 
 /** What a step edit or a Rebuild answers while a run for the pack is live (`engine::BUSY`) */
@@ -400,6 +402,43 @@ export function choiceHint(choice: DriftChoice, d: DriftDifference): string {
   }
 }
 
+// ── Remove import ─────────────────────────────────────────────────────────
+
+/** The Remove confirmation, open while a Remove waits for its go */
+export interface RemoveDraft {
+  preview: RemovePreview;
+  /** Why the confirmation shows again, or why the Remove was refused */
+  notice: string | null;
+}
+
+/** What the Remove confirmation names, each list by path */
+export interface RemoveSummary {
+  /** Kept from outside changes: not from the original, and deleted too */
+  kept: string[];
+  /** Changed outside OpenDAM since the last build: deleted, and the changes lost */
+  lost: string[];
+  /** Added outside OpenDAM: not the pack's, so left in its folder */
+  staying: string[];
+  /** Already gone */
+  missing: number;
+}
+
+export function removeSummary(preview: RemovePreview): RemoveSummary {
+  const of = (...changes: DriftDifference['change'][]) =>
+    preview.drift.filter((d) => changes.includes(d.change)).map((d) => d.path);
+  return {
+    kept: preview.files.filter((f) => f.origin === 'kept').map((f) => f.path),
+    lost: of('changed', 'clash'),
+    staying: of('added'),
+    missing: of('missing').length,
+  };
+}
+
+/** The outside changes as `remove_import_pack` takes them, as the confirmation showed them */
+export function seenFrom(preview: RemovePreview): DriftSeen[] {
+  return preview.drift.map(({ path, change, sha256 }) => ({ path, change, sha256 }));
+}
+
 // ── Target ────────────────────────────────────────────────────────────────
 
 /**
@@ -445,6 +484,8 @@ export interface Editor {
   target: TargetDraft | null;
   /** The drift dialog, open while a Rebuild waits for a choice about each outside change */
   drift: DriftDraft | null;
+  /** The Remove confirmation, open while a Remove waits for its go */
+  remove: RemoveDraft | null;
   /** How many mounted editors show it: the pack's details, its Imports view row, or both */
   mounts: number;
 }
@@ -479,6 +520,12 @@ interface PreparationStore {
   closeDrift: (packId: string) => void;
   /** Queues the rebuild with the dialog's choices; true once it is queued */
   confirmDrift: (packId: string) => Promise<boolean>;
+  /** Reads what a Remove of the pack would delete and opens its confirmation */
+  askRemove: (packId: string) => Promise<void>;
+  /** Closes the Remove confirmation, queuing nothing */
+  closeRemove: (packId: string) => void;
+  /** Queues the Remove the confirmation shows; true once it is queued */
+  confirmRemove: (packId: string) => Promise<boolean>;
   editTarget: (packId: string, value: string) => void;
   /** Asks the library about the typed target, unless it was asked already */
   checkTarget: (packId: string, current: string) => Promise<void>;
@@ -489,6 +536,11 @@ interface PreparationStore {
 /** Whether a drift dialog is open, over whatever view asked for the Rebuild */
 export function driftOpen(): boolean {
   return Object.values(usePreparationStore.getState().editors).some((e) => e.drift !== null);
+}
+
+/** Whether a Remove confirmation is open, over whatever view asked for it */
+export function removeOpen(): boolean {
+  return Object.values(usePreparationStore.getState().editors).some((e) => e.remove !== null);
 }
 
 export const usePreparationStore = create<PreparationStore>()((set, get) => {
@@ -568,6 +620,7 @@ export const usePreparationStore = create<PreparationStore>()((set, get) => {
           saving: false,
           target: null,
           drift: null,
+          remove: null,
           mounts: 1,
         };
         set((s) => ({ editors: { ...s.editors, [packId]: editor } }));
@@ -695,6 +748,68 @@ export const usePreparationStore = create<PreparationStore>()((set, get) => {
       }
       patch(packId, { saving: true });
       return queue(editor, chosenFrom(editor.drift));
+    },
+
+    askRemove: async (packId) => {
+      const editor = get().editors[packId];
+      if (!editor || editor.saving) return;
+      const reason = busy(editor);
+      if (reason) {
+        patch(packId, { error: reason });
+        return;
+      }
+      patch(packId, { saving: true, error: null });
+      try {
+        const preview = await api.checkImportRemove(editor.libraryId, packId);
+        patch(packId, { saving: false, remove: { preview, notice: null } });
+      } catch (err) {
+        patch(packId, { saving: false, error: String(err) });
+      }
+    },
+
+    closeRemove: (packId) => {
+      const editor = get().editors[packId];
+      if (!editor?.remove || editor.saving) return;
+      patch(packId, { remove: null });
+    },
+
+    confirmRemove: async (packId) => {
+      const editor = get().editors[packId];
+      const remove = editor?.remove;
+      if (!editor || !remove || editor.saving) return false;
+      const reason = busy(editor);
+      if (reason) {
+        patch(packId, { remove: { ...remove, notice: reason } });
+        return false;
+      }
+      const { libraryId } = editor;
+      patch(packId, { saving: true });
+      try {
+        const run = await api.removeImportPack(libraryId, packId, seenFrom(remove.preview));
+        useImportStore.setState((s) => ({ runs: upsertRun(s.runs, run) }));
+        // Edits not saved go with the pack
+        const draft = get().editors[packId]?.draft;
+        patch(packId, {
+          saving: false,
+          remove: null,
+          ...(draft ? { draft: { ...draft, steps: draft.saved } } : {}),
+        });
+        return true;
+      } catch (err) {
+        const message = String(err);
+        if (!message.includes(DRIFT_STALE)) {
+          patch(packId, { saving: false, remove: { ...remove, notice: message } });
+          return false;
+        }
+        try {
+          const preview = await api.checkImportRemove(libraryId, packId);
+          const notice = 'The pack folder changed again: check what Remove deletes now';
+          patch(packId, { saving: false, remove: { preview, notice } });
+        } catch (again) {
+          patch(packId, { saving: false, remove: null, error: String(again) });
+        }
+        return false;
+      }
     },
 
     editTarget: (packId, value) => {

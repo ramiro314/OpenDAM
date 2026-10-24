@@ -10,6 +10,7 @@ pub mod original;
 pub mod place;
 pub mod records;
 pub mod recovery;
+pub mod remove;
 pub mod scan;
 pub mod settings;
 pub mod tools;
