@@ -924,3 +924,158 @@ export type ProposalDecision =
     }
   | { action: 'map'; proposalId: string; tagId: string; assetIds: string[] }
   | { action: 'reject'; proposalId: string };
+
+// ── Pack import (docs/plans/pack-import/plan.md) ──────────────────────────
+
+/** An archive entry an extraction skipped, named by its path in the original */
+export interface SkippedEntry {
+  sourcePath: string[];
+  reason: 'absolute' | 'escapes' | 'noName' | 'duplicate' | 'hardlink' | 'symlink' | 'special';
+}
+
+/** A folder of a build's tree, the pack root being `''` */
+export interface ImportFolderCount {
+  path: string;
+  /** Files directly in it */
+  files: number;
+  /** Files in it and below it */
+  total: number;
+}
+
+/** The folder tree a build would produce, read from the archive's index */
+export interface ImportTree {
+  folders: ImportFolderCount[];
+  files: number;
+  /** The GLBs the conversion would write */
+  glbs: number;
+  skipped: SkippedEntry[];
+  /** Why the build would fail, when it would */
+  error: string | null;
+}
+
+/** A step as the scan proposes it: its kind and its options */
+export interface ImportStepRecord {
+  kind: string;
+  /** Off when its tool is missing, as `unity_glb` is without Blender */
+  enabled: boolean;
+  options: Record<string, unknown>;
+}
+
+/** A place step as `start_import` and `preview_import` take it */
+export type PlaceStep =
+  | { kind: 'flatten' }
+  | { kind: 'hoist'; folder: string }
+  | { kind: 'rename'; source: string[]; name: string }
+  | { kind: 'exclude'; source: string[] };
+
+/** A Fab pack's source: a `.unitypackage` in the zip, or one pipeline folder of it */
+export interface ImportVariant {
+  variant: string;
+  subpath: string | null;
+  pipeline: 'urp' | 'built-in' | 'hdrp' | null;
+  ticked: boolean;
+  tree: ImportTree;
+}
+
+export type ImportPreset = 'unity' | 'fab' | 'kenney' | 'none';
+
+export interface ImportCandidate {
+  name: string;
+  ticked: boolean;
+  preset: ImportPreset;
+  publisher: string;
+  /** Relative to the library root */
+  target: string;
+  /** Why the library refuses the target: it exists, or nests with another pack's */
+  targetError: string | null;
+  /** The target is `<Publisher>/<Pack>`, so it moves with the publisher */
+  targetFollowsPublisher: boolean;
+  variants: ImportVariant[];
+  steps: ImportStepRecord[];
+  /** null while a Fab pack has no variant ticked */
+  tree: ImportTree | null;
+}
+
+/** One row of the plan's detection table the original matches */
+export interface ImportOffer {
+  layout: 'unity' | 'fab' | 'kenney' | 'zip';
+  candidates: ImportCandidate[];
+}
+
+export interface ImportScan {
+  originalPath: string;
+  kind: 'unitypackage' | 'zip';
+  offers: ImportOffer[];
+  /** Why a step kind can't run here, by kind: `unity_glb` without an accepted Blender */
+  unavailable: Record<string, string>;
+}
+
+/** What `start_import` takes: one pack of an original */
+export interface ImportRequest {
+  libraryId: string;
+  originalPath: string;
+  target: string;
+  publisher: string;
+  variant?: string;
+  subpath?: string;
+  preset?: ImportPreset;
+  place?: PlaceStep[];
+  title?: string;
+  version?: string;
+  license?: string;
+  lookupStorePage?: boolean;
+}
+
+export type ImportRunStatus =
+  | 'queued'
+  | 'running'
+  | 'done'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted';
+
+/** An import run as `import:updated` and the run list show it */
+export interface ImportRun {
+  id: string;
+  libraryId: string;
+  kind: 'import' | 'rebuild' | 'remove';
+  packs: { packId: string; recipeRev: number }[];
+  status: ImportRunStatus;
+  phase: string | null;
+  progressDone: number;
+  progressTotal: number;
+  error: string | null;
+  warnings: SkippedEntry[];
+  createdAt: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+}
+
+/** The payload of `import:progress` */
+export interface ImportProgress {
+  runId: string;
+  libraryId: string;
+  packId: string;
+  step: string;
+  done: number;
+  total: number;
+}
+
+export interface ImportPackSummary {
+  id: string;
+  target: string;
+  preset: string;
+  status: 'built' | 'failed' | 'never_built';
+  builtAt: number | null;
+}
+
+/** An import as `list_imports` gives it: its original and its packs */
+export interface ImportSummary {
+  id: string;
+  libraryId: string;
+  /** Absolute */
+  originalPath: string;
+  kind: 'unitypackage' | 'zip';
+  createdAt: number;
+  packs: ImportPackSummary[];
+}

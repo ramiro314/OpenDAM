@@ -29,7 +29,8 @@ use super::build::{self, BuildEnv, Hooks, Point, Progress, RunControl, Stop};
 use super::metadata::LicenseOption;
 use super::place::PlaceStep;
 use super::records::{
-    self, NewImport, Owner, PackSteps, QueuedPack, RunSummary, Step, StepRecord, TargetRefused,
+    self, ImportSummary, NewImport, Owner, PackSteps, QueuedPack, RunSummary, Step, StepRecord,
+    TargetRefused,
 };
 use super::scan::{self, Scan};
 use super::unity_glb;
@@ -519,6 +520,14 @@ impl Engine {
             .map_err(|e| e.to_string())
     }
 
+    /// The library's imports, newest first, each with its packs.
+    pub async fn list_imports(&self, library_id: &str) -> Result<Vec<ImportSummary>, String> {
+        let library = self.library(library_id).await?;
+        records::imports(&library.pool, &library.id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn library(&self, library_id: &str) -> Result<LibraryHandle, String> {
         self.db
             .get_library_handle(library_id)
@@ -590,6 +599,57 @@ impl Engine {
             offers,
             unavailable,
         })
+    }
+
+    /// The tree pack source `variant`/`subpath` of the original at `original_path` would build
+    /// with the place steps `place` (`scan::preview_source`), read from the archive's index and
+    /// writing nothing: the import dialog's preview once you change a candidate's steps.
+    pub async fn preview_import(
+        &self,
+        library_id: &str,
+        original_path: &str,
+        variant: Option<&str>,
+        subpath: Option<&str>,
+        place: Vec<PlaceStep>,
+    ) -> Result<scan::Tree, String> {
+        let library = self.library(library_id).await?;
+        let root = library
+            .root_path
+            .canonicalize()
+            .map_err(|e| format!("The library folder can't be read: {e}"))?;
+        let (original, kind) = original(original_path, &root)?;
+        let variant = inner_path(variant, "variant")?;
+        let subpath = inner_path(subpath, "sub-folder")?;
+        tokio::task::spawn_blocking(move || {
+            scan::preview_source(
+                &original,
+                kind,
+                variant.as_deref(),
+                subpath.as_deref(),
+                &place,
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    /// Why the library would refuse `target` for a new pack, as `start_import` checks it: it
+    /// exists, or nests with another pack's target, naming that pack. `None` when it is free.
+    pub async fn check_import_target(
+        &self,
+        library_id: &str,
+        target: &str,
+    ) -> Result<Option<String>, String> {
+        let library = self.library(library_id).await?;
+        let root = library
+            .root_path
+            .canonicalize()
+            .map_err(|e| format!("The library folder can't be read: {e}"))?;
+        let checked = match clean_target(target) {
+            Ok(target) => check_target(&library.pool, &root, &target).await,
+            Err(error) => Err(error),
+        };
+        Ok(checked.err())
     }
 
     /// Moves pack `pack_id`'s target to `target`, refusing one that exists in the library or
@@ -1501,6 +1561,7 @@ mod tests {
                 "writing metadata",
                 "hashing",
                 "waiting for the library",
+                "re-checking",
                 "swapping",
                 "indexing",
                 "settling"
@@ -1801,6 +1862,19 @@ mod tests {
         let run = s.engine.start_import(s.golden_request()).await.unwrap();
         pause.reached.notified().await;
 
+        // Past the lock the build says so first, which the Imports view's Cancel reads.
+        let steps: Vec<String> = s
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                ImportEvent::Progress(p) => Some(p.step.clone()),
+                _ => None,
+            })
+            .collect();
+        let locked = steps.iter().position(|step| step == "re-checking").unwrap();
+        assert_eq!(steps[locked - 1], "waiting for the library", "{steps:?}");
         assert_eq!(
             s.engine.cancel_run("lib", &run.id).await,
             Err(FINISHING.into())
@@ -2780,6 +2854,197 @@ mod tests {
         assert_eq!(
             records::set_target(&s.lib.pool, "nope", "X").await.unwrap(),
             Err(TargetRefused::NoPack)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_imports_view_lists_each_import_with_its_packs_and_checks_new_targets() {
+        let s = setup().await;
+        assert_eq!(s.engine.list_imports("lib").await.unwrap(), []);
+        let mut request = s.golden_request();
+        request.target = "Pub/Pack".into();
+        let run = s.engine.start_import(request).await.unwrap();
+        s.wait_for(&run.id, "done").await;
+
+        let imports = s.engine.list_imports("lib").await.unwrap();
+        assert_eq!(imports.len(), 1);
+        let import = &imports[0];
+        let original = fixture("synthetic.unitypackage").canonicalize().unwrap();
+        assert_eq!(import.original_path, original.to_string_lossy());
+        assert_eq!(
+            (import.kind.as_str(), import.library_id.as_str()),
+            ("unitypackage", "lib")
+        );
+        assert_eq!(import.packs.len(), 1);
+        let pack = &import.packs[0];
+        assert_eq!(pack.id, run.packs[0].pack_id);
+        assert_eq!(
+            (
+                pack.target.as_str(),
+                pack.preset.as_str(),
+                pack.status.as_str()
+            ),
+            ("Pub/Pack", "unity", "built")
+        );
+        assert!(pack.built_at.is_some());
+
+        // A target the dialog checks gets start_import's reason, naming the other pack.
+        let check = |target: &'static str| s.engine.check_import_target("lib", target);
+        for target in ["Pub/Pack/Sub", "Pub"] {
+            assert_eq!(
+                check(target).await.unwrap().as_deref(),
+                Some(nests(target, "Pub/Pack").as_str())
+            );
+        }
+        assert_eq!(
+            check("Other").await.unwrap().as_deref(),
+            Some("Other already exists in the library")
+        );
+        assert!(check("../Out")
+            .await
+            .unwrap()
+            .unwrap()
+            .contains("isn't a folder"));
+        assert_eq!(check("Pub/Package").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_preview_with_edited_place_steps_is_the_tree_the_scan_would_show_for_them() {
+        let s = setup().await;
+        let fab = fixture("fab-unity.zip");
+        let scan = s.engine.scan("lib", &fab.to_string_lossy()).await.unwrap();
+        let pack = &scan.offers[0].candidates[0];
+        let ticked = pack.variants.iter().find(|v| v.ticked).unwrap();
+        let preview = |place: Vec<PlaceStep>| {
+            s.engine.preview_import(
+                "lib",
+                &scan.original_path,
+                Some(&ticked.variant),
+                ticked.subpath.as_deref(),
+                place,
+            )
+        };
+        let hoisted = vec![
+            PlaceStep::Flatten,
+            PlaceStep::Hoist {
+                folder: "Art".into(),
+            },
+        ];
+        assert_eq!(preview(hoisted).await.unwrap(), ticked.tree);
+        let flat = preview(vec![PlaceStep::Flatten]).await.unwrap();
+        assert_ne!(flat, ticked.tree);
+        assert_eq!(flat.files, ticked.tree.files);
+        assert!(flat.folders.iter().any(|f| f.path == "Art"), "{flat:?}");
+
+        let error = s
+            .engine
+            .preview_import("lib", "/no/such.zip", None, None, vec![])
+            .await
+            .unwrap_err();
+        assert!(error.contains("can't be read"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_preview_of_a_package_or_a_plain_zip_is_the_scan_s_tree_and_only_a_package_converts()
+    {
+        let s = setup().await;
+        let preview = |original: String, subpath: Option<String>, place: Vec<PlaceStep>| {
+            let engine = s.engine.clone();
+            async move {
+                engine
+                    .preview_import("lib", &original, None, subpath.as_deref(), place)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // A .unitypackage: its tree counts the models unity_glb converts.
+        let package = fixture("synthetic.unitypackage")
+            .to_string_lossy()
+            .into_owned();
+        let scan = s.engine.scan("lib", &package).await.unwrap();
+        let scanned = scan.offers[0].candidates[0].tree.clone().unwrap();
+        let flat = preview(package.clone(), None, vec![PlaceStep::Flatten]).await;
+        assert_eq!(flat, scanned);
+        assert!(flat.glbs > 0, "{flat:?}");
+        let unflattened = preview(package, None, vec![]).await;
+        assert_ne!(unflattened, scanned);
+        assert_eq!(
+            (unflattened.files, unflattened.glbs),
+            (flat.files, flat.glbs)
+        );
+
+        // A Kenney pack's folder of a zip, by its sub-folder.
+        let kenney = fixture("kenney.zip").to_string_lossy().into_owned();
+        let scan = s.engine.scan("lib", &kenney).await.unwrap();
+        let pack = &scan.offers[0].candidates[0];
+        let subpath = pack.steps[0].options["subpath"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tree = preview(kenney, Some(subpath), vec![]).await;
+        assert_eq!(Some(&tree), pack.tree.as_ref());
+
+        // A plain zip holding a model converts nothing, as its scan says.
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("plain.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&plain).unwrap());
+        for entry in ["Plain/Models/Rock.fbx", "Plain/Rock.png"] {
+            zip.start_file(entry, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, b"data").unwrap();
+        }
+        zip.finish().unwrap();
+        let plain = plain.to_string_lossy().into_owned();
+        let scan = s.engine.scan("lib", &plain).await.unwrap();
+        let any = scan.offers.iter().find(|o| o.layout == "zip").unwrap();
+        let tree = preview(plain, None, vec![PlaceStep::Flatten]).await;
+        assert_eq!(Some(&tree), any.candidates[0].tree.as_ref());
+        assert_eq!((tree.files, tree.glbs), (3, 0), "{tree:?}");
+    }
+
+    #[tokio::test]
+    async fn the_imports_view_lists_several_imports_newest_first_each_with_its_own_packs() {
+        let s = setup().await;
+        let mut first = s.golden_request();
+        first.target = "Pub/One".into();
+        let one = s.engine.start_import(first).await.unwrap();
+        s.wait_for(&one.id, "done").await;
+        // Created at the same millisecond, the rowid still orders them.
+        let second = s.zip_request(
+            "kenney.zip",
+            None,
+            Some("Kenney/2D assets/Fixture Tiles"),
+            "Tiles",
+        );
+        let two = s.engine.start_import(second).await.unwrap();
+        s.wait_for(&two.id, "done").await;
+
+        let imports = s.engine.list_imports("lib").await.unwrap();
+        let listed: Vec<(String, Vec<(String, String)>)> = imports
+            .iter()
+            .map(|i| {
+                let name = i.original_path.rsplit('/').next().unwrap().to_string();
+                let packs = i
+                    .packs
+                    .iter()
+                    .map(|p| (p.id.clone(), p.target.clone()))
+                    .collect();
+                (name, packs)
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (
+                    "kenney.zip".to_string(),
+                    vec![(two.packs[0].pack_id.clone(), "Tiles".to_string())]
+                ),
+                (
+                    "synthetic.unitypackage".to_string(),
+                    vec![(one.packs[0].pack_id.clone(), "Pub/One".to_string())]
+                ),
+            ]
         );
     }
 }

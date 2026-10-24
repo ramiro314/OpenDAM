@@ -45,6 +45,12 @@ import type {
   RunEstimate,
   ReviewProposal,
   ProposalDecision,
+  ImportRequest,
+  ImportRun,
+  ImportScan,
+  ImportSummary,
+  ImportTree,
+  PlaceStep,
 } from '../types';
 
 /** Thin wrapper around Tauri IPC commands */
@@ -219,4 +225,27 @@ export const api = {
   /** Clears one stopped run, or with none every finished run; returns how many it cleared */
   clearAutotagRuns: (runId: string | null = null) =>
     invoke<number>('clear_autotag_runs', { runId }),
+
+  // Pack import. Progress arrives as `import:progress` events, run changes as `import:updated`.
+  /** An original's candidate packs, each with its default target, steps and tree; writes nothing */
+  scanImport: (libraryId: string, originalPath: string) =>
+    invoke<ImportScan>('scan_import', { libraryId, originalPath }),
+  /** The tree one source of an original builds with these place steps; writes nothing */
+  previewImport: (
+    libraryId: string,
+    originalPath: string,
+    variant: string | null,
+    subpath: string | null,
+    place: PlaceStep[]
+  ) => invoke<ImportTree>('preview_import', { libraryId, originalPath, variant, subpath, place }),
+  /** Why the library would refuse this target for a new pack, or null when it is free */
+  checkImportTarget: (libraryId: string, target: string) =>
+    invoke<string | null>('check_import_target', { libraryId, target }),
+  /** Records one pack's import and queues its first build */
+  startImport: (request: ImportRequest) => invoke<ImportRun>('start_import', { request }),
+  /** Fails with "Finishing, can't cancel now" once the build holds the library's lock */
+  cancelImportRun: (libraryId: string, runId: string) =>
+    invoke<void>('cancel_import_run', { libraryId, runId }),
+  listImports: (libraryId: string) => invoke<ImportSummary[]>('list_imports', { libraryId }),
+  listImportRuns: (libraryId: string) => invoke<ImportRun[]>('list_import_runs', { libraryId }),
 };
