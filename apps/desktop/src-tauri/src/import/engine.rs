@@ -1168,14 +1168,18 @@ impl Engine {
     }
 
     /// What a Remove of pack `pack_id` would delete, its current manifest's files, and how its
-    /// folder differs from them now, for the confirmation.
+    /// folder differs from them now, for the confirmation. Refused, as the Remove would be,
+    /// while a run for the pack is queued or running or a swap or Remove is journaled, so a
+    /// folder mid-swap is never read.
     pub async fn remove_preview(
         &self,
         library_id: &str,
         pack_id: &str,
     ) -> Result<remove::RemovePreview, String> {
         let library = self.library(library_id).await?;
-        busy(&library, pack_id).await?;
+        if busy(&library, pack_id).await? {
+            return Err(refused(records::Refused::Busy));
+        }
         Ok(remove::preview(&library.pool, &library.root_path, pack_id)
             .await?
             .0)

@@ -264,6 +264,12 @@ mod tests {
         let steps = s.engine.pack_steps("lib", &pack_id).await.unwrap().steps;
         let refused = s.engine.set_pack_steps("lib", &pack_id, steps, None).await;
         assert_eq!(refused.unwrap_err(), BUSY);
+        let preview = s.engine.remove_preview("lib", &pack_id).await;
+        assert_eq!(
+            preview.unwrap_err(),
+            BUSY,
+            "no confirmation of a pack mid-Remove"
+        );
         assert_eq!(
             s.engine
                 .remove_pack("lib", &pack_id, Vec::new())

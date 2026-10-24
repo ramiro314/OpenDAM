@@ -223,7 +223,7 @@ pub async fn rebuild_import_pack(
 
 /// What Remove import would delete in an imported pack, its current build's files with their
 /// origins (kept files among them), and how its folder differs from them now, for the
-/// confirmation.
+/// confirmation. Refused while a run for the pack is queued or running.
 #[tauri::command]
 pub async fn check_import_remove(
     library_id: String,
