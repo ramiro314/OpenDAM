@@ -432,7 +432,7 @@ pub async fn open_library_db(
 ) -> Result<Pool<Sqlite>> {
     let db_path = root.join(".opendam").join("library.sqlite");
     let pool = connect_library_sqlite(&db_path).await?;
-    let _index_guard = index_lock.lock().await;
+    let index_guard = index_lock.lock().await;
     let Some(advisory) = crate::watcher::IndexLock::try_acquire(root).await else {
         tracing::info!(
             "Another holder has the advisory lock of {root:?}: its structure pass runs later"
@@ -440,7 +440,14 @@ pub async fn open_library_db(
         crate::structure::mark_pending(&pool).await;
         return Ok(pool);
     };
-    crate::import::recover_swaps(&pool, root, crate::import::Recovery::Open).await;
+    crate::import::recover_swaps(
+        &pool,
+        root,
+        crate::import::Recovery::Open,
+        &index_guard,
+        &advisory,
+    )
+    .await;
     if let Err(e) = crate::structure::rebuild(&pool, root).await {
         tracing::warn!("Could not derive the folder tree of {db_path:?}: {e}");
     }

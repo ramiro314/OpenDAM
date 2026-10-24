@@ -73,11 +73,11 @@ function progress(runId: string, step: string, done = 0, total = 0): ImportProgr
 }
 
 const fabSteps = (variant: string | null) => [
-  { kind: 'extract_unitypackage', options: variant ? { variant } : {} },
-  { kind: 'flatten', options: {} },
-  { kind: 'hoist', options: { folder: 'Art' } },
-  { kind: 'unity_glb', options: { max_texture: 1024 } },
-  { kind: 'metadata', options: { preset: 'fab', publisher: 'Studio' } },
+  { kind: 'extract_unitypackage', enabled: true, options: variant ? { variant } : {} },
+  { kind: 'flatten', enabled: true, options: {} },
+  { kind: 'hoist', enabled: true, options: { folder: 'Art' } },
+  { kind: 'unity_glb', enabled: true, options: { max_texture: 1024 } },
+  { kind: 'metadata', enabled: true, options: { preset: 'fab', publisher: 'Studio' } },
 ];
 
 const fab: ImportCandidate = {
@@ -118,9 +118,10 @@ const kenney = (name: string, category: string, ticked = true): ImportCandidate 
   targetFollowsPublisher: false,
   variants: [],
   steps: [
-    { kind: 'extract_zip', options: { subpath: `Kenney/${category}/${name}` } },
+    { kind: 'extract_zip', enabled: true, options: { subpath: `Kenney/${category}/${name}` } },
     {
       kind: 'metadata',
+      enabled: true,
       options: { preset: 'kenney', publisher: 'Kenney', lookup_store_page: true },
     },
   ],
@@ -137,9 +138,9 @@ const zipCandidate: ImportCandidate = {
   targetFollowsPublisher: false,
   variants: [],
   steps: [
-    { kind: 'extract_zip', options: {} },
-    { kind: 'flatten', options: {} },
-    { kind: 'metadata', options: { preset: 'none', publisher: 'Studio' } },
+    { kind: 'extract_zip', enabled: true, options: {} },
+    { kind: 'flatten', enabled: true, options: {} },
+    { kind: 'metadata', enabled: true, options: { preset: 'none', publisher: 'Studio' } },
   ],
   tree: tree(9),
 };
@@ -151,6 +152,7 @@ const fabScan: ImportScan = {
     { layout: 'fab', candidates: [fab] },
     { layout: 'zip', candidates: [zipCandidate] },
   ],
+  unavailable: {},
 };
 
 const kenneyScan: ImportScan = {
@@ -162,6 +164,7 @@ const kenneyScan: ImportScan = {
       candidates: [kenney('Car Kit', '3D assets'), kenney('Old Kit', 'Archive', false)],
     },
   ],
+  unavailable: {},
 };
 
 describe('importRows', () => {
@@ -603,6 +606,20 @@ describe('the dialog', () => {
       'Pub/Pack/Sub would nest with the pack imported to Pub/Pack',
     ]);
     expect(candidateProblem(useImportStore.getState().draft!, 0)).toContain('Pub/Pack');
+  });
+
+  test("the scan's reason a step can't run here stays with the draft across layouts", async () => {
+    const why = 'Blender 5.2 is needed to convert models; set it in Settings';
+    await open({ ...fabScan, unavailable: { unity_glb: why } });
+    expect(useImportStore.getState().draft!.unavailable).toEqual({ unity_glb: why });
+    useImportStore.getState().pickOffer(1);
+    useImportStore.getState().pickOffer(0);
+    const draft = useImportStore.getState().draft!;
+    expect([draft.offer, draft.unavailable.unity_glb, draft.candidates[0].converts]).toEqual([
+      0,
+      why,
+      true,
+    ]);
   });
 
   test('picking another layout drafts its candidates', async () => {

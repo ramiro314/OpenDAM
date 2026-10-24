@@ -5,6 +5,7 @@ use crate::import::engine::ImportRequest;
 use crate::import::place::PlaceStep;
 use crate::import::records::{ImportSummary, PackSteps, RunSummary, Step};
 use crate::import::scan::{Scan, Tree};
+use crate::import::settings::{self, ImportSettings};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -162,4 +163,22 @@ pub async fn rebuild_import_pack(
     state: State<'_, Arc<AppState>>,
 ) -> Result<RunSummary> {
     state.imports.rebuild_pack(&library_id, &pack_id).await
+}
+
+/// The import settings: Blender's memory cap for the `unity_glb` step.
+#[tauri::command]
+pub async fn get_import_settings(state: State<'_, Arc<AppState>>) -> Result<ImportSettings> {
+    settings::load(&state.db.master_pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `patch` is a partial `ImportSettings`, such as `{"blenderMemoryMax": "16G"}`; null clears a
+/// field. A cap systemd can't read saves nothing.
+#[tauri::command]
+pub async fn set_import_settings(
+    patch: serde_json::Value,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ImportSettings> {
+    settings::update(&state.db.master_pool, patch).await
 }

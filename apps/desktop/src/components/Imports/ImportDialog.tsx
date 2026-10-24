@@ -101,6 +101,8 @@ function Candidate({
   const refreshTree = useImportStore((s) => s.refreshTree);
   const [expanded, setExpanded] = useState(expandedByDefault);
   const problem = candidateProblem(draft, index);
+  // Why the conversion can't run here (no accepted Blender), so the import records it off
+  const convertOff = draft.unavailable.unity_glb ?? null;
   const key = treeKey(c);
   const set = (patch: Partial<DraftCandidate>) => edit((d) => patchCandidate(d, index, patch));
 
@@ -215,9 +217,14 @@ function Candidate({
                 />
               </li>
               {c.converts && (
-                <li className={clsx(styles.step, styles.stepDisabled)}>
+                <li
+                  className={clsx(styles.step, convertOff && styles.stepDisabled)}
+                  data-convert-step
+                >
                   Convert models to GLB
-                  <span className={styles.preset}>not available yet: a later update adds it</span>
+                  <span className={styles.preset}>
+                    {convertOff ? `off: ${convertOff}` : 'beside each model, in Blender'}
+                  </span>
                 </li>
               )}
               <li className={styles.step}>
@@ -266,7 +273,7 @@ function Candidate({
           <div className={styles.section}>
             <span className={styles.sectionLabel}>Resulting folders</span>
             {c.tree && c.treeKey === key ? (
-              <Tree tree={c.tree} converts={c.converts} />
+              <Tree tree={c.tree} converts={c.converts && !convertOff} />
             ) : (
               <span className={styles.hint}>
                 {c.variants.length > 0 && c.variant === null

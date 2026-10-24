@@ -956,6 +956,8 @@ export interface ImportTree {
 /** A step as the scan proposes it: its kind and its options */
 export interface ImportStepRecord {
   kind: string;
+  /** Off when its tool is missing, as `unity_glb` is without Blender */
+  enabled: boolean;
   options: Record<string, unknown>;
 }
 
@@ -1004,6 +1006,8 @@ export interface ImportScan {
   originalPath: string;
   kind: 'unitypackage' | 'zip';
   offers: ImportOffer[];
+  /** Why a step kind can't run here, by kind: `unity_glb` without an accepted Blender */
+  unavailable: Record<string, string>;
 }
 
 /** What `start_import` takes: one pack of an original */

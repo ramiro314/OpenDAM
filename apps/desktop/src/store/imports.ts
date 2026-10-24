@@ -215,7 +215,7 @@ export interface DraftCandidate {
   scannedPlace: PlaceStep[];
   /** The scan's target is `<Publisher>/<Pack>`, so it moves with the publisher */
   followsPublisher: boolean;
-  /** Whether the preset converts models to GLB (`unity_glb`), a later step of the plan */
+  /** Whether the preset converts models to GLB (`unity_glb`) */
   converts: boolean;
   title: string;
   version: string;
@@ -239,6 +239,8 @@ export interface ImportDraft {
   offer: number;
   publisher: string;
   candidates: DraftCandidate[];
+  /** The scan's steps that can't run here, by kind, with the reason */
+  unavailable: Record<string, string>;
 }
 
 /** `<Publisher>/<Pack>`, or `<Pack>` while no publisher is known, as the scan names targets */
@@ -335,6 +337,7 @@ export function draftFromScan(libraryId: string, scan: ImportScan, offer = 0): I
     offer,
     publisher: chosen?.candidates[0]?.publisher ?? '',
     candidates: chosen?.candidates.map(draftCandidate) ?? [],
+    unavailable: scan.unavailable ?? {},
   };
 }
 
@@ -600,6 +603,7 @@ export const useImportStore = create<ImportStore>()((set, get) => {
         originalPath: draft.originalPath,
         kind: draft.kind,
         offers: draft.offers,
+        unavailable: draft.unavailable,
       };
       set({ draft: draftFromScan(draft.libraryId, scanned, offer) });
     },

@@ -33,6 +33,7 @@ use super::records::{
     TargetRefused,
 };
 use super::scan::{self, Scan};
+use super::unity_glb;
 use crate::db::{Database, LibraryHandle};
 
 const HEARTBEAT: Duration = Duration::from_secs(30);
@@ -122,6 +123,11 @@ pub struct Engine {
     owner: Owner,
     hooks: Hooks,
     lock_wait: Duration,
+    /// The conversion cache (`unity_glb::default_cache_dir`).
+    cache_dir: PathBuf,
+    /// The systemd tools a test runs Blender's scope through.
+    #[cfg(test)]
+    systemd: Mutex<Option<crate::capped::Systemd>>,
     /// Runs whose Cancel was accepted while their claim failed. Their next attempt starts
     /// cancelled, so the build stops before it changes anything.
     pending_cancels: Mutex<HashSet<String>>,
@@ -129,10 +135,15 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(db: Arc<Database>, events: EventSink) -> Arc<Self> {
-        Self::with_lock_wait(db, events, LOCK_WAIT)
+        Self::with_options(db, events, LOCK_WAIT, unity_glb::default_cache_dir())
     }
 
-    fn with_lock_wait(db: Arc<Database>, events: EventSink, lock_wait: Duration) -> Arc<Self> {
+    fn with_options(
+        db: Arc<Database>,
+        events: EventSink,
+        lock_wait: Duration,
+        cache_dir: PathBuf,
+    ) -> Arc<Self> {
         Arc::new(Engine {
             db,
             events,
@@ -142,12 +153,20 @@ impl Engine {
             owner: crate::watcher::this_process(),
             hooks: Hooks::default(),
             lock_wait,
+            cache_dir,
+            #[cfg(test)]
+            systemd: Mutex::new(None),
         })
     }
 
     #[cfg(test)]
     pub fn hooks(&self) -> &Hooks {
         &self.hooks
+    }
+
+    #[cfg(test)]
+    pub fn set_systemd(&self, systemd: crate::capped::Systemd) {
+        *self.systemd.lock().unwrap() = Some(systemd);
     }
 
     /// Marks the runs of gone owners `interrupted`, then runs queued runs one at a time, for good.
@@ -215,10 +234,7 @@ impl Engine {
         .await?;
         let now = now_ms();
         for (id, machine, boot, pid, started, heartbeat) in running {
-            let gone = self
-                .local_owner_gone(&machine, &boot, pid, started)
-                .unwrap_or_else(|| now - heartbeat.unwrap_or(0) >= DEAD_AFTER.as_millis() as i64);
-            if !gone {
+            if !owner_gone(&self.owner, &machine, &boot, pid, started, heartbeat, now) {
                 continue;
             }
             sqlx::query(
@@ -264,7 +280,8 @@ impl Engine {
                     && boot == self.owner.boot
                     && pid as u32 == self.owner.pid
                     && started as u64 == self.owner.started;
-                let orphan = self.local_owner_gone(&machine, &boot, pid, started) == Some(true);
+                let orphan =
+                    local_owner_gone(&self.owner, &machine, &boot, pid, started) == Some(true);
                 if mine || orphan {
                     let packs = serde_json::from_str(&packs).unwrap_or_default();
                     return Some((library, Queued { id, kind, packs }));
@@ -272,22 +289,6 @@ impl Engine {
             }
         }
         None
-    }
-
-    /// Whether a run's owner on this machine is gone: one of an earlier boot always is, one of
-    /// this boot while no process has its pid and start time. `None` for another machine's run,
-    /// or when this machine's id is unknown, which only its heartbeat can tell.
-    fn local_owner_gone(
-        &self,
-        machine: &Option<String>,
-        boot: &Option<String>,
-        pid: i64,
-        started: i64,
-    ) -> Option<bool> {
-        if self.owner.machine.is_none() || *machine != self.owner.machine {
-            return None;
-        }
-        Some(*boot != self.owner.boot || !crate::watcher::process_alive(pid as u32, started as u64))
     }
 
     async fn execute(&self, library: &LibraryHandle, run: Queued) {
@@ -353,6 +354,7 @@ impl Engine {
             run.id.clone(),
             latest.clone(),
         )));
+        let tools = self.tools().await;
         let mut warnings = Vec::new();
         let mut outcome = Ok(());
         for pack in &run.packs {
@@ -379,6 +381,7 @@ impl Engine {
                 hooks: &self.hooks,
                 progress,
                 lock_wait: self.lock_wait,
+                tools: tools.clone(),
             };
             outcome = match run.kind.as_str() {
                 "import" | "rebuild" => {
@@ -540,10 +543,27 @@ impl Engine {
                 Err(error) => candidate.target_error = Some(error),
             }
         }
+        // As an import records it: `unity_glb` off, with the reason, without Blender.
+        let mut unavailable = std::collections::BTreeMap::new();
+        let mut converts: Vec<&mut StepRecord> = offers
+            .iter_mut()
+            .flat_map(|o| o.candidates.iter_mut())
+            .flat_map(|c| c.steps.iter_mut())
+            .filter(|s| s.kind == "unity_glb")
+            .collect();
+        if !converts.is_empty() {
+            if let Some(why) = self.tools().await.unavailable().await {
+                for step in &mut converts {
+                    step.enabled = false;
+                }
+                unavailable.insert("unity_glb".to_string(), why);
+            }
+        }
         Ok(Scan {
             original_path: original.to_string_lossy().into_owned(),
             kind,
             offers,
+            unavailable,
         })
     }
 
@@ -698,10 +718,7 @@ impl Engine {
         } else {
             "extract_unitypackage"
         };
-        let mut steps = vec![StepRecord {
-            kind: extract_kind.into(),
-            options: extract.into(),
-        }];
+        let mut steps = vec![StepRecord::new(extract_kind, extract.into())];
         let place = request.place.unwrap_or_else(|| match preset {
             "fab" => vec![
                 PlaceStep::Flatten,
@@ -713,6 +730,12 @@ impl Engine {
             _ => vec![PlaceStep::Flatten],
         });
         steps.extend(place.iter().map(StepRecord::place));
+        // A Unity pack's GLBs, off with the reason shown when there's no Blender to make them.
+        if extract_kind == "extract_unitypackage" {
+            let mut convert = StepRecord::new("unity_glb", unity_glb::Options::default_json());
+            convert.enabled = self.tools().await.unavailable().await.is_none();
+            steps.push(convert);
+        }
         let mut metadata = json!({ "preset": preset, "publisher": publisher });
         for (key, value) in [("title", &request.title), ("version", &request.version)] {
             if let Some(value) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
@@ -725,10 +748,7 @@ impl Engine {
         if preset == "kenney" {
             metadata["lookup_store_page"] = request.lookup_store_page.unwrap_or(true).into();
         }
-        steps.push(StepRecord {
-            kind: "metadata".into(),
-            options: metadata,
-        });
+        steps.push(StepRecord::new("metadata", metadata));
         let source = [variant, subpath.as_deref()]
             .into_iter()
             .flatten()
@@ -760,12 +780,30 @@ impl Engine {
     }
 
     /// Pack `pack_id`'s steps in order, with its `recipe_rev`.
+    /// Names each step kind that can't run here, with why.
     pub async fn pack_steps(&self, library_id: &str, pack_id: &str) -> Result<PackSteps, String> {
         let library = self.library(library_id).await?;
-        records::steps(&library.pool, pack_id)
+        let mut steps = records::steps(&library.pool, pack_id)
             .await
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| refused(records::Refused::NoPack))
+            .ok_or_else(|| refused(records::Refused::NoPack))?;
+        if steps.steps.iter().any(|s| s.kind == "unity_glb") {
+            if let Some(why) = self.tools().await.unavailable().await {
+                steps.unavailable.insert("unity_glb".into(), why);
+            }
+        }
+        Ok(steps)
+    }
+
+    /// What a run's convert phase runs with, from Settings now.
+    async fn tools(&self) -> unity_glb::Tools {
+        #[allow(unused_mut)]
+        let mut tools = unity_glb::Tools::load(&self.db.master_pool, self.cache_dir.clone()).await;
+        #[cfg(test)]
+        if let Some(systemd) = self.systemd.lock().unwrap().clone() {
+            tools.systemd = systemd;
+        }
+        tools
     }
 
     /// Replaces pack `pack_id`'s steps (turning one off or on, changing its options) and bumps
@@ -868,7 +906,38 @@ async fn beat(pool: Pool<Sqlite>, run_id: String, latest: Arc<Mutex<Option<Progr
     }
 }
 
-fn now_ms() -> i64 {
+/// Whether a run's owner is gone, judged from process `me`: on this machine by its process
+/// (`local_owner_gone`), else by its heartbeat, which is gone once it is 10 minutes old at `now`.
+pub(crate) fn owner_gone(
+    me: &Owner,
+    machine: &Option<String>,
+    boot: &Option<String>,
+    pid: i64,
+    started: i64,
+    heartbeat: Option<i64>,
+    now: i64,
+) -> bool {
+    local_owner_gone(me, machine, boot, pid, started)
+        .unwrap_or_else(|| now - heartbeat.unwrap_or(0) >= DEAD_AFTER.as_millis() as i64)
+}
+
+/// Whether a run's owner on `me`'s machine is gone: one of an earlier boot always is, one of
+/// this boot while no process has its pid and start time. `None` for another machine's run,
+/// or when this machine's id is unknown, which only its heartbeat can tell.
+fn local_owner_gone(
+    me: &Owner,
+    machine: &Option<String>,
+    boot: &Option<String>,
+    pid: i64,
+    started: i64,
+) -> Option<bool> {
+    if me.machine.is_none() || *machine != me.machine {
+        return None;
+    }
+    Some(*boot != me.boot || !crate::watcher::process_alive(pid as u32, started as u64))
+}
+
+pub(crate) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
@@ -975,8 +1044,16 @@ fn refuse_target(root: &Path, target: &str, targets: &[String]) -> Result<(), St
 mod rebuild_tests;
 
 #[cfg(test)]
+#[path = "unity_glb_tests.rs"]
+mod unity_glb_tests;
+
+#[cfg(test)]
 #[path = "metadata_tests.rs"]
 mod metadata_tests;
+
+#[cfg(test)]
+#[path = "recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -991,6 +1068,8 @@ mod tests {
 
     pub(super) struct Setup {
         pub(super) dir: tempfile::TempDir,
+        /// The engine's conversion cache.
+        pub(super) cache: tempfile::TempDir,
         pub(super) lib: LibraryHandle,
         pub(super) engine: Arc<Engine>,
         pub(super) events: Arc<Mutex<Vec<ImportEvent>>>,
@@ -1172,6 +1251,12 @@ mod tests {
 
     /// `setup`, with the engine started only when `start` is set.
     pub(super) async fn setup_with(start: bool) -> Setup {
+        setup_in(start, false).await
+    }
+
+    /// `setup_with`, the library DB in its `.opendam/library.sqlite` when `on_disk` is set, so
+    /// a test can open it again as a restart, a reconnect or another machine does.
+    pub(super) async fn setup_in(start: bool, on_disk: bool) -> Setup {
         let dir = tempfile::Builder::new()
             .prefix("opendam-lib-")
             .tempdir()
@@ -1183,12 +1268,24 @@ mod tests {
             id: "lib".into(),
             name: "lib".into(),
             root_path: dir.path().to_path_buf(),
-            pool: memory_library_pool().await,
+            pool: if on_disk {
+                let file = dir.path().join(".opendam/library.sqlite");
+                crate::db::connect_library_sqlite(&file).await.unwrap()
+            } else {
+                memory_library_pool().await
+            },
         };
         let db = Arc::new(memory_database(vec![lib.clone()]).await);
         crate::watcher::index_paths(&db, "lib", &[dir.path().to_string_lossy().into_owned()])
             .await
             .unwrap();
+        if on_disk {
+            // Its pool enforces foreign keys: the id below changes only once no job names it.
+            sqlx::query("DELETE FROM preview_jobs")
+                .execute(&lib.pool)
+                .await
+                .unwrap();
+        }
         for sql in [
             "UPDATE assets SET id = 'tree' WHERE file_path = 'Other/Tree.png'",
             "INSERT INTO tags (id, name) VALUES ('t1', 'keep')",
@@ -1196,18 +1293,31 @@ mod tests {
         ] {
             sqlx::query(sql).execute(&lib.pool).await.unwrap();
         }
+        // No Blender, unless a test gives one (`unity_glb_tests`): imports leave `unity_glb` off.
+        crate::export::settings::update(
+            &db.master_pool,
+            json!({"blenderPath": "/nonexistent/opendam-test/blender"}),
+        )
+        .await
+        .unwrap();
+        let cache = tempfile::Builder::new()
+            .prefix("opendam-import-cache-")
+            .tempdir()
+            .unwrap();
         let events: Arc<Mutex<Vec<ImportEvent>>> = Default::default();
         let sink = events.clone();
-        let engine = Engine::with_lock_wait(
+        let engine = Engine::with_options(
             db,
             Arc::new(move |event| sink.lock().unwrap().push(event)),
             Duration::from_secs(2),
+            cache.path().to_path_buf(),
         );
         if start {
             tokio::spawn(engine.clone().start());
         }
         Setup {
             dir,
+            cache,
             lib,
             engine,
             events,

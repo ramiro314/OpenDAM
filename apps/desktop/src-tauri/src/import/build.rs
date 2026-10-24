@@ -1,7 +1,9 @@
 //! A pack's build, first or later (plan pack-import, Flow). It stages the whole pack beside its
-//! target as `.<Pack>.import-<build id>`, writing the staged files' manifest rows under the new
-//! build id. A staged file the previous build also had, by file key, size and sha256, gets that
-//! build's mtime, so the index sees it unchanged, moved or not, and queues no preview. Then:
+//! target as `.<Pack>.import-<build id>`: extract, place, then convert (`unity_glb`, whose GLBs
+//! are `generated` rows with their models' source paths), writing the staged files' manifest
+//! rows under the new build id. A staged file the previous build also had, by file key, size and
+//! sha256, gets that build's mtime, so the index sees it unchanged, moved or not, and queues no
+//! preview. Then:
 //!
 //! 1. **Lock.** Takes the library's `index_lock`, then the advisory `.opendam/index.lock`, and
 //!    holds both to the end. Cancel takes effect only before this point.
@@ -31,6 +33,7 @@ use super::carry;
 use super::metadata::{self, KenneyLicense, Lookup, MetadataStep};
 use super::place::{place, PlaceStep};
 use super::records::{self, InsertedRows, ManifestRow, Output, Recipe};
+use super::unity_glb::{self, Conversion};
 use super::unitypackage::{extract_unitypackage, extract_variant, ExtractedFile, SkippedEntry};
 use super::zipfile::extract_zip;
 use crate::db::{Database, LibraryHandle};
@@ -42,9 +45,9 @@ pub const FINISHING: &str = "Finishing, can't cancel now";
 const CHANGED: &str = "The pack changed during the build; Rebuild again";
 
 /// `fs_swap` tags of the folders beside the pack.
-const STAGING: &str = "import";
-const PREV: &str = "prev";
-const FAILED: &str = "failed";
+pub(super) const STAGING: &str = "import";
+pub(super) const PREV: &str = "prev";
+pub(super) const FAILED: &str = "failed";
 
 /// Whether a run was cancelled, and whether its build passed the point where Cancel stops
 /// working (step 1). One mutex for both, so a Cancel never lands after that point unnoticed.
@@ -76,15 +79,34 @@ impl RunControl {
     }
 }
 
-/// Where a test can pause a build or make it fail.
+/// Where a test can pause a build, make it fail or crash it (a panic, which leaves the disk and
+/// the records as a killed process would).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Point {
     /// Staged, its manifest rows written, before step 1.
     Staged,
-    /// Step 5, after the index.
-    Indexed,
+    /// Step 3's journal written, before step 4.
+    Journaled,
+    /// Step 4's rename of the live folder aside (failure only).
+    MoveAside,
+    /// Step 4, between its renames (crash only).
+    Aside,
     /// Step 4's rename of the staging folder to the live name (failure only).
     MoveIn,
+    /// Step 4 failed with nothing of the build in place, before its journal is cleared.
+    Unjournal,
+    /// Step 5's carry, between its aside and place passes.
+    CarryAside,
+    /// Step 5, after the index.
+    Indexed,
+    /// Step 6 committed, before step 7.
+    Committed,
+    /// A rollback, between its renames (crash only).
+    RollbackAside,
+    /// A rollback, after its renames (crash only).
+    RollbackRenamed,
+    /// A rollback, after its step 4 transaction and before it deletes `.failed-<build id>`.
+    RollbackCleared,
     /// The engine's claim of a queued run, before its `UPDATE`.
     Claim,
     /// A failed claim, after the engine cleared the active run and before it checks for Cancel.
@@ -110,6 +132,8 @@ enum Hook {
     Fail,
     /// Fails the first time only.
     FailOnce,
+    /// Panics the first time only, as a killed process stops: nothing after it runs.
+    Crash,
 }
 
 /// A paused build: it notifies `reached` and waits for `release`.
@@ -165,6 +189,11 @@ impl Hooks {
     }
 
     #[cfg(test)]
+    pub fn crash(&self, point: Point) {
+        self.points.lock().unwrap().push((point, Hook::Crash));
+    }
+
+    #[cfg(test)]
     fn hooks(&self, point: Point) -> Vec<Hook> {
         let points = self.points.lock().unwrap();
         points
@@ -195,8 +224,24 @@ impl Hooks {
         false
     }
 
-    /// Pauses at `point` if a test asked to, then fails if it asked to.
-    pub(crate) async fn at(&self, point: Point) -> Result<(), String> {
+    /// Panics at `point` if a test asked to, once, so the test's next build runs through.
+    pub(crate) fn crashes(&self, _point: Point) {
+        #[cfg(test)]
+        {
+            let mut points = self.points.lock().unwrap();
+            let crash = points
+                .iter()
+                .position(|(p, h)| *p == _point && matches!(h, Hook::Crash));
+            if let Some(crash) = crash {
+                points.remove(crash);
+                drop(points);
+                panic!("injected crash at {_point:?}");
+            }
+        }
+    }
+
+    /// Pauses at `point` if a test asked to, then panics if it asked to.
+    pub(crate) async fn stop(&self, point: Point) {
         #[cfg(test)]
         for hook in self.hooks(point) {
             if let Hook::Pause(pause) = hook {
@@ -204,6 +249,12 @@ impl Hooks {
                 pause.release.notified().await;
             }
         }
+        self.crashes(point);
+    }
+
+    /// Pauses at `point` if a test asked to, then panics or fails if it asked to.
+    pub(crate) async fn at(&self, point: Point) -> Result<(), String> {
+        self.stop(point).await;
         if self.fails(point) {
             return Err(format!("injected failure at {point:?}"));
         }
@@ -230,6 +281,8 @@ pub struct BuildEnv<'a> {
     pub progress: ProgressSink,
     /// How long step 1 waits for another holder of the advisory lock.
     pub lock_wait: Duration,
+    /// What the convert phase runs with.
+    pub tools: unity_glb::Tools,
 }
 
 /// Why a build stopped.
@@ -254,11 +307,19 @@ fn db_error(e: sqlx::Error) -> Stop {
 struct Plan {
     extract: Extract,
     place: Vec<PlaceStep>,
+    /// The `unity_glb` step's options, when it is on.
+    convert: Option<unity_glb::Options>,
     metadata: Option<MetadataStep>,
 }
 
-/// A recipe's steps by phase.
-type Parts = (Vec<Extract>, Vec<PlaceStep>, Vec<MetadataStep>);
+/// The steps of a recipe, by phase.
+#[derive(Default)]
+struct Parts {
+    extracts: Vec<Extract>,
+    place: Vec<PlaceStep>,
+    converts: Vec<unity_glb::Options>,
+    metadata: Vec<MetadataStep>,
+}
 
 /// The extract step, by the original's kind.
 #[derive(Clone)]
@@ -273,7 +334,7 @@ enum Extract {
 }
 
 /// Refuses steps a build of an original of `kind` couldn't run: an unknown step, invalid
-/// options, or other than exactly one enabled extract step.
+/// options, other than exactly one enabled extract step, or more than one enabled `unity_glb`.
 pub fn check_steps(kind: &str, steps: &[records::Step]) -> Result<(), String> {
     for step in steps {
         Plan::parts(kind, &[(step.kind.clone(), step.options.clone())])?;
@@ -283,43 +344,43 @@ pub fn check_steps(kind: &str, steps: &[records::Step]) -> Result<(), String> {
         .filter(|s| s.enabled)
         .map(|s| (s.kind.clone(), s.options.clone()))
         .collect();
-    let (extracts, _, metadata) = Plan::parts(kind, &enabled)?;
-    if extracts.len() != 1 {
-        return Err("A pack needs exactly one extract step".into());
-    }
-    if metadata.len() > 1 {
-        return Err("A pack has at most one metadata step".into());
-    }
+    Plan::checked(Plan::parts(kind, &enabled)?)?;
     Ok(())
 }
 
 impl Plan {
     fn of(recipe: &Recipe) -> Result<Self, String> {
-        let (extracts, place, mut metadata) = Self::parts(&recipe.kind, &recipe.steps)?;
-        if metadata.len() > 1 {
-            return Err("A pack has at most one metadata step".into());
-        }
-        match <[Extract; 1]>::try_from(extracts) {
-            Ok([extract]) => Ok(Plan {
-                extract,
-                place,
-                metadata: metadata.pop(),
-            }),
-            Err(_) => Err("A pack needs exactly one extract step".into()),
-        }
+        Self::checked(Self::parts(&recipe.kind, &recipe.steps)?)
     }
 
-    /// The extract, place and metadata steps among `steps`, for an original of `kind`, refusing
-    /// an unknown step or invalid options.
+    fn checked(parts: Parts) -> Result<Self, String> {
+        let Ok([extract]) = <[Extract; 1]>::try_from(parts.extracts) else {
+            return Err("A pack needs exactly one extract step".into());
+        };
+        if parts.converts.len() > 1 {
+            return Err("A pack runs at most one unity_glb step".into());
+        }
+        if parts.metadata.len() > 1 {
+            return Err("A pack has at most one metadata step".into());
+        }
+        Ok(Plan {
+            extract,
+            place: parts.place,
+            convert: parts.converts.into_iter().next(),
+            metadata: parts.metadata.into_iter().next(),
+        })
+    }
+
+    /// The steps among `steps` by phase, for an original of `kind`, refusing an unknown step or
+    /// invalid options.
     fn parts(kind: &str, steps: &[(String, serde_json::Value)]) -> Result<Parts, String> {
         let zip = match kind {
             "unitypackage" => false,
             "zip" => true,
             other => return Err(format!("{other} originals can't be built yet")),
         };
-        let mut extracts = Vec::new();
-        let mut place = Vec::new();
-        let mut metadata = Vec::new();
+        let mut parts = Parts::default();
+        let (extracts, place) = (&mut parts.extracts, &mut parts.place);
         for (kind, options) in steps {
             let text = |key: &str| options[key].as_str().map(str::to_string);
             match kind.as_str() {
@@ -349,14 +410,15 @@ impl Plan {
                             .map_err(|e| format!("The {kind} step's options are invalid: {e}"))?,
                     );
                 }
-                "metadata" => metadata.push(
+                "metadata" => parts.metadata.push(
                     serde_json::from_value(options.clone())
                         .map_err(|e| format!("The metadata step's options are invalid: {e}"))?,
                 ),
+                "unity_glb" => parts.converts.push(unity_glb::Options::parse(options)?),
                 other => return Err(format!("The {other} step can't run yet")),
             }
         }
-        Ok((extracts, place, metadata))
+        Ok(parts)
     }
 }
 
@@ -509,6 +571,7 @@ async fn swap_in(
     if !matches!(&journaled, Ok(done) if done.rows_affected() == 1) {
         return Err(cleanup.run(CHANGED.to_string().into()).await);
     }
+    env.hooks.stop(Point::Journaled).await;
 
     // ── 4. Swap ─────────────────────────────────────────────────────────
     (env.progress)(Progress {
@@ -523,7 +586,12 @@ async fn swap_in(
         prev.as_deref(),
         fs_swap::Old::Keep,
         |a, b| {
-            if a == staging && b == live && env.hooks.fails(Point::MoveIn) {
+            if a == staging && b == live {
+                env.hooks.crashes(Point::Aside);
+                if env.hooks.fails(Point::MoveIn) {
+                    return Err(std::io::Error::other("injected failure"));
+                }
+            } else if a == live && env.hooks.fails(Point::MoveAside) {
                 return Err(std::io::Error::other("injected failure"));
             }
             std::fs::rename(a, b)
@@ -546,6 +614,7 @@ async fn swap_in(
                 "Could not move the built pack to {}: {error}",
                 live.display()
             );
+            env.hooks.stop(Point::Unjournal).await;
             if let Err(e) = unjournal(pool, pack_id, build_id).await {
                 return Err(Stop::Failed(format!(
                     "{failed}. Clearing its journal failed: {e}"
@@ -564,9 +633,16 @@ async fn swap_in(
     let pack_path = [live.to_string_lossy().into_owned()];
     let committed = async {
         if let Some(prev_build) = &recipe.current_build {
-            carry::carry(pool, pack_id, &recipe.target, prev_build, build_id)
-                .await
-                .map_err(|e| format!("Carrying the moved files' rows failed: {e}"))?;
+            carry::carry(
+                pool,
+                pack_id,
+                &recipe.target,
+                prev_build,
+                build_id,
+                env.hooks,
+            )
+            .await
+            .map_err(|e| format!("Carrying the moved files' rows failed: {e}"))?;
         }
         let journal = InsertedRows::after(pool, pack_id, build_id)
             .await
@@ -605,6 +681,7 @@ async fn swap_in(
         };
         return Err(rollback(env, index_guard, advisory, pack_id, &swap, error).await);
     }
+    env.hooks.stop(Point::Committed).await;
 
     // ── 7. Settle ───────────────────────────────────────────────────────
     (env.progress)(Progress {
@@ -772,35 +849,116 @@ async fn stage(
     .await?;
     cancelled()?;
 
-    let package = match &plan.metadata {
-        Some(step) => Some(write_package(env, recipe, step, staging, &files).await?),
-        None => None,
-    };
+    // A staged file the previous build had, by file key, size and sha256, keeps its mtime.
+    let unchanged: Arc<Unchanged> = Arc::new(
+        previous
+            .iter()
+            .filter_map(|row| {
+                let key = (row.source_path.clone()?, row.generated);
+                Some((key, (row.size, row.sha256.clone(), row.mtime_ns)))
+            })
+            .collect(),
+    );
+    // The phases after placing, in plan order: convert, then metadata, which sees the GLBs.
+    // Files are hashed once at the end, except that a conversion needs its inputs' hashes first.
+    let prefix = format!("{}/", recipe.target);
+    let mut pending: Vec<(ExtractedFile, bool)> = files.into_iter().map(|f| (f, false)).collect();
+    let mut outputs = Vec::new();
+    if let Some(options) = &plan.convert {
+        outputs = hash_staged(
+            env,
+            recipe,
+            staging,
+            std::mem::take(&mut pending),
+            &unchanged,
+        )
+        .await?;
+        cancelled()?;
+        let files: Vec<unity_glb::Staged> = outputs
+            .iter()
+            .map(|o| unity_glb::Staged {
+                path: o.path[prefix.len()..].to_string(),
+                source_path: o.source_path.clone(),
+                sha256: o.sha256.clone(),
+            })
+            .collect();
+        let models = Conversion {
+            staging,
+            files: &files,
+            original_sha256: &recipe.original_sha256,
+            options,
+            tools: &env.tools,
+            control: env.control.clone(),
+            progress: env.progress.clone(),
+        }
+        .run()
+        .await?;
+        let generated = models
+            .into_iter()
+            .map(|m| {
+                // Its size is read from disk when it is hashed, below.
+                let glb = ExtractedFile {
+                    path: m.glb,
+                    source_path: m.source_path,
+                    size: 0,
+                };
+                (glb, true)
+            })
+            .collect();
+        outputs.extend(hash_staged(env, recipe, staging, generated, &unchanged).await?);
+        cancelled()?;
+    }
+    if let Some(step) = &plan.metadata {
+        let files: Vec<ExtractedFile> = outputs
+            .iter()
+            .map(|o| ExtractedFile {
+                path: o.path[prefix.len()..].to_string(),
+                source_path: o.source_path.clone(),
+                size: o.size,
+            })
+            .chain(pending.iter().map(|(f, _)| f.clone()))
+            .collect();
+        let package = write_package(env, recipe, step, staging, &files).await?;
+        pending.push((package, true));
+        cancelled()?;
+    }
+    outputs.extend(hash_staged(env, recipe, staging, pending, &unchanged).await?);
     cancelled()?;
+    outputs.sort_by(|a, b| a.path.cmp(&b.path));
 
-    // A staged file's file key: its source path, and whether it is generated.
-    let unchanged: HashMap<(String, bool), (i64, String, i64)> = previous
-        .iter()
-        .filter_map(|row| {
-            let key = (row.source_path.clone()?, row.generated);
-            Some((key, (row.size, row.sha256.clone(), row.mtime_ns)))
-        })
-        .collect();
-    let staged: Vec<(ExtractedFile, bool)> = files
-        .into_iter()
-        .map(|file| (file, false))
-        .chain(package.map(|file| (file, true)))
-        .collect();
-    let (to, target, control, progress) = (
+    records::write_outputs(&env.library.pool, &recipe.pack_id, build_id, &outputs)
+        .await
+        .map_err(db_error)?;
+    env.hooks.at(Point::Staged).await?;
+    cancelled()?;
+    Ok(outputs)
+}
+
+/// The previous build's rows by file key (source path, generated): size, sha256 and mtime.
+type Unchanged = HashMap<(String, bool), (i64, String, i64)>;
+
+/// Hashes the staged files `files`, each with whether it is generated, as their manifest rows
+/// (a file's size is read from disk). A file the previous build had, by file key, size and sha256, gets that
+/// build's mtime, so the index sees it unchanged.
+async fn hash_staged(
+    env: &BuildEnv<'_>,
+    recipe: &Recipe,
+    staging: &Path,
+    files: Vec<(ExtractedFile, bool)>,
+    unchanged: &Arc<Unchanged>,
+) -> Result<Vec<Output>, Stop> {
+    let (to, target, control, progress, unchanged) = (
         staging.to_path_buf(),
         recipe.target.clone(),
         env.control.clone(),
         env.progress.clone(),
+        unchanged.clone(),
     );
-    let outputs = tokio::task::spawn_blocking(move || {
-        let total = staged.len() as u64;
-        let mut outputs = Vec::with_capacity(staged.len());
-        for (done, (file, generated)) in staged.into_iter().enumerate() {
+    tokio::task::spawn_blocking(move || {
+        let total = files.len() as u64;
+        let mut outputs = Vec::with_capacity(files.len());
+        for (done, (file, generated)) in files.into_iter().enumerate() {
+            let (rel, source_path) = (file.path, file.source_path);
             if control.cancelled() {
                 return Err(Stop::Cancelled);
             }
@@ -809,42 +967,34 @@ async fn stage(
                 done: done as u64,
                 total,
             });
-            let path = to.join(&file.path);
-            let read = |e: std::io::Error| format!("The staged {} can't be read: {e}", file.path);
+            let path = to.join(&rel);
+            let read = |e: std::io::Error| format!("The staged {rel} can't be read: {e}");
             let (size, mut mtime_ns) = file_stamp(&path).map_err(read)?;
             let sha256 = crate::export::hashes::sha256_file(&path).map_err(read)?;
-            let key = (records::source_json(&file.source_path), generated);
+            let key = (records::source_json(&source_path), generated);
             if let Some((_, _, before)) = unchanged
                 .get(&key)
                 .filter(|(s, sha, _)| *s == size as i64 && *sha == sha256)
             {
                 if *before != mtime_ns {
                     set_mtime(&path, *before)
-                        .map_err(|e| format!("The staged {} can't be stamped: {e}", file.path))?;
+                        .map_err(|e| format!("The staged {rel} can't be stamped: {e}"))?;
                     mtime_ns = *before;
                 }
             }
             outputs.push(Output {
-                path: format!("{target}/{}", file.path),
+                path: format!("{target}/{rel}"),
                 size,
                 mtime_ns,
                 sha256,
-                source_path: file.source_path,
+                source_path,
                 generated,
             });
         }
         Ok(outputs)
     })
     .await
-    .map_err(|e| Stop::Failed(format!("The build's worker stopped: {e}")))??;
-    cancelled()?;
-
-    records::write_outputs(&env.library.pool, &recipe.pack_id, build_id, &outputs)
-        .await
-        .map_err(db_error)?;
-    env.hooks.at(Point::Staged).await?;
-    cancelled()?;
-    Ok(outputs)
+    .map_err(|e| Stop::Failed(format!("The build's worker stopped: {e}")))?
 }
 
 /// The metadata step: writes the pack's `datapackage.json` into `staging`, beside the placed
@@ -1110,7 +1260,11 @@ fn staged_sizes(folder: &Path) -> std::io::Result<Vec<(String, i64)>> {
 }
 
 /// Clears a swap's journal and the build's rows, when nothing of the build is in place.
-async fn unjournal(pool: &Pool<Sqlite>, pack_id: &str, build_id: &str) -> sqlx::Result<()> {
+pub(super) async fn unjournal(
+    pool: &Pool<Sqlite>,
+    pack_id: &str,
+    build_id: &str,
+) -> sqlx::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE import_packs SET swap_state = NULL, swap_build = NULL, swap_prev = NULL
@@ -1155,52 +1309,172 @@ async fn rollback(
     if let Err(e) = std::fs::rename(swap.live, &failed) {
         return unfinished(format!("moving the pack aside: {e}"));
     }
+    env.hooks.crashes(Point::RollbackAside);
     if let Some(prev) = swap.prev {
         if let Err(e) = std::fs::rename(prev, swap.live) {
             return unfinished(format!("moving the previous folder back: {e}"));
         }
     }
+    env.hooks.crashes(Point::RollbackRenamed);
 
-    // 3. The rows the build's index inserted, which frees their paths, then the carried rows
-    //    back by asset id, then the structure of what is on disk now.
-    let deleted = sqlx::query(
+    // 3-4. Rows, index, journal, then the failed build's folder.
+    let rolled = Rollback {
+        pool,
+        pack_id,
+        target: swap.target,
+        build_id: swap.build_id,
+        live: swap.live,
+        failed: &failed,
+        reindex: swap.prev.is_some(),
+    };
+    let refresh = Refresh::Registered {
+        db: env.db,
+        library: env.library,
+    };
+    if let Err(step) = finish_rollback(&rolled, refresh, index_guard, advisory, env.hooks).await {
+        return unfinished(step);
+    }
+    // Only the build knows which folders it made on the way to the pack.
+    remove_created(swap.created);
+    Stop::Failed(error)
+}
+
+/// A swap being rolled back, its folders already in place: the failed build at `failed`, and the
+/// previous folder (if any) back at `live`.
+pub(super) struct Rollback<'a> {
+    pub pool: &'a Pool<Sqlite>,
+    pub pack_id: &'a str,
+    pub target: &'a str,
+    pub build_id: &'a str,
+    pub live: &'a Path,
+    pub failed: &'a Path,
+    /// A previous folder was moved aside and is back, so the pack is reindexed. Without one the
+    /// pack folder is gone again, as before the build, and an index would prune the rows just
+    /// moved back.
+    pub reindex: bool,
+}
+
+/// How `finish_rollback` brings the index and the structure up to date.
+pub(super) enum Refresh<'a> {
+    /// A build's own rollback, its library registered: `index_paths_locked`, which also stores
+    /// the asset count, or without a previous folder `rebuild_library_locked`.
+    Registered {
+        db: &'a Database,
+        library: &'a LibraryHandle,
+    },
+    /// Recovery, maybe before the library is registered: the lock-free index core over the
+    /// library at `root`. Its caller runs the structure pass right after it.
+    Core { root: &'a Path },
+}
+
+/// A rollback's steps 3 and 4 (plan Flow, Rollback), shared by a build's own rollback and swap
+/// recovery, which finishes one a crash interrupted. Holding both of the library's locks, it
+/// deletes the rows the build's index inserted, which frees their paths, moves the carried rows
+/// back by asset id, reindexes the restored pack (`Rollback::reindex`), then clears the journal
+/// and the build's records in one transaction, and only then deletes the failed build's folder.
+/// On failure it returns the step that failed, the journal still set, for recovery.
+pub(super) async fn finish_rollback(
+    rolled: &Rollback<'_>,
+    refresh: Refresh<'_>,
+    index_guard: &tokio::sync::MutexGuard<'_, ()>,
+    advisory: &IndexLock,
+    hooks: &Hooks,
+) -> Result<(), String> {
+    let pool = rolled.pool;
+    sqlx::query(
         "DELETE FROM assets WHERE id IN (SELECT asset_id FROM import_moves
          WHERE pack_id = ? AND build_id = ? AND kind = 'inserted')",
     )
-    .bind(pack_id)
-    .bind(swap.build_id)
+    .bind(rolled.pack_id)
+    .bind(rolled.build_id)
     .execute(pool)
-    .await;
-    if let Err(e) = deleted {
-        return unfinished(format!("deleting the rows it inserted: {e}"));
-    }
-    if let Err(e) = carry::reverse(pool, pack_id, swap.target, swap.build_id).await {
-        return unfinished(format!("moving the carried rows back: {e}"));
-    }
-    if swap.prev.is_some() {
-        let pack_path = [swap.live.to_string_lossy().into_owned()];
-        let indexed = watcher::index_paths_locked(
-            env.db,
-            &env.library.id,
-            &pack_path,
-            Prune::Now,
-            index_guard,
-            advisory,
-        )
-        .await;
-        if let Err(e) = indexed {
-            tracing::warn!("Re-indexing the restored pack: {e:#}");
+    .await
+    .map_err(|e| format!("deleting the rows it inserted: {e}"))?;
+    carry::reverse(pool, rolled.pack_id, rolled.target, rolled.build_id)
+        .await
+        .map_err(|e| format!("moving the carried rows back: {e}"))?;
+    match (refresh, rolled.reindex) {
+        (Refresh::Registered { db, library }, true) => {
+            let pack_path = [rolled.live.to_string_lossy().into_owned()];
+            let indexed = watcher::index_paths_locked(
+                db,
+                &library.id,
+                &pack_path,
+                Prune::Now,
+                index_guard,
+                advisory,
+            )
+            .await;
+            if let Err(e) = indexed {
+                tracing::warn!("Re-indexing the restored pack: {e:#}");
+            }
         }
-    } else {
-        // No pack folder now, as before the build: an index would prune rows it never should.
-        crate::structure::rebuild_library_locked(env.db, env.library, index_guard, advisory).await;
+        (Refresh::Registered { db, library }, false) => {
+            crate::structure::rebuild_library_locked(db, library, index_guard, advisory).await;
+        }
+        (Refresh::Core { root }, true) => index_pack(pool, root, advisory, rolled.live).await,
+        (Refresh::Core { .. }, false) => {}
+    }
+    unjournal(pool, rolled.pack_id, rolled.build_id)
+        .await
+        .map_err(|e| format!("clearing its journal: {e}"))?;
+    hooks.stop(Point::RollbackCleared).await;
+    fs_swap::discard(rolled.failed);
+    Ok(())
+}
+
+/// Indexes the pack folder `live` of the library at `root` with `Prune::Now` through the
+/// lock-free core, when it is a folder: walking a missing one would prune every row below it. A
+/// failure is logged, as a build's settle logs it: the next refresh indexes it again.
+pub(super) async fn index_pack(
+    pool: &Pool<Sqlite>,
+    root: &Path,
+    advisory: &IndexLock,
+    live: &Path,
+) {
+    if !live.is_dir() {
+        tracing::warn!("{} is no folder now, so it isn't indexed", live.display());
+        return;
+    }
+    let paths = [live.to_string_lossy().into_owned()];
+    if let Err(e) = watcher::index_pool(pool, root, &paths, Prune::Now, Some(advisory)).await {
+        tracing::warn!("Indexing the pack {}: {e:#}", live.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn step(kind: &str, enabled: bool, options: serde_json::Value) -> records::Step {
+        records::Step {
+            kind: kind.into(),
+            enabled,
+            options,
+        }
     }
 
-    // 4. The journal and the build's records in one transaction, then its folder.
-    if let Err(e) = unjournal(pool, pack_id, swap.build_id).await {
-        return unfinished(format!("clearing its journal: {e}"));
+    #[test]
+    fn a_pack_runs_at_most_one_unity_glb_step() {
+        let extract = step("extract_unitypackage", true, json!({}));
+        let convert = |enabled| step("unity_glb", enabled, json!({"max_texture": 1024}));
+        assert_eq!(
+            check_steps(
+                "unitypackage",
+                &[extract.clone(), convert(true), convert(true)]
+            ),
+            Err("A pack runs at most one unity_glb step".into())
+        );
+        assert_eq!(
+            check_steps(
+                "unitypackage",
+                &[extract.clone(), convert(true), convert(false)]
+            ),
+            Ok(())
+        );
+        // A step that is off still needs options it could run with.
+        let invalid = step("unity_glb", false, json!({"max_texture": 1}));
+        assert!(check_steps("unitypackage", &[extract, invalid]).is_err());
     }
-    fs_swap::discard(&failed);
-    remove_created(swap.created);
-    Stop::Failed(error)
 }
