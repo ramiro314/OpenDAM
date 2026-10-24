@@ -780,6 +780,27 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
         }
     }
 
+    /// A clean exit with no result file, and a result file that isn't the script's JSON, each
+    /// fail the step with what went wrong, not as a crash.
+    #[tokio::test]
+    async fn a_missing_or_unreadable_result_fails_the_step() {
+        let s = setup().await;
+        assert_eq!(
+            failed_with_stub_blender(&s, "exit 0").await,
+            "Converting to GLB failed: Blender exited without a result"
+        );
+        let s = setup().await;
+        let error =
+            failed_with_stub_blender(&s, "for last; do :; done\nprintf 'not json' > \"$last\"")
+                .await;
+        assert!(
+            error.starts_with(
+                "Converting to GLB failed: Blender's conversion result can't be read: "
+            ),
+            "{error}"
+        );
+    }
+
     /// Without Blender an import leaves the step off and says why, and a build with it on fails
     /// with that reason.
     #[tokio::test]

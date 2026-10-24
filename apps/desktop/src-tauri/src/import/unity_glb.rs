@@ -569,12 +569,13 @@ impl Conversion<'_> {
         let ran = self
             .run_blender(blender, &args, &work.0, cached_already, total)
             .await?;
-        let text = tokio::fs::read_to_string(&result_file).await;
-        let result: ScriptResult = match text {
-            Ok(text) if ran.status.success() => serde_json::from_str(&text)
-                .map_err(|e| format!("Blender's conversion result can't be read: {e}"))?,
+        // A crash, and a clean exit with no result file, are told apart by `crashed`.
+        let text = match tokio::fs::read_to_string(&result_file).await {
+            Ok(text) if ran.status.success() => text,
             _ => return Err(Stop::Failed(converting(blender::crashed(&ran)))),
         };
+        let result: ScriptResult = serde_json::from_str(&text)
+            .map_err(|e| converting(format!("Blender's conversion result can't be read: {e}")))?;
         if result.version != UNITY_GLB_VERSION {
             return Err(Stop::Failed(converting(format!(
                 "the script reported version {}, not {UNITY_GLB_VERSION}",

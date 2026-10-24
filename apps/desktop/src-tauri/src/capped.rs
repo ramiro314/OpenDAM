@@ -164,7 +164,9 @@ impl Capped {
 /// or `T` suffix.
 pub fn check_cap(max: &str) -> Result<(), String> {
     let digits = max.strip_suffix(['K', 'M', 'G', 'T']).unwrap_or(max);
-    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && digits != "0" {
+    let digits_only = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+    // A cap of zero, however many zeros it is written with, would kill every run at once.
+    if digits_only && digits.bytes().any(|b| b != b'0') {
         Ok(())
     } else {
         Err(format!(
@@ -362,11 +364,11 @@ mod tests {
 
     #[test]
     fn caps_are_sizes_systemd_reads() {
-        for ok in ["12G", "512M", "1073741824", "2T", "64K"] {
+        for ok in ["12G", "512M", "1073741824", "2T", "64K", "016G"] {
             assert_eq!(check_cap(ok), Ok(()), "{ok}");
         }
         for bad in [
-            "", "G", "12g", "12 G", "-1G", "1.5G", "0", "12GB", "infinity",
+            "", "G", "12g", "12 G", "-1G", "1.5G", "0", "00", "00G", "000M", "12GB", "infinity",
         ] {
             assert!(check_cap(bad).is_err(), "{bad}");
         }
