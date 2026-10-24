@@ -40,12 +40,12 @@ const SCRIPT: &str = include_str!("unity_glb.py");
 pub const DEFAULT_MEMORY_MAX: &str = "12G";
 
 const MODEL_EXTENSIONS: [&str; 2] = ["fbx", "obj"];
-/// The files Blender reads besides the models: Unity's `.meta`, `.mat`, `.prefab` and `.unity`,
-/// an OBJ's `.mtl`, and the textures the script loads.
-const INPUT_EXTENSIONS: [&str; 13] = [
-    "meta", "mat", "prefab", "unity", "mtl", "png", "jpg", "jpeg", "tga", "tif", "tiff", "psd",
-    "bmp",
-];
+/// The files the script loads as textures. It reads them from its job (`imageExtensions`), so
+/// this is the one list of them.
+const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "tga", "tif", "tiff", "psd", "bmp"];
+/// The other files Blender reads besides the models: Unity's `.meta`, `.mat`, `.prefab` and
+/// `.unity`, and an OBJ's `.mtl`. A test keeps every extension the script names among these.
+const UNITY_EXTENSIONS: [&str; 5] = ["meta", "mat", "prefab", "unity", "mtl"];
 
 /// The step's options. `force` converts every model again, whatever the cache holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,10 +237,12 @@ pub fn models(files: &[Staged]) -> Vec<Model> {
     models
 }
 
-/// Whether Blender reads `path`: a model or one of `INPUT_EXTENSIONS`.
+/// Whether Blender reads `path`: a model, a texture or another of the files the script reads.
 pub fn is_input(path: &str) -> bool {
     extension(path).is_some_and(|ext| {
-        MODEL_EXTENSIONS.contains(&ext.as_str()) || INPUT_EXTENSIONS.contains(&ext.as_str())
+        [&MODEL_EXTENSIONS[..], &IMAGE_EXTENSIONS, &UNITY_EXTENSIONS]
+            .iter()
+            .any(|set| set.contains(&ext.as_str()))
     })
 }
 
@@ -368,6 +370,8 @@ struct Job<'a> {
     scratch: PathBuf,
     max_texture: u32,
     assimp: &'a str,
+    /// `IMAGE_EXTENSIONS`, as `.png`.
+    image_extensions: Vec<String>,
     models: Vec<JobModel>,
 }
 
@@ -530,6 +534,7 @@ impl Conversion<'_> {
             scratch: work.0.join("scratch"),
             max_texture: self.options.max_texture,
             assimp: &self.tools.assimp,
+            image_extensions: IMAGE_EXTENSIONS.iter().map(|e| format!(".{e}")).collect(),
             models: uncached
                 .iter()
                 .enumerate()
@@ -749,6 +754,39 @@ pub(crate) mod tests {
             .find_map(|l| l.strip_prefix("VERSION = \""))
             .and_then(|rest| rest.strip_suffix('"'));
         assert_eq!(declared, Some(UNITY_GLB_VERSION));
+    }
+
+    /// Every extension the script names, in a glob or a suffix check, is one Rust copies into the
+    /// work copy, and the textures it loads are the ones its job names.
+    #[test]
+    fn the_script_reads_only_files_rust_copies() {
+        assert!(
+            !SCRIPT.contains("IMAGE_EXTENSIONS"),
+            "the script takes the image extensions from its job"
+        );
+        assert!(SCRIPT.contains(r#"set(job["imageExtensions"])"#));
+        let copied: Vec<&str> =
+            [&MODEL_EXTENSIONS[..], &IMAGE_EXTENSIONS, &UNITY_EXTENSIONS].concat();
+        let named: Vec<&str> = SCRIPT
+            .match_indices("\"*.")
+            .chain(SCRIPT.match_indices("\"."))
+            .filter_map(|(at, quote)| {
+                let rest = &SCRIPT[at + quote.len()..];
+                let ext = &rest[..rest.find('"')?];
+                (!ext.is_empty() && ext.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(ext)
+            })
+            .collect();
+        for ext in [
+            "meta", "prefab", "unity", "mat", "mtl", "fbx", "jpg", "jpeg",
+        ] {
+            assert!(named.contains(&ext), "the scan finds .{ext}: {named:?}");
+        }
+        for ext in &named {
+            assert!(
+                copied.contains(ext),
+                "the script reads .{ext}, which isn't copied"
+            );
+        }
     }
 
     #[test]

@@ -5,7 +5,9 @@ Blender, one process per build:
     blender -b --factory-startup --python-exit-code 1 -P unity_glb.py -- <job.json> <result.json>
 
 The job names the work copy (`pack`), a scratch folder, the models to convert, each with the
-path its GLB goes to, the longest texture side (`maxTexture`) and the `assimp` program. The
+path its GLB goes to, the longest texture side (`maxTexture`), the `assimp` program and the
+extensions of the files it loads as textures (`imageExtensions`), which OpenDAM owns: it copies
+exactly those files, with the models and Unity files, into the work copy. The
 result lists each model as converted, with its material slot count, or failed, with why.
 
 A port of `unity_gltf.py` (`~/Documents/Assets`, sha256 f6e1b992...), whose heuristics it keeps
@@ -68,7 +70,6 @@ import bpy
 # which a test keeps equal. Bump both when the GLBs this writes change.
 VERSION = "opendam-unity-glb/4"
 
-MODEL_EXTENSIONS = {".fbx", ".obj"}
 # Property names are matched lowercased, without underscores: `_Base_Map` is `basemap`.
 BASE_PROPS = ["basemap", "maintex", "basecolormap", "mainbasemap", "base", "albedo", "albedomap",
               "diffuse", "diffusemap", "basecolor", "basetexture", "maintexture", "albedotexture",
@@ -468,7 +469,6 @@ def external_objects(meta: Path) -> dict[str, str]:
         r"\{fileID: -?\d+, guid: ([0-9a-f]{32})", text)}
 
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tga", ".tif", ".tiff", ".psd", ".bmp"}
 # Suffixes after the model or material name that mark a texture's role: `Bow Diffuse`, `bow_n`.
 NAME_ROLES = {
     "basemap": ["diffuse", "albedo", "basecolor", "basemap", "color", "colour", "diff", "col",
@@ -564,8 +564,9 @@ def main() -> None:
     for mat in by_path(pack.rglob("*.mat")):
         by_name.setdefault(mat.stem.lower(), mat)
     images: dict[str, Path] = {}
+    image_extensions = set(job["imageExtensions"])
     for img in by_path(pack.rglob("*")):
-        if img.suffix.lower() in IMAGE_EXTENSIONS:
+        if img.suffix.lower() in image_extensions:
             images.setdefault(alnum(img.stem), img)
     mtls: dict[str, Path] = {}
     for mtl in by_path(pack.rglob("*")):
