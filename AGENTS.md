@@ -98,9 +98,12 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               convert phase: one textured X.glb per model stem (FBX over OBJ,
                               none where the folder ships one), made by the embedded
                               unity_glb.py (versioned by UNITY_GLB_VERSION) in Blender on a work
-                              copy, under the memory cap in settings (import.blenderMemoryMax),
-                              and cached in ~/.cache/opendam/import/glb by a key over every
-                              input's source path, final name and sha256
+                              copy, whose binary .mat, .prefab and .unity files the preview
+                              worker's unity_binary_to_text rewrites as text, under the memory
+                              cap in settings (import.blenderMemoryMax), and cached in
+                              ~/.cache/opendam/import/glb by a key over every input's source
+                              path, final name and sha256 (and, with binary Unity files,
+                              unity_text.py's VERSION and the locked UnityPy)
     src/capped.rs             capped_command: a child process in a systemd user scope with
                               MemoryMax (as scripts/memory-cap.sh), uncapped with a warning
                               without systemd-run --user, and exit 137 reported as killed by the cap
@@ -121,7 +124,8 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
     migrations/               Library DB schema
     contract/                 Pinned copy of dungeon-game's asset contract schema, never edited by hand:
                               SOURCE.md pins it, scripts/sync-asset-contract.sh re-copies it
-packages/preview-engine/      Python worker (worker.py, fbx_nodes.py: an FBX node-tree reader), uv project, dev venv in .venv/
+packages/preview-engine/      Python worker (worker.py, fbx_nodes.py: an FBX node-tree reader, unity_text.py: binary
+                              Unity files as text through UnityPy), uv project, dev venv in .venv/
 docs/adr, docs/specs          Upstream design records, kept as history
 docs/plans                    Plans for this fork
 .github/                      CI workflow, Dependabot, Tauri version check script
@@ -220,8 +224,9 @@ docs/plans                    Plans for this fork
   requests over the existing stream; one process serves every file. The queue starts it eagerly
   and asks each new process its `engine_info`, publishing the answer in
   `AppState::engine_version` (`preview::PreviewEngine`). Replies are matched to requests by `id`.
-  Other parts of the app, such as the game export's `fbx_facts`, send a `preview::WorkerRequest`
-  to the queue, which serves it on that process between jobs.
+  Other parts of the app, such as the game export's `fbx_facts` and the import's
+  `unity_binary_to_text`, send a `preview::WorkerRequest` to the queue, which serves it on that
+  process between jobs.
 - **Zero telemetry.** The app makes no network calls to analytics or tracking services. The only
   outbound calls are:
   - AI tagging requests to the provider you configured (the Anthropic API, your local `claude`

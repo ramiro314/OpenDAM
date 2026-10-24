@@ -9,9 +9,15 @@
 //! - **A work copy.** Blender reads a copy of the staged pack's inputs (Unity files, models,
 //!   `.mtl` files and textures) in a work folder of the cache, never the staging folder, and the
 //!   folder is deleted when the step ends.
+//! - **Binary Unity files.** A `.mat`, `.prefab` or `.unity` that Unity 4 or 5 wrote in its
+//!   binary serialization is rewritten as text in the work copy only, by the preview worker's
+//!   `unity_binary_to_text` (UnityPy), so the script reads it and the library keeps its bytes.
+//!   Only a file with the binary serialization's header counts (`is_serialized_file`), so another
+//!   program's `.mat` is copied as it is. One the worker can't rewrite fails the step, naming it.
 //! - **The cache.** Each GLB is kept at `<cache>/glb/<key>.glb`, keyed by the original's sha256,
 //!   the model's source path, the options, `UNITY_GLB_VERSION`, Blender's version and the
-//!   **inputs hash** (`inputs_hash`), so a rebuild that only moved files between folders runs no
+//!   **inputs hash** (`inputs_hash`), and for a pack holding binary Unity files, the converter's
+//!   version (`converter_version`), so a rebuild that only moved files between folders runs no
 //!   Blender at all, and one that dropped, renamed or changed an input converts again.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -23,15 +29,37 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+use tokio::sync::{mpsc, oneshot};
 
 use super::build::{Progress, ProgressSink, RunControl, Stop};
 use crate::capped;
 use crate::export::blender::{self, Blender};
 use crate::export::hashes::sha256_bytes;
+use crate::preview::WorkerRequest;
 
 /// The script's version, which every GLB's cache key holds. The script declares it as
 /// `VERSION`, which a test keeps equal: bump both when the GLBs it writes change.
 pub const UNITY_GLB_VERSION: &str = "opendam-unity-glb/4";
+
+/// The version of the preview engine's `unity_text.py`, which writes binary Unity files as text.
+/// It declares it as `VERSION`, which a test keeps equal: bump both when the text it writes
+/// changes.
+pub const UNITY_TEXT_VERSION: &str = "opendam-unity-text/1";
+
+/// The preview engine's lockfile, for the UnityPy version the text is written with.
+const ENGINE_LOCK: &str = include_str!("../../../../../packages/preview-engine/uv.lock");
+
+/// What a binary Unity file's text depends on besides its bytes: `UNITY_TEXT_VERSION` and the
+/// UnityPy version the engine's lockfile pins, which the installed engine runs.
+pub fn converter_version() -> String {
+    let unitypy = ENGINE_LOCK
+        .split("[[package]]")
+        .find(|p| p.contains("\nname = \"unitypy\"\n"))
+        .and_then(|p| p.lines().find_map(|l| l.strip_prefix("version = \"")))
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or("unknown");
+    format!("{UNITY_TEXT_VERSION} UnityPy {unitypy}")
+}
 
 /// The conversion script, embedded so the installed app needs no file beside it.
 const SCRIPT: &str = include_str!("unity_glb.py");
@@ -46,6 +74,9 @@ const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "tga", "tif", "tiff",
 /// The other files Blender reads besides the models: Unity's `.meta`, `.mat`, `.prefab` and
 /// `.unity`, and an OBJ's `.mtl`. A test keeps every extension the script names among these.
 const UNITY_EXTENSIONS: [&str; 5] = ["meta", "mat", "prefab", "unity", "mtl"];
+/// The Unity files the script reads as text that Unity 4 and 5 could also write in their binary
+/// serialization.
+const SERIALIZED_EXTENSIONS: [&str; 3] = ["mat", "prefab", "unity"];
 
 /// The step's options. `force` converts every model again, whatever the cache holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,10 +124,16 @@ pub struct Tools {
     pub assimp: String,
     /// The systemd tools Blender's scope runs through.
     pub systemd: capped::Systemd,
+    /// The preview queue's worker, which rewrites binary Unity files as text.
+    pub worker: mpsc::Sender<WorkerRequest>,
 }
 
 impl Tools {
-    pub async fn load(master: &sqlx::Pool<sqlx::Sqlite>, cache_dir: PathBuf) -> Self {
+    pub async fn load(
+        master: &sqlx::Pool<sqlx::Sqlite>,
+        cache_dir: PathBuf,
+        worker: mpsc::Sender<WorkerRequest>,
+    ) -> Self {
         let blender_path = match crate::export::settings::load(master).await {
             Ok(settings) => settings.blender_path,
             Err(e) => {
@@ -117,6 +154,7 @@ impl Tools {
             cache_dir,
             assimp: "assimp".into(),
             systemd: capped::Systemd::default(),
+            worker,
         }
     }
 
@@ -314,15 +352,18 @@ pub fn inputs_hash(inputs: &[Input]) -> String {
     )
 }
 
-/// A GLB's cache key.
+/// A GLB's cache key. `converter` is the converter's version (`converter_version`) when the
+/// pack holds binary Unity files, whose text Blender reads, and `None` otherwise, so a pack
+/// without them keeps its key whatever the converter does.
 pub fn glb_key(
     original_sha256: &str,
     model: &Model,
     options: &Options,
     blender_version: &str,
     inputs_hash: &str,
+    converter: Option<&str>,
 ) -> String {
-    let key = json!({
+    let mut key = json!({
         "original": original_sha256,
         "model": model.source_path,
         "maxTexture": options.max_texture,
@@ -330,6 +371,9 @@ pub fn glb_key(
         "blender": blender_version,
         "inputs": inputs_hash,
     });
+    if let Some(converter) = converter {
+        key["converter"] = json!(converter);
+    }
     sha256_bytes(key.to_string().as_bytes())
 }
 
@@ -348,6 +392,46 @@ fn meta_guid(path: &Path) -> Option<String> {
     guid.bytes()
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         .then(|| guid.to_string())
+}
+
+/// Whether `head`, the start of a file of `len` bytes, is the header of Unity's binary
+/// serialization: big-endian, the format version at byte 8, and the file's own size at byte 4
+/// (versions before 22) or as a 64-bit number at byte 24 (22 and later).
+pub fn is_serialized_file(head: &[u8], len: u64) -> bool {
+    let u32_at = |at: usize| {
+        head.get(at..at + 4)
+            .map(|b| u32::from_be_bytes(b.try_into().unwrap()) as u64)
+    };
+    let u64_at = |at: usize| {
+        head.get(at..at + 8)
+            .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+    };
+    match u32_at(8) {
+        Some(1..22) => u32_at(4) == Some(len) && u32_at(12).is_some_and(|data| data <= len),
+        Some(22..100) => u64_at(24) == Some(len),
+        _ => false,
+    }
+}
+
+/// Whether the file at `path` is a `.mat`, `.prefab` or `.unity` in Unity's binary
+/// serialization (`is_serialized_file`). Unity's text format starts with `%YAML` instead, and
+/// another program's file of those extensions with neither is copied as it is.
+fn is_binary_unity(path: &Path) -> bool {
+    use std::io::Read;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if !extension(name).is_some_and(|ext| SERIALIZED_EXTENSIONS.contains(&ext.as_str())) {
+        return false;
+    }
+    let mut head = Vec::with_capacity(32);
+    let read = std::fs::File::open(path).and_then(|f| {
+        let len = f.metadata()?.len();
+        f.take(32).read_to_end(&mut head)?;
+        Ok(len)
+    });
+    read.is_ok_and(|len| is_serialized_file(&head, len))
 }
 
 /// One run of the step over a staged pack.
@@ -434,8 +518,8 @@ impl Conversion<'_> {
             .await
             .map_err(needs_blender)?;
         let (staging, files) = (self.staging.to_path_buf(), self.files.to_vec());
-        let inputs = blocking(move || {
-            Ok(files
+        let (inputs, has_binary) = blocking(move || {
+            let inputs: Vec<Input> = files
                 .into_iter()
                 .filter(|f| is_input(&f.path))
                 .map(|f| Input {
@@ -446,10 +530,15 @@ impl Conversion<'_> {
                     source_path: f.source_path,
                     sha256: f.sha256,
                 })
-                .collect::<Vec<_>>())
+                .collect();
+            let has_binary = inputs
+                .iter()
+                .any(|i| is_binary_unity(&staging.join(&i.path)));
+            Ok((inputs, has_binary))
         })
         .await?;
         let inputs_hash = inputs_hash(&inputs);
+        let converter = has_binary.then(converter_version);
         let glb_dir = self.tools.cache_dir.join("glb");
         let keyed: Vec<(Model, PathBuf)> = models
             .iter()
@@ -460,6 +549,7 @@ impl Conversion<'_> {
                     self.options,
                     &blender.version,
                     &inputs_hash,
+                    converter.as_deref(),
                 );
                 (m.clone(), glb_dir.join(format!("{key}.glb")))
             })
@@ -509,12 +599,13 @@ impl Conversion<'_> {
             (pack.clone(), out.clone()),
         );
         let control = self.control.clone();
-        blocking(move || {
+        let binary = blocking(move || {
             std::fs::create_dir_all(&folders.1)
                 .map_err(|e| format!("Could not make the conversion's work folder: {e}"))?;
+            let mut binary = Vec::new();
             for path in copied {
                 if control.cancelled() {
-                    return Ok(());
+                    return Ok(binary);
                 }
                 let to = folders.0.join(&path);
                 if let Some(parent) = to.parent() {
@@ -523,11 +614,15 @@ impl Conversion<'_> {
                 }
                 std::fs::copy(staging.join(&path), &to)
                     .map_err(|e| format!("Could not copy {path} to the work folder: {e}"))?;
+                if is_binary_unity(&to) {
+                    binary.push(path);
+                }
             }
-            Ok(())
+            Ok(binary)
         })
         .await?;
         self.cancelled()?;
+        self.binary_to_text(&work.0, &pack, &binary).await?;
 
         let job = Job {
             pack: &pack,
@@ -609,6 +704,52 @@ impl Conversion<'_> {
                 .map_err(|e| format!("Converting {} to GLB failed: {e}", model.path))?;
         }
         Ok(())
+    }
+
+    /// Rewrites each of `binary`, binary Unity files of the work copy at `pack`, as text, through
+    /// the preview worker. Only the work copy changes: the staged files keep their bytes.
+    async fn binary_to_text(
+        &self,
+        work: &Path,
+        pack: &Path,
+        binary: &[String],
+    ) -> Result<(), Stop> {
+        for (n, path) in binary.iter().enumerate() {
+            self.cancelled()?;
+            let failed =
+                |why: String| Stop::Failed(format!("Reading {path} as text failed: {why}"));
+            let source = pack.join(path);
+            let output = work.join("text").join(format!("{n}.txt"));
+            let (reply, answer) = oneshot::channel();
+            let request = json!({
+                "id": format!("unity_binary_to_text-{}", uuid::Uuid::new_v4()),
+                "method": "unity_binary_to_text",
+                "params": { "source": source, "output": output },
+            });
+            self.tools
+                .worker
+                .send(WorkerRequest { request, reply })
+                .await
+                .map_err(|_| failed("the preview engine isn't running".into()))?;
+            let reply = answer
+                .await
+                .map_err(|_| failed("the preview engine stopped before it answered".into()))?
+                .map_err(failed)?;
+            if let Some(error) = reply.get("error").and_then(|e| e.as_str()) {
+                return Err(failed(error.into()));
+            }
+            let result = &reply["result"];
+            if result["ok"] != true {
+                let why = result["error"]
+                    .as_str()
+                    .unwrap_or("the preview engine gave no reason");
+                return Err(failed(why.into()));
+            }
+            tokio::fs::rename(&output, &source)
+                .await
+                .map_err(|e| failed(format!("its text can't be read: {e}")))?;
+        }
+        self.cancelled()
     }
 
     /// Runs Blender with `args` in `dir` under the memory cap, counting the models it reports
@@ -961,7 +1102,7 @@ pub(crate) mod tests {
         let options = Options::parse(&Options::default_json()).unwrap();
         let key =
             |original: &str, model: &Model, options: &Options, blender: &str, inputs: &str| {
-                glb_key(original, model, options, blender, inputs)
+                glb_key(original, model, options, blender, inputs, None)
             };
         let base = key("orig", &model, &options, "5.2.2", "inputs");
         assert_eq!(base, key("orig", &model, &options, "5.2.2", "inputs"));
@@ -995,6 +1136,60 @@ pub(crate) mod tests {
             ..model.clone()
         };
         assert_eq!(key("orig", &placed, &options, "5.2.2", "inputs"), base);
+
+        // A pack with binary Unity files also keys by the converter, each version apart
+        let converted =
+            |converter: &str| glb_key("orig", &model, &options, "5.2.2", "inputs", Some(converter));
+        let now = converter_version();
+        assert_ne!(converted(&now), base);
+        assert_eq!(converted(&now), converted(&now));
+        assert_ne!(
+            converted(&now),
+            converted("opendam-unity-text/0 UnityPy 1.25.4")
+        );
+    }
+
+    #[test]
+    fn the_converter_version_holds_unity_text_s_version_and_the_locked_unitypy() {
+        let engine = include_str!("../../../../../packages/preview-engine/unity_text.py");
+        let declared = engine
+            .lines()
+            .find_map(|l| l.strip_prefix("VERSION = \""))
+            .and_then(|rest| rest.strip_suffix('"'));
+        assert_eq!(declared, Some(UNITY_TEXT_VERSION));
+        let version = converter_version();
+        let unitypy = version
+            .strip_prefix(&format!("{UNITY_TEXT_VERSION} UnityPy "))
+            .unwrap();
+        assert!(
+            unitypy.split('.').count() == 3 && unitypy.split('.').all(|n| n.parse::<u32>().is_ok()),
+            "{version}"
+        );
+    }
+
+    #[test]
+    fn only_a_file_with_the_binary_serialization_s_header_is_binary_unity() {
+        // Unity 4.3's header: metadata size, file size, version 9, data offset
+        let unity_4 = |len: u32| {
+            let mut head = [0xa89u32, len, 9, 0x1000].map(u32::to_be_bytes).concat();
+            head.extend(b"4.3.4f1\0");
+            head
+        };
+        assert!(is_serialized_file(&unity_4(4448), 4448));
+        assert!(!is_serialized_file(&unity_4(4448), 4449), "another size");
+        // Version 22 and later keep the size as 64 bits at byte 24
+        let mut unity_2020 = [0u32, 0, 22, 0, 0, 0x2000].map(u32::to_be_bytes).concat();
+        unity_2020.extend(9000u64.to_be_bytes());
+        assert!(is_serialized_file(&unity_2020, 9000));
+        assert!(!is_serialized_file(&unity_2020, 9001));
+        for other in [
+            &b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"[..],
+            b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1 a 3ds Max material library",
+            b"\xef\xbb\xbf%YAML 1.1\n",
+            b"",
+        ] {
+            assert!(!is_serialized_file(other, other.len() as u64), "{other:?}");
+        }
     }
 
     #[test]

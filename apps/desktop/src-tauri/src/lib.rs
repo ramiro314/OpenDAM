@@ -157,6 +157,7 @@ pub fn run(render_choice: render::RenderChoice) {
                     }
                 }),
             );
+            let (worker_requests, requests) = tokio::sync::mpsc::channel(64);
             let import_events = app.handle().clone();
             let imports = import::engine::Engine::new(
                 db.clone(),
@@ -170,8 +171,8 @@ pub fn run(render_choice: render::RenderChoice) {
                         ImportEvent::LibraryUpdated => import_events.emit("library:updated", ()),
                     };
                 }),
+                worker_requests.clone(),
             );
-            let (worker_requests, requests) = tokio::sync::mpsc::channel(64);
             let state = Arc::new(AppState {
                 db,
                 credentials,
