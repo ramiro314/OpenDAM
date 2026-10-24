@@ -717,9 +717,9 @@ mod tests {
         s.settled().await;
     }
 
-    /// A changed file from the original whose exclude is on, and a kept `.meta` whose asset's
-    /// exclude is on, can't be kept: each is a clash offering only discard, which leaves the
-    /// exclude as it is, and the Rebuild then builds.
+    /// A changed file from the original whose exclude is on can't be kept: it is a clash
+    /// offering only discard, which leaves the exclude as it is. A kept `.meta` whose asset's
+    /// exclude is on is no difference: it goes with its asset, and the Rebuild builds.
     #[tokio::test]
     async fn a_file_an_exclude_now_leaves_out_offers_only_discard() {
         let s = setup().await;
@@ -744,20 +744,12 @@ mod tests {
         .await;
         assert_eq!(
             s.seen(&pack_id).await,
-            [
-                (
-                    "Readme.txt".into(),
-                    Change::Clash,
-                    Kind::Extracted,
-                    vec![Choice::Discard]
-                ),
-                (
-                    "Textures/T_Log_D.png.meta".into(),
-                    Change::Clash,
-                    Kind::Kept,
-                    vec![Choice::Discard]
-                ),
-            ]
+            [(
+                "Readme.txt".into(),
+                Change::Clash,
+                Kind::Extracted,
+                vec![Choice::Discard]
+            )]
         );
         let steps = s.engine.pack_steps("lib", &pack_id).await.unwrap();
         let run = s.rebuild_choosing(&pack_id, first).await;
@@ -870,6 +862,82 @@ mod tests {
                 "{meta_choice:?}"
             );
             assert!(s.drift(&pack_id).await.is_empty(), "{meta_choice:?}");
+            s.settled().await;
+        }
+    }
+
+    /// A kept or changed `.meta` goes with its asset when this very Rebuild leaves the asset
+    /// out, and stays when it restores it: the build judges it with the Rebuild's own edits
+    /// made, and no difference flips between the dialog and the build's checks.
+    #[tokio::test]
+    async fn a_meta_follows_its_asset_s_answer_in_the_same_rebuild() {
+        for kept_before in [true, false] {
+            let s = setup().await;
+            let pack_id = s.import_golden().await;
+            let meta = "Textures/T_Log_D.png.meta";
+            s.write(meta, "my meta");
+            if kept_before {
+                let run = s.rebuild_choosing(&pack_id, first).await;
+                s.wait_for(&run.id, "done").await;
+                assert_eq!(s.kept(&pack_id).await, [in_pack(meta)]);
+            }
+            std::fs::remove_file(s.live().join("Textures/T_Log_D.png")).unwrap();
+
+            // Leave the PNG out, keep the .meta (or keep it again): both go, no false change.
+            s.engine.hooks().fail_once(Point::Staged);
+            let run = s.rebuild_choosing(&pack_id, first).await;
+            let failed = s.wait_for(&run.id, "failed").await;
+            assert_eq!(
+                failed.error.as_deref(),
+                Some("injected failure at Staged"),
+                "kept {kept_before}: only the injected failure"
+            );
+            let before = s.seen(&pack_id).await;
+            assert!(
+                before
+                    .iter()
+                    .all(|d| d.2 != Kind::Kept || d.1 != Change::Clash),
+                "kept {kept_before}: no clash for the .meta: {before:?}"
+            );
+
+            // After that failed run, Restore the PNG and keep the .meta: both stay.
+            let run = s
+                .rebuild_choosing(&pack_id, |d| {
+                    if d.choices.contains(&Choice::Restore) {
+                        Choice::Restore
+                    } else {
+                        d.choices[0]
+                    }
+                })
+                .await;
+            s.wait_for(&run.id, "done").await;
+            assert!(
+                s.live().join("Textures/T_Log_D.png").is_file(),
+                "kept {kept_before}"
+            );
+            assert_eq!(s.read(meta), "my meta", "kept {kept_before}");
+            assert_eq!(
+                s.kept(&pack_id).await,
+                [in_pack(meta)],
+                "kept {kept_before}"
+            );
+            assert!(s.drift(&pack_id).await.is_empty(), "kept {kept_before}");
+            s.settled().await;
+
+            // Now leave the PNG out in a Rebuild that commits: its .meta goes with it.
+            std::fs::remove_file(s.live().join("Textures/T_Log_D.png")).unwrap();
+            let run = s.rebuild_choosing(&pack_id, first).await;
+            s.wait_for(&run.id, "done").await;
+            assert!(
+                !s.live().join("Textures/T_Log_D.png").exists(),
+                "kept {kept_before}"
+            );
+            assert!(
+                !s.live().join(meta).exists(),
+                "kept {kept_before}: the .meta goes too"
+            );
+            assert!(s.kept(&pack_id).await.is_empty(), "kept {kept_before}");
+            assert!(s.drift(&pack_id).await.is_empty(), "kept {kept_before}");
             s.settled().await;
         }
     }

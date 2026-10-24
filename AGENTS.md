@@ -185,9 +185,10 @@ docs/plans                    Plans for this fork
   step off, or for a Restore the edit a run that never committed recorded turned back, never
   a step you set yourself, which refuses the Restore) in the transaction that queues the run,
   and stores the rest in `import_runs.drift`. A file the build would keep (a kept one, or a
-  changed one keep yours would carry) that the recipe now writes over or an `exclude` leaves
-  out (its own, or its asset's for a `.meta`) is listed as a `clash`, offering only discard, and
-  a pack folder that is gone defaults every missing file to Restore.
+  changed one keep yours would carry) that the recipe now writes over or its own `exclude`
+  leaves out is listed as a `clash`, offering only discard. A `.meta` whose asset is left out
+  goes with its asset, never kept, judged by the build with the Rebuild's own edits made. A
+  pack folder that is gone defaults every missing file to Restore.
   The build checks, before it stages and again under the lock, that the folder still differs
   exactly so. A kept file (`origin = 'kept'`) is carried by every later rebuild: one that
   replaced a recipe file keeps its source path, takes its bytes right after the extraction, and

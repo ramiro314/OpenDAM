@@ -180,16 +180,12 @@ impl<'a> Writes<'a> {
                  the step that writes it to keep yours",
             );
         }
+        // Only the file's own exclude: a `.meta` goes with its asset (`kept`), whose exclude
+        // the Rebuild itself may record or turn back, so it never decides a difference.
         row.source_path
             .as_deref()
-            .filter(|source| self.leaves_out(source))
+            .filter(|source| self.excluded.contains(*source))
             .map(|_| "An exclude step now leaves this file out, so your copy can't be kept")
-    }
-
-    /// Whether an enabled `exclude` drops the file with the source path `source` (a JSON
-    /// array): one of its own, or for a `.meta`, its asset's, which drops the `.meta` too.
-    fn leaves_out(&self, source: &str) -> bool {
-        leaves_out(&self.excluded, source)
     }
 
     fn writes(&self, path: &str) -> bool {
@@ -526,10 +522,18 @@ pub fn edits(
     Ok(edits)
 }
 
-/// The files the next build carries from the pack folder: the manifest's kept files but those
-/// forgotten (with their new bytes when changed), and every changed or added file kept. A kept
-/// `datapackage.json` is a file of its own: the metadata step that wrote it is off.
-pub fn kept(manifest: &[ManifestRow], found: &[Difference], chosen: &[Chosen]) -> Vec<KeptFile> {
+/// The files the next build of `recipe` carries from the pack folder: the manifest's kept files
+/// but those forgotten (with their new bytes when changed), and every changed or added file
+/// kept. A kept `datapackage.json` is a file of its own: the metadata step that wrote it is off.
+/// A `.meta` whose asset an exclude leaves out goes with its asset, as an in-app delete takes
+/// the `.meta` along: the build reads `recipe` with the Rebuild's own edits made, so a `.meta`
+/// follows its asset's answer in this very Rebuild.
+pub fn kept(
+    recipe: &Recipe,
+    manifest: &[ManifestRow],
+    found: &[Difference],
+    chosen: &[Chosen],
+) -> Vec<KeptFile> {
     let answers: HashMap<&str, (&Difference, Choice)> = pairs(found, chosen)
         .map(|(d, c)| (d.path.as_str(), (d, c)))
         .collect();
@@ -565,6 +569,14 @@ pub fn kept(manifest: &[ManifestRow], found: &[Difference], chosen: &[Chosen]) -
             sha256: difference.sha256.clone().unwrap_or_default(),
         });
     }
+    let excluded = Writes::of(recipe, &[]).excluded;
+    kept.retain(|k| {
+        let asset = k
+            .source_path
+            .as_ref()
+            .and_then(|s| asset_of_meta(&records::source_json(s)));
+        !asset.is_some_and(|asset| excluded.contains(&asset))
+    });
     kept.sort_by(|a, b| a.path.cmp(&b.path));
     kept
 }

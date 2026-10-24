@@ -302,6 +302,15 @@ export function choosableAll(draft: DriftDraft, choice: DriftChoice): number {
   return draft.differences.filter((d) => d.choices.includes(choice) && d.choices.length > 1).length;
 }
 
+/**
+ * Whether the `.meta` difference `d` goes with its file, which the draft leaves out: the build
+ * then drops the `.meta` whatever is chosen for it, as an in-app delete takes it along
+ */
+export function followsItsFile(draft: DriftDraft, d: DriftDifference): boolean {
+  const asset = d.path.endsWith('.meta') ? d.path.slice(0, -'.meta'.length) : null;
+  return asset !== null && draft.choices[asset] === 'exclude';
+}
+
 /** The choices as `rebuild_import_pack` takes them */
 export function chosenFrom(draft: DriftDraft): DriftChosen[] {
   return draft.differences.map((d) => ({

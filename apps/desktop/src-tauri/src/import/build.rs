@@ -1312,7 +1312,7 @@ async fn outside(
     })?;
     match drift::unmatched(&found, chosen) {
         Some(path) => Err(path),
-        None => Ok(drift::kept(previous, &found, chosen)),
+        None => Ok(drift::kept(recipe, previous, &found, chosen)),
     }
 }
 

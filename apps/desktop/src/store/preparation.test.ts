@@ -17,6 +17,7 @@ import {
   busyReason,
   chooseAllDrift,
   choosableAll,
+  followsItsFile,
   chooseDrift,
   choiceLabel,
   chosenFrom,
@@ -681,6 +682,15 @@ describe('outside changes', () => {
       'Pub/Pack/Models/SM_Log.glb': 'restore',
       'Pub/Pack/Notes.txt': 'forget',
     });
+  });
+
+  test('a .meta goes with its file while the file is left out, whatever its own choice', () => {
+    const png = difference('T_Log_D.png', 'missing', 'extracted', ['exclude', 'restore']);
+    const meta = difference('T_Log_D.png.meta', 'changed', 'extracted', ['keep', 'recipe']);
+    const draft = driftDraft([png, meta]);
+    expect(followsItsFile(draft, meta)).toBe(true);
+    expect(followsItsFile(draft, png)).toBe(false);
+    expect(followsItsFile(chooseDrift(draft, png.path, 'restore'), meta)).toBe(false);
   });
 
   test('a kept file in the way of the recipe reads so, and offers its discard', () => {

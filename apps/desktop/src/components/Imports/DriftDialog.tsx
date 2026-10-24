@@ -3,6 +3,7 @@ import clsx from 'clsx';
 import {
   choiceHint,
   choosableAll,
+  followsItsFile,
   choiceLabel,
   differenceText,
   usePreparationStore,
@@ -130,6 +131,11 @@ export function DriftDialog({ packId, draft, saving, folder }: Props) {
                     </label>
                   ))}
                 </div>
+                {followsItsFile(draft, d) && (
+                  <span className={styles.hint} data-drift-follows>
+                    Goes with its file, which this rebuild leaves out
+                  </span>
+                )}
                 {d.reason && (
                   <span className={styles.hint} data-drift-reason>
                     {d.reason}
