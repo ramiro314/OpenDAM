@@ -81,12 +81,15 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               code run over the archive's index (`list_*`, `place_listed`), which
                               reads no file body and writes nothing,
                               records, the import tables (imports, import_packs, import_steps,
-                              import_outputs, import_moves, import_runs), build, a pack's first
-                              build (stage beside the target, lock, re-check, journal, swap,
-                              index with Prune::Defer, commit current_build, settle, or roll back),
-                              with test hooks to pause or fail it, and engine, the durable run
-                              queue (one run at a time, owner and heartbeat, import:progress and
-                              import:updated, Cancel before the lock), behind commands/import.rs
+                              import_outputs, import_moves, import_runs) and the step edits and
+                              rebuilds they refuse while a run for the pack is queued or running,
+                              build, a pack's build, first or later (stage beside the target,
+                              lock, re-check, journal, swap, carry, index with Prune::Defer,
+                              commit current_build, settle, or roll back), with test hooks to
+                              pause or fail it, carry, which moves rows to their files' new paths
+                              and back, and engine, the durable run queue (one run at a time,
+                              owner and heartbeat, import:progress and import:updated, Cancel
+                              before the lock), behind commands/import.rs
     src/fs_swap.rs            Staging a folder beside the one it replaces and swapping it in by
                               rename, shared by the export's bundles and the import's builds
     tests/fixtures/pack-import/  Its fixture originals, made by make_fixtures.py (stdlib only) and
@@ -116,16 +119,42 @@ docs/plans                    Plans for this fork
   every library, so it is stored by absolute path, with its size, mtime and sha256.
 - **Originals are read-only.** Nothing writes to an import's original or to the folder it sits in.
   An original inside the library is refused (`import::engine::start_import`).
-- **An imported pack changes on disk only by a swap.** A build stages the whole pack beside its
-  target as `.<Pack>.import-<build id>` (a dot folder, which no index walks), writing its manifest
-  rows under the new build id, then takes the library's `index_lock` and the advisory lock and
-  holds both to the end. Under them it re-checks, journals `import_packs.swap_state`, renames the
-  staging folder in, indexes the pack with `Prune::Defer`, and commits by flipping
-  `import_packs.current_build` in one transaction. A failure before the commit rolls the swap back
-  in-run: the folder goes, the rows the index inserted (journaled in `import_moves`) are deleted,
-  and `current_build` stays as it was. Cancel works only before the lock; after it a run
-  finishes. Rebuilds, swap recovery at library open and in-app edits recording steps come with
-  the plan's later tickets: until then a pack left `swapping` by a crash stays so.
+- **An imported pack changes on disk only by a swap.** A build, first or a rebuild, stages the
+  whole pack beside its target as `.<Pack>.import-<build id>` (a dot folder, which no index
+  walks), writing its manifest rows under the new build id, then takes the library's `index_lock`
+  and the advisory lock and holds both to the end. Under them it re-checks the recipe, the pack
+  folder against the current manifest and the staging folder, journals
+  `import_packs.swap_state`, moves the live folder aside as `.<Pack>.prev-<build id>`, renames
+  the staging folder in, carries moved rows, indexes the pack with `Prune::Defer`, and commits by
+  flipping `import_packs.current_build` in one transaction. A failure before the commit rolls the
+  swap back in-run, and `current_build` stays as it was. Cancel works only before the lock; after
+  it a run finishes. Step edits (`records::set_steps`, which bumps `recipe_rev`) and Rebuild are
+  refused while a run for the pack is queued or running. A staged file the previous build had,
+  by file key, size and sha256, gets that build's mtime, so the index sees it unchanged, moved or
+  not, and queues no preview. Swap recovery at library open and in-app edits recording steps
+  come with the plan's later tickets: until then a pack left `swapping` by a crash stays so.
+- **Rows follow their files.** A rebuild carries each moved file's asset row to the file's new
+  path (`import::carry`), matched by its file key (`source_path` and whether it is generated),
+  keeping its id, metadata and `modified_at`. It runs in two passes, so the order of the moves
+  never matters, not even for a swap of two names: every moving row goes aside to
+  `<pack>/.opendam-carry/<asset id>`, journaled as `moved` in `import_moves` in the same
+  transaction, then each is placed. A row at any path of the new build that the previous build's
+  same file didn't hold (a carried file's new path, or that of a file new to this build) belongs
+  to a file the new build doesn't have there: unless it is moving itself, it is moved aside too
+  and stays there, so the settle prunes it and a rollback puts it back, and no file takes over
+  another file's row. The index's inserted
+  rows are journaled as `inserted`. A rollback deletes the inserted rows, then reverses the moves
+  by asset id in the same two passes, so neither a rebuild nor its rollback loses metadata.
+- **Pruning waits for the commit.** `Prune::Defer` deletes no row, runs no structure pass, and
+  journals each row it inserts. Only an import build uses it, between its swap and its commit, so
+  the rows of paths only the previous build had are pruned only by the settle's `Prune::Now`,
+  after the commit. Every other index run prunes as before.
+- **A rollback clears its journal before its folder.** It moves the failed build aside as
+  `.<Pack>.failed-<build id>`, puts `.prev-<build id>` back, deletes the inserted rows, reverses
+  the moves, and reindexes the restored pack (or, with no previous folder, runs only the
+  structure pass). Then `swap_state` and the failed build's records (`import_outputs` and
+  `import_moves`) go in one transaction, and only then is `.failed-*` deleted. A rollback step
+  that fails leaves the journal set, for recovery.
 - **Pack targets never nest.** No pack's target is an ancestor or a descendant of another's, on
   whole path components (`Pub/Pack` holds `Pub/Pack/Sub` but not `Pub/Package`), so every build,
   swap and Remove touches only its own pack's files. The scan, the import

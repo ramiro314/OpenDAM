@@ -1,29 +1,35 @@
-//! A pack's first build (plan pack-import, Flow). It stages the whole pack beside its target as
-//! `.<Pack>.import-<build id>`, writing the staged files' manifest rows under the new build id,
-//! then:
+//! A pack's build, first or later (plan pack-import, Flow). It stages the whole pack beside its
+//! target as `.<Pack>.import-<build id>`, writing the staged files' manifest rows under the new
+//! build id. A staged file the previous build also had, by file key, size and sha256, gets that
+//! build's mtime, so the index sees it unchanged, moved or not, and queues no preview. Then:
 //!
 //! 1. **Lock.** Takes the library's `index_lock`, then the advisory `.opendam/index.lock`, and
 //!    holds both to the end. Cancel takes effect only before this point.
-//! 2. **Re-check.** Stops when the recipe, the target or the staging folder changed meanwhile.
+//! 2. **Re-check.** Stops when the recipe, the pack folder (against the current manifest) or the
+//!    staging folder changed meanwhile.
 //! 3. **Journal.** Sets `swap_state = 'swapping'` with the build id and `swap_prev`.
-//! 4. **Swap.** Renames the staging folder in (`fs_swap`).
-//! 5. **Index without pruning** (`Prune::Defer`), journaling every row it inserts.
+//! 4. **Swap.** Moves the live folder aside as `.<Pack>.prev-<build id>`, if there is one, and
+//!    renames the staging folder in (`fs_swap`).
+//! 5. **Carry, then index without pruning.** Carries the rows of moved files to their new paths
+//!    (`carry`), then indexes with `Prune::Defer`, journaling every row it inserts.
 //! 6. **Commit.** Flips `current_build` to the build, in one transaction.
-//! 7. **Settle.** Indexes the pack with `Prune::Now`, which ends with the structure pass, and
-//!    deletes the other builds' rows and this build's journal.
+//! 7. **Settle.** Indexes the pack with `Prune::Now`, which prunes the rows of paths only the
+//!    previous build had and ends with the structure pass, then deletes the previous folder, the
+//!    other builds' rows and this build's journal.
 //!
-//! Step 5 or 6 failing rolls the swap back: the pack folder goes, the inserted rows with it, and
-//! `current_build` stays as it was. A first build carries no row (there is no previous build to
-//! carry from), so its journal holds only inserted rows.
+//! Step 5 or 6 failing rolls the swap back: the previous folder (if any) returns, the inserted
+//! rows go, the carried rows go back by asset id, and `current_build` stays as it was.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sqlx::{Pool, Sqlite};
 
+use super::carry;
 use super::place::{place, PlaceStep};
-use super::records::{self, InsertedRows, Output, Recipe};
+use super::records::{self, InsertedRows, ManifestRow, Output, Recipe};
 use super::unitypackage::{extract_unitypackage, extract_variant, SkippedEntry};
 use super::zipfile::extract_zip;
 use crate::db::{Database, LibraryHandle};
@@ -235,16 +241,46 @@ enum Extract {
     Zip { subpath: Option<String> },
 }
 
+/// Refuses steps a build of an original of `kind` couldn't run: an unknown step, invalid
+/// options, or other than exactly one enabled extract step.
+pub fn check_steps(kind: &str, steps: &[records::Step]) -> Result<(), String> {
+    for step in steps {
+        Plan::parts(kind, &[(step.kind.clone(), step.options.clone())])?;
+    }
+    let enabled: Vec<(String, serde_json::Value)> = steps
+        .iter()
+        .filter(|s| s.enabled)
+        .map(|s| (s.kind.clone(), s.options.clone()))
+        .collect();
+    if Plan::parts(kind, &enabled)?.0.len() != 1 {
+        return Err("A pack needs exactly one extract step".into());
+    }
+    Ok(())
+}
+
 impl Plan {
     fn of(recipe: &Recipe) -> Result<Self, String> {
-        let zip = match recipe.kind.as_str() {
+        let (extracts, place) = Self::parts(&recipe.kind, &recipe.steps)?;
+        match <[Extract; 1]>::try_from(extracts) {
+            Ok([extract]) => Ok(Plan { extract, place }),
+            Err(_) => Err("A pack needs exactly one extract step".into()),
+        }
+    }
+
+    /// The extract and place steps among `steps`, for an original of `kind`, refusing an unknown
+    /// step or invalid options.
+    fn parts(
+        kind: &str,
+        steps: &[(String, serde_json::Value)],
+    ) -> Result<(Vec<Extract>, Vec<PlaceStep>), String> {
+        let zip = match kind {
             "unitypackage" => false,
             "zip" => true,
             other => return Err(format!("{other} originals can't be built yet")),
         };
         let mut extracts = Vec::new();
         let mut place = Vec::new();
-        for (kind, options) in &recipe.steps {
+        for (kind, options) in steps {
             let text = |key: &str| options[key].as_str().map(str::to_string);
             match kind.as_str() {
                 "extract_unitypackage" => {
@@ -279,16 +315,13 @@ impl Plan {
                 other => return Err(format!("The {other} step can't run yet")),
             }
         }
-        match <[Extract; 1]>::try_from(extracts) {
-            Ok([extract]) => Ok(Plan { extract, place }),
-            Err(_) => Err("A pack needs exactly one extract step".into()),
-        }
+        Ok((extracts, place))
     }
 }
 
-/// Builds pack `pack_id`, queued at `queued_rev`, for the first time. Fills `warnings` with the
-/// entries the extraction skipped.
-pub async fn build_first(
+/// Builds pack `pack_id`, queued at `queued_rev`: its first build, or a rebuild over the
+/// committed one. Fills `warnings` with the entries the extraction skipped.
+pub async fn build(
     env: &BuildEnv<'_>,
     pack_id: &str,
     queued_rev: i64,
@@ -296,11 +329,6 @@ pub async fn build_first(
 ) -> Result<(), Stop> {
     let pool = &env.library.pool;
     let recipe = records::recipe(pool, pack_id).await.map_err(db_error)?;
-    if recipe.current_build.is_some() {
-        return Err(Stop::Failed(
-            "The pack is already built, and rebuilding isn't supported yet".to_string(),
-        ));
-    }
     if recipe.swap_state.is_some() || recipe.recipe_rev != queued_rev {
         return Err(Stop::Failed(CHANGED.to_string()));
     }
@@ -313,6 +341,18 @@ pub async fn build_first(
             "A folder on the way to {} is a link: a pack is built only inside the library",
             recipe.target
         )));
+    }
+    let previous = match &recipe.current_build {
+        Some(build) => records::manifest(pool, pack_id, build)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    if let Some(changed) = live_changed(&live, &recipe, &previous).await {
+        return Err(Stop::Failed(match recipe.current_build {
+            None => format!("{} already exists in the library", recipe.target),
+            Some(_) => format!("{changed} changed outside OpenDAM since the pack's last build"),
+        }));
     }
     let created = missing_folders(&root, &live);
     let staging = fs_swap::create_staging(&live, STAGING, &build_id).map_err(|e| {
@@ -330,7 +370,11 @@ pub async fn build_first(
         created: &created,
     };
 
-    let outputs = match stage(env, &recipe, &plan, &staging, &build_id, warnings).await {
+    let outputs = match stage(
+        env, &recipe, &plan, &staging, &build_id, &previous, warnings,
+    )
+    .await
+    {
         Ok(outputs) => outputs,
         Err(stop) => return Err(cleanup.run(stop).await),
     };
@@ -352,6 +396,7 @@ pub async fn build_first(
         env,
         &recipe,
         queued_rev,
+        &previous,
         &staging,
         &build_id,
         &outputs,
@@ -371,6 +416,7 @@ async fn swap_in(
     env: &BuildEnv<'_>,
     recipe: &Recipe,
     queued_rev: i64,
+    previous: &[ManifestRow],
     staging: &Path,
     build_id: &str,
     outputs: &[Output],
@@ -390,7 +436,11 @@ async fn swap_in(
     if !plainly_inside(&env.library.root_path, &live) {
         return Err(cleanup.run(Stop::Failed(CHANGED.to_string())).await);
     }
-    if let Err(stop) = recheck(pool, recipe, queued_rev, &live, staging, build_id, outputs).await {
+    let checked = recheck(
+        pool, recipe, queued_rev, previous, &live, staging, build_id, outputs,
+    )
+    .await;
+    if let Err(stop) = checked {
         return Err(cleanup.run(stop).await);
     }
     if !advisory.still_held() {
@@ -426,7 +476,7 @@ async fn swap_in(
         prev.as_deref(),
         fs_swap::Old::Keep,
         |a, b| {
-            if b == live && env.hooks.fails(Point::MoveIn) {
+            if a == staging && b == live && env.hooks.fails(Point::MoveIn) {
                 return Err(std::io::Error::other("injected failure"));
             }
             std::fs::rename(a, b)
@@ -458,7 +508,7 @@ async fn swap_in(
         }
     }
 
-    // ── 5. Index without pruning, 6. Commit ─────────────────────────────
+    // ── 5. Carry, then index without pruning, 6. Commit ─────────────────
     (env.progress)(Progress {
         step: "indexing",
         done: 0,
@@ -466,6 +516,11 @@ async fn swap_in(
     });
     let pack_path = [live.to_string_lossy().into_owned()];
     let committed = async {
+        if let Some(prev_build) = &recipe.current_build {
+            carry::carry(pool, pack_id, &recipe.target, prev_build, build_id)
+                .await
+                .map_err(|e| format!("Carrying the moved files' rows failed: {e}"))?;
+        }
         let journal = InsertedRows::after(pool, pack_id, build_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -496,6 +551,7 @@ async fn swap_in(
     if let Err(error) = committed {
         let swap = Swapped {
             live: &live,
+            target: &recipe.target,
             prev: prev.as_deref(),
             build_id,
             created,
@@ -612,6 +668,7 @@ async fn stage(
     plan: &Plan,
     staging: &Path,
     build_id: &str,
+    previous: &[ManifestRow],
     warnings: &mut Vec<SkippedEntry>,
 ) -> Result<Vec<Output>, Stop> {
     let cancelled = || {
@@ -668,6 +725,15 @@ async fn stage(
     .await?;
     cancelled()?;
 
+    // Every staged file is extracted: its file key is its source path, not generated.
+    let unchanged: HashMap<String, (i64, String, i64)> = previous
+        .iter()
+        .filter(|row| !row.generated)
+        .filter_map(|row| {
+            let key = row.source_path.clone()?;
+            Some((key, (row.size, row.sha256.clone(), row.mtime_ns)))
+        })
+        .collect();
     let (to, target, control, progress) = (
         staging.to_path_buf(),
         recipe.target.clone(),
@@ -688,12 +754,24 @@ async fn stage(
             });
             let path = to.join(&file.path);
             let read = |e: std::io::Error| format!("The staged {} can't be read: {e}", file.path);
-            let (size, mtime_ns) = file_stamp(&path).map_err(read)?;
+            let (size, mut mtime_ns) = file_stamp(&path).map_err(read)?;
+            let sha256 = crate::export::hashes::sha256_file(&path).map_err(read)?;
+            let key = records::source_json(&file.source_path);
+            if let Some((_, _, before)) = unchanged
+                .get(&key)
+                .filter(|(s, sha, _)| *s == size as i64 && *sha == sha256)
+            {
+                if *before != mtime_ns {
+                    set_mtime(&path, *before)
+                        .map_err(|e| format!("The staged {} can't be stamped: {e}", file.path))?;
+                    mtime_ns = *before;
+                }
+            }
             outputs.push(Output {
                 path: format!("{target}/{}", file.path),
                 size,
                 mtime_ns,
-                sha256: crate::export::hashes::sha256_file(&path).map_err(read)?,
+                sha256,
                 source_path: file.source_path,
             });
         }
@@ -718,6 +796,15 @@ async fn blocking<T: Send + 'static>(
         .await
         .map_err(|e| format!("The build's worker stopped: {e}"))?
         .map_err(Stop::Failed)
+}
+
+/// Sets the file at `path`'s mtime to `mtime_ns` nanoseconds.
+fn set_mtime(path: &Path, mtime_ns: i64) -> std::io::Result<()> {
+    let at = std::time::UNIX_EPOCH + Duration::from_nanos(mtime_ns.max(0) as u64);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_modified(at)
 }
 
 /// A file's size and mtime in nanoseconds. An original's stamp is recorded and checked with this
@@ -759,12 +846,15 @@ async fn both_locks<'l>(
     }
 }
 
-/// Step 2: the recipe is as queued, the target still doesn't exist, and the staging folder and
-/// the build's manifest rows hold exactly the files the build staged.
+/// Step 2: the recipe and the committed build are as queued, the pack folder still holds the
+/// current manifest's files (or still doesn't exist before a first build), and the staging
+/// folder and the build's manifest rows hold exactly the files the build staged.
+#[allow(clippy::too_many_arguments)]
 async fn recheck(
     pool: &Pool<Sqlite>,
     queued: &Recipe,
     queued_rev: i64,
+    previous: &[ManifestRow],
     live: &Path,
     staging: &Path,
     build_id: &str,
@@ -774,7 +864,7 @@ async fn recheck(
         .await
         .map_err(db_error)?;
     let same_recipe = now.recipe_rev == queued_rev
-        && now.current_build.is_none()
+        && now.current_build == queued.current_build
         && now.swap_state.is_none()
         && now.target == queued.target;
     let mut expected: Vec<(String, i64)> = outputs
@@ -793,13 +883,62 @@ async fn recheck(
         .await
         .map_err(db_error)?;
     if !same_recipe
-        || live.symlink_metadata().is_ok()
+        || live_changed(live, queued, previous).await.is_some()
         || staged.ok().as_ref() != Some(&expected)
         || rows != expected
     {
         return Err(Stop::Failed(CHANGED.to_string()));
     }
     Ok(())
+}
+
+/// What changed in the pack folder `live` since the committed build: `None` when it holds exactly
+/// the files of `manifest` (that build's rows), compared by size and mtime and hashed only when
+/// the mtime differs, or, before a first build, when it doesn't exist.
+async fn live_changed(live: &Path, recipe: &Recipe, manifest: &[ManifestRow]) -> Option<String> {
+    let folder = format!("The pack folder {}", recipe.target);
+    if recipe.current_build.is_none() {
+        return live.symlink_metadata().is_ok().then_some(folder);
+    }
+    if !live.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+        return Some(folder);
+    }
+    let (live, prefix) = (live.to_path_buf(), format!("{}/", recipe.target));
+    let (manifest, stopped) = (manifest.to_vec(), folder.clone());
+    tokio::task::spawn_blocking(move || {
+        let Ok(files) = staged_sizes(&live) else {
+            return Some(folder);
+        };
+        let listed: Vec<(String, i64)> = manifest
+            .iter()
+            .map(|row| (row.path.clone(), row.size))
+            .collect();
+        let found: Vec<(String, i64)> = files
+            .into_iter()
+            .map(|(path, size)| (format!("{prefix}{path}"), size))
+            .collect();
+        if found != listed {
+            // The first path that differs, in either list.
+            let differs = found
+                .iter()
+                .zip(&listed)
+                .find(|(a, b)| a != b)
+                .map(|(a, b)| a.0.as_str().min(b.0.as_str()).to_string());
+            let extra = found.get(listed.len()).or(listed.get(found.len()));
+            return differs.or(extra.map(|e| e.0.clone()));
+        }
+        manifest.iter().find_map(|row| {
+            let path = live.join(&row.path[prefix.len()..]);
+            let same = match file_stamp(&path) {
+                Ok((_, mtime_ns)) if mtime_ns == row.mtime_ns => true,
+                Ok(_) => crate::export::hashes::sha256_file(&path).is_ok_and(|h| h == row.sha256),
+                Err(_) => false,
+            };
+            (!same).then(|| row.path.clone())
+        })
+    })
+    .await
+    .unwrap_or(Some(stopped))
 }
 
 /// Every file below `folder` as `(path, size)`, sorted. Anything but a regular file or a folder
@@ -839,6 +978,7 @@ async fn unjournal(pool: &Pool<Sqlite>, pack_id: &str, build_id: &str) -> sqlx::
 /// A build swapped in and not committed.
 struct Swapped<'a> {
     live: &'a Path,
+    target: &'a str,
     prev: Option<&'a Path>,
     build_id: &'a str,
     created: &'a [PathBuf],
@@ -873,7 +1013,8 @@ async fn rollback(
         }
     }
 
-    // 3. The rows the build's index inserted, then the structure of what is on disk now.
+    // 3. The rows the build's index inserted, which frees their paths, then the carried rows
+    //    back by asset id, then the structure of what is on disk now.
     let deleted = sqlx::query(
         "DELETE FROM assets WHERE id IN (SELECT asset_id FROM import_moves
          WHERE pack_id = ? AND build_id = ? AND kind = 'inserted')",
@@ -884,6 +1025,9 @@ async fn rollback(
     .await;
     if let Err(e) = deleted {
         return unfinished(format!("deleting the rows it inserted: {e}"));
+    }
+    if let Err(e) = carry::reverse(pool, pack_id, swap.target, swap.build_id).await {
+        return unfinished(format!("moving the carried rows back: {e}"));
     }
     if swap.prev.is_some() {
         let pack_path = [swap.live.to_string_lossy().into_owned()];
