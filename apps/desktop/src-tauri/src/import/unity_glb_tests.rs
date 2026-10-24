@@ -423,11 +423,12 @@ mod tests {
             .all(|(got, want)| got.abs_diff(want) <= 4)
     }
 
-    /// A texture the importer finds by path, relative to the model, is found by its name in the
-    /// pack instead, so a hoist that moves only the model away from it reuses the cached GLB,
-    /// and that GLB is what a fresh conversion in the new layout makes.
+    /// A material library and a texture the OBJ importer finds by path, relative to the model,
+    /// are found by their names in the pack instead, so a hoist that moves only the model away
+    /// from them reuses the cached GLB, and that GLB is what a fresh conversion in the new layout
+    /// makes.
     #[tokio::test]
-    async fn an_importer_s_texture_is_found_by_name_whatever_the_layout() {
+    async fn an_importer_s_mtl_and_texture_are_found_by_name_whatever_the_layout() {
         let s = setup().await;
         let Some(log) = s.logged_blender().await else {
             return;
@@ -436,7 +437,7 @@ mod tests {
         let originals = tempfile::tempdir().unwrap();
         // No .mat, prefab or name rule matches "Wood" or "Barrel": the importer's material stays.
         let obj =
-            b"mtllib Barrel.mtl\no Barrel\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\n\
+            b"mtllib ../Materials/Wood.mtl\no Barrel\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\n\
                     usemtl Wood\nf 1/1 2/2 3/3\n";
         let mtl = b"newmtl Wood\nKd 1 1 1\nmap_Kd ../Textures/wood_planks.png\n";
         let missing = b"newmtl Gone\nKd 1 1 1\nmap_Kd ../Textures/not_in_the_pack.png\n";
@@ -448,7 +449,7 @@ mod tests {
             "barrel.zip",
             &[
                 ("Models/Barrel.obj", obj),
-                ("Models/Barrel.mtl", mtl),
+                ("Materials/Wood.mtl", mtl),
                 ("Models/Stump.obj", obj_gone),
                 ("Models/Stump.mtl", missing),
                 ("Textures/wood_planks.png", &png(blue)),
@@ -465,7 +466,8 @@ mod tests {
         );
         let cached = sha(&s.live().join("Models/Barrel.glb"));
 
-        // Hoisting Models takes Barrel.obj out of reach of `../Textures/`: still the same GLB.
+        // Hoisting Models takes Barrel.obj out of reach of `../Materials/`, and Stump.mtl out of
+        // reach of `../Textures/`: still the same GLBs.
         s.edit(&pack_id, |steps| insert(steps, hoist("Models")))
             .await;
         s.rebuilt(&pack_id).await;

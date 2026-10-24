@@ -46,6 +46,9 @@ and the order of their paths, which OpenDAM's cache key covers:
   the model (an FBX's `RelativeFilename`, its folder's subtree, an `.mtl`'s `map_Kd`), so where it
   sat relative to the model would decide the GLB, which a hoist changes. Textures embedded in the
   FBX are kept as they are.
+- For the same reason an OBJ's material libraries are found by file name too: Blender imports a
+  copy of the OBJ, under its own name, whose `mtllib` lines name the pack's first `.mtl` of each
+  name, and drop one the pack has no file of that name for.
 """
 
 import json
@@ -60,7 +63,7 @@ import bpy
 
 # OpenDAM records it with each GLB and keys its cache by it: `import::unity_glb::UNITY_GLB_VERSION`,
 # which a test keeps equal. Bump both when the GLBs this writes change.
-VERSION = "opendam-unity-glb/2"
+VERSION = "opendam-unity-glb/3"
 
 MODEL_EXTENSIONS = {".fbx", ".obj"}
 # Property names are matched lowercased, without underscores: `_Base_Map` is `basemap`.
@@ -336,7 +339,40 @@ def base_name(name: str) -> str:
     return re.sub(r"\.\d{3}$", "", name)
 
 
-def convert(model: Path, target: Path, guids, by_mesh, by_name, images, max_size: int,
+def obj_for_import(model: Path, mtls: dict[str, Path], scratch: Scratch) -> Path:
+    """A copy of the OBJ at `model`, under its own name (Blender names an object without an `o`
+    line after the file), whose `mtllib` lines name copies of the pack's `.mtl` files found by
+    name, beside no other `.mtl`, so where they sit relative to the model doesn't count."""
+    folder = scratch.path("-obj")
+    (folder / "mtl").mkdir(parents=True)
+    copies: dict[Path, str] = {}
+
+    def library(name: str) -> str | None:
+        found = mtls.get(alnum(Path(name.replace("\\", "/").rsplit("/", 1)[-1]).stem))
+        if found is None:
+            return None
+        if found not in copies:
+            copies[found] = f"mtl/{len(copies) + 1}.mtl"
+            (folder / copies[found]).write_bytes(found.read_bytes())
+        return copies[found]
+
+    copy = folder / model.name
+    with model.open("rb") as source, copy.open("wb") as out:
+        for line in source:
+            words = line.split(maxsplit=1)
+            if not words or words[0] != b"mtllib":
+                out.write(line)
+                continue
+            rest = words[1].strip().decode(errors="replace") if len(words) > 1 else ""
+            # One name with spaces, else several names
+            names = [rest] if library(rest) else rest.split()
+            found = [lib for lib in map(library, names) if lib]
+            if found:
+                out.write(("mtllib " + " ".join(found) + "\n").encode())
+    return copy
+
+
+def convert(model: Path, target: Path, guids, by_mesh, by_name, images, mtls, max_size: int,
             assimp: str, scratch: Scratch) -> str:
     clear_scene()
     if model.suffix.lower() == ".fbx":
@@ -344,7 +380,7 @@ def convert(model: Path, target: Path, guids, by_mesh, by_name, images, max_size
             filepath=str(binary_fbx(model, assimp, scratch)), use_image_search=False
         )
     else:
-        bpy.ops.wm.obj_import(filepath=str(model))
+        bpy.ops.wm.obj_import(filepath=str(obj_for_import(model, mtls, scratch)))
     rebind_imported_textures(images, max_size, scratch)
     meta = Path(str(model) + ".meta")
     fbx_guid = None
@@ -522,6 +558,10 @@ def main() -> None:
     for img in by_path(pack.rglob("*")):
         if img.suffix.lower() in IMAGE_EXTENSIONS:
             images.setdefault(alnum(img.stem), img)
+    mtls: dict[str, Path] = {}
+    for mtl in by_path(pack.rglob("*")):
+        if mtl.suffix.lower() == ".mtl":
+            mtls.setdefault(alnum(mtl.stem), mtl)
     print(f"[unity-glb] pack: {len(job['models'])} models, {len(by_mesh)} prefab meshes, "
           f"{len(by_name)} materials", flush=True)
     # One `[unity-glb] model` line per model, which OpenDAM counts for its progress.
@@ -530,7 +570,7 @@ def main() -> None:
         rel = entry["model"]
         try:
             note = convert(pack / rel, Path(entry["output"]), guids, by_mesh, by_name, images,
-                           max_size, assimp, scratch)
+                           mtls, max_size, assimp, scratch)
             results.append({"model": rel, "ok": True, "note": note})
             print(f"[unity-glb] model {rel}: {note}", flush=True)
         except Exception as e:  # one bad file must not stop the others' report
