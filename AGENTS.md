@@ -111,7 +111,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               unreal_glb.py (UNREAL_GLB_VERSION) in headless Unreal Editor
                               sessions of `batch` assets under import.unrealMemoryMax, the editor
                               found at import.unrealEditorRoot, each GLB cached as its session
-                              ends so an interrupted run resumes
+                              ends so an interrupted run resumes, and tools, what Settings'
+                              Import tools section checks (assimp at import.assimpPath, the
+                              Unreal Editor) and the conversion cache's size, which Clear
+                              empties only while no run executes (Engine::cache_use)
     src/capped.rs             capped_command: a child process in a systemd user scope with
                               MemoryMax (as scripts/memory-cap.sh), uncapped with a warning
                               without systemd-run --user, and exit 137 reported as killed by the cap

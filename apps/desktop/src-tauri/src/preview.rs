@@ -775,6 +775,11 @@ fn reported_version(reply: &serde_json::Value) -> i64 {
         .unwrap_or(1)
 }
 
+/// Whether a worker's `engine_info` reply says UnityPy imports, `None` when it doesn't say.
+fn reported_unitypy(reply: &serde_json::Value) -> Option<bool> {
+    reply.get("result")?.get("unitypy")?.as_bool()
+}
+
 /// The persistent Python worker that serves the queue, and the engine version it reported
 /// (plan textured-fbx-previews C9, "Engine gate"). Each process it starts is first asked its
 /// `engine_info`, and only a real reply publishes a version in `version`. Until then, and
@@ -783,6 +788,9 @@ struct PreviewEngine {
     py_exec: PathBuf,
     worker_py: PathBuf,
     version: watch::Sender<Option<i64>>,
+    /// Whether UnityPy imports, as the last process to answer `engine_info` said, kept while
+    /// no process serves.
+    unitypy: watch::Sender<Option<bool>>,
     info_timeout: Duration,
     worker: Option<PythonWorker>,
     /// Processes started so far.
@@ -794,11 +802,17 @@ struct PreviewEngine {
 }
 
 impl PreviewEngine {
-    fn new(py_exec: PathBuf, worker_py: PathBuf, version: watch::Sender<Option<i64>>) -> Self {
+    fn new(
+        py_exec: PathBuf,
+        worker_py: PathBuf,
+        version: watch::Sender<Option<i64>>,
+        unitypy: watch::Sender<Option<bool>>,
+    ) -> Self {
         PreviewEngine {
             py_exec,
             worker_py,
             version,
+            unitypy,
             info_timeout: ENGINE_INFO_TIMEOUT,
             worker: None,
             starts: 0,
@@ -828,7 +842,10 @@ impl PreviewEngine {
             Ok(mut worker) => {
                 let req = json!({"id": "engine_info", "method": "engine_info", "params": {}});
                 match tokio::time::timeout(self.info_timeout, worker.execute(&req)).await {
-                    Ok(Ok(reply)) => Some((worker, reported_version(&reply))),
+                    Ok(Ok(reply)) => {
+                        self.unitypy.send_replace(reported_unitypy(&reply));
+                        Some((worker, reported_version(&reply)))
+                    }
                     Ok(Err(e)) => {
                         tracing::error!("Python worker failed to answer engine_info: {}", e);
                         worker.kill().await;
@@ -942,7 +959,12 @@ async fn run_python_queue(
     worker_py: PathBuf,
     mut requests: mpsc::Receiver<WorkerRequest>,
 ) {
-    let mut engine = PreviewEngine::new(py_exec, worker_py, state.engine_version.clone());
+    let mut engine = PreviewEngine::new(
+        py_exec,
+        worker_py,
+        state.engine_version.clone(),
+        state.engine_unitypy.clone(),
+    );
     loop {
         let libs = state.db.get_all_libraries().await;
         let processed_any =
@@ -1731,7 +1753,12 @@ done
             ),
         )
         .unwrap();
-        PreviewEngine::new("sh".into(), script, watch::Sender::new(None))
+        PreviewEngine::new(
+            "sh".into(),
+            script,
+            watch::Sender::new(None),
+            watch::Sender::new(None),
+        )
     }
 
     /// The outcomes of one round of the Python queue over `libs`.
@@ -1763,7 +1790,13 @@ done
 
     #[tokio::test]
     async fn the_queue_publishes_its_workers_engine_version() {
-        for (engine_info, published) in [(ANSWER_2, 2), (UNKNOWN_METHOD, 1)] {
+        let with_unitypy =
+            r#"printf '{"id":"%s","result":{"preview_version":2,"unitypy":false}}\n' "$id""#;
+        for (engine_info, published, unitypy) in [
+            (ANSWER_2, 2, None),
+            (with_unitypy, 2, Some(false)),
+            (UNKNOWN_METHOD, 1, None),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let mut engine = stub_engine(dir.path(), engine_info, JOB_DONE);
             assert_eq!(*engine.version.borrow(), None, "none yet");
@@ -1771,6 +1804,7 @@ done
             // The worker starts and is asked with no job waiting
             assert!(queue_round(&mut engine, &[]).await.is_empty());
             assert_eq!(*engine.version.borrow(), Some(published));
+            assert_eq!(*engine.unitypy.borrow(), unitypy, "{engine_info}");
 
             // An older worker answering `Unknown method` keeps serving jobs
             let lib = library_with_pending_job(dir.path(), "models/ship.fbx", "").await;

@@ -6,6 +6,7 @@ use crate::import::place::PlaceStep;
 use crate::import::records::{ImportSummary, PackSteps, RunSummary, Step};
 use crate::import::scan::{Scan, Tree};
 use crate::import::settings::{self, ImportSettings};
+use crate::import::tools::{self, CacheStatus, ImportTools};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -171,7 +172,8 @@ pub async fn rebuild_import_pack(
     state.imports.rebuild_pack(&library_id, &pack_id).await
 }
 
-/// The import settings: Blender's memory cap for the `unity_glb` step.
+/// The import settings: the memory caps Blender and the Unreal Editor run under, the Unreal
+/// Editor's folder and the `assimp` program.
 #[tauri::command]
 pub async fn get_import_settings(state: State<'_, Arc<AppState>>) -> Result<ImportSettings> {
     settings::load(&state.db.master_pool)
@@ -187,4 +189,36 @@ pub async fn set_import_settings(
     state: State<'_, Arc<AppState>>,
 ) -> Result<ImportSettings> {
     settings::update(&state.db.master_pool, patch).await
+}
+
+/// The import's tools as Settings shows them: `assimp` at `assimp_path` (else on `PATH`), the
+/// Unreal Editor below `unreal_editor_root` (else the default folder), both as typed in
+/// Settings, saved or not, and whether UnityPy imports in the preview engine.
+#[tauri::command]
+pub async fn get_import_tools(
+    assimp_path: Option<String>,
+    unreal_editor_root: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ImportTools> {
+    let typed = |v: Option<String>| v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let root = typed(unreal_editor_root)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::import::unreal_glb::default_editor_root);
+    Ok(ImportTools {
+        assimp: tools::assimp_status(typed(assimp_path).as_deref()).await,
+        unreal_editor: tools::unreal_status(&root),
+        unitypy: *state.engine_unitypy.borrow(),
+    })
+}
+
+/// The conversion cache's folder and size.
+#[tauri::command]
+pub async fn get_import_cache(state: State<'_, Arc<AppState>>) -> Result<CacheStatus> {
+    state.imports.conversion_cache().await
+}
+
+/// Empties the conversion cache, refused while an import run executes. Returns its size after.
+#[tauri::command]
+pub async fn clear_import_cache(state: State<'_, Arc<AppState>>) -> Result<CacheStatus> {
+    state.imports.clear_conversion_cache().await
 }

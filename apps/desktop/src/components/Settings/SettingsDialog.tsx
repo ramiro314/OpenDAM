@@ -11,20 +11,31 @@ import type {
   ClaudePlanStatus,
   ConnectionTest,
   ExportSettings,
+  ImportCache,
+  ImportSettings,
+  ImportTools,
   ProviderStatus,
+  ToolStatus,
 } from '../../types';
 import { formatCost } from '../../utils/autotag';
 import { IconSettings, IconX } from '../Icons';
 import {
   ANTHROPIC_MODELS,
+  absoluteProblem,
   blenderLine,
+  cacheLine,
+  capProblem,
   claudePlanLines,
   exportSettingsPatch,
   ignoredOverridesNote,
+  importSettingsPatch,
+  importSettingsProblem,
   isKnownModel,
   parseNumberInput,
   rootCollectionOptions,
   settingsPatch,
+  toolLine,
+  unityPyLine,
 } from './settingsHelpers';
 import styles from './SettingsDialog.module.css';
 
@@ -45,7 +56,11 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
   const [exportSaved, setExportSaved] = useState<ExportSettings | null>(null);
   const [exportDraft, setExportDraft] = useState<ExportSettings | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [importSaved, setImportSaved] = useState<ImportSettings | null>(null);
+  const [importDraft, setImportDraft] = useState<ImportSettings | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const blender = useBlenderCheck(exportDraft ? exportDraft.blenderPath : undefined);
 
   useEffect(() => {
     Promise.all([api.getAiSettings(), api.getProviderStatus()])
@@ -63,6 +78,13 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
         setExportDraft(settings);
       })
       .catch((e) => setExportError(String(e)));
+    api
+      .getImportSettings()
+      .then((settings) => {
+        setImportSaved(settings);
+        setImportDraft(settings);
+      })
+      .catch((e) => setImportError(String(e)));
   }, []);
 
   // Runs `claude` twice, so it doesn't hold up the rest of the dialog
@@ -104,20 +126,38 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
         : null;
     const exportPatch =
       exportSaved && exportDraft ? exportSettingsPatch(exportSaved, exportDraft) : null;
-    if (!patch && !exportPatch) {
+    const importPatch =
+      importSaved && importDraft ? importSettingsPatch(importSaved, importDraft) : null;
+    if (!patch && !exportPatch && !importPatch) {
       onClose();
+      return;
+    }
+    const importProblem = importPatch && importDraft && importSettingsProblem(importDraft);
+    if (importProblem) {
+      setImportError(importProblem);
       return;
     }
     setSaving(true);
     // Keep a load error on the side that has nothing to save
     if (patch) setError(null);
     if (exportPatch) setExportError(null);
-    // The export root can be refused, so it saves first and keeps the dialog open when it is
+    if (importPatch) setImportError(null);
+    // The export root and the import's caps and paths can be refused, so they save first and
+    // keep the dialog open when they are
     if (exportPatch) {
       try {
         setExportSaved(await api.setExportSettings(exportPatch));
       } catch (e) {
         setExportError(String(e));
+        setSaving(false);
+        return;
+      }
+    }
+    if (importPatch) {
+      try {
+        setImportSaved(await api.setImportSettings(importPatch));
+      } catch (e) {
+        setImportError(String(e));
         setSaving(false);
         return;
       }
@@ -303,7 +343,20 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
           )}
 
           <h4 className={styles.sectionTitle}>Game export</h4>
-          <ExportSection draft={exportDraft} onChange={setExportDraft} error={exportError} />
+          <ExportSection
+            draft={exportDraft}
+            onChange={setExportDraft}
+            error={exportError}
+            blender={blender}
+          />
+
+          <h4 className={styles.sectionTitle}>Import tools</h4>
+          <ImportSection
+            draft={importDraft}
+            onChange={setImportDraft}
+            error={importError}
+            blender={blender}
+          />
         </div>
 
         <div className={styles.actions}>
@@ -314,7 +367,7 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
             id="settings-save"
             type="button"
             className={clsx(styles.btn, styles.primaryBtn)}
-            disabled={(!draft && !exportDraft) || saving}
+            disabled={(!draft && !exportDraft && !importDraft) || saving}
             onClick={handleSave}
           >
             Save
@@ -329,13 +382,14 @@ interface ExportSectionProps {
   draft: ExportSettings | null;
   onChange: (draft: ExportSettings) => void;
   error: string | null;
+  blender: BlenderCheck;
 }
 
 /**
  * The export root and root collection, saved with the dialog, and "Clear export cache", which
  * acts at once. The root is checked against every library when it is saved.
  */
-function ExportSection({ draft, onChange, error }: ExportSectionProps) {
+function ExportSection({ draft, onChange, error, blender }: ExportSectionProps) {
   const collections = useCollectionStore((s) => s.collections);
   const options = rootCollectionOptions(collections);
   const [clearing, setClearing] = useState(false);
@@ -425,6 +479,7 @@ function ExportSection({ draft, onChange, error }: ExportSectionProps) {
           <BlenderField
             path={draft.blenderPath}
             onChange={(blenderPath) => onChange({ ...draft, blenderPath })}
+            check={blender}
           />
         </>
       )}
@@ -459,6 +514,314 @@ function ExportSection({ draft, onChange, error }: ExportSectionProps) {
         )}
       </div>
     </section>
+  );
+}
+
+interface ImportSectionProps {
+  draft: ImportSettings | null;
+  onChange: (draft: ImportSettings) => void;
+  error: string | null;
+  blender: BlenderCheck;
+}
+
+/**
+ * The import's tools: Blender (set under Game export, which shares it), assimp, the Unreal
+ * Editor, both memory caps and UnityPy, then the conversion cache with Clear, which acts at once.
+ * The tools are checked as their paths are typed, saved or not.
+ */
+function ImportSection({ draft, onChange, error, blender }: ImportSectionProps) {
+  const [tools, setTools] = useState<ImportTools | null>(null);
+  const [toolsError, setToolsError] = useState<string | null>(null);
+  const [checks, setChecks] = useState(0);
+  const [cache, setCache] = useState<ImportCache | null>(null);
+  const [cacheError, setCacheError] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
+  const assimpPath = draft?.assimpPath?.trim() || null;
+  const editorRoot = draft?.unrealEditorRoot?.trim() || null;
+  const loaded = draft !== null;
+
+  // Waits for typing to pause, and drops the answer for paths that have since changed
+  useEffect(() => {
+    let current = true;
+    setTools(null);
+    setToolsError(null);
+    if (!loaded) return;
+    const timer = setTimeout(() => {
+      api
+        .getImportTools(assimpPath, editorRoot)
+        .then((t) => current && setTools(t))
+        .catch((e) => current && setToolsError(String(e)));
+    }, 400);
+    return () => {
+      current = false;
+      clearTimeout(timer);
+    };
+  }, [loaded, assimpPath, editorRoot, checks]);
+
+  useEffect(() => {
+    api
+      .getImportCache()
+      .then(setCache)
+      .catch((e) => setCacheError(String(e)));
+  }, []);
+
+  const clearCache = async () => {
+    setClearing(true);
+    setCacheError(null);
+    try {
+      setCache(await api.clearImportCache());
+    } catch (e) {
+      setCacheError(String(e));
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  const chooseAssimp = async () => {
+    const picked = await open({ directory: false, multiple: false, title: 'Select assimp' });
+    if (draft && typeof picked === 'string') onChange({ ...draft, assimpPath: picked });
+  };
+  const chooseEditor = async () => {
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      title: 'Select the Unreal Engine folder',
+    });
+    if (draft && typeof picked === 'string') onChange({ ...draft, unrealEditorRoot: picked });
+  };
+
+  const checking = !tools && !toolsError;
+  const blenderStatus = blender.status;
+
+  return (
+    <section className={styles.provider} id="settings-import">
+      <div className={styles.keyBlock} id="settings-import-blender">
+        <div className={styles.row}>
+          <span className={styles.label}>Blender</span>
+          <span className={styles.cliStatus}>
+            <span className={styles.cliLine} id="settings-import-blender-status">
+              {!blenderStatus && !blender.error && 'Checking Blender…'}
+              {blenderStatus && (
+                <>
+                  <span
+                    className={clsx(
+                      styles.dot,
+                      blenderStatus.accepted ? styles.dotOn : styles.dotOff
+                    )}
+                    aria-hidden
+                  />
+                  {blenderLine(blenderStatus)}
+                </>
+              )}
+              {blender.error}
+            </span>
+          </span>
+        </div>
+        <p className={styles.keyStatus}>
+          <span className={styles.hint}>
+            Converts Unity packs&apos; models to GLB. Its path is set under Game export, which uses
+            it too.
+          </span>
+        </p>
+      </div>
+      {draft && (
+        <>
+          <PathField
+            id="settings-import-assimp"
+            label="assimp"
+            value={draft.assimpPath}
+            placeholder="assimp on PATH"
+            onChange={(assimpPath) => onChange({ ...draft, assimpPath })}
+            onChoose={chooseAssimp}
+            problem={absoluteProblem(draft.assimpPath)}
+            status={checking ? null : (tools?.assimp ?? null)}
+            name="assimp"
+            hint="Converts ASCII and old FBX files for Blender, in Unity packs"
+          />
+          <PathField
+            id="settings-import-unreal"
+            label="Unreal Editor"
+            value={draft.unrealEditorRoot}
+            placeholder="~/Applications/UnrealEngine"
+            onChange={(unrealEditorRoot) => onChange({ ...draft, unrealEditorRoot })}
+            onChoose={chooseEditor}
+            problem={absoluteProblem(draft.unrealEditorRoot)}
+            status={checking ? null : (tools?.unrealEditor ?? null)}
+            name="Unreal Editor"
+            hint="The folder its Linux zip was extracted to, holding Engine/Binaries/Linux/UnrealEditor. Exports Unreal projects' meshes to GLB."
+          />
+          <div className={styles.numbers}>
+            <CapField
+              id="settings-import-blender-cap"
+              label="Blender memory cap"
+              value={draft.blenderMemoryMax}
+              placeholder="12G"
+              onChange={(blenderMemoryMax) => onChange({ ...draft, blenderMemoryMax })}
+            />
+            <CapField
+              id="settings-import-unreal-cap"
+              label="Unreal Editor memory cap"
+              value={draft.unrealMemoryMax}
+              placeholder="20G"
+              onChange={(unrealMemoryMax) => onChange({ ...draft, unrealMemoryMax })}
+            />
+          </div>
+          <p className={styles.keyStatus}>
+            <span className={styles.hint}>
+              Each runs in a systemd scope with this MemoryMax, and a run the cap kills fails its
+              step
+            </span>
+          </p>
+        </>
+      )}
+      <div className={styles.keyBlock} id="settings-import-unitypy">
+        <div className={styles.row}>
+          <span className={styles.label}>UnityPy</span>
+          <span className={styles.cliStatus}>
+            <span className={styles.cliLine} id="settings-import-unitypy-status">
+              {tools && (
+                <span
+                  className={clsx(styles.dot, tools.unitypy ? styles.dotOn : styles.dotOff)}
+                  aria-hidden
+                />
+              )}
+              {checking ? 'Checking…' : tools ? unityPyLine(tools.unitypy) : ''}
+            </span>
+          </span>
+          <button
+            type="button"
+            className={clsx(styles.btn, styles.secondaryBtn)}
+            disabled={checking}
+            onClick={() => setChecks((n) => n + 1)}
+            title="Check assimp, the Unreal Editor and UnityPy again"
+          >
+            Check again
+          </button>
+        </div>
+        <p className={styles.keyStatus}>
+          <span className={styles.hint}>Reads binary Unity materials, prefabs and scenes</span>
+        </p>
+      </div>
+      {toolsError && (
+        <p className={styles.error} role="alert">
+          {toolsError}
+        </p>
+      )}
+      {error && (
+        <p className={styles.error} role="alert">
+          {error}
+        </p>
+      )}
+      <div className={styles.keyBlock} id="settings-import-cache">
+        <div className={styles.row}>
+          <span className={styles.label}>Cache</span>
+          <span className={styles.cliStatus}>
+            <span className={styles.cliLine} id="settings-import-cache-size" role="status">
+              {cache ? cacheLine(cache) : !cacheError && 'Measuring…'}
+            </span>
+          </span>
+          <button
+            id="settings-import-clear-cache"
+            type="button"
+            className={clsx(styles.btn, styles.secondaryBtn)}
+            disabled={clearing || !cache || cache.bytes === 0}
+            onClick={clearCache}
+            title="Delete the GLBs import builds converted. The next build converts its models again."
+          >
+            {clearing ? 'Clearing…' : 'Clear'}
+          </button>
+        </div>
+        {cacheError && (
+          <p className={styles.error} role="alert">
+            {cacheError}
+          </p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+interface PathFieldProps {
+  id: string;
+  label: string;
+  value: string | null;
+  placeholder: string;
+  onChange: (value: string | null) => void;
+  onChoose: () => void;
+  /** Why the typed value can't be saved */
+  problem: string | null;
+  /** The tool found there, null while it is checked */
+  status: ToolStatus | null;
+  name: string;
+  hint: string;
+}
+
+/** A tool's path, saved with the dialog, and what was found there. */
+function PathField(props: PathFieldProps) {
+  const { id, label, value, placeholder, onChange, onChoose, problem, status, name, hint } = props;
+  return (
+    <div className={styles.keyBlock} id={id}>
+      <div className={styles.row}>
+        <span className={styles.label}>{label}</span>
+        <input
+          id={`${id}-path`}
+          className={styles.input}
+          value={value ?? ''}
+          placeholder={placeholder}
+          spellCheck={false}
+          onChange={(e) => onChange(e.target.value || null)}
+        />
+        <button type="button" className={clsx(styles.btn, styles.secondaryBtn)} onClick={onChoose}>
+          Choose…
+        </button>
+      </div>
+      <p className={styles.keyStatus} id={`${id}-status`} role="status">
+        {problem ? (
+          <span className={styles.problemText}>{problem}</span>
+        ) : status ? (
+          <>
+            <span
+              className={clsx(styles.dot, status.problem ? styles.dotOff : styles.dotOn)}
+              aria-hidden
+            />
+            <span className={styles.wrapText}>{toolLine(name, status)}</span>
+          </>
+        ) : (
+          `Checking ${name}…`
+        )}
+      </p>
+      <p className={styles.keyStatus}>
+        <span className={styles.hint}>{hint}</span>
+      </p>
+    </div>
+  );
+}
+
+interface CapFieldProps {
+  id: string;
+  label: string;
+  value: string | null;
+  placeholder: string;
+  onChange: (value: string | null) => void;
+}
+
+/** A memory cap, saved with the dialog, empty for its default. */
+function CapField({ id, label, value, placeholder, onChange }: CapFieldProps) {
+  const problem = capProblem(value);
+  return (
+    <label className={styles.numberField}>
+      <span className={styles.label}>{label}</span>
+      <input
+        id={id}
+        className={clsx(styles.input, problem && styles.invalid)}
+        value={value ?? ''}
+        placeholder={placeholder}
+        spellCheck={false}
+        title={problem ?? `Empty for the default, ${placeholder}`}
+        aria-invalid={problem !== null}
+        onChange={(e) => onChange(e.target.value || null)}
+      />
+    </label>
   );
 }
 
@@ -589,16 +952,19 @@ function ApiKeyField({ provider, status, onStatus }: ApiKeyFieldProps) {
   );
 }
 
-interface BlenderFieldProps {
-  path: string | null;
-  onChange: (path: string | null) => void;
+interface BlenderCheck {
+  status: BlenderStatus | null;
+  error: string | null;
+  /** Kept across checks, so the hint doesn't flicker while one runs */
+  series: string | null;
+  checkAgain: () => void;
 }
 
 /**
- * Blender's path, saved with the dialog, and the version found there, checked as the path
- * changes. Exports that run Blender accept only the series the backend names (`status.series`).
+ * The Blender at `path` (null is `blender` on PATH, undefined not loaded yet) and its version,
+ * checked as the path changes. The export and the import share it, so Settings asks Blender once.
  */
-function BlenderField({ path, onChange }: BlenderFieldProps) {
+function useBlenderCheck(path: string | null | undefined): BlenderCheck {
   const [status, setStatus] = useState<BlenderStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [checks, setChecks] = useState(0);
@@ -610,6 +976,7 @@ function BlenderField({ path, onChange }: BlenderFieldProps) {
     let current = true;
     setStatus(null);
     setError(null);
+    if (path === undefined) return;
     const timer = setTimeout(() => {
       api
         .getBlenderStatus(path?.trim() || null)
@@ -626,6 +993,21 @@ function BlenderField({ path, onChange }: BlenderFieldProps) {
     };
   }, [path, checks]);
 
+  return { status, error, series, checkAgain: () => setChecks((n) => n + 1) };
+}
+
+interface BlenderFieldProps {
+  path: string | null;
+  onChange: (path: string | null) => void;
+  check: BlenderCheck;
+}
+
+/**
+ * Blender's path, saved with the dialog, and the version found there. Exports that run Blender
+ * accept only the series the backend names (`status.series`).
+ */
+function BlenderField({ path, onChange, check }: BlenderFieldProps) {
+  const { status, error, series } = check;
   const choose = async () => {
     const picked = await open({ directory: false, multiple: false, title: 'Select Blender' });
     if (typeof picked === 'string') onChange(picked);
@@ -650,7 +1032,7 @@ function BlenderField({ path, onChange }: BlenderFieldProps) {
           type="button"
           className={clsx(styles.btn, styles.secondaryBtn)}
           disabled={!status && !error}
-          onClick={() => setChecks((n) => n + 1)}
+          onClick={check.checkAgain}
           title="Ask Blender for its version again"
         >
           Check again

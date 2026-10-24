@@ -1,7 +1,8 @@
 //! Pack import settings, one row per field in the master DB's `settings` table
 //! (`import.<field>`, JSON value), as the export's are: the memory caps Blender (`unity_glb`)
-//! and the Unreal Editor (`export_unreal`) run under, and where the Unreal Editor is (plan
-//! pack-import, Runs, Capped processes, and Settings). An unset field has no row.
+//! and the Unreal Editor (`export_unreal`) run under, where the Unreal Editor is, and the
+//! `assimp` program `unity_glb` converts ASCII FBX files with (plan pack-import, Runs, Capped
+//! processes, and Settings). An unset field has no row.
 
 use std::path::PathBuf;
 
@@ -14,7 +15,13 @@ use crate::capped::check_cap;
 const BLENDER_MEMORY_MAX: &str = "blenderMemoryMax";
 const UNREAL_MEMORY_MAX: &str = "unrealMemoryMax";
 const UNREAL_EDITOR_ROOT: &str = "unrealEditorRoot";
-const FIELDS: [&str; 3] = [BLENDER_MEMORY_MAX, UNREAL_MEMORY_MAX, UNREAL_EDITOR_ROOT];
+const ASSIMP_PATH: &str = "assimpPath";
+const FIELDS: [&str; 4] = [
+    BLENDER_MEMORY_MAX,
+    UNREAL_MEMORY_MAX,
+    UNREAL_EDITOR_ROOT,
+    ASSIMP_PATH,
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +33,8 @@ pub struct ImportSettings {
     /// The folder the Unreal Editor's Linux zip was extracted to, holding
     /// `Engine/Binaries/Linux/UnrealEditor`: `~/Applications/UnrealEngine` when unset.
     pub unreal_editor_root: Option<String>,
+    /// The `assimp` program, `assimp` on `PATH` when unset.
+    pub assimp_path: Option<String>,
 }
 
 impl ImportSettings {
@@ -48,10 +57,18 @@ impl ImportSettings {
             .unwrap_or_else(super::unreal_glb::default_editor_root)
     }
 
+    /// The `assimp` program a run starts: the setting's path, else `assimp` on `PATH`.
+    pub fn assimp(&self) -> String {
+        self.assimp_path
+            .clone()
+            .unwrap_or_else(|| super::tools::ASSIMP.to_string())
+    }
+
     fn field(&mut self, field: &str) -> &mut Option<String> {
         match field {
             BLENDER_MEMORY_MAX => &mut self.blender_memory_max,
             UNREAL_MEMORY_MAX => &mut self.unreal_memory_max,
+            ASSIMP_PATH => &mut self.assimp_path,
             _ => &mut self.unreal_editor_root,
         }
     }
@@ -61,13 +78,17 @@ fn key(field: &str) -> String {
     format!("import.{field}")
 }
 
-/// Whether `value` is one field `field` can hold: a cap systemd reads, or an absolute folder.
-fn check(field: &str, value: &str) -> Result<(), String> {
+/// Whether `value` is one field `field` can hold: a cap systemd reads, an absolute folder, or
+/// an absolute program.
+pub fn check(field: &str, value: &str) -> Result<(), String> {
     match field {
         UNREAL_EDITOR_ROOT if !value.starts_with('/') => Err(format!(
             "import.{field} must be an absolute folder, not {value:?}"
         )),
-        UNREAL_EDITOR_ROOT => Ok(()),
+        ASSIMP_PATH if !value.starts_with('/') => Err(format!(
+            "import.{field} must be an absolute path, not {value:?}"
+        )),
+        UNREAL_EDITOR_ROOT | ASSIMP_PATH => Ok(()),
         _ => check_cap(value),
     }
 }
@@ -201,5 +222,31 @@ mod tests {
             .unwrap();
         assert_eq!(cleared.unreal_memory_max(), "24G");
         assert_eq!(cleared.unreal_editor_root, None);
+    }
+
+    #[tokio::test]
+    async fn assimp_is_on_path_unless_an_absolute_path_is_saved() {
+        let db = crate::db::memory_database(vec![]).await;
+        let pool = &db.master_pool;
+        assert_eq!(load(pool).await.unwrap().assimp(), "assimp");
+
+        let saved = update(pool, json!({"assimpPath": " /opt/assimp/bin/assimp "}))
+            .await
+            .unwrap();
+        assert_eq!(saved.assimp(), "/opt/assimp/bin/assimp");
+        assert_eq!(load(pool).await.unwrap(), saved);
+
+        for bad in [json!({"assimpPath": "assimp"}), json!({"assimpPath": 1})] {
+            assert!(update(pool, bad.clone()).await.is_err(), "{bad}");
+        }
+        assert_eq!(load(pool).await.unwrap().assimp(), "/opt/assimp/bin/assimp");
+
+        // The convert step runs the saved program
+        let (worker, _requests) = tokio::sync::mpsc::channel(1);
+        let tools = crate::import::unity_glb::Tools::load(pool, PathBuf::new(), worker).await;
+        assert_eq!(tools.assimp, "/opt/assimp/bin/assimp");
+
+        let cleared = update(pool, json!({"assimpPath": ""})).await.unwrap();
+        assert_eq!(cleared.assimp(), "assimp");
     }
 }

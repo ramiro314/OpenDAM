@@ -32,6 +32,10 @@ import type {
   ExportOutcome,
   ExportSettings,
   ExportSettingsPatch,
+  ImportCache,
+  ImportSettings,
+  ImportSettingsPatch,
+  ImportTools,
   GameDetail,
   ProviderStatus,
   AutotagMode,
@@ -174,6 +178,18 @@ export const api = {
   clearExportCache: () => invoke<number>('clear_export_cache'),
   /** The Blender at `path` (null is `blender` on PATH), its version, and whether exports accept it */
   getBlenderStatus: (path: string | null) => invoke<BlenderStatus>('get_blender_status', { path }),
+
+  // Pack import settings. A cap systemd can't read or a relative path is refused.
+  getImportSettings: () => invoke<ImportSettings>('get_import_settings'),
+  setImportSettings: (patch: ImportSettingsPatch) =>
+    invoke<ImportSettings>('set_import_settings', { patch }),
+  /** assimp at `assimpPath` and the Unreal Editor below `unrealEditorRoot` (null: the defaults),
+   * as typed, and whether UnityPy imports */
+  getImportTools: (assimpPath: string | null, unrealEditorRoot: string | null) =>
+    invoke<ImportTools>('get_import_tools', { assimpPath, unrealEditorRoot }),
+  getImportCache: () => invoke<ImportCache>('get_import_cache'),
+  /** Empties the conversion cache, refused while an import runs, returning its size after */
+  clearImportCache: () => invoke<ImportCache>('clear_import_cache'),
   /**
    * Checks a domain collection: its assets, the problems that refuse its export and the diff
    * against the previous bundle. With no problem, it stages the bundle for `exportBundle`.

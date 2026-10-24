@@ -436,6 +436,44 @@ export interface BlenderStatus {
 /** The fields to change, where null clears one */
 export type ExportSettingsPatch = Partial<ExportSettings>;
 
+/** Pack import settings (plan pack-import, Settings). Null is unset, the default. */
+export interface ImportSettings {
+  /** The memory cap Blender runs under, such as "12G" (the default) */
+  blenderMemoryMax: string | null;
+  /** The memory cap the Unreal Editor runs under, such as "20G" (the default) */
+  unrealMemoryMax: string | null;
+  /** The absolute folder holding `Engine/Binaries/Linux/UnrealEditor`. Null means
+   * `~/Applications/UnrealEngine`. */
+  unrealEditorRoot: string | null;
+  /** An absolute path to `assimp`. Null means `assimp` on PATH. */
+  assimpPath: string | null;
+}
+
+/** The fields to change, where null clears one */
+export type ImportSettingsPatch = Partial<ImportSettings>;
+
+/** A tool an import step runs, read for Settings */
+export interface ToolStatus {
+  path: string | null;
+  version: string | null;
+  /** Why its step can't run it, when it can't */
+  problem: string | null;
+}
+
+/** The import's tools besides Blender, read for Settings */
+export interface ImportTools {
+  assimp: ToolStatus;
+  unrealEditor: ToolStatus;
+  /** Whether UnityPy imports in the preview engine, null until its worker has said */
+  unitypy: boolean | null;
+}
+
+/** The import's conversion cache */
+export interface ImportCache {
+  path: string;
+  bytes: number;
+}
+
 /** A URP Lit texture role, as the game's asset contract names it */
 export type TextureRole =
   | 'BaseColor'

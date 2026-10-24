@@ -6,7 +6,12 @@ import type {
   Collection,
   ExportSettings,
   ExportSettingsPatch,
+  ImportCache,
+  ImportSettings,
+  ImportSettingsPatch,
+  ToolStatus,
 } from '../../types';
+import { formatSize } from '../../utils/format';
 
 /** The Claude models Settings offers by name. Any other id is a custom model. */
 export const ANTHROPIC_MODELS = [
@@ -39,6 +44,71 @@ export function exportSettingsPatch(
   draft: ExportSettings
 ): ExportSettingsPatch | null {
   return changedFields(saved, draft) ?? null;
+}
+
+/** The import settings as they would be saved: trimmed, an empty field unset (its default). */
+export function cleanImportSettings(draft: ImportSettings): ImportSettings {
+  const clean = (v: string | null) => v?.trim() || null;
+  return {
+    blenderMemoryMax: clean(draft.blenderMemoryMax),
+    unrealMemoryMax: clean(draft.unrealMemoryMax),
+    unrealEditorRoot: clean(draft.unrealEditorRoot),
+    assimpPath: clean(draft.assimpPath),
+  };
+}
+
+/** The import settings fields of `draft` that differ from `saved`, or null when nothing changed. */
+export function importSettingsPatch(
+  saved: ImportSettings,
+  draft: ImportSettings
+): ImportSettingsPatch | null {
+  return changedFields(saved, cleanImportSettings(draft)) ?? null;
+}
+
+/** Why `value` isn't a memory cap systemd reads (digits, not all zero, then K, M, G or T), or
+ * null when it is one or is empty, the default. As the backend's `check_cap`. */
+export function capProblem(value: string | null): string | null {
+  const v = value?.trim() ?? '';
+  if (v === '') return null;
+  return /^\d*[1-9]\d*[KMGT]?$/.test(v) ? null : 'Give a size such as 12G (K, M, G or T)';
+}
+
+/** Why `value` isn't an absolute path, or null when it is one or is empty, the default. */
+export function absoluteProblem(value: string | null): string | null {
+  const v = value?.trim() ?? '';
+  return v === '' || v.startsWith('/') ? null : 'Give an absolute path, starting with /';
+}
+
+/** The first problem with the import settings typed, which keeps them from saving, or null. */
+export function importSettingsProblem(draft: ImportSettings): string | null {
+  const problems: [string, string | null][] = [
+    ["Blender's memory cap", capProblem(draft.blenderMemoryMax)],
+    ["The Unreal Editor's memory cap", capProblem(draft.unrealMemoryMax)],
+    ["The Unreal Editor's folder", absoluteProblem(draft.unrealEditorRoot)],
+    ["assimp's path", absoluteProblem(draft.assimpPath)],
+  ];
+  const found = problems.find(([, problem]) => problem);
+  return found ? `${found[0]}: ${found[1]}` : null;
+}
+
+/** What Settings says about a tool: "assimp 6.0 at /usr/bin/assimp", or why there is none. */
+export function toolLine(name: string, status: ToolStatus): string {
+  if (status.path && status.version) return `${name} ${status.version} at ${status.path}`;
+  return status.problem ?? `${name} not found`;
+}
+
+/** What Settings says about UnityPy, which the preview engine ships. */
+export function unityPyLine(unitypy: boolean | null): string {
+  if (unitypy === null) return "Not known yet: the preview engine hasn't started";
+  return unitypy
+    ? 'UnityPy imports in the preview engine'
+    : "UnityPy can't be imported in the preview engine, so binary Unity files can't be read";
+}
+
+/** What Settings says about the conversion cache: its size and where it is. */
+export function cacheLine(cache: ImportCache): string {
+  const size = cache.bytes === 0 ? 'Empty' : formatSize(cache.bytes);
+  return `Conversion cache: ${size}, at ${cache.path}`;
 }
 
 /** The collections the root collection picker offers: top-level, non-smart ones, by name. */
