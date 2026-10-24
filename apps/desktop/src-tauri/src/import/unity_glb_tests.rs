@@ -12,10 +12,13 @@ mod tests {
 
     use serde_json::{json, Value};
 
+    use std::sync::{Arc, Mutex};
+
     use crate::export::blender::test_blender;
     use crate::import::engine::tests::{setup, Setup, TARGET};
     use crate::import::engine::*;
     use crate::import::unitypackage::tests::fixture;
+    use crate::preview::WorkerRequest;
 
     /// The synthetic package's prefix to every source path.
     const WRAP: &str = "Assets/Pack/Built-In/Built-In_Pack/Pack";
@@ -315,6 +318,17 @@ mod tests {
         /// Imports the zip original at `path` with its preset's steps plus `unity_glb`, and
         /// returns the pack's id. The preset has no `unity_glb`, so the first build runs none.
         async fn import_zip_converted(&self, path: &Path) -> String {
+            let (pack_id, _) = self.import_zip_then_convert(path, "done").await;
+            pack_id
+        }
+
+        /// `import_zip_converted`, the rebuild ending as `status`. Returns the pack's id and the
+        /// rebuild's run.
+        async fn import_zip_then_convert(
+            &self,
+            path: &Path,
+            status: &str,
+        ) -> (String, crate::import::records::RunSummary) {
             let request = ImportRequest {
                 original_path: path.to_string_lossy().into_owned(),
                 ..self.request(vec![])
@@ -330,8 +344,9 @@ mod tests {
                 })
             })
             .await;
-            self.rebuilt(&pack_id).await;
-            pack_id
+            let run = self.engine.rebuild_pack("lib", &pack_id).await.unwrap();
+            let run = self.wait_for(&run.id, status).await;
+            (pack_id, run)
         }
     }
 
@@ -668,24 +683,7 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
     /// every scope and runs its command, as on a desktop. Returns the run's error, once it
     /// checked the build changed nothing: no pack folder, folder beside it or work folder.
     async fn failed_with_stub_blender(s: &Setup, body: &str) -> String {
-        let bin = s.cache.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let blender = bin.join("blender");
-        executable(
-            &blender,
-            &format!("[ \"$1\" = --version ] && {{ echo 'Blender 5.2.2'; exit 0; }}\n{body}"),
-        );
-        s.set_blender(&blender).await;
-        executable(&bin.join("systemctl"), "exit 0");
-        executable(
-            &bin.join("systemd-run"),
-            "while [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"",
-        );
-        s.engine.set_systemd(crate::capped::Systemd {
-            run: bin.join("systemd-run"),
-            ctl: bin.join("systemctl"),
-        });
-
+        s.stub_blender(body).await;
         let run = s
             .engine
             .start_import(s.request(vec![PlaceStep::Flatten]))
@@ -697,6 +695,55 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
         s.no_leftovers();
         s.no_work_left();
         failed.error.unwrap()
+    }
+
+    /// Each worker request a test served, with the bytes its `source` held when it came.
+    type Served = Arc<Mutex<Vec<(Value, Vec<u8>)>>>;
+
+    /// How a stub worker answers a request.
+    type Answer = fn(&Value) -> Value;
+
+    impl Setup {
+        /// Points Settings at a stub Blender that answers `--version` as 5.2.2 and otherwise runs
+        /// `body`, under a user manager that accepts every scope and runs its command, as on a
+        /// desktop.
+        async fn stub_blender(&self, body: &str) {
+            let bin = self.cache.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let blender = bin.join("blender");
+            executable(
+                &blender,
+                &format!("[ \"$1\" = --version ] && {{ echo 'Blender 5.2.2'; exit 0; }}\n{body}"),
+            );
+            self.set_blender(&blender).await;
+            executable(&bin.join("systemctl"), "exit 0");
+            executable(
+                &bin.join("systemd-run"),
+                "while [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"",
+            );
+            self.engine.set_systemd(crate::capped::Systemd {
+                run: bin.join("systemd-run"),
+                ctl: bin.join("systemctl"),
+            });
+        }
+
+        /// Answers the engine's preview worker requests with `answer`, given each request,
+        /// and returns each request with the bytes its `source` held when it came.
+        fn serve_worker(&self, answer: impl Fn(&Value) -> Value + Send + 'static) -> Served {
+            let mut requests = self.worker.lock().unwrap().take().unwrap();
+            let served: Served = Default::default();
+            let log = served.clone();
+            tokio::spawn(async move {
+                while let Some(WorkerRequest { request, reply }) = requests.recv().await {
+                    let source = request["params"]["source"].as_str().unwrap_or_default();
+                    let bytes = std::fs::read(source).unwrap_or_default();
+                    let answer = answer(&request);
+                    log.lock().unwrap().push((request, bytes));
+                    let _ = reply.send(Ok(answer));
+                }
+            });
+            served
+        }
     }
 
     /// A stub body that writes `result` as the script's result file, its last argument, and
@@ -854,5 +901,174 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
         let failed = s.wait_for(&run.id, "failed").await;
         assert_eq!(failed.error.as_deref(), Some(why));
         s.no_leftovers();
+    }
+
+    /// A binary Unity 4 material and prefab, as far as the step reads them: no `%YAML` header.
+    const BINARY_MAT: &[u8] = b"\x00\x00\x0a\x89\x00\x00\x11\x60\x00\x00\x00\x09 4.3.4f1 Material";
+    const BINARY_PREFAB: &[u8] = b"\x00\x00\x58\x04\x00\x00\x00\x09 4.3.4f1 GameObject";
+    const TEXT_MAT: &[u8] = b"%YAML 1.1\n--- !u!21 &2100000\nMaterial:\n  m_Name: M_Text\n";
+    /// What the stub worker writes for a binary file.
+    const AS_TEXT: &str = "%YAML 1.1\n--- !u!21 &2100000\nMaterial:\n  m_Name: from the worker\n";
+
+    fn binary_pack(dir: &Path) -> PathBuf {
+        zip_of(
+            dir,
+            "binary.zip",
+            &[
+                ("Models/SM_Log.fbx", b"an FBX the stub Blender never reads"),
+                ("Materials/M_Log.mat", BINARY_MAT),
+                ("Materials/M_Text.mat", TEXT_MAT),
+                ("Prefabs/SM_Log.prefab", BINARY_PREFAB),
+            ],
+        )
+    }
+
+    /// A stub Blender body that copies the work copy it was given to `seen` and converts
+    /// `Models/SM_Log.fbx`.
+    fn copying_blender(seen: &Path) -> String {
+        let result = json!({
+            "version": crate::import::unity_glb::UNITY_GLB_VERSION,
+            "models": [{"model": "Models/SM_Log.fbx", "ok": true}],
+        });
+        format!(
+            "for last; do :; done\nwork=$(dirname \"$last\")\ncp -R \"$work/pack\" '{}'\n\
+             printf glTF > \"$work/out/0.glb\"\nprintf '%s' '{result}' > \"$last\"",
+            seen.display()
+        )
+    }
+
+    /// Binary `.mat` and `.prefab` files reach Blender as the worker's text, the text `.mat` as
+    /// it is, and the library keeps every file's own bytes.
+    #[tokio::test]
+    async fn binary_unity_files_reach_blender_as_text_and_the_library_keeps_their_bytes() {
+        let s = setup().await;
+        let seen = s.cache.path().join("seen");
+        s.stub_blender(&copying_blender(&seen)).await;
+        let served = s.serve_worker(|request| {
+            let output = Path::new(request["params"]["output"].as_str().unwrap());
+            std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+            std::fs::write(output, AS_TEXT).unwrap();
+            json!({"id": request["id"], "result": {"ok": true, "output": output}})
+        });
+        let originals = tempfile::tempdir().unwrap();
+        s.import_zip_converted(&binary_pack(originals.path())).await;
+
+        let served = served.lock().unwrap().clone();
+        let work = s.cache.path().join("work");
+        let asked: Vec<(&str, String, &[u8])> = served
+            .iter()
+            .map(|(request, bytes)| {
+                let source = Path::new(request["params"]["source"].as_str().unwrap());
+                let in_pack = source
+                    .strip_prefix(&work)
+                    .expect("a work copy")
+                    .components()
+                    .skip(2) // the work folder and its `pack`
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                (request["method"].as_str().unwrap(), in_pack, &bytes[..])
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                (
+                    "unity_binary_to_text",
+                    "Materials/M_Log.mat".to_string(),
+                    BINARY_MAT
+                ),
+                (
+                    "unity_binary_to_text",
+                    "Prefabs/SM_Log.prefab".to_string(),
+                    BINARY_PREFAB
+                ),
+            ]
+        );
+        for path in ["Materials/M_Log.mat", "Prefabs/SM_Log.prefab"] {
+            assert_eq!(
+                std::fs::read_to_string(seen.join(path)).unwrap(),
+                AS_TEXT,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(seen.join("Materials/M_Text.mat")).unwrap(),
+            TEXT_MAT
+        );
+
+        assert_eq!(
+            std::fs::read(s.live().join("Materials/M_Log.mat")).unwrap(),
+            BINARY_MAT
+        );
+        assert_eq!(
+            std::fs::read(s.live().join("Prefabs/SM_Log.prefab")).unwrap(),
+            BINARY_PREFAB
+        );
+        assert_eq!(
+            std::fs::read(s.live().join("Materials/M_Text.mat")).unwrap(),
+            TEXT_MAT
+        );
+        assert_eq!(
+            std::fs::read(s.live().join("Models/SM_Log.glb")).unwrap(),
+            b"glTF"
+        );
+        let recorded: String = sqlx::query_scalar(
+            "SELECT o.sha256 FROM import_outputs o JOIN import_packs p ON p.id = o.pack_id
+             AND o.build_id = p.current_build WHERE o.path = ?",
+        )
+        .bind(format!("{TARGET}/Materials/M_Log.mat"))
+        .fetch_one(&s.lib.pool)
+        .await
+        .unwrap();
+        assert_eq!(recorded, crate::export::hashes::sha256_bytes(BINARY_MAT));
+        s.no_work_left();
+    }
+
+    /// A binary file the worker can't rewrite fails the step, naming the file and why: UnityPy
+    /// missing, an engine older than the request, or no engine at all. The pack stays as it was.
+    #[tokio::test]
+    async fn a_binary_unity_file_the_worker_can_t_rewrite_fails_the_step_naming_it() {
+        let missing = |request: &Value| {
+            json!({"id": request["id"], "result": {
+                "ok": false, "error": "UnityPy can't be imported: No module named 'UnityPy'",
+            }})
+        };
+        let older = |request: &Value| json!({"id": request["id"], "error": "Unknown method: unity_binary_to_text"});
+        let cases: [(Option<Answer>, &str); 3] = [
+            (
+                Some(missing),
+                "UnityPy can't be imported: No module named 'UnityPy'",
+            ),
+            (Some(older), "Unknown method: unity_binary_to_text"),
+            (None, "the preview engine isn't running"),
+        ];
+        for (answer, why) in cases {
+            let s = setup().await;
+            s.stub_blender(&copying_blender(&s.cache.path().join("seen")))
+                .await;
+            match answer {
+                Some(answer) => {
+                    s.serve_worker(answer);
+                }
+                None => drop(s.worker.lock().unwrap().take()),
+            }
+            let originals = tempfile::tempdir().unwrap();
+            let (_, run) = s
+                .import_zip_then_convert(&binary_pack(originals.path()), "failed")
+                .await;
+            assert_eq!(
+                run.error.as_deref(),
+                Some(format!("Reading Materials/M_Log.mat as text failed: {why}").as_str())
+            );
+            assert!(!s.cache.path().join("seen").exists(), "Blender never ran");
+            assert!(!s.live().join("Models/SM_Log.glb").exists());
+            assert_eq!(
+                std::fs::read(s.live().join("Materials/M_Log.mat")).unwrap(),
+                BINARY_MAT
+            );
+            s.no_leftovers();
+            s.no_work_left();
+        }
     }
 }

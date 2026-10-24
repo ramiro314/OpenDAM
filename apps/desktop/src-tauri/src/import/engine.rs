@@ -23,7 +23,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{Pool, Sqlite};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 
 use super::build::{self, BuildEnv, Hooks, Point, Progress, RunControl, Stop};
 use super::metadata::LicenseOption;
@@ -34,6 +34,7 @@ use super::records::{
 use super::scan::{self, Scan};
 use super::unity_glb;
 use crate::db::{Database, LibraryHandle};
+use crate::preview::WorkerRequest;
 
 const HEARTBEAT: Duration = Duration::from_secs(30);
 /// Another machine's run whose heartbeat is this old is gone.
@@ -124,6 +125,8 @@ pub struct Engine {
     lock_wait: Duration,
     /// The conversion cache (`unity_glb::default_cache_dir`).
     cache_dir: PathBuf,
+    /// The preview queue's worker, which rewrites binary Unity files for the convert phase.
+    worker: mpsc::Sender<WorkerRequest>,
     /// The systemd tools a test runs Blender's scope through.
     #[cfg(test)]
     systemd: Mutex<Option<crate::capped::Systemd>>,
@@ -133,8 +136,18 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(db: Arc<Database>, events: EventSink) -> Arc<Self> {
-        Self::with_options(db, events, LOCK_WAIT, unity_glb::default_cache_dir())
+    pub fn new(
+        db: Arc<Database>,
+        events: EventSink,
+        worker: mpsc::Sender<WorkerRequest>,
+    ) -> Arc<Self> {
+        Self::with_options(
+            db,
+            events,
+            LOCK_WAIT,
+            unity_glb::default_cache_dir(),
+            worker,
+        )
     }
 
     fn with_options(
@@ -142,6 +155,7 @@ impl Engine {
         events: EventSink,
         lock_wait: Duration,
         cache_dir: PathBuf,
+        worker: mpsc::Sender<WorkerRequest>,
     ) -> Arc<Self> {
         Arc::new(Engine {
             db,
@@ -153,6 +167,7 @@ impl Engine {
             hooks: Hooks::default(),
             lock_wait,
             cache_dir,
+            worker,
             #[cfg(test)]
             systemd: Mutex::new(None),
         })
@@ -738,7 +753,12 @@ impl Engine {
     /// What a run's convert phase runs with, from Settings now.
     async fn tools(&self) -> unity_glb::Tools {
         #[allow(unused_mut)]
-        let mut tools = unity_glb::Tools::load(&self.db.master_pool, self.cache_dir.clone()).await;
+        let mut tools = unity_glb::Tools::load(
+            &self.db.master_pool,
+            self.cache_dir.clone(),
+            self.worker.clone(),
+        )
+        .await;
         #[cfg(test)]
         if let Some(systemd) = self.systemd.lock().unwrap().clone() {
             tools.systemd = systemd;
@@ -1013,6 +1033,8 @@ mod tests {
         pub(super) lib: LibraryHandle,
         pub(super) engine: Arc<Engine>,
         pub(super) events: Arc<Mutex<Vec<ImportEvent>>>,
+        /// The requests the engine sends the preview worker, which a test answers.
+        pub(super) worker: Mutex<Option<mpsc::Receiver<WorkerRequest>>>,
     }
 
     impl Setup {
@@ -1246,11 +1268,13 @@ mod tests {
             .unwrap();
         let events: Arc<Mutex<Vec<ImportEvent>>> = Default::default();
         let sink = events.clone();
+        let (worker, requests) = mpsc::channel(16);
         let engine = Engine::with_options(
             db,
             Arc::new(move |event| sink.lock().unwrap().push(event)),
             Duration::from_secs(2),
             cache.path().to_path_buf(),
+            worker,
         );
         if start {
             tokio::spawn(engine.clone().start());
@@ -1261,6 +1285,7 @@ mod tests {
             lib,
             engine,
             events,
+            worker: Mutex::new(Some(requests)),
         }
     }
 

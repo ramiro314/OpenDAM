@@ -200,8 +200,9 @@ def test_model_meta_over_stdio_downscales_an_obj_texture(tmp_path):
         assert image_sizes(gltf, binary) == [expected[reply["id"]]]
 
 
-def test_engine_info_returns_the_preview_version():
-    """Over stdio, as the app asks each new worker process (plan C7)."""
+def test_engine_info_returns_the_preview_version_and_that_unitypy_imports():
+    """Over stdio, as the app asks each new worker process (plan C7), with UnityPy, which the dev
+    venv and the installed engine hold."""
     run = subprocess.run(
         [sys.executable, "worker.py"],
         cwd=ENGINE,
@@ -214,5 +215,5 @@ def test_engine_info_returns_the_preview_version():
     assert worker.PREVIEW_VERSION == 2
     assert json.loads(run.stdout) == {
         "id": "engine_info",
-        "result": {"preview_version": worker.PREVIEW_VERSION},
+        "result": {"preview_version": worker.PREVIEW_VERSION, "unitypy": True},
     }, run.stderr

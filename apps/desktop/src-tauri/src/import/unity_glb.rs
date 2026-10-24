@@ -9,6 +9,10 @@
 //! - **A work copy.** Blender reads a copy of the staged pack's inputs (Unity files, models,
 //!   `.mtl` files and textures) in a work folder of the cache, never the staging folder, and the
 //!   folder is deleted when the step ends.
+//! - **Binary Unity files.** A `.mat`, `.prefab` or `.unity` that Unity 4 or 5 wrote in its
+//!   binary serialization is rewritten as text in the work copy only, by the preview worker's
+//!   `unity_binary_to_text` (UnityPy), so the script reads it and the library keeps its bytes.
+//!   A file the worker can't rewrite fails the step, naming it.
 //! - **The cache.** Each GLB is kept at `<cache>/glb/<key>.glb`, keyed by the original's sha256,
 //!   the model's source path, the options, `UNITY_GLB_VERSION`, Blender's version and the
 //!   **inputs hash** (`inputs_hash`), so a rebuild that only moved files between folders runs no
@@ -23,11 +27,13 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+use tokio::sync::{mpsc, oneshot};
 
 use super::build::{Progress, ProgressSink, RunControl, Stop};
 use crate::capped;
 use crate::export::blender::{self, Blender};
 use crate::export::hashes::sha256_bytes;
+use crate::preview::WorkerRequest;
 
 /// The script's version, which every GLB's cache key holds. The script declares it as
 /// `VERSION`, which a test keeps equal: bump both when the GLBs it writes change.
@@ -46,6 +52,9 @@ const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "tga", "tif", "tiff",
 /// The other files Blender reads besides the models: Unity's `.meta`, `.mat`, `.prefab` and
 /// `.unity`, and an OBJ's `.mtl`. A test keeps every extension the script names among these.
 const UNITY_EXTENSIONS: [&str; 5] = ["meta", "mat", "prefab", "unity", "mtl"];
+/// The Unity files the script reads as text that Unity 4 and 5 could also write in their binary
+/// serialization.
+const SERIALIZED_EXTENSIONS: [&str; 3] = ["mat", "prefab", "unity"];
 
 /// The step's options. `force` converts every model again, whatever the cache holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,10 +102,16 @@ pub struct Tools {
     pub assimp: String,
     /// The systemd tools Blender's scope runs through.
     pub systemd: capped::Systemd,
+    /// The preview queue's worker, which rewrites binary Unity files as text.
+    pub worker: mpsc::Sender<WorkerRequest>,
 }
 
 impl Tools {
-    pub async fn load(master: &sqlx::Pool<sqlx::Sqlite>, cache_dir: PathBuf) -> Self {
+    pub async fn load(
+        master: &sqlx::Pool<sqlx::Sqlite>,
+        cache_dir: PathBuf,
+        worker: mpsc::Sender<WorkerRequest>,
+    ) -> Self {
         let blender_path = match crate::export::settings::load(master).await {
             Ok(settings) => settings.blender_path,
             Err(e) => {
@@ -117,6 +132,7 @@ impl Tools {
             cache_dir,
             assimp: "assimp".into(),
             systemd: capped::Systemd::default(),
+            worker,
         }
     }
 
@@ -350,6 +366,22 @@ fn meta_guid(path: &Path) -> Option<String> {
         .then(|| guid.to_string())
 }
 
+/// Whether the file at `path` is a `.mat`, `.prefab` or `.unity` in Unity's binary
+/// serialization: one that doesn't start with `%YAML`, as Unity's text format does.
+fn is_binary_unity(path: &Path) -> bool {
+    use std::io::Read;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if !extension(name).is_some_and(|ext| SERIALIZED_EXTENSIONS.contains(&ext.as_str())) {
+        return false;
+    }
+    let mut head = Vec::with_capacity(5);
+    let read = std::fs::File::open(path).and_then(|f| f.take(5).read_to_end(&mut head));
+    read.is_ok() && head != b"%YAML"
+}
+
 /// One run of the step over a staged pack.
 pub struct Conversion<'a> {
     pub staging: &'a Path,
@@ -509,12 +541,13 @@ impl Conversion<'_> {
             (pack.clone(), out.clone()),
         );
         let control = self.control.clone();
-        blocking(move || {
+        let binary = blocking(move || {
             std::fs::create_dir_all(&folders.1)
                 .map_err(|e| format!("Could not make the conversion's work folder: {e}"))?;
+            let mut binary = Vec::new();
             for path in copied {
                 if control.cancelled() {
-                    return Ok(());
+                    return Ok(binary);
                 }
                 let to = folders.0.join(&path);
                 if let Some(parent) = to.parent() {
@@ -523,11 +556,15 @@ impl Conversion<'_> {
                 }
                 std::fs::copy(staging.join(&path), &to)
                     .map_err(|e| format!("Could not copy {path} to the work folder: {e}"))?;
+                if is_binary_unity(&to) {
+                    binary.push(path);
+                }
             }
-            Ok(())
+            Ok(binary)
         })
         .await?;
         self.cancelled()?;
+        self.binary_to_text(&work.0, &pack, &binary).await?;
 
         let job = Job {
             pack: &pack,
@@ -609,6 +646,52 @@ impl Conversion<'_> {
                 .map_err(|e| format!("Converting {} to GLB failed: {e}", model.path))?;
         }
         Ok(())
+    }
+
+    /// Rewrites each of `binary`, binary Unity files of the work copy at `pack`, as text, through
+    /// the preview worker. Only the work copy changes: the staged files keep their bytes.
+    async fn binary_to_text(
+        &self,
+        work: &Path,
+        pack: &Path,
+        binary: &[String],
+    ) -> Result<(), Stop> {
+        for (n, path) in binary.iter().enumerate() {
+            self.cancelled()?;
+            let failed =
+                |why: String| Stop::Failed(format!("Reading {path} as text failed: {why}"));
+            let source = pack.join(path);
+            let output = work.join("text").join(format!("{n}.txt"));
+            let (reply, answer) = oneshot::channel();
+            let request = json!({
+                "id": format!("unity_binary_to_text-{}", uuid::Uuid::new_v4()),
+                "method": "unity_binary_to_text",
+                "params": { "source": source, "output": output },
+            });
+            self.tools
+                .worker
+                .send(WorkerRequest { request, reply })
+                .await
+                .map_err(|_| failed("the preview engine isn't running".into()))?;
+            let reply = answer
+                .await
+                .map_err(|_| failed("the preview engine stopped before it answered".into()))?
+                .map_err(failed)?;
+            if let Some(error) = reply.get("error").and_then(|e| e.as_str()) {
+                return Err(failed(error.into()));
+            }
+            let result = &reply["result"];
+            if result["ok"] != true {
+                let why = result["error"]
+                    .as_str()
+                    .unwrap_or("the preview engine gave no reason");
+                return Err(failed(why.into()));
+            }
+            tokio::fs::rename(&output, &source)
+                .await
+                .map_err(|e| failed(format!("its text can't be read: {e}")))?;
+        }
+        self.cancelled()
     }
 
     /// Runs Blender with `args` in `dir` under the memory cap, counting the models it reports

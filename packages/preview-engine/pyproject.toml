@@ -14,6 +14,7 @@ dependencies = [
   "pypdfium2>=4.30.0", # .ai (PDF-compatible) previews
   "imageio>=2.34", # HDR reader
   "openexr-numpy>=0.0.6", # EXR reader
+  "unitypy>=1.25.4", # binary Unity .mat/.prefab/.unity to text (unity_binary_to_text)
 ]
 
 [dependency-groups]
