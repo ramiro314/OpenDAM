@@ -311,6 +311,52 @@ the step's deviations from `unity_gltf.py` and from this plan as written:
     gives the reason (`unavailable`). A build with it on fails with that reason.
   - **assimp.** It is `assimp` on `PATH`, with no setting yet.
 
+Revised again 2026-10-24 (revision 21) while building outside changes (drift), whose
+reviews found choices the table promised but a build couldn't honour. No decision changed. These
+are the drift's deviations from this plan as written (Edits after an import, A6):
+
+- **R47 - Recipe edits are recorded when the Rebuild is queued.** "Record as `exclude`" and
+  "turn the metadata step off" (or "keep yours" on `datapackage.json`) are written as step edits
+  in the transaction that queues the run, bumping `recipe_rev`, so they stay when the build
+  fails. The other choices travel with the run in `import_runs.drift`.
+  - **Restore turns back only its own kind of edit.** A Restore, or "use the recipe's", turns an
+    `exclude` off, or the metadata step back on, only when the pack's latest run that never
+    committed recorded that edit and the steps are still as it left them
+    (`records::uncommitted`).
+  - **Your own steps are never turned back.** A Restore that would need a step you set yourself
+    turned back is refused, naming the file and the step to change.
+- **R48 - A new difference, the clash.** A file the build would keep (a kept file, or a changed
+  one that keep yours would carry) is listed as a `clash`, offering only Discard, when the recipe
+  now writes over it (`datapackage.json` with the metadata step on, a converted GLB) or its own
+  `exclude` leaves it out. Without it, keeping such a file failed every Rebuild.
+- **R49 - A `.meta` follows its asset.** When an `exclude` leaves out the asset of a kept or
+  changed `.meta`:
+  - **The asset is still in the folder:** the `.meta` is a clash, offering only Discard.
+  - **The asset is missing:** the `.meta` follows the asset's answer in the same Rebuild. Left
+    out with it, it goes with it and is never kept, as an in-app delete takes it along.
+
+  The asset's exclude can change within the Rebuild only for a missing asset, so the dialog, the
+  queue's check and the build's checks always agree on the `.meta`.
+- **R50 - A deleted pack folder defaults to Restore.** When the whole folder is gone, every
+  missing file's default is Restore, not "record as `exclude`", and the dialog offers "Restore
+  all".
+- **R51 - Kept files of their own.**
+  - **No source path.** A kept file added outside OpenDAM, or a kept `datapackage.json`, has a
+    `NULL` source path. It keeps its path, is never carried, and the carry never moves its row
+    aside.
+  - **When they join.** They join the staging folder after the convert phase, so they are no
+    conversion input. A kept replacement is one: it takes the extracted file's bytes before the
+    place phase.
+  - **A source the extract no longer produces.** A kept replacement whose source the extract no
+    longer produces (another variant, say) joins at its own path too.
+- **R52 - Paths the build writes are estimated.** An added or kept `.glb` counts as one the
+  convert phase writes when a `.fbx` or `.obj` of the same stem sits in its folder, the folder
+  ships no GLB of that stem, and `unity_glb` is on. A step change that moves models (a hoist
+  toggled in the same edit) can defeat the estimate. The build then fails naming the kept file,
+  to rename or delete in the app.
+- **R53 - Remove's drift waits for Remove.** Remove import isn't built yet, so only Rebuild runs
+  the drift check.
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:

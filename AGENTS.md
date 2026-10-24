@@ -177,26 +177,36 @@ docs/plans                    Plans for this fork
   to a file the new build doesn't have there: unless it is moving itself, it is moved aside too
   and stays there, so the settle prunes it and a rollback puts it back, and no file takes over
   another file's row. A kept file added outside OpenDAM (no source path) is copied from its own
-  path, so it is never carried and the row there, its own, never moved aside.
+  path, so it is never carried and the row there, its own, never moved aside. The index's
+  inserted rows are journaled as `inserted`. A rollback deletes the inserted rows, then reverses
+  the moves by asset id in the same two passes, so neither a rebuild nor its rollback loses
+  metadata.
 - **Outside changes are answered before a Rebuild.** `import::drift` compares the pack folder
-  with the current manifest (size and mtime, hashing on a mismatch), and offers each file only
-  the choices its origin can honour. `rebuild_import_pack` refuses choices that don't answer the
-  folder now (`drift::STALE`), records the ones that edit the recipe (an `exclude`, the metadata
-  step off, or for a Restore the edit a run that never committed recorded turned back, never
-  a step you set yourself, which refuses the Restore) in the transaction that queues the run,
-  and stores the rest in `import_runs.drift`. A file the build would keep (a kept one, or a
-  changed one keep yours would carry) that the recipe now writes over or its own `exclude`
-  leaves out is listed as a `clash`, offering only discard, and so is a kept or changed `.meta`
-  whose asset, still in the folder, an `exclude` leaves out. A `.meta` whose missing asset is
-  left out goes with its asset, never kept, judged by the build with the Rebuild's own edits
-  made. A
-  pack folder that is gone defaults every missing file to Restore.
-  The build checks, before it stages and again under the lock, that the folder still differs
-  exactly so. A kept file (`origin = 'kept'`) is carried by every later rebuild: one that
-  replaced a recipe file keeps its source path, takes its bytes right after the extraction, and
-  goes where the steps put it; one added outside OpenDAM keeps its path (`source_path` `NULL`). The index's inserted
-  rows are journaled as `inserted`. A rollback deletes the inserted rows, then reverses the moves
-  by asset id in the same two passes, so neither a rebuild nor its rollback loses metadata.
+  with the current manifest (size and mtime, hashing on a mismatch) and offers each difference
+  only the choices its file's origin can honour (`drift::offered`).
+  - **The choices travel with the run.** `rebuild_import_pack` refuses choices that don't answer
+    the folder now (`drift::STALE`). In the transaction that queues the run it records the
+    choices that edit the recipe: an `exclude` for "Leave it out", the metadata step off, and,
+    for a Restore, the turning back of an edit that the pack's latest run that never committed
+    recorded (`records::uncommitted`). A Restore that would turn back a step you set yourself
+    is refused instead. The other choices are stored in `import_runs.drift`, and the build
+    checks, before it stages and again under the lock, that the folder still differs exactly
+    so.
+  - **Clashes.** A file the build would keep (a kept one, or a changed one that keep yours
+    would carry) is listed as a `clash`, offering only Discard, when the recipe now writes over
+    it (`datapackage.json`, a converted GLB) or its own `exclude` leaves it out.
+  - **A `.meta` and its asset.** When an `exclude` leaves out the asset of a kept or changed
+    `.meta`, the outcome depends on the asset:
+    - **The asset is still in the folder:** the `.meta` is a `clash`, offering only Discard.
+    - **The asset is missing:** the `.meta` follows the asset's answer in the same Rebuild. If
+      the asset is left out, the `.meta` goes with it and is never kept. The build judges this
+      with the Rebuild's own edits made (`drift::kept`).
+  - **A deleted pack folder.** When the whole folder is gone, every missing file defaults to
+    Restore.
+  - **Kept files.** A kept file (`origin = 'kept'`) is carried by every later rebuild. One that
+    replaced a recipe file keeps its source path, takes its bytes right after the extraction,
+    and goes where the steps put it. One added outside OpenDAM keeps its path, with a `NULL`
+    source path (`records::Output::stored_source`).
 - **Pruning waits for the commit.** `Prune::Defer` deletes no row, runs no structure pass, and
   journals each row it inserts. Only an import build uses it, between its swap and its commit, so
   the rows of paths only the previous build had are pruned only by the settle's `Prune::Now`,
