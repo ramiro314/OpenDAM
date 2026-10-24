@@ -996,6 +996,10 @@ mod metadata_tests;
 mod recovery_tests;
 
 #[cfg(test)]
+#[path = "edits_tests.rs"]
+mod edits_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::{memory_database, memory_library_pool};

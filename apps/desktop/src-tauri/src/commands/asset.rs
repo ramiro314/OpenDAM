@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use crate::db::{make_relative_path, resolve_path, upsert_tag, Database, LibraryHandle};
+use crate::import::{edits, engine};
 use crate::models::{
     Asset, AssetPatch, FilterSpec, FolderRef, GroupMember, SearchPayload, SearchQuery,
     SearchResult, SortSpec,
@@ -1416,7 +1417,10 @@ async fn item_files(pool: &sqlx::Pool<sqlx::Sqlite>, id: &str) -> sqlx::Result<V
 /// Deletes the rows of `id`'s files (`item_files`) from `lib` and, when `delete_file` is set,
 /// first moves each file to the trash with `trash`, never falling back to a permanent delete. A
 /// failed trash stops there: the files trashed before it lose their rows, and the error names
-/// the files left in place, which keep theirs.
+/// the files left in place, which keep theirs. Inside an imported pack, each file's `.meta` goes
+/// to the trash right after it, and the files trashed are recorded as the pack's steps
+/// (`edits::record`) in the transaction that deletes their rows. Refused before anything is
+/// trashed while a run is building the pack.
 async fn delete_asset_with<E: std::fmt::Display>(
     db: &Database,
     lib: &LibraryHandle,
@@ -1425,25 +1429,57 @@ async fn delete_asset_with<E: std::fmt::Display>(
     trash: impl Fn(&Path) -> std::result::Result<(), E>,
 ) -> Result<()> {
     let files = item_files(&lib.pool, id).await.map_err(|e| e.to_string())?;
+    let sidecars = if delete_file {
+        let paths: Vec<&str> = files.iter().map(|f| f.file_path.as_str()).collect();
+        edits::prepare(&lib.pool, &lib.root_path, &paths, false)
+            .await
+            .map_err(|e| e.to_string())??
+    } else {
+        vec![None; files.len()]
+    };
     let mut failure = None;
     let mut trashed = 0;
-    for file in &files {
+    let mut changes = Vec::new();
+    let trash_failed = |path: &Path, e: E| {
+        format!(
+            "Could not move {} to the trash, so it was not deleted: {}",
+            path.display(),
+            e
+        )
+    };
+    for (file, sidecar) in files.iter().zip(&sidecars) {
         let path = PathBuf::from(resolve_path(&lib.root_path, &file.file_path));
         if delete_file && path.exists() {
             if let Err(e) = trash(&path) {
-                failure = Some(format!(
-                    "Could not move {} to the trash, so it was not deleted: {}",
-                    path.display(),
-                    e
-                ));
+                failure = Some(trash_failed(&path, e));
                 break;
             }
         }
         trashed += 1;
+        if !delete_file {
+            continue;
+        }
+        changes.push(edits::Change {
+            path: file.file_path.clone(),
+            to: None,
+            sidecar: false,
+        });
+        if let Some(meta) = sidecar {
+            let path = lib.root_path.join(meta);
+            if let Err(e) = trash(&path) {
+                failure = Some(trash_failed(&path, e));
+                break;
+            }
+            changes.push(edits::Change {
+                path: meta.clone(),
+                to: None,
+                sidecar: true,
+            });
+        }
     }
 
     let gone: Vec<&str> = files[..trashed].iter().map(|f| f.id.as_str()).collect();
-    if let Err(e) = delete_rows(&lib.pool, &gone).await {
+    if let Err(e) = delete_rows_recording(&lib.pool, &gone, &changes).await {
         tracing::warn!(
             "Could not delete the rows of {gone:?} from library {}: {e}",
             lib.id
@@ -1476,6 +1512,29 @@ async fn delete_asset_with<E: std::fmt::Display>(
 /// transaction.
 async fn delete_rows(pool: &sqlx::Pool<sqlx::Sqlite>, ids: &[&str]) -> sqlx::Result<()> {
     let mut tx = pool.begin().await?;
+    delete_rows_in(&mut tx, ids).await?;
+    tx.commit().await
+}
+
+/// `delete_rows`, recording `changes` in imported packs (`edits::record`) in the same
+/// transaction. When a run was queued for a pack since the delete's check, its files are gone
+/// all the same: the rows go without the steps, and the run's re-check stops it.
+async fn delete_rows_recording(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    ids: &[&str],
+    changes: &[edits::Change],
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    delete_rows_in(&mut tx, ids).await?;
+    if edits::record(&mut tx, changes).await?.is_err() {
+        tracing::warn!("A run was queued for the pack of {ids:?} during its delete");
+        tx.rollback().await?;
+        return delete_rows(pool, ids).await;
+    }
+    tx.commit().await
+}
+
+async fn delete_rows_in(tx: &mut sqlx::SqliteConnection, ids: &[&str]) -> sqlx::Result<()> {
     for id in ids {
         for sql in [
             "DELETE FROM asset_tags WHERE asset_id = ?",
@@ -1486,7 +1545,7 @@ async fn delete_rows(pool: &sqlx::Pool<sqlx::Sqlite>, ids: &[&str]) -> sqlx::Res
             sqlx::query(sql).bind(id).execute(&mut *tx).await?;
         }
     }
-    tx.commit().await
+    Ok(())
 }
 
 #[tauri::command]
@@ -1517,7 +1576,7 @@ pub struct DeleteAssetsError {
 /// Deletes each asset with its group and bundled preview (`delete_asset_with`), carrying on past
 /// failures, and reports them. Before it returns, it reruns the structure pass once for each
 /// library that held one of them, failed or not, since a group can lose some of its files.
-async fn delete_assets_with<E: std::fmt::Display>(
+pub(crate) async fn delete_assets_with<E: std::fmt::Display>(
     db: &Database,
     ids: &[String],
     delete_file: bool,
@@ -1573,9 +1632,9 @@ pub async fn rename_asset(
     get_asset(id, state).await
 }
 
-/// One file's rename: its row, where it is and where it goes.
+/// One file's rename: its row (none for a `.meta`), where it is and where it goes.
 struct Move<'a> {
-    file: &'a ItemFile,
+    id: Option<&'a str>,
     from: PathBuf,
     to: PathBuf,
     name: String,
@@ -1587,9 +1646,12 @@ struct Move<'a> {
 /// added when the name has none, so a typed extension changes its format. A group's members take
 /// `new_name` as their stem, less the main item's extension if it ends with it, and each keeps
 /// its own extension (plan C21). Either way the bundled preview takes the new stem and keeps its
-/// extension. Nothing moves when a new name is taken, and a failed rename or row write
-/// puts the files already renamed back.
-async fn rename_asset_with(
+/// extension. Inside an imported pack, each file's `.meta` is renamed right after it, and the
+/// renames are recorded as the pack's steps (`edits::record`) in the transaction that moves the
+/// rows. Nothing moves when a new name is taken, the pack's `datapackage.json` is among the
+/// files, or a run is building the pack, and a failed rename or row write puts the files already
+/// renamed back.
+pub(crate) async fn rename_asset_with(
     db: &Database,
     id: &str,
     new_name: &str,
@@ -1650,20 +1712,33 @@ async fn rename_asset_with(
         }
         files.iter().map(|f| with_stem(f, stem)).collect()
     };
-    let moves: Vec<Move> = files
-        .iter()
-        .zip(names)
-        .map(|(file, (name, extension))| {
-            let from = PathBuf::from(resolve_path(&lib.root_path, &file.file_path));
+    let paths: Vec<&str> = files.iter().map(|f| f.file_path.as_str()).collect();
+    let sidecars = edits::prepare(&lib.pool, &lib.root_path, &paths, true)
+        .await
+        .map_err(|e| e.to_string())??;
+    let mut moves: Vec<Move> = Vec::new();
+    for ((file, (name, extension)), sidecar) in files.iter().zip(names).zip(&sidecars) {
+        let from = PathBuf::from(resolve_path(&lib.root_path, &file.file_path));
+        let to = from.with_file_name(&name);
+        let meta = sidecar.as_ref().map(|meta| {
+            let name = format!("{name}.meta");
             Move {
-                file,
-                to: from.with_file_name(&name),
-                from,
+                id: None,
+                from: lib.root_path.join(meta),
+                to: to.with_file_name(&name),
                 name,
-                extension,
+                extension: "meta".into(),
             }
-        })
-        .collect();
+        });
+        moves.push(Move {
+            id: Some(&file.id),
+            from,
+            to,
+            name,
+            extension,
+        });
+        moves.extend(meta);
+    }
 
     // Refuse before anything moves if a new name is taken, or two files would take one name
     let mut targets = HashSet::new();
@@ -1715,18 +1790,23 @@ async fn rename_asset_with(
     let now = chrono::Utc::now().timestamp_millis();
     let rows: Vec<(&str, String, &str, &str)> = moves
         .iter()
-        .map(|m| {
+        .filter_map(|m| {
             let path = make_relative_path(&lib.root_path, &m.to);
-            (
-                m.name.as_str(),
-                path,
-                m.extension.as_str(),
-                m.file.id.as_str(),
-            )
+            Some((m.name.as_str(), path, m.extension.as_str(), m.id?))
         })
         .collect();
-    let write = |pool: sqlx::Pool<sqlx::Sqlite>| {
-        let rows = &rows;
+    let changes: Vec<edits::Change> = moves
+        .iter()
+        .map(|m| edits::Change {
+            path: make_relative_path(&lib.root_path, &m.from),
+            to: Some(make_relative_path(&lib.root_path, &m.to)),
+            sidecar: m.id.is_none(),
+        })
+        .collect();
+    // Only the library's own DB records the import's steps (`record`), and refuses them while a
+    // run is building the pack.
+    let write = |pool: sqlx::Pool<sqlx::Sqlite>, record: bool| {
+        let (rows, changes) = (&rows, &changes);
         async move {
             let mut tx = pool.begin().await?;
             for (name, path, ext, id) in rows {
@@ -1741,10 +1821,17 @@ async fn rename_asset_with(
                 .execute(&mut *tx)
                 .await?;
             }
-            tx.commit().await
+            if record && edits::record(&mut tx, changes).await?.is_err() {
+                return Ok(Err(engine::BUSY.to_string()));
+            }
+            tx.commit().await.map(Ok)
         }
     };
-    if let Err(e) = write(lib.pool.clone()).await {
+    let written = match write(lib.pool.clone(), true).await {
+        Ok(refused) => refused,
+        Err(e) => Err(e.to_string()),
+    };
+    if let Err(e) = written {
         return Err(match undo_renames(&done, &rename) {
             Ok(()) => format!("Could not record the rename, so it was undone: {e}"),
             Err(left) => {
@@ -1752,7 +1839,7 @@ async fn rename_asset_with(
             }
         });
     }
-    let _ = write(db.master_pool.clone()).await;
+    let _ = write(db.master_pool.clone(), false).await;
 
     structure::rebuild_library(db, &lib).await;
     Ok(())
