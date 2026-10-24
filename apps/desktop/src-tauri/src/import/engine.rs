@@ -214,10 +214,7 @@ impl Engine {
         .await?;
         let now = now_ms();
         for (id, machine, boot, pid, started, heartbeat) in running {
-            let gone = self
-                .local_owner_gone(&machine, &boot, pid, started)
-                .unwrap_or_else(|| now - heartbeat.unwrap_or(0) >= DEAD_AFTER.as_millis() as i64);
-            if !gone {
+            if !owner_gone(&self.owner, &machine, &boot, pid, started, heartbeat, now) {
                 continue;
             }
             sqlx::query(
@@ -263,7 +260,8 @@ impl Engine {
                     && boot == self.owner.boot
                     && pid as u32 == self.owner.pid
                     && started as u64 == self.owner.started;
-                let orphan = self.local_owner_gone(&machine, &boot, pid, started) == Some(true);
+                let orphan =
+                    local_owner_gone(&self.owner, &machine, &boot, pid, started) == Some(true);
                 if mine || orphan {
                     let packs = serde_json::from_str(&packs).unwrap_or_default();
                     return Some((library, Queued { id, kind, packs }));
@@ -271,22 +269,6 @@ impl Engine {
             }
         }
         None
-    }
-
-    /// Whether a run's owner on this machine is gone: one of an earlier boot always is, one of
-    /// this boot while no process has its pid and start time. `None` for another machine's run,
-    /// or when this machine's id is unknown, which only its heartbeat can tell.
-    fn local_owner_gone(
-        &self,
-        machine: &Option<String>,
-        boot: &Option<String>,
-        pid: i64,
-        started: i64,
-    ) -> Option<bool> {
-        if self.owner.machine.is_none() || *machine != self.owner.machine {
-            return None;
-        }
-        Some(*boot != self.owner.boot || !crate::watcher::process_alive(pid as u32, started as u64))
     }
 
     async fn execute(&self, library: &LibraryHandle, run: Queued) {
@@ -808,7 +790,38 @@ async fn beat(pool: Pool<Sqlite>, run_id: String, latest: Arc<Mutex<Option<Progr
     }
 }
 
-fn now_ms() -> i64 {
+/// Whether a run's owner is gone, judged from process `me`: on this machine by its process
+/// (`local_owner_gone`), else by its heartbeat, which is gone once it is 10 minutes old at `now`.
+pub(crate) fn owner_gone(
+    me: &Owner,
+    machine: &Option<String>,
+    boot: &Option<String>,
+    pid: i64,
+    started: i64,
+    heartbeat: Option<i64>,
+    now: i64,
+) -> bool {
+    local_owner_gone(me, machine, boot, pid, started)
+        .unwrap_or_else(|| now - heartbeat.unwrap_or(0) >= DEAD_AFTER.as_millis() as i64)
+}
+
+/// Whether a run's owner on `me`'s machine is gone: one of an earlier boot always is, one of
+/// this boot while no process has its pid and start time. `None` for another machine's run,
+/// or when this machine's id is unknown, which only its heartbeat can tell.
+fn local_owner_gone(
+    me: &Owner,
+    machine: &Option<String>,
+    boot: &Option<String>,
+    pid: i64,
+    started: i64,
+) -> Option<bool> {
+    if me.machine.is_none() || *machine != me.machine {
+        return None;
+    }
+    Some(*boot != me.boot || !crate::watcher::process_alive(pid as u32, started as u64))
+}
+
+pub(crate) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
@@ -917,6 +930,10 @@ mod rebuild_tests;
 #[cfg(test)]
 #[path = "metadata_tests.rs"]
 mod metadata_tests;
+
+#[cfg(test)]
+#[path = "recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1112,6 +1129,12 @@ mod tests {
 
     /// `setup`, with the engine started only when `start` is set.
     pub(super) async fn setup_with(start: bool) -> Setup {
+        setup_in(start, false).await
+    }
+
+    /// `setup_with`, the library DB in its `.opendam/library.sqlite` when `on_disk` is set, so
+    /// a test can open it again as a restart, a reconnect or another machine does.
+    pub(super) async fn setup_in(start: bool, on_disk: bool) -> Setup {
         let dir = tempfile::Builder::new()
             .prefix("opendam-lib-")
             .tempdir()
@@ -1123,12 +1146,24 @@ mod tests {
             id: "lib".into(),
             name: "lib".into(),
             root_path: dir.path().to_path_buf(),
-            pool: memory_library_pool().await,
+            pool: if on_disk {
+                let file = dir.path().join(".opendam/library.sqlite");
+                crate::db::connect_library_sqlite(&file).await.unwrap()
+            } else {
+                memory_library_pool().await
+            },
         };
         let db = Arc::new(memory_database(vec![lib.clone()]).await);
         crate::watcher::index_paths(&db, "lib", &[dir.path().to_string_lossy().into_owned()])
             .await
             .unwrap();
+        if on_disk {
+            // Its pool enforces foreign keys: the id below changes only once no job names it.
+            sqlx::query("DELETE FROM preview_jobs")
+                .execute(&lib.pool)
+                .await
+                .unwrap();
+        }
         for sql in [
             "UPDATE assets SET id = 'tree' WHERE file_path = 'Other/Tree.png'",
             "INSERT INTO tags (id, name) VALUES ('t1', 'keep')",
