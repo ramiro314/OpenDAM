@@ -31,8 +31,7 @@ use serde_json::json;
 use super::place::{place_listed, PlaceStep};
 use super::records::StepRecord;
 use super::unitypackage::{
-    below, clean, list_unitypackage, list_variant, ExtractedFile, Extraction, SkipReason,
-    SkippedEntry,
+    below, list_unitypackage, list_variant, ExtractedFile, Extraction, SkippedEntry,
 };
 use super::zipfile::list_zip;
 
@@ -213,22 +212,6 @@ fn below_folder(extraction: &Extraction, folder: &str) -> Extraction {
     }
 }
 
-/// The files of a zip listing below `folder`, relative to it, and the entries `list_zip` with
-/// that sub-folder would skip: those whose names are unsafe, and the others below it.
-fn zip_folder(zip: &Extraction, folder: &str) -> Extraction {
-    let mut out = below_folder(zip, folder);
-    out.skipped.retain(|s| {
-        let unsafe_name = matches!(
-            s.reason,
-            SkipReason::Absolute | SkipReason::Escapes | SkipReason::NoName
-        );
-        unsafe_name
-            || clean(&s.source_path[0])
-                .is_ok_and(|p| below(&p.join("/"), folder).is_some_and(|r| !r.is_empty()))
-    });
-    out
-}
-
 /// The render pipeline a package's or folder's name names, read by its words:
 /// `URP`/`Universal`, `Built-In`/`BiRP`/`Standard`, `HDRP`.
 pub fn pipeline(name: &str) -> Option<&'static str> {
@@ -351,7 +334,7 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
     if let Some(fab) = fab(original, &zip, &name, publisher) {
         offers.push(fab);
     }
-    if let Some(kenney) = kenney(&zip, &name) {
+    if let Some(kenney) = kenney(original, &zip, &name) {
         offers.push(kenney);
     }
     let place = [PlaceStep::Flatten];
@@ -471,8 +454,9 @@ const UNTICKED: [&str; 2] = ["archive", "early access"];
 
 /// A zip whose folders hold `License*.txt` files: one pack per folder directly holding one, the
 /// outermost where they nest, at its path below a top folder every file shares (so
-/// `<Category>/<Pack>` in the Kenney All-in-1).
-fn kenney(zip: &Extraction, name: &str) -> Option<Offer> {
+/// `<Category>/<Pack>` in the Kenney All-in-1). `zip` is the whole zip `original`'s listing, and
+/// each pack's preview lists its folder as its build's `extract_zip` would.
+fn kenney(original: &Path, zip: &Extraction, name: &str) -> Option<Offer> {
     let mut packs: Vec<&str> = zip
         .files
         .iter()
@@ -527,11 +511,11 @@ fn kenney(zip: &Extraction, name: &str) -> Option<Offer> {
                 .any(|c| UNTICKED.contains(&c.to_ascii_lowercase().as_str()));
             let subpath = (!folder.is_empty()).then_some(folder);
             let files = match subpath {
-                Some(folder) => zip_folder(zip, folder),
-                None => Extraction {
+                Some(folder) => list_zip(original, Some(folder)),
+                None => Ok(Extraction {
                     files: zip.files.clone(),
                     skipped: zip.skipped.clone(),
-                },
+                }),
             };
             Candidate {
                 name: pack.to_string(),
@@ -549,7 +533,7 @@ fn kenney(zip: &Extraction, name: &str) -> Option<Offer> {
                                 "lookup_store_page": true }),
                     ),
                 ],
-                tree: Some(preview(Ok(files), &[], false)),
+                tree: Some(preview(files, &[], false)),
             }
         })
         .collect();
@@ -935,6 +919,8 @@ mod tests {
                 .collect(),
             skipped: Vec::new(),
         };
+        // Only the targets are checked here: the previews list no real zip.
+        let none = Path::new("/no/such.zip");
         let targets = |offer: Offer| -> Vec<(String, Option<String>, bool)> {
             offer
                 .candidates
@@ -953,7 +939,7 @@ mod tests {
             "Top/Other/a.png",
         ]);
         assert_eq!(
-            targets(kenney(&nested, "bundle").unwrap()),
+            targets(kenney(none, &nested, "bundle").unwrap()),
             [
                 (
                     "Early Access/New".into(),
@@ -965,15 +951,20 @@ mod tests {
         );
         let single = zip(&["car-kit/License.txt", "car-kit/Models/car.glb"]);
         assert_eq!(
-            targets(kenney(&single, "kenney_car-kit").unwrap()),
+            targets(kenney(none, &single, "kenney_car-kit").unwrap()),
             [("car-kit".into(), Some("car-kit".into()), true)]
         );
         let flat = zip(&["License.txt", "car.glb"]);
         assert_eq!(
-            targets(kenney(&flat, "kenney_car-kit").unwrap()),
+            targets(kenney(none, &flat, "kenney_car-kit").unwrap()),
             [("kenney_car-kit".into(), None, true)]
         );
-        assert!(kenney(&zip(&["Pack/Readme.txt", "Pack/LicenseNotes.md"]), "x").is_none());
+        assert!(kenney(
+            none,
+            &zip(&["Pack/Readme.txt", "Pack/LicenseNotes.md"]),
+            "x"
+        )
+        .is_none());
     }
 
     #[test]
@@ -1081,11 +1072,6 @@ mod tests {
             let listed = list_zip(&fixture(name), subpath).unwrap();
             assert_eq!(listed.files, written.files, "{name} {subpath:?}");
             assert_eq!(listed.skipped, written.skipped, "{name} {subpath:?}");
-            if let Some(subpath) = subpath {
-                let folder = zip_folder(&list_zip(&fixture(name), None).unwrap(), subpath);
-                assert_eq!(folder.files, written.files, "{name} {subpath:?}");
-                assert_eq!(folder.skipped, written.skipped, "{name} {subpath:?}");
-            }
         }
         // Errors match too: no file under the sub-folder.
         let err = list_zip(&fixture("kenney.zip"), Some("Nope")).unwrap_err();
