@@ -31,7 +31,7 @@ use crate::export::hashes::sha256_bytes;
 
 /// The script's version, which every GLB's cache key holds. The script declares it as
 /// `VERSION`, which a test keeps equal: bump both when the GLBs it writes change.
-pub const UNITY_GLB_VERSION: &str = "opendam-unity-glb/3";
+pub const UNITY_GLB_VERSION: &str = "opendam-unity-glb/4";
 
 /// The conversion script, embedded so the installed app needs no file beside it.
 const SCRIPT: &str = include_str!("unity_glb.py");

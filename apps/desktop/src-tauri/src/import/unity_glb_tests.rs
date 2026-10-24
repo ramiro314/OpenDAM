@@ -491,6 +491,137 @@ mod tests {
         s.no_work_left();
     }
 
+    /// `Barrel.fbx`, a plane whose material `Wood` names `planks.png` by a relative path, not
+    /// embedded, made by `blender` from the RGBA PNG `planks`.
+    async fn barrel_fbx(blender: &Path, planks: &[u8]) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("planks.png"), planks).unwrap();
+        let fbx = dir.path().join("Barrel.fbx");
+        let script = format!(
+            r#"
+import bpy
+bpy.ops.object.select_all(action="SELECT")
+bpy.ops.object.delete()
+bpy.ops.mesh.primitive_plane_add()
+obj = bpy.context.active_object
+obj.name = "Barrel"
+mat = bpy.data.materials.new("Wood")
+mat.use_nodes = True
+tex = mat.node_tree.nodes.new("ShaderNodeTexImage")
+tex.image = bpy.data.images.load({png:?})
+bsdf = next(n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
+mat.node_tree.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+obj.data.materials.append(mat)
+bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=False)
+"#,
+            png = dir.path().join("planks.png").to_str().unwrap(),
+            fbx = fbx.to_str().unwrap(),
+        );
+        let made = tokio::process::Command::new(blender)
+            .args([
+                "-b",
+                "--factory-startup",
+                "--python-exit-code",
+                "1",
+                "--python-expr",
+            ])
+            .arg(script)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        // The folder it was made in, with its texture, goes away before the import.
+        std::fs::read(fbx).unwrap()
+    }
+
+    /// A material's alpha mode, and its base color texture's format and first pixel.
+    type Look = (Option<String>, Option<String>, Option<[u8; 3]>);
+
+    /// What the GLB's materials look like.
+    fn looks(path: &Path) -> Vec<Look> {
+        let (json, _) = glb(path);
+        let colors = base_colors(path);
+        let mut colors = colors.into_iter();
+        json["materials"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|m| {
+                let texture = m["pbrMetallicRoughness"]["baseColorTexture"]["index"].as_u64();
+                let mime = texture.map(|t| {
+                    let source = json["textures"][t as usize]["source"].as_u64().unwrap();
+                    json["images"][source as usize]["mimeType"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                });
+                (
+                    m["alphaMode"].as_str().map(str::to_string),
+                    mime,
+                    texture.and_then(|_| colors.next()),
+                )
+            })
+            .collect()
+    }
+
+    /// An FBX's texture is found by its name in the pack, never by its path from the FBX, so a
+    /// hoist that puts the texture beside the FBX reuses the cached GLB, and that GLB is what a
+    /// fresh conversion in the new layout makes, alpha included.
+    #[tokio::test]
+    async fn an_fbx_s_texture_is_found_by_name_whatever_the_layout() {
+        let s = setup().await;
+        let Some(log) = s.logged_blender().await else {
+            return;
+        };
+        let red = [200, 40, 40];
+        let rgba = {
+            let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([200, 40, 40, 128]));
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+            bytes.into_inner()
+        };
+        let fbx = barrel_fbx(&test_blender().unwrap(), &rgba).await;
+        let originals = tempfile::tempdir().unwrap();
+        // No .mat, prefab or name rule matches "Wood" or "Barrel": the importer's material stays.
+        let zip = zip_of(
+            originals.path(),
+            "barrel.zip",
+            &[("Barrel.fbx", &fbx), ("Textures/planks.png", &rgba)],
+        );
+        let pack_id = s.import_zip_converted(&zip).await;
+        assert_eq!(runs(&log), 1);
+        let cached = looks(&s.live().join("Barrel.glb"));
+        assert!(
+            cached.len() == 1 && cached[0].2.is_some_and(|c| near(c, red)),
+            "{cached:?}"
+        );
+        let bytes = sha(&s.live().join("Barrel.glb"));
+
+        // Hoisting Textures puts planks.png beside Barrel.fbx: still the same GLB.
+        s.edit(&pack_id, |steps| insert(steps, hoist("Textures")))
+            .await;
+        s.rebuilt(&pack_id).await;
+        assert!(s.live().join("planks.png").is_file());
+        assert_eq!(runs(&log), 1, "a hoist reuses the cache");
+        assert_eq!(sha(&s.live().join("Barrel.glb")), bytes);
+
+        // And converting afresh in that layout makes a GLB that looks the same.
+        s.edit(&pack_id, |steps| {
+            let convert = steps.iter_mut().find(|s| s.kind == "unity_glb").unwrap();
+            convert.options = json!({ "force": true });
+        })
+        .await;
+        s.rebuilt(&pack_id).await;
+        assert_eq!(runs(&log), 2);
+        assert_eq!(looks(&s.live().join("Barrel.glb")), cached);
+        s.no_work_left();
+    }
+
     /// An ASCII FBX, which Blender can't import, converts through a binary copy `assimp` makes.
     /// Skips without `assimp` on `PATH`, as in CI.
     #[tokio::test]

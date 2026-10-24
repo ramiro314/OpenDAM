@@ -38,7 +38,7 @@ and the order of their paths, which OpenDAM's cache key covers:
   which models get one (one per stem, none where the pack ships the GLB) and caches them.
 - Every lookup that keeps the first of several files reads them sorted by path, lowercased,
   the GUID index included, where the script kept whichever `.meta` `rglob` found last.
-- Its JPEG copies and `assimp` conversions go to the job's scratch folder, named by a counter,
+- Its JPEG copies and the models' import copies go to the job's scratch folder, named by a counter,
   not to `~/.cache/unity-gltf` by Python's per-process `hash()`.
 - A texture the FBX or OBJ importer loaded for a material the script leaves as imported is found
   again by its file name in the pack, as the script's own name fallback finds textures, and
@@ -46,14 +46,17 @@ and the order of their paths, which OpenDAM's cache key covers:
   the model (an FBX's `RelativeFilename`, its folder's subtree, an `.mtl`'s `map_Kd`), so where it
   sat relative to the model would decide the GLB, which a hoist changes. Textures embedded in the
   FBX are kept as they are.
-- For the same reason an OBJ's material libraries are found by file name too: Blender imports a
-  copy of the OBJ, under its own name, whose `mtllib` lines name the pack's first `.mtl` of each
-  name, and drop one the pack has no file of that name for.
+- For the same reason no importer reads the pack by path. Blender imports each model from a copy,
+  under its own name, in a scratch folder of its own: an FBX finds no texture file (so it wires
+  no alpha of its own; the rebind then binds the pack's file of that name), and an OBJ's copy
+  has `mtllib` lines naming copies of the pack's first `.mtl` of each name, dropping one the
+  pack has no file of that name for.
 """
 
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import traceback
@@ -63,7 +66,7 @@ import bpy
 
 # OpenDAM records it with each GLB and keys its cache by it: `import::unity_glb::UNITY_GLB_VERSION`,
 # which a test keeps equal. Bump both when the GLBs this writes change.
-VERSION = "opendam-unity-glb/3"
+VERSION = "opendam-unity-glb/4"
 
 MODEL_EXTENSIONS = {".fbx", ".obj"}
 # Property names are matched lowercased, without underscores: `_Base_Map` is `basemap`.
@@ -208,7 +211,7 @@ IMAGES: dict[tuple[Path, bool], bpy.types.Image] = {}
 
 
 class Scratch:
-    """The job's scratch folder, for JPEG copies and `assimp` conversions."""
+    """The job's scratch folder, for JPEG copies and the models' import copies."""
 
     def __init__(self, folder: Path):
         self.folder = folder
@@ -290,17 +293,23 @@ def build_material(um: UnityMaterial, max_size: int, scratch: Scratch) -> bpy.ty
     return mat
 
 
-def binary_fbx(model: Path, assimp: str, scratch: Scratch) -> Path:
-    """The model itself, or for an FBX Blender can't read (ASCII, or binary older than 7.1) a
-    binary copy made with the `assimp` command line tool, in the scratch folder."""
+def fbx_for_import(model: Path, assimp: str, scratch: Scratch) -> Path:
+    """A copy of the FBX at `model`, under its own name, in a folder of its own, so the importer
+    finds no pack file by path; for an FBX Blender can't read (ASCII, or binary older than 7.1)
+    a binary copy made with the `assimp` command line tool."""
+    folder = scratch.path("-fbx")
+    folder.mkdir(parents=True)
+    out = folder / model.name
     with model.open("rb") as f:
         head = f.read(32)
-    if head.startswith(b"Kaydara FBX Binary"):
-        if int.from_bytes(head[23:27], "little") >= 7100:
-            return model
-    elif not head.lstrip().startswith(b";"):
-        return model
-    out = scratch.path(".fbx")
+    readable = (
+        int.from_bytes(head[23:27], "little") >= 7100
+        if head.startswith(b"Kaydara FBX Binary")
+        else not head.lstrip().startswith(b";")
+    )
+    if readable:
+        shutil.copyfile(model, out)
+        return out
     try:
         subprocess.run([assimp, "export", str(model), str(out), "-f", "fbx"],
                        check=True, capture_output=True)
@@ -377,7 +386,7 @@ def convert(model: Path, target: Path, guids, by_mesh, by_name, images, mtls, ma
     clear_scene()
     if model.suffix.lower() == ".fbx":
         bpy.ops.import_scene.fbx(
-            filepath=str(binary_fbx(model, assimp, scratch)), use_image_search=False
+            filepath=str(fbx_for_import(model, assimp, scratch)), use_image_search=False
         )
     else:
         bpy.ops.wm.obj_import(filepath=str(obj_for_import(model, mtls, scratch)))
