@@ -292,7 +292,10 @@ export function ImportDialog() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') closeDialog();
+      // Taken here, so the Imports view under the dialog stays open
+      if (e.key !== 'Escape' || !useImportStore.getState().dialog) return;
+      e.preventDefault();
+      closeDialog();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
@@ -320,7 +323,12 @@ export function ImportDialog() {
               Import {originalName(state.originalPath)}
             </h3>
           </div>
-          <button className={dialog.closeBtn} onClick={closeDialog} title="Close">
+          <button
+            className={dialog.closeBtn}
+            onClick={closeDialog}
+            disabled={submitting}
+            title="Close"
+          >
             <IconX size={14} />
           </button>
         </div>
@@ -426,7 +434,11 @@ export function ImportDialog() {
           <span className={styles.footerNote} data-import-problem>
             {draft && !submitting ? problem : null}
           </span>
-          <button className={clsx(dialog.btn, dialog.secondaryBtn)} onClick={closeDialog}>
+          <button
+            className={clsx(dialog.btn, dialog.secondaryBtn)}
+            onClick={closeDialog}
+            disabled={submitting}
+          >
             Close
           </button>
           <button

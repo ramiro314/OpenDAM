@@ -176,6 +176,17 @@ export function skippedText(entry: SkippedEntry): string {
   return `${entry.sourcePath.join(' > ')}: ${SKIP_REASONS[entry.reason] ?? entry.reason}`;
 }
 
+/**
+ * Whether Escape closes the Imports view: not while the Import pack dialog is open over it, nor
+ * when the dialog already took the key (`preventDefault`), whichever listener runs first.
+ */
+export function escapeClosesPanel(
+  e: Pick<KeyboardEvent, 'key' | 'defaultPrevented'>,
+  dialogOpen: boolean
+): boolean {
+  return e.key === 'Escape' && !e.defaultPrevented && !dialogOpen;
+}
+
 // ── The Import pack dialog's draft ────────────────────────────────────────
 
 /** A candidate pack as the dialog edits it */
@@ -441,6 +452,7 @@ interface ImportStore {
   setPanelOpen: (open: boolean) => void;
   /** Opens the dialog over `originalPath` and scans it for `libraryId` */
   openDialog: (originalPath: string, libraryId: string) => Promise<void>;
+  /** Closes the dialog, unless Import is submitting its packs */
   closeDialog: () => void;
   /** Scans the dialog's original again for another library */
   setLibrary: (libraryId: string) => Promise<void>;
@@ -544,7 +556,11 @@ export const useImportStore = create<ImportStore>()((set, get) => {
 
     openDialog: (originalPath, libraryId) => scan(originalPath, libraryId),
 
-    closeDialog: () => set({ dialog: null, draft: null, scanning: false, scanError: null }),
+    // Not while Import runs: each pack's refusal is shown on its candidate, which must stay open
+    closeDialog: () => {
+      if (get().submitting) return;
+      set({ dialog: null, draft: null, scanning: false, scanError: null });
+    },
 
     setLibrary: async (libraryId) => {
       const dialog = get().dialog;

@@ -5,6 +5,7 @@ import { useLibraryStore, useUIStore } from '../../store';
 import {
   FINISHING,
   cancelState,
+  escapeClosesPanel,
   importRows,
   isLive,
   packStatus,
@@ -135,7 +136,7 @@ export function ImportsPanel() {
   useEffect(() => {
     void useImportStore.getState().fetch(useLibraryStore.getState().libraries.map((l) => l.id));
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !useImportStore.getState().dialog) setPanelOpen(false);
+      if (escapeClosesPanel(e, useImportStore.getState().dialog !== null)) setPanelOpen(false);
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);

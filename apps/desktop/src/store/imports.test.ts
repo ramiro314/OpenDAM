@@ -17,6 +17,7 @@ import {
   draftProblem,
   editPublisher,
   editTarget,
+  escapeClosesPanel,
   importRequest,
   importRows,
   mergeRun,
@@ -340,6 +341,18 @@ describe('Cancel', () => {
   });
 });
 
+describe('Escape', () => {
+  test('closes the Imports view only when the dialog is neither open nor took the key', () => {
+    const key = (k: string, defaultPrevented = false) => ({ key: k, defaultPrevented });
+    expect(escapeClosesPanel(key('Escape'), false)).toBe(true);
+    // The panel's listener runs first: the dialog is still open
+    expect(escapeClosesPanel(key('Escape'), true)).toBe(false);
+    // The dialog's listener ran first and closed it, taking the key
+    expect(escapeClosesPanel(key('Escape', true), false)).toBe(false);
+    expect(escapeClosesPanel(key('Enter'), false)).toBe(false);
+  });
+});
+
 describe('the draft', () => {
   test("starts from the scan's first offer, its URP variant ticked and its place steps read", () => {
     const draft = draftFromScan('lib', fabScan);
@@ -481,6 +494,12 @@ describe('the draft', () => {
   });
 });
 
+/** Waits, a microtask at a time, until `done` holds */
+async function waitUntil(done: () => boolean) {
+  for (let i = 0; i < 100 && !done(); i++) await new Promise((r) => setTimeout(r, 0));
+  expect(done()).toBe(true);
+}
+
 describe('the dialog', () => {
   /** Opens the dialog over `scan`, answered by the stand-in API */
   async function open(scan: ImportScan) {
@@ -581,6 +600,34 @@ describe('the dialog', () => {
       "The build would fail: The original /dl/Forest.zip can't be read: gone"
     );
     expect(draftProblem(draft)).toContain('The build would fail');
+  });
+
+  test("the dialog stays open while Import submits, so a later pack's refusal shows", async () => {
+    await open(kenneyScan);
+    const store = useImportStore.getState();
+    store.edit((d) => patchCandidate(d, 1, { ticked: true }));
+    let refuse: () => void = () => {};
+    api.startImport = (request) =>
+      request.target === 'Archive/Old Kit'
+        ? new Promise((_, reject) => {
+            refuse = () => reject('Archive/Old Kit would nest with the pack imported to Archive');
+          })
+        : Promise.resolve(run('r1', ['p1'], { status: 'queued', createdAt: 1 }));
+    const submitted = store.submit();
+    await waitUntil(() => useImportStore.getState().draft!.candidates[0].imported);
+    // Escape, Close and the overlay all close through closeDialog
+    useImportStore.getState().closeDialog();
+    expect(useImportStore.getState().dialog).not.toBeNull();
+    refuse();
+    expect(await submitted).toBe(false);
+    const s = useImportStore.getState();
+    expect(s.dialog).not.toBeNull();
+    expect(s.draft!.candidates[1].error).toBe(
+      'Archive/Old Kit would nest with the pack imported to Archive'
+    );
+    // Once Import is done, it closes
+    s.closeDialog();
+    expect(useImportStore.getState().dialog).toBeNull();
   });
 
   test('a step edit previews the tree of the new steps', async () => {
