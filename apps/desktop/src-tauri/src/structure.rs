@@ -333,6 +333,24 @@ pub async fn read_overrides(pool: &Pool<Sqlite>) -> sqlx::Result<Overrides> {
     Ok(rows.into_iter().map(|r| (r.path, r.edit)).collect())
 }
 
+/// The `.mat` files of the imported packs that Unity owns, by path relative to the library
+/// root: each `.mat` whose `.mat.meta` is in its pack's committed build (plan pack-import,
+/// Unity-only files).
+pub type UnityMaterials = HashSet<String>;
+
+/// The `UnityMaterials` of the library DB at `pool`, from the manifest rows of each pack's
+/// `current_build` and of no other build, so a failed or rolled back build hides nothing.
+pub async fn read_unity_materials(pool: &Pool<Sqlite>) -> sqlx::Result<UnityMaterials> {
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT substr(o.path, 1, length(o.path) - length('.meta')) FROM import_outputs o
+         JOIN import_packs p ON p.id = o.pack_id AND o.build_id = p.current_build
+         WHERE o.path LIKE '%.mat.meta'",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(paths.into_iter().collect())
+}
+
 /// Why a file is a pack's support file, hidden from the grid unless "Show hidden files" is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupportRole {
@@ -342,6 +360,9 @@ pub enum SupportRole {
     Cover,
     /// A model's render, its group's bundled preview (`model_previews`)
     ModelPreview,
+    /// A Unity material of an imported pack (`UnityMaterials`), kept for Unity and the GLB
+    /// conversion
+    Unity,
 }
 
 impl SupportRole {
@@ -350,6 +371,7 @@ impl SupportRole {
             SupportRole::Doc => "doc",
             SupportRole::Cover => "cover",
             SupportRole::ModelPreview => "model_preview",
+            SupportRole::Unity => "unity",
         }
     }
 }
@@ -470,7 +492,8 @@ impl FileKind {
 ///    folder directly holding a `datapackage.json` is one too, as if you had marked it, unless
 ///    you said it is "Not a pack" (plan pack-metadata-files C2).
 /// 3. **Support roles** (C10): in a pack's own folder, or in a marked folder inside a pack, docs
-///    are `Doc` and `Preview*`/`Sample*` images are `Cover`.
+///    are `Doc` and `Preview*`/`Sample*` images are `Cover`. A `.mat` in `unity`, an imported
+///    pack's Unity material, is `Unity` wherever it is.
 /// 4. **Format groups** (C11, `format_groups`): one model shipped in several formats, and the
 ///    copies of a file under format folders, form one grid item led by its main item.
 /// 5. **Bundled previews** (C12, `model_previews`): a render of a model is a `ModelPreview`
@@ -493,6 +516,7 @@ impl FileKind {
 pub fn derive<'a>(
     files: impl IntoIterator<Item = (&'a str, i64)>,
     overrides: &Overrides,
+    unity: &UnityMaterials,
     mut read_license: impl FnMut(&str) -> LicenseText,
     mut read_package: impl FnMut(&str) -> PackageMeta,
     mut render_size: impl FnMut(&str) -> Option<(u32, u32)>,
@@ -568,6 +592,9 @@ pub fn derive<'a>(
         .iter()
         .zip(&kinds)
         .map(|(path, kind)| {
+            if kind.ext == "mat" && unity.contains(*path) {
+                return Some(SupportRole::Unity);
+            }
             let (dir, _) = split_dir(path);
             (packs.contains(dir) || (marked.contains(dir) && in_pack(&packs, dir)))
                 .then(|| kind.support_role())
@@ -2160,6 +2187,7 @@ async fn derive_and_apply(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<Pass
     .await?;
     let (known, known_packages) = known_files(pool).await?;
     let overrides = read_overrides(pool).await?;
+    let unity = read_unity_materials(pool).await?;
     let by_path: HashMap<&str, &FileRow> =
         files.iter().map(|f| (f.file_path.as_str(), f)).collect();
     let inputs = || files.iter().map(|f| (f.file_path.as_str(), f.size_bytes));
@@ -2171,6 +2199,7 @@ async fn derive_and_apply(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<Pass
     let mut structure = derive(
         inputs(),
         &overrides,
+        &unity,
         |path| {
             known_text(by_path[path], &known).unwrap_or_else(|| {
                 changed.push(path.to_string());
@@ -2222,6 +2251,7 @@ async fn derive_and_apply(pool: &Pool<Sqlite>, root: &Path) -> sqlx::Result<Pass
         structure = derive(
             inputs(),
             &overrides,
+            &unity,
             |path| match read.get(path) {
                 None => known_text(by_path[path], &known).unwrap_or_default(),
                 Some(Ok(text)) => text.clone(),
@@ -2501,6 +2531,7 @@ pub(crate) mod tests {
         super::derive(
             paths.into_iter().map(|p| (p, 1)),
             overrides,
+            &UnityMaterials::new(),
             |_| LicenseText::default(),
             |_| PackageMeta::default(),
             |_| None,
@@ -3132,6 +3163,7 @@ pub(crate) mod tests {
             let structure = super::derive(
                 KENNEY_3D_KIT.map(|p| (p, 1)),
                 &overrides,
+                &UnityMaterials::new(),
                 |_| kenney("Car Kit Deluxe", LicenseKind::Cc0),
                 |_| PackageMeta::default(),
                 |_| None,
@@ -3534,6 +3566,7 @@ pub(crate) mod tests {
         super::derive(
             paths.iter().map(|p| (*p, 1)),
             &Overrides::new(),
+            &UnityMaterials::new(),
             |_| LicenseText::default(),
             |_| PackageMeta::default(),
             |path| sizes.get(path).copied(),
@@ -3731,6 +3764,7 @@ pub(crate) mod tests {
         let structure = super::derive(
             KENNEY_3D_KIT.map(|p| (p, 1)),
             &Overrides::new(),
+            &UnityMaterials::new(),
             |path| {
                 if path == "3D assets/Car Kit/License.txt" {
                     kenney("Car Kit Deluxe", LicenseKind::Cc0)
@@ -3789,6 +3823,7 @@ pub(crate) mod tests {
         let structure = super::derive(
             KENNEY_3D_KIT.into_iter().zip(sizes),
             &Overrides::new(),
+            &UnityMaterials::new(),
             |_| LicenseText::default(),
             |_| PackageMeta::default(),
             |_| None,
@@ -3817,6 +3852,7 @@ pub(crate) mod tests {
                 ("kit/Extra/a/b.glb", 4),
             ],
             &Overrides::new(),
+            &UnityMaterials::new(),
             |_| LicenseText::default(),
             |_| PackageMeta::default(),
             |_| None,
@@ -3826,6 +3862,7 @@ pub(crate) mod tests {
         let structure = super::derive(
             [("License.txt", 1), ("rock.png", 2), ("Tiles/a.png", 4)],
             &Overrides::new(),
+            &UnityMaterials::new(),
             |_| LicenseText::default(),
             |_| PackageMeta::default(),
             |_| None,
@@ -4299,6 +4336,152 @@ pub(crate) mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    /// Records an imported pack at `target` whose committed build is `current_build`, with
+    /// each `(build id, path)` of `outputs` as a manifest row.
+    pub(crate) async fn insert_import(
+        pool: &Pool<Sqlite>,
+        target: &str,
+        current_build: Option<&str>,
+        outputs: &[(&str, &str)],
+    ) {
+        sqlx::query(
+            "INSERT INTO imports (id, original_path, original_size, original_mtime_ns,
+             original_sha256, kind, created_at)
+             VALUES (?1, '/originals/' || ?1 || '.unitypackage', 1, 0, '', 'unitypackage', 0);
+             INSERT INTO import_packs (id, import_id, target, preset, current_build)
+             VALUES (?1, ?1, ?1, 'unity', ?2)",
+        )
+        .bind(target)
+        .bind(current_build)
+        .execute(pool)
+        .await
+        .unwrap();
+        for (build, path) in outputs {
+            sqlx::query(
+                "INSERT INTO import_outputs (pack_id, build_id, path, size, mtime_ns, sha256,
+                 origin) VALUES (?, ?, ?, 1, 0, '', 'extracted')",
+            )
+            .bind(target)
+            .bind(build)
+            .bind(path)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn an_imported_unity_material_is_a_hidden_unity_support_file_and_derive_reads_no_file() {
+        let paths = [
+            "Pub/Pack/Materials/Rock.mat",
+            "Pub/Pack/Models/Rock.fbx",
+            "Pub/Pack/Textures/Rock.png",
+            "Other/Glass.mat",
+        ];
+        let unity = UnityMaterials::from([
+            "Pub/Pack/Materials/Rock.mat".to_string(),
+            // Only a `.mat` is a Unity material, whatever the set holds.
+            "Pub/Pack/Textures/Rock.png".to_string(),
+        ]);
+        // The file system is unavailable: every read fails the test.
+        let structure = super::derive(
+            paths.map(|p| (p, 1)),
+            &Overrides::new(),
+            &unity,
+            |path| panic!("read the license {path}"),
+            |path| panic!("read the package {path}"),
+            |path| panic!("read the render {path}"),
+        );
+        assert_eq!(
+            structure.roles,
+            [Some(SupportRole::Unity), None, None, None],
+            "the material outside the import keeps its kind and stays visible"
+        );
+        assert_eq!(SupportRole::Unity.as_str(), "unity");
+        let pack = &structure.folders["Pub/Pack"];
+        assert_eq!((pack.item_count, pack.hidden_count), (2, 1));
+        assert_eq!(structure.folders["Other"].item_count, 1);
+        // With no Unity materials, the same `.mat` is an ordinary file.
+        assert_eq!(derive(paths).roles, [None; 4]);
+    }
+
+    #[tokio::test]
+    async fn the_pass_hides_the_unity_materials_of_the_committed_build_only() {
+        let pool = memory_library_pool().await;
+        let paths = [
+            "Loose/Glass.mat",
+            "Pub/Pack/Old.mat",
+            "Pub/Pack/Rock.fbx",
+            "Pub/Pack/Rock.mat",
+            "Pub/Unbuilt/Moss.mat",
+        ];
+        for path in paths {
+            insert_path(&pool, path).await;
+        }
+        // Build b1 shipped `Old.mat.meta`, the committed b2 ships `Rock.mat.meta` instead, and a
+        // pack that never committed has a manifest of a build that failed.
+        insert_import(
+            &pool,
+            "Pub/Pack",
+            Some("b2"),
+            &[
+                ("b1", "Pub/Pack/Old.mat"),
+                ("b1", "Pub/Pack/Old.mat.meta"),
+                ("b2", "Pub/Pack/Old.mat"),
+                ("b2", "Pub/Pack/Rock.fbx"),
+                ("b2", "Pub/Pack/Rock.mat"),
+                ("b2", "Pub/Pack/Rock.mat.meta"),
+            ],
+        )
+        .await;
+        insert_import(
+            &pool,
+            "Pub/Unbuilt",
+            None,
+            &[
+                ("b3", "Pub/Unbuilt/Moss.mat"),
+                ("b3", "Pub/Unbuilt/Moss.mat.meta"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            read_unity_materials(&pool).await.unwrap(),
+            UnityMaterials::from(["Pub/Pack/Rock.mat".to_string()])
+        );
+        let roles = |pool: Pool<Sqlite>| async move {
+            sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT file_path, support_role FROM assets
+                 WHERE support_role IS NOT NULL ORDER BY file_path",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        };
+        // The library isn't mounted, so the pass reads no file for this either.
+        rebuild(&pool, unmounted()).await.unwrap();
+        assert_eq!(
+            roles(pool.clone()).await,
+            [("Pub/Pack/Rock.mat".to_string(), Some("unity".to_string()))]
+        );
+        let pack: (i64, i64) =
+            sqlx::query_as("SELECT item_count, hidden_count FROM folders WHERE path = 'Pub/Pack'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pack, (2, 1));
+
+        // Committing b1 instead, as a rollback to it does, shows `Rock.mat` and hides `Old.mat`.
+        sqlx::query("UPDATE import_packs SET current_build = 'b1' WHERE id = 'Pub/Pack'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        rebuild(&pool, unmounted()).await.unwrap();
+        assert_eq!(
+            roles(pool.clone()).await,
+            [("Pub/Pack/Old.mat".to_string(), Some("unity".to_string()))]
+        );
     }
 
     #[tokio::test]
@@ -5192,6 +5375,7 @@ pub(crate) mod tests {
         let structure = super::derive(
             paths.iter().map(|p| (*p, 1)),
             overrides,
+            &UnityMaterials::new(),
             |_| LicenseText::default(),
             |path| {
                 asked.push(path.to_string());
@@ -5682,6 +5866,7 @@ pub(crate) mod tests {
             let structure = super::derive(
                 paths.iter().map(|p| (*p, 1)),
                 &Overrides::from([("kit".to_string(), edit)]),
+                &UnityMaterials::new(),
                 |_| kenney("Header Kit", LicenseKind::Cc0),
                 |_| package.clone(),
                 |_| None,
@@ -5830,6 +6015,7 @@ pub(crate) mod tests {
         let structure = super::derive(
             KENNEY.map(|p| (p, 1)),
             &Overrides::new(),
+            &UnityMaterials::new(),
             |_| LicenseText::default(),
             |path| panic!("read {path}"),
             |_| None,
