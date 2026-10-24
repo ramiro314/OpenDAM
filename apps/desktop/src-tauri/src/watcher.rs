@@ -552,19 +552,19 @@ pub async fn index_paths(db: &Database, library_id: &str, paths: &[String]) -> R
     )
     .await;
     // A pack recovery couldn't put back keeps its journal: no index reaches it mid-swap.
-    let journaled: Vec<String> = match sqlx::query_scalar(
-        "SELECT target FROM import_packs WHERE swap_state IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await
-    {
-        Ok(targets) => targets,
-        Err(e) => {
-            tracing::error!("Could not read the swap journals of library {library_id}, so it isn't indexed: {e}");
-            lock.release(pool, root).await;
-            return Ok(());
-        }
-    };
+    let journaled: Vec<String> =
+        match sqlx::query_scalar("SELECT target FROM import_packs WHERE swap_state IS NOT NULL")
+            .fetch_all(pool)
+            .await
+        {
+            Ok(targets) => targets,
+            Err(e) => {
+                lock.release(pool, root).await;
+                return Err(anyhow::anyhow!(
+                "Could not read the swap journals of library {library_id}, so it isn't indexed: {e}"
+            ));
+            }
+        };
     let prune = if journaled.is_empty() {
         Prune::Now
     } else {

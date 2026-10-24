@@ -690,6 +690,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rollback_whose_restored_folder_vanished_is_left_as_found() {
+        let s = disk().await;
+        let pack_id = later(&s).await;
+        s.engine.hooks().fail(Point::Indexed);
+        s.engine.hooks().crash(Point::RollbackRenamed);
+        let run = rebuild_killed(&s, &pack_id).await;
+        // The previous folder was put back, then went: only the failed build is left on disk.
+        std::fs::remove_dir_all(s.live()).unwrap();
+        let failed = beside(&s, "failed");
+        assert_eq!(failed.len(), 1);
+        let (files, rows) = (on_disk(&failed[0]), s.rows().await);
+
+        reopen(&s).await;
+        refresh(&s).await;
+        assert_eq!(
+            on_disk(&failed[0]),
+            files,
+            "the last copy of the files stays"
+        );
+        assert!(!s.live().exists());
+        assert_eq!(s.rows().await, rows, "no row is moved or pruned");
+        assert_eq!(s.pack().await.0, "failed");
+        assert_eq!(s.pack().await.2.as_deref(), Some("swapping"));
+        assert_eq!(status(&s, &run).await, "failed");
+    }
+
+    #[tokio::test]
     async fn a_recovery_that_fails_leaves_the_pack_to_no_index_and_a_later_one_finishes_it() {
         use std::os::unix::fs::PermissionsExt;
         let s = disk().await;

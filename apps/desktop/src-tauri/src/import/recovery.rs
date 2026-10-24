@@ -177,7 +177,10 @@ async fn recover_swap(
         (false, true, true, false) => Found::Swapped { prev: true },
         (false, false, true, false) if !swap_prev => Found::Swapped { prev: false },
         (false, true, false, true) => Found::RollingBack { prev: true },
-        (false, false, _, true) => Found::RollingBack { prev: false },
+        // After its renames a rollback leaves the pack folder exactly when a live folder was
+        // moved aside. Either other state lost a folder no step removes: left as found.
+        (false, false, true, true) if swap_prev => Found::RollingBack { prev: false },
+        (false, false, false, true) if !swap_prev => Found::RollingBack { prev: false },
         (false, false, true, false) => Found::Nothing,
         (false, false, false, false) if !swap_prev => Found::Nothing,
         (s, p, l, f) => {
