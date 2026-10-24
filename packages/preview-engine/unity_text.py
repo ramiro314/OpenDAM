@@ -18,6 +18,10 @@ from pathlib import Path
 
 import numpy
 
+# Bumped with `unity_glb::UNITY_TEXT_VERSION` whenever the text this writes changes, so the
+# GLBs made from it are converted again.
+VERSION = "opendam-unity-text/1"
+
 HEADER = "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"
 
 # A plain scalar can't start with these, as YAML reads it.

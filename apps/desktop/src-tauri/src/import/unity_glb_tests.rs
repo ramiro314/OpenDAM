@@ -12,7 +12,7 @@ mod tests {
 
     use serde_json::{json, Value};
 
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
 
     use crate::export::blender::test_blender;
     use crate::import::engine::tests::{setup, Setup, TARGET};
@@ -903,9 +903,19 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
         s.no_leftovers();
     }
 
-    /// A binary Unity 4 material and prefab, as far as the step reads them: no `%YAML` header.
-    const BINARY_MAT: &[u8] = b"\x00\x00\x0a\x89\x00\x00\x11\x60\x00\x00\x00\x09 4.3.4f1 Material";
-    const BINARY_PREFAB: &[u8] = b"\x00\x00\x58\x04\x00\x00\x00\x09 4.3.4f1 GameObject";
+    /// `body` behind the header of Unity 4.3's binary serialization, which holds the file's size.
+    fn serialized(body: &[u8]) -> Vec<u8> {
+        let len = 16 + body.len() as u32;
+        let mut file = [0x10u32, len, 9, 16].map(u32::to_be_bytes).concat();
+        file.extend(body);
+        file
+    }
+
+    /// A binary Unity 4 material and prefab, as far as the step reads them: the header.
+    static BINARY_MAT: LazyLock<Vec<u8>> = LazyLock::new(|| serialized(b"4.3.4f1 Material"));
+    static BINARY_PREFAB: LazyLock<Vec<u8>> = LazyLock::new(|| serialized(b"4.3.4f1 GameObject"));
+    /// Other programs' `.mat` files: a 3ds Max material library, and an empty one.
+    const MAX_MAT: &[u8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1 3ds Max material library";
     const TEXT_MAT: &[u8] = b"%YAML 1.1\n--- !u!21 &2100000\nMaterial:\n  m_Name: M_Text\n";
     /// What the stub worker writes for a binary file.
     const AS_TEXT: &str = "%YAML 1.1\n--- !u!21 &2100000\nMaterial:\n  m_Name: from the worker\n";
@@ -916,9 +926,11 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
             "binary.zip",
             &[
                 ("Models/SM_Log.fbx", b"an FBX the stub Blender never reads"),
-                ("Materials/M_Log.mat", BINARY_MAT),
+                ("Materials/M_Log.mat", &BINARY_MAT[..]),
                 ("Materials/M_Text.mat", TEXT_MAT),
-                ("Prefabs/SM_Log.prefab", BINARY_PREFAB),
+                ("Prefabs/SM_Log.prefab", &BINARY_PREFAB[..]),
+                ("Materials/Max.mat", MAX_MAT),
+                ("Materials/Empty.mat", b""),
             ],
         )
     }
@@ -976,12 +988,12 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
                 (
                     "unity_binary_to_text",
                     "Materials/M_Log.mat".to_string(),
-                    BINARY_MAT
+                    &BINARY_MAT[..]
                 ),
                 (
                     "unity_binary_to_text",
                     "Prefabs/SM_Log.prefab".to_string(),
-                    BINARY_PREFAB
+                    &BINARY_PREFAB[..]
                 ),
             ]
         );
@@ -996,14 +1008,23 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
             std::fs::read(seen.join("Materials/M_Text.mat")).unwrap(),
             TEXT_MAT
         );
+        // Other programs' `.mat` files aren't sent, and reach Blender as they are
+        assert_eq!(
+            std::fs::read(seen.join("Materials/Max.mat")).unwrap(),
+            MAX_MAT
+        );
+        assert_eq!(
+            std::fs::read(seen.join("Materials/Empty.mat")).unwrap(),
+            b""
+        );
 
         assert_eq!(
             std::fs::read(s.live().join("Materials/M_Log.mat")).unwrap(),
-            BINARY_MAT
+            &BINARY_MAT[..]
         );
         assert_eq!(
             std::fs::read(s.live().join("Prefabs/SM_Log.prefab")).unwrap(),
-            BINARY_PREFAB
+            &BINARY_PREFAB[..]
         );
         assert_eq!(
             std::fs::read(s.live().join("Materials/M_Text.mat")).unwrap(),
@@ -1021,7 +1042,44 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
         .fetch_one(&s.lib.pool)
         .await
         .unwrap();
-        assert_eq!(recorded, crate::export::hashes::sha256_bytes(BINARY_MAT));
+        assert_eq!(
+            recorded,
+            crate::export::hashes::sha256_bytes(&BINARY_MAT[..])
+        );
+
+        // The GLB is cached under a key holding the converter's version
+        use crate::import::unity_glb::{self, Input};
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT o.path, o.source_path, o.sha256 FROM import_outputs o JOIN import_packs p
+             ON p.id = o.pack_id AND o.build_id = p.current_build",
+        )
+        .fetch_all(&s.lib.pool)
+        .await
+        .unwrap();
+        let inputs: Vec<Input> = rows
+            .into_iter()
+            .map(|(path, source, sha256)| Input {
+                path: path[TARGET.len() + 1..].to_string(),
+                source_path: serde_json::from_str(&source).unwrap(),
+                sha256,
+                guid: None,
+            })
+            .filter(|i| unity_glb::is_input(&i.path))
+            .collect();
+        let model = unity_glb::Model {
+            path: "Models/SM_Log.fbx".into(),
+            source_path: vec!["Models/SM_Log.fbx".into()],
+            glb: "Models/SM_Log.glb".into(),
+        };
+        let original = sha(&originals.path().join("binary.zip"));
+        let options = unity_glb::Options::parse(&json!({})).unwrap();
+        let key = |converter: Option<&str>| {
+            let inputs = unity_glb::inputs_hash(&inputs);
+            let key = unity_glb::glb_key(&original, &model, &options, "5.2.2", &inputs, converter);
+            s.cache.path().join("glb").join(format!("{key}.glb"))
+        };
+        assert!(key(Some(&unity_glb::converter_version())).is_file());
+        assert!(!key(None).exists());
         s.no_work_left();
     }
 
@@ -1065,7 +1123,7 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
             assert!(!s.live().join("Models/SM_Log.glb").exists());
             assert_eq!(
                 std::fs::read(s.live().join("Materials/M_Log.mat")).unwrap(),
-                BINARY_MAT
+                &BINARY_MAT[..]
             );
             s.no_leftovers();
             s.no_work_left();
