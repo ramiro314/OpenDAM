@@ -904,6 +904,9 @@ async fn store_page(
     names: &[&str],
 ) -> Result<Option<String>, Stop> {
     let urls = metadata::store_urls(names);
+    if urls.is_empty() {
+        return Ok(None);
+    }
     let kept = recipe
         .store_page
         .as_deref()

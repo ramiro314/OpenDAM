@@ -390,11 +390,16 @@ fn version_suffix(rest: &str) -> Option<&str> {
         .find(|v| dotted(v))
 }
 
-/// The store page URLs to try, by each name's slug, without repeats.
+/// The store page URLs to try, by each name's slug, without repeats. A name whose slug is empty
+/// (no `a-z`, `0-9`, `.` or `_` in it) has none: it would ask for the store's index page.
 pub fn store_urls(names: &[&str]) -> Vec<String> {
     let mut urls: Vec<String> = Vec::new();
-    for name in names {
-        let url = format!("{STORE}{}", slug(name));
+    for slug in names
+        .iter()
+        .map(|name| slug(name))
+        .filter(|s| !s.is_empty())
+    {
+        let url = format!("{STORE}{slug}");
         if !urls.contains(&url) {
             urls.push(url);
         }
@@ -710,6 +715,12 @@ mod tests {
                 "https://kenney.nl/assets/car-kit-2"
             ]
         );
+        // A name with no slug asks for no page, not for the store's index.
+        assert_eq!(
+            store_urls(&["車キット", "Car Kit"]),
+            ["https://kenney.nl/assets/car-kit"]
+        );
+        assert!(store_urls(&["車キット", " -!- "]).is_empty());
         let answers = |first: Result<u16, String>, second: Result<u16, String>| -> Head {
             Arc::new(move |url: String| {
                 let answer = if url.ends_with("-2") {

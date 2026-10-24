@@ -271,6 +271,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn names_with_no_slug_ask_for_no_page() {
+        let s = setup().await;
+        let calls = kenney_nl(&s, "https://kenney.nl/assets/");
+        let mut request = s.kenney_request(CAR_KIT);
+        request.target = "3D assets/車".into();
+        request.title = Some("車キット".into());
+        s.import(request).await;
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(s.store_page().await, None);
+        let package = s.package("3D assets/車");
+        let package: serde_json::Value = serde_json::from_str(&package).unwrap();
+        assert_eq!(package["title"], "車キット");
+        assert!(package.get("sources").is_none(), "{package}");
+    }
+
+    #[tokio::test]
     async fn a_title_set_later_looks_the_page_up_again() {
         let s = setup().await;
         // The header's title has no page.
