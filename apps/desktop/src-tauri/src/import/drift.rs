@@ -174,9 +174,16 @@ impl<'a> Writes<'a> {
             );
         }
         row.source_path
-            .as_ref()
-            .filter(|source| self.excluded.contains(*source))
-            .map(|_| "An exclude step now leaves this file out, so the kept copy goes too")
+            .as_deref()
+            .filter(|source| self.leaves_out(source))
+            .map(|_| "An exclude step now leaves this file out, so your copy can't be kept")
+    }
+
+    /// Whether an enabled `exclude` drops the file with the source path `source` (a JSON
+    /// array): one of its own, or for a `.meta`, its asset's, which drops the `.meta` too.
+    fn leaves_out(&self, source: &str) -> bool {
+        self.excluded.contains(source)
+            || asset_of_meta(source).is_some_and(|a| self.excluded.contains(&a))
     }
 
     fn writes(&self, path: &str) -> bool {
@@ -186,6 +193,15 @@ impl<'a> Writes<'a> {
         let (folder, stem, ext) = split(path);
         self.convert && ext == "glb" && self.models.contains(&(folder.to_string(), stem))
     }
+}
+
+/// The source path (a JSON array) of the asset whose `.meta` has the source path `source`: its
+/// last element without `.meta`, or `None` for a file that isn't a `.meta`.
+fn asset_of_meta(source: &str) -> Option<String> {
+    let mut source: Vec<String> = serde_json::from_str(source).ok()?;
+    let last = source.last_mut()?;
+    *last = last.strip_suffix(".meta")?.to_string();
+    Some(records::source_json(&source))
 }
 
 /// A path's folder, then its stem and extension, lowercased.
@@ -281,9 +297,14 @@ fn differences(
                 (sha256 != row.sha256).then_some((Change::Changed, Some(size as i64), Some(sha256)))
             }
         };
-        let clash = (kind == Kind::Kept && on_disk.contains_key(&row.path))
-            .then(|| writes.clash(row))
-            .flatten();
+        // A file the build would keep: a kept one, or a changed one from the original, which
+        // keep yours would carry.
+        let would_keep = match kind {
+            Kind::Kept => on_disk.contains_key(&row.path),
+            Kind::Extracted => matches!(change, Some((Change::Changed, ..))),
+            _ => false,
+        };
+        let clash = would_keep.then(|| writes.clash(row)).flatten();
         if let Some(reason) = clash {
             let (size, sha256) = match change {
                 Some((_, size, sha256)) => (size, sha256),
@@ -429,8 +450,23 @@ pub fn unmatched(found: &[Difference], chosen: &[Chosen]) -> Option<String> {
 /// missing extracted file left out, and none (the enabled one turned off) for one restored or
 /// rebuilt from the recipe; the metadata step off when a missing `datapackage.json` turns it off
 /// or a changed one is kept, and on when it is restored or rebuilt from the recipe.
-pub fn edits(recipe: &Recipe, found: &[Difference], chosen: &[Chosen]) -> DriftEdits {
+///
+/// Only an edit `recorded` made is turned back: `recorded` holds the choices of the pack's latest
+/// run that never committed, while the steps are still as it left them (`records::uncommitted`).
+/// A Restore or "Use the recipe's" that would need any other step turned back, one you set
+/// yourself, is refused, naming the file and the step to change.
+pub fn edits(
+    recipe: &Recipe,
+    found: &[Difference],
+    chosen: &[Chosen],
+    recorded: &[Chosen],
+) -> Result<DriftEdits, String> {
     let writes = Writes::of(recipe, &[]);
+    let made = |d: &Difference, choices: &[Choice]| {
+        recorded
+            .iter()
+            .any(|r| r.path == d.path && choices.contains(&r.choice))
+    };
     let mut edits = DriftEdits::default();
     for (difference, choice) in pairs(found, chosen) {
         let source = difference.source_path.as_deref();
@@ -441,20 +477,35 @@ pub fn edits(recipe: &Recipe, found: &[Difference], chosen: &[Chosen]) -> DriftE
                 }
             }
             (Kind::Extracted, Choice::Restore | Choice::Recipe) => {
-                if let Some(source) = source.filter(|s| writes.excluded.contains(*s)) {
-                    edits
-                        .includes
-                        .extend(serde_json::from_str::<Vec<String>>(source).ok());
+                let Some(source) = source.filter(|s| writes.leaves_out(s)) else {
+                    continue;
+                };
+                if !writes.excluded.contains(source) || !made(difference, &[Choice::Exclude]) {
+                    return Err(format!(
+                        "An exclude step leaves {} out, so it can't be restored: turn that \
+                         step off first, or leave the file out",
+                        difference.path
+                    ));
                 }
+                edits
+                    .includes
+                    .extend(serde_json::from_str::<Vec<String>>(source).ok());
             }
             (Kind::Package, Choice::MetadataOff | Choice::Keep) => edits.metadata_off = true,
             (Kind::Package, Choice::Restore | Choice::Recipe) if !writes.metadata => {
+                if !made(difference, &[Choice::MetadataOff, Choice::Keep]) {
+                    return Err(format!(
+                        "The metadata step is off, so {} can't be restored: turn it on first, \
+                         or turn it off here",
+                        difference.path
+                    ));
+                }
                 edits.metadata_on = true
             }
             _ => {}
         }
     }
-    edits
+    Ok(edits)
 }
 
 /// The files the next build carries from the pack folder: the manifest's kept files but those

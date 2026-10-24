@@ -182,10 +182,12 @@ docs/plans                    Plans for this fork
   with the current manifest (size and mtime, hashing on a mismatch), and offers each file only
   the choices its origin can honour. `rebuild_import_pack` refuses choices that don't answer the
   folder now (`drift::STALE`), records the ones that edit the recipe (an `exclude`, the metadata
-  step off, or for a Restore that edit turned back) in the transaction that queues the run, and
-  stores the rest in `import_runs.drift`. A kept file the recipe now writes over or leaves out
-  is listed as a `clash`, offering only discard, and a pack folder that is gone defaults every
-  missing file to Restore.
+  step off, or for a Restore the edit a run that never committed recorded turned back, never
+  a step you set yourself, which refuses the Restore) in the transaction that queues the run,
+  and stores the rest in `import_runs.drift`. A file the build would keep (a kept one, or a
+  changed one keep yours would carry) that the recipe now writes over or an `exclude` leaves
+  out (its own, or its asset's for a `.meta`) is listed as a `clash`, offering only discard, and
+  a pack folder that is gone defaults every missing file to Restore.
   The build checks, before it stages and again under the lock, that the folder still differs
   exactly so. A kept file (`origin = 'kept'`) is carried by every later rebuild: one that
   replaced a recipe file keeps its source path, takes its bytes right after the extraction, and

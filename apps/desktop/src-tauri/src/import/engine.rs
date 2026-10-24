@@ -914,7 +914,11 @@ impl Engine {
         let recipe = records::recipe(&library.pool, pack_id)
             .await
             .map_err(|e| e.to_string())?;
-        let edits = drift::edits(&recipe, &found, &chosen);
+        let recorded = records::uncommitted(&library.pool, pack_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let recorded: Vec<drift::Chosen> = serde_json::from_value(recorded).unwrap_or_default();
+        let edits = drift::edits(&recipe, &found, &chosen, &recorded)?;
         let run_id = records::queue_rebuild(
             &library.pool,
             pack_id,

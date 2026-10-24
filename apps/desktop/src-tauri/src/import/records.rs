@@ -835,6 +835,29 @@ async fn record_drift_edits(
     Ok(())
 }
 
+/// The drift choices of pack `pack_id`'s latest rebuild that never committed (failed,
+/// cancelled or interrupted), queued since the pack's last build and with its steps still at
+/// the `recipe_rev` that run left: the recipe edits those choices made are still its own, and a
+/// Restore may turn them back. Empty when there is no such run.
+pub async fn uncommitted(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Value> {
+    let drift: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT json_extract(r.drift, '$.' || json_quote(p.id))
+         FROM import_runs r, json_each(r.packs) j, import_packs p
+         WHERE p.id = ? AND json_extract(j.value, '$.packId') = p.id AND r.kind = 'rebuild'
+         AND r.status IN ('failed', 'cancelled', 'interrupted')
+         AND json_extract(j.value, '$.recipeRev') = p.recipe_rev
+         AND r.created_at >= COALESCE(p.built_at, 0)
+         ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1",
+    )
+    .bind(pack_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(drift
+        .flatten()
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .unwrap_or_else(|| json!([])))
+}
+
 /// The drift choices run `run_id` was queued with for pack `pack_id`, as the JSON array
 /// `queue_rebuild` stored (empty for an import's first build).
 pub async fn run_drift(pool: &Pool<Sqlite>, run_id: &str, pack_id: &str) -> sqlx::Result<Value> {

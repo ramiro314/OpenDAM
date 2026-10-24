@@ -716,4 +716,102 @@ mod tests {
         assert!(s.drift(&pack_id).await.is_empty());
         s.settled().await;
     }
+
+    /// A changed file from the original whose exclude is on, and a kept `.meta` whose asset's
+    /// exclude is on, can't be kept: each is a clash offering only discard, which leaves the
+    /// exclude as it is, and the Rebuild then builds.
+    #[tokio::test]
+    async fn a_file_an_exclude_now_leaves_out_offers_only_discard() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        let (readme, log) = (
+            s.source_of("Readme.txt").await,
+            s.source_of("Textures/T_Log_D.png").await,
+        );
+        s.write("Textures/T_Log_D.png.meta", "my meta");
+        let run = s.rebuild_choosing(&pack_id, first).await;
+        s.wait_for(&run.id, "done").await;
+        assert_eq!(
+            s.kept(&pack_id).await,
+            [in_pack("Textures/T_Log_D.png.meta")]
+        );
+
+        s.write("Readme.txt", "edited outside");
+        s.edit_steps(&pack_id, |steps| {
+            add(steps, PlaceStep::Exclude { source: readme });
+            add(steps, PlaceStep::Exclude { source: log });
+        })
+        .await;
+        assert_eq!(
+            s.seen(&pack_id).await,
+            [
+                (
+                    "Readme.txt".into(),
+                    Change::Clash,
+                    Kind::Extracted,
+                    vec![Choice::Discard]
+                ),
+                (
+                    "Textures/T_Log_D.png.meta".into(),
+                    Change::Clash,
+                    Kind::Kept,
+                    vec![Choice::Discard]
+                ),
+            ]
+        );
+        let steps = s.engine.pack_steps("lib", &pack_id).await.unwrap();
+        let run = s.rebuild_choosing(&pack_id, first).await;
+        s.wait_for(&run.id, "done").await;
+        assert!(!s.live().join("Readme.txt").exists());
+        assert!(!s.live().join("Textures/T_Log_D.png.meta").exists());
+        assert!(s.kept(&pack_id).await.is_empty());
+        let after = s.engine.pack_steps("lib", &pack_id).await.unwrap();
+        assert_eq!(after.steps, steps.steps, "discard leaves the steps alone");
+        assert!(s.drift(&pack_id).await.is_empty());
+        s.settled().await;
+    }
+
+    /// A Restore that would turn back a step you set yourself (an exclude you turned on, the
+    /// metadata step you turned off) is refused, naming the file, and changes no step.
+    #[tokio::test]
+    async fn restore_never_turns_back_a_step_you_set() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        let log = s.source_of("Textures/T_Log_D.png").await;
+        std::fs::remove_file(s.live().join("Textures/T_Log_D.png")).unwrap();
+        std::fs::remove_file(s.live().join(metadata::FILE)).unwrap();
+        s.edit_steps(&pack_id, |steps| {
+            add(steps, PlaceStep::Exclude { source: log });
+            toggle(steps, "metadata", false);
+        })
+        .await;
+        let steps = s.engine.pack_steps("lib", &pack_id).await.unwrap();
+
+        for path in ["Textures/T_Log_D.png", metadata::FILE] {
+            let chosen = s
+                .choices(&pack_id, |d| {
+                    if d.path == in_pack(path) {
+                        Choice::Restore
+                    } else {
+                        d.choices[0]
+                    }
+                })
+                .await;
+            let refused = s
+                .engine
+                .rebuild_pack("lib", &pack_id, chosen)
+                .await
+                .unwrap_err();
+            assert!(
+                refused.contains(&in_pack(path)) && refused.contains("can't be restored"),
+                "{refused}"
+            );
+        }
+        assert_eq!(s.engine.pack_steps("lib", &pack_id).await.unwrap(), steps);
+        assert_eq!(
+            s.count("SELECT COUNT(*) FROM import_runs WHERE kind = 'rebuild'")
+                .await,
+            0
+        );
+    }
 }
