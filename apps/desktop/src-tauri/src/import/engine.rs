@@ -27,7 +27,7 @@ use tokio::sync::Notify;
 
 use super::build::{self, BuildEnv, Hooks, Point, Progress, RunControl, Stop};
 use super::place::PlaceStep;
-use super::records::{self, NewImport, Owner, QueuedPack, RunSummary, StepRecord};
+use super::records::{self, NewImport, Owner, PackSteps, QueuedPack, RunSummary, Step, StepRecord};
 use crate::db::{Database, LibraryHandle};
 
 const HEARTBEAT: Duration = Duration::from_secs(30);
@@ -39,6 +39,8 @@ const CLAIM_RETRY: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(5)
 };
+/// What an edit or a Rebuild answers while a run for the pack is queued or running.
+pub const BUSY: &str = "An import run is building this pack";
 /// How long a build waits for another machine's advisory lock.
 const LOCK_WAIT: Duration = Duration::from_secs(5 * 60);
 
@@ -348,8 +350,8 @@ impl Engine {
                 lock_wait: self.lock_wait,
             };
             outcome = match run.kind.as_str() {
-                "import" => {
-                    build::build_first(&env, &pack.pack_id, pack.recipe_rev, &mut warnings).await
+                "import" | "rebuild" => {
+                    build::build(&env, &pack.pack_id, pack.recipe_rev, &mut warnings).await
                 }
                 other => Err(Stop::Failed(format!("{other} runs can't run yet"))),
             };
@@ -527,6 +529,60 @@ impl Engine {
         self.wake.notify_one();
         Ok(run)
     }
+
+    /// Pack `pack_id`'s steps in order, with its `recipe_rev`.
+    pub async fn pack_steps(&self, library_id: &str, pack_id: &str) -> Result<PackSteps, String> {
+        let library = self.library(library_id).await?;
+        records::steps(&library.pool, pack_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| refused(records::Refused::NoPack))
+    }
+
+    /// Replaces pack `pack_id`'s steps (turning one off or on, changing its options) and bumps
+    /// its `recipe_rev`. Refused while a run for the pack is queued or running. Returns the new
+    /// `recipe_rev`. The pack changes on disk only at its next Rebuild.
+    pub async fn set_pack_steps(
+        &self,
+        library_id: &str,
+        pack_id: &str,
+        steps: Vec<Step>,
+    ) -> Result<i64, String> {
+        let library = self.library(library_id).await?;
+        build::check_steps(&steps)?;
+        records::set_steps(&library.pool, pack_id, &steps)
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(refused)
+    }
+
+    /// Queues a rebuild of pack `pack_id` from its current steps. Refused while a run for the
+    /// pack is queued or running.
+    pub async fn rebuild_pack(
+        &self,
+        library_id: &str,
+        pack_id: &str,
+    ) -> Result<RunSummary, String> {
+        let library = self.library(library_id).await?;
+        let run_id = records::queue_rebuild(&library.pool, pack_id, &self.owner, now_ms())
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(refused)?;
+        let run = records::run(&library.pool, &library.id, &run_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        (self.events)(ImportEvent::Updated(run.clone()));
+        self.wake.notify_one();
+        Ok(run)
+    }
+}
+
+/// Why an edit or a Rebuild is refused.
+fn refused(refusal: records::Refused) -> String {
+    match refusal {
+        records::Refused::NoPack => "The pack isn't an imported pack of this library".into(),
+        records::Refused::Busy => BUSY.into(),
+    }
 }
 
 /// A queued run, as the engine claims it.
@@ -640,6 +696,10 @@ async fn check_target(pool: &Pool<Sqlite>, root: &Path, target: &str) -> Result<
 }
 
 #[cfg(test)]
+#[path = "rebuild_tests.rs"]
+mod rebuild_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::{memory_database, memory_library_pool};
@@ -647,21 +707,21 @@ mod tests {
     use crate::import::build::FINISHING;
     use crate::import::unitypackage::tests::{fixture, golden, on_disk};
 
-    const TARGET: &str = "Pub/Synthetic";
+    pub(super) const TARGET: &str = "Pub/Synthetic";
 
-    struct Setup {
-        dir: tempfile::TempDir,
-        lib: LibraryHandle,
-        engine: Arc<Engine>,
-        events: Arc<Mutex<Vec<ImportEvent>>>,
+    pub(super) struct Setup {
+        pub(super) dir: tempfile::TempDir,
+        pub(super) lib: LibraryHandle,
+        pub(super) engine: Arc<Engine>,
+        pub(super) events: Arc<Mutex<Vec<ImportEvent>>>,
     }
 
     impl Setup {
-        fn live(&self) -> PathBuf {
+        pub(super) fn live(&self) -> PathBuf {
             self.dir.path().join(TARGET)
         }
 
-        fn request(&self, place: Vec<PlaceStep>) -> ImportRequest {
+        pub(super) fn request(&self, place: Vec<PlaceStep>) -> ImportRequest {
             ImportRequest {
                 library_id: self.lib.id.clone(),
                 original_path: fixture("synthetic.unitypackage")
@@ -674,7 +734,7 @@ mod tests {
         }
 
         /// The import of `synthetic.unitypackage` whose output is the place golden.
-        fn golden_request(&self) -> ImportRequest {
+        pub(super) fn golden_request(&self) -> ImportRequest {
             self.request(vec![
                 PlaceStep::Flatten,
                 PlaceStep::Hoist {
@@ -683,7 +743,7 @@ mod tests {
             ])
         }
 
-        async fn wait_for(&self, run_id: &str, status: &str) -> RunSummary {
+        pub(super) async fn wait_for(&self, run_id: &str, status: &str) -> RunSummary {
             for _ in 0..1500 {
                 let run = records::run(&self.lib.pool, &self.lib.id, run_id)
                     .await
@@ -702,14 +762,14 @@ mod tests {
             panic!("the run never reached {status}");
         }
 
-        async fn strings(&self, sql: &str) -> Vec<String> {
+        pub(super) async fn strings(&self, sql: &str) -> Vec<String> {
             sqlx::query_scalar(sql)
                 .fetch_all(&self.lib.pool)
                 .await
                 .unwrap()
         }
 
-        async fn count(&self, sql: &str) -> i64 {
+        pub(super) async fn count(&self, sql: &str) -> i64 {
             sqlx::query_scalar(sql)
                 .fetch_one(&self.lib.pool)
                 .await
@@ -717,7 +777,7 @@ mod tests {
         }
 
         /// The pack's `(status, current_build, swap_state)`.
-        async fn pack(&self) -> (String, Option<String>, Option<String>) {
+        pub(super) async fn pack(&self) -> (String, Option<String>, Option<String>) {
             sqlx::query_as("SELECT status, current_build, swap_state FROM import_packs")
                 .fetch_one(&self.lib.pool)
                 .await
@@ -725,7 +785,7 @@ mod tests {
         }
 
         /// Waits for the build to report `step`.
-        async fn wait_for_step(&self, step: &str) {
+        pub(super) async fn wait_for_step(&self, step: &str) {
             for _ in 0..1500 {
                 let reached = self
                     .events
@@ -761,7 +821,7 @@ mod tests {
         }
 
         /// No staging, previous or failed folder is left beside the target.
-        fn no_leftovers(&self) {
+        pub(super) fn no_leftovers(&self) {
             for tag in ["import", "prev", "failed"] {
                 let left = fs_swap::leftovers(&self.live(), tag).unwrap();
                 assert!(left.is_empty(), "{left:?}");
@@ -782,12 +842,12 @@ mod tests {
 
     /// A library holding `Other/Tree.png`, indexed, with the row given the id `tree` and a tag,
     /// and an engine started over it.
-    async fn setup() -> Setup {
+    pub(super) async fn setup() -> Setup {
         setup_with(true).await
     }
 
     /// `setup`, with the engine started only when `start` is set.
-    async fn setup_with(start: bool) -> Setup {
+    pub(super) async fn setup_with(start: bool) -> Setup {
         let dir = tempfile::Builder::new()
             .prefix("opendam-lib-")
             .tempdir()
