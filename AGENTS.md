@@ -92,7 +92,16 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               a dropped task left (recover_swaps), and engine, the durable run
                               queue (one run at a time,
                               owner and heartbeat, import:progress and import:updated, Cancel
-                              before the lock), behind commands/import.rs
+                              before the lock), behind commands/import.rs, and unity_glb, the
+                              convert phase: one textured X.glb per model stem (FBX over OBJ,
+                              none where the folder ships one), made by the embedded
+                              unity_glb.py (versioned by UNITY_GLB_VERSION) in Blender on a work
+                              copy, under the memory cap in settings (import.blenderMemoryMax),
+                              and cached in ~/.cache/opendam/import/glb by a key over every
+                              input's source path, final name and sha256
+    src/capped.rs             capped_command: a child process in a systemd user scope with
+                              MemoryMax (as scripts/memory-cap.sh), uncapped with a warning
+                              without systemd-run --user, and exit 137 reported as killed by the cap
     src/fs_swap.rs            Staging a folder beside the one it replaces and swapping it in by
                               rename, shared by the export's bundles and the import's builds
     tests/fixtures/pack-import/  Its fixture originals, made by make_fixtures.py (stdlib only) and

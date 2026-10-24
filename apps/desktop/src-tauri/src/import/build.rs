@@ -1,7 +1,9 @@
 //! A pack's build, first or later (plan pack-import, Flow). It stages the whole pack beside its
-//! target as `.<Pack>.import-<build id>`, writing the staged files' manifest rows under the new
-//! build id. A staged file the previous build also had, by file key, size and sha256, gets that
-//! build's mtime, so the index sees it unchanged, moved or not, and queues no preview. Then:
+//! target as `.<Pack>.import-<build id>`: extract, place, then convert (`unity_glb`, whose GLBs
+//! are `generated` rows with their models' source paths), writing the staged files' manifest
+//! rows under the new build id. A staged file the previous build also had, by file key, size and
+//! sha256, gets that build's mtime, so the index sees it unchanged, moved or not, and queues no
+//! preview. Then:
 //!
 //! 1. **Lock.** Takes the library's `index_lock`, then the advisory `.opendam/index.lock`, and
 //!    holds both to the end. Cancel takes effect only before this point.
@@ -31,6 +33,7 @@ use super::carry;
 use super::metadata::{self, KenneyLicense, Lookup, MetadataStep};
 use super::place::{place, PlaceStep};
 use super::records::{self, InsertedRows, ManifestRow, Output, Recipe};
+use super::unity_glb::{self, Conversion};
 use super::unitypackage::{extract_unitypackage, extract_variant, ExtractedFile, SkippedEntry};
 use super::zipfile::extract_zip;
 use crate::db::{Database, LibraryHandle};
@@ -278,6 +281,8 @@ pub struct BuildEnv<'a> {
     pub progress: ProgressSink,
     /// How long step 1 waits for another holder of the advisory lock.
     pub lock_wait: Duration,
+    /// What the convert phase runs with.
+    pub tools: unity_glb::Tools,
 }
 
 /// Why a build stopped.
@@ -302,11 +307,19 @@ fn db_error(e: sqlx::Error) -> Stop {
 struct Plan {
     extract: Extract,
     place: Vec<PlaceStep>,
+    /// The `unity_glb` step's options, when it is on.
+    convert: Option<unity_glb::Options>,
     metadata: Option<MetadataStep>,
 }
 
-/// A recipe's steps by phase.
-type Parts = (Vec<Extract>, Vec<PlaceStep>, Vec<MetadataStep>);
+/// The steps of a recipe, by phase.
+#[derive(Default)]
+struct Parts {
+    extracts: Vec<Extract>,
+    place: Vec<PlaceStep>,
+    converts: Vec<unity_glb::Options>,
+    metadata: Vec<MetadataStep>,
+}
 
 /// The extract step, by the original's kind.
 #[derive(Clone)]
@@ -321,7 +334,7 @@ enum Extract {
 }
 
 /// Refuses steps a build of an original of `kind` couldn't run: an unknown step, invalid
-/// options, or other than exactly one enabled extract step.
+/// options, other than exactly one enabled extract step, or more than one enabled `unity_glb`.
 pub fn check_steps(kind: &str, steps: &[records::Step]) -> Result<(), String> {
     for step in steps {
         Plan::parts(kind, &[(step.kind.clone(), step.options.clone())])?;
@@ -331,43 +344,43 @@ pub fn check_steps(kind: &str, steps: &[records::Step]) -> Result<(), String> {
         .filter(|s| s.enabled)
         .map(|s| (s.kind.clone(), s.options.clone()))
         .collect();
-    let (extracts, _, metadata) = Plan::parts(kind, &enabled)?;
-    if extracts.len() != 1 {
-        return Err("A pack needs exactly one extract step".into());
-    }
-    if metadata.len() > 1 {
-        return Err("A pack has at most one metadata step".into());
-    }
+    Plan::checked(Plan::parts(kind, &enabled)?)?;
     Ok(())
 }
 
 impl Plan {
     fn of(recipe: &Recipe) -> Result<Self, String> {
-        let (extracts, place, mut metadata) = Self::parts(&recipe.kind, &recipe.steps)?;
-        if metadata.len() > 1 {
-            return Err("A pack has at most one metadata step".into());
-        }
-        match <[Extract; 1]>::try_from(extracts) {
-            Ok([extract]) => Ok(Plan {
-                extract,
-                place,
-                metadata: metadata.pop(),
-            }),
-            Err(_) => Err("A pack needs exactly one extract step".into()),
-        }
+        Self::checked(Self::parts(&recipe.kind, &recipe.steps)?)
     }
 
-    /// The extract, place and metadata steps among `steps`, for an original of `kind`, refusing
-    /// an unknown step or invalid options.
+    fn checked(parts: Parts) -> Result<Self, String> {
+        let Ok([extract]) = <[Extract; 1]>::try_from(parts.extracts) else {
+            return Err("A pack needs exactly one extract step".into());
+        };
+        if parts.converts.len() > 1 {
+            return Err("A pack runs at most one unity_glb step".into());
+        }
+        if parts.metadata.len() > 1 {
+            return Err("A pack has at most one metadata step".into());
+        }
+        Ok(Plan {
+            extract,
+            place: parts.place,
+            convert: parts.converts.into_iter().next(),
+            metadata: parts.metadata.into_iter().next(),
+        })
+    }
+
+    /// The steps among `steps` by phase, for an original of `kind`, refusing an unknown step or
+    /// invalid options.
     fn parts(kind: &str, steps: &[(String, serde_json::Value)]) -> Result<Parts, String> {
         let zip = match kind {
             "unitypackage" => false,
             "zip" => true,
             other => return Err(format!("{other} originals can't be built yet")),
         };
-        let mut extracts = Vec::new();
-        let mut place = Vec::new();
-        let mut metadata = Vec::new();
+        let mut parts = Parts::default();
+        let (extracts, place) = (&mut parts.extracts, &mut parts.place);
         for (kind, options) in steps {
             let text = |key: &str| options[key].as_str().map(str::to_string);
             match kind.as_str() {
@@ -397,14 +410,15 @@ impl Plan {
                             .map_err(|e| format!("The {kind} step's options are invalid: {e}"))?,
                     );
                 }
-                "metadata" => metadata.push(
+                "metadata" => parts.metadata.push(
                     serde_json::from_value(options.clone())
                         .map_err(|e| format!("The metadata step's options are invalid: {e}"))?,
                 ),
+                "unity_glb" => parts.converts.push(unity_glb::Options::parse(options)?),
                 other => return Err(format!("The {other} step can't run yet")),
             }
         }
-        Ok((extracts, place, metadata))
+        Ok(parts)
     }
 }
 
@@ -829,35 +843,116 @@ async fn stage(
     .await?;
     cancelled()?;
 
-    let package = match &plan.metadata {
-        Some(step) => Some(write_package(env, recipe, step, staging, &files).await?),
-        None => None,
-    };
+    // A staged file the previous build had, by file key, size and sha256, keeps its mtime.
+    let unchanged: Arc<Unchanged> = Arc::new(
+        previous
+            .iter()
+            .filter_map(|row| {
+                let key = (row.source_path.clone()?, row.generated);
+                Some((key, (row.size, row.sha256.clone(), row.mtime_ns)))
+            })
+            .collect(),
+    );
+    // The phases after placing, in plan order: convert, then metadata, which sees the GLBs.
+    // Files are hashed once at the end, except that a conversion needs its inputs' hashes first.
+    let prefix = format!("{}/", recipe.target);
+    let mut pending: Vec<(ExtractedFile, bool)> = files.into_iter().map(|f| (f, false)).collect();
+    let mut outputs = Vec::new();
+    if let Some(options) = &plan.convert {
+        outputs = hash_staged(
+            env,
+            recipe,
+            staging,
+            std::mem::take(&mut pending),
+            &unchanged,
+        )
+        .await?;
+        cancelled()?;
+        let files: Vec<unity_glb::Staged> = outputs
+            .iter()
+            .map(|o| unity_glb::Staged {
+                path: o.path[prefix.len()..].to_string(),
+                source_path: o.source_path.clone(),
+                sha256: o.sha256.clone(),
+            })
+            .collect();
+        let models = Conversion {
+            staging,
+            files: &files,
+            original_sha256: &recipe.original_sha256,
+            options,
+            tools: &env.tools,
+            control: env.control.clone(),
+            progress: env.progress.clone(),
+        }
+        .run()
+        .await?;
+        let generated = models
+            .into_iter()
+            .map(|m| {
+                // Its size is read from disk when it is hashed, below.
+                let glb = ExtractedFile {
+                    path: m.glb,
+                    source_path: m.source_path,
+                    size: 0,
+                };
+                (glb, true)
+            })
+            .collect();
+        outputs.extend(hash_staged(env, recipe, staging, generated, &unchanged).await?);
+        cancelled()?;
+    }
+    if let Some(step) = &plan.metadata {
+        let files: Vec<ExtractedFile> = outputs
+            .iter()
+            .map(|o| ExtractedFile {
+                path: o.path[prefix.len()..].to_string(),
+                source_path: o.source_path.clone(),
+                size: o.size,
+            })
+            .chain(pending.iter().map(|(f, _)| f.clone()))
+            .collect();
+        let package = write_package(env, recipe, step, staging, &files).await?;
+        pending.push((package, true));
+        cancelled()?;
+    }
+    outputs.extend(hash_staged(env, recipe, staging, pending, &unchanged).await?);
     cancelled()?;
+    outputs.sort_by(|a, b| a.path.cmp(&b.path));
 
-    // A staged file's file key: its source path, and whether it is generated.
-    let unchanged: HashMap<(String, bool), (i64, String, i64)> = previous
-        .iter()
-        .filter_map(|row| {
-            let key = (row.source_path.clone()?, row.generated);
-            Some((key, (row.size, row.sha256.clone(), row.mtime_ns)))
-        })
-        .collect();
-    let staged: Vec<(ExtractedFile, bool)> = files
-        .into_iter()
-        .map(|file| (file, false))
-        .chain(package.map(|file| (file, true)))
-        .collect();
-    let (to, target, control, progress) = (
+    records::write_outputs(&env.library.pool, &recipe.pack_id, build_id, &outputs)
+        .await
+        .map_err(db_error)?;
+    env.hooks.at(Point::Staged).await?;
+    cancelled()?;
+    Ok(outputs)
+}
+
+/// The previous build's rows by file key (source path, generated): size, sha256 and mtime.
+type Unchanged = HashMap<(String, bool), (i64, String, i64)>;
+
+/// Hashes the staged files `files`, each with whether it is generated, as their manifest rows
+/// (a file's size is read from disk). A file the previous build had, by file key, size and sha256, gets that
+/// build's mtime, so the index sees it unchanged.
+async fn hash_staged(
+    env: &BuildEnv<'_>,
+    recipe: &Recipe,
+    staging: &Path,
+    files: Vec<(ExtractedFile, bool)>,
+    unchanged: &Arc<Unchanged>,
+) -> Result<Vec<Output>, Stop> {
+    let (to, target, control, progress, unchanged) = (
         staging.to_path_buf(),
         recipe.target.clone(),
         env.control.clone(),
         env.progress.clone(),
+        unchanged.clone(),
     );
-    let outputs = tokio::task::spawn_blocking(move || {
-        let total = staged.len() as u64;
-        let mut outputs = Vec::with_capacity(staged.len());
-        for (done, (file, generated)) in staged.into_iter().enumerate() {
+    tokio::task::spawn_blocking(move || {
+        let total = files.len() as u64;
+        let mut outputs = Vec::with_capacity(files.len());
+        for (done, (file, generated)) in files.into_iter().enumerate() {
+            let (rel, source_path) = (file.path, file.source_path);
             if control.cancelled() {
                 return Err(Stop::Cancelled);
             }
@@ -866,42 +961,34 @@ async fn stage(
                 done: done as u64,
                 total,
             });
-            let path = to.join(&file.path);
-            let read = |e: std::io::Error| format!("The staged {} can't be read: {e}", file.path);
+            let path = to.join(&rel);
+            let read = |e: std::io::Error| format!("The staged {rel} can't be read: {e}");
             let (size, mut mtime_ns) = file_stamp(&path).map_err(read)?;
             let sha256 = crate::export::hashes::sha256_file(&path).map_err(read)?;
-            let key = (records::source_json(&file.source_path), generated);
+            let key = (records::source_json(&source_path), generated);
             if let Some((_, _, before)) = unchanged
                 .get(&key)
                 .filter(|(s, sha, _)| *s == size as i64 && *sha == sha256)
             {
                 if *before != mtime_ns {
                     set_mtime(&path, *before)
-                        .map_err(|e| format!("The staged {} can't be stamped: {e}", file.path))?;
+                        .map_err(|e| format!("The staged {rel} can't be stamped: {e}"))?;
                     mtime_ns = *before;
                 }
             }
             outputs.push(Output {
-                path: format!("{target}/{}", file.path),
+                path: format!("{target}/{rel}"),
                 size,
                 mtime_ns,
                 sha256,
-                source_path: file.source_path,
+                source_path,
                 generated,
             });
         }
         Ok(outputs)
     })
     .await
-    .map_err(|e| Stop::Failed(format!("The build's worker stopped: {e}")))??;
-    cancelled()?;
-
-    records::write_outputs(&env.library.pool, &recipe.pack_id, build_id, &outputs)
-        .await
-        .map_err(db_error)?;
-    env.hooks.at(Point::Staged).await?;
-    cancelled()?;
-    Ok(outputs)
+    .map_err(|e| Stop::Failed(format!("The build's worker stopped: {e}")))?
 }
 
 /// The metadata step: writes the pack's `datapackage.json` into `staging`, beside the placed
@@ -1346,5 +1433,42 @@ pub(super) async fn index_pack(
     let paths = [live.to_string_lossy().into_owned()];
     if let Err(e) = watcher::index_pool(pool, root, &paths, Prune::Now, Some(advisory)).await {
         tracing::warn!("Indexing the pack {}: {e:#}", live.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn step(kind: &str, enabled: bool, options: serde_json::Value) -> records::Step {
+        records::Step {
+            kind: kind.into(),
+            enabled,
+            options,
+        }
+    }
+
+    #[test]
+    fn a_pack_runs_at_most_one_unity_glb_step() {
+        let extract = step("extract_unitypackage", true, json!({}));
+        let convert = |enabled| step("unity_glb", enabled, json!({"max_texture": 1024}));
+        assert_eq!(
+            check_steps(
+                "unitypackage",
+                &[extract.clone(), convert(true), convert(true)]
+            ),
+            Err("A pack runs at most one unity_glb step".into())
+        );
+        assert_eq!(
+            check_steps(
+                "unitypackage",
+                &[extract.clone(), convert(true), convert(false)]
+            ),
+            Ok(())
+        );
+        // A step that is off still needs options it could run with.
+        let invalid = step("unity_glb", false, json!({"max_texture": 1}));
+        assert!(check_steps("unitypackage", &[extract, invalid]).is_err());
     }
 }

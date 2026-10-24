@@ -46,6 +46,9 @@ pub struct Scan {
     pub kind: &'static str,
     /// One per row of the plan's table the original matches. You import one of them.
     pub offers: Vec<Offer>,
+    /// Why a step kind can't run here, by kind: `unity_glb` without an accepted Blender, whose
+    /// steps are then off, as an import records them.
+    pub unavailable: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -248,10 +251,7 @@ fn place_steps(steps: &[PlaceStep]) -> impl Iterator<Item = StepRecord> + '_ {
 }
 
 fn step(kind: &str, options: serde_json::Value) -> StepRecord {
-    StepRecord {
-        kind: kind.into(),
-        options,
-    }
+    StepRecord::new(kind, options)
 }
 
 /// The source options of an extract step: the non-empty ones of `variant` and `subpath`.
@@ -267,7 +267,7 @@ fn source(variant: Option<&str>, subpath: Option<&str>) -> serde_json::Value {
 }
 
 fn unity_glb() -> StepRecord {
-    step("unity_glb", json!({ "max_texture": 1024 }))
+    step("unity_glb", super::unity_glb::Options::default_json())
 }
 
 fn metadata(preset: &str, publisher: &str) -> StepRecord {

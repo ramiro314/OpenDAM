@@ -20,9 +20,11 @@ pub struct Output {
     pub size: u64,
     pub mtime_ns: i64,
     pub sha256: String,
-    /// Empty for the metadata step's `datapackage.json`, which comes from no entry.
+    /// For a generated GLB, its source model's; empty for the metadata step's
+    /// `datapackage.json`, which comes from no entry.
     pub source_path: Vec<String>,
-    /// Made by a step (`datapackage.json`), not extracted.
+    /// Made by a step (a `unity_glb` GLB, the metadata step's `datapackage.json`), not
+    /// extracted: `origin = 'generated'`.
     pub generated: bool,
 }
 
@@ -118,10 +120,20 @@ pub type Owner = crate::watcher::ProcessIdentity;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StepRecord {
     pub kind: String,
+    pub enabled: bool,
     pub options: Value,
 }
 
 impl StepRecord {
+    /// An enabled step.
+    pub fn new(kind: &str, options: Value) -> Self {
+        StepRecord {
+            kind: kind.into(),
+            enabled: true,
+            options,
+        }
+    }
+
     pub fn place(step: &PlaceStep) -> Self {
         let mut options = serde_json::to_value(step).expect("a place step serializes");
         let kind = options
@@ -129,7 +141,7 @@ impl StepRecord {
             .and_then(|o| o.remove("kind"))
             .and_then(|k| k.as_str().map(str::to_string))
             .expect("a place step has a kind");
-        StepRecord { kind, options }
+        StepRecord::new(&kind, options)
     }
 }
 
@@ -201,11 +213,12 @@ pub async fn create_import(
     for (position, step) in import.steps.iter().enumerate() {
         sqlx::query(
             "INSERT INTO import_steps (pack_id, position, kind, enabled, options)
-             VALUES (?, ?, ?, 1, ?)",
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&pack_id)
         .bind(position as i64)
         .bind(&step.kind)
+        .bind(step.enabled)
         .bind(step.options.to_string())
         .execute(&mut *tx)
         .await?;
@@ -326,6 +339,7 @@ pub struct Recipe {
     pub original_path: String,
     pub original_size: i64,
     pub original_mtime_ns: i64,
+    pub original_sha256: String,
     pub kind: String,
     /// The Kenney store page lookup's answer, `metadata::StorePage` as JSON, `None` before one.
     pub store_page: Option<String>,
@@ -335,7 +349,18 @@ pub struct Recipe {
 
 pub async fn recipe(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Recipe> {
     #[allow(clippy::type_complexity)]
-    let (target, recipe_rev, current_build, swap_state, original_path, size, mtime, kind, page): (
+    let (
+        target,
+        recipe_rev,
+        current_build,
+        swap_state,
+        original_path,
+        size,
+        mtime,
+        sha256,
+        kind,
+        page,
+    ): (
         String,
         i64,
         Option<String>,
@@ -343,11 +368,12 @@ pub async fn recipe(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Recipe> 
         String,
         i64,
         i64,
+        String,
         String,
         Option<String>,
     ) = sqlx::query_as(
         "SELECT p.target, p.recipe_rev, p.current_build, p.swap_state, i.original_path,
-         i.original_size, i.original_mtime_ns, i.kind, p.store_page
+         i.original_size, i.original_mtime_ns, i.original_sha256, i.kind, p.store_page
          FROM import_packs p JOIN imports i ON i.id = p.import_id WHERE p.id = ?",
     )
     .bind(pack_id)
@@ -369,6 +395,7 @@ pub async fn recipe(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Recipe> 
         original_path,
         original_size: size,
         original_mtime_ns: mtime,
+        original_sha256: sha256,
         kind,
         store_page: page,
         steps: steps
@@ -444,6 +471,8 @@ fn empty_options() -> Value {
 pub struct PackSteps {
     pub recipe_rev: i64,
     pub steps: Vec<Step>,
+    /// Why a step kind can't run here, by kind: `unity_glb` without an accepted Blender.
+    pub unavailable: std::collections::BTreeMap<String, String>,
 }
 
 pub async fn steps(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Option<PackSteps>> {
@@ -468,7 +497,11 @@ pub async fn steps(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Option<Pa
             options: serde_json::from_str(&options).unwrap_or(Value::Null),
         })
         .collect();
-    Ok(Some(PackSteps { recipe_rev, steps }))
+    Ok(Some(PackSteps {
+        recipe_rev,
+        steps,
+        unavailable: Default::default(),
+    }))
 }
 
 /// Why a pack's steps can't be edited, or it can't be rebuilt, now.
@@ -570,8 +603,8 @@ pub async fn queue_rebuild(
     Ok(Ok(run_id))
 }
 
-/// Writes `outputs` as build `build_id`'s manifest rows, in 200-row transactions.
-/// They mean nothing until the build commits.
+/// Writes `outputs` as build `build_id`'s manifest rows, extracted or generated, in 200-row
+/// transactions. They mean nothing until the build commits.
 pub async fn write_outputs(
     pool: &Pool<Sqlite>,
     pack_id: &str,
