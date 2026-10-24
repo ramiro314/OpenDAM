@@ -63,7 +63,7 @@ pub(super) mod tests {
             let mut steps = self.engine.pack_steps("lib", pack_id).await.unwrap().steps;
             edit(&mut steps);
             self.engine
-                .set_pack_steps("lib", pack_id, steps)
+                .set_pack_steps("lib", pack_id, steps, None)
                 .await
                 .unwrap()
         }
@@ -846,7 +846,7 @@ pub(super) mod tests {
         // Queued.
         assert_eq!(
             s.engine
-                .set_pack_steps("lib", &pack_id, steps.steps.clone())
+                .set_pack_steps("lib", &pack_id, steps.steps.clone(), None)
                 .await
                 .map(|_| ()),
             refused
@@ -862,7 +862,7 @@ pub(super) mod tests {
         reached(&pause).await;
         assert_eq!(
             s.engine
-                .set_pack_steps("lib", &pack_id, steps.steps.clone())
+                .set_pack_steps("lib", &pack_id, steps.steps.clone(), None)
                 .await
                 .map(|_| ()),
             refused
@@ -884,7 +884,7 @@ pub(super) mod tests {
         toggle(&mut edited, "hoist", false);
         assert_eq!(
             s.engine
-                .set_pack_steps("lib", &pack_id, edited.clone())
+                .set_pack_steps("lib", &pack_id, edited.clone(), None)
                 .await,
             Ok(1)
         );
@@ -898,13 +898,38 @@ pub(super) mod tests {
         );
         assert_eq!(
             s.engine
-                .set_pack_steps("lib", &pack_id, edited)
+                .set_pack_steps("lib", &pack_id, edited, None)
                 .await
                 .map(|_| ()),
             refused
         );
         pause.release.notify_one();
         s.wait_for(&rebuild.id, "done").await;
+    }
+
+    #[tokio::test]
+    async fn a_step_edit_read_at_an_older_recipe_rev_is_refused_and_records_nothing() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        let read = s.engine.pack_steps("lib", &pack_id).await.unwrap();
+        let mut edited = read.steps.clone();
+        toggle(&mut edited, "hoist", false);
+        assert_eq!(
+            s.engine
+                .set_pack_steps("lib", &pack_id, edited.clone(), Some(read.recipe_rev))
+                .await,
+            Ok(read.recipe_rev + 1)
+        );
+
+        // An editor still holding the steps it read before that edit can't overwrite it.
+        assert_eq!(
+            s.engine
+                .set_pack_steps("lib", &pack_id, read.steps.clone(), Some(read.recipe_rev))
+                .await,
+            Err(STALE.to_string())
+        );
+        let now = s.engine.pack_steps("lib", &pack_id).await.unwrap();
+        assert_eq!((now.recipe_rev, now.steps), (read.recipe_rev + 1, edited));
     }
 
     #[tokio::test]
@@ -930,12 +955,12 @@ pub(super) mod tests {
         for edit in [no_extract, bad_options, unknown] {
             assert!(s
                 .engine
-                .set_pack_steps("lib", &pack_id, edit)
+                .set_pack_steps("lib", &pack_id, edit, None)
                 .await
                 .is_err());
         }
         assert_eq!(
-            s.engine.set_pack_steps("lib", "nope", steps).await,
+            s.engine.set_pack_steps("lib", "nope", steps, None).await,
             Err("The pack isn't an imported pack of this library".into())
         );
         assert_eq!(

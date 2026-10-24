@@ -67,6 +67,9 @@ import { domainsLine, exportsAs, hasGameTab, namePatch, shownValue } from '../..
 import { AnimationEditor, MaterialEditor, ModelEditor, TextureEditor } from './GameEditors';
 import { ThreeViewer } from './ThreeViewer';
 import { SuggestTags } from './SuggestTags';
+import { Preparation } from '../Imports/Preparation';
+import { useImportStore } from '../../store/imports';
+import { preparationPack } from '../../store/preparation';
 import styles from './DetailPanel.module.css';
 
 const COLOR_LABELS: ColorLabel[] = [
@@ -467,6 +470,12 @@ function PackPanel({ pack }: { pack: PackDetail }) {
   const files = kinds.reduce((sum, [, n]) => sum + n, 0);
   const { license, edits } = pack;
   const sourceUrl = edits.sourceUrl ?? pack.sourceUrl;
+  // A pack an import built shows its Preparation
+  const imports = useImportStore((s) => s.imports);
+  const imported = useMemo(
+    () => preparationPack(imports, pack.libraryId, pack.path),
+    [imports, pack.libraryId, pack.path]
+  );
   /** Opens `url` in the browser, only ever on a click */
   const openUrl = async (url: string, what: string) => {
     try {
@@ -680,6 +689,17 @@ function PackPanel({ pack }: { pack: PackDetail }) {
           <label className={styles.infoLabel}>Folder</label>
           <span className={clsx(styles.infoValue, styles.mono)}>{pack.path || '/'}</span>
         </div>
+
+        {imported && (
+          <section className={styles.preparation} id="detail-pack-preparation">
+            <p className={styles.groupFilesTitle}>Preparation</p>
+            <Preparation
+              libraryId={pack.libraryId}
+              pack={imported.pack}
+              originalPath={imported.original.originalPath}
+            />
+          </section>
+        )}
       </div>
     </aside>
   );

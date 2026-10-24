@@ -30,6 +30,7 @@ import {
   lookupAsset,
 } from './store';
 import { useImportStore } from './store/imports';
+import { usePreparationStore } from './store/preparation';
 import type { AutotagUpdate, ImportProgress, ImportRun } from './types';
 import { api } from './api';
 import { startModelThumbnailer } from './preview/modelThumbnailer';
@@ -111,6 +112,8 @@ export default function App() {
       useFolderTreeStore.getState().refetch();
       usePacksStore.getState().refetch();
       usePackDetailStore.getState().refetch();
+      // An in-app rename or delete in an imported pack records a step
+      usePreparationStore.getState().refetch();
     });
 
     // Keyboard shortcuts: F5, Space hold for QuickLook, Ctrl+C to copy path

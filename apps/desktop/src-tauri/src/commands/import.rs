@@ -46,17 +46,18 @@ pub async fn preview_import(
         .await
 }
 
-/// Why the library would refuse `target` for a new pack (it exists, or nests with another pack's
-/// target, naming it), or `None` when it is free.
+/// Why the library would refuse `target` for a new pack, or with `pack_id` as that pack's new
+/// target (it exists, or nests with another pack's target, naming it), or `None` when it is free.
 #[tauri::command]
 pub async fn check_import_target(
     library_id: String,
     target: String,
+    pack_id: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<String>> {
     state
         .imports
-        .check_import_target(&library_id, &target)
+        .check_import_target(&library_id, &target, pack_id.as_deref())
         .await
 }
 
@@ -127,18 +128,20 @@ pub async fn get_import_steps(
 }
 
 /// Replaces an imported pack's steps (turn one off or on, change its options) and returns its
-/// new `recipe_rev`. Refused while a run for the pack is queued or running. The pack changes on
-/// disk only when it is rebuilt.
+/// new `recipe_rev`. Refused while a run for the pack is queued or running, and, given the
+/// `recipe_rev` the steps were read at, once they changed since. The pack changes on disk only
+/// when it is rebuilt.
 #[tauri::command]
 pub async fn set_import_steps(
     library_id: String,
     pack_id: String,
     steps: Vec<Step>,
+    recipe_rev: Option<i64>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<i64> {
     state
         .imports
-        .set_pack_steps(&library_id, &pack_id, steps)
+        .set_pack_steps(&library_id, &pack_id, steps, recipe_rev)
         .await
 }
 
