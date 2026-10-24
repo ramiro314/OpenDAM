@@ -146,6 +146,17 @@ impl ZipIndex {
         Ok(out)
     }
 
+    /// The entry index of every file `list(None)` lists, by its name there (its source path).
+    /// The names are unique: the listing keeps one file per clean path.
+    pub(super) fn file_entries(&self) -> std::collections::HashMap<String, usize> {
+        let mut skipped = Extraction::default();
+        self.wanted(None, &mut skipped)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|wanted| (wanted.name, wanted.index))
+            .collect()
+    }
+
     /// The files below the clean `subpath`, else all of them, in the zip's order. Adds the
     /// entries it skips to `out`.
     fn wanted(&self, subpath: Option<&str>, out: &mut Extraction) -> Result<Vec<Wanted>> {
@@ -205,6 +216,26 @@ impl ZipIndex {
 pub(super) fn open(original: &Path) -> Result<ZipArchive<File>> {
     let file = File::open(original).with_context(|| format!("opening {}", original.display()))?;
     ZipArchive::new(file).with_context(|| format!("reading the zip {}", original.display()))
+}
+
+/// Copies the entry at `index` in `zip`, one of the files `ZipIndex::file_entries` names, to a
+/// new file at `to`, with the entry's mtime, as the extraction writes each file, and returns its
+/// size.
+pub(super) fn copy_entry(zip: &mut ZipArchive<File>, index: usize, to: &Path) -> Result<u64> {
+    let mut entry = zip
+        .by_index(index)
+        .with_context(|| format!("reading entry {index} of the zip"))?;
+    let name = self::name(&entry);
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating the folder of {name}"))?;
+    }
+    let mut file = File::create_new(to).with_context(|| format!("writing {}", to.display()))?;
+    let size =
+        io::copy(&mut entry, &mut file).with_context(|| format!("reading {name} in the zip"))?;
+    if let Some(mtime) = mtime(&entry) {
+        file.set_modified(mtime)?;
+    }
+    Ok(size)
 }
 
 /// The index and name of the regular file at `variant` in `zip`, compared on clean paths.

@@ -436,6 +436,44 @@ export interface BlenderStatus {
 /** The fields to change, where null clears one */
 export type ExportSettingsPatch = Partial<ExportSettings>;
 
+/** Pack import settings (plan pack-import, Settings). Null is unset, the default. */
+export interface ImportSettings {
+  /** The memory cap Blender runs under, such as "12G" (the default) */
+  blenderMemoryMax: string | null;
+  /** The memory cap the Unreal Editor runs under, such as "20G" (the default) */
+  unrealMemoryMax: string | null;
+  /** The absolute folder holding `Engine/Binaries/Linux/UnrealEditor`. Null means
+   * `~/Applications/UnrealEngine`. */
+  unrealEditorRoot: string | null;
+  /** An absolute path to `assimp`. Null means `assimp` on PATH. */
+  assimpPath: string | null;
+}
+
+/** The fields to change, where null clears one */
+export type ImportSettingsPatch = Partial<ImportSettings>;
+
+/** A tool an import step runs, read for Settings */
+export interface ToolStatus {
+  path: string | null;
+  version: string | null;
+  /** Why its step can't run it, when it can't */
+  problem: string | null;
+}
+
+/** The import's tools besides Blender, read for Settings */
+export interface ImportTools {
+  assimp: ToolStatus;
+  unrealEditor: ToolStatus;
+  /** Whether UnityPy imports in the preview engine, null until its worker has said */
+  unitypy: boolean | null;
+}
+
+/** The import's conversion cache */
+export interface ImportCache {
+  path: string;
+  bytes: number;
+}
+
 /** A URP Lit texture role, as the game's asset contract names it */
 export type TextureRole =
   | 'BaseColor'
@@ -951,6 +989,8 @@ export interface ImportTree {
   skipped: SkippedEntry[];
   /** Why the build would fail, when it would */
   error: string | null;
+  /** An Unreal pack's tree: its `glbs` are at most so many */
+  estimate?: boolean;
 }
 
 /** A step as the scan proposes it: its kind and its options */
@@ -1045,6 +1085,8 @@ export interface ImportCandidate {
   /** The target is `<Publisher>/<Pack>`, so it moves with the publisher */
   targetFollowsPublisher: boolean;
   variants: ImportVariant[];
+  /** An Unreal pack's `.uproject`, by its path in the zip */
+  project?: string | null;
   steps: ImportStepRecord[];
   /** null while a Fab pack has no variant ticked */
   tree: ImportTree | null;
@@ -1052,7 +1094,7 @@ export interface ImportCandidate {
 
 /** One row of the plan's detection table the original matches */
 export interface ImportOffer {
-  layout: 'unity' | 'fab' | 'kenney' | 'zip';
+  layout: 'unity' | 'fab' | 'unreal' | 'kenney' | 'zip';
   candidates: ImportCandidate[];
 }
 
@@ -1078,6 +1120,8 @@ export interface ImportRequest {
   version?: string;
   license?: string;
   lookupStorePage?: boolean;
+  /** Builds the zip's Unreal project to GLBs (`export_unreal`) rather than copying the zip */
+  unreal?: boolean;
 }
 
 export type ImportRunStatus =
@@ -1131,5 +1175,15 @@ export interface ImportSummary {
   originalPath: string;
   kind: 'unitypackage' | 'zip';
   createdAt: number;
+  /** What the last check of the original found */
+  originalState: OriginalState;
+  /** While `changed`, the sha256 of the file at the original's path, which Use this file names */
+  changedSha256: string | null;
   packs: ImportPackSummary[];
 }
+
+/** An import's original: the recorded file, gone, or another file at its path */
+export type OriginalState = 'ok' | 'missing' | 'changed';
+
+/** What Locate original did: re-pointed the imports, or found a file that isn't the original */
+export type ImportLocated = { kind: 'located' } | { kind: 'differs'; path: string; sha256: string };

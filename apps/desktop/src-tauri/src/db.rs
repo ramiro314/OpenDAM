@@ -273,6 +273,27 @@ async fn add_pack_override_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
     .await
 }
 
+/// Backward compatibility: `imports` gained the original's state, the last check's answer, and
+/// the stamp and sha256 of a changed file found at its path (plan pack-import, The original's
+/// state). Older rows read as `ok`, so their first check decides. As with tag descriptions, any
+/// failure other than a column already being there is an error, since the import list reads them.
+async fn add_import_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
+    add_missing_columns(
+        pool,
+        &[
+            (
+                "imports",
+                "original_state",
+                "TEXT NOT NULL DEFAULT 'ok' CHECK (original_state IN ('ok', 'missing', 'changed'))",
+            ),
+            ("imports", "seen_size", "INTEGER"),
+            ("imports", "seen_mtime_ns", "INTEGER"),
+            ("imports", "seen_sha256", "TEXT"),
+        ],
+    )
+    .await
+}
+
 /// Adds each `(table, column, definition)` of `columns` that its table lacks.
 async fn add_missing_columns(
     pool: &Pool<Sqlite>,
@@ -387,6 +408,9 @@ pub async fn connect_library_sqlite(db_path: &Path) -> Result<Pool<Sqlite>> {
     add_pack_override_columns(&pool)
         .await
         .context("Could not add the pack origin columns")?;
+    add_import_columns(&pool)
+        .await
+        .context("Could not add the import original state columns")?;
     // Search still works on the old index, so a failed conversion only waits for the next open.
     if let Err(e) = index_file_paths(&pool, false).await {
         tracing::warn!("Could not index folder names for search in {db_path:?}: {e}");
@@ -1866,6 +1890,31 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(row, ("a1".to_string(), None, None));
+    }
+
+    #[tokio::test]
+    async fn adding_the_original_state_columns_to_imports_made_before_them_reads_them_ok() {
+        let pool = memory_library_pool().await;
+        sqlx::query(
+            "PRAGMA foreign_keys = OFF; DROP TABLE imports;
+             CREATE TABLE imports (id TEXT PRIMARY KEY, original_path TEXT NOT NULL,
+             original_size INTEGER NOT NULL, original_mtime_ns INTEGER NOT NULL,
+             original_sha256 TEXT NOT NULL, kind TEXT NOT NULL, created_at INTEGER NOT NULL);
+             INSERT INTO imports VALUES ('i', '/o.zip', 1, 2, 'sha', 'zip', 3);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        add_import_columns(&pool).await.unwrap();
+        add_import_columns(&pool).await.unwrap();
+
+        let row: (String, String, Option<String>) =
+            sqlx::query_as("SELECT id, original_state, seen_sha256 FROM imports")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, ("i".to_string(), "ok".to_string(), None));
     }
 
     #[tokio::test]

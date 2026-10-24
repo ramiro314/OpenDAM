@@ -309,13 +309,95 @@ the step's deviations from `unity_gltf.py` and from this plan as written:
     `scripts/memory-cap.sh` does, and a SIGKILL under the cap counts as a cap kill, like 137.
   - **Without Blender.** A Unity import adds `unity_glb` turned off, and `get_import_steps`
     gives the reason (`unavailable`). A build with it on fails with that reason.
-  - **assimp.** It is `assimp` on `PATH`, with no setting yet.
+  - **assimp.** It is `assimp` on `PATH`, with no setting yet (R51 adds `import.assimpPath`).
 
-Revised again 2026-10-24 (revision 21) while building outside changes (drift), whose
+Revised again 2026-10-23 (revision 21) while building the `export_unreal` step (ticket 9). No
+decision changed. These are the step's deviations from `ue_gltf_export.sh/.py` and from this
+plan as written:
+
+- **R47 - Settings and the request.**
+  - **Names.** The cap is `import.unrealMemoryMax` (default `20G`), named like
+    `import.blenderMemoryMax` (R46), and the editor's folder `import.unrealEditorRoot` (default
+    `~/Applications/UnrealEngine`, an absolute path). The editor's version, which the cache
+    key holds, is read from `Engine/Build/Build.version` below it.
+  - **The import.** An Import pack request asks for the Unreal build with `unreal: true`; the
+    scan offers it as the `unreal` layout, with the `.uproject`'s path and a tree marked as an
+    estimate. A zip with two `.uproject` files is refused.
+  - **Without the editor.** `export_unreal` is a pack's only extract step, so it stays on: the
+    scan and the pack's steps give the reason (`unavailable`), and the build fails with it.
+- **R48 - The cache.**
+  - **The key.** A GLB's key leaves out `batch`, which changes how many sessions make the GLBs,
+    not what they hold.
+  - **A record per original.** `<cache>/unreal/<key>.json` (the key without the asset) lists
+    the GLBs exported so far, the assets that failed, and whether a session reported nothing
+    left. It is rewritten after every session. Its GLBs are put where the script looks first,
+    so a rerun exports only the rest, and a rebuild after a finished export, with every GLB
+    still cached, unzips nothing and runs no editor.
+- **R49 - When a session counts as progress.**
+  - **A failed asset.** The exporter failing on an asset doesn't fail the step, as in the
+    script. The asset gets no GLB and becomes a run warning (`notExported`, by its `/Game`
+    path). A session whose attempts all failed still made progress, since later sessions skip
+    those assets.
+  - **A cap kill.** Every session's finished GLBs are cached however it ends, killed by the
+    cap or cancelled included. A session the cap kills after exporting something is followed
+    by a fresh one, whose memory starts over; one it kills before fails the step, naming the
+    cap. The script also quits the editor in a `finally` block.
+  - **Exit status.** Otherwise the editor's exit status is ignored, as the wrapper does: only
+    progress and `.gltf-remaining` count.
+- **R50 - What the pack gets, and what is checked.**
+  - **Docs.** `txt`, `md`, `pdf` and `rtf` files at the project's root keep their names, and
+    those below `Content/` their paths below it, beside the GLBs. Nothing comes from `Config/`,
+    `Saved/` or elsewhere. Two docs landing at one path are refused.
+  - **Free space.** There is no check before the unzip: one that runs out of space fails the
+    step with the system's "No space left on device".
+  - **The project's own code.** The editor opens the project as you, with its Python plugin on.
+    So besides a root `Source/`, a project that ships compiled code is refused: any file below a
+    `Binaries/` folder, or below a plugin's `Source/`. Before the editor starts, the work copy
+    loses the startup hooks the editor would run with Python on: every `Python/` folder
+    directly below a `Content/` folder (an `init_unreal.py` runs at startup), and in every
+    `.ini` file the Python plugin's settings sections (`StartupScripts`, `AdditionalPaths`)
+    and the editor utility subsystem's (`StartupObjects`), with any stray `StartupScripts`
+    entry. This disarms the known hooks; it is no sandbox. The editor still loads the
+    project's assets and its startup map, whose Blueprints run as in any editor that opens the
+    project, so a project you don't trust shouldn't be imported.
+  - **The fixtures.** `unreal.zip` holds `Feif/Feif.uproject` (named unlike the zip) with three
+    meshes, a texture, a level and docs, so the batches and the hoist can be tested;
+    `unreal-source.zip` adds `Source/`.
+
+Revised again 2026-10-24 (revision 22) while building Settings' Import tools section (ticket
+22). No decision changed. These are the section's deviations from this plan as written:
+
+- **R51 - The section, assimp and Clear.**
+  - **assimp's setting.** It is `import.assimpPath`, an absolute path, unset for `assimp` on
+    `PATH` (replacing R46's "no setting yet"). `unity_glb` runs the saved program.
+  - **A missing assimp disables nothing.** Only an ASCII or pre-7.1 FBX needs it, and that
+    model's conversion already fails naming assimp. Settings shows where assimp is, its version,
+    or why it can't be used, but `unity_glb` stays available without it, so packs that never
+    need it still convert.
+  - **Blender.** Its path stays the export's `export.blenderPath`, set under Game export. The
+    section shows the same status, from one check both sections share.
+  - **UnityPy.** The queue keeps the `unitypy` answer of the worker's `engine_info` beside its
+    version (`AppState::engine_unitypy`), so Settings reads it without asking the worker again.
+    It shows "not known yet" until a worker has answered.
+  - **The tools are checked as typed.** `get_import_tools` checks assimp and the Unreal Editor
+    at the paths in the form, saved or not, as Game export checks Blender.
+  - **Clear.** `get_import_cache` gives the cache folder's size (every file below it, following
+    no symlink), and `clear_import_cache` deletes everything below the folder, keeping it, and
+    returns the size after. Clear is refused while a run of this process executes: each run
+    holds the engine's `cache_use` lock shared, and Clear takes it exclusively without waiting.
+    An entry it can't delete fails the clear, naming it, after the rest are deleted.
+  - **Known gap: one process.** Clear sees only its own process's runs. Another OpenDAM
+    process on the same machine shares `~/.cache/opendam/import`, so clearing in one can remove
+    files a build in the other is reading.
+  - **Missing tools, as built before.** The import dialog and the step editor already show a
+    step whose tool is missing with the reason: `unity_glb` off and locked off (R46), and
+    `export_unreal` locked on, its build failing with the reason (R47).
+
+Revised again 2026-10-24 (revision 23) while building outside changes (drift), whose
 reviews found choices the table promised but a build couldn't honour. No decision changed. These
 are the drift's deviations from this plan as written (Edits after an import, A6):
 
-- **R47 - Recipe edits are recorded when the Rebuild is queued.** "Record as `exclude`" and
+- **R52 - Recipe edits are recorded when the Rebuild is queued.** "Record as `exclude`" and
   "turn the metadata step off" (or "keep yours" on `datapackage.json`) are written as step edits
   in the transaction that queues the run, bumping `recipe_rev`, so they stay when the build
   fails. The other choices travel with the run in `import_runs.drift`.
@@ -325,11 +407,11 @@ are the drift's deviations from this plan as written (Edits after an import, A6)
     (`records::uncommitted`).
   - **Your own steps are never turned back.** A Restore that would need a step you set yourself
     turned back is refused, naming the file and the step to change.
-- **R48 - A new difference, the clash.** A file the build would keep (a kept file, or a changed
+- **R53 - A new difference, the clash.** A file the build would keep (a kept file, or a changed
   one that keep yours would carry) is listed as a `clash`, offering only Discard, when the recipe
   now writes over it (`datapackage.json` with the metadata step on, a converted GLB) or its own
   `exclude` leaves it out. Without it, keeping such a file failed every Rebuild.
-- **R49 - A `.meta` follows its asset.** When an `exclude` leaves out the asset of a kept or
+- **R54 - A `.meta` follows its asset.** When an `exclude` leaves out the asset of a kept or
   changed `.meta`:
   - **The asset is still in the folder:** the `.meta` is a clash, offering only Discard.
   - **The asset is missing:** the `.meta` follows the asset's answer in the same Rebuild. Left
@@ -337,10 +419,10 @@ are the drift's deviations from this plan as written (Edits after an import, A6)
 
   The asset's exclude can change within the Rebuild only for a missing asset, so the dialog, the
   queue's check and the build's checks always agree on the `.meta`.
-- **R50 - A deleted pack folder defaults to Restore.** When the whole folder is gone, every
+- **R55 - A deleted pack folder defaults to Restore.** When the whole folder is gone, every
   missing file's default is Restore, not "record as `exclude`", and the dialog offers "Restore
   all".
-- **R51 - Kept files of their own.**
+- **R56 - Kept files of their own.**
   - **No source path.** A kept file added outside OpenDAM, or a kept `datapackage.json`, has a
     `NULL` source path. It keeps its path, is never carried, and the carry never moves its row
     aside.
@@ -349,12 +431,12 @@ are the drift's deviations from this plan as written (Edits after an import, A6)
     place phase.
   - **A source the extract no longer produces.** A kept replacement whose source the extract no
     longer produces (another variant, say) joins at its own path too.
-- **R52 - Paths the build writes are estimated.** An added or kept `.glb` counts as one the
+- **R57 - Paths the build writes are estimated.** An added or kept `.glb` counts as one the
   convert phase writes when a `.fbx` or `.obj` of the same stem sits in its folder, the folder
   ships no GLB of that stem, and `unity_glb` is on. A step change that moves models (a hoist
   toggled in the same edit) can defeat the estimate. The build then fails naming the kept file,
   to rename or delete in the app.
-- **R53 - Remove's drift waits for Remove.** Remove import isn't built yet, so only Rebuild runs
+- **R58 - Remove's drift waits for Remove.** Remove import isn't built yet, so only Rebuild runs
   the drift check.
 
 ## Problem
@@ -927,10 +1009,12 @@ whenever a target is edited:
 - **The export.** `ue_gltf_export.py` is embedded as a versioned script (`UNREAL_GLB_VERSION`).
   The editor runs headless one session per `batch` assets, restarted until nothing is left or a
   session makes no progress. Each GLB is cached by: the original's sha256, its `/Game` path,
-  the options, the script version and the editor version. An interrupted run resumes from those
-  cached files.
+  the script version and the editor version (not `batch`, R48), as soon as its session ends,
+  however it ends (R49). An interrupted run resumes from those cached files, and a per-original
+  record lets a rebuild after a finished export skip the editor (R48). A failed asset becomes a
+  warning, and a session the cap kills after exporting something is followed by another (R49).
 - **What the pack gets.** GLBs at the project's `/Game/...` layout, the docs found in the
-  project, and `datapackage.json` (D21). The work folder is deleted when the step ends.
+  project (R50), and `datapackage.json` (D21). The work folder is deleted when the step ends.
 
 ### Pack metadata
 
@@ -1090,17 +1174,19 @@ half manifest.
   `systemd-run --user --scope -p MemoryMax=<cap> -p MemorySwapMax=0`, mirroring
   `scripts/memory-cap.sh`. It warns and runs uncapped when `systemd-run --user` is unavailable,
   and reports exit 137 as `killed by the memory cap (<cap>)` (D20). The caps are settings
-  (`import.blenderMemoryMax`, default `12G`, R46; `import.unreal_memory_max`, default `20G`).
+  (`import.blenderMemoryMax`, default `12G`, R46; `import.unrealMemoryMax`, default `20G`, R47).
 
 ### Settings
 
 - **Import tools section.** It holds Blender (the existing setting and status), the assimp
-  path (default `assimp` on `PATH`), the Unreal Editor root (default
-  `~/Applications/UnrealEngine`, checked for `Engine/Binaries/Linux/UnrealEditor`), the two
-  memory caps, and the conversion cache's size with Clear.
+  path (`import.assimpPath`, R51, default `assimp` on `PATH`), the Unreal Editor root
+  (`import.unrealEditorRoot`, R47, default `~/Applications/UnrealEngine`, checked for
+  `Engine/Binaries/Linux/UnrealEditor`), the two memory caps, and the conversion cache's size
+  with Clear, refused while an import run executes (R51).
 - **UnityPy.** It ships in the preview engine, and the worker's `engine_info` reports whether
   it imports.
 - **Missing tools.** A step whose tool is missing is shown disabled, with the reason (D17).
+  assimp is the exception: only some FBX files need it, so it disables no step (R51).
 
 ### UI
 
@@ -1542,6 +1628,9 @@ files go with their tags, ratings and collections, as on any delete (D27).
 - **The hidden `.mat` covers imported packs only** (R1). A Unity `.mat` in a folder you didn't
   import through OpenDAM stays visible.
 - **The Unreal preview is an estimate.** It counts every `.uasset` as a possible GLB.
+- **Unreal sessions have limits.** A session has no timeout: an editor that hangs holds the run
+  until you cancel it. The editor still reads a downloaded project's assets as you, a trust no
+  refusal removes (R50). A work folder left by a crash is never swept, as for Unity (R48, R49).
 - **Some textures are dropped.** `.exr`, `.hdr` and `.gif` textures aren't copied into the work
   copy, so a `.mat` naming one by GUID gets none, where `unity_gltf.py` loaded it (R45).
 - **Unity GLB leftovers.** A work folder left by a crash is never swept, the GLB cache is never

@@ -38,6 +38,9 @@ pub struct AppState {
     /// The preview engine version the Python queue's worker process reported to `engine_info`,
     /// or `None` until a process answers (`preview::PreviewEngine`).
     pub engine_version: tokio::sync::watch::Sender<Option<i64>>,
+    /// Whether UnityPy imports in the preview engine, as its worker last answered `engine_info`,
+    /// or `None` until one answers it.
+    pub engine_unitypy: tokio::sync::watch::Sender<Option<bool>>,
     /// The `worker.py` the Python queue runs, once `preview::start_preview_worker` has found it.
     pub preview_worker: std::sync::OnceLock<std::path::PathBuf>,
     /// The game export's staged bundles, one per open Export view
@@ -169,6 +172,9 @@ pub fn run(render_choice: render::RenderChoice) {
                         }
                         ImportEvent::Updated(run) => import_events.emit("import:updated", run),
                         ImportEvent::LibraryUpdated => import_events.emit("library:updated", ()),
+                        ImportEvent::OriginalsChanged(library_id) => {
+                            import_events.emit("import:originals", library_id)
+                        }
                     };
                 }),
                 worker_requests.clone(),
@@ -182,6 +188,7 @@ pub fn run(render_choice: render::RenderChoice) {
                 autotag: autotag.clone(),
                 app_handle: app.handle().clone(),
                 engine_version: tokio::sync::watch::Sender::new(None),
+                engine_unitypy: tokio::sync::watch::Sender::new(None),
                 preview_worker: std::sync::OnceLock::new(),
                 exports: Default::default(),
                 fbx_facts: export::fbx_facts::Cached::new(export::fbx_facts::Worker::new(
@@ -331,6 +338,8 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::import::preview_import,
             commands::import::check_import_target,
             commands::import::list_imports,
+            commands::import::check_import_originals,
+            commands::import::locate_import_original,
             commands::import::start_import,
             commands::import::set_import_target,
             commands::import::cancel_import_run,
@@ -341,6 +350,9 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::import::rebuild_import_pack,
             commands::import::get_import_settings,
             commands::import::set_import_settings,
+            commands::import::get_import_tools,
+            commands::import::get_import_cache,
+            commands::import::clear_import_cache,
             commands::import::clear_import_store_page,
             commands::autotag::list_autotag_providers,
             commands::autotag::estimate_autotag_run,

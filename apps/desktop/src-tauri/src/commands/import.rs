@@ -3,10 +3,12 @@ use tauri::State;
 
 use crate::import::drift::{Chosen, Difference};
 use crate::import::engine::ImportRequest;
+use crate::import::original::Located;
 use crate::import::place::PlaceStep;
 use crate::import::records::{ImportSummary, PackSteps, RunSummary, Step};
 use crate::import::scan::{Scan, Tree};
 use crate::import::settings::{self, ImportSettings};
+use crate::import::tools::{self, CacheStatus, ImportTools};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -25,7 +27,8 @@ pub async fn scan_import(
 }
 
 /// The folder tree one source of an original would build with the place steps `place`, for the
-/// import dialog once a candidate's steps change. Nothing is written.
+/// import dialog once a candidate's steps change. Nothing is written. With `unreal`, it is the
+/// estimate of the zip's Unreal project.
 #[tauri::command]
 pub async fn preview_import(
     library_id: String,
@@ -33,6 +36,7 @@ pub async fn preview_import(
     variant: Option<String>,
     subpath: Option<String>,
     place: Vec<PlaceStep>,
+    unreal: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Tree> {
     state
@@ -43,6 +47,7 @@ pub async fn preview_import(
             variant.as_deref(),
             subpath.as_deref(),
             place,
+            unreal.unwrap_or(false),
         )
         .await
 }
@@ -107,6 +112,34 @@ pub async fn list_imports(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<ImportSummary>> {
     state.imports.list_imports(&library_id).await
+}
+
+/// A library's imports, as `list_imports`, once each original was checked by size and mtime
+/// and hashed again only when either changed: the Imports view's read when it opens.
+#[tauri::command]
+pub async fn check_import_originals(
+    library_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<ImportSummary>> {
+    state.imports.check_originals(&library_id).await
+}
+
+/// Locate original: re-points the imports of `original_path` at the file `path` when it is the
+/// same file by sha256. A file with another sha256 changes nothing and comes back as `differs`
+/// with its sha256, until it is passed back as `sha256` (Use this file), which makes it the new
+/// original that each pack's next build reads. Refused while a pack of the original is building.
+#[tauri::command]
+pub async fn locate_import_original(
+    library_id: String,
+    original_path: String,
+    path: String,
+    sha256: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Located> {
+    state
+        .imports
+        .locate_original(&library_id, &original_path, &path, sha256.as_deref())
+        .await
 }
 
 /// A library's import runs, newest first.
@@ -187,7 +220,8 @@ pub async fn rebuild_import_pack(
         .await
 }
 
-/// The import settings: Blender's memory cap for the `unity_glb` step.
+/// The import settings: the memory caps Blender and the Unreal Editor run under, the Unreal
+/// Editor's folder and the `assimp` program.
 #[tauri::command]
 pub async fn get_import_settings(state: State<'_, Arc<AppState>>) -> Result<ImportSettings> {
     settings::load(&state.db.master_pool)
@@ -203,4 +237,36 @@ pub async fn set_import_settings(
     state: State<'_, Arc<AppState>>,
 ) -> Result<ImportSettings> {
     settings::update(&state.db.master_pool, patch).await
+}
+
+/// The import's tools as Settings shows them: `assimp` at `assimp_path` (else on `PATH`), the
+/// Unreal Editor below `unreal_editor_root` (else the default folder), both as typed in
+/// Settings, saved or not, and whether UnityPy imports in the preview engine.
+#[tauri::command]
+pub async fn get_import_tools(
+    assimp_path: Option<String>,
+    unreal_editor_root: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ImportTools> {
+    let typed = |v: Option<String>| v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let root = typed(unreal_editor_root)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::import::unreal_glb::default_editor_root);
+    Ok(ImportTools {
+        assimp: tools::assimp_status(typed(assimp_path).as_deref()).await,
+        unreal_editor: tools::unreal_status(&root),
+        unitypy: *state.engine_unitypy.borrow(),
+    })
+}
+
+/// The conversion cache's folder and size.
+#[tauri::command]
+pub async fn get_import_cache(state: State<'_, Arc<AppState>>) -> Result<CacheStatus> {
+    state.imports.conversion_cache().await
+}
+
+/// Empties the conversion cache, refused while an import run executes. Returns its size after.
+#[tauri::command]
+pub async fn clear_import_cache(state: State<'_, Arc<AppState>>) -> Result<CacheStatus> {
+    state.imports.clear_conversion_cache().await
 }

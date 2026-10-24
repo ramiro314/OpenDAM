@@ -16,6 +16,7 @@ import {
   type PackRow,
 } from '../../store/imports';
 import { IconInbox, IconX } from '../Icons';
+import { OriginalStatus } from './OriginalStatus';
 import { Preparation } from './Preparation';
 import { driftOpen } from '../../store/preparation';
 import dialog from '../Settings/SettingsDialog.module.css';
@@ -147,7 +148,8 @@ export function ImportsPanel() {
   const onClose = () => setPanelOpen(false);
 
   useEffect(() => {
-    void useImportStore.getState().fetch(useLibraryStore.getState().libraries.map((l) => l.id));
+    // Opening the view checks every original, rehashing only one whose size or mtime changed
+    void useImportStore.getState().check(useLibraryStore.getState().libraries.map((l) => l.id));
     const onKeyDown = (e: KeyboardEvent) => {
       // The Import pack and drift dialogs over the view take Escape themselves
       const over = useImportStore.getState().dialog !== null || driftOpen();
@@ -208,6 +210,13 @@ export function ImportsPanel() {
                     )}
                   </div>
                   <span className={styles.path}>{row.originalPath}</span>
+                  <OriginalStatus
+                    libraryId={row.libraryId}
+                    originalPath={row.originalPath}
+                    kind={row.kind}
+                    state={row.originalState}
+                    changedSha256={row.changedSha256}
+                  />
                   <ul className={styles.packs}>
                     {row.packs.map((pack) => (
                       <Pack key={pack.pack.id} row={pack} libraryId={row.libraryId} />

@@ -101,6 +101,10 @@ export default function App() {
     const unlistenImportProgress = listen<ImportProgress>('import:progress', (event) =>
       useImportStore.getState().applyProgress(event.payload)
     );
+    // A check or Locate original changed an original's state
+    const unlistenImportOriginals = listen<string>('import:originals', (event) =>
+      useImportStore.getState().fetchLibrary(event.payload)
+    );
 
     // Live counts follow the results: once per search or refresh, like the total
     const stopLiveCounts = useAssetStore.subscribe((s, prev) => {
@@ -250,6 +254,7 @@ export default function App() {
       unlistenAutotag.then((fn) => fn());
       unlistenImport.then((fn) => fn());
       unlistenImportProgress.then((fn) => fn());
+      unlistenImportOriginals.then((fn) => fn());
       stopModelThumbnailer();
       stopLiveCounts();
       window.removeEventListener('keydown', handleKeyDown);

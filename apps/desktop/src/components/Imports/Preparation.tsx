@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import clsx from 'clsx';
-import { skippedText, useImportStore } from '../../store/imports';
+import { importOfPack, rebuildRefusal, skippedText, useImportStore } from '../../store/imports';
 import {
   busyReason,
   draftProblem,
@@ -18,6 +18,7 @@ import {
   usePreparationStore,
 } from '../../store/preparation';
 import type { ImportPackSummary, ImportStepRecord } from '../../types';
+import { OriginalStatus } from './OriginalStatus';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './Imports.module.css';
 
@@ -38,6 +39,7 @@ interface Props {
 export function Preparation({ libraryId, pack, originalPath, runShown = false }: Props) {
   const editor = usePreparationStore((s) => s.editors[pack.id]);
   const runs = useImportStore((s) => s.runs);
+  const original = useImportStore((s) => importOfPack(s.imports, libraryId, pack.id));
   const store = usePreparationStore.getState();
   useEffect(() => {
     void usePreparationStore.getState().open(libraryId, pack.id);
@@ -52,6 +54,8 @@ export function Preparation({ libraryId, pack, originalPath, runShown = false }:
   const dirty = draft !== null && isDirty(draft);
   const problem = draft ? draftProblem(draft) : null;
   const notice = busy ?? editor?.error ?? (dirty ? problem : null);
+  // A missing or changed original disables Rebuild, not the step edits
+  const noRebuild = useImportStore((s) => rebuildRefusal(s.imports, libraryId, pack.id));
 
   const targetLock = targetLocked(pack);
   const typed = editor?.target ?? null;
@@ -74,6 +78,15 @@ export function Preparation({ libraryId, pack, originalPath, runShown = false }:
           <span className={styles.path} data-prep-original>
             {originalPath}
           </span>
+          {original && (
+            <OriginalStatus
+              libraryId={libraryId}
+              originalPath={original.originalPath}
+              kind={original.kind}
+              state={original.originalState}
+              changedSha256={original.changedSha256}
+            />
+          )}
         </div>
       )}
 
@@ -156,7 +169,7 @@ export function Preparation({ libraryId, pack, originalPath, runShown = false }:
           className={clsx(styles.footerNote, busy === null && editor?.error && styles.errorText)}
           data-prep-notice
         >
-          {notice ?? (dirty ? 'Saved steps change the pack at its next Rebuild' : '')}
+          {notice ?? noRebuild ?? (dirty ? 'Saved steps change the pack at its next Rebuild' : '')}
         </span>
         {dirty && (
           <>
@@ -180,9 +193,12 @@ export function Preparation({ libraryId, pack, originalPath, runShown = false }:
         )}
         <button
           className={clsx(dialog.btn, dialog.primaryBtn, styles.smallBtn)}
-          disabled={!draft || locked || problem !== null}
+          disabled={!draft || locked || problem !== null || noRebuild !== null}
           onClick={() => void store.rebuild(pack.id)}
-          title="Build the pack again from its steps. Files changed outside OpenDAM are listed first, to keep or not. The pack stays as it is until the new build is done, and every file keeps its tags and metadata."
+          title={
+            noRebuild ??
+            'Build the pack again from its steps. Files changed outside OpenDAM are listed first, to keep or not. The pack stays as it is until the new build is done, and every file keeps its tags and metadata.'
+          }
           data-prep-rebuild
         >
           {dirty ? 'Save and rebuild' : 'Rebuild'}

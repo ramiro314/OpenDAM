@@ -204,6 +204,10 @@ pub struct ImportSummary {
     pub original_path: String,
     pub kind: String,
     pub created_at: i64,
+    /// What the last check of the original found: `ok`, `missing`, or `changed` (`original`).
+    pub original_state: String,
+    /// While `changed`, the sha256 of the file at the original's path, which Use this file names.
+    pub changed_sha256: Option<String>,
     pub packs: Vec<PackSummary>,
 }
 
@@ -221,8 +225,10 @@ pub struct PackSummary {
 
 /// The library's imports, newest first, each with its packs by target.
 pub async fn imports(pool: &Pool<Sqlite>, library_id: &str) -> sqlx::Result<Vec<ImportSummary>> {
-    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
-        "SELECT id, original_path, kind, created_at FROM imports
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(String, String, String, i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, original_path, kind, created_at, original_state,
+         CASE original_state WHEN 'changed' THEN seen_sha256 END FROM imports
          ORDER BY created_at DESC, rowid DESC",
     )
     .fetch_all(pool)
@@ -234,24 +240,28 @@ pub async fn imports(pool: &Pool<Sqlite>, library_id: &str) -> sqlx::Result<Vec<
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, original_path, kind, created_at)| ImportSummary {
-            packs: packs
-                .iter()
-                .filter(|p| p.0 == id)
-                .map(|(_, id, target, preset, status, built_at)| PackSummary {
-                    id: id.clone(),
-                    target: target.clone(),
-                    preset: preset.clone(),
-                    status: status.clone(),
-                    built_at: *built_at,
-                })
-                .collect(),
-            id,
-            library_id: library_id.to_string(),
-            original_path,
-            kind,
-            created_at,
-        })
+        .map(
+            |(id, original_path, kind, created_at, state, changed)| ImportSummary {
+                packs: packs
+                    .iter()
+                    .filter(|p| p.0 == id)
+                    .map(|(_, id, target, preset, status, built_at)| PackSummary {
+                        id: id.clone(),
+                        target: target.clone(),
+                        preset: preset.clone(),
+                        status: status.clone(),
+                        built_at: *built_at,
+                    })
+                    .collect(),
+                id,
+                library_id: library_id.to_string(),
+                original_path,
+                kind,
+                created_at,
+                original_state: state,
+                changed_sha256: changed,
+            },
+        )
         .collect())
 }
 

@@ -32,6 +32,10 @@ import type {
   ExportOutcome,
   ExportSettings,
   ExportSettingsPatch,
+  ImportCache,
+  ImportSettings,
+  ImportSettingsPatch,
+  ImportTools,
   GameDetail,
   ProviderStatus,
   AutotagMode,
@@ -53,6 +57,7 @@ import type {
   ImportScan,
   ImportStepRecord,
   ImportSummary,
+  ImportLocated,
   ImportTree,
   PlaceStep,
 } from '../types';
@@ -176,6 +181,18 @@ export const api = {
   clearExportCache: () => invoke<number>('clear_export_cache'),
   /** The Blender at `path` (null is `blender` on PATH), its version, and whether exports accept it */
   getBlenderStatus: (path: string | null) => invoke<BlenderStatus>('get_blender_status', { path }),
+
+  // Pack import settings. A cap systemd can't read or a relative path is refused.
+  getImportSettings: () => invoke<ImportSettings>('get_import_settings'),
+  setImportSettings: (patch: ImportSettingsPatch) =>
+    invoke<ImportSettings>('set_import_settings', { patch }),
+  /** assimp at `assimpPath` and the Unreal Editor below `unrealEditorRoot` (null: the defaults),
+   * as typed, and whether UnityPy imports */
+  getImportTools: (assimpPath: string | null, unrealEditorRoot: string | null) =>
+    invoke<ImportTools>('get_import_tools', { assimpPath, unrealEditorRoot }),
+  getImportCache: () => invoke<ImportCache>('get_import_cache'),
+  /** Empties the conversion cache, refused while an import runs, returning its size after */
+  clearImportCache: () => invoke<ImportCache>('clear_import_cache'),
   /**
    * Checks a domain collection: its assets, the problems that refuse its export and the diff
    * against the previous bundle. With no problem, it stages the bundle for `exportBundle`.
@@ -234,14 +251,26 @@ export const api = {
   /** An original's candidate packs, each with its default target, steps and tree; writes nothing */
   scanImport: (libraryId: string, originalPath: string) =>
     invoke<ImportScan>('scan_import', { libraryId, originalPath }),
-  /** The tree one source of an original builds with these place steps; writes nothing */
+  /**
+   * The tree one source of an original builds with these place steps; writes nothing. With
+   * `unreal`, the estimate of the zip's Unreal project.
+   */
   previewImport: (
     libraryId: string,
     originalPath: string,
     variant: string | null,
     subpath: string | null,
-    place: PlaceStep[]
-  ) => invoke<ImportTree>('preview_import', { libraryId, originalPath, variant, subpath, place }),
+    place: PlaceStep[],
+    unreal = false
+  ) =>
+    invoke<ImportTree>('preview_import', {
+      libraryId,
+      originalPath,
+      variant,
+      subpath,
+      place,
+      unreal,
+    }),
   /**
    * Why the library would refuse this target for a new pack, or with `packId` as that pack's new
    * target, or null when it is free
@@ -278,5 +307,18 @@ export const api = {
   cancelImportRun: (libraryId: string, runId: string) =>
     invoke<void>('cancel_import_run', { libraryId, runId }),
   listImports: (libraryId: string) => invoke<ImportSummary[]>('list_imports', { libraryId }),
+  /** The imports, once each original was checked by size and mtime (hashed only when changed) */
+  checkImportOriginals: (libraryId: string) =>
+    invoke<ImportSummary[]>('check_import_originals', { libraryId }),
+  /**
+   * Locate original: re-points the imports of `originalPath` at `path` when it is the same file
+   * by sha256; another file is used only once its `sha256` is passed back (Use this file)
+   */
+  locateImportOriginal: (
+    libraryId: string,
+    originalPath: string,
+    path: string,
+    sha256: string | null = null
+  ) => invoke<ImportLocated>('locate_import_original', { libraryId, originalPath, path, sha256 }),
   listImportRuns: (libraryId: string) => invoke<ImportRun[]>('list_import_runs', { libraryId }),
 };

@@ -30,6 +30,7 @@ const TREE_ROWS = 200;
 const OFFER_LABELS: Record<ImportOffer['layout'], string> = {
   unity: 'Unity package',
   fab: 'Fab Unity download',
+  unreal: 'Fab Unreal project',
   kenney: 'Kenney bundle',
   zip: 'Any other zip',
 };
@@ -52,6 +53,8 @@ function Tree({ tree, converts }: { tree: ImportTree; converts: boolean }) {
       <span className={styles.hint} data-tree-summary>
         {plural(tree.files, 'file')} in {plural(tree.folders.length, 'folder')}
         {converts && tree.glbs > 0 && ` · ${plural(tree.glbs, 'model')} to convert to GLB`}
+        {tree.estimate &&
+          ` · at most ${plural(tree.glbs, 'model')}, an estimate: only the Unreal Editor knows which assets are meshes`}
       </span>
       <ul className={styles.tree}>
         {shown.map((f) => {
@@ -103,6 +106,8 @@ function Candidate({
   const problem = candidateProblem(draft, index);
   // Why the conversion can't run here (no accepted Blender), so the import records it off
   const convertOff = draft.unavailable.unity_glb ?? null;
+  // Why the Unreal export can't run here (no editor): its build fails with this reason
+  const exportOff = draft.unavailable.export_unreal ?? null;
   const key = treeKey(c);
   const set = (patch: Partial<DraftCandidate>) => edit((d) => patchCandidate(d, index, patch));
 
@@ -186,9 +191,21 @@ function Candidate({
           <div className={styles.section}>
             <span className={styles.sectionLabel}>Steps</span>
             <ol className={styles.steps}>
-              <li className={styles.step}>
-                Extract <code>{extract}</code>
-              </li>
+              {c.unreal !== null ? (
+                <li
+                  className={clsx(styles.step, exportOff && styles.stepDisabled)}
+                  data-export-step
+                >
+                  Export the meshes of <code>{c.unreal}</code> to GLB
+                  <span className={styles.preset}>
+                    {exportOff ?? 'in the Unreal Editor, materials baked to PNG'}
+                  </span>
+                </li>
+              ) : (
+                <li className={styles.step}>
+                  Extract <code>{extract}</code>
+                </li>
+              )}
               <li className={styles.step}>
                 <label className={styles.check}>
                   <input

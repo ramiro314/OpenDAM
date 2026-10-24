@@ -28,13 +28,16 @@ use tokio::sync::{mpsc, Notify};
 use super::build::{self, BuildEnv, Hooks, Point, Progress, RunControl, Stop};
 use super::drift;
 use super::metadata::LicenseOption;
+use super::original::{self, LocateRefused, Located};
 use super::place::PlaceStep;
 use super::records::{
     self, ImportSummary, NewImport, Owner, PackSteps, QueuedPack, RunSummary, Step, StepRecord,
     TargetRefused,
 };
 use super::scan::{self, Scan};
+use super::tools;
 use super::unity_glb;
+use super::unreal_glb;
 use crate::db::{Database, LibraryHandle};
 use crate::preview::WorkerRequest;
 
@@ -74,6 +77,9 @@ pub enum ImportEvent {
     Updated(RunSummary),
     /// `library:updated`: a build changed the library.
     LibraryUpdated,
+    /// `import:originals`: a check or a Locate original changed the state of an import's
+    /// original in this library.
+    OriginalsChanged(String),
 }
 
 pub type EventSink = Arc<dyn Fn(ImportEvent) + Send + Sync>;
@@ -116,6 +122,11 @@ pub struct ImportRequest {
     /// for Kenney as the plan decides (D22), so on when left out.
     #[serde(default)]
     pub lookup_store_page: Option<bool>,
+    /// Builds a zip's Unreal project to GLBs (`export_unreal`) instead of copying the zip. The
+    /// project is found in the zip, so no variant or sub-folder is given. The preset is then
+    /// `fab` and the place steps `flatten` then `hoist Meshes`, when left out.
+    #[serde(default)]
+    pub unreal: bool,
 }
 
 pub struct Engine {
@@ -129,6 +140,9 @@ pub struct Engine {
     lock_wait: Duration,
     /// The conversion cache (`unity_glb::default_cache_dir`).
     cache_dir: PathBuf,
+    /// Held shared by each run while it executes, and exclusively by Clear, so the cache is
+    /// never cleared under a run.
+    cache_use: tokio::sync::RwLock<()>,
     /// The preview queue's worker, which rewrites binary Unity files for the convert phase.
     worker: mpsc::Sender<WorkerRequest>,
     /// The systemd tools a test runs Blender's scope through.
@@ -137,6 +151,9 @@ pub struct Engine {
     /// Runs whose Cancel was accepted while their claim failed. Their next attempt starts
     /// cancelled, so the build stops before it changes anything.
     pending_cancels: Mutex<HashSet<String>>,
+    /// Each original path's lock, held by a check of it and by a Locate of it, so two never
+    /// hash the same file at once and a scoped check never waits for another original's.
+    pub(super) checking: original::PathLocks,
 }
 
 impl Engine {
@@ -167,10 +184,12 @@ impl Engine {
             wake: Notify::new(),
             active: Mutex::new(None),
             pending_cancels: Mutex::new(HashSet::new()),
+            checking: original::PathLocks::default(),
             owner: crate::watcher::this_process(),
             hooks: Hooks::default(),
             lock_wait,
             cache_dir,
+            cache_use: tokio::sync::RwLock::new(()),
             worker,
             #[cfg(test)]
             systemd: Mutex::new(None),
@@ -187,13 +206,21 @@ impl Engine {
         *self.systemd.lock().unwrap() = Some(systemd);
     }
 
-    /// Marks the runs of gone owners `interrupted`, then runs queued runs one at a time, for good.
+    /// Marks the runs of gone owners `interrupted`, starts checking every import's original,
+    /// then runs queued runs one at a time, for good.
     pub async fn start(self: Arc<Self>) {
-        for library in self.db.get_all_libraries().await {
-            if let Err(e) = self.interrupt_dead_runs(&library).await {
+        let libraries = self.db.get_all_libraries().await;
+        for library in &libraries {
+            if let Err(e) = self.interrupt_dead_runs(library).await {
                 tracing::error!("Could not check the import runs of {}: {e}", library.id);
             }
         }
+        let this = self.clone();
+        tokio::spawn(async move {
+            for library in libraries {
+                this.check_in_background(&library).await;
+            }
+        });
         loop {
             match self.next_run().await {
                 Some((library, run)) => {
@@ -224,15 +251,114 @@ impl Engine {
     }
 
     /// A library opened after the engine started (added, re-added, or back online): marks its
-    /// runs whose owner is gone `interrupted`, as startup does for the libraries open then, and
-    /// wakes the queue for any of its queued runs this engine may claim.
-    pub async fn library_opened(&self, library_id: &str) {
+    /// runs whose owner is gone `interrupted` and starts checking its originals, as startup does
+    /// for the libraries open then, and wakes the queue for any of its queued runs this engine
+    /// may claim.
+    pub async fn library_opened(self: &Arc<Self>, library_id: &str) {
         if let Some(library) = self.db.get_library_handle(library_id).await {
             if let Err(e) = self.interrupt_dead_runs(&library).await {
                 tracing::error!("Could not check the import runs of {library_id}: {e}");
             }
+            let this = self.clone();
+            tokio::spawn(async move { this.check_in_background(&library).await });
         }
         self.wake.notify_one();
+    }
+
+    /// Checks the library's originals, or only import `only`'s, announcing a changed state.
+    async fn check_originals_of(
+        &self,
+        library: &LibraryHandle,
+        only: Option<&str>,
+    ) -> sqlx::Result<()> {
+        if original::check_library(&library.pool, &self.checking, only).await? {
+            (self.events)(ImportEvent::OriginalsChanged(library.id.clone()));
+        }
+        Ok(())
+    }
+
+    async fn check_in_background(&self, library: &LibraryHandle) {
+        if let Err(e) = self.check_originals_of(library, None).await {
+            tracing::error!(
+                "Could not check the import originals of {}: {e}",
+                library.id
+            );
+        }
+    }
+
+    /// Checks each import's original in library `library_id` by size and mtime, hashing it
+    /// again only when either changed, and returns the imports with their state, as the Imports
+    /// view shows them when it opens.
+    pub async fn check_originals(&self, library_id: &str) -> Result<Vec<ImportSummary>, String> {
+        let library = self.library(library_id).await?;
+        self.check_originals_of(&library, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.list_imports(library_id).await
+    }
+
+    /// Locate original: re-points every import of library `library_id` recorded at
+    /// `original_path` at the file `path`, when its sha256 is the original's, or when `named` is
+    /// its sha256 (Use this file), which makes it the new original that every pack's next build
+    /// reads. A file with another sha256 changes nothing and comes back as `Differs`, with the
+    /// sha256 Use this file names.
+    pub async fn locate_original(
+        &self,
+        library_id: &str,
+        original_path: &str,
+        path: &str,
+        named: Option<&str>,
+    ) -> Result<Located, String> {
+        let library = self.library(library_id).await?;
+        let root = library
+            .root_path
+            .canonicalize()
+            .map_err(|e| format!("The library folder can't be read: {e}"))?;
+        let (file, kind) = self::original(path, &root)?;
+        let kinds: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT kind FROM imports WHERE original_path = ?")
+                .bind(original_path)
+                .fetch_all(&library.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        if let Some(other) = kinds.iter().find(|k| *k != kind) {
+            return Err(format!(
+                "The original is a .{other}: locate a .{other} file"
+            ));
+        }
+        let at = file.clone();
+        let (size, mtime_ns, sha256) = tokio::task::spawn_blocking(move || {
+            let (size, mtime_ns) = build::file_stamp(&at)?;
+            let sha256 = crate::export::hashes::sha256_file(&at)?;
+            Ok::<_, std::io::Error>((size, mtime_ns, sha256))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("The file {path} can't be read: {e}"))?;
+        let _checking = self.checking.lock(original_path).await;
+        let located = original::locate(
+            &library.pool,
+            original_path,
+            &file.to_string_lossy(),
+            (size as i64, mtime_ns),
+            &sha256,
+            named,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|refused| match refused {
+            LocateRefused::NoImport => {
+                format!("Library {library_id} has no import of {original_path}")
+            }
+            LocateRefused::Busy => BUSY.to_string(),
+            LocateRefused::NotNamed => {
+                format!("The file {path} changed since it was checked: locate it again")
+            }
+        })?;
+        if located == Located::Located {
+            (self.events)(ImportEvent::OriginalsChanged(library.id.clone()));
+        }
+        Ok(located)
     }
 
     async fn interrupt_dead_runs(&self, library: &LibraryHandle) -> sqlx::Result<()> {
@@ -310,6 +436,7 @@ impl Engine {
     }
 
     async fn execute(&self, library: &LibraryHandle, run: Queued) {
+        let _cache = self.cache_use.read().await;
         let control = Arc::new(RunControl::default());
         let cancelled_before = self
             .pending_cancels
@@ -373,6 +500,7 @@ impl Engine {
             latest.clone(),
         )));
         let tools = self.tools().await;
+        let unreal = self.unreal_tools().await;
         let mut warnings = Vec::new();
         let mut outcome = Ok(());
         for pack in &run.packs {
@@ -400,6 +528,7 @@ impl Engine {
                 progress,
                 lock_wait: self.lock_wait,
                 tools: tools.clone(),
+                unreal: unreal.clone(),
             };
             outcome = match run.kind.as_str() {
                 "import" | "rebuild" => match queued_drift(library, &run.id, &pack.pack_id).await {
@@ -581,6 +710,17 @@ impl Engine {
                 unavailable.insert("unity_glb".to_string(), why);
             }
         }
+        // An Unreal pack's only extract step stays on: its build fails with the reason.
+        let exports = offers
+            .iter()
+            .flat_map(|o| &o.candidates)
+            .flat_map(|c| &c.steps)
+            .any(|s| s.kind == "export_unreal");
+        if exports {
+            if let Some(why) = self.unreal_tools().await.unavailable() {
+                unavailable.insert("export_unreal".to_string(), why);
+            }
+        }
         Ok(Scan {
             original_path: original.to_string_lossy().into_owned(),
             kind,
@@ -599,6 +739,7 @@ impl Engine {
         variant: Option<&str>,
         subpath: Option<&str>,
         place: Vec<PlaceStep>,
+        unreal: bool,
     ) -> Result<scan::Tree, String> {
         let library = self.library(library_id).await?;
         let root = library
@@ -615,6 +756,7 @@ impl Engine {
                 variant.as_deref(),
                 subpath.as_deref(),
                 &place,
+                unreal,
             )
         })
         .await
@@ -723,11 +865,16 @@ impl Engine {
         if kind == "unitypackage" && variant.is_some() {
             return Err("A .unitypackage original has no variant: only a zip holds them".into());
         }
+        let project = if request.unreal {
+            Some(unreal_project(&original, kind, variant, subpath.as_deref()).await?)
+        } else {
+            None
+        };
         let preset = match request.preset.as_deref() {
             Some(preset @ ("unity" | "fab" | "kenney" | "none")) => preset,
             Some(other) => return Err(format!("{other:?} isn't a preset")),
             None if kind == "unitypackage" => "unity",
-            None if variant.is_some() => "fab",
+            None if variant.is_some() || project.is_some() => "fab",
             None => "none",
         };
         check_target(&library.pool, &root, &target).await?;
@@ -749,13 +896,16 @@ impl Engine {
         if let Some(subpath) = &subpath {
             extract.insert("subpath".into(), subpath.as_str().into());
         }
-        let extract_kind = if kind == "zip" && variant.is_none() {
-            "extract_zip"
+        let (extract_kind, extract) = if project.is_some() {
+            ("export_unreal", unreal_glb::Options::default_json())
+        } else if kind == "zip" && variant.is_none() {
+            ("extract_zip", extract.into())
         } else {
-            "extract_unitypackage"
+            ("extract_unitypackage", extract.into())
         };
-        let mut steps = vec![StepRecord::new(extract_kind, extract.into())];
+        let mut steps = vec![StepRecord::new(extract_kind, extract)];
         let place = request.place.unwrap_or_else(|| match preset {
+            _ if project.is_some() => scan::unreal_place(),
             "fab" => vec![
                 PlaceStep::Flatten,
                 PlaceStep::Hoist {
@@ -785,11 +935,14 @@ impl Engine {
             metadata["lookup_store_page"] = request.lookup_store_page.unwrap_or(true).into();
         }
         steps.push(StepRecord::new("metadata", metadata));
-        let source = [variant, subpath.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("/");
+        let source = match &project {
+            Some(project) => project.clone(),
+            None => [variant, subpath.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("/"),
+        };
         let original_path = original.to_string_lossy();
         let import = NewImport {
             original_path: &original_path,
@@ -828,7 +981,41 @@ impl Engine {
                 steps.unavailable.insert("unity_glb".into(), why);
             }
         }
+        if steps.steps.iter().any(|s| s.kind == "export_unreal") {
+            if let Some(why) = self.unreal_tools().await.unavailable() {
+                steps.unavailable.insert("export_unreal".into(), why);
+            }
+        }
         Ok(steps)
+    }
+
+    /// The conversion cache's folder and size.
+    pub async fn conversion_cache(&self) -> Result<tools::CacheStatus, String> {
+        let dir = self.cache_dir.clone();
+        let bytes = tokio::task::spawn_blocking({
+            let dir = dir.clone();
+            move || tools::cache_size(&dir)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(tools::CacheStatus {
+            path: dir.display().to_string(),
+            bytes,
+        })
+    }
+
+    /// Empties the conversion cache, refused while a run executes, and returns its size after.
+    pub async fn clear_conversion_cache(&self) -> Result<tools::CacheStatus, String> {
+        let _clearing = self.cache_use.try_write().map_err(|_| {
+            "An import is running, and its build reads the conversion cache: clear it once the \
+             run ends"
+                .to_string()
+        })?;
+        let dir = self.cache_dir.clone();
+        tokio::task::spawn_blocking(move || tools::clear_cache(&dir))
+            .await
+            .map_err(|e| e.to_string())??;
+        self.conversion_cache().await
     }
 
     /// What a run's convert phase runs with, from Settings now.
@@ -840,6 +1027,17 @@ impl Engine {
             self.worker.clone(),
         )
         .await;
+        #[cfg(test)]
+        if let Some(systemd) = self.systemd.lock().unwrap().clone() {
+            tools.systemd = systemd;
+        }
+        tools
+    }
+
+    /// What a run's `export_unreal` step runs with, from Settings now.
+    async fn unreal_tools(&self) -> unreal_glb::Tools {
+        #[allow(unused_mut)]
+        let mut tools = unreal_glb::Tools::load(&self.db.master_pool, self.cache_dir.clone()).await;
         #[cfg(test)]
         if let Some(systemd) = self.systemd.lock().unwrap().clone() {
             tools.systemd = systemd;
@@ -899,7 +1097,8 @@ impl Engine {
     /// each of its outside changes. Refused while a run for the pack is queued or running, and
     /// unless `chosen` answers exactly the differences its folder has now (`drift::STALE`). The
     /// choices that edit the recipe (an `exclude`, the metadata step off) are recorded with the
-    /// run, in its transaction; the others travel with the run to its build.
+    /// run, in its transaction; the others travel with the run to its build. Refused too while
+    /// the pack's original is missing or changed, which it checks first.
     pub async fn rebuild_pack(
         &self,
         library_id: &str,
@@ -907,6 +1106,24 @@ impl Engine {
         chosen: Vec<drift::Chosen>,
     ) -> Result<RunSummary, String> {
         let library = self.library(library_id).await?;
+        let import_id: Option<String> =
+            sqlx::query_scalar("SELECT import_id FROM import_packs WHERE id = ?")
+                .bind(pack_id)
+                .fetch_optional(&library.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        let import_id = import_id.ok_or_else(|| refused(records::Refused::NoPack))?;
+        self.check_originals_of(&library, Some(&import_id))
+            .await
+            .map_err(|e| e.to_string())?;
+        let state: String = sqlx::query_scalar("SELECT original_state FROM imports WHERE id = ?")
+            .bind(&import_id)
+            .fetch_one(&library.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(why) = original::refusal(&state) {
+            return Err(why.into());
+        }
         let found = drift::check(&library.pool, &library.root_path, pack_id).await?;
         if drift::unmatched(&found, &chosen).is_some() {
             return Err(drift::STALE.into());
@@ -1072,6 +1289,35 @@ fn original(path: &str, root: &Path) -> Result<(PathBuf, &'static str), String> 
     Ok((original, kind))
 }
 
+/// The `.uproject` path in the zip original of an Unreal import, which takes no variant or
+/// sub-folder, refusing a zip without a project or with one the editor can't export.
+async fn unreal_project(
+    original: &Path,
+    kind: &str,
+    variant: Option<&str>,
+    subpath: Option<&str>,
+) -> Result<String, String> {
+    if kind != "zip" || variant.is_some() || subpath.is_some() {
+        return Err(
+            "An Unreal import builds the project in a zip: it takes no variant or sub-folder"
+                .into(),
+        );
+    }
+    let original = original.to_path_buf();
+    let project = tokio::task::spawn_blocking(move || {
+        let listing = super::zipfile::list_zip(&original, None)
+            .map_err(|e| format!("The original can't be read: {e:#}"))?;
+        unreal_glb::Project::find(&listing)
+    })
+    .await
+    .map_err(|e| e.to_string())??
+    .ok_or_else(|| "The zip holds no Unreal project (.uproject)".to_string())?;
+    match project.refusal() {
+        Some(why) => Err(why),
+        None => Ok(project.path()),
+    }
+}
+
 /// A variant or sub-folder option in its clean form, or `None` when it is left out or blank.
 /// One that names no path, or climbs out with `..`, is refused before anything is recorded.
 fn inner_path(raw: Option<&str>, what: &str) -> Result<Option<String>, String> {
@@ -1138,6 +1384,10 @@ mod rebuild_tests;
 mod unity_glb_tests;
 
 #[cfg(test)]
+#[path = "unreal_glb_tests.rs"]
+mod unreal_glb_tests;
+
+#[cfg(test)]
 #[path = "metadata_tests.rs"]
 mod metadata_tests;
 
@@ -1152,6 +1402,10 @@ mod edits_tests;
 #[cfg(test)]
 #[path = "drift_tests.rs"]
 mod drift_tests;
+
+#[cfg(test)]
+#[path = "original_tests.rs"]
+mod original_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1196,6 +1450,7 @@ mod tests {
                 version: None,
                 license: None,
                 lookup_store_page: None,
+                unreal: false,
             }
         }
 
@@ -1397,6 +1652,13 @@ mod tests {
         crate::export::settings::update(
             &db.master_pool,
             json!({"blenderPath": "/nonexistent/opendam-test/blender"}),
+        )
+        .await
+        .unwrap();
+        // Nor an Unreal Editor, unless a test gives one (`unreal_glb_tests`).
+        crate::import::settings::update(
+            &db.master_pool,
+            json!({"unrealEditorRoot": "/nonexistent/opendam-test/UnrealEngine"}),
         )
         .await
         .unwrap();
@@ -1811,6 +2073,41 @@ mod tests {
         );
         assert!(!s.dir.path().join("A").exists() && !s.dir.path().join("B").exists());
         s.other_asset_untouched().await;
+    }
+
+    #[tokio::test]
+    async fn clear_empties_the_conversion_cache_but_never_under_a_run() {
+        let s = setup().await;
+        let glb = s.cache.path().join("glb");
+        std::fs::create_dir_all(&glb).unwrap();
+        std::fs::write(glb.join("k.glb"), [0u8; 64]).unwrap();
+        let cache = s.engine.conversion_cache().await.unwrap();
+        assert_eq!(
+            (cache.path.as_str(), cache.bytes),
+            (s.cache.path().to_str().unwrap(), 64)
+        );
+
+        let pause = s.engine.hooks().pause(Point::Staged);
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        pause.reached.notified().await;
+        let refused = s.engine.clear_conversion_cache().await.unwrap_err();
+        assert!(refused.contains("An import is running"), "{refused}");
+        assert!(glb.join("k.glb").exists());
+        pause.release.notify_one();
+        s.wait_for(&run.id, "done").await;
+
+        // The run records `done` just before its `execute` lets go of the cache
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let cleared = loop {
+            match s.engine.clear_conversion_cache().await {
+                Ok(cleared) => break cleared,
+                Err(e) if std::time::Instant::now() > deadline => panic!("{e}"),
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        assert_eq!(cleared.bytes, 0);
+        assert!(s.cache.path().is_dir());
+        assert_eq!(std::fs::read_dir(s.cache.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -2921,6 +3218,7 @@ mod tests {
                 Some(&ticked.variant),
                 ticked.subpath.as_deref(),
                 place,
+                false,
             )
         };
         let hoisted = vec![
@@ -2937,7 +3235,7 @@ mod tests {
 
         let error = s
             .engine
-            .preview_import("lib", "/no/such.zip", None, None, vec![])
+            .preview_import("lib", "/no/such.zip", None, None, vec![], false)
             .await
             .unwrap_err();
         assert!(error.contains("can't be read"), "{error}");
@@ -2951,7 +3249,7 @@ mod tests {
             let engine = s.engine.clone();
             async move {
                 engine
-                    .preview_import("lib", &original, None, subpath.as_deref(), place)
+                    .preview_import("lib", &original, None, subpath.as_deref(), place, false)
                     .await
                     .unwrap()
             }

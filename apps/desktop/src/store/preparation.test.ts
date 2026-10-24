@@ -9,7 +9,7 @@ import type {
   ImportStepRecord,
   ImportSummary,
 } from '../types';
-import { useImportStore } from './imports';
+import { MISSING, useImportStore } from './imports';
 import {
   BUSY,
   DRIFT_STALE,
@@ -120,6 +120,8 @@ describe('finding a pack folder’s import', () => {
           originalPath: '/dl/pack.unitypackage',
           kind: 'unitypackage',
           createdAt: 0,
+          originalState: 'ok',
+          changedSha256: null,
           packs: [pack()],
         },
       ],
@@ -171,6 +173,9 @@ describe('the steps', () => {
     expect(stepLabel(step('metadata', { preset: 'kenney' }))).toBe(
       'Write datapackage.json (kenney)'
     );
+    expect(stepLabel(step('export_unreal', { batch: 30 }))).toBe(
+      'Export the Unreal project’s meshes to GLB'
+    );
     expect(stepLabel(step('unreal'))).toBe('unreal');
   });
 
@@ -181,6 +186,7 @@ describe('the steps', () => {
     expect(keys(step('exclude', { source: ['a'] }))).toEqual([]);
     expect(keys(step('flatten'))).toEqual([]);
     expect(keys(step('unity_glb'))).toEqual(['max_texture', 'force']);
+    expect(keys(step('export_unreal', { batch: 30 }))).toEqual(['batch']);
     expect(keys(step('metadata', { preset: 'unity', license: 'CC0-1.0' }))).toEqual([
       'title',
       'version',
@@ -242,6 +248,9 @@ describe('the steps', () => {
       expect(stepProblem(step('unity_glb', { max_texture: max }))).toContain('16 to 16384');
     expect(stepProblem(step('unity_glb', { max_texture: '512' }))).toBeNull();
     expect(stepProblem(step('unity_glb'))).toBeNull();
+    for (const batch of ['0', '1001', '2.5', 'many'])
+      expect(stepProblem(step('export_unreal', { batch }))).toContain('1 to 1000');
+    expect(stepProblem(step('export_unreal', { batch: '10' }))).toBeNull();
 
     const draft = setOption(draftFromSteps(read()), hoistAt(golden()), 'folder', '');
     expect(draftProblem(draft)).toBe(
@@ -287,6 +296,10 @@ describe('editing the draft', () => {
     expect(toggleStep(draft, 3, false).steps[3].enabled).toBe(false);
     expect(toggleProblem(steps[5], unavailable)).toBe('Blender 5.2 is not installed');
     expect(toggleStep(draft, 5, true)).toBe(draft);
+    // An Unreal pack's export is its extract step, and stays on too
+    expect(toggleProblem(step('export_unreal', { batch: 30 }), {})).toBe(
+      'A pack is built from its extract step'
+    );
   });
 });
 
@@ -444,6 +457,35 @@ describe('the editor store', () => {
     expect(await store().rebuild('p1')).toBe(false);
     expect(editor().error).toContain('Name the folder to move up');
     expect(calls).toBe(0);
+  });
+
+  test('Rebuild sends nothing while the original is missing, and goes once it is located', async () => {
+    api.getImportSteps = async () => read();
+    api.checkImportDrift = async () => [];
+    let rebuilds = 0;
+    api.rebuildImportPack = async () => {
+      rebuilds++;
+      return run('r', 'p1');
+    };
+    const imported = (originalState: ImportSummary['originalState']): ImportSummary => ({
+      id: 'i1',
+      libraryId: 'lib',
+      originalPath: '/dl/pack.unitypackage',
+      kind: 'unitypackage',
+      createdAt: 0,
+      originalState,
+      changedSha256: null,
+      packs: [pack()],
+    });
+    useImportStore.setState({ imports: { lib: [imported('missing')] } });
+    await store().open('lib', 'p1');
+    expect(await store().rebuild('p1')).toBe(false);
+    expect(editor().error).toBe(MISSING);
+    expect(rebuilds).toBe(0);
+
+    useImportStore.setState({ imports: { lib: [imported('ok')] } });
+    expect(await store().rebuild('p1')).toBe(true);
+    expect(rebuilds).toBe(1);
   });
 
   test('library:updated reads unedited editors again and leaves edited ones alone', async () => {

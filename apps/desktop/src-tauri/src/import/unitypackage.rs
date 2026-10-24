@@ -58,6 +58,8 @@ pub enum SkipReason {
     Symlink,
     /// A device, a FIFO or any other entry that isn't a regular file or a folder.
     Special,
+    /// An Unreal asset the editor's glTF exporter failed on, named by its `/Game` path.
+    NotExported,
 }
 
 /// An entry the extraction skipped, for the run's warnings.

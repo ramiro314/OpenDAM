@@ -10,8 +10,10 @@ import type {
   ImportTree,
 } from '../types';
 import {
+  CHANGED,
   FINISHING,
   LOCKED_STEP,
+  MISSING,
   cancelState,
   candidateProblem,
   draftFromScan,
@@ -22,11 +24,14 @@ import {
   importRequest,
   importRows,
   mergeRun,
+  originalLabel,
   packStatus,
   patchCandidate,
   pickVariant,
   placeSteps,
   progressText,
+  rebuildRefusal,
+  rowKey,
   setHoist,
   skippedText,
   treeCurrent,
@@ -155,6 +160,35 @@ const fabScan: ImportScan = {
   unavailable: {},
 };
 
+const unrealCandidate: ImportCandidate = {
+  name: 'Waterways',
+  ticked: true,
+  preset: 'fab',
+  publisher: 'Studio',
+  target: 'Studio/Waterways',
+  targetError: null,
+  targetFollowsPublisher: true,
+  variants: [],
+  project: 'Feif/Feif.uproject',
+  steps: [
+    { kind: 'export_unreal', enabled: true, options: { batch: 30 } },
+    { kind: 'flatten', enabled: true, options: {} },
+    { kind: 'hoist', enabled: true, options: { folder: 'Meshes' } },
+    { kind: 'metadata', enabled: true, options: { preset: 'fab', publisher: 'Studio' } },
+  ],
+  tree: { ...tree(7), glbs: 4, estimate: true },
+};
+
+const unrealScan: ImportScan = {
+  originalPath: '/dl/Waterways.zip',
+  kind: 'zip',
+  offers: [
+    { layout: 'unreal', candidates: [unrealCandidate] },
+    { layout: 'zip', candidates: [zipCandidate] },
+  ],
+  unavailable: {},
+};
+
 const kenneyScan: ImportScan = {
   originalPath: '/dl/Kenney.zip',
   kind: 'zip',
@@ -175,6 +209,8 @@ describe('importRows', () => {
       originalPath: '/dl/Kenney.zip',
       kind: 'zip',
       createdAt: 1,
+      originalState: 'ok',
+      changedSha256: null,
       packs: [
         { id: 'p2', target: '3D assets/Car Kit', preset: 'kenney', status: 'built', builtAt: 5 },
       ],
@@ -185,6 +221,8 @@ describe('importRows', () => {
       originalPath: '/dl/Kenney.zip',
       kind: 'zip',
       createdAt: 2,
+      originalState: 'ok',
+      changedSha256: null,
       packs: [
         {
           id: 'p1',
@@ -201,6 +239,8 @@ describe('importRows', () => {
       originalPath: '/cache/Rocks.unitypackage',
       kind: 'unitypackage',
       createdAt: 3,
+      originalState: 'ok',
+      changedSha256: null,
       packs: [{ id: 'p3', target: 'Pub/Rocks', preset: 'unity', status: 'failed', builtAt: null }],
     },
   ];
@@ -250,6 +290,104 @@ describe('importRows', () => {
       'lib',
       'other',
     ]);
+  });
+});
+
+describe("the original's state", () => {
+  const imp = (
+    id: string,
+    originalState: ImportSummary['originalState'],
+    changedSha256: string | null = null
+  ): ImportSummary => ({
+    id,
+    libraryId: 'lib',
+    originalPath: '/dl/Kenney.zip',
+    kind: 'zip',
+    createdAt: Number(id.slice(1)),
+    originalState,
+    changedSha256,
+    packs: [{ id: `p${id}`, target: `T/${id}`, preset: 'kenney', status: 'built', builtAt: 1 }],
+  });
+
+  test("a row shows the worst of its imports' states, and a changed one's file", () => {
+    const row = (imports: ImportSummary[]) => importRows(imports, [], {})[0];
+    expect(row([imp('i1', 'ok'), imp('i2', 'ok')]).originalState).toBe('ok');
+    const changed = row([imp('i1', 'ok'), imp('i2', 'changed', 'abc')]);
+    expect([changed.originalState, changed.changedSha256]).toEqual(['changed', 'abc']);
+    const missing = row([imp('i1', 'missing'), imp('i2', 'changed', 'abc')]);
+    expect([missing.originalState, missing.kind]).toEqual(['missing', 'zip']);
+    expect(originalLabel('ok')).toBe('OK');
+    expect(originalLabel('missing')).toBe('Original missing');
+    expect(originalLabel('changed')).toBe('Original changed');
+  });
+
+  test("a missing or changed original disables its packs' Rebuild with the reason", () => {
+    const imports = { lib: [imp('i1', 'ok'), imp('i2', 'missing'), imp('i3', 'changed', 'abc')] };
+    expect(rebuildRefusal(imports, 'lib', 'pi1')).toBeNull();
+    expect(rebuildRefusal(imports, 'lib', 'pi2')).toBe(MISSING);
+    expect(rebuildRefusal(imports, 'lib', 'pi3')).toBe(CHANGED);
+    expect(rebuildRefusal(imports, 'other', 'pi2')).toBeNull();
+  });
+
+  test('opening the Imports view checks the originals; a refetch only lists them', async () => {
+    const calls: string[] = [];
+    api.checkImportOriginals = async (libraryId) => {
+      calls.push(`check ${libraryId}`);
+      return [imp('i1', 'missing')];
+    };
+    api.listImports = async (libraryId) => {
+      calls.push(`list ${libraryId}`);
+      return [imp('i1', 'ok')];
+    };
+    api.listImportRuns = async () => [];
+    await useImportStore.getState().check(['lib']);
+    expect(useImportStore.getState().imports.lib[0].originalState).toBe('missing');
+    await useImportStore.getState().fetchLibrary('lib');
+    expect(calls).toEqual(['check lib', 'list lib']);
+  });
+
+  test('Locate original re-points a same file at once, and another only through Use this file', async () => {
+    const key = rowKey('lib', '/dl/Kenney.zip');
+    const sent: unknown[] = [];
+    api.locateImportOriginal = async (libraryId, originalPath, path, sha256 = null) => {
+      sent.push([libraryId, originalPath, path, sha256]);
+      return sha256 === null ? { kind: 'differs', path, sha256: 'other' } : { kind: 'located' };
+    };
+    let lists = 0;
+    api.listImports = async () => {
+      lists++;
+      return [];
+    };
+    api.listImportRuns = async () => [];
+    const store = useImportStore.getState();
+
+    await store.locate('lib', '/dl/Kenney.zip', '/new/Other.zip');
+    expect(useImportStore.getState().locating[key]).toEqual({
+      kind: 'differs',
+      path: '/new/Other.zip',
+      sha256: 'other',
+    });
+    expect(lists).toBe(0);
+
+    // Use this file names the sha256 it was shown
+    await store.locate('lib', '/dl/Kenney.zip', '/new/Other.zip', 'other');
+    expect(sent).toEqual([
+      ['lib', '/dl/Kenney.zip', '/new/Other.zip', null],
+      ['lib', '/dl/Kenney.zip', '/new/Other.zip', 'other'],
+    ]);
+    expect(useImportStore.getState().locating[key]).toBeUndefined();
+    expect(lists).toBe(1);
+
+    api.locateImportOriginal = async () => {
+      throw 'An import run is building this pack';
+    };
+    await store.locate('lib', '/dl/Kenney.zip', '/new/Kenney.zip');
+    expect(useImportStore.getState().locating[key]).toEqual({
+      kind: 'error',
+      error: 'An import run is building this pack',
+    });
+    store.dismissLocate(key);
+    expect(useImportStore.getState().locating).toEqual({});
   });
 });
 
@@ -349,6 +487,8 @@ describe('Cancel', () => {
           originalPath: '/o.unitypackage',
           kind: 'unitypackage',
           createdAt: 1,
+          originalState: 'ok',
+          changedSha256: null,
           packs: [{ id: 'p', target: 'Pub/Pack', preset: 'unity', status, builtAt: null }],
         },
       ] as ImportSummary[];
@@ -570,6 +710,23 @@ describe('the draft', () => {
       license: 'Standard EULA',
     });
 
+    // An Unreal pack asks for its project's export, with no variant or sub-folder.
+    const u = draftFromScan('lib', unrealScan);
+    expect(u.candidates[0].unreal).toBe('Feif/Feif.uproject');
+    expect(importRequest(u, u.candidates[0])).toEqual({
+      libraryId: 'lib',
+      originalPath: '/dl/Waterways.zip',
+      target: 'Studio/Waterways',
+      publisher: 'Studio',
+      preset: 'fab',
+      place: [{ kind: 'flatten' }, { kind: 'hoist', folder: 'Meshes' }],
+      unreal: true,
+    });
+    // The same zip as any other zip is copied, as before.
+    const z = draftFromScan('lib', unrealScan, 1);
+    expect(z.candidates[0].unreal).toBeNull();
+    expect(importRequest(z, z.candidates[0]).unreal).toBeUndefined();
+
     const k = patchCandidate(draftFromScan('lib', kenneyScan), 0, { lookupStorePage: false });
     expect(importRequest(k, k.candidates[0])).toEqual({
       libraryId: 'lib',
@@ -784,6 +941,21 @@ describe('the dialog', () => {
     ]);
     const c = useImportStore.getState().draft!.candidates[0];
     expect([c.tree?.files, treeCurrent(c)]).toEqual([7, true]);
+  });
+
+  test("an Unreal pack's step edit previews its project's estimate", async () => {
+    await open(unrealScan);
+    const calls: unknown[] = [];
+    api.previewImport = async (_libraryId, _originalPath, variant, subpath, place, unreal) => {
+      calls.push({ variant, subpath, place, unreal });
+      return { ...tree(7), glbs: 4, estimate: true };
+    };
+    const store = useImportStore.getState();
+    store.edit((d) => patchCandidate(d, 0, { hoistOn: false }));
+    await store.refreshTree(0);
+    expect(calls).toEqual([
+      { variant: null, subpath: null, place: [{ kind: 'flatten' }], unreal: true },
+    ]);
   });
 
   test('Import queues each ticked pack and keeps a refused one in the dialog with its reason', async () => {

@@ -22,13 +22,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::sync::{mpsc, oneshot};
 
 use super::build::{Progress, ProgressSink, RunControl, Stop};
@@ -121,6 +118,7 @@ pub struct Tools {
     pub memory_max: String,
     /// The import's cache folder: `glb/` for the GLBs, `work/` for the work copies.
     pub cache_dir: PathBuf,
+    /// `import.assimpPath`, else `assimp` on `PATH`.
     pub assimp: String,
     /// The systemd tools Blender's scope runs through.
     pub systemd: capped::Systemd,
@@ -141,18 +139,15 @@ impl Tools {
                 None
             }
         };
-        let memory_max = match super::settings::load(master).await {
-            Ok(settings) => settings.blender_memory_max(),
-            Err(e) => {
-                tracing::warn!("Could not read the import settings: {e}");
-                DEFAULT_MEMORY_MAX.to_string()
-            }
-        };
+        let settings = super::settings::load(master).await.unwrap_or_else(|e| {
+            tracing::warn!("Could not read the import settings: {e}");
+            Default::default()
+        });
         Tools {
             blender_path,
-            memory_max,
+            memory_max: settings.blender_memory_max(),
             cache_dir,
-            assimp: "assimp".into(),
+            assimp: settings.assimp(),
             systemd: capped::Systemd::default(),
             worker,
         }
@@ -699,7 +694,7 @@ impl Conversion<'_> {
                     ))))
                 }
             }
-            publish(&out.join(format!("{n}.glb")), cached)
+            publish(&out.join(format!("{n}.glb")), cached, "Blender")
                 .await
                 .map_err(|e| format!("Converting {} to GLB failed: {e}", model.path))?;
         }
@@ -769,69 +764,30 @@ impl Conversion<'_> {
             &self.tools.memory_max,
         )
         .await;
-        // Uncapped, `capped_command_with` has warned.
-        let mut child = capped
-            .command
-            .current_dir(dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| converting(format!("Could not start Blender: {e}")))?;
-        let mut stderr = child.stderr.take().expect("piped");
-        let errors = tokio::spawn(async move {
-            let mut text = Vec::new();
-            let _ = stderr.read_to_end(&mut text).await;
-            text
-        });
-        // Read as bytes: a line that isn't UTF-8 must not stop the reading, or a full pipe
-        // would block Blender.
-        let mut lines = tokio::io::BufReader::new(child.stdout.take().expect("piped")).split(b'\n');
-        let mut printed = Vec::new();
+        capped.command.current_dir(dir);
         let mut converted = done;
-        let mut tick = tokio::time::interval(Duration::from_millis(200));
-        let mut reading = true;
-        let status = loop {
-            tokio::select! {
-                line = lines.next_segment(), if reading => match line {
-                    Ok(Some(line)) => {
-                        if line.starts_with(b"[unity-glb] model ") {
-                            converted += 1;
-                            (self.progress)(Progress {
-                                step: "converting",
-                                done: converted.min(total) as u64,
-                                total: total as u64,
-                            });
-                        }
-                        printed.extend_from_slice(&line);
-                        printed.push(b'\n');
+        // Uncapped, `capped_command_with` has warned.
+        let output = capped
+            .watch(
+                |line| {
+                    if line.starts_with(b"[unity-glb] model ") {
+                        converted += 1;
+                        (self.progress)(Progress {
+                            step: "converting",
+                            done: converted.min(total) as u64,
+                            total: total as u64,
+                        });
                     }
-                    _ => reading = false,
                 },
-                status = child.wait() => break status,
-                _ = tick.tick() => {
-                    if self.control.cancelled() {
-                        // Dropping the child kills it.
-                        return Err(Stop::Cancelled);
-                    }
-                }
-            }
-        }
-        .map_err(|e| converting(format!("Blender's job failed: {e}")))?;
-        while let Ok(Some(line)) = lines.next_segment().await {
-            printed.extend_from_slice(&line);
-            printed.push(b'\n');
-        }
-        capped.finish(status).await;
-        if let Some(killed) = capped.killed_by_cap(status) {
+                || self.control.cancelled(),
+            )
+            .await
+            .map_err(|e| converting(format!("Could not run Blender: {e}")))?
+            .ok_or(Stop::Cancelled)?;
+        if let Some(killed) = capped.killed_by_cap(output.status) {
             return Err(Stop::Failed(converting(format!("Blender was {killed}"))));
         }
-        Ok(std::process::Output {
-            status,
-            stdout: printed,
-            stderr: errors.await.unwrap_or_default(),
-        })
+        Ok(output)
     }
 }
 
@@ -839,9 +795,9 @@ fn converting(why: String) -> String {
     format!("Converting to GLB failed: {why}")
 }
 
-/// Puts the GLB at `made` in the cache at `cached`, copied beside it and renamed, so the cache
-/// only ever holds whole GLBs.
-async fn publish(made: &Path, cached: &Path) -> Result<(), String> {
+/// Puts the GLB at `made`, which the tool `who` wrote, in the cache at `cached`, copied beside it
+/// and renamed, so the cache only ever holds whole GLBs.
+pub(super) async fn publish(made: &Path, cached: &Path, who: &str) -> Result<(), String> {
     let mut head = [0u8; 4];
     let read = async {
         use tokio::io::AsyncReadExt;
@@ -851,7 +807,7 @@ async fn publish(made: &Path, cached: &Path) -> Result<(), String> {
             .await
     };
     if read.await.is_err() || &head != b"glTF" {
-        return Err("Blender wrote no GLB".into());
+        return Err(format!("{who} wrote no GLB"));
     }
     let dir = cached.parent().expect("in the cache folder");
     let partial = dir.join(format!(".{}.partial", uuid::Uuid::new_v4()));

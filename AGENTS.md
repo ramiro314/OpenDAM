@@ -89,6 +89,8 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               changes a Rebuild answers (each file added, changed or missing
                               against the manifest, with only the choices its origin can
                               honour) and the kept files they carry,
+                              original, the original's state check and Locate
+                              original (`check_library`, `locate`),
                               metadata, the metadata step's `datapackage.json` by preset (Unity,
                               Fab, Kenney, none) and the Kenney store page lookup, build, a pack's build, first or later (stage beside the target,
                               lock, re-check, journal, swap, carry, index with Prune::Defer,
@@ -107,7 +109,17 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               cap in settings (import.blenderMemoryMax), and cached in
                               ~/.cache/opendam/import/glb by a key over every input's source
                               path, final name and sha256 (and, with binary Unity files,
-                              unity_text.py's VERSION and the locked UnityPy)
+                              unity_text.py's VERSION and the locked UnityPy), and unreal_glb, the
+                              export_unreal step: a zip's content-only Unreal project (refused
+                              with a Source/ folder) unzipped to a work copy with its plugins
+                              enabled there only, exported to GLBs by the embedded
+                              unreal_glb.py (UNREAL_GLB_VERSION) in headless Unreal Editor
+                              sessions of `batch` assets under import.unrealMemoryMax, the editor
+                              found at import.unrealEditorRoot, each GLB cached as its session
+                              ends so an interrupted run resumes, and tools, what Settings'
+                              Import tools section checks (assimp at import.assimpPath, the
+                              Unreal Editor) and the conversion cache's size, which Clear
+                              empties only while no run executes (Engine::cache_use)
     src/capped.rs             capped_command: a child process in a systemd user scope with
                               MemoryMax (as scripts/memory-cap.sh), uncapped with a warning
                               without systemd-run --user, and exit 137 reported as killed by the cap
@@ -140,9 +152,16 @@ docs/plans                    Plans for this fork
 - **Relative paths in library DBs.** Every path stored in `.opendam/library.sqlite` is relative to
   the library root (`textures/rock.png`, `.opendam/thumbs/...`), so a library folder works wherever
   it is mounted. The one exception is `imports.original_path`: an import's original lives outside
-  every library, so it is stored by absolute path, with its size, mtime and sha256.
+  every library, so it is stored by absolute path, with its size, mtime and sha256. Its state
+  (`imports.original_state`, `import::original`) is checked at startup, when a library opens, when
+  the Imports view opens and before a Rebuild, by size and mtime, hashing the file only when
+  either changed (and a changed file it already hashed, kept in `seen_*`, not again). A missing or
+  changed original refuses Rebuild while its packs keep working, until Locate original re-points
+  the import at a file with the same sha256, or Use this file names another file's sha256.
 - **Originals are read-only.** Nothing writes to an import's original or to the folder it sits in.
-  An original inside the library is refused (`import::engine::start_import`).
+  An original inside the library is refused (`import::engine::start_import`). An Unreal
+  project is changed (its plugins enabled) only in its work copy under
+  `~/.cache/opendam/import/work`.
 - **An imported pack changes on disk only by a swap.** A build, first or a rebuild, stages the
   whole pack beside its target as `.<Pack>.import-<build id>` (a dot folder, which no index
   walks), writing its manifest rows under the new build id, then takes the library's `index_lock`
