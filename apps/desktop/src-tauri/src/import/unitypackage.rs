@@ -4,7 +4,8 @@
 //! A package is a gzipped tar of GUID folders, each holding a `pathname`, and for a file an
 //! `asset` and its `asset.meta`. Extraction keeps every file and each `.meta`, drops `Assets/` and
 //! a top folder every file shares, and unpacks a nested package into a folder named after it.
-//! The original is only read. Every file it writes is a regular file it creates and fills from an
+//! The package is the original itself, or a variant inside a zip original (`extract_variant`),
+//! read from the zip as a stream. The original is only read. Every file it writes is a regular file it creates and fills from an
 //! entry's bytes, and it never asks the tar reader to unpack an entry, so no link is ever made.
 //!
 //! Unsafe entries (absolute or `..` pathnames, links, devices and other special types) and
@@ -22,6 +23,8 @@ use anyhow::{bail, Context, Result};
 use flate2::read::MultiGzDecoder;
 use serde::{Deserialize, Serialize};
 use tar::EntryType;
+
+use super::zipfile;
 
 /// A file the extraction wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -80,19 +83,57 @@ pub fn extract_unitypackage(
     target: &Path,
     subpath: Option<&str>,
 ) -> Result<Extraction> {
-    let subpath = match subpath {
+    let subpath = clean_subpath(subpath)?;
+    into_empty(target, |target| {
+        let original =
+            File::open(package).with_context(|| format!("opening {}", package.display()))?;
+        extract_into(original, &[], target, subpath.as_deref())
+    })
+}
+
+/// Extracts the variant `.unitypackage` at `variant` inside the zip `original`, as
+/// `extract_unitypackage` does. The variant's path in the zip starts every source path. The
+/// package is read straight from the zip, never written out whole.
+pub fn extract_variant(
+    original: &Path,
+    variant: &str,
+    target: &Path,
+    subpath: Option<&str>,
+) -> Result<Extraction> {
+    let subpath = clean_subpath(subpath)?;
+    into_empty(target, |target| {
+        let mut zip = zipfile::open(original)?;
+        let (index, name) = zipfile::variant(&mut zip, variant)?;
+        let package = zip
+            .by_index(index)
+            .with_context(|| format!("reading {name} in the zip"))?;
+        extract_into(package, &[name], target, subpath.as_deref())
+    })
+}
+
+/// A sub-folder option's clean form.
+pub(super) fn clean_subpath(subpath: Option<&str>) -> Result<Option<String>> {
+    match subpath {
         Some(raw) => match clean(raw) {
-            Ok(parts) if !parts.is_empty() => Some(parts.join("/")),
+            Ok(parts) if !parts.is_empty() => Ok(Some(parts.join("/"))),
             _ => bail!("invalid sub-folder {raw:?}"),
         },
-        None => None,
-    };
+        None => Ok(None),
+    }
+}
+
+/// Runs `extract` into `target`, which must be empty or missing. When it fails, the target is
+/// left as it was found: empty, or missing.
+pub(super) fn into_empty(
+    target: &Path,
+    extract: impl FnOnce(&Path) -> Result<Extraction>,
+) -> Result<Extraction> {
     let missing = !target.exists();
     fs::create_dir_all(target).with_context(|| format!("creating {}", target.display()))?;
     if fs::read_dir(target)?.next().is_some() {
         bail!("{} is not empty", target.display());
     }
-    let result = extract_into(package, target, subpath.as_deref());
+    let result = extract(target);
     if result.is_err() {
         // The target held nothing before, so everything in it is this call's.
         if let Err(err) = clear(target, missing) {
@@ -105,7 +146,14 @@ pub fn extract_unitypackage(
     result
 }
 
-fn extract_into(package: &Path, target: &Path, subpath: Option<&str>) -> Result<Extraction> {
+/// Unpacks the package read from `package`, whose own source path is `chain` (empty for the
+/// original itself), into `target`.
+fn extract_into(
+    package: impl Read,
+    chain: &[String],
+    target: &Path,
+    subpath: Option<&str>,
+) -> Result<Extraction> {
     // Entries are staged here, by number, until the pathnames are known, then renamed into place.
     let scratch = tempfile::Builder::new()
         .prefix(".extract-")
@@ -122,8 +170,7 @@ fn extract_into(package: &Path, target: &Path, subpath: Option<&str>) -> Result<
         blobs: 0,
         out: Extraction::default(),
     };
-    let original = File::open(package).with_context(|| format!("opening {}", package.display()))?;
-    unpack(&mut job, original, &[], subpath, "")?;
+    unpack(&mut job, package, chain, subpath, "")?;
     let mut out = job.out;
     scratch.close()?;
     if let (Some(subpath), true) = (subpath, out.files.is_empty()) {

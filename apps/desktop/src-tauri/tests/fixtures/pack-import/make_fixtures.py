@@ -18,12 +18,26 @@ committed, like `tests/fixtures/game-export/`. The fixtures grow with the plan's
   absolute pathname, a duplicate `pathname`, an asset whose `pathname` ends in `.meta`, a
   hardlink whose link name points outside the target, and a symlink. Extraction skips each of
   the last six and reports it. It has no golden, since `extract_unity.py` differs there by design.
+- `fab-unity.zip`: a Fab download with two variant packages, `Crypt/Crypt_URP.unitypackage` and
+  `Crypt/Crypt_Built-In.unitypackage`. Each holds `Assets/Crypt/` with `Art/`, a `Demo/` scene
+  folder beside it (so `flatten` keeps the root and `hoist Art` moves something), a `Readme.txt`
+  and a `Pipeline.txt` naming its pipeline.
+- `fab-unity-folders.zip`: the other Fab layout, one `Crypt/Crypt.unitypackage` whose
+  `Assets/Crypt/` holds the same files under a wrapper per pipeline, `URP/URP_Crypt/` and
+  `Built-In/Built-In_Crypt/`, beside a shared `Readme.txt`.
+- `kenney.zip`: the Kenney All-in-1's layout under a shared top folder `Kenney/`:
+  `<Category>/<Pack>/License.txt` with a Kenney header and CC0 text, for two packs and one under
+  `Archive/`, with folder entries as zip tools write them. The pack titles have no kenney.nl page.
+- `escape.zip`: `Esc/` with two files, plus an escaping `../escape.txt`, an absolute name, a
+  repeated path spelled apart (`Esc/./b.txt`), a symlink, a FIFO and a folder entry. Extraction
+  skips and reports each of the first five. It has no golden.
 """
 
 import gzip
 import io
 import struct
 import tarfile
+import zipfile
 import zlib
 from functools import partial
 from pathlib import Path
@@ -31,8 +45,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SM_LOG = HERE.parent / "game-export" / "library" / "Unity Moss" / "Models" / "SM_Log.fbx"
 
-# Every member's mtime: 2023-11-14 22:13:20 UTC.
+# Every member's mtime: 2023-11-14 22:13:20 UTC. A zip entry holds it as a DOS time, which has
+# no time zone; extraction reads it as UTC.
 MTIME = 1_700_000_000
+DOS_TIME = (2023, 11, 14, 22, 13, 20)
 
 # The wrapper levels below the shared top folder.
 WRAP = "Assets/Pack/Built-In/Built-In_Pack/Pack"
@@ -235,9 +251,149 @@ def escape() -> bytes:
     return pkg.finish()
 
 
+class Zip:
+    """A zip in the making, every entry made on Unix with a fixed time and mode."""
+
+    def __init__(self) -> None:
+        self.buf = io.BytesIO()
+        self.zip = zipfile.ZipFile(self.buf, "w")
+
+    def member(self, name: str, data: bytes = b"", mode: int = 0o100644):
+        info = zipfile.ZipInfo(name, date_time=DOS_TIME)
+        info.create_system = 3
+        info.external_attr = mode << 16
+        if name.endswith("/"):
+            info.external_attr |= 0x10  # MS-DOS directory bit, as zip tools set it
+        info.compress_type = zipfile.ZIP_DEFLATED
+        self.zip.writestr(info, data, compresslevel=9)
+
+    def folder(self, name: str):
+        self.member(f"{name}/", mode=0o040755)
+
+    def finish(self) -> bytes:
+        self.zip.close()
+        return self.buf.getvalue()
+
+
+def crypt(pkg: Package, g, root: str, pipeline: str):
+    """One pipeline's Crypt files under `root`: `Art/`, a `Demo/` scene folder and a
+    `Pipeline.txt` naming the pipeline."""
+    pkg.folder(g(1), root)
+    pkg.folder(g(2), f"{root}/Art")
+    pkg.file(g(3), f"{root}/Art/Textures/T_Stone.png", png((95, 95, 90, 255)), texture_meta(g(3)))
+    pkg.file(
+        g(4),
+        f"{root}/Art/Materials/M_Stone.mat",
+        material("M_Stone", g(3)),
+        meta(g(4), MAT_IMPORTER),
+    )
+    pkg.file(g(5), f"{root}/Demo/Demo.unity", b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n")
+    pkg.file(g(6), f"{root}/Pipeline.txt", f"{pipeline}\n".encode())
+
+
+def crypt_variant(pipeline: str) -> bytes:
+    pkg = Package()
+    crypt(pkg, partial(guid, "c1" if pipeline == "URP" else "c2"), "Assets/Crypt", pipeline)
+    pkg.file(guid("c3", 1), "Assets/Crypt/Readme.txt", b"Crypt, a Fab fixture pack.\n")
+    return pkg.finish()
+
+
+def fab_unity() -> bytes:
+    z = Zip()
+    z.member("Crypt/Crypt_URP.unitypackage", crypt_variant("URP"))
+    z.member("Crypt/Crypt_Built-In.unitypackage", crypt_variant("Built-In"))
+    return z.finish()
+
+
+def fab_unity_folders() -> bytes:
+    pkg = Package()
+    pkg.folder(guid("d1", 1), "Assets/Crypt")
+    pkg.file(guid("d1", 2), "Assets/Crypt/Readme.txt", b"Crypt, a Fab fixture pack.\n")
+    pkg.folder(guid("d1", 3), "Assets/Crypt/URP")
+    crypt(pkg, partial(guid, "d2"), "Assets/Crypt/URP/URP_Crypt", "URP")
+    pkg.folder(guid("d1", 4), "Assets/Crypt/Built-In")
+    crypt(pkg, partial(guid, "d3"), "Assets/Crypt/Built-In/Built-In_Crypt", "Built-In")
+    z = Zip()
+    z.member("Crypt/Crypt.unitypackage", pkg.finish())
+    return z.finish()
+
+
+def kenney_license(title: str) -> bytes:
+    """A Kenney `License.txt`: the title and version header, then CC0."""
+    return f"""
+
+\t{title} (1.0)
+
+\tCreated/distributed by Kenney (www.kenney.nl)
+\tCreation date: 14-11-2023
+
+\t\t\t------------------------------
+
+\tLicense: (Creative Commons Zero, CC0)
+\thttp://creativecommons.org/publicdomain/zero/1.0/
+
+\tThis content is free to use in personal, educational and commercial projects.
+\tSupport us by crediting Kenney or www.kenney.nl (this is not mandatory)
+
+\t\t\t------------------------------
+""".encode()
+
+
+def glb() -> bytes:
+    """A GLB holding an empty glTF scene."""
+    doc = b'{"asset":{"version":"2.0"},"scenes":[{"nodes":[]}],"scene":0}'
+    doc += b" " * (-len(doc) % 4)
+    body = struct.pack("<I", len(doc)) + b"JSON" + doc
+    return b"glTF" + struct.pack("<II", 2, 12 + len(body)) + body
+
+
+def kenney() -> bytes:
+    z = Zip()
+    z.folder("Kenney")
+    packs = {
+        "3D assets/Fixture Car Kit": {
+            "Models/car.glb": glb(),
+            "Preview.png": png((200, 60, 60, 255)),
+        },
+        "2D assets/Fixture Tiles": {
+            "Tiles/tile_0000.png": png((60, 160, 60, 255)),
+            "Tiles/tile_0001.png": png((60, 60, 160, 255)),
+        },
+        "Archive/Fixture Old Kit": {"old.png": png((128, 128, 128, 255))},
+    }
+    for category in sorted({p.split("/")[0] for p in packs}):
+        z.folder(f"Kenney/{category}")
+    for pack, files in packs.items():
+        z.folder(f"Kenney/{pack}")
+        z.member(f"Kenney/{pack}/License.txt", kenney_license(pack.split("/")[1]))
+        for folder in sorted({f.rsplit("/", 1)[0] for f in files if "/" in f}):
+            z.folder(f"Kenney/{pack}/{folder}")
+        for name, data in files.items():
+            z.member(f"Kenney/{pack}/{name}", data)
+    return z.finish()
+
+
+def escape_zip() -> bytes:
+    z = Zip()
+    z.member("Esc/Keep/a.txt", b"kept\n")
+    z.member("Esc/b.txt", b"first b\n")
+    z.member("../escape.txt", b"escaped\n")
+    z.member("/tmp/opendam-pack-import-absolute-zip.txt", b"absolute\n")
+    # The zip reader keeps one entry of an exactly repeated name, so the repeat is spelled apart.
+    z.member("Esc/./b.txt", b"second b\n")
+    z.member("Esc/link.txt", b"/etc/passwd", mode=0o120777)
+    z.member("Esc/fifo", mode=0o010644)
+    z.folder("Esc/Empty")
+    return z.finish()
+
+
 def main() -> None:
     (HERE / "synthetic.unitypackage").write_bytes(synthetic())
     (HERE / "escape.unitypackage").write_bytes(escape())
+    (HERE / "fab-unity.zip").write_bytes(fab_unity())
+    (HERE / "fab-unity-folders.zip").write_bytes(fab_unity_folders())
+    (HERE / "kenney.zip").write_bytes(kenney())
+    (HERE / "escape.zip").write_bytes(escape_zip())
 
 
 if __name__ == "__main__":

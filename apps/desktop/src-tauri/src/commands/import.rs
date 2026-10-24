@@ -7,8 +7,9 @@ use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
 
-/// Imports a `.unitypackage` original as a new pack at an explicit target folder, with its
-/// publisher, and queues its first build. Progress arrives as `import:progress` events, status
+/// Imports a `.unitypackage` or `.zip` original as a new pack from an explicit source in it (a
+/// zip's variant `.unitypackage` or folder, a package's pipeline folder), at an explicit target
+/// folder, with its publisher, and queues its first build. Progress arrives as `import:progress` events, status
 /// changes as `import:updated`, and `library:updated` once the build changed the library.
 #[tauri::command]
 pub async fn start_import(

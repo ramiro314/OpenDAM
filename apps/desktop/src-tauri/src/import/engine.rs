@@ -66,8 +66,11 @@ pub enum ImportEvent {
 
 pub type EventSink = Arc<dyn Fn(ImportEvent) + Send + Sync>;
 
-/// An Import pack request: a `.unitypackage` original, the pack's target folder relative to the
-/// library root, and its publisher.
+/// An Import pack request: a `.unitypackage` or `.zip` original, the pack's source inside it,
+/// the pack's target folder relative to the library root, and its publisher. The source is given
+/// explicitly: a `.unitypackage`, or one pipeline folder of it (`subpath`); in a zip, a variant
+/// `.unitypackage` (`variant`, and optionally its `subpath`), or a folder of the zip (`subpath`),
+/// else all of it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportRequest {
@@ -75,7 +78,18 @@ pub struct ImportRequest {
     pub original_path: String,
     pub target: String,
     pub publisher: String,
-    /// The place steps, `flatten` alone when left out (the Unity preset's).
+    /// A zip original's `.unitypackage` to build from, by its path in the zip.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// A folder of the package (a variant's, in a zip), or of the zip when there's no variant.
+    #[serde(default)]
+    pub subpath: Option<String>,
+    /// The metadata preset (`unity`, `fab`, `kenney`, `none`). Left out, it is `unity` for a
+    /// `.unitypackage`, `fab` for a zip's variant and `none` for a zip's folder.
+    #[serde(default)]
+    pub preset: Option<String>,
+    /// The place steps, the preset's when left out (plan Presets): `flatten` for `unity` and
+    /// `none`, `flatten` then `hoist Art` for `fab`, and none for `kenney`.
     #[serde(default)]
     pub place: Option<Vec<PlaceStep>>,
 }
@@ -481,7 +495,18 @@ impl Engine {
         if publisher.is_empty() {
             return Err("Name the pack's publisher".into());
         }
-        let original = original(&request.original_path, &root)?;
+        let (original, kind) = original(&request.original_path, &root)?;
+        let variant = request.variant.as_deref().map(str::trim);
+        if kind == "unitypackage" && variant.is_some() {
+            return Err("A .unitypackage original has no variant: only a zip holds them".into());
+        }
+        let preset = match request.preset.as_deref() {
+            Some(preset @ ("unity" | "fab" | "kenney" | "none")) => preset,
+            Some(other) => return Err(format!("{other:?} isn't a preset")),
+            None if kind == "unitypackage" => "unity",
+            None if variant.is_some() => "fab",
+            None => "none",
+        };
         check_target(&library.pool, &root, &target).await?;
 
         let path = original.clone();
@@ -494,25 +519,52 @@ impl Engine {
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("The original can't be read: {e}"))?;
 
+        let mut extract = serde_json::Map::new();
+        if let Some(variant) = variant {
+            extract.insert("variant".into(), variant.into());
+        }
+        if let Some(subpath) = &request.subpath {
+            extract.insert("subpath".into(), subpath.as_str().into());
+        }
+        let extract_kind = if kind == "zip" && variant.is_none() {
+            "extract_zip"
+        } else {
+            "extract_unitypackage"
+        };
         let mut steps = vec![StepRecord {
-            kind: "extract_unitypackage".into(),
-            options: json!({}),
+            kind: extract_kind.into(),
+            options: extract.into(),
         }];
-        let place = request.place.unwrap_or_else(|| vec![PlaceStep::Flatten]);
+        let place = request.place.unwrap_or_else(|| match preset {
+            "fab" => vec![
+                PlaceStep::Flatten,
+                PlaceStep::Hoist {
+                    folder: "Art".into(),
+                },
+            ],
+            "kenney" => vec![],
+            _ => vec![PlaceStep::Flatten],
+        });
         steps.extend(place.iter().map(StepRecord::place));
         steps.push(StepRecord {
             kind: "metadata".into(),
-            options: json!({ "preset": "unity", "publisher": publisher }),
+            options: json!({ "preset": preset, "publisher": publisher }),
         });
+        let source = [variant, request.subpath.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("/");
         let original_path = original.to_string_lossy();
         let import = NewImport {
             original_path: &original_path,
             original_size: size as i64,
             original_mtime_ns: mtime_ns,
             original_sha256: &sha256,
-            kind: "unitypackage",
+            kind,
+            source: &source,
             target: &target,
-            preset: "unity",
+            preset,
             steps: &steps,
         };
         // Checked again in the insert: an import that overlapped this one may have got there.
@@ -587,27 +639,27 @@ fn clean_target(target: &str) -> Result<String, String> {
     Ok(parts.join("/"))
 }
 
-/// The original as an absolute path: an existing `.unitypackage` outside the library, which
-/// nothing ever writes.
-fn original(path: &str, root: &Path) -> Result<PathBuf, String> {
+/// The original as an absolute path, with its kind: an existing `.unitypackage` or `.zip`
+/// outside the library, which nothing ever writes.
+fn original(path: &str, root: &Path) -> Result<(PathBuf, &'static str), String> {
     let original = Path::new(path)
         .canonicalize()
         .map_err(|e| format!("The original {path} can't be read: {e}"))?;
     if !original.is_file() {
         return Err(format!("The original {path} isn't a file"));
     }
-    let unitypackage = original
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("unitypackage"));
-    if !unitypackage {
-        return Err(format!("{path} isn't a .unitypackage"));
-    }
+    let extension = original.extension().and_then(|e| e.to_str());
+    let kind = match extension.map(str::to_ascii_lowercase).as_deref() {
+        Some("unitypackage") => "unitypackage",
+        Some("zip") => "zip",
+        _ => return Err(format!("{path} isn't a .unitypackage or a .zip")),
+    };
     if original.starts_with(root) {
         return Err(format!(
             "The original {path} is inside the library: an original stays outside it"
         ));
     }
-    Ok(original)
+    Ok((original, kind))
 }
 
 fn nests(target: &str, other: &str) -> String {
@@ -646,6 +698,7 @@ mod tests {
     use crate::fs_swap;
     use crate::import::build::FINISHING;
     use crate::import::unitypackage::tests::{fixture, golden, on_disk};
+    use crate::import::unitypackage::SkipReason;
 
     const TARGET: &str = "Pub/Synthetic";
 
@@ -669,8 +722,48 @@ mod tests {
                     .into_owned(),
                 target: TARGET.into(),
                 publisher: "Synthetic Studio".into(),
+                variant: None,
+                subpath: None,
+                preset: None,
                 place: Some(place),
             }
+        }
+
+        /// An import of the zip fixture `name` with the preset's place steps.
+        fn zip_request(
+            &self,
+            name: &str,
+            variant: Option<&str>,
+            subpath: Option<&str>,
+            target: &str,
+        ) -> ImportRequest {
+            ImportRequest {
+                original_path: fixture(name).to_string_lossy().into_owned(),
+                target: target.into(),
+                variant: variant.map(str::to_string),
+                subpath: subpath.map(str::to_string),
+                place: None,
+                ..self.request(vec![])
+            }
+        }
+
+        /// The current build's manifest below `target`, as `(path below it, source path)`.
+        async fn manifest(&self, target: &str) -> Vec<(String, Vec<String>)> {
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT o.path, o.source_path FROM import_outputs o JOIN import_packs p
+                 ON p.id = o.pack_id AND o.build_id = p.current_build WHERE p.target = ?
+                 ORDER BY o.path",
+            )
+            .bind(target)
+            .fetch_all(&self.lib.pool)
+            .await
+            .unwrap();
+            rows.into_iter()
+                .map(|(path, source)| {
+                    let rel = path.strip_prefix(&format!("{target}/")).unwrap();
+                    (rel.to_string(), serde_json::from_str(&source).unwrap())
+                })
+                .collect()
         }
 
         /// The import of `synthetic.unitypackage` whose output is the place golden.
@@ -952,6 +1045,225 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_kenney_pack_imported_by_sub_path_lands_at_its_category_and_pack() {
+        let s = setup().await;
+        let original = fixture("kenney.zip");
+        let before = stamp(&original);
+        let target = "3D assets/Fixture Car Kit";
+        let subpath = "Kenney/3D assets/Fixture Car Kit";
+        let mut request = s.zip_request("kenney.zip", None, Some(subpath), target);
+        request.preset = Some("kenney".into());
+        request.publisher = "Kenney".into();
+        let run = s.engine.start_import(request).await.unwrap();
+        let run = s.wait_for(&run.id, "done").await;
+        assert!(run.warnings.is_empty(), "{:?}", run.warnings);
+
+        let files = ["License.txt", "Models/car.glb", "Preview.png"];
+        assert_eq!(on_disk(&s.dir.path().join(target)), files);
+        let expected: Vec<(String, Vec<String>)> = files
+            .iter()
+            .map(|f| (f.to_string(), vec![format!("{subpath}/{f}")]))
+            .collect();
+        assert_eq!(s.manifest(target).await, expected);
+        let license = std::fs::read_to_string(s.dir.path().join(target).join("License.txt"));
+        assert!(license.unwrap().contains("Fixture Car Kit (1.0)"));
+        assert_eq!(
+            s.strings(&format!(
+                "SELECT file_path FROM assets WHERE file_path LIKE '{target}/%'
+                 AND file_path NOT LIKE '%.txt' ORDER BY file_path"
+            ))
+            .await,
+            [
+                format!("{target}/Models/car.glb"),
+                format!("{target}/Preview.png")
+            ]
+        );
+        // The Kenney preset: the zip's folder, no place step, and its metadata preset.
+        assert_eq!(
+            s.strings("SELECT kind || ' ' || options FROM import_steps ORDER BY position")
+                .await,
+            [
+                format!(r#"extract_zip {{"subpath":"{subpath}"}}"#),
+                r#"metadata {"preset":"kenney","publisher":"Kenney"}"#.to_string(),
+            ]
+        );
+        assert_eq!(
+            s.strings("SELECT i.kind || ' ' || p.source FROM imports i JOIN import_packs p")
+                .await,
+            [format!("zip {subpath}")]
+        );
+        s.other_asset_untouched().await;
+        assert_eq!(stamp(&original), before, "the original is unchanged");
+    }
+
+    #[tokio::test]
+    async fn a_fab_variant_and_a_pipeline_folder_build_from_inside_the_zip() {
+        let s = setup().await;
+        let originals = ["fab-unity.zip", "fab-unity-folders.zip"].map(|n| (n, stamp(&fixture(n))));
+        let variant = "Crypt/Crypt_URP.unitypackage";
+        let package = "Crypt/Crypt.unitypackage";
+        let requests = [
+            s.zip_request("fab-unity.zip", Some(variant), None, "Fab/Crypt"),
+            s.zip_request(
+                "fab-unity-folders.zip",
+                Some(package),
+                Some("URP"),
+                "Fab/Folders",
+            ),
+        ];
+        let mut runs = Vec::new();
+        for request in requests {
+            runs.push(s.engine.start_import(request).await.unwrap().id);
+        }
+        for run in &runs {
+            let run = s.wait_for(run, "done").await;
+            assert!(run.warnings.is_empty(), "{:?}", run.warnings);
+        }
+
+        // The Fab preset's `flatten` and `hoist Art` ran over each.
+        let hoisted = [
+            "Demo/Demo.unity",
+            "Demo/Demo.unity.meta",
+            "Materials/M_Stone.mat",
+            "Materials/M_Stone.mat.meta",
+            "Pipeline.txt",
+            "Pipeline.txt.meta",
+            "Textures/T_Stone.png",
+            "Textures/T_Stone.png.meta",
+        ];
+        let crypt = s.dir.path().join("Fab/Crypt");
+        let with_readme = [&hoisted[..], &["Readme.txt", "Readme.txt.meta"]].concat();
+        let mut sorted = with_readme.clone();
+        sorted.sort();
+        assert_eq!(on_disk(&crypt), sorted);
+        // The pipeline folder leaves out the package's shared `Readme.txt`.
+        let folders = s.dir.path().join("Fab/Folders");
+        assert_eq!(on_disk(&folders), hoisted);
+        for pack in [&crypt, &folders] {
+            let pipeline = std::fs::read_to_string(pack.join("Pipeline.txt")).unwrap();
+            assert_eq!(pipeline, "URP\n", "{}", pack.display());
+        }
+
+        let source = |manifest: &[(String, Vec<String>)], path: &str| {
+            let row = manifest.iter().find(|(p, _)| p == path);
+            row.unwrap().1.clone()
+        };
+        assert_eq!(
+            source(&s.manifest("Fab/Crypt").await, "Textures/T_Stone.png"),
+            [variant, "Assets/Crypt/Art/Textures/T_Stone.png"]
+        );
+        assert_eq!(
+            source(&s.manifest("Fab/Folders").await, "Textures/T_Stone.png"),
+            [
+                package,
+                "Assets/Crypt/URP/URP_Crypt/Art/Textures/T_Stone.png"
+            ]
+        );
+        assert_eq!(
+            s.strings("SELECT p.preset || ' ' || p.source FROM import_packs p ORDER BY p.target")
+                .await,
+            [format!("fab {variant}"), format!("fab {package}/URP")]
+        );
+        assert_eq!(
+            s.strings(
+                "SELECT options FROM import_steps WHERE kind = 'extract_unitypackage'
+                 ORDER BY options"
+            )
+            .await,
+            [
+                format!(r#"{{"subpath":"URP","variant":"{package}"}}"#),
+                format!(r#"{{"variant":"{variant}"}}"#),
+            ]
+        );
+        for (name, before) in originals {
+            assert_eq!(stamp(&fixture(name)), before, "{name} is unchanged");
+        }
+        s.other_asset_untouched().await;
+    }
+
+    #[tokio::test]
+    async fn a_zip_import_warns_of_each_unsafe_entry_and_writes_nothing_outside() {
+        let s = setup().await;
+        let original = fixture("escape.zip");
+        let before = stamp(&original);
+        let run = s
+            .engine
+            .start_import(s.zip_request("escape.zip", None, None, "Esc"))
+            .await
+            .unwrap();
+        let run = s.wait_for(&run.id, "done").await;
+        let warned: Vec<(String, SkipReason)> = run
+            .warnings
+            .iter()
+            .map(|w| (w.source_path.join(" > "), w.reason))
+            .collect();
+        assert_eq!(
+            warned,
+            [
+                ("../escape.txt".into(), SkipReason::Escapes),
+                (
+                    "/tmp/opendam-pack-import-absolute-zip.txt".into(),
+                    SkipReason::Absolute
+                ),
+                ("Esc/./b.txt".into(), SkipReason::Duplicate),
+                ("Esc/link.txt".into(), SkipReason::Symlink),
+                ("Esc/fifo".into(), SkipReason::Special),
+            ]
+        );
+        // The `none` preset's `flatten` merged the zip's top folder, then `Keep/`, which sat
+        // beside nothing but a doc.
+        assert_eq!(on_disk(&s.dir.path().join("Esc")), ["a.txt", "b.txt"]);
+        let library = on_disk(s.dir.path());
+        assert!(
+            library.iter().all(|p| p.starts_with("Esc/")
+                || p.starts_with("Other/")
+                || p.starts_with(".opendam/")),
+            "{library:?}"
+        );
+        assert!(!s.dir.path().parent().unwrap().join("escape.txt").exists());
+        assert_eq!(stamp(&original), before, "the original is unchanged");
+    }
+
+    #[tokio::test]
+    async fn a_zip_source_is_checked_at_the_request_and_at_the_build() {
+        let s = setup().await;
+        let mut request = s.golden_request();
+        request.variant = Some("Inner.unitypackage".into());
+        let error = s.engine.start_import(request).await.unwrap_err();
+        assert!(error.contains("has no variant"), "{error}");
+        let mut request = s.zip_request("kenney.zip", None, None, "K");
+        request.preset = Some("kenny".into());
+        let error = s.engine.start_import(request).await.unwrap_err();
+        assert_eq!(error, r#""kenny" isn't a preset"#);
+
+        // A variant or a folder the zip doesn't hold fails the build and leaves nothing.
+        let missing = [
+            s.zip_request(
+                "fab-unity.zip",
+                Some("Crypt/Crypt_HDRP.unitypackage"),
+                None,
+                "A",
+            ),
+            s.zip_request("kenney.zip", None, Some("Kenney/Nope"), "B"),
+        ];
+        let mut errors = Vec::new();
+        for request in missing {
+            let run = s.engine.start_import(request).await.unwrap();
+            errors.push(s.wait_for(&run.id, "failed").await.error.unwrap());
+        }
+        assert!(
+            errors[0].contains("holds no Crypt/Crypt_HDRP.unitypackage"),
+            "{errors:?}"
+        );
+        assert!(
+            errors[1].contains("no file under Kenney/Nope"),
+            "{errors:?}"
+        );
+        assert!(!s.dir.path().join("A").exists() && !s.dir.path().join("B").exists());
+        s.other_asset_untouched().await;
+    }
+
+    #[tokio::test]
     async fn cancel_before_the_lock_deletes_the_staging_folder_and_changes_nothing() {
         let s = setup().await;
         let assets = s.strings("SELECT id FROM assets ORDER BY id").await;
@@ -1099,7 +1411,10 @@ mod tests {
         let not_a_package = s.dir.path().join("Other/Tree.png");
         request.original_path = not_a_package.to_string_lossy().into();
         let error = s.engine.start_import(request).await.unwrap_err();
-        assert!(error.ends_with("isn't a .unitypackage"), "{error}");
+        assert!(
+            error.ends_with("isn't a .unitypackage or a .zip"),
+            "{error}"
+        );
         let inside = s.dir.path().join("Other/In.unitypackage");
         std::fs::copy(fixture("synthetic.unitypackage"), &inside).unwrap();
         let mut request = s.golden_request();
@@ -1401,6 +1716,7 @@ mod tests {
                     original_mtime_ns: 0,
                     original_sha256: "",
                     kind: "unitypackage",
+                    source: "",
                     target,
                     preset: "unity",
                     steps: &[],
