@@ -291,4 +291,86 @@ mod tests {
             "its row was pruned"
         );
     }
+
+    #[tokio::test]
+    async fn an_original_s_own_datapackage_json_at_the_pack_root_fails_the_build() {
+        use std::io::Write;
+        let s = setup().await;
+        // Outside the library: a zip whose `Docs/datapackage.json` reaches the pack root once
+        // `Docs` is hoisted.
+        let originals = tempfile::tempdir().unwrap();
+        let original = originals.path().join("own.zip");
+        let own: &[u8] = b"{\"name\": \"theirs\"}\n";
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&original).unwrap());
+        for (name, data) in [
+            ("Own/a.fbx", &b"fbx"[..]),
+            ("Own/Docs/datapackage.json", own),
+        ] {
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file(name, stored).unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap();
+        let request = ImportRequest {
+            original_path: original.to_string_lossy().into_owned(),
+            target: "Own".into(),
+            preset: Some("none".into()),
+            place: Some(vec![PlaceStep::Flatten]),
+            ..s.request(vec![])
+        };
+        let pack_id = s.import(request).await;
+        let live = s.dir.path().join("Own");
+        let ours = std::fs::read_to_string(live.join(metadata::FILE)).unwrap();
+        assert_eq!(
+            std::fs::read(live.join("Docs/datapackage.json")).unwrap(),
+            own
+        );
+        let build = s.pack().await.1;
+
+        let mut steps = s.engine.pack_steps("lib", &pack_id).await.unwrap().steps;
+        let at = steps
+            .iter()
+            .position(|step| step.kind == "metadata")
+            .unwrap();
+        steps.insert(
+            at,
+            Step {
+                kind: "hoist".into(),
+                enabled: true,
+                options: serde_json::json!({"folder": "Docs"}),
+            },
+        );
+        s.engine
+            .set_pack_steps("lib", &pack_id, steps)
+            .await
+            .unwrap();
+        let run = s.engine.rebuild_pack("lib", &pack_id).await.unwrap();
+        let run = s.wait_for(&run.id, "failed").await;
+        assert_eq!(
+            run.error.as_deref(),
+            Some(
+                "The original holds its own datapackage.json where the metadata step writes \
+                 datapackage.json: turn the step off to keep it"
+            )
+        );
+        // The live pack is as the last build left it, its own file not overwritten.
+        assert_eq!(
+            crate::import::unitypackage::tests::on_disk(&live),
+            ["Docs/datapackage.json", "a.fbx", "datapackage.json"]
+        );
+        assert_eq!(
+            std::fs::read(live.join("Docs/datapackage.json")).unwrap(),
+            own
+        );
+        assert_eq!(
+            std::fs::read_to_string(live.join(metadata::FILE)).unwrap(),
+            ours
+        );
+        assert_eq!(s.pack().await, ("built".into(), build, None));
+        for tag in ["import", "prev", "failed"] {
+            let left = crate::fs_swap::leftovers(&live, tag).unwrap();
+            assert!(left.is_empty(), "the staging folder is gone: {left:?}");
+        }
+    }
 }

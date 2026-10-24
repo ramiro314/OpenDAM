@@ -599,6 +599,78 @@ mod tests {
     }
 
     #[test]
+    fn a_kenney_pack_gets_cc0_only_when_its_license_names_it() {
+        let step: MetadataStep =
+            serde_json::from_value(serde_json::json!({"preset": "kenney"})).unwrap();
+        let license = |cc0| KenneyLicense {
+            file: "License.txt".into(),
+            header: Header {
+                title: Some("Car Kit".into()),
+                version: Some("3.1".into()),
+                cc0,
+            },
+        };
+        let pack = files(&["License.txt", "car.glb"]);
+        let named = step.package("3D/Car Kit", &pack, Some(&license(true)), None);
+        assert_eq!(
+            named.licenses,
+            [License {
+                name: "CC0-1.0".into(),
+                title: Some("Creative Commons Zero v1.0 Universal".into()),
+                path: Some("License.txt".into()),
+            }]
+        );
+        let unnamed = step.package("3D/Car Kit", &pack, Some(&license(false)), None);
+        assert!(unnamed.licenses.is_empty(), "{:?}", unnamed.licenses);
+        assert_eq!(unnamed.title, "Car Kit");
+        assert_eq!(unnamed.version.as_deref(), Some("3.1"));
+        // Without a license file there's no header and no license.
+        let none = step.package("3D/Car Kit", &files(&["car.glb"]), None, None);
+        assert!(none.licenses.is_empty());
+        assert_eq!((none.title.as_str(), none.version), ("Car Kit", None));
+    }
+
+    #[test]
+    fn the_none_preset_writes_only_what_was_set() {
+        let pack = files(&["Docs/readme.txt", "a.fbx"]);
+        let bare: MetadataStep =
+            serde_json::from_value(serde_json::json!({"preset": "none"})).unwrap();
+        let package = bare.package("Pub/Pack", &pack, None, None);
+        assert_eq!(
+            package.render(),
+            "{\n  \"$schema\": \"https://datapackage.org/profiles/2.0/datapackage.json\",\n  \
+             \"name\": \"pack\",\n  \"title\": \"Pack\",\n  \"resources\": [\n    {\n      \
+             \"name\": \"a.fbx\",\n      \"path\": \"a.fbx\"\n    }\n  ]\n}\n",
+            "no publisher from the folder above, no license, no homepage, no author"
+        );
+
+        let set: MetadataStep = serde_json::from_value(serde_json::json!({
+            "preset": "none",
+            "publisher": "Pub Co",
+            "license": "MIT",
+        }))
+        .unwrap();
+        let package = set.package("Pub/Pack", &pack, None, Some("https://kenney.nl/x"));
+        assert_eq!(
+            package.contributors,
+            [Contributor {
+                title: "Pub Co".into(),
+                roles: vec!["publisher"]
+            }]
+        );
+        assert_eq!(
+            package.licenses,
+            [License {
+                name: "MIT".into(),
+                title: None,
+                path: None
+            }]
+        );
+        assert_eq!(package.homepage, None);
+        assert!(package.sources.is_empty(), "no store page outside Kenney");
+    }
+
+    #[test]
     fn unknown_options_are_refused() {
         let step = serde_json::from_value::<MetadataStep>(serde_json::json!({
             "preset": "kenney", "lookup": true
