@@ -2326,4 +2326,94 @@ mod tests {
             ["Pub/R"]
         );
     }
+
+    #[tokio::test]
+    async fn the_publisher_defaults_to_the_latest_import_s() {
+        let s = setup_with(false).await;
+        let publisher = || async {
+            let fab = fixture("fab-unity.zip");
+            let scan = s.engine.scan("lib", &fab.to_string_lossy()).await.unwrap();
+            let pack = scan.offers[0].candidates[0].clone();
+            assert_eq!(
+                pack.steps.last().unwrap().options["publisher"],
+                pack.publisher.as_str()
+            );
+            (pack.publisher, pack.target)
+        };
+        // Imports recorded in the order they were made, each with its metadata step.
+        let import = |id: &'static str, created: i64, options: &'static str| {
+            let pool = s.lib.pool.clone();
+            async move {
+                for sql in [
+                    "INSERT INTO imports (id, original_path, original_size, original_mtime_ns,
+                     original_sha256, kind, created_at) VALUES (?1, '/o.zip', 0, 0, '', 'zip', ?2)",
+                    "INSERT INTO import_packs (id, import_id, target, preset)
+                     VALUES (?1, ?1, 'T/' || ?1, 'fab')",
+                    "INSERT INTO import_steps (pack_id, position, kind, enabled, options)
+                     VALUES (?1, 0, 'metadata', 1, ?3)",
+                ] {
+                    sqlx::query(sql)
+                        .bind(id)
+                        .bind(created)
+                        .bind(options)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                }
+            }
+        };
+
+        assert_eq!(publisher().await, (String::new(), "fab-unity".into()));
+        import("a", 1, r#"{"preset":"fab","publisher":"First"}"#).await;
+        import("b", 2, r#"{"preset":"fab","publisher":"Second"}"#).await;
+        assert_eq!(
+            publisher().await,
+            ("Second".into(), "Second/fab-unity".into())
+        );
+        // A later import whose metadata step names no publisher is passed over.
+        import("c", 3, r#"{"preset":"none"}"#).await;
+        assert_eq!(publisher().await.0, "Second");
+        // Imports made in the same millisecond: the one recorded last.
+        import("d", 4, r#"{"preset":"fab","publisher":"Third"}"#).await;
+        import("e", 4, r#"{"preset":"fab","publisher":"Fourth"}"#).await;
+        assert_eq!(publisher().await.0, "Fourth");
+    }
+
+    #[tokio::test]
+    async fn the_target_update_itself_refuses_a_target_nesting_with_another_pack() {
+        let s = setup_with(false).await;
+        unbuilt_pack(&s, "p", "Pub/Pack").await;
+        unbuilt_pack(&s, "q", "Elsewhere/Q").await;
+        let target_of_q = || async {
+            s.strings("SELECT target FROM import_packs WHERE id = 'q'")
+                .await
+                .remove(0)
+        };
+
+        for target in ["Pub", "Pub/Pack", "Pub/Pack/Sub"] {
+            let refused = records::set_target(&s.lib.pool, "q", target).await.unwrap();
+            assert_eq!(
+                refused,
+                Err(TargetRefused::Nests("Pub/Pack".into())),
+                "{target}"
+            );
+            assert_eq!(target_of_q().await, "Elsewhere/Q", "{target}");
+        }
+        // Its own target is no nesting.
+        records::set_target(&s.lib.pool, "q", "Elsewhere/Q/Deeper")
+            .await
+            .unwrap()
+            .unwrap();
+        for target in ["Pub/Package", "Pu", "Pub/Pac"] {
+            records::set_target(&s.lib.pool, "q", target)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(target_of_q().await, target);
+        }
+        assert_eq!(
+            records::set_target(&s.lib.pool, "nope", "X").await.unwrap(),
+            Err(TargetRefused::NoPack)
+        );
+    }
 }
