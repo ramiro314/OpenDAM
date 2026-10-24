@@ -388,47 +388,54 @@ export function ImportDialog() {
               </div>
             </div>
           )}
-          {draft && many && (
-            <div className={styles.footer}>
-              <span className={styles.hint}>
-                {plural(ticked, 'pack')} of {draft.candidates.length} ticked
-              </span>
-              <button
-                className={clsx(dialog.btn, dialog.secondaryBtn, styles.smallBtn)}
-                onClick={() =>
-                  edit((d) => ({
-                    ...d,
-                    candidates: d.candidates.map((c) => (c.imported ? c : { ...c, ticked: true })),
-                  }))
-                }
-              >
-                Tick all
-              </button>
-              <button
-                className={clsx(dialog.btn, dialog.secondaryBtn, styles.smallBtn)}
-                onClick={() =>
-                  edit((d) => ({
-                    ...d,
-                    candidates: d.candidates.map((c) => (c.imported ? c : { ...c, ticked: false })),
-                  }))
-                }
-              >
-                Untick all
-              </button>
-            </div>
-          )}
-          {draft && (
-            <ul className={styles.list}>
-              {draft.candidates.map((_, i) => (
-                <Candidate
-                  key={`${draft.offer}/${i}`}
-                  draft={draft}
-                  index={i}
-                  expandedByDefault={!many}
-                />
-              ))}
-            </ul>
-          )}
+          {/* Import sends the packs as they are when it starts, so nothing changes until it ends */}
+          <fieldset className={styles.lock} disabled={submitting}>
+            {draft && many && (
+              <div className={styles.footer}>
+                <span className={styles.hint}>
+                  {plural(ticked, 'pack')} of {draft.candidates.length} ticked
+                </span>
+                <button
+                  className={clsx(dialog.btn, dialog.secondaryBtn, styles.smallBtn)}
+                  onClick={() =>
+                    edit((d) => ({
+                      ...d,
+                      candidates: d.candidates.map((c) =>
+                        c.imported ? c : { ...c, ticked: true }
+                      ),
+                    }))
+                  }
+                >
+                  Tick all
+                </button>
+                <button
+                  className={clsx(dialog.btn, dialog.secondaryBtn, styles.smallBtn)}
+                  onClick={() =>
+                    edit((d) => ({
+                      ...d,
+                      candidates: d.candidates.map((c) =>
+                        c.imported ? c : { ...c, ticked: false }
+                      ),
+                    }))
+                  }
+                >
+                  Untick all
+                </button>
+              </div>
+            )}
+            {draft && (
+              <ul className={styles.list}>
+                {draft.candidates.map((_, i) => (
+                  <Candidate
+                    key={`${draft.offer}/${i}`}
+                    draft={draft}
+                    index={i}
+                    expandedByDefault={!many}
+                  />
+                ))}
+              </ul>
+            )}
+          </fieldset>
         </div>
         <div className={dialog.actions}>
           <span className={styles.footerNote} data-import-problem>

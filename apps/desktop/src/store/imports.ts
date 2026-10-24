@@ -457,7 +457,7 @@ interface ImportStore {
   /** Scans the dialog's original again for another library */
   setLibrary: (libraryId: string) => Promise<void>;
   pickOffer: (offer: number) => void;
-  /** Applies a pure draft change, such as `editTarget` or `editPublisher` */
+  /** Applies a pure draft change, such as `editTarget` or `editPublisher`, unless Import is submitting */
   edit: (change: (draft: ImportDraft) => ImportDraft) => void;
   /** Asks the library about candidate `i`'s target, unless it was asked already */
   checkTarget: (i: number) => Promise<void>;
@@ -578,9 +578,10 @@ export const useImportStore = create<ImportStore>()((set, get) => {
       set({ draft: draftFromScan(draft.libraryId, scanned, offer) });
     },
 
+    // Not while Import runs: it sends each pack as it was when Import was clicked
     edit: (change) => {
       const draft = get().draft;
-      if (draft) set({ draft: change(draft) });
+      if (draft && !get().submitting) set({ draft: change(draft) });
     },
 
     checkTarget: async (i) => {

@@ -630,6 +630,33 @@ describe('the dialog', () => {
     expect(useImportStore.getState().dialog).toBeNull();
   });
 
+  test('edits made while Import submits change nothing, so each pack goes as it was', async () => {
+    await open(kenneyScan);
+    const store = useImportStore.getState();
+    store.edit((d) => patchCandidate(d, 1, { ticked: true }));
+    const requests: ImportRequest[] = [];
+    let answerFirst: () => void = () => {};
+    api.startImport = (request) => {
+      requests.push(request);
+      const queued = run(`r${requests.length}`, ['p'], { status: 'queued' });
+      return requests.length === 1
+        ? new Promise((resolve) => (answerFirst = () => resolve(queued)))
+        : Promise.resolve(queued);
+    };
+    const submitted = store.submit();
+    await waitUntil(() => requests.length === 1);
+    // Untick the pending pack, retarget it, and Untick all, while the first answer is pending
+    const before = useImportStore.getState().draft;
+    store.edit((d) => editTarget(d, 1, 'Vehicles/Old Kit'));
+    store.edit((d) => patchCandidate(d, 1, { ticked: false }));
+    store.edit((d) => ({ ...d, candidates: d.candidates.map((c) => ({ ...c, ticked: false })) }));
+    expect(useImportStore.getState().draft).toBe(before);
+    answerFirst();
+    expect(await submitted).toBe(true);
+    expect(requests.map((r) => r.target)).toEqual(['3D assets/Car Kit', 'Archive/Old Kit']);
+    expect(useImportStore.getState().dialog).toBeNull();
+  });
+
   test('a step edit previews the tree of the new steps', async () => {
     await open(fabScan);
     const calls: unknown[] = [];
