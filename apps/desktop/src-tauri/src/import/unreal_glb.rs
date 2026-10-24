@@ -34,7 +34,7 @@ use crate::export::hashes::sha256_bytes;
 
 /// The script's version, which every GLB's cache key holds. The script declares it as
 /// `VERSION`, which a test keeps equal: bump both when the GLBs it writes change.
-pub const UNREAL_GLB_VERSION: &str = "opendam-unreal-glb/1";
+pub const UNREAL_GLB_VERSION: &str = "opendam-unreal-glb/2";
 
 /// The export script, embedded so the installed app needs no file beside it.
 const SCRIPT: &str = include_str!("unreal_glb.py");
@@ -405,13 +405,25 @@ impl Export<'_> {
         });
         let editor = self.tools.editor()?;
         let original = self.original.to_path_buf();
-        let (project, listing) = blocking(move || {
+        let (project, listing, doc_entries) = blocking(move || {
             let read = |e: anyhow::Error| format!("The original can't be read: {e:#}");
             let index = zipfile::index_zip(&original).map_err(read)?;
             let project = Project::find(&index.list(None).map_err(read)?)?
                 .ok_or_else(|| NO_PROJECT.to_string())?;
             let listing = index.list(project.dir.as_deref()).map_err(read)?;
-            Ok((project, listing))
+            // Each doc's entry, by the index the listing read it at: its name may not be the
+            // zip's own (an undecodable one is read lossily), so it isn't looked up by name.
+            let entries = index.file_entries();
+            let doc_entries = project
+                .docs
+                .iter()
+                .map(|doc| {
+                    let name = &doc.source_path[0];
+                    let entry = entries.get(name).copied();
+                    entry.ok_or_else(|| format!("{name} isn't among the zip's files"))
+                })
+                .collect::<Result<Vec<usize>, String>>()?;
+            Ok((project, listing, doc_entries))
         })
         .await?;
         if let Some(why) = project.refusal() {
@@ -461,10 +473,9 @@ impl Export<'_> {
             }
             let mut zip = zipfile::open(&original)
                 .map_err(|e| format!("The original can't be read: {e:#}"))?;
-            for doc in docs {
-                let size =
-                    zipfile::copy_entry(&mut zip, &doc.source_path[0], &staging.join(&doc.path))
-                        .map_err(|e| format!("Could not write {}: {e:#}", doc.path))?;
+            for (doc, entry) in docs.into_iter().zip(doc_entries) {
+                let size = zipfile::copy_entry(&mut zip, entry, &staging.join(&doc.path))
+                    .map_err(|e| format!("Could not write {}: {e:#}", doc.path))?;
                 files.push(ExtractedFile { size, ..doc });
             }
             Ok(files)
@@ -722,12 +733,17 @@ async fn exported_in(out: &Path) -> Result<BTreeSet<String>, Stop> {
     .await
 }
 
-/// The `/Game` paths the script failed on in this work folder, from its `.gltf-failed`.
+/// The `/Game` paths the script failed on in this work folder, from its `.gltf-failed`, one per
+/// line: a path can hold spaces (`/Game/My Pack/SM_Rock`).
 async fn failed_in(out: &Path) -> BTreeSet<String> {
     let failed = tokio::fs::read_to_string(out.join(".gltf-failed"))
         .await
         .unwrap_or_default();
-    failed.split_whitespace().map(str::to_string).collect()
+    failed
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Enables `PLUGINS` in the `.uproject` at `path`, a work copy: an entry it lists is turned on,
@@ -909,6 +925,21 @@ pub(crate) mod tests {
         assert!(
             clash.as_ref().is_err_and(|e| e.contains("Readme.txt")),
             "{clash:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_assets_are_read_one_per_line_spaces_and_all() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(failed_in(dir.path()).await.is_empty());
+        std::fs::write(
+            dir.path().join(".gltf-failed"),
+            "/Game/My Pack/SM_Rock\n\n/Game/Other/SM_Tree\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            failed_in(dir.path()).await.into_iter().collect::<Vec<_>>(),
+            ["/Game/My Pack/SM_Rock", "/Game/Other/SM_Tree"]
         );
     }
 

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import unreal
 
-VERSION = "opendam-unreal-glb/1"
+VERSION = "opendam-unreal-glb/2"
 
 OUT = Path(os.environ["GLTF_OUT"])
 TYPES = {"StaticMesh", "SkeletalMesh", "AnimSequence"}
@@ -67,7 +67,12 @@ def main() -> None:
     assets.sort(key=lambda a: str(a.package_name))
     opts = options()
     failed_list = OUT / ".gltf-failed"
-    failed_before = set(failed_list.read_text().split()) if failed_list.exists() else set()
+    # One package per line: a /Game path can hold spaces.
+    failed_before = (
+        {line for line in failed_list.read_text().splitlines() if line}
+        if failed_list.exists()
+        else set()
+    )
     targets = []
     for data in assets:
         rel = str(data.package_path).removeprefix("/Game").strip("/")
@@ -85,11 +90,20 @@ def main() -> None:
             task.enter_progress_frame(1, str(target.relative_to(OUT)))
             target.parent.mkdir(parents=True, exist_ok=True)
             partial = target.with_name(f".{target.stem}.partial.glb")
+            ok = False
             try:
-                unreal.GLTFExporter.export_to_gltf(data.get_asset(), str(partial), opts, set())
+                result = unreal.GLTFExporter.export_to_gltf(
+                    data.get_asset(), str(partial), opts, set()
+                )
+                # The exporter reports a failure by returning False (with its messages as a
+                # tuple's second item where the engine has them), not always by raising.
+                ok = bool(result[0] if isinstance(result, tuple) else result)
             except Exception as e:  # one bad asset must not stop the run
                 unreal.log_warning(f"[gltf] failed {data.package_name}: {e}")
-            if partial.exists():
+            if not ok:
+                # What a failed export left is no GLB to keep.
+                partial.unlink(missing_ok=True)
+            if ok and partial.exists():
                 partial.rename(target)
                 done += 1
                 unreal.log(f"[gltf] exported {data.package_name}")
