@@ -271,6 +271,46 @@ decision changed:
   generated, so `extracted` and `kept` count as the same file and only a generated GLB stays apart
   from its model. The manifest's uniqueness uses the same key (Flow, Steps, Records, A2, A4).
 
+Revised again 2026-10-23 (revision 20) while building the `unity_glb` step (ticket 8), whose
+reviews found the plan's cache key blind to things Blender reads. No decision changed. These are
+the step's deviations from `unity_gltf.py` and from this plan as written:
+
+- **R43 - No importer reads the pack by path.** Blender's FBX and OBJ importers find a texture,
+  and an OBJ its `.mtl`, by path relative to the model, which the key, blind to folders, can't
+  see. So a hoist could reuse a GLB a fresh conversion would no longer make. Now:
+  - **Copies.** Blender imports each model from a copy under its own name, in a scratch folder
+    of its own, assimp's binary copy of an ASCII FBX included, with the FBX image search off.
+  - **Textures by name.** Every texture an importer loaded is bound to the pack's file of that
+    name, through the same name map the script's name fallback uses, or dropped when the pack
+    has no file of that name. Textures embedded in an FBX are kept.
+  - **Libraries by name.** An OBJ's `mtllib` lines name the pack's `.mtl` of that name.
+  - **The cost.** A material left as the importer built it is opaque, since the importer never
+    sees the texture to wire its alpha. A pack of per-model folders with generic file names
+    (`Chair/model.mtl`, `Table/model.mtl`) gives every model the first folder's files.
+- **R44 - Every first-wins lookup is ordered and keyed.** The script's GUID index now reads the
+  `.meta` files sorted by path and keeps the first, where `unity_gltf.py` kept whichever `rglob`
+  found last. Names match as the script compares them: lowercased, letters and digits only. The
+  inputs hash records the order, by final path lowercased, of every set the script tells apart
+  only by path: same-named inputs, `.meta` files of one GUID, all prefabs and all scenes.
+  - **Scratch files.** JPEG copies and import copies go to the job's scratch folder, named by a
+    counter, not to `~/.cache/unity-gltf` by Python's per-process `hash()`.
+- **R45 - Which models, inputs and options.**
+  - **Per stem.** "None where the folder ships a `.glb`" is per stem, ignoring case, as the
+    script and the dialog's count do: `Tree.obj` still gets a GLB beside a shipped `Rock.glb`.
+  - **Options.** `force` converts again despite the cache, since overwriting a shipped GLB would
+    clash with the extracted file. A pack runs at most one enabled `unity_glb` step.
+  - **Failures.** A model Blender fails on fails the step, naming the model, where the script
+    went on. Excluding the model lets the pack build.
+  - **Inputs.** An OBJ's `.mtl` is an input. The texture extensions are one list, in Rust, sent
+    in the job. `.exr`, `.hdr` and `.gif` aren't in it, so they are dropped (Known gaps).
+- **R46 - Tools and settings.**
+  - **The cap's setting.** It is `import.blenderMemoryMax`, named like `export.blenderPath`.
+  - **The scope.** It also gets `OOMPolicy=kill` where systemd accepts it for scopes, as
+    `scripts/memory-cap.sh` does, and a SIGKILL under the cap counts as a cap kill, like 137.
+  - **Without Blender.** A Unity import adds `unity_glb` turned off, and `get_import_steps`
+    gives the reason (`unavailable`). A build with it on fails with that reason.
+  - **assimp.** It is `assimp` on `PATH`, with no setting yet.
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -689,7 +729,7 @@ they run in recipe order. Each step has `enabled` and JSON `options`.
 | `hoist` | place | `folder` | Moves one folder's contents up to the pack root, with the same clash rule. |
 | `rename` | place | `source` (the file's source path), `name` (the new file name) | Recorded by an in-app rename (D10). Renames the extracted file wherever earlier steps put it, and its `.meta` with it. |
 | `exclude` | place | `source` (the file's source path) | Recorded by an in-app delete (D10). Drops the extracted file and its `.meta`. |
-| `unity_glb` | convert | `max_texture` (1024), `force` | Runs the embedded `unity_glb.py` (ported `unity_gltf.py`) in Blender on a work copy, then writes one `X.glb` per model stem in a folder that doesn't already ship a `.glb` (D13). When the folder holds both `X.fbx` and `X.obj`, it converts the FBX, as the format group would pick it, and the OBJ gets no GLB. |
+| `unity_glb` | convert | `max_texture` (1024), `force` | Runs the embedded `unity_glb.py` (ported `unity_gltf.py`) in Blender on a work copy, then writes one `X.glb` per model stem, ignoring case, unless the folder already ships an `X.glb` (D13, R45). When the folder holds both `X.fbx` and `X.obj`, it converts the FBX, as the format group would pick it, and the OBJ gets no GLB. |
 | `metadata` | metadata | `preset` (`unity`, `fab`, `kenney`, `none`), `title`, `version`, `publisher`, `authors`, `license`, `sources`, `lookup_store_page` | Writes `datapackage.json` at the pack root (`gen_datapackage.py`, `gen_kenney_datapackage.py`). Its `resources` names the first model in the final tree. |
 
 - **Unsafe entries are skipped and reported.** Extraction writes only regular files and
@@ -801,7 +841,8 @@ whenever a target is edited:
 - **The script.** `unity_gltf.py` is embedded as `import/unity_glb.py` with a `VERSION`
   constant, and a test keeps it equal to the Rust `UNITY_GLB_VERSION`. Its material sources,
   property tables, LOD and collision dropping, and 1024 px JPEG/PNG embedding are kept as they
-  are (D28).
+  are (D28). It finds every file by name, never by its path from the model, and reads its
+  first-wins lookups in path order (R43, R44).
 - **The work folder.** The step makes a work folder in the cache directory holding the staged
   pack's Unity files (`.meta`, `.mat`, `.prefab`, `.unity`), models and textures.
 - **Binary Unity files.** Binary `.mat`, `.prefab` and `.unity` files are rewritten to text in
@@ -812,9 +853,9 @@ whenever a target is edited:
   the sha256 of: the original's sha256, the model's source path, the step options,
   `UNITY_GLB_VERSION`, the Blender version, and the **inputs hash**.
   - **The inputs hash** covers every file the step copies into the work folder: Unity files,
-    models and textures. Each is listed by its source path (a kept file by its path in the pack),
-    its final file name in the pack and its sha256, which the staged manifest already holds,
-    sorted, then hashed.
+    models, `.mtl` files and textures. Each is listed by its source path (a kept file by its path
+    in the pack), its final file name in the pack and its sha256, which the staged manifest
+    already holds, sorted, then hashed. It also orders the GUID, prefab and scene sets (R44).
   - **Why file names count.** `unity_gltf.py` resolves materials and textures by GUID through
     the `.meta` files first, then falls back to file names (`by_name`, its `images` map by stem,
     `named_material`). It never matches by folder, but when two files share a name it keeps the
@@ -1003,7 +1044,7 @@ half manifest.
   `systemd-run --user --scope -p MemoryMax=<cap> -p MemorySwapMax=0`, mirroring
   `scripts/memory-cap.sh`. It warns and runs uncapped when `systemd-run --user` is unavailable,
   and reports exit 137 as `killed by the memory cap (<cap>)` (D20). The caps are settings
-  (`import.blender_memory_max`, default `12G`; `import.unreal_memory_max`, default `20G`).
+  (`import.blenderMemoryMax`, default `12G`, R46; `import.unreal_memory_max`, default `20G`).
 
 ### Settings
 
@@ -1455,6 +1496,15 @@ files go with their tags, ratings and collections, as on any delete (D27).
 - **The hidden `.mat` covers imported packs only** (R1). A Unity `.mat` in a folder you didn't
   import through OpenDAM stays visible.
 - **The Unreal preview is an estimate.** It counts every `.uasset` as a possible GLB.
+- **Some textures are dropped.** `.exr`, `.hdr` and `.gif` textures aren't copied into the work
+  copy, so a `.mat` naming one by GUID gets none, where `unity_gltf.py` loaded it (R45).
+- **Unity GLB leftovers.** A work folder left by a crash is never swept, the GLB cache is never
+  evicted, and a cancelled conversion's systemd scope isn't reset. The key doesn't hold
+  assimp's version, and a build needs Blender even when every GLB is cached, since the key
+  holds Blender's.
+- **Name lookups have limits.** Paths that differ only by case are ordered as the file system
+  lists them, which the key can't capture. Generic per-model file names share the first
+  folder's files (R43).
 - **Conversion heuristics are unchanged.** Smoothness maps (`_MetallicGlossMap`, HDRP
   `_MaskMap`) still aren't converted. HDRP-only packs convert less well than URP and Built-in.
 - **No bulk import.** There's no Unity-cache scan and no watched inbox. Each original is

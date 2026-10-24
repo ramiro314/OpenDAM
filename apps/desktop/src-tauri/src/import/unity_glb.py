@@ -34,7 +34,8 @@ as they are:
   should use; these GLBs are for browsing.
 
 What differs from the script, so its output depends only on the work copy's files, their names
-and the order of their paths, which OpenDAM's cache key covers:
+and the order of their paths, which OpenDAM's cache key covers (the plan's deviations,
+docs/plans/pack-import/plan.md R43-R46, record each with its cost):
 
 - It converts the models the job names and writes each GLB where the job says. OpenDAM decides
   which models get one (one per stem, none where the pack ships the GLB) and caches them.
