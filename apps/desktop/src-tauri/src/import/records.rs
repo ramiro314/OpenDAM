@@ -20,7 +20,10 @@ pub struct Output {
     pub size: u64,
     pub mtime_ns: i64,
     pub sha256: String,
+    /// Empty for the metadata step's `datapackage.json`, which comes from no entry.
     pub source_path: Vec<String>,
+    /// Made by a step (`datapackage.json`), not extracted.
+    pub generated: bool,
 }
 
 /// One pack of a run, with the `recipe_rev` it was queued at.
@@ -241,13 +244,15 @@ pub struct Recipe {
     pub original_size: i64,
     pub original_mtime_ns: i64,
     pub kind: String,
+    /// The Kenney store page lookup's answer, `metadata::StorePage` as JSON, `None` before one.
+    pub store_page: Option<String>,
     /// Enabled steps in position order, as `(kind, options)`.
     pub steps: Vec<(String, Value)>,
 }
 
 pub async fn recipe(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Recipe> {
     #[allow(clippy::type_complexity)]
-    let (target, recipe_rev, current_build, swap_state, original_path, size, mtime, kind): (
+    let (target, recipe_rev, current_build, swap_state, original_path, size, mtime, kind, page): (
         String,
         i64,
         Option<String>,
@@ -256,9 +261,10 @@ pub async fn recipe(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Recipe> 
         i64,
         i64,
         String,
+        Option<String>,
     ) = sqlx::query_as(
         "SELECT p.target, p.recipe_rev, p.current_build, p.swap_state, i.original_path,
-         i.original_size, i.original_mtime_ns, i.kind
+         i.original_size, i.original_mtime_ns, i.kind, p.store_page
          FROM import_packs p JOIN imports i ON i.id = p.import_id WHERE p.id = ?",
     )
     .bind(pack_id)
@@ -281,6 +287,7 @@ pub async fn recipe(pool: &Pool<Sqlite>, pack_id: &str) -> sqlx::Result<Recipe> 
         original_size: size,
         original_mtime_ns: mtime,
         kind,
+        store_page: page,
         steps: steps
             .into_iter()
             .map(|(k, o)| (k, serde_json::from_str(&o).unwrap_or(Value::Null)))
@@ -480,7 +487,7 @@ pub async fn queue_rebuild(
     Ok(Ok(run_id))
 }
 
-/// Writes `outputs` as build `build_id`'s manifest rows, all extracted, in 200-row transactions.
+/// Writes `outputs` as build `build_id`'s manifest rows, in 200-row transactions.
 /// They mean nothing until the build commits.
 pub async fn write_outputs(
     pool: &Pool<Sqlite>,
@@ -493,7 +500,7 @@ pub async fn write_outputs(
         for output in chunk {
             sqlx::query(
                 "INSERT INTO import_outputs (pack_id, build_id, path, size, mtime_ns, sha256,
-                 origin, source_path) VALUES (?, ?, ?, ?, ?, ?, 'extracted', ?)",
+                 origin, source_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(pack_id)
             .bind(build_id)
@@ -501,6 +508,11 @@ pub async fn write_outputs(
             .bind(output.size as i64)
             .bind(output.mtime_ns)
             .bind(&output.sha256)
+            .bind(if output.generated {
+                "generated"
+            } else {
+                "extracted"
+            })
             .bind(source_json(&output.source_path))
             .execute(&mut *tx)
             .await?;
@@ -508,6 +520,38 @@ pub async fn write_outputs(
         tx.commit().await?;
     }
     Ok(())
+}
+
+/// Keeps the store page lookup's answer for pack `pack_id` (`metadata::StorePage` as JSON),
+/// replacing one for other URLs. It is no change to the pack's steps, so it bumps no
+/// `recipe_rev` (plan R24).
+pub async fn set_store_page(pool: &Pool<Sqlite>, pack_id: &str, answer: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE import_packs SET store_page = ? WHERE id = ?")
+        .bind(answer)
+        .bind(pack_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Forgets pack `pack_id`'s store page answer, so its next build looks the page up again.
+/// Refused while a run for the pack is queued or running, as a step edit is.
+pub async fn clear_store_page(
+    pool: &Pool<Sqlite>,
+    pack_id: &str,
+) -> sqlx::Result<Result<(), Refused>> {
+    let mut tx = pool.begin().await?;
+    let cleared = sqlx::query(&format!(
+        "UPDATE import_packs SET store_page = NULL WHERE id = ? AND NOT {BUSY}"
+    ))
+    .bind(pack_id)
+    .execute(&mut *tx)
+    .await?;
+    if cleared.rows_affected() == 0 {
+        return Ok(Err(refusal(&mut tx, pack_id).await?));
+    }
+    tx.commit().await?;
+    Ok(Ok(()))
 }
 
 /// Build `build_id`'s manifest rows as `(path, size)`, sorted by path.

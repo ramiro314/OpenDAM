@@ -173,7 +173,9 @@ CREATE TABLE IF NOT EXISTS imports (
 -- One pack of an import. `current_build` names the committed build (its `import_outputs` rows are
 -- the pack's manifest), NULL before the first. `recipe_rev` grows with every change to its steps.
 -- `swap_state` journals a swap in progress: 'swapping' with `swap_build` and `swap_prev`, whether
--- the swap moved a live folder aside, or 'removing'.
+-- the swap moved a live folder aside, or 'removing'. `store_page` keeps the Kenney store page
+-- lookup's answer outside the recipe: JSON {"urls", "page"}, the URLs tried and the page found
+-- (null for none), NULL before an answer.
 CREATE TABLE IF NOT EXISTS import_packs (
     id             TEXT PRIMARY KEY,
     import_id      TEXT NOT NULL REFERENCES imports(id) ON DELETE CASCADE,

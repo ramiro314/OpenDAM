@@ -1,0 +1,26 @@
+{
+  "$schema": "https://datapackage.org/profiles/2.0/datapackage.json",
+  "name": "crypt",
+  "title": "Crypt",
+  "contributors": [
+    {
+      "title": "Synthetic Studio",
+      "roles": [
+        "publisher"
+      ]
+    }
+  ],
+  "licenses": [
+    {
+      "name": "LicenseRef-Fab-Standard-License",
+      "title": "Fab Standard License",
+      "path": "https://www.fab.com/eula"
+    }
+  ],
+  "resources": [
+    {
+      "name": "demo.unity",
+      "path": "Demo/Demo.unity"
+    }
+  ]
+}

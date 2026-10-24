@@ -9,6 +9,7 @@
     "docs/**",
     ".github/actions/mission-flake-report/**",
     "apps/desktop/src-tauri/contract/**",
-    "apps/desktop/src-tauri/tests/fixtures/game-export/library/**"
+    "apps/desktop/src-tauri/tests/fixtures/game-export/library/**",
+    "apps/desktop/src-tauri/tests/fixtures/pack-import/expected/**"
   ]
 }

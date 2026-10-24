@@ -331,6 +331,7 @@ pub fn run(render_choice: render::RenderChoice) {
             commands::import::get_import_steps,
             commands::import::set_import_steps,
             commands::import::rebuild_import_pack,
+            commands::import::clear_import_store_page,
             commands::autotag::list_autotag_providers,
             commands::autotag::estimate_autotag_run,
             commands::autotag::start_autotag_run,

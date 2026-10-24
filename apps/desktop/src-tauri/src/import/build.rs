@@ -28,9 +28,10 @@ use std::time::Duration;
 use sqlx::{Pool, Sqlite};
 
 use super::carry;
+use super::metadata::{self, KenneyLicense, Lookup, MetadataStep};
 use super::place::{place, PlaceStep};
 use super::records::{self, InsertedRows, ManifestRow, Output, Recipe};
-use super::unitypackage::{extract_unitypackage, extract_variant, SkippedEntry};
+use super::unitypackage::{extract_unitypackage, extract_variant, ExtractedFile, SkippedEntry};
 use super::zipfile::extract_zip;
 use crate::db::{Database, LibraryHandle};
 use crate::fs_swap;
@@ -97,6 +98,9 @@ pub enum Point {
 pub struct Hooks {
     #[cfg(test)]
     points: Mutex<Vec<(Point, Hook)>>,
+    /// The store page lookup's HEAD request, injected.
+    #[cfg(test)]
+    head: Mutex<Option<metadata::Head>>,
 }
 
 #[cfg(test)]
@@ -125,6 +129,29 @@ impl Hooks {
             .unwrap()
             .push((point, Hook::Pause(pause.clone())));
         pause
+    }
+
+    /// Answers the store page lookup's HEAD requests with `head`.
+    #[cfg(test)]
+    pub fn store_pages(&self, head: metadata::Head) {
+        *self.head.lock().unwrap() = Some(head);
+    }
+
+    /// The store page lookup's HEAD request. In tests, the injected one, else one that never
+    /// reaches the network.
+    pub(crate) fn head(&self) -> metadata::Head {
+        #[cfg(test)]
+        {
+            use futures_util::FutureExt;
+            let injected = self.head.lock().unwrap().clone();
+            injected.unwrap_or_else(|| {
+                Arc::new(|url: String| {
+                    async move { Err(format!("no network in tests: {url}")) }.boxed()
+                })
+            })
+        }
+        #[cfg(not(test))]
+        metadata::http_head()
     }
 
     #[cfg(test)]
@@ -227,7 +254,11 @@ fn db_error(e: sqlx::Error) -> Stop {
 struct Plan {
     extract: Extract,
     place: Vec<PlaceStep>,
+    metadata: Option<MetadataStep>,
 }
+
+/// A recipe's steps by phase.
+type Parts = (Vec<Extract>, Vec<PlaceStep>, Vec<MetadataStep>);
 
 /// The extract step, by the original's kind.
 #[derive(Clone)]
@@ -252,27 +283,35 @@ pub fn check_steps(kind: &str, steps: &[records::Step]) -> Result<(), String> {
         .filter(|s| s.enabled)
         .map(|s| (s.kind.clone(), s.options.clone()))
         .collect();
-    if Plan::parts(kind, &enabled)?.0.len() != 1 {
+    let (extracts, _, metadata) = Plan::parts(kind, &enabled)?;
+    if extracts.len() != 1 {
         return Err("A pack needs exactly one extract step".into());
+    }
+    if metadata.len() > 1 {
+        return Err("A pack has at most one metadata step".into());
     }
     Ok(())
 }
 
 impl Plan {
     fn of(recipe: &Recipe) -> Result<Self, String> {
-        let (extracts, place) = Self::parts(&recipe.kind, &recipe.steps)?;
+        let (extracts, place, mut metadata) = Self::parts(&recipe.kind, &recipe.steps)?;
+        if metadata.len() > 1 {
+            return Err("A pack has at most one metadata step".into());
+        }
         match <[Extract; 1]>::try_from(extracts) {
-            Ok([extract]) => Ok(Plan { extract, place }),
+            Ok([extract]) => Ok(Plan {
+                extract,
+                place,
+                metadata: metadata.pop(),
+            }),
             Err(_) => Err("A pack needs exactly one extract step".into()),
         }
     }
 
-    /// The extract and place steps among `steps`, for an original of `kind`, refusing an unknown
-    /// step or invalid options.
-    fn parts(
-        kind: &str,
-        steps: &[(String, serde_json::Value)],
-    ) -> Result<(Vec<Extract>, Vec<PlaceStep>), String> {
+    /// The extract, place and metadata steps among `steps`, for an original of `kind`, refusing
+    /// an unknown step or invalid options.
+    fn parts(kind: &str, steps: &[(String, serde_json::Value)]) -> Result<Parts, String> {
         let zip = match kind {
             "unitypackage" => false,
             "zip" => true,
@@ -280,6 +319,7 @@ impl Plan {
         };
         let mut extracts = Vec::new();
         let mut place = Vec::new();
+        let mut metadata = Vec::new();
         for (kind, options) in steps {
             let text = |key: &str| options[key].as_str().map(str::to_string);
             match kind.as_str() {
@@ -309,13 +349,14 @@ impl Plan {
                             .map_err(|e| format!("The {kind} step's options are invalid: {e}"))?,
                     );
                 }
-                // Its datapackage.json comes with the metadata step's own work (plan Pack
-                // metadata). Until then the step only records the import's publisher.
-                "metadata" => {}
+                "metadata" => metadata.push(
+                    serde_json::from_value(options.clone())
+                        .map_err(|e| format!("The metadata step's options are invalid: {e}"))?,
+                ),
                 other => return Err(format!("The {other} step can't run yet")),
             }
         }
-        Ok((extracts, place))
+        Ok((extracts, place, metadata))
     }
 }
 
@@ -725,14 +766,24 @@ async fn stage(
     .await?;
     cancelled()?;
 
-    // Every staged file is extracted: its file key is its source path, not generated.
-    let unchanged: HashMap<String, (i64, String, i64)> = previous
+    let package = match &plan.metadata {
+        Some(step) => Some(write_package(env, recipe, step, staging, &files).await?),
+        None => None,
+    };
+    cancelled()?;
+
+    // A staged file's file key: its source path, and whether it is generated.
+    let unchanged: HashMap<(String, bool), (i64, String, i64)> = previous
         .iter()
-        .filter(|row| !row.generated)
         .filter_map(|row| {
-            let key = row.source_path.clone()?;
+            let key = (row.source_path.clone()?, row.generated);
             Some((key, (row.size, row.sha256.clone(), row.mtime_ns)))
         })
+        .collect();
+    let staged: Vec<(ExtractedFile, bool)> = files
+        .into_iter()
+        .map(|file| (file, false))
+        .chain(package.map(|file| (file, true)))
         .collect();
     let (to, target, control, progress) = (
         staging.to_path_buf(),
@@ -741,9 +792,9 @@ async fn stage(
         env.progress.clone(),
     );
     let outputs = tokio::task::spawn_blocking(move || {
-        let total = files.len() as u64;
-        let mut outputs = Vec::with_capacity(files.len());
-        for (done, file) in files.into_iter().enumerate() {
+        let total = staged.len() as u64;
+        let mut outputs = Vec::with_capacity(staged.len());
+        for (done, (file, generated)) in staged.into_iter().enumerate() {
             if control.cancelled() {
                 return Err(Stop::Cancelled);
             }
@@ -756,7 +807,7 @@ async fn stage(
             let read = |e: std::io::Error| format!("The staged {} can't be read: {e}", file.path);
             let (size, mut mtime_ns) = file_stamp(&path).map_err(read)?;
             let sha256 = crate::export::hashes::sha256_file(&path).map_err(read)?;
-            let key = records::source_json(&file.source_path);
+            let key = (records::source_json(&file.source_path), generated);
             if let Some((_, _, before)) = unchanged
                 .get(&key)
                 .filter(|(s, sha, _)| *s == size as i64 && *sha == sha256)
@@ -773,6 +824,7 @@ async fn stage(
                 mtime_ns,
                 sha256,
                 source_path: file.source_path,
+                generated,
             });
         }
         Ok(outputs)
@@ -787,6 +839,100 @@ async fn stage(
     env.hooks.at(Point::Staged).await?;
     cancelled()?;
     Ok(outputs)
+}
+
+/// The metadata step: writes the pack's `datapackage.json` into `staging`, beside the placed
+/// `files`, and returns it as a staged file, generated from no entry of the original.
+async fn write_package(
+    env: &BuildEnv<'_>,
+    recipe: &Recipe,
+    step: &MetadataStep,
+    staging: &Path,
+    files: &[ExtractedFile],
+) -> Result<ExtractedFile, Stop> {
+    (env.progress)(Progress {
+        step: "writing metadata",
+        done: 0,
+        total: 0,
+    });
+    if let Some(path) = metadata::clash(files) {
+        return Err(Stop::Failed(format!(
+            "The original holds its own {path} where the metadata step writes {}: turn the step \
+             off to keep it",
+            metadata::FILE
+        )));
+    }
+    let kenney = match metadata::license_file(files) {
+        Some(file) if step.preset == metadata::Preset::Kenney => {
+            let text = tokio::fs::read(staging.join(file))
+                .await
+                .map_err(|e| format!("The staged {file} can't be read: {e}"))?;
+            Some(KenneyLicense {
+                file: file.to_string(),
+                header: metadata::header(&String::from_utf8_lossy(&text)),
+            })
+        }
+        _ => None,
+    };
+    let folder = recipe.target.rsplit('/').next().unwrap_or(&recipe.target);
+    let page = if step.looks_up() {
+        let title = step.title(folder, kenney.as_ref());
+        store_page(env, recipe, &[&title, folder]).await?
+    } else {
+        None
+    };
+    let package = step.package(&recipe.target, files, kenney.as_ref(), page.as_deref());
+    let text = package.render();
+    tokio::fs::write(staging.join(metadata::FILE), &text)
+        .await
+        .map_err(|e| format!("Could not write {}: {e}", metadata::FILE))?;
+    Ok(ExtractedFile {
+        path: metadata::FILE.to_string(),
+        source_path: Vec::new(),
+        size: text.len() as u64,
+    })
+}
+
+/// The pack's Kenney store page, by the slugs of `names`: the answer kept in
+/// `import_packs.store_page` while it is for the same URLs, else what HEAD requests find, which
+/// is then kept there when they answered. A rebuild therefore makes no request unless the title
+/// or the folder the slugs come from changed. The kept answer is no change to the recipe, so
+/// neither this build's re-check nor another queued run fails over it (plan R24).
+async fn store_page(
+    env: &BuildEnv<'_>,
+    recipe: &Recipe,
+    names: &[&str],
+) -> Result<Option<String>, Stop> {
+    let urls = metadata::store_urls(names);
+    if urls.is_empty() {
+        return Ok(None);
+    }
+    let kept = recipe
+        .store_page
+        .as_deref()
+        .and_then(|kept| serde_json::from_str::<metadata::StorePage>(kept).ok())
+        .filter(|kept| kept.urls == urls);
+    if let Some(kept) = kept {
+        return Ok(kept.page);
+    }
+    (env.progress)(Progress {
+        step: "looking up the store page",
+        done: 0,
+        total: 0,
+    });
+    let page = match metadata::look_up(&env.hooks.head(), &urls).await {
+        Lookup::Found(url) => Some(url),
+        Lookup::Miss => None,
+        Lookup::Unknown => return Ok(None),
+    };
+    let answer = metadata::StorePage {
+        urls,
+        page: page.clone(),
+    };
+    records::set_store_page(&env.library.pool, &recipe.pack_id, &answer.to_json())
+        .await
+        .map_err(db_error)?;
+    Ok(page)
 }
 
 async fn blocking<T: Send + 'static>(
