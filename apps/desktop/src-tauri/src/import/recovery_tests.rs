@@ -246,7 +246,8 @@ mod tests {
 
     /// Starts an engine over `db`, whose startup marks the runs of gone owners `interrupted`.
     fn start_engine(db: &Arc<Database>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(Engine::new(db.clone(), Arc::new(|_| {})).start())
+        let (worker, _) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(Engine::new(db.clone(), Arc::new(|_| {}), worker).start())
     }
 
     // ── The `swap_state NULL` table ─────────────────────────────────────────

@@ -9,7 +9,9 @@ Supported operations (Phase 1):
   - video_thumb   → extract a frame from a video (requires ffmpeg)
   - model_meta    → extract metadata from 3D model files (stub → Phase 2)
   - fbx_facts     → an FBX's materials, meshes, bones and takes, for the game export
-  - engine_info   → the engine's `preview_version`
+  - unity_binary_to_text → a binary Unity `.mat`, `.prefab` or `.unity` file as text, for the
+                    import's `unity_glb` step
+  - engine_info   → the engine's `preview_version`, and whether UnityPy imports
 
 Phase 2 will add:
   - 3D thumbnails via assimp/Three.js headless or Blender headless
@@ -21,6 +23,7 @@ Phase 2 will add:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import subprocess
@@ -1260,10 +1263,39 @@ def fbx_facts(source: str, patterns: dict, library_root: str | None = None) -> d
     }
 
 
+# ── Binary Unity files ────────────────────────────────────────────────────
+def unity_binary_to_text(source: str, output: str) -> dict:
+    """Writes the binary Unity file at `source` (a work copy, never a library file) as Unity's
+    text format to `output`, for the import's `unity_glb` step (`unity_text`)."""
+    try:
+        import UnityPy  # noqa: F401
+
+        import unity_text
+    except Exception as e:
+        return {"ok": False, "error": f"UnityPy can't be imported: {e}"}
+    try:
+        text = unity_text.to_text(Path(source))
+        Path(output).parent.mkdir(parents=True, exist_ok=True)
+        Path(output).write_text(text, encoding="utf-8")
+        return {"ok": True, "output": output}
+    except Exception as e:
+        return {"ok": False, "error": f"UnityPy can't read it: {str(e) or type(e).__name__}"}
+
+
 # ── JSON-RPC loop ─────────────────────────────────────────────────────────
+def unitypy_imports() -> bool:
+    """Whether UnityPy can be imported, found without running the import, so `engine_info`
+    still loads nothing within the app's deadline for it."""
+    try:
+        return importlib.util.find_spec("UnityPy") is not None
+    except ImportError, ValueError:
+        return False
+
+
 def engine_info() -> dict:
-    """The engine's version, which the app asks each new worker process. Loads nothing."""
-    return {"preview_version": PREVIEW_VERSION}
+    """The engine's version, which the app asks each new worker process, and whether UnityPy,
+    which `unity_binary_to_text` needs, is installed. Loads nothing."""
+    return {"preview_version": PREVIEW_VERSION, "unitypy": unitypy_imports()}
 
 
 DISPATCH = {
@@ -1278,6 +1310,7 @@ DISPATCH = {
         p.get("pack_root"),
     ),
     "fbx_facts": lambda p: fbx_facts(p["source"], p["patterns"], p.get("library_root")),
+    "unity_binary_to_text": lambda p: unity_binary_to_text(p["source"], p["output"]),
 }
 
 
