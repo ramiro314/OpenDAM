@@ -478,4 +478,114 @@ mod tests {
         assert_eq!(s.read("Readme.txt"), "edited again");
         s.settled().await;
     }
+
+    /// A file whose stamp changed but whose bytes didn't is no difference: the check hashes it
+    /// on the mismatch and finds the manifest's sha256, so a Rebuild answers nothing.
+    #[tokio::test]
+    async fn a_file_rewritten_with_the_same_bytes_is_no_difference() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        let path = s.live().join("Readme.txt");
+        let bytes = std::fs::read(&path).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let later = before + std::time::Duration::from_secs(5);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+
+        assert!(s.drift(&pack_id).await.is_empty());
+        let run = s
+            .engine
+            .rebuild_pack("lib", &pack_id, Vec::new())
+            .await
+            .unwrap();
+        s.wait_for(&run.id, "done").await;
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        s.settled().await;
+    }
+
+    /// A kept file of its own at a path the build comes to write fails the build, naming it,
+    /// and changes nothing: the build's own file can't take the kept file's path.
+    #[tokio::test]
+    async fn a_kept_file_where_the_build_now_writes_fails_the_build_and_changes_nothing() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        // With `hoist Art` on there is no `Art/` folder: a file added there is kept as is.
+        std::fs::create_dir_all(s.live().join("Art")).unwrap();
+        s.write("Art/T_Rock.png", "my own rock");
+        let run = s.rebuild_choosing(&pack_id, |_| Choice::Keep).await;
+        s.wait_for(&run.id, "done").await;
+        assert_eq!(s.origin_of("Art/T_Rock.png").await, ("kept".into(), None));
+
+        // With the hoist off, the recipe's T_Rock.png lands at that path.
+        s.edit_steps(&pack_id, |steps| toggle(steps, "hoist", false))
+            .await;
+        let (build, rows) = (s.current_build().await, s.rows().await);
+        let failed = s.rebuild_until(&pack_id, "failed").await;
+        assert_eq!(
+            failed.error.unwrap(),
+            format!(
+                "{} is kept from outside changes where the build now writes its own file: \
+                 Rebuild again and discard it, or delete it in the app",
+                in_pack("Art/T_Rock.png")
+            )
+        );
+        assert_eq!(s.current_build().await, build);
+        assert_eq!(s.rows().await, rows);
+        assert_eq!(s.read("Art/T_Rock.png"), "my own rock");
+        assert!(
+            s.live().join("T_Rock.png").is_file(),
+            "the live folder is unchanged"
+        );
+        assert_eq!(s.kept(&pack_id).await, [in_pack("Art/T_Rock.png")]);
+        s.settled().await;
+    }
+
+    /// A missing file and its missing `.meta` both left out record one `exclude`, the asset's,
+    /// which drops its `.meta` too, so the rebuild builds.
+    #[tokio::test]
+    async fn excluding_a_missing_file_and_its_meta_records_one_step() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        let source = s.source_of("Textures/T_Log_D.png").await;
+        for path in ["Textures/T_Log_D.png", "Textures/T_Log_D.png.meta"] {
+            std::fs::remove_file(s.live().join(path)).unwrap();
+        }
+        let before = s.engine.pack_steps("lib", &pack_id).await.unwrap();
+        let chosen = s.choices(&pack_id, first).await;
+        assert_eq!(chosen.len(), 2);
+        assert!(chosen.iter().all(|c| c.choice == Choice::Exclude));
+
+        let run = s
+            .engine
+            .rebuild_pack("lib", &pack_id, chosen)
+            .await
+            .unwrap();
+        let after = s.engine.pack_steps("lib", &pack_id).await.unwrap();
+        assert_eq!(after.recipe_rev, before.recipe_rev + 1);
+        assert_eq!(after.steps[..before.steps.len()], before.steps[..]);
+        assert_eq!(
+            after.steps[before.steps.len()..],
+            [Step {
+                kind: "exclude".into(),
+                enabled: true,
+                options: serde_json::json!({ "source": source }),
+            }]
+        );
+        s.wait_for(&run.id, "done").await;
+        assert!(
+            !s.live().join("Textures").exists(),
+            "the emptied folder goes too"
+        );
+        assert!(s.drift(&pack_id).await.is_empty());
+        s.settled().await;
+    }
 }
