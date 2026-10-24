@@ -239,6 +239,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn use_this_file_once_rebuilds_every_pack_of_the_original_from_it() {
+        let s = setup().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.unitypackage");
+        std::fs::copy(fixture("synthetic.unitypackage"), &path).unwrap();
+        // Two imports of the one original, at two targets: one row in the Imports view
+        let targets = [TARGET, "Pub/Second"];
+        let mut packs = Vec::new();
+        for target in targets {
+            let mut request = s.golden_request();
+            request.original_path = path.to_string_lossy().into_owned();
+            request.target = target.into();
+            let run = s.engine.start_import(request).await.unwrap();
+            s.wait_for(&run.id, "done").await;
+            packs.push(run.packs[0].pack_id.clone());
+        }
+        let path = path.canonicalize().unwrap();
+        changed_package(&path);
+        let after = sha256(&path);
+        let imports = s.engine.check_originals("lib").await.unwrap();
+        let states: Vec<_> = imports
+            .iter()
+            .map(|i| (i.original_state.as_str(), i.changed_sha256.as_deref()))
+            .collect();
+        assert_eq!(states, [("changed", Some(after.as_str())); 2]);
+
+        // One Use this file names the new original for both imports
+        let used = s.locate(&path, &path, Some(&after)).await.unwrap();
+        assert_eq!(used, Located::Located);
+        assert_eq!(
+            s.strings("SELECT original_sha256 || ' ' || original_state FROM imports")
+                .await,
+            [format!("{after} ok"), format!("{after} ok")]
+        );
+
+        for (target, pack) in targets.iter().zip(&packs) {
+            let root = s.dir.path().join(target);
+            assert!(!root.join(ADDED).exists());
+            s.rebuild_until(pack, "done").await;
+            assert_eq!(
+                std::fs::read(root.join(ADDED)).unwrap(),
+                b"added",
+                "{target}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn an_unchanged_original_is_not_hashed_again() {
         let s = setup().await;
         let (original, _) = s.import_copy().await;
