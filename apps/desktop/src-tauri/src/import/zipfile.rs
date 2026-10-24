@@ -207,6 +207,25 @@ pub(super) fn open(original: &Path) -> Result<ZipArchive<File>> {
     ZipArchive::new(file).with_context(|| format!("reading the zip {}", original.display()))
 }
 
+/// Copies the entry named `name` in `zip` to a new file at `to`, with the entry's mtime, as the
+/// extraction writes each file, and returns its size. The entry must be one the zip's listing
+/// (`ZipIndex::list`) names: a regular file.
+pub(super) fn copy_entry(zip: &mut ZipArchive<File>, name: &str, to: &Path) -> Result<u64> {
+    let mut entry = zip
+        .by_name(name)
+        .with_context(|| format!("reading {name} in the zip"))?;
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating the folder of {name}"))?;
+    }
+    let mut file = File::create_new(to).with_context(|| format!("writing {}", to.display()))?;
+    let size =
+        io::copy(&mut entry, &mut file).with_context(|| format!("reading {name} in the zip"))?;
+    if let Some(mtime) = mtime(&entry) {
+        file.set_modified(mtime)?;
+    }
+    Ok(size)
+}
+
 /// The index and name of the regular file at `variant` in `zip`, compared on clean paths.
 pub(super) fn variant(zip: &mut ZipArchive<File>, variant: &str) -> Result<(usize, String)> {
     let want = match clean(variant) {

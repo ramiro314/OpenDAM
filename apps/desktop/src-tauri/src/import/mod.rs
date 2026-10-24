@@ -11,6 +11,7 @@ pub mod scan;
 pub mod settings;
 pub mod unity_glb;
 pub mod unitypackage;
+pub mod unreal_glb;
 pub mod zipfile;
 
 pub use recovery::{recover_swaps, Recovery};

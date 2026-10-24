@@ -31,6 +31,12 @@ committed, like `tests/fixtures/game-export/`. The fixtures grow with the plan's
 - `escape.zip`: `Esc/` with two files, plus an escaping `../escape.txt`, an absolute name, a
   repeated path spelled apart (`Esc/./b.txt`), a symlink, a FIFO and a folder entry. Extraction
   skips and reports each of the first five. It has no golden.
+- `unreal.zip`: a content-only Unreal project, `Feif/Feif.uproject` (named unlike the zip, with a
+  BOM and `GLTFExporter` listed but off), whose `Content/Fixture/` holds three meshes under
+  `Meshes/`, a texture under `Textures/` and a level, beside a `Readme.txt`, and a `README.md`
+  and `Config/` at the project root. The `.uasset` files are stand-ins: only their names count.
+- `unreal-source.zip`: the same project with a `Source/` folder of C++ code, which the prebuilt
+  editor can't compile.
 """
 
 import gzip
@@ -387,6 +393,47 @@ def escape_zip() -> bytes:
     return z.finish()
 
 
+UPROJECT = (
+    "\ufeff"
+    + """{
+\t"FileVersion": 3,
+\t"EngineAssociation": "5.4",
+\t"Category": "",
+\t"Description": "",
+\t"Plugins": [
+\t\t{
+\t\t\t"Name": "GLTFExporter",
+\t\t\t"Enabled": false
+\t\t},
+\t\t{
+\t\t\t"Name": "ModelingToolsEditorMode",
+\t\t\t"Enabled": true
+\t\t}
+\t]
+}
+"""
+).encode()
+
+
+def uasset(name: str) -> bytes:
+    """A stand-in `.uasset`: Unreal's package tag, then the asset's name."""
+    return b"\xc1\x83\x2a\x9e" + name.encode() + b"\n"
+
+
+def unreal(source: bool) -> bytes:
+    z = Zip()
+    z.member("Feif/Feif.uproject", UPROJECT)
+    z.member("Feif/README.md", b"# Feif\n\nA Fab fixture project.\n")
+    z.member("Feif/Config/DefaultEngine.ini", b"[/Script/EngineSettings.GameMapsSettings]\n")
+    for asset in ["Meshes/SM_A", "Meshes/SM_B", "Meshes/SM_C", "Textures/T_A"]:
+        z.member(f"Feif/Content/Fixture/{asset}.uasset", uasset(asset))
+    z.member("Feif/Content/Fixture/Maps/Demo.umap", uasset("Maps/Demo"))
+    z.member("Feif/Content/Fixture/Readme.txt", b"Fixture, an Unreal fixture pack.\n")
+    if source:
+        z.member("Feif/Source/Feif/Feif.Build.cs", b"public class Feif : ModuleRules {}\n")
+    return z.finish()
+
+
 def main() -> None:
     (HERE / "synthetic.unitypackage").write_bytes(synthetic())
     (HERE / "escape.unitypackage").write_bytes(escape())
@@ -394,6 +441,8 @@ def main() -> None:
     (HERE / "fab-unity-folders.zip").write_bytes(fab_unity_folders())
     (HERE / "kenney.zip").write_bytes(kenney())
     (HERE / "escape.zip").write_bytes(escape_zip())
+    (HERE / "unreal.zip").write_bytes(unreal(source=False))
+    (HERE / "unreal-source.zip").write_bytes(unreal(source=True))
 
 
 if __name__ == "__main__":

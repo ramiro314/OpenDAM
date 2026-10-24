@@ -14,6 +14,10 @@
 //!   folder below `Asset Store*/` in its path;
 //! - a zip holding `.unitypackage` files (Fab): one pack named after the zip, with every package
 //!   and every pipeline-named top folder of one as a variant, URP ticked;
+//! - a zip holding a `.uproject` (Fab Unreal): one pack named after the zip, refused when the
+//!   project has a `Source/` folder. Only the Unreal Editor knows which `.uasset` is a mesh or an
+//!   animation, so its tree is an estimate: a GLB for every `.uasset` below `Content/`, at most,
+//!   with the project's docs, placed by the pack's place steps;
 //! - a zip whose folders hold `License*.txt` files (the Kenney All-in-1): one pack per folder
 //!   directly holding one, at its path below a top folder every file shares, unticked under
 //!   `Archive` and `Early access`;
@@ -34,6 +38,7 @@ use super::records::StepRecord;
 use super::unitypackage::{
     below, list_unitypackage, list_variant, ExtractedFile, Extraction, SkippedEntry,
 };
+use super::unreal_glb::Project;
 use super::zipfile::{index_zip, ZipIndex};
 
 /// What scanning an original found.
@@ -54,7 +59,8 @@ pub struct Scan {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Offer {
-    /// The row: `unity` (a cached `.unitypackage`), `fab`, `kenney` or `zip` (any other zip).
+    /// The row: `unity` (a cached `.unitypackage`), `fab`, `unreal`, `kenney` or `zip` (any
+    /// other zip).
     pub layout: &'static str,
     pub candidates: Vec<Candidate>,
 }
@@ -73,6 +79,8 @@ pub struct Candidate {
     pub target_error: Option<String>,
     /// A Fab pack's variants, else none. At most one is ticked.
     pub variants: Vec<Variant>,
+    /// An Unreal pack's `.uproject`, by its path in the zip.
+    pub project: Option<String>,
     /// The default steps, the extract step naming the ticked variant's source.
     pub steps: Vec<StepRecord>,
     /// The build's tree from the ticked source, or `None` while a Fab pack has no variant ticked.
@@ -105,8 +113,11 @@ pub struct Tree {
     pub glbs: u64,
     /// The entries the extraction would skip.
     pub skipped: Vec<SkippedEntry>,
-    /// Why the build would fail, when it would: an unreadable archive, a clash in a step.
+    /// Why the build would fail, when it would: an unreadable archive, a clash in a step, an
+    /// Unreal project with a `Source/` folder.
     pub error: Option<String>,
+    /// Whether the tree is an estimate: an Unreal pack's, whose `glbs` are at most so many.
+    pub estimate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -167,6 +178,7 @@ impl Tree {
             glbs,
             skipped: Vec::new(),
             error: None,
+            estimate: false,
         }
     }
 
@@ -331,6 +343,7 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
                 publisher,
                 target_error: None,
                 variants: Vec::new(),
+                project: None,
                 steps,
             }],
         }]);
@@ -341,6 +354,9 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
     let mut offers = Vec::new();
     if let Some(fab) = fab(original, &zip, &name, publisher) {
         offers.push(fab);
+    }
+    if let Some(unreal) = unreal(&index, &zip, &name, publisher) {
+        offers.push(unreal);
     }
     if let Some(kenney) = kenney(&index, &zip, &name) {
         offers.push(kenney);
@@ -360,6 +376,7 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
             publisher: publisher.to_string(),
             target_error: None,
             variants: Vec::new(),
+            project: None,
             steps,
         }],
     });
@@ -451,8 +468,70 @@ fn fab(original: &Path, zip: &Extraction, name: &str, publisher: &str) -> Option
             target: publisher_target(publisher, name),
             target_error: None,
             variants,
+            project: None,
             steps,
             tree,
+        }],
+    })
+}
+
+/// The place steps of an Unreal pack: its meshes hoisted to the root (`Waterways/Meshes/`).
+pub fn unreal_place() -> Vec<PlaceStep> {
+    vec![
+        PlaceStep::Flatten,
+        PlaceStep::Hoist {
+            folder: "Meshes".into(),
+        },
+    ]
+}
+
+/// A zip holding a `.uproject`, at any depth: one pack named after the zip (`Waterways`, not
+/// `Feif`), unticked with the reason when the project can't be exported. Its tree is the
+/// project's estimate (`Project::estimate`), placed and counted as a build's would be.
+fn unreal(index: &ZipIndex, zip: &Extraction, name: &str, publisher: &str) -> Option<Offer> {
+    let place = unreal_place();
+    let found = Project::find(zip).transpose()?;
+    let (project, tree) = match found {
+        Ok(project) => {
+            // The entries an export would skip are those of the project's folder.
+            let skipped = index
+                .list(project.dir.as_deref())
+                .map(|listing| listing.skipped)
+                .unwrap_or_default();
+            let estimate = Extraction {
+                files: project.estimate(),
+                skipped,
+            };
+            let mut tree = preview(Ok(estimate), &place, false);
+            if tree.error.is_none() {
+                // At most one per `.uasset`: "at most N models".
+                tree.glbs = project.assets.len() as u64;
+            }
+            tree.error = project.refusal().or(tree.error);
+            tree.estimate = true;
+            (Some(project), tree)
+        }
+        Err(error) => (None, Tree::failed(anyhow::anyhow!(error), Vec::new())),
+    };
+    let mut steps = vec![step(
+        "export_unreal",
+        super::unreal_glb::Options::default_json(),
+    )];
+    steps.extend(place_steps(&place));
+    steps.push(metadata("fab", publisher));
+    Some(Offer {
+        layout: "unreal",
+        candidates: vec![Candidate {
+            name: name.to_string(),
+            ticked: tree.error.is_none(),
+            preset: "fab",
+            publisher: publisher.to_string(),
+            target: publisher_target(publisher, name),
+            target_error: None,
+            variants: Vec::new(),
+            project: project.map(|p| p.path()),
+            steps,
+            tree: Some(tree),
         }],
     })
 }
@@ -534,6 +613,7 @@ fn kenney(index: &ZipIndex, zip: &Extraction, name: &str) -> Option<Offer> {
                 target: target.to_string(),
                 target_error: None,
                 variants: Vec::new(),
+                project: None,
                 steps: vec![
                     step("extract_zip", source(None, subpath)),
                     step(
@@ -916,6 +996,64 @@ mod tests {
         );
         let expected = built(|to| extract_zip(&original, to, None), &flatten(), false);
         assert_eq!(zip.tree.as_ref(), Some(&expected));
+    }
+
+    #[test]
+    fn an_unreal_zip_is_one_pack_whose_tree_estimates_the_export_placed() {
+        let offers = detect(&fixture("unreal.zip"), "zip", "Fab").unwrap();
+        assert_eq!(layouts(&offers), ["unreal", "zip"]);
+        let [pack] = &offers[0].candidates[..] else {
+            panic!("{offers:?}");
+        };
+        // Named after the zip, not the project.
+        assert_eq!(
+            (
+                pack.name.as_str(),
+                pack.preset,
+                pack.target.as_str(),
+                pack.ticked
+            ),
+            ("unreal", "fab", "Fab/unreal", true)
+        );
+        assert_eq!(pack.project.as_deref(), Some("Feif/Feif.uproject"));
+        assert_eq!(
+            kinds(&pack.steps),
+            [
+                ("export_unreal", json!({ "batch": 30 })),
+                ("flatten", json!({})),
+                ("hoist", json!({ "folder": "Meshes" })),
+                ("metadata", json!({ "preset": "fab", "publisher": "Fab" })),
+            ]
+        );
+        let tree = pack.tree.as_ref().unwrap();
+        assert!(tree.estimate);
+        assert_eq!(tree.error, None);
+        // At most a GLB per .uasset (the level is none), placed: `flatten` merges `Fixture/`,
+        // and `hoist Meshes` lifts the meshes beside the docs and `datapackage.json`.
+        assert_eq!((tree.files, tree.glbs), (7, 4));
+        let folders: Vec<_> = tree
+            .folders
+            .iter()
+            .map(|f| (f.path.as_str(), f.files, f.total))
+            .collect();
+        assert_eq!(folders, [("", 6, 7), ("Textures", 1, 1)]);
+        let expected = Tree {
+            glbs: 4,
+            estimate: true,
+            ..Tree::of(
+                [
+                    "README.md",
+                    "Readme.txt",
+                    "SM_A.glb",
+                    "SM_B.glb",
+                    "SM_C.glb",
+                    "Textures/T_A.glb",
+                    metadata::FILE,
+                ],
+                false,
+            )
+        };
+        assert_eq!(tree, &expected);
     }
 
     #[test]

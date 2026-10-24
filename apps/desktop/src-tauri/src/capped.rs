@@ -145,6 +145,66 @@ impl Capped {
             .then(|| format!("killed by the memory cap ({max})"))
     }
 
+    /// Spawns the command and waits for it, its stdin closed and its output piped: `line` sees
+    /// each line it prints to stdout as it prints it, and `cancelled` is polled every 200 ms.
+    /// When that turns true the child is killed and the result is `None`. Every line of stdout
+    /// and all of stderr come back in the output, and the scope is `finish`ed.
+    pub async fn watch(
+        &mut self,
+        mut line: impl FnMut(&[u8]),
+        cancelled: impl Fn() -> bool,
+    ) -> std::io::Result<Option<std::process::Output>> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        let mut child = self
+            .command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut stderr = child.stderr.take().expect("piped");
+        let errors = tokio::spawn(async move {
+            let mut text = Vec::new();
+            let _ = stderr.read_to_end(&mut text).await;
+            text
+        });
+        // Read as bytes: a line that isn't UTF-8 must not stop the reading, or a full pipe
+        // would block the child.
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().expect("piped")).split(b'\n');
+        let mut printed = Vec::new();
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
+        let mut reading = true;
+        let status = loop {
+            tokio::select! {
+                read = lines.next_segment(), if reading => match read {
+                    Ok(Some(read)) => {
+                        line(&read);
+                        printed.extend_from_slice(&read);
+                        printed.push(b'\n');
+                    }
+                    _ => reading = false,
+                },
+                status = child.wait() => break status?,
+                _ = tick.tick() => {
+                    if cancelled() {
+                        // Dropping the child kills it.
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+        while let Ok(Some(read)) = lines.next_segment().await {
+            printed.extend_from_slice(&read);
+            printed.push(b'\n');
+        }
+        self.finish(status).await;
+        Ok(Some(std::process::Output {
+            status,
+            stdout: printed,
+            stderr: errors.await.unwrap_or_default(),
+        }))
+    }
+
     /// Clears the scope's failed state, which systemd keeps until reset, after a run that
     /// didn't exit cleanly.
     pub async fn finish(&self, status: ExitStatus) {
