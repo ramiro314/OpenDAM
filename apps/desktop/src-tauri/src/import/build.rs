@@ -24,7 +24,8 @@ use sqlx::{Pool, Sqlite};
 
 use super::place::{place, PlaceStep};
 use super::records::{self, InsertedRows, Output, Recipe};
-use super::unitypackage::{extract_unitypackage, SkippedEntry};
+use super::unitypackage::{extract_unitypackage, extract_variant, SkippedEntry};
+use super::zipfile::extract_zip;
 use crate::db::{Database, LibraryHandle};
 use crate::fs_swap;
 use crate::watcher::{self, IndexLock, Prune};
@@ -218,24 +219,52 @@ fn db_error(e: sqlx::Error) -> Stop {
 
 /// The steps a build runs, from its recipe.
 struct Plan {
-    subpath: Option<String>,
+    extract: Extract,
     place: Vec<PlaceStep>,
+}
+
+/// The extract step, by the original's kind.
+#[derive(Clone)]
+enum Extract {
+    /// The original `.unitypackage`, or with a `variant`, the one at that path in a zip original.
+    Unitypackage {
+        variant: Option<String>,
+        subpath: Option<String>,
+    },
+    /// A zip original, or one folder of it.
+    Zip { subpath: Option<String> },
 }
 
 impl Plan {
     fn of(recipe: &Recipe) -> Result<Self, String> {
-        if recipe.kind != "unitypackage" {
-            return Err(format!("{} originals can't be built yet", recipe.kind));
-        }
-        let mut subpath = None;
-        let mut extracts = 0;
+        let zip = match recipe.kind.as_str() {
+            "unitypackage" => false,
+            "zip" => true,
+            other => return Err(format!("{other} originals can't be built yet")),
+        };
+        let mut extracts = Vec::new();
         let mut place = Vec::new();
         for (kind, options) in &recipe.steps {
+            let text = |key: &str| options[key].as_str().map(str::to_string);
             match kind.as_str() {
                 "extract_unitypackage" => {
-                    extracts += 1;
-                    subpath = options["subpath"].as_str().map(str::to_string);
+                    let variant = text("variant");
+                    if zip != variant.is_some() {
+                        return Err(if zip {
+                            "The extract_unitypackage step of a zip names its variant".into()
+                        } else {
+                            "A .unitypackage original has no variant".into()
+                        });
+                    }
+                    extracts.push(Extract::Unitypackage {
+                        variant,
+                        subpath: text("subpath"),
+                    });
                 }
+                "extract_zip" if zip => extracts.push(Extract::Zip {
+                    subpath: text("subpath"),
+                }),
+                "extract_zip" => return Err("The extract_zip step needs a zip original".into()),
                 "flatten" | "hoist" | "rename" | "exclude" => {
                     let mut step = options.clone();
                     step["kind"] = kind.clone().into();
@@ -250,10 +279,10 @@ impl Plan {
                 other => return Err(format!("The {other} step can't run yet")),
             }
         }
-        if extracts != 1 {
-            return Err("A pack needs exactly one extract step".into());
+        match <[Extract; 1]>::try_from(extracts) {
+            Ok([extract]) => Ok(Plan { extract, place }),
+            Err(_) => Err("A pack needs exactly one extract step".into()),
         }
-        Ok(Plan { subpath, place })
     }
 }
 
@@ -607,9 +636,20 @@ async fn stage(
         done: 0,
         total: 0,
     });
-    let (to, subpath) = (staging.to_path_buf(), plan.subpath.clone());
+    let (to, extract) = (staging.to_path_buf(), plan.extract.clone());
     let extraction = blocking(move || {
-        extract_unitypackage(&original, &to, subpath.as_deref()).map_err(|e| format!("{e:#}"))
+        match &extract {
+            Extract::Unitypackage {
+                variant: None,
+                subpath,
+            } => extract_unitypackage(&original, &to, subpath.as_deref()),
+            Extract::Unitypackage {
+                variant: Some(variant),
+                subpath,
+            } => extract_variant(&original, variant, &to, subpath.as_deref()),
+            Extract::Zip { subpath } => extract_zip(&original, &to, subpath.as_deref()),
+        }
+        .map_err(|e| format!("{e:#}"))
     })
     .await?;
     warnings.extend(extraction.skipped);

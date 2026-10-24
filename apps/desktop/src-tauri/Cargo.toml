@@ -49,6 +49,8 @@ tempfile = "3"
 # Pack import: reads `.unitypackage` originals (gzipped tars) entry by entry, never unpacking one
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
+# and zip originals (Fab, Kenney), deflated or stored, through the flate2 above
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 [profile.release]
 codegen-units = 1

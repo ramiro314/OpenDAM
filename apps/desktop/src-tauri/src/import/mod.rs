@@ -5,6 +5,7 @@ pub mod engine;
 pub mod place;
 pub mod records;
 pub mod unitypackage;
+pub mod zipfile;
 
 use sqlx::{Pool, Sqlite};
 use std::path::Path;
