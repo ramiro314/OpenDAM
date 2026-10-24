@@ -175,9 +175,11 @@ docs/plans                    Plans for this fork
     CLI, or TypeSafe's Jev). They are made only for runs you start, and nothing is sent until a
     provider is set up.
   - The Kenney store page lookup: one or two HEAD requests to `https://kenney.nl/assets/<slug>`
-    per pack, made only by a Kenney pack's build with "Look up store page" ticked
-    (`import::metadata`). The answer is kept in `import_packs.store_page`, so a rebuild sends
-    none until you clear it.
+    per pack, made only by a Kenney pack's build with "Look up store page" ticked, which a
+    Kenney import is unless it turns it off (`lookupStorePage: false`, plan D22;
+    `import::metadata`). An answer (the page, or a 404 or 410 for each URL) is kept in
+    `import_packs.store_page`, so a rebuild sends none until you clear it. No answer, or
+    another status, keeps nothing, and the next build asks again.
 - **Claude-plan access is personal use only.** Anthropic's "Claude plan" access runs the owner's
   own installed, logged-in `claude` CLI (`autotag/claude_cli.rs`). Anthropic doesn't let
   third-party products offer claude.ai login or plan limits, so this access mode must be removed

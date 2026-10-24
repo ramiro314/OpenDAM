@@ -103,7 +103,8 @@ pub struct ImportRequest {
     pub version: Option<String>,
     #[serde(default)]
     pub license: Option<LicenseOption>,
-    /// "Look up store page": the Kenney preset's HEAD requests to kenney.nl, on when left out.
+    /// "Look up store page": the Kenney preset's HEAD requests to kenney.nl, ticked by default
+    /// for Kenney as the plan decides (D22), so on when left out.
     #[serde(default)]
     pub lookup_store_page: Option<bool>,
 }

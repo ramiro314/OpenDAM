@@ -410,9 +410,10 @@ pub type Head = Arc<dyn Fn(String) -> BoxFuture<'static, Result<u16, String>> + 
 pub enum Lookup {
     /// The first URL that answered 200.
     Found(String),
-    /// Every URL answered, none with 200.
+    /// Every URL answered that it has no page (404 or 410).
     Miss,
-    /// No URL answered 200 and one got no answer, so another try could find it.
+    /// No URL answered 200, and one got no answer or another status (a 503, a 429), so another
+    /// try could find it.
     Unknown,
 }
 
@@ -422,7 +423,11 @@ pub async fn look_up(head: &Head, urls: &[String]) -> Lookup {
     for url in urls {
         match head(url.clone()).await {
             Ok(200) => return Lookup::Found(url.clone()),
-            Ok(_) => {}
+            Ok(404 | 410) => {}
+            Ok(status) => {
+                tracing::info!("{url} answered {status}");
+                answered = false;
+            }
             Err(e) => {
                 tracing::info!("No answer from {url}: {e}");
                 answered = false;
@@ -709,8 +714,20 @@ mod tests {
             Lookup::Miss
         );
         assert_eq!(
+            look_up(&answers(Ok(410), Ok(404)), &urls).await,
+            Lookup::Miss
+        );
+        assert_eq!(
             look_up(&answers(Err("offline".into()), Ok(404)), &urls).await,
             Lookup::Unknown
         );
+        // A server error or a rate limit is no answer about the page.
+        for status in [503, 500, 429, 408, 403] {
+            assert_eq!(
+                look_up(&answers(Ok(404), Ok(status)), &urls).await,
+                Lookup::Unknown,
+                "{status}"
+            );
+        }
     }
 }
