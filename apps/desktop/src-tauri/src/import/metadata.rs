@@ -402,6 +402,21 @@ pub fn store_urls(names: &[&str]) -> Vec<String> {
     urls
 }
 
+/// A store page lookup's answer, as `import_packs.store_page` keeps it (JSON): the URLs it
+/// tried and the page found among them, if any. It holds only while a build would try the same
+/// URLs, so a changed title looks the page up again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorePage {
+    pub urls: Vec<String>,
+    pub page: Option<String>,
+}
+
+impl StorePage {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("a store page serializes")
+    }
+}
+
 /// A HEAD request: the status it got, or why it got none.
 pub type Head = Arc<dyn Fn(String) -> BoxFuture<'static, Result<u16, String>> + Send + Sync>;
 

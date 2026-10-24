@@ -12,12 +12,21 @@ mod tests {
 
     use crate::import::engine::tests::{setup, setup_with, Setup, TARGET};
     use crate::import::engine::*;
-    use crate::import::metadata::{self, Head};
+    use crate::import::metadata::{self, Head, StorePage};
     use crate::import::place::PlaceStep;
     use crate::import::unitypackage::tests::fixture;
 
     const CAR_KIT: &str = "3D assets/Fixture Car Kit";
     const CAR_KIT_PAGE: &str = "https://kenney.nl/assets/fixture-car-kit";
+    const TILES_PAGE: &str = "https://kenney.nl/assets/fixture-tiles";
+
+    /// The answer kept for a lookup of `urls` that found `page`.
+    fn answer(urls: &[&str], page: Option<&str>) -> StorePage {
+        StorePage {
+            urls: urls.iter().map(|u| u.to_string()).collect(),
+            page: page.map(str::to_string),
+        }
+    }
 
     /// The golden `expected/<name>`.
     fn golden(name: &str) -> String {
@@ -63,11 +72,13 @@ mod tests {
             self.wait_for(&run.id, "done").await;
         }
 
-        async fn store_page(&self) -> Option<String> {
-            sqlx::query_scalar("SELECT store_page FROM import_packs")
+        /// The kept store page answer.
+        async fn store_page(&self) -> Option<StorePage> {
+            let kept: Option<String> = sqlx::query_scalar("SELECT store_page FROM import_packs")
                 .fetch_one(&self.lib.pool)
                 .await
-                .unwrap()
+                .unwrap();
+            kept.map(|json| serde_json::from_str(&json).unwrap())
         }
 
         async fn recipe_rev(&self) -> i64 {
@@ -97,14 +108,16 @@ mod tests {
             s.import(s.kenney_request(pack)).await;
             assert_eq!(s.package(pack), golden(&format!("{name}.datapackage.json")));
         }
+        assert_eq!(*calls.lock().unwrap(), [CAR_KIT_PAGE, TILES_PAGE]);
         assert_eq!(
-            *calls.lock().unwrap(),
-            [CAR_KIT_PAGE, "https://kenney.nl/assets/fixture-tiles"]
-        );
-        assert_eq!(
-            s.strings("SELECT store_page FROM import_packs WHERE preset = 'kenney'")
-                .await,
-            ["", ""],
+            s.strings(
+                "SELECT store_page FROM import_packs WHERE preset = 'kenney' ORDER BY target"
+            )
+            .await,
+            [
+                answer(&[TILES_PAGE], None).to_json(),
+                answer(&[CAR_KIT_PAGE], None).to_json()
+            ],
             "a miss is kept too"
         );
 
@@ -202,7 +215,10 @@ mod tests {
             [CAR_KIT_PAGE],
             "the second run asked nothing"
         );
-        assert_eq!(s.store_page().await.as_deref(), Some(CAR_KIT_PAGE));
+        assert_eq!(
+            s.store_page().await,
+            Some(answer(&[CAR_KIT_PAGE], Some(CAR_KIT_PAGE)))
+        );
         assert_eq!(s.recipe_rev().await, 0, "the answer is no step change");
 
         s.rebuild_done(&pack_id).await;
@@ -251,7 +267,64 @@ mod tests {
         let calls = kenney_nl(&s, "none");
         s.rebuild_done(&pack_id).await;
         assert_eq!(calls.lock().unwrap().len(), 1);
-        assert_eq!(s.store_page().await.as_deref(), Some(""));
+        assert_eq!(s.store_page().await, Some(answer(&[TILES_PAGE], None)));
+    }
+
+    #[tokio::test]
+    async fn a_title_set_later_looks_the_page_up_again() {
+        let s = setup().await;
+        // The header's title has no page.
+        let calls = kenney_nl(&s, "none");
+        let pack_id = s.import(s.kenney_request(CAR_KIT)).await;
+        assert_eq!(s.store_page().await, Some(answer(&[CAR_KIT_PAGE], None)));
+
+        // The right title, whose page exists.
+        let car_kit = "https://kenney.nl/assets/car-kit";
+        let calls_after = kenney_nl(&s, car_kit);
+        let mut steps = s.engine.pack_steps("lib", &pack_id).await.unwrap().steps;
+        let at = steps
+            .iter()
+            .position(|step| step.kind == "metadata")
+            .unwrap();
+        steps[at].options["title"] = "Car Kit".into();
+        s.engine
+            .set_pack_steps("lib", &pack_id, steps.clone())
+            .await
+            .unwrap();
+        s.rebuild_done(&pack_id).await;
+        assert_eq!(*calls.lock().unwrap(), [CAR_KIT_PAGE]);
+        assert_eq!(
+            *calls_after.lock().unwrap(),
+            [car_kit],
+            "the new slug first"
+        );
+        assert_eq!(
+            s.store_page().await,
+            Some(answer(&[car_kit, CAR_KIT_PAGE], Some(car_kit)))
+        );
+        let package: serde_json::Value = serde_json::from_str(&s.package(CAR_KIT)).unwrap();
+        assert_eq!(
+            package["sources"],
+            serde_json::json!([{"title": "Kenney", "path": car_kit}])
+        );
+
+        // Kept for those URLs: a rebuild asks nothing.
+        s.rebuild_done(&pack_id).await;
+        assert_eq!(calls_after.lock().unwrap().len(), 1);
+
+        // Back to the header's title: the page found for the other title isn't reused.
+        steps[at].options["title"] = serde_json::Value::Null;
+        s.engine
+            .set_pack_steps("lib", &pack_id, steps)
+            .await
+            .unwrap();
+        s.rebuild_done(&pack_id).await;
+        assert_eq!(*calls_after.lock().unwrap(), [car_kit, CAR_KIT_PAGE]);
+        assert_eq!(s.store_page().await, Some(answer(&[CAR_KIT_PAGE], None)));
+        assert_eq!(
+            s.package(CAR_KIT),
+            golden("kenney-car-kit.datapackage.json")
+        );
     }
 
     #[tokio::test]

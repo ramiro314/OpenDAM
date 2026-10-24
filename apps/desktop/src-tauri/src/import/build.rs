@@ -894,34 +894,42 @@ async fn write_package(
 }
 
 /// The pack's Kenney store page, by the slugs of `names`: the answer kept in
-/// `import_packs.store_page`, else what HEAD requests find, which is then kept there when they
-/// answered. A rebuild therefore makes no request, and the kept answer is no change to the
-/// recipe, so neither this build's re-check nor another queued run fails over it (plan R24).
+/// `import_packs.store_page` while it is for the same URLs, else what HEAD requests find, which
+/// is then kept there when they answered. A rebuild therefore makes no request unless the title
+/// or the folder the slugs come from changed. The kept answer is no change to the recipe, so
+/// neither this build's re-check nor another queued run fails over it (plan R24).
 async fn store_page(
     env: &BuildEnv<'_>,
     recipe: &Recipe,
     names: &[&str],
 ) -> Result<Option<String>, Stop> {
-    if let Some(kept) = &recipe.store_page {
-        return Ok(Some(kept.clone()).filter(|url| !url.is_empty()));
+    let urls = metadata::store_urls(names);
+    let kept = recipe
+        .store_page
+        .as_deref()
+        .and_then(|kept| serde_json::from_str::<metadata::StorePage>(kept).ok())
+        .filter(|kept| kept.urls == urls);
+    if let Some(kept) = kept {
+        return Ok(kept.page);
     }
     (env.progress)(Progress {
         step: "looking up the store page",
         done: 0,
         total: 0,
     });
-    let urls = metadata::store_urls(names);
-    let (answer, found) = match metadata::look_up(&env.hooks.head(), &urls).await {
-        Lookup::Found(url) => (Some(url.clone()), Some(url)),
-        Lookup::Miss => (Some(String::new()), None),
-        Lookup::Unknown => (None, None),
+    let page = match metadata::look_up(&env.hooks.head(), &urls).await {
+        Lookup::Found(url) => Some(url),
+        Lookup::Miss => None,
+        Lookup::Unknown => return Ok(None),
     };
-    if let Some(answer) = answer {
-        records::set_store_page(&env.library.pool, &recipe.pack_id, &answer)
-            .await
-            .map_err(db_error)?;
-    }
-    Ok(found)
+    let answer = metadata::StorePage {
+        urls,
+        page: page.clone(),
+    };
+    records::set_store_page(&env.library.pool, &recipe.pack_id, &answer.to_json())
+        .await
+        .map_err(db_error)?;
+    Ok(page)
 }
 
 async fn blocking<T: Send + 'static>(

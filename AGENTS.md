@@ -180,8 +180,9 @@ docs/plans                    Plans for this fork
     per pack, made only by a Kenney pack's build with "Look up store page" ticked, which a
     Kenney import is unless it turns it off (`lookupStorePage: false`, plan D22;
     `import::metadata`). An answer (the page, or a 404 or 410 for each URL) is kept in
-    `import_packs.store_page`, so a rebuild sends none until you clear it. No answer, or
-    another status, keeps nothing, and the next build asks again.
+    `import_packs.store_page` with the URLs it was for, so a rebuild sends none until you
+    clear it or the title or folder its slugs come from changes. No answer, or another status,
+    keeps nothing, and the next build asks again.
 - **Claude-plan access is personal use only.** Anthropic's "Claude plan" access runs the owner's
   own installed, logged-in `claude` CLI (`autotag/claude_cli.rs`). Anthropic doesn't let
   third-party products offer claude.ai login or plan limits, so this access mode must be removed

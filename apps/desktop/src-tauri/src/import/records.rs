@@ -244,7 +244,7 @@ pub struct Recipe {
     pub original_size: i64,
     pub original_mtime_ns: i64,
     pub kind: String,
-    /// The Kenney store page lookup's answer: the URL, `""` for no page, `None` before one.
+    /// The Kenney store page lookup's answer, `metadata::StorePage` as JSON, `None` before one.
     pub store_page: Option<String>,
     /// Enabled steps in position order, as `(kind, options)`.
     pub steps: Vec<(String, Value)>,
@@ -522,11 +522,11 @@ pub async fn write_outputs(
     Ok(())
 }
 
-/// Keeps the store page lookup's answer for pack `pack_id`: the URL, or `""` for no page. It is
-/// no change to the pack's steps, so it bumps no `recipe_rev` (plan R24). An answer already kept
-/// stays.
+/// Keeps the store page lookup's answer for pack `pack_id` (`metadata::StorePage` as JSON),
+/// replacing one for other URLs. It is no change to the pack's steps, so it bumps no
+/// `recipe_rev` (plan R24).
 pub async fn set_store_page(pool: &Pool<Sqlite>, pack_id: &str, answer: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE import_packs SET store_page = ? WHERE id = ? AND store_page IS NULL")
+    sqlx::query("UPDATE import_packs SET store_page = ? WHERE id = ?")
         .bind(answer)
         .bind(pack_id)
         .execute(pool)
