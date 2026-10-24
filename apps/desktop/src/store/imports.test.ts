@@ -216,6 +216,24 @@ describe('importRows', () => {
     expect(packStatus(rows[0].packs[0])).toBe('Failed');
   });
 
+  test('a cancelled or interrupted run shows as such unless the pack is built', () => {
+    const pack = (status: 'built' | 'never_built') => ({
+      id: 'p',
+      target: 'Pub/Pack',
+      preset: 'unity',
+      status,
+      builtAt: null,
+    });
+    for (const [runStatus, label] of [
+      ['cancelled', 'Cancelled'],
+      ['interrupted', 'Interrupted'],
+    ] as const) {
+      const r = run('r', ['p'], { status: runStatus });
+      expect(packStatus({ pack: pack('never_built'), run: r, progress: null })).toBe(label);
+      expect(packStatus({ pack: pack('built'), run: r, progress: null })).toBe('Built');
+    }
+  });
+
   test('keeps the same original apart in two libraries', () => {
     const other = { ...imports[2], id: 'i4', libraryId: 'other' };
     expect(importRows([imports[2], other], [], {}).map((r) => r.libraryId)).toEqual([
@@ -408,6 +426,19 @@ describe('the draft', () => {
     expect(draftProblem(draft)).toBeNull();
   });
 
+  test('targets nest on whole path components only', () => {
+    let draft = draftFromScan('lib', kenneyScan);
+    draft = patchCandidate(draft, 1, { ticked: true });
+    const at = (d: typeof draft, i: number, target: string) =>
+      patchCandidate(editTarget(d, i, target), i, { checkedTarget: target, targetError: null });
+    draft = at(at(draft, 0, 'Pub/Pack'), 1, 'Pub/Package');
+    expect([candidateProblem(draft, 0), candidateProblem(draft, 1)]).toEqual([null, null]);
+    expect(draftProblem(draft)).toBeNull();
+    draft = at(draft, 1, 'Pub/Pack/Sub');
+    expect(candidateProblem(draft, 0)).toBe('Pub/Pack would nest with Pub/Pack/Sub, also ticked');
+    expect(candidateProblem(draft, 1)).toBe('Pub/Pack/Sub would nest with Pub/Pack, also ticked');
+  });
+
   test('Import waits for a ticked pack and a publisher, and a build that would fail', () => {
     let draft = draftFromScan('lib', kenneyScan);
     expect(draftProblem(patchCandidate(draft, 0, { ticked: false }))).toBe('Tick a pack to import');
@@ -497,6 +528,59 @@ describe('the dialog', () => {
       'Pub/Pack/Sub would nest with the pack imported to Pub/Pack',
     ]);
     expect(candidateProblem(useImportStore.getState().draft!, 0)).toContain('Pub/Pack');
+  });
+
+  test('picking another layout drafts its candidates', async () => {
+    await open(fabScan);
+    useImportStore.getState().pickOffer(1);
+    const draft = useImportStore.getState().draft!;
+    expect(draft.offer).toBe(1);
+    expect(draft.candidates.map((c) => [c.name, c.preset, c.target])).toEqual([
+      ['bundle', 'none', 'bundle'],
+    ]);
+    expect(draftProblem(draft)).toBeNull();
+  });
+
+  test('a target check that fails shows its error, and an empty target asks for a folder', async () => {
+    await open(fabScan);
+    const store = useImportStore.getState();
+    api.checkImportTarget = async () => {
+      throw "Library lib isn't open";
+    };
+    store.edit((d) => editTarget(d, 0, 'Pub/Forest'));
+    await store.checkTarget(0);
+    let c = useImportStore.getState().draft!.candidates[0];
+    expect([c.checkedTarget, c.targetError]).toEqual(['Pub/Forest', "Library lib isn't open"]);
+    expect(candidateProblem(useImportStore.getState().draft!, 0)).toBe("Library lib isn't open");
+
+    let asked = 0;
+    api.checkImportTarget = async () => {
+      asked++;
+      return null;
+    };
+    store.edit((d) => editTarget(d, 0, ''));
+    await store.checkTarget(0);
+    c = useImportStore.getState().draft!.candidates[0];
+    expect([asked, c.checkedTarget, c.targetError]).toEqual([0, '', null]);
+    expect(candidateProblem(useImportStore.getState().draft!, 0)).toBe(
+      'Name the folder to import into'
+    );
+  });
+
+  test('a preview that fails blocks Import with its reason', async () => {
+    await open(fabScan);
+    api.previewImport = async () => {
+      throw "The original /dl/Forest.zip can't be read: gone";
+    };
+    const store = useImportStore.getState();
+    store.edit((d) => patchCandidate(d, 0, { hoist: '' }));
+    await store.refreshTree(0);
+    const draft = useImportStore.getState().draft!;
+    expect(treeCurrent(draft.candidates[0])).toBe(true);
+    expect(candidateProblem(draft, 0)).toBe(
+      "The build would fail: The original /dl/Forest.zip can't be read: gone"
+    );
+    expect(draftProblem(draft)).toContain('The build would fail');
   });
 
   test('a step edit previews the tree of the new steps', async () => {

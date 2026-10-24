@@ -2716,4 +2716,108 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("can't be read"), "{error}");
     }
+
+    #[tokio::test]
+    async fn a_preview_of_a_package_or_a_plain_zip_is_the_scan_s_tree_and_only_a_package_converts()
+    {
+        let s = setup().await;
+        let preview = |original: String, subpath: Option<String>, place: Vec<PlaceStep>| {
+            let engine = s.engine.clone();
+            async move {
+                engine
+                    .preview_import("lib", &original, None, subpath.as_deref(), place)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // A .unitypackage: its tree counts the models unity_glb converts.
+        let package = fixture("synthetic.unitypackage")
+            .to_string_lossy()
+            .into_owned();
+        let scan = s.engine.scan("lib", &package).await.unwrap();
+        let scanned = scan.offers[0].candidates[0].tree.clone().unwrap();
+        let flat = preview(package.clone(), None, vec![PlaceStep::Flatten]).await;
+        assert_eq!(flat, scanned);
+        assert!(flat.glbs > 0, "{flat:?}");
+        let unflattened = preview(package, None, vec![]).await;
+        assert_ne!(unflattened, scanned);
+        assert_eq!(
+            (unflattened.files, unflattened.glbs),
+            (flat.files, flat.glbs)
+        );
+
+        // A Kenney pack's folder of a zip, by its sub-folder.
+        let kenney = fixture("kenney.zip").to_string_lossy().into_owned();
+        let scan = s.engine.scan("lib", &kenney).await.unwrap();
+        let pack = &scan.offers[0].candidates[0];
+        let subpath = pack.steps[0].options["subpath"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tree = preview(kenney, Some(subpath), vec![]).await;
+        assert_eq!(Some(&tree), pack.tree.as_ref());
+
+        // A plain zip holding a model converts nothing, as its scan says.
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("plain.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&plain).unwrap());
+        for entry in ["Plain/Models/Rock.fbx", "Plain/Rock.png"] {
+            zip.start_file(entry, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, b"data").unwrap();
+        }
+        zip.finish().unwrap();
+        let plain = plain.to_string_lossy().into_owned();
+        let scan = s.engine.scan("lib", &plain).await.unwrap();
+        let any = scan.offers.iter().find(|o| o.layout == "zip").unwrap();
+        let tree = preview(plain, None, vec![PlaceStep::Flatten]).await;
+        assert_eq!(Some(&tree), any.candidates[0].tree.as_ref());
+        assert_eq!((tree.files, tree.glbs), (3, 0), "{tree:?}");
+    }
+
+    #[tokio::test]
+    async fn the_imports_view_lists_several_imports_newest_first_each_with_its_own_packs() {
+        let s = setup().await;
+        let mut first = s.golden_request();
+        first.target = "Pub/One".into();
+        let one = s.engine.start_import(first).await.unwrap();
+        s.wait_for(&one.id, "done").await;
+        // Created at the same millisecond, the rowid still orders them.
+        let second = s.zip_request(
+            "kenney.zip",
+            None,
+            Some("Kenney/2D assets/Fixture Tiles"),
+            "Tiles",
+        );
+        let two = s.engine.start_import(second).await.unwrap();
+        s.wait_for(&two.id, "done").await;
+
+        let imports = s.engine.list_imports("lib").await.unwrap();
+        let listed: Vec<(String, Vec<(String, String)>)> = imports
+            .iter()
+            .map(|i| {
+                let name = i.original_path.rsplit('/').next().unwrap().to_string();
+                let packs = i
+                    .packs
+                    .iter()
+                    .map(|p| (p.id.clone(), p.target.clone()))
+                    .collect();
+                (name, packs)
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (
+                    "kenney.zip".to_string(),
+                    vec![(two.packs[0].pack_id.clone(), "Tiles".to_string())]
+                ),
+                (
+                    "synthetic.unitypackage".to_string(),
+                    vec![(one.packs[0].pack_id.clone(), "Pub/One".to_string())]
+                ),
+            ]
+        );
+    }
 }
