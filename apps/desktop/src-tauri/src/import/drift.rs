@@ -36,6 +36,9 @@ pub enum Change {
     Changed,
     /// A manifest file that is gone.
     Missing,
+    /// A kept file the recipe now writes over (a GLB, `datapackage.json`) or leaves out (an
+    /// `exclude` of its source path), so it can't be carried as it is.
+    Clash,
 }
 
 /// What made the file a difference is about, as the choices depend on it.
@@ -127,6 +130,8 @@ struct Writes<'a> {
     convert: bool,
     /// The manifest's models by folder and stem, lowercased, for the GLBs `unity_glb` writes.
     models: HashSet<(String, String)>,
+    /// The source paths (JSON arrays) the recipe's enabled `exclude` steps leave out.
+    excluded: HashSet<String>,
 }
 
 impl<'a> Writes<'a> {
@@ -142,12 +147,36 @@ impl<'a> Writes<'a> {
                     .then(|| (folder.to_string(), stem))
             })
             .collect();
+        let excluded = recipe
+            .steps
+            .iter()
+            .filter(|(kind, _)| kind == "exclude")
+            .filter_map(|(_, options)| {
+                let source: Vec<String> = serde_json::from_value(options["source"].clone()).ok()?;
+                Some(records::source_json(&source))
+            })
+            .collect();
         Writes {
             target: &recipe.target,
             metadata: on("metadata"),
             convert: on("unity_glb"),
             models,
+            excluded,
         }
+    }
+
+    /// Why the kept file `row` can't be carried as it is under the recipe now, if it can't.
+    fn clash(&self, row: &ManifestRow) -> Option<&'static str> {
+        if self.writes(&row.path) {
+            return Some(
+                "The build now writes its own file at this path: discard yours, or turn off \
+                 the step that writes it to keep yours",
+            );
+        }
+        row.source_path
+            .as_ref()
+            .filter(|source| self.excluded.contains(*source))
+            .map(|_| "An exclude step now leaves this file out, so the kept copy goes too")
     }
 
     fn writes(&self, path: &str) -> bool {
@@ -230,6 +259,8 @@ fn differences(
             .collect(),
     };
     let writes = Writes::of(recipe, manifest);
+    // With the whole folder gone, deleted outside OpenDAM, restoring is the likely wish.
+    let gone = on_disk.is_empty() && !live.exists();
     let mut found = Vec::new();
     for row in manifest {
         let kind = match row.origin {
@@ -250,8 +281,31 @@ fn differences(
                 (sha256 != row.sha256).then_some((Change::Changed, Some(size as i64), Some(sha256)))
             }
         };
+        let clash = (kind == Kind::Kept && on_disk.contains_key(&row.path))
+            .then(|| writes.clash(row))
+            .flatten();
+        if let Some(reason) = clash {
+            let (size, sha256) = match change {
+                Some((_, size, sha256)) => (size, sha256),
+                None => (Some(row.size), Some(row.sha256.clone())),
+            };
+            found.push(Difference {
+                path: row.path.clone(),
+                change: Change::Clash,
+                kind,
+                size,
+                sha256,
+                choices: vec![Choice::Discard],
+                reason: Some(reason),
+                source_path: row.source_path.clone(),
+            });
+            continue;
+        }
         if let Some((change, size, sha256)) = change {
-            let (choices, reason) = offered(change, kind);
+            let (mut choices, reason) = offered(change, kind);
+            if gone && change == Change::Missing {
+                choices.sort_by_key(|c| *c != Choice::Restore);
+            }
             found.push(Difference {
                 path: row.path.clone(),
                 change,
@@ -319,6 +373,7 @@ fn offered(change: Change, kind: Kind) -> (Vec<Choice>, Option<&'static str>) {
             vec![Forget],
             Some("A kept file isn't from the original, so a rebuild can't recreate it"),
         ),
+        (Change::Clash, _) => (vec![Discard], None),
         (_, Kind::Outside) | (Change::Added, _) => (vec![Keep, Discard], None),
     }
 }
@@ -346,7 +401,12 @@ fn files(folder: &Path) -> std::io::Result<Vec<String>> {
 /// Checks that `chosen` answers exactly the differences `found`, each with a choice its file
 /// offers. Returns the first path that doesn't match, if any.
 pub fn unmatched(found: &[Difference], chosen: &[Chosen]) -> Option<String> {
-    let by_path: HashMap<&str, &Chosen> = chosen.iter().map(|c| (c.path.as_str(), c)).collect();
+    let mut by_path: HashMap<&str, &Chosen> = HashMap::new();
+    for c in chosen {
+        if by_path.insert(c.path.as_str(), c).is_some() {
+            return Some(c.path.clone());
+        }
+    }
     for difference in found {
         let ok = by_path.get(difference.path.as_str()).is_some_and(|c| {
             c.change == difference.change
@@ -364,23 +424,33 @@ pub fn unmatched(found: &[Difference], chosen: &[Chosen]) -> Option<String> {
         .map(|c| c.path.clone())
 }
 
-/// What `chosen`, matched against `found`, asks of the recipe at the Rebuild: an `exclude` for
-/// each missing extracted file recorded as one, and the metadata step off when a missing
-/// `datapackage.json` turns it off or a changed one is kept.
-pub fn edits(found: &[Difference], chosen: &[Chosen]) -> DriftEdits {
+/// What `chosen`, matched against `found`, asks of `recipe` at the Rebuild, so each choice is
+/// honoured whatever an earlier Rebuild that never committed recorded: an `exclude` for each
+/// missing extracted file left out, and none (the enabled one turned off) for one restored or
+/// rebuilt from the recipe; the metadata step off when a missing `datapackage.json` turns it off
+/// or a changed one is kept, and on when it is restored or rebuilt from the recipe.
+pub fn edits(recipe: &Recipe, found: &[Difference], chosen: &[Chosen]) -> DriftEdits {
+    let writes = Writes::of(recipe, &[]);
     let mut edits = DriftEdits::default();
     for (difference, choice) in pairs(found, chosen) {
+        let source = difference.source_path.as_deref();
         match (difference.kind, choice) {
             (Kind::Extracted, Choice::Exclude) => {
-                if let Some(source) = difference
-                    .source_path
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str(s).ok())
-                {
+                if let Some(source) = source.and_then(|s| serde_json::from_str(s).ok()) {
                     edits.excludes.push(source);
                 }
             }
+            (Kind::Extracted, Choice::Restore | Choice::Recipe) => {
+                if let Some(source) = source.filter(|s| writes.excluded.contains(*s)) {
+                    edits
+                        .includes
+                        .extend(serde_json::from_str::<Vec<String>>(source).ok());
+                }
+            }
             (Kind::Package, Choice::MetadataOff | Choice::Keep) => edits.metadata_off = true,
+            (Kind::Package, Choice::Restore | Choice::Recipe) if !writes.metadata => {
+                edits.metadata_on = true
+            }
             _ => {}
         }
     }
@@ -499,6 +569,11 @@ mod tests {
         assert_eq!(
             unmatched(&[], &[chosen(Choice::Restore)]),
             Some("P/a".into())
+        );
+        assert_eq!(
+            unmatched(&found, &[chosen(Choice::Restore), chosen(Choice::Restore)]),
+            Some("P/a".into()),
+            "one choice per difference"
         );
         let mut changed = chosen(Choice::Restore);
         changed.sha256 = Some("other".into());

@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import clsx from 'clsx';
 import {
   choiceHint,
+  choosableAll,
   choiceLabel,
   differenceText,
   usePreparationStore,
@@ -46,7 +47,7 @@ interface Props {
  * build, with only the choices its origin can honour, the default chosen.
  */
 export function DriftDialog({ packId, draft, saving, folder }: Props) {
-  const { chooseDrift, closeDrift, confirmDrift } = usePreparationStore.getState();
+  const { chooseDrift, chooseAllDrift, closeDrift, confirmDrift } = usePreparationStore.getState();
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -60,6 +61,7 @@ export function DriftDialog({ packId, draft, saving, folder }: Props) {
 
   const prefix = folder ? `${folder}/` : '';
   const many = draft.differences.length !== 1;
+  const restorable = choosableAll(draft, 'restore');
   return (
     <div className={dialog.overlay} onClick={() => closeDrift(packId)}>
       <div
@@ -92,6 +94,18 @@ export function DriftDialog({ packId, draft, saving, folder }: Props) {
               ? 'Nothing differs from the last build now.'
               : `${many ? `These ${draft.differences.length} files differ` : 'This file differs'} from the pack's last build. Choose what the rebuild does with ${many ? 'each' : 'it'}.`}
           </span>
+          {restorable > 1 && (
+            <div className={styles.prepRow}>
+              <button
+                className={clsx(dialog.btn, dialog.secondaryBtn, styles.smallBtn)}
+                disabled={saving}
+                onClick={() => chooseAllDrift(packId, 'restore')}
+                data-drift-restore-all
+              >
+                Restore all {restorable} missing files
+              </button>
+            </div>
+          )}
           <ul className={styles.drift} data-drift-list>
             {draft.differences.map((d) => (
               <li key={d.path} className={styles.driftItem} data-drift-path={d.path}>

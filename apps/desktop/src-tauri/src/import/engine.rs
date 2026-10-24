@@ -911,7 +911,10 @@ impl Engine {
         if drift::unmatched(&found, &chosen).is_some() {
             return Err(drift::STALE.into());
         }
-        let edits = drift::edits(&found, &chosen);
+        let recipe = records::recipe(&library.pool, pack_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let edits = drift::edits(&recipe, &found, &chosen);
         let run_id = records::queue_rebuild(
             &library.pool,
             pack_id,

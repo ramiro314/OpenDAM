@@ -683,17 +683,23 @@ pub async fn set_steps(
     Ok(Ok(recipe_rev))
 }
 
-/// The recipe edits a Rebuild's drift choices make (`drift::Queued`): an `exclude` for each
-/// missing file recorded as one, and the metadata step turned off.
+/// The recipe edits a Rebuild's drift choices make (`drift::edits`): an `exclude` for each
+/// missing file left out, the enabled `exclude` of each one restored turned off, and the
+/// metadata step turned off or on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DriftEdits {
     pub excludes: Vec<Vec<String>>,
+    pub includes: Vec<Vec<String>>,
     pub metadata_off: bool,
+    pub metadata_on: bool,
 }
 
 impl DriftEdits {
     fn is_empty(&self) -> bool {
-        self.excludes.is_empty() && !self.metadata_off
+        self.excludes.is_empty()
+            && self.includes.is_empty()
+            && !self.metadata_off
+            && !self.metadata_on
     }
 }
 
@@ -809,8 +815,19 @@ async fn record_drift_edits(
         position += 1;
         excluded.push(source);
     }
-    if edits.metadata_off {
-        sqlx::query("UPDATE import_steps SET enabled = 0 WHERE pack_id = ? AND kind = 'metadata'")
+    for source in &edits.includes {
+        sqlx::query(
+            "UPDATE import_steps SET enabled = 0 WHERE pack_id = ? AND kind = 'exclude'
+             AND enabled = 1 AND json_extract(options, '$.source') = ?",
+        )
+        .bind(pack_id)
+        .bind(source_json(source))
+        .execute(&mut *tx)
+        .await?;
+    }
+    if edits.metadata_off || edits.metadata_on {
+        sqlx::query("UPDATE import_steps SET enabled = ? WHERE pack_id = ? AND kind = 'metadata'")
+            .bind(edits.metadata_on)
             .bind(pack_id)
             .execute(&mut *tx)
             .await?;

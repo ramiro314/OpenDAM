@@ -290,6 +290,18 @@ export function chooseDrift(draft: DriftDraft, path: string, choice: DriftChoice
   return { ...draft, choices: { ...draft.choices, [path]: choice } };
 }
 
+/** Chooses `choice` for every difference that offers it, such as Restore for a deleted folder */
+export function chooseAllDrift(draft: DriftDraft, choice: DriftChoice): DriftDraft {
+  const choices = { ...draft.choices };
+  for (const d of draft.differences) if (d.choices.includes(choice)) choices[d.path] = choice;
+  return { ...draft, choices };
+}
+
+/** How many differences offer `choice` among others, so choosing it for all of them helps */
+export function choosableAll(draft: DriftDraft, choice: DriftChoice): number {
+  return draft.differences.filter((d) => d.choices.includes(choice) && d.choices.length > 1).length;
+}
+
 /** The choices as `rebuild_import_pack` takes them */
 export function chosenFrom(draft: DriftDraft): DriftChosen[] {
   return draft.differences.map((d) => ({
@@ -302,7 +314,12 @@ export function chosenFrom(draft: DriftDraft): DriftChosen[] {
 
 /** What happened to the file, and where it came from */
 export function differenceText(d: DriftDifference): string {
-  const what = { added: 'Added', changed: 'Changed', missing: 'Missing' }[d.change];
+  const what = {
+    added: 'Added',
+    changed: 'Changed',
+    missing: 'Missing',
+    clash: 'In the way of the recipe',
+  }[d.change];
   const from = {
     extracted: 'from the original',
     generated: 'a converted GLB',
@@ -353,7 +370,9 @@ export function choiceHint(choice: DriftChoice, d: DriftDifference): string {
     case 'forget':
       return 'Drops it from the kept files';
     case 'discard':
-      return 'Removes it with the previous build';
+      return d.change === 'clash'
+        ? "Drops your copy from the kept files, so the recipe's steps decide the path"
+        : 'Removes it with the previous build';
   }
 }
 
@@ -430,6 +449,8 @@ interface PreparationStore {
   rebuild: (packId: string) => Promise<boolean>;
   /** Chooses what the Rebuild does about the outside change at `path` */
   chooseDrift: (packId: string, path: string, choice: DriftChoice) => void;
+  /** Chooses `choice` for every outside change that offers it */
+  chooseAllDrift: (packId: string, choice: DriftChoice) => void;
   /** Closes the drift dialog, queuing nothing */
   closeDrift: (packId: string) => void;
   /** Queues the rebuild with the dialog's choices; true once it is queued */
@@ -625,6 +646,12 @@ export const usePreparationStore = create<PreparationStore>()((set, get) => {
       const editor = get().editors[packId];
       if (!editor?.drift || editor.saving) return;
       patch(packId, { drift: chooseDrift(editor.drift, path, choice) });
+    },
+
+    chooseAllDrift: (packId, choice) => {
+      const editor = get().editors[packId];
+      if (!editor?.drift || editor.saving) return;
+      patch(packId, { drift: chooseAllDrift(editor.drift, choice) });
     },
 
     closeDrift: (packId) => {

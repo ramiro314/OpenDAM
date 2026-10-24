@@ -93,6 +93,21 @@ describe('the drift dialog', () => {
   });
 });
 
+describe('restoring a deleted folder', () => {
+  test('offers Restore for every missing file once two or more could take it', () => {
+    const missing = (path: string) =>
+      difference(path, 'missing', 'extracted', ['restore', 'exclude']);
+    const many = driftDraft([missing('A.png'), missing('B.png')]);
+    const one = driftDraft([missing('A.png')]);
+    const restoreAll = (draft: typeof one) =>
+      renderToStaticMarkup(
+        <DriftDialog packId="p1" draft={draft} saving={false} folder="Pub/Pack" />
+      );
+    expect(restoreAll(many)).toContain('Restore all 2 missing files');
+    expect(restoreAll(one)).not.toContain('data-drift-restore-all');
+  });
+});
+
 describe("the Preparation panel's kept files", () => {
   test('lists them as not from the original, by their path in the pack', () => {
     const html = renderToStaticMarkup(

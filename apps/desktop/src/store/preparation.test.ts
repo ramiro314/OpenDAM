@@ -15,6 +15,8 @@ import {
   DRIFT_STALE,
   STALE,
   busyReason,
+  chooseAllDrift,
+  choosableAll,
   chooseDrift,
   choiceLabel,
   chosenFrom,
@@ -663,6 +665,29 @@ describe('outside changes', () => {
     await store().rebuild('p1');
     expect(await store().confirmDrift('p1')).toBe(false);
     expect(editor().drift?.notice).toBe(BUSY);
+  });
+
+  test('a deleted folder can restore every missing file at once, leaving the others alone', () => {
+    const draft = driftDraft([
+      difference('Readme.txt', 'missing', 'extracted', ['exclude', 'restore']),
+      difference('datapackage.json', 'missing', 'package', ['metadataOff', 'restore']),
+      difference('Models/SM_Log.glb', 'missing', 'generated', ['restore']),
+      difference('Notes.txt', 'missing', 'kept', ['forget']),
+    ]);
+    expect(choosableAll(draft, 'restore')).toBe(2);
+    expect(chooseAllDrift(draft, 'restore').choices).toEqual({
+      'Pub/Pack/Readme.txt': 'restore',
+      'Pub/Pack/datapackage.json': 'restore',
+      'Pub/Pack/Models/SM_Log.glb': 'restore',
+      'Pub/Pack/Notes.txt': 'forget',
+    });
+  });
+
+  test('a kept file in the way of the recipe reads so, and offers its discard', () => {
+    const clash = difference('datapackage.json', 'clash', 'kept', ['discard'], 'The build writes');
+    expect(differenceText(clash)).toBe('In the way of the recipe, a kept file');
+    expect(choiceLabel('discard', clash)).toBe('Discard');
+    expect(driftDraft([clash]).choices).toEqual({ 'Pub/Pack/datapackage.json': 'discard' });
   });
 
   test("the kept files are read with the steps, for the panel's list", async () => {

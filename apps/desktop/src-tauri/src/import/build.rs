@@ -963,6 +963,18 @@ async fn stage(
         cancelled()?;
     }
     if let Some(step) = &plan.metadata {
+        // The drift check lists a kept file where the metadata step writes, to discard.
+        let kept_package = pending.iter().find(|(f, origin)| {
+            *origin == Origin::Kept && metadata::clash(std::slice::from_ref(f)).is_some()
+        });
+        if let Some((file, _)) = kept_package {
+            return Err(Stop::Failed(format!(
+                "{prefix}{} is kept from outside changes where the metadata step writes {}: \
+                 Rebuild again and discard it, or turn the step off to keep it",
+                file.path,
+                metadata::FILE
+            )));
+        }
         let files: Vec<ExtractedFile> = outputs
             .iter()
             .map(|o| ExtractedFile {
@@ -979,17 +991,30 @@ async fn stage(
     outputs.extend(hash_staged(env, recipe, staging, pending, &unchanged).await?);
     cancelled()?;
     outputs.sort_by(|a, b| a.path.cmp(&b.path));
-    // A kept file copied with other bytes than the drift check saw changed since: the re-check
-    // under the lock would refuse the build anyway.
-    let mut staged_kept: Vec<&str> = outputs
+    // Every kept file reaches the build. One a step left out is named: the drift check lists
+    // it at the next Rebuild, to discard. One copied with other bytes than the drift check saw
+    // changed since, which the re-check under the lock would refuse anyway.
+    let staged_kept: Vec<&Output> = outputs
         .iter()
         .filter(|o| o.origin == Origin::Kept)
-        .map(|o| o.sha256.as_str())
         .collect();
+    if let Some(lost) = kept.iter().find(|k| {
+        !staged_kept.iter().any(|o| match &k.source_path {
+            Some(source) => o.source_path == *source,
+            None => o.path == k.path,
+        })
+    }) {
+        return Err(Stop::Failed(format!(
+            "{}, kept from outside changes, is left out by the steps now: Rebuild again and \
+             discard it",
+            lost.path
+        )));
+    }
+    let mut staged_shas: Vec<&str> = staged_kept.iter().map(|o| o.sha256.as_str()).collect();
     let mut expected: Vec<&str> = kept.iter().map(|k| k.sha256.as_str()).collect();
     expected.sort_unstable();
-    staged_kept.sort_unstable();
-    if staged_kept != expected {
+    staged_shas.sort_unstable();
+    if staged_shas != expected {
         return Err(Stop::Failed(CHANGED.to_string()));
     }
 
@@ -1340,8 +1365,8 @@ fn add_kept(
         let to = staging.join(rel);
         if taken.contains(&file.path) || to.symlink_metadata().is_ok() {
             return Err(format!(
-                "{} is kept from outside changes where the build now writes its own file: \
-                 Rebuild again and discard it, or delete it in the app",
+                "{} is kept from outside changes where the build now puts a file of the \
+                 recipe: rename or delete it in the app, then Rebuild again",
                 file.path
             ));
         }

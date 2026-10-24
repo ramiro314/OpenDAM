@@ -533,8 +533,8 @@ mod tests {
         assert_eq!(
             failed.error.unwrap(),
             format!(
-                "{} is kept from outside changes where the build now writes its own file: \
-                 Rebuild again and discard it, or delete it in the app",
+                "{} is kept from outside changes where the build now puts a file of the \
+                 recipe: rename or delete it in the app, then Rebuild again",
                 in_pack("Art/T_Rock.png")
             )
         );
@@ -585,6 +585,134 @@ mod tests {
             !s.live().join("Textures").exists(),
             "the emptied folder goes too"
         );
+        assert!(s.drift(&pack_id).await.is_empty());
+        s.settled().await;
+    }
+
+    /// A kept `datapackage.json` once the metadata step is turned back on, and a kept copy an
+    /// `exclude` now leaves out, are listed as clashes offering only discard, rather than
+    /// failing every Rebuild: discarding lets the recipe's file in, or leaves the file out.
+    #[tokio::test]
+    async fn a_kept_file_the_recipe_now_writes_over_or_leaves_out_offers_only_discard() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        s.write(metadata::FILE, r#"{"name": "mine"}"#);
+        s.write("Readme.txt", "edited outside");
+        let run = s.rebuild_choosing(&pack_id, first).await;
+        s.wait_for(&run.id, "done").await;
+        assert_eq!(
+            s.kept(&pack_id).await,
+            [in_pack("Readme.txt"), in_pack(metadata::FILE)]
+        );
+        assert!(!s.metadata_on(&pack_id).await);
+
+        let readme = s.source_of("Readme.txt").await;
+        s.edit_steps(&pack_id, |steps| {
+            toggle(steps, "metadata", true);
+            add(steps, PlaceStep::Exclude { source: readme });
+        })
+        .await;
+        let found = s.drift(&pack_id).await;
+        assert_eq!(
+            found
+                .iter()
+                .map(|d| (d.path.clone(), d.change, d.kind, d.choices.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    in_pack("Readme.txt"),
+                    Change::Clash,
+                    Kind::Kept,
+                    vec![Choice::Discard]
+                ),
+                (
+                    in_pack(metadata::FILE),
+                    Change::Clash,
+                    Kind::Kept,
+                    vec![Choice::Discard]
+                ),
+            ]
+        );
+        assert!(found.iter().all(|d| d.reason.is_some()));
+        assert_eq!(
+            s.engine
+                .rebuild_pack("lib", &pack_id, Vec::new())
+                .await
+                .unwrap_err(),
+            STALE,
+            "a Rebuild must answer them"
+        );
+
+        let run = s.rebuild_choosing(&pack_id, first).await;
+        s.wait_for(&run.id, "done").await;
+        assert!(
+            !s.live().join("Readme.txt").exists(),
+            "left out by its exclude"
+        );
+        assert_ne!(s.read(metadata::FILE), r#"{"name": "mine"}"#);
+        assert_eq!(s.origin_of(metadata::FILE).await.0, "generated");
+        assert!(s.kept(&pack_id).await.is_empty());
+        assert!(s.drift(&pack_id).await.is_empty());
+        s.settled().await;
+    }
+
+    /// A Rebuild whose "Leave it out" or "Turn the metadata step off" was recorded, then failed,
+    /// leaves the file missing: a later Restore is honoured, turning that edit back.
+    #[tokio::test]
+    async fn restore_after_a_failed_rebuild_undoes_the_edit_the_failed_run_recorded() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        let log = s.source_of("Textures/T_Log_D.png").await;
+        std::fs::remove_file(s.live().join("Textures/T_Log_D.png")).unwrap();
+        std::fs::remove_file(s.live().join(metadata::FILE)).unwrap();
+        s.engine.hooks().fail_once(Point::Staged);
+        let run = s.rebuild_choosing(&pack_id, first).await;
+        s.wait_for(&run.id, "failed").await;
+        let steps = s.engine.pack_steps("lib", &pack_id).await.unwrap().steps;
+        let excluding = |steps: &[Step]| {
+            steps.iter().any(|st| {
+                st.kind == "exclude" && st.enabled && st.options["source"] == serde_json::json!(log)
+            })
+        };
+        assert!(excluding(&steps), "the failed run's exclude stays");
+        assert!(!s.metadata_on(&pack_id).await);
+
+        let restore = |d: &Difference| {
+            assert!(d.choices.contains(&Choice::Restore), "{d:?}");
+            Choice::Restore
+        };
+        let run = s.rebuild_choosing(&pack_id, restore).await;
+        s.wait_for(&run.id, "done").await;
+        assert!(s.live().join("Textures/T_Log_D.png").is_file());
+        assert!(s.live().join(metadata::FILE).is_file());
+        let steps = s.engine.pack_steps("lib", &pack_id).await.unwrap().steps;
+        assert!(!excluding(&steps), "Restore turned the exclude off");
+        assert!(
+            s.metadata_on(&pack_id).await,
+            "and the metadata step back on"
+        );
+        assert!(s.drift(&pack_id).await.is_empty());
+        s.settled().await;
+    }
+
+    /// A pack folder deleted outside OpenDAM defaults every missing file to Restore, so the
+    /// default Rebuild brings the pack back rather than leaving everything out.
+    #[tokio::test]
+    async fn a_deleted_pack_folder_defaults_every_file_to_restore() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        let tree = crate::import::unitypackage::tests::on_disk(&s.live());
+        std::fs::remove_dir_all(s.live()).unwrap();
+        let found = s.drift(&pack_id).await;
+        assert_eq!(found.len(), tree.len());
+        assert!(
+            found.iter().all(|d| d.choices[0] == Choice::Restore),
+            "{found:?}"
+        );
+
+        let run = s.rebuild_choosing(&pack_id, first).await;
+        s.wait_for(&run.id, "done").await;
+        assert_eq!(crate::import::unitypackage::tests::on_disk(&s.live()), tree);
         assert!(s.drift(&pack_id).await.is_empty());
         s.settled().await;
     }

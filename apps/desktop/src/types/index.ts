@@ -976,7 +976,8 @@ export interface ImportPackSteps {
 }
 
 /** How a pack folder's file differs from its manifest (`drift::Change`) */
-export type DriftChange = 'added' | 'changed' | 'missing';
+/** `clash`: a kept file the recipe now writes over or leaves out */
+export type DriftChange = 'added' | 'changed' | 'missing' | 'clash';
 
 /** What made the file a difference is about (`drift::Kind`) */
 export type DriftKind = 'extracted' | 'generated' | 'package' | 'kept' | 'outside';
