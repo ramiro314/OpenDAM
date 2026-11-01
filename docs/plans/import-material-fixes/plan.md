@@ -51,7 +51,7 @@ The baseline now lives at `~/.local/share/opendam-import-baseline-63efa51` (27 G
 - `data/` and `cache/`: its throwaway profile, with `libraries.root_paths` pointing at `libs/`.
 - `h/`: the driver page, server, session scripts, app logs and run log.
 - `tools/`: the throwaway prototype and audit scripts, for reference only. This plan is the spec.
-- `proto/` and `proto-filewide/`: the prototype's GLBs.
+- `proto/`, `proto-filewide/` and `proto-words/`: the prototype's GLBs.
 
 It holds no app thumbnails. The driver page replaces the app's UI, so `modelThumbnailer` never ran
 and model rows point at `_preview.glb` files.
@@ -69,7 +69,7 @@ and model rows point at `_preview.glb` files.
 | 7 | Fab titles and publishers | Confirmed | Split CamelCase in title and folder |
 | 8 | 10 failed previews | Three separate causes, one a real bug | See below |
 | 9 | Progress ends short | Not lost work: a stale heartbeat in the DB | Write the final figures |
-| 10 | Kenney offers | Confirmed trap: `fab` is offer 0 and is selected | Put `kenney` first |
+| 10 | Kenney offers | Confirmed trap: `fab` is offer 0 and is selected | Put `kenney` first when the zip's shape says it is Kenney's |
 
 Details that changed a proposal:
 
@@ -227,9 +227,13 @@ opacity take the first two steps only. The base colour alone also takes the only
    JSON objects, and map each property's reference to its display name, cached per file. An
    unreadable or older graph gives an empty map. Keep the display names sorted, so `A_BaseColor`
    wins over `B_BaseColor`.
-2. **Role words.** Base uses the existing `BASE_HINTS` and `NOT_BASE`. Normal needs `normal`. ORM
-   needs `orm` without `normal`. Opacity needs `opacity` or `alpha`, never bare `mask`, because
-   `GlitterMask` isn't opacity.
+2. **Role words.** Base uses the existing `BASE_HINTS` and `NOT_BASE`. For the others, split a
+   display name into words on separators and case changes, so `Material 01 ORM` gives `Material`,
+   `01` and `ORM`, and `ORMMap` gives `ORM` and `Map`. Normal needs the word `normal` or `normals`,
+   and no word `detail` or `second`. ORM needs the word `orm`. Opacity needs `opacity` or `alpha`,
+   never bare `mask`, because `GlitterMask` isn't opacity. Over the 131 texture display names in
+   these packs, words change two results from plain substrings: `Detail Map Normal` no longer
+   counts as a normal, and `MaskedColorMask` no longer counts as ORM.
 3. **Only texture.** A material with exactly one bound texture uses it as its base, with three
    exceptions: a generated `_SampleTexture...` slot, a generated `Texture2D_...` name with no
    display name, and a raw name or display name holding a `NOT_BASE` word. So a lone `Texture2D_x`
@@ -311,8 +315,12 @@ Piece 1 merged: with version 4 the URP copy stays at 192 of 193. Its other check
 - **Fab names (`scan.rs`).** Split CamelCase in `fab()` and `unreal()` names: `StylizedVillage`
   becomes `Stylized Village`, for the title and target. A name that already has a space stays.
   The `zip` offer and `.unitypackage` names don't change.
-- **Kenney offer first (`scan.rs`).** Push `kenney` before `fab` and `unreal`, so it is offer 0. A
-  zip that isn't Kenney's keeps its order.
+- **Kenney offer first (`scan.rs`).** `kenney()` matches any zip with a `license*.txt` file, so that
+  match alone can't decide. Put `kenney` at offer 0 only when the zip holds no `.uproject`, every
+  `.unitypackage` sits inside a license folder other than the root, and there are more license
+  folders than `.unitypackage` files. Any other zip keeps today's order: `fab`, `unreal`, `kenney`,
+  `zip`. This reads names only, as a scan does. The All-in-1 passes, with 246 license folders, 7
+  packages and no project, and all 8 Fab zips keep their order.
 - **Pipeline choice for cached packages (`scan.rs`, `unitypackage.rs`, `engine.rs`, dialog).** When
   a `.unitypackage` holds nested packages of two or more pipelines, offer a pipeline, URP by
   default, using `pipeline()`. The build keeps loose files, keeps nested packages of that
@@ -369,6 +377,8 @@ through `OPENDAM_BLENDER`, which CI's test job sets up.
 |---|---|---|
 | Generated names | `Texture2D_a` shown as `A_BaseColor`, with normal and ORM | All three maps bound |
 | Layers | `A_BaseColor` and `B_BaseColor` | Layer A |
+| ORM word | `UniformClouds` and `MaskedColorMask` beside a base | No ORM map |
+| Detail normal | `Detail Map Normal` and `Macro Normal` | `Macro Normal` |
 | Mask only | `OpacityMap` and a colour | `MASK`, texture, and colour as factor |
 | Helper mask | `GlitterMask` beside a base | Stays opaque |
 | Blank twin | Blank `MI_X`, textured `M_X` | `M_X`'s texture |
@@ -393,10 +403,15 @@ through `OPENDAM_BLENDER`, which CI's test job sets up.
 | Graph missing | `.shadergraph` left out | Same GLB as with today's rules |
 
 Add unit tests beside the code for `is_input`, the version match, the collider terms matching
-`COLLISION_RE`, the cover order, the hoist warning, CamelCase splitting, offer order, pipeline
-filtering, the changed-model preview, the final progress write and LOD grouping and renames. Test
-`glb_audit.py`'s join on small manifests: a renamed pack, a changed prefix, an expected absence, an
-unexpected absence, an extra GLB and a matched count that falls short.
+`COLLISION_RE`, the cover order, the hoist warning, CamelCase splitting, pipeline filtering, the
+changed-model preview, the final progress write and LOD grouping and renames.
+
+The offer-order test covers a Fab zip with a license file at its root and one in a folder, a Fab
+zip wrapped in one licensed folder, two licensed variants, and an Unreal zip with plugin licenses,
+all keeping today's order, and a Kenney-shaped zip with nested packages, which opens on `kenney`.
+
+Test `glb_audit.py`'s join on small manifests: a renamed pack, a changed prefix, an expected
+absence, an unexpected absence, an extra GLB and a matched count that falls short.
 
 ## Acceptance
 
@@ -452,9 +467,10 @@ The rules:
     keeps a tag and a rename, and leaves byte-identical GLBs and their thumbnails alone.
 - **Piece 2:** the 6 Fab packs get a model cover, not a texture. Wizard Room's dialog warns about
   `hoist Art`, and `Stylarts/WizardRoom/Art` hoists. `StylizedVillage` becomes `Stylized Village`.
-  The Kenney zip opens on `kenney` with 241 packs ticked. Nature Package and Medieval Houses each
-  build one pipeline. With Piece 1 merged, Medieval Houses reaches 193 of 193 GLBs and matches its
-  193 URP baseline GLBs through the map. The bench checks U10 and U11 still pass.
+  The Kenney zip opens on `kenney` with 241 packs ticked, and all 8 Fab zips keep their offer order.
+  Nature Package and Medieval Houses each build one pipeline. With Piece 1 merged, Medieval Houses
+  reaches 193 of 193 GLBs and matches its 193 URP baseline GLBs through the map. The bench checks
+  U10 and U11 still pass.
 - **Piece 3:** the 7 `.hdr` files seen across both libraries get previews. `T_Beige.png` and
   `T_Brown.png` say too large. A finished run's row shows its final figures.
 - **Piece 4:** Wizard Room shows 39 items. A rename keeps each `_LOD<n>`. U11 and U12 still pass.
@@ -515,6 +531,12 @@ reading the gate report. Piece 4 can land before or after.
 - **Geometry:** of all those GLBs, only `SM_Bulidings.glb` and `SM_Grass_Foliage.glb` changed vertex
   count, and those are the two fixed models. No other GLB gained geometry, so the rule left no
   doubled levels in these packs.
+- **Role words:** the whole-word rule was run over all 131 display names, and the skip of `detail`
+  was rerun through the prototype on Lost Cave, the only pack it affects. Four of its materials
+  changed normal map, such as `M_Tunnel` from `T_Rock_Tiles_N` to its own `T_Tunnel_A_N`. Its floor
+  held, with no lost map and no geometry change.
+- **Kenney offer rule:** checked against the names in the All-in-1 and all 8 Fab zips, and against
+  five made-up zip shapes. It was not run through a real scan.
 - **Filename rule:** tried and dropped after the false cutouts above.
 - **Big Castle's cutouts:** MASK uses fell from 58 to 23. That isn't a loss: the 42 lost uses were
   misnamed `Material.00x` slots that now resolve to real materials such as `wood_a_beams`, and
@@ -534,6 +556,8 @@ reading the gate report. Piece 4 can land before or after.
   Synty and Fantasy Adventure samples).
 - **Models with no `.mtl` and no prefab stay untextured**, as do slots no Unity file resolves.
 - **Mask-only foliage has flat RGB.** It counts as textured but has no colour detail.
+- **The audit can't see a wrong map.** It counts maps, so a role bound to the wrong texture only
+  shows in the visual check.
 - **The 16 cached packages not sampled** run no acceptance pass, though the census found no
   sign of trouble.
 - **Nothing flags a stale pack** after a future version bump.
