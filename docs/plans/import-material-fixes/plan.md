@@ -230,16 +230,23 @@ opacity take the first two steps only. The base colour alone also takes the only
 2. **Role words.** Base uses the existing `BASE_HINTS` and `NOT_BASE`. Normal needs `normal`. ORM
    needs `orm` without `normal`. Opacity needs `opacity` or `alpha`, never bare `mask`, because
    `GlitterMask` isn't opacity.
-3. **Only texture.** A material with exactly one bound texture uses it as its base, unless the
-   property is a generated `_SampleTexture...` slot, or its raw name or display name holds a
-   `NOT_BASE` word. A lone `Texture2D_x` shown as `OpacityMap` is a mask, never a base.
+3. **Only texture.** A material with exactly one bound texture uses it as its base, with three
+   exceptions: a generated `_SampleTexture...` slot, a generated `Texture2D_...` name with no
+   display name, and a raw name or display name holding a `NOT_BASE` word. So a lone `Texture2D_x`
+   shown as `OpacityMap` is a mask, never a base, and with a missing, unreadable or older graph it
+   stays unresolved, as it does today. Both materials this rule fired on in the prototype use the
+   raw name `_Grid`, so these exceptions move no floor.
 4. **Mask with no base.** `build_material` wires the mask to alpha whether or not there is a base,
    over the flat colour. Blender 5.2.3 exports that as `alphaMode: MASK` with a `baseColorTexture`
    holding the mask, so the audit counts it as textured though its RGB is flat.
 5. **Flat colours.** Display names apply to colours too, and `basecolorvalue` comes first in
    `COLOR_PROPS`, so `M_BasicFill` is black, as its file says.
-6. **Twin lookup.** For a slot with no `.mat` or a blank one, `MI_X` resolves through `by_name` to
-   `M_X` when that material has textures. `named_material` stays as today's last resort.
+6. **Twin lookup.** A slot is blank when it finds no `.mat`, or a `.mat` with no bound textures,
+   whether or not that `.mat` holds colours. A blank slot named `MI_X` resolves through `by_name` to
+   `M_X` when that material has textures. Otherwise a `.mat` with colours keeps them, so a true flat
+   colour stays flat, and `named_material` stays as today's last resort. The prototype used this
+   reading, and the floors depend on it: all 6 of Village's 26 twin slots that have a `.mat` hold
+   colours.
 7. **Lowest LOD per mesh.** Group mesh objects by name, without Blender's numeric suffix and the
    `_LOD<n>` suffix. No suffix and `_LOD0` are both level 0. Keep each group's lowest level, and
    every object at that level: `Wall` beside `Wall_LOD1` keeps `Wall`, and a group of only
@@ -366,11 +373,14 @@ through `OPENDAM_BLENDER`, which CI's test job sets up.
 | Helper mask | `GlitterMask` beside a base | Stays opaque |
 | Blank twin | Blank `MI_X`, textured `M_X` | `M_X`'s texture |
 | Twin with no .mat | Slot `MI_X` with no `.mat`, textured `M_X` | `M_X`'s texture |
+| Twin over colours | `MI_X` with colours only, textured `M_X` | `M_X`'s texture |
+| True flat colour | `MI_Y` with colours only, `M_Y` missing or untextured | `MI_Y`'s colour, no texture |
 | Flat colour | `BaseColor Value` only | That colour, no texture |
 | Only texture | `_Grid` alone | Base texture |
 | Generated slot | `_SampleTexture2D_..._Texture_1` alone | No base |
 | Lone mask | Lone `Texture2D_x` shown as `OpacityMap` | Cutout over the flat colour, not a base |
 | Lone normal | Lone `Texture2D_x` shown as `NormalMap` | Normal map, not a base |
+| Lone, graph missing | Lone `Texture2D_x` with its `.shadergraph` left out | No base, same GLB as with today's rules |
 | LOD only | Only `_LOD1` meshes | Mesh kept, no warning |
 | Mixed LODs | A with `_LOD0` and `_LOD1`, B with `_LOD1` | A's `_LOD0`, B's `_LOD1` |
 | No suffix | `Wall` beside `Wall_LOD1` | `Wall` only |
@@ -379,7 +389,7 @@ through `OPENDAM_BLENDER`, which CI's test job sets up.
 | No mesh | Only collision meshes in a model not named as a collider | Warning |
 | No mesh, cache hit | The same model and inputs, run twice, the second from the cache | Warning on both runs |
 | Collider file | `rock_collider.obj` | No warning, on either run |
-| Exact name | Object `Plane.099` mapped in the `.meta` and a `.prefab` | Prefab's material |
+| Exact name | Objects `Plane.099` and `Plane.100`, each mapped in the `.meta`, with different material lists in the `.prefab`, so the single-list fallback can't apply | Each gets its own prefab material |
 | Graph missing | `.shadergraph` left out | Same GLB as with today's rules |
 
 Add unit tests beside the code for `is_input`, the version match, the collider terms matching
