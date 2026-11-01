@@ -21,14 +21,20 @@ checked in the code or measured on real packs, in a throwaway profile, at commit
 | POLYGON Prototype (Synty) | 950 | 746 | 909 |
 | The Big Castle Kit | 293 | 226 | 257 |
 | Fantasy Adventure Environment | 36 | 26 | 26 |
-| Medieval Houses Vol 1 | 386 | 384 | 192 of the URP copy's 193 |
+| Medieval Houses Vol 1, after Piece 1 | 386 | 384 | 384 of 386 |
+| Medieval Houses Vol 1, after Piece 2 | 193 | 192 of those | 193 of 193 |
 
 "Fully textured" means every material a GLB's meshes use has a `baseColorTexture`, the trial's
-audit. Targets are what a throwaway prototype of Piece 1 reached, with no GLB losing a texture.
-The prototype used the file-wide LOD rule, so Piece 1 must measure the per-mesh rule again.
+audit. Targets are what a throwaway prototype of Piece 1 reached with the per-mesh LOD rule this
+plan ships. No GLB lost a base, normal or ORM map.
 
-Medieval Houses' target assumes Piece 2. Before Piece 2 it stays 384 of 386. Each copy holds 193
-GLBs with one gap, `SM_Plane_01`.
+Medieval Houses has one floor per stage, because Piece 2 changes what it imports. After Piece 1
+both copies still land. After Piece 2 only the URP copy lands, so the gate uses 193 of 193. The
+owner accepted "384, or half if variants land" in round 2 and chose the pipeline rule in round 3.
+Both floors were measured: the prototype scored 384 of 386 on the doubled import and 193 of 193 on
+the URP copy alone. That copy's one gap in the doubled import, `SM_Plane_01`, closes when it
+converts alone, probably because by-name lookups no longer reach the Built-In copy. Piece 2's real
+import must confirm it.
 
 ## Baseline
 
@@ -37,6 +43,18 @@ session. None of this session's commands removed it, and the cause is unknown. T
 repeated from its scripts in a fresh throwaway profile, with the 63efa51 debug binary. It gave
 the same counts for all 7 packs: 157, 99, 179, 198, 0, 201 and 1. `~/Documents/Assets` was not
 touched.
+
+The baseline now lives at `~/.local/share/opendam-import-baseline-63efa51` (24 GB), outside
+`~/.cache` because of that loss:
+
+- `libs/`: all 11 packs built at version 4, with Medieval Houses as both copies.
+- `data/` and `cache/`: its throwaway profile, with `libraries.root_paths` pointing at `libs/`.
+- `h/`: the driver page, server, session scripts, app logs and run log.
+- `tools/`: the throwaway prototype and audit scripts, for reference only. This plan is the spec.
+- `proto/` and `proto-filewide/`: the prototype's GLBs.
+
+It holds no app thumbnails. The driver page replaces the app's UI, so `modelThumbnailer` never ran
+and model rows point at `_preview.glb` files.
 
 ## What held up and what did not
 
@@ -115,6 +133,68 @@ Problems the trial didn't show:
 
 Everything that changes GLB bytes goes in one version bump.
 
+### Before changing the converter
+
+Do these first, in order. Steps 4 and 5 must finish before the version bump.
+
+1. **Check the baseline.** Confirm `~/.local/share/opendam-import-baseline-63efa51` exists and that
+   an audit of its `libs/` gives this plan's Now column. If it is gone or differs, regenerate it
+   (below).
+2. **Commit the tools.** They are the first commit of this piece:
+   - `packages/preview-engine/tools/glb_audit.py`, stdlib only. It writes a manifest with one row
+     per GLB and material: pack, path, mesh, primitive and vertex counts, and each material's
+     name, base, normal and ORM maps and alpha mode. Given two manifests it lists every lost map
+     and every changed vertex or primitive count. Given floors, it checks them and lists
+     leftovers by material and count.
+   - `packages/preview-engine/tools/contact_sheet.py`, which builds a sheet from a library's PNG
+     thumbnails for a list of paths, with Pillow.
+   - `apps/desktop/scripts/import-trial/`, the driver: the page, the server, the session script
+     and the pack list, from the baseline's `h/`.
+3. **Commit the manifest.** Write `docs/plans/import-material-fixes/baseline-v4.tsv` from the
+   baseline. From then on the no-regression check needs only that file.
+4. **Capture the before thumbnails.** Build 63efa51 with its embedded frontend, as
+   `docs/agents/running-the-app.md` does under "Checking the CSP". Open a copy of the baseline in
+   a nested KWin, under `scripts/memory-cap.sh`, with the real UI. Wait until only failed models
+   still have a `.glb` thumbnail, then build the before sheets.
+5. **Keep a version 4 build.** The Rebuild check uses a copy of the baseline's Ancient Ruins. In
+   the prototype 157 of its 184 GLBs changed bytes and 27 stayed identical, so it exercises both
+   paths. Never rebuild the baseline itself.
+
+To regenerate the baseline:
+
+1. Make a worktree at 63efa51, run `mise install && make deps`, and build the debug binary.
+2. Point `XDG_DATA_HOME` and `XDG_CACHE_HOME` at a new folder outside `~/.cache`, and set
+   `OPENDAM_NO_KEYRING=1`, `OPENDAM_PYTHON` and `OPENDAM_WORKER` to that worktree's preview engine.
+3. Launch once to create the master DB, then add libraries `unity`, `fab` and `kenney` to its
+   `libraries` table, with roots under that folder.
+4. Serve a page on port 1420 from a small local server, and run the binary under
+   `scripts/memory-cap.sh` inside `dbus-run-session -- env -u DISPLAY kwin_wayland --virtual
+   --no-lockscreen --width 1400 --height 900 --socket <name> --exit-with-session <script>`.
+5. For each pack below, the page calls `scan_import` with `libraryId` and `originalPath`, takes the
+   offer whose `layout` matches and its first candidate, and calls `start_import` with
+   `libraryId`, `originalPath`, `target` (`<publisher>/<name>`), `publisher`, `preset`, and the
+   ticked variant's `variant` and `subpath`. It polls `list_import_runs` until none is queued or
+   running.
+
+The packs, each with its library, offer and publisher:
+
+| Original | Library, offer | Publisher |
+|---|---|---|
+| `~/Documents/AssetOriginals/Fab/StylizedWizardRoom.zip` | `fab`, `fab` | Stylarts |
+| `.../Fab/StylizedVillage.zip` | `fab`, `fab` | Stylarts |
+| `.../Fab/SpookyCemeteryCrypt.zip` | `fab`, `fab` | Stylarts |
+| `.../Fab/StylizedElvenValley.zip` | `fab`, `fab` | Stylarts |
+| `.../Fab/StylizedLostCave.zip` | `fab`, `fab` | Stylarts |
+| `.../Fab/AncientRuins.zip` | `fab`, `fab` | Leartes Studios |
+| Unity cache, `Elven Long Bow.unitypackage` | `unity`, `unity` | Manuel Wieser |
+| Unity cache, `POLYGON - Prototype Pack - Art by Synty.unitypackage` | `unity`, `unity` | Synty Studios |
+| Unity cache, `Fantasy Adventure Environment.unitypackage` | `unity`, `unity` | Staggart Creations |
+| Unity cache, `The Big Castle Kit.unitypackage` | `unity`, `unity` | Triplebrick |
+| Unity cache, `Medieval Houses Modular Vol 1.unitypackage` | `unity`, `unity` | GameAssetFactory |
+
+The Unity cache is `~/.local/share/unity3d/Asset Store-5.x`. If a regenerated baseline's counts
+differ from the Now column, stop and report it.
+
 ### How a slot finds its texture
 
 ```mermaid
@@ -146,7 +226,8 @@ opacity take the first two steps only. The base colour alone also takes the only
    needs `orm` without `normal`. Opacity needs `opacity` or `alpha`, never bare `mask`, because
    `GlitterMask` isn't opacity.
 3. **Only texture.** A material with exactly one bound texture uses it as its base, unless the
-   property is a generated `_SampleTexture...` slot or holds a `NOT_BASE` word.
+   property is a generated `_SampleTexture...` slot, or its raw name or display name holds a
+   `NOT_BASE` word. A lone `Texture2D_x` shown as `OpacityMap` is a mask, never a base.
 4. **Mask with no base.** `build_material` wires the mask to alpha whether or not there is a base,
    over the flat colour. Blender 5.2.3 exports that as `alphaMode: MASK` with a `baseColorTexture`
    holding the mask, so the audit counts it as textured though its RGB is flat.
@@ -154,9 +235,10 @@ opacity take the first two steps only. The base colour alone also takes the only
    `COLOR_PROPS`, so `M_BasicFill` is black, as its file says.
 6. **Twin lookup.** For a slot with no `.mat` or a blank one, `MI_X` resolves through `by_name` to
    `M_X` when that material has textures. `named_material` stays as today's last resort.
-7. **Lowest LOD per mesh.** Group objects by name without the numeric suffix and the LOD suffix,
-   and keep each group's lowest level, so a `_LOD1`-only file keeps its mesh. A LOD file keeps
-   all, as today.
+7. **Lowest LOD per mesh.** Group mesh objects by name, without Blender's numeric suffix and the
+   `_LOD<n>` suffix. No suffix and `_LOD0` are both level 0. Keep each group's lowest level, and
+   every object at that level: `Wall` beside `Wall_LOD1` keeps `Wall`, and a group of only
+   `_LOD1` meshes keeps them all. A file that is itself a LOD keeps all, as today.
 8. **Raw names first.** Look up `obj.name` and `obj.data.name` as they are, before `base_name()`.
 9. **No-mesh warning.** Report a model left with no mesh, unless its file name matches
    `COLLISION_RE`, whose empty GLBs are the known collider gap.
@@ -186,8 +268,11 @@ deviations.
 - After the bump, a Rebuild of any built pack misses the cache and reconverts every model. A
   Rebuild with no other change is already allowed, and the button is always in Preparation.
 - A staged GLB whose bytes changed keeps its asset row, id, tags and path, and takes a new mtime.
-  With the watcher change above, it gets a fresh preview. An unchanged GLB keeps its mtime and
+  With the watcher change above, it gets a fresh preview. A byte-identical GLB keeps its mtime and
   queues nothing.
+- Expect most GLBs to change. In the prototype 157 of Ancient Ruins' 184 changed bytes though only
+  19 gained a texture, so a Rebuild after a bump requeues most of a pack's previews. Why the
+  other bytes changed wasn't traced.
 - In-app renames and excludes are recipe steps, so they survive. Kept files carry as before.
 - Nothing flags a pack as built by an older converter. A version bump means you Rebuild. Old
   cache entries stay until Clear in Settings' Import tools.
@@ -254,8 +339,9 @@ Across the 11 packs measured, only Wizard Room changes: 219 items to 39.
 
 Real Asset Store content can't be committed. Add
 `apps/desktop/src-tauri/tests/fixtures/unity-glb/`, made by a stdlib `make_fixtures.py` and
-committed with its output, as the pack-import fixtures are: text `.mat`, `.meta` and
-`.shadergraph` files, a small OBJ per case and tiny PNGs.
+committed with its output, as the pack-import fixtures are: text `.mat`, `.meta`, `.prefab`, `.mtl`
+and `.shadergraph` files, a small OBJ per case and tiny PNGs. An OBJ's `usemtl` and `.mtl` give it
+a named material slot. A `.prefab` and the `.meta`'s `fileIDToRecycleName` map its meshes.
 
 Blender-backed Rust tests run the script over it and read each GLB's JSON. They find Blender
 through `OPENDAM_BLENDER`, which CI's test job sets up.
@@ -271,11 +357,16 @@ through `OPENDAM_BLENDER`, which CI's test job sets up.
 | Flat colour | `BaseColor Value` only | That colour, no texture |
 | Only texture | `_Grid` alone | Base texture |
 | Generated slot | `_SampleTexture2D_..._Texture_1` alone | No base |
+| Lone mask | Lone `Texture2D_x` shown as `OpacityMap` | Cutout over the flat colour, not a base |
+| Lone normal | Lone `Texture2D_x` shown as `NormalMap` | Normal map, not a base |
 | LOD only | Only `_LOD1` meshes | Mesh kept, no warning |
 | Mixed LODs | A with `_LOD0` and `_LOD1`, B with `_LOD1` | A's `_LOD0`, B's `_LOD1` |
+| No suffix | `Wall` beside `Wall_LOD1` | `Wall` only |
+| Several at one level | `X_LOD1.001` and `X_LOD1.002` only | Both kept |
+| LOD file | File `X_LOD1.obj` holding `X_LOD1` | Kept |
 | No mesh | Only collision meshes in a model not named as a collider | Warning |
 | Collider file | `rock_collider.obj` | No warning |
-| Exact name | Object `Plane.099` mapped in the `.meta` | Prefab's material |
+| Exact name | Object `Plane.099` mapped in the `.meta` and a `.prefab` | Prefab's material |
 | Graph missing | `.shadergraph` left out | Same GLB as with today's rules |
 
 Add unit tests beside the code for `is_input`, the version match, the cover order, the hoist
@@ -286,15 +377,21 @@ final progress write and LOD grouping and renames.
 
 ### Each piece
 
-- **Piece 1:** the fixture tests pass, and all 11 packs reach their floors in a clean throwaway
-  profile. Compared GLB by GLB with the baseline, none loses a base texture, normal or ORM map.
-  `SM_Bulidings.glb` and `SM_Grass_Foliage.glb` have meshes. Rebuilding one built pack from
-  version 4 gives new GLBs and new thumbnails, keeps a tag and a rename, and leaves unchanged
-  GLBs alone.
+- **Piece 1:** the fixture tests pass, and all 11 packs reach their Piece 1 floors in a clean
+  throwaway profile, with Medieval Houses at 384 of 386. Run `glb_audit.py` against
+  `baseline-v4.tsv`:
+  - No GLB loses a base, normal or ORM map.
+  - Every GLB whose vertex or primitive count changed is listed and explained. The expected list
+    is exactly `SM_Bulidings.glb` (0 to 2,116,110 vertices) and `SM_Grass_Foliage.glb` (0 to
+    3,610). Any other increase may be doubled geometry from a LOD group that didn't match, and
+    blocks the merge until explained.
+  - Rebuilding the copy of Ancient Ruins gives new GLBs and new thumbnails for the changed ones,
+    keeps a tag and a rename, and leaves byte-identical GLBs alone.
 - **Piece 2:** the 6 Fab packs get a model cover, not a texture. Wizard Room's dialog warns about
   `hoist Art`, and `Stylarts/WizardRoom/Art` hoists. `StylizedVillage` becomes `Stylized Village`.
-  The Kenney zip opens on `kenney` with 241 packs ticked. Medieval Houses and Nature Package
-  build one pipeline. The bench checks U10 and U11 still pass.
+  The Kenney zip opens on `kenney` with 241 packs ticked. Nature Package and Medieval Houses each
+  build one pipeline, and Medieval Houses reaches 193 of 193 GLBs. The bench checks U10 and U11
+  still pass.
 - **Piece 3:** the 7 `.hdr` files seen across both libraries get previews. `T_Beige.png` and
   `T_Brown.png` say too large. A finished run's row shows its final figures.
 - **Piece 4:** Wizard Room shows 39 items. A rename keeps each `_LOD<n>`. U11 and U12 still pass.
@@ -315,29 +412,45 @@ Each must be listed by material and count, so anything else stands out.
 
 ### Visual check
 
-The audit reads JSON and proves nothing about how a GLB looks. For each pack, render a contact
-sheet of about 12 models from the app's own thumbnails, before and after, covering foliage,
-walls, roofs, props and flat colours, and register it as evidence. **The owner reviews the
-sheets.** Use the app's three.js thumbnails, not Blender: `SM_Leaves01` renders almost black in
-Cycles both before and after, though its GLB's colour is right, and that needs judging on what
-the app shows.
+The audit reads JSON and proves nothing about how a GLB looks. For each pack, build a contact
+sheet of about 12 models with `contact_sheet.py`, before and after, covering foliage, walls, roofs,
+props and flat colours, and register it as evidence. **The owner reviews the sheets.** The before
+sheets come from Piece 1's first steps, and the after sheets from the gate's run. Use the app's
+three.js thumbnails, not Blender: `SM_Leaves01` renders almost black in Cycles both before and
+after, though its GLB's colour is right, and that needs judging on what the app shows.
 
 ### Before deleting the old libraries
 
-With Pieces 1-3 merged, run these in a clean throwaway profile:
+With Pieces 1-3 merged, run these in one clean throwaway profile, with the real UI, so thumbnails
+render. Each needs its pass result recorded in one gate report for the owner.
 
-1. All 11 packs, audited against the floors, with the contact sheets reviewed.
-2. `LostRuins.zip` through the Unreal route. The editor is at `~/Applications/UnrealEngine`.
-3. `Waterways.zip`, after a memory check, under `import.unrealMemoryMax`. A kill at the cap is a
-   finding, not a reason to raise it.
-4. The Kenney build, for time and disk use. It has no conversion step.
+| Run | Passes when |
+|---|---|
+| All 11 packs | Every run ends `done` with no error. Every pack reaches its floor, with Medieval Houses at 193 of 193. `glb_audit.py` shows no lost map, the expected geometry list only, and leftovers all explained. The owner has reviewed the sheets |
+| `LostRuins.zip`, Unreal route | The run ends `done` with no error and no failed model. Its GLB count is above 0 and at most the scan's estimate. `glb_audit.py` reports its textured count and leftovers. The owner has reviewed a sheet of about 12 models |
+| `Waterways.zip`, Unreal route | As LostRuins, after the memory check, and with no cap kill in the app log, including a session the run recovered from |
+| Kenney build | The zip opens on `kenney` with 241 packs ticked. Every ticked pack ends built, with no failed run. Each pack's file count matches its scan tree, and skipped entries are listed. Time and disk use are recorded |
 
-Only then delete the old libraries. Piece 4 can land before or after.
+The memory check for Waterways: `import.unrealMemoryMax` keeps its default of 20G, `MemAvailable`
+is at least 24 GB before the run starts, no benchmark or other Unreal run is going, and the disk
+has at least 20 GB free. Record the scope's peak memory. If 24 GB can't be freed, stop and ask.
+
+Unreal packs have no floors, because this work never ran them. These first runs set their numbers.
+
+**Any failed run, cap kill, missed floor, lost map, unexplained leftover or unexplained geometry
+change holds the deletion until the owner decides.** Never raise a cap or lower a floor to pass.
+The owner deletes the old libraries by hand after reading the gate report. Piece 4 can land before
+or after.
 
 ## Evidence so far
 
 - **Prototype:** a throwaway copy of `unity_glb.py`, never in the repository, ran on 10 packs
-  under `scripts/memory-cap.sh` with no regressions. Elven Long Bow wasn't rerun, and keeps 1.
+  under `scripts/memory-cap.sh`, plus the Medieval URP copy alone, with the per-mesh LOD rule and
+  the only-texture check on both names. No GLB lost a base, normal or ORM map, and no model failed.
+  Elven Long Bow wasn't rerun, and keeps 1.
+- **Geometry:** of all those GLBs, only `SM_Bulidings.glb` and `SM_Grass_Foliage.glb` changed vertex
+  count, and those are the two fixed models. No other GLB gained geometry, so the rule left no
+  doubled levels in these packs.
 - **Filename rule:** tried and dropped after the false cutouts above.
 - **Big Castle's cutouts:** MASK uses fell from 58 to 23. That isn't a loss: the 42 lost uses were
   misnamed `Material.00x` slots that now resolve to real materials such as `wood_a_beams`, and
