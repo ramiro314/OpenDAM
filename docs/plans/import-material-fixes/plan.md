@@ -143,22 +143,27 @@ Do these first, in order. Steps 4 and 5 must finish before the version bump.
 2. **Commit the tools.** They are the first commit of this piece:
    - `packages/preview-engine/tools/glb_audit.py`, stdlib only. It writes a manifest with one row
      per GLB and material: pack, path, mesh, primitive and vertex counts, and each material's
-     name, base, normal and ORM maps and alpha mode. Given two manifests it lists every lost map
-     and every changed vertex or primitive count. Given floors, it checks them and lists
-     leftovers by material and count.
+     name, base, normal and ORM maps and alpha mode. Given two manifests and a pack map (see
+     Matching against the baseline), it lists every lost map, every changed vertex or primitive
+     count, every unmatched GLB on either side, and the matched GLBs per pack. Given floors, it
+     checks them and lists leftovers by material and count.
    - `packages/preview-engine/tools/contact_sheet.py`, which builds a sheet from a library's PNG
-     thumbnails for a list of paths, with Pillow.
+     thumbnails for a list of paths, with Pillow. It reads the same pack map.
    - `apps/desktop/scripts/import-trial/`, the driver: the page, the server, the session script
      and the pack list, from the baseline's `h/`.
 3. **Commit the manifest.** Write `docs/plans/import-material-fixes/baseline-v4.tsv` from the
-   baseline. From then on the no-regression check needs only that file.
+   baseline, and `pack-map.tsv` beside it. From then on the no-regression check needs only those
+   files.
 4. **Capture the before thumbnails.** Build 63efa51 with its embedded frontend, as
-   `docs/agents/running-the-app.md` does under "Checking the CSP". Open a copy of the baseline in
-   a nested KWin, under `scripts/memory-cap.sh`, with the real UI. Wait until only failed models
-   still have a `.glb` thumbnail, then build the before sheets.
-5. **Keep a version 4 build.** The Rebuild check uses a copy of the baseline's Ancient Ruins. In
-   the prototype 157 of its 184 GLBs changed bytes and 27 stayed identical, so it exercises both
-   paths. Never rebuild the baseline itself.
+   `docs/agents/running-the-app.md` does under "Checking the CSP". Copy the baseline's `libs/` and
+   `data/` to a new folder, and point the copy's `libraries.root_paths` at that folder, so nothing
+   writes to the baseline. Open the copy in a nested KWin, under `scripts/memory-cap.sh`, with
+   `XDG_DATA_HOME` and `XDG_CACHE_HOME` there and the real UI. Wait until only failed models still
+   have a `.glb` thumbnail, then build the before sheets. Keep this copy.
+5. **Keep a version 4 build.** The Rebuild check runs on a second copy of step 4's folder,
+   repointed the same way, so it starts with version 4 app thumbnails to replace. It rebuilds Ancient
+   Ruins. In the prototype 157 of those 184 GLBs changed bytes and 27 stayed identical, so it
+   exercises both paths. Never rebuild the baseline or step 4's copy.
 
 To regenerate the baseline:
 
@@ -279,7 +284,8 @@ deviations.
 
 ## Piece 2: Import dialog and pack metadata
 
-Needs no new GLBs, and doesn't depend on Piece 1.
+Comes after Piece 1. Its code doesn't touch the converter, but its Medieval Houses check needs
+Piece 1 merged: with version 4 the URP copy stays at 192 of 193. Its other checks need no new GLBs.
 
 - **Covers (`structure.rs`).** `PackFiles::cover` becomes preview, sample, largest model, image,
   visible file. The largest is the biggest visible model item by size, ties by path, so `derive`
@@ -304,6 +310,8 @@ Needs no new GLBs, and doesn't depend on Piece 1.
   - Medieval Houses keeps its URP copy, about half of 4.1 GB.
   - Nature Package keeps its base content, `URP` and both URP shader sets, and skips the HDRP
     overlays and the 1.8 GB Built-In package.
+- **Pack map.** Update `pack-map.tsv` for the new Fab targets and Medieval's prefix (see Matching
+  against the baseline).
 
 ## Piece 3: Small preview fixes
 
@@ -371,27 +379,67 @@ through `OPENDAM_BLENDER`, which CI's test job sets up.
 
 Add unit tests beside the code for `is_input`, the version match, the cover order, the hoist
 warning, CamelCase splitting, offer order, pipeline filtering, the changed-model preview, the
-final progress write and LOD grouping and renames.
+final progress write and LOD grouping and renames. Test `glb_audit.py`'s join on small manifests: a
+renamed pack, a changed prefix, an expected absence, an unexpected absence, an extra GLB and a
+matched count that falls short.
 
 ## Acceptance
+
+### Matching against the baseline
+
+`baseline-v4.tsv` holds version 4 pack names and both Medieval copies, and Piece 2 changes both.
+So every comparison goes through `docs/plans/import-material-fixes/pack-map.tsv`, which
+`glb_audit.py` and `contact_sheet.py` both read. One row per pack gives its baseline pack and path
+prefix, its current pack and path prefix, and how many GLBs must match.
+
+From Piece 2 on, the map reads:
+
+| Baseline pack | Baseline prefix | Current pack | Current prefix | GLBs |
+|---|---|---|---|---|
+| `Stylarts/StylizedVillage` | none | `Stylarts/Stylized Village` | none | 181 |
+| `Leartes Studios/AncientRuins` | none | `Leartes Studios/Ancient Ruins` | none | 184 |
+| `Stylarts/SpookyCemeteryCrypt` | none | `Stylarts/Spooky Cemetery Crypt` | none | 100 |
+| `Stylarts/StylizedElvenValley` | none | `Stylarts/Stylized Elven Valley` | none | 200 |
+| `Stylarts/StylizedLostCave` | none | `Stylarts/Stylized Lost Cave` | none | 208 |
+| `Stylarts/StylizedWizardRoom` | none | `Stylarts/Stylized Wizard Room` | none | 219 |
+| `Manuel Wieser/Elven Long Bow` | none | same | none | 2 |
+| `Synty Studios/POLYGON - Prototype Pack - Art by Synty` | none | same | none | 950 |
+| `Triplebrick/The Big Castle Kit` | none | same | none | 293 |
+| `Staggart Creations/Fantasy Adventure Environment` | none | same | none | 36 |
+| `GameAssetFactory/Medieval Houses Modular Vol 1` | `Medieval_Houses_Vol1_URP_HDRP/` | same | from Piece 2's real import | 193 |
+
+Before Piece 2 the map has the same pack on both sides, no prefixes, and 386 GLBs for Medieval
+Houses. Piece 2 fills in Medieval's current prefix from its first real import, because `flatten`
+may remove that folder once only one copy lands.
+
+The rules:
+
+- **Join key.** A GLB matches on its mapped pack plus its path after the prefix.
+- **Expected absences.** Only the 193 baseline GLBs under `Medieval_Houses_Vol1_Built-In/`.
+- **Everything else must match.** Any other unmatched GLB on either side fails, as does a pack whose
+  matched count differs from its GLBs column. So a wrong name or prefix fails loudly, and can't
+  pass by comparing nothing.
+- **Default steps.** The gate imports every pack with its default steps and no typed hoist, so
+  Wizard Room's paths stay as in the baseline.
 
 ### Each piece
 
 - **Piece 1:** the fixture tests pass, and all 11 packs reach their Piece 1 floors in a clean
   throwaway profile, with Medieval Houses at 384 of 386. Run `glb_audit.py` against
   `baseline-v4.tsv`:
+  - Every pack matches its GLB count, with no unmatched GLB.
   - No GLB loses a base, normal or ORM map.
   - Every GLB whose vertex or primitive count changed is listed and explained. The expected list
     is exactly `SM_Bulidings.glb` (0 to 2,116,110 vertices) and `SM_Grass_Foliage.glb` (0 to
     3,610). Any other increase may be doubled geometry from a LOD group that didn't match, and
     blocks the merge until explained.
-  - Rebuilding the copy of Ancient Ruins gives new GLBs and new thumbnails for the changed ones,
-    keeps a tag and a rename, and leaves byte-identical GLBs alone.
+  - Rebuilding Ancient Ruins in step 5's copy replaces each changed GLB's version 4 thumbnail,
+    keeps a tag and a rename, and leaves byte-identical GLBs and their thumbnails alone.
 - **Piece 2:** the 6 Fab packs get a model cover, not a texture. Wizard Room's dialog warns about
   `hoist Art`, and `Stylarts/WizardRoom/Art` hoists. `StylizedVillage` becomes `Stylized Village`.
   The Kenney zip opens on `kenney` with 241 packs ticked. Nature Package and Medieval Houses each
-  build one pipeline, and Medieval Houses reaches 193 of 193 GLBs. The bench checks U10 and U11
-  still pass.
+  build one pipeline. With Piece 1 merged, Medieval Houses reaches 193 of 193 GLBs and matches its
+  193 URP baseline GLBs through the map. The bench checks U10 and U11 still pass.
 - **Piece 3:** the 7 `.hdr` files seen across both libraries get previews. `T_Beige.png` and
   `T_Brown.png` say too large. A finished run's row shows its final figures.
 - **Piece 4:** Wizard Room shows 39 items. A rename keeps each `_LOD<n>`. U11 and U12 still pass.
@@ -415,9 +463,10 @@ Each must be listed by material and count, so anything else stands out.
 The audit reads JSON and proves nothing about how a GLB looks. For each pack, build a contact
 sheet of about 12 models with `contact_sheet.py`, before and after, covering foliage, walls, roofs,
 props and flat colours, and register it as evidence. **The owner reviews the sheets.** The before
-sheets come from Piece 1's first steps, and the after sheets from the gate's run. Use the app's
-three.js thumbnails, not Blender: `SM_Leaves01` renders almost black in Cycles both before and
-after, though its GLB's colour is right, and that needs judging on what the app shows.
+sheets come from Piece 1's first steps, and the after sheets from the gate's run, with one path list
+per pack joined through `pack-map.tsv`, so each pair shows the same model. Use the app's three.js
+thumbnails, not Blender: `SM_Leaves01` renders almost black in Cycles both before and after, though
+its GLB's colour is right, and that needs judging on what the app shows.
 
 ### Before deleting the old libraries
 
@@ -426,7 +475,7 @@ render. Each needs its pass result recorded in one gate report for the owner.
 
 | Run | Passes when |
 |---|---|
-| All 11 packs | Every run ends `done` with no error. Every pack reaches its floor, with Medieval Houses at 193 of 193. `glb_audit.py` shows no lost map, the expected geometry list only, and leftovers all explained. The owner has reviewed the sheets |
+| All 11 packs | Every run ends `done` with no error. Every pack reaches its floor, with Medieval Houses at 193 of 193. `glb_audit.py`, through `pack-map.tsv`, matches every pack's GLB count with only the 193 Built-In GLBs absent, and shows no lost map, the expected geometry list only, and leftovers all explained. The owner has reviewed the sheets |
 | `LostRuins.zip`, Unreal route | The run ends `done` with no error and no failed model. Its GLB count is above 0 and at most the scan's estimate. `glb_audit.py` reports its textured count and leftovers. The owner has reviewed a sheet of about 12 models |
 | `Waterways.zip`, Unreal route | As LostRuins, after the memory check, and with no cap kill in the app log, including a session the run recovered from |
 | Kenney build | The zip opens on `kenney` with 241 packs ticked. Every ticked pack ends built, with no failed run. Each pack's file count matches its scan tree, and skipped entries are listed. Time and disk use are recorded |
@@ -437,10 +486,10 @@ has at least 20 GB free. Record the scope's peak memory. If 24 GB can't be freed
 
 Unreal packs have no floors, because this work never ran them. These first runs set their numbers.
 
-**Any failed run, cap kill, missed floor, lost map, unexplained leftover or unexplained geometry
-change holds the deletion until the owner decides.** Never raise a cap or lower a floor to pass.
-The owner deletes the old libraries by hand after reading the gate report. Piece 4 can land before
-or after.
+**Any failed run, cap kill, missed floor, lost map, unmatched GLB other than the expected absences,
+unexplained leftover or unexplained geometry change holds the deletion until the owner decides.**
+Never raise a cap or lower a floor to pass. The owner deletes the old libraries by hand after
+reading the gate report. Piece 4 can land before or after.
 
 ## Evidence so far
 
