@@ -460,9 +460,9 @@ The rules:
   - Every pack matches its GLB count, with no unmatched GLB.
   - No GLB loses a base, normal or ORM map.
   - Every GLB whose vertex or primitive count changed is listed and explained. The expected list
-    is exactly `SM_Bulidings.glb` (0 to 2,116,110 vertices) and `SM_Grass_Foliage.glb` (0 to
-    3,610). Any other increase may be doubled geometry from a LOD group that didn't match, and
-    blocks the merge until explained.
+    is exactly `SM_Bulidings.glb` (0 to 2,116,110 vertices, 0 to 176 primitives) and
+    `SM_Grass_Foliage.glb` (0 to 3,610 vertices, 0 to 1 primitive). Any other increase may be
+    doubled geometry from a LOD group that didn't match, and blocks the merge until explained.
   - Rebuilding Ancient Ruins in step 5's copy replaces each changed GLB's version 4 thumbnail,
     keeps a tag and a rename, and leaves byte-identical GLBs and their thumbnails alone.
 - **Piece 2:** the 6 Fab packs get a model cover, not a texture. Wizard Room's dialog warns about
@@ -528,9 +528,10 @@ reading the gate report. Piece 4 can land before or after.
   under `scripts/memory-cap.sh`, plus the Medieval URP copy alone, with the per-mesh LOD rule and
   the only-texture check on both names. No GLB lost a base, normal or ORM map, and no model failed.
   Elven Long Bow wasn't rerun, and keeps 1.
-- **Geometry:** of all those GLBs, only `SM_Bulidings.glb` and `SM_Grass_Foliage.glb` changed vertex
-  count, and those are the two fixed models. No other GLB gained geometry, so the rule left no
-  doubled levels in these packs.
+- **Geometry:** across those 2,757 GLBs, only `SM_Bulidings.glb` and `SM_Grass_Foliage.glb` changed
+  vertex, primitive or mesh count, and those are the two fixed models. So slot changes such as the
+  twin lookup and exact names moved no primitive count, and the rule left no doubled levels in
+  these packs.
 - **Role words:** the whole-word rule was run over all 131 display names, and the skip of `detail`
   was rerun through the prototype on Lost Cave, the only pack it affects. Four of its materials
   changed normal map, such as `M_Tunnel` from `T_Rock_Tiles_N` to its own `T_Tunnel_A_N`. Its floor
