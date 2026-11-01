@@ -44,7 +44,7 @@ repeated from its scripts in a fresh throwaway profile, with the 63efa51 debug b
 the same counts for all 7 packs: 157, 99, 179, 198, 0, 201 and 1. `~/Documents/Assets` was not
 touched.
 
-The baseline now lives at `~/.local/share/opendam-import-baseline-63efa51` (24 GB), outside
+The baseline now lives at `~/.local/share/opendam-import-baseline-63efa51` (27 GB), outside
 `~/.cache` because of that loss:
 
 - `libs/`: all 11 packs built at version 4, with Medieval Houses as both copies.
@@ -245,19 +245,23 @@ opacity take the first two steps only. The base colour alone also takes the only
    every object at that level: `Wall` beside `Wall_LOD1` keeps `Wall`, and a group of only
    `_LOD1` meshes keeps them all. A file that is itself a LOD keeps all, as today.
 8. **Raw names first.** Look up `obj.name` and `obj.data.name` as they are, before `base_name()`.
-9. **No-mesh warning.** Report a model left with no mesh, unless its file name matches
-   `COLLISION_RE`, whose empty GLBs are the known collider gap.
-10. Bump `VERSION` to `opendam-unity-glb/5`. Update the docstring's list of what differs from the
-    original script.
+9. Bump `VERSION` to `opendam-unity-glb/5`. Update the docstring's list of what differs from the
+   original script.
 
 `apps/desktop/src-tauri/src/import/unity_glb.rs`:
 
 - Add `shadergraph` to `UNITY_EXTENSIONS`, which `inputs_hash` then covers by source path and
   sha256.
 - Bump `UNITY_GLB_VERSION` with the script. A test keeps the two equal.
-- Carry the no-mesh warning into the run's warnings. Today `warnings` is a list of skipped
-  archive entries, under a heading saying entries were skipped, so it needs a reason of its own
-  and a heading that fits both.
+- **No-mesh warning.** `Conversion::run` reports a model left with no mesh, because the script only
+  sees uncached models. After placing the GLBs, `run` reads each one's JSON chunk, new or from the
+  cache, and warns when its `meshes` list is empty. So an empty GLB warns on every run, including
+  a Rebuild with unchanged inputs and a retry after another model failed the step. A model whose
+  file name is a collider's stays silent, as the known collider gap: Rust keeps the same terms as
+  `COLLISION_RE`, and a test keeps the two equal.
+- Carry that warning into the run's warnings. Today `warnings` is a list of skipped archive
+  entries, under a heading saying entries were skipped, so it needs a reason of its own and a
+  heading that fits both.
 
 `apps/desktop/src-tauri/src/watcher.rs`:
 
@@ -373,15 +377,16 @@ through `OPENDAM_BLENDER`, which CI's test job sets up.
 | Several at one level | `X_LOD1.001` and `X_LOD1.002` only | Both kept |
 | LOD file | File `X_LOD1.obj` holding `X_LOD1` | Kept |
 | No mesh | Only collision meshes in a model not named as a collider | Warning |
-| Collider file | `rock_collider.obj` | No warning |
+| No mesh, cache hit | The same model and inputs, run twice, the second from the cache | Warning on both runs |
+| Collider file | `rock_collider.obj` | No warning, on either run |
 | Exact name | Object `Plane.099` mapped in the `.meta` and a `.prefab` | Prefab's material |
 | Graph missing | `.shadergraph` left out | Same GLB as with today's rules |
 
-Add unit tests beside the code for `is_input`, the version match, the cover order, the hoist
-warning, CamelCase splitting, offer order, pipeline filtering, the changed-model preview, the
-final progress write and LOD grouping and renames. Test `glb_audit.py`'s join on small manifests: a
-renamed pack, a changed prefix, an expected absence, an unexpected absence, an extra GLB and a
-matched count that falls short.
+Add unit tests beside the code for `is_input`, the version match, the collider terms matching
+`COLLISION_RE`, the cover order, the hoist warning, CamelCase splitting, offer order, pipeline
+filtering, the changed-model preview, the final progress write and LOD grouping and renames. Test
+`glb_audit.py`'s join on small manifests: a renamed pack, a changed prefix, an expected absence, an
+unexpected absence, an extra GLB and a matched count that falls short.
 
 ## Acceptance
 
