@@ -26,7 +26,7 @@ uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 walkdir = "2"
 chrono = { version = "0.4", features = ["serde"] }
-image = { version = "0.25", features = ["jpeg", "png", "tiff", "bmp", "gif", "tga", "webp"] }
+image = { version = "0.25", features = ["jpeg", "png", "tiff", "bmp", "gif", "tga", "webp", "hdr"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trash = "5"
