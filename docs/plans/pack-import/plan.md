@@ -487,7 +487,14 @@ the script's heuristics as they were. Real packs needed more, so these are its d
   with the empties and armatures above it.
 - **R65 - Exact names first.** A prefab's mesh is looked up by the object's and the mesh's raw
   names, then without Blender's numeric suffix, since a `.meta` can name `Plane.099`.
-- **R66 - A version bump means a Rebuild.** Every GLB's key holds the version, so a pack's next
+- **R66 - A flat color is written linear.** `unity_gltf.py` wrote a `.mat`'s color straight into
+  glTF's linear factor, though Unity stores it as sRGB, so every flat color came out too pale.
+  Each is converted, unless it is HDR, which Unity keeps linear: its graph's `m_ColorMode` says
+  so, or a channel is past 1.
+- **R67 - A prefab's material list skips a slot no face uses.** The script indexed the list by
+  FBX slot. Unity makes one submesh per slot that faces use, and a renderer lists those, so a
+  material after an empty slot landed on that slot and the used one stayed unresolved.
+- **R68 - A version bump means a Rebuild.** Every GLB's key holds the version, so a pack's next
   Rebuild reconverts every model. A GLB whose bytes changed keeps its row, id, tags and path and
   gets a fresh preview, and a byte-identical one keeps its mtime and queues nothing. Nothing flags
   a pack built by an older version, and old cache entries stay until Clear.
@@ -1022,7 +1029,7 @@ whenever a target is edited:
 - **The script.** `unity_gltf.py` is embedded as `import/unity_glb.py` with a `VERSION`
   constant, and a test keeps it equal to the Rust `UNITY_GLB_VERSION`. Its material sources,
   property tables, LOD and collision dropping, and 1024 px JPEG/PNG embedding are kept as they
-  are (D28), with what R62-R65 add. It finds every file by name, never by its path from the model, and reads its
+  are (D28), with what R62-R67 add. It finds every file by name, never by its path from the model, and reads its
   first-wins lookups in path order (R43, R44).
 - **The work folder.** The step makes a work folder in the cache directory holding the staged
   pack's Unity files (`.meta`, `.mat`, `.prefab`, `.unity`, `.shadergraph`), models and textures.

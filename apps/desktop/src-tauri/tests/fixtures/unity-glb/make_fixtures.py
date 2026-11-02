@@ -18,7 +18,8 @@ object and mesh share a name, so their tests make `Model.fbx` under Blender. The
   NORMAL, and MASK is black, so a mask read as a base shows.
 - An alpha base is BASE with an alpha of 0. Its red is high, so a clip that read its red channel
   as a mask keeps what its own alpha cuts.
-- TINT is the flat colour a material should show, and GREY one it should not.
+- TINT is the flat colour a material should show, as Unity stores it, in sRGB, and GREY one it
+  should not.
 """
 
 import hashlib
@@ -148,11 +149,15 @@ class Pack:
         self.meta(f"{name}.mat")
 
 
-def stream(properties: dict[str, str], override: dict[str, str] | None = None) -> str:
+def stream(
+    properties: dict[str, str],
+    override: dict[str, str] | None = None,
+    hdr: tuple[str, ...] = (),
+) -> str:
     """A Shader Graph as Unity 2021 writes it: a stream of JSON objects, the graph, then one for
     each property of `properties`, reference -> display name, a color for a generated `Color_`
     reference and a texture otherwise. `override` holds the references set by hand: the generated
-    one stays in `m_DefaultReferenceName`."""
+    one stays in `m_DefaultReferenceName`. `hdr` holds the colors whose mode is HDR."""
     override = override or {}
 
     def kind(ref: str) -> str:
@@ -168,14 +173,15 @@ def stream(properties: dict[str, str], override: dict[str, str] | None = None) -
         {"m_Type": "UnityEditor.ShaderGraph.BlockNode", "m_Name": "SurfaceDescription.BaseColor"},
     ]
     for ref, shown in properties.items():
-        objects.append(
-            {
-                "m_Type": f"UnityEditor.ShaderGraph.Internal.{kind(ref)}ShaderProperty",
-                "m_Name": shown,
-                "m_DefaultReferenceName": ref,
-                "m_OverrideReferenceName": override.get(ref, ""),
-            }
-        )
+        found = {
+            "m_Type": f"UnityEditor.ShaderGraph.Internal.{kind(ref)}ShaderProperty",
+            "m_Name": shown,
+            "m_DefaultReferenceName": ref,
+            "m_OverrideReferenceName": override.get(ref, ""),
+        }
+        if kind(ref) == "Color":
+            found["m_ColorMode"] = 1 if ref in hdr else 0
+        objects.append(found)
     return "\n\n".join(json.dumps(o, indent=4) for o in objects) + "\n"
 
 
@@ -471,6 +477,42 @@ def main() -> None:
     pack = Pack("colour-sort", ["M_Thing"])
     shader = pack.graph("S_Thing", stream({"Color_a": "BaseColor", "Color_b": "Base Color"}))
     pack.material("M_Thing", colors={"Color_a": GREY, "Color_b": TINT}, shader=shader)
+
+    # An HDR colour is stored linear, by its graph's mode, or past 1 in a shader with no graph.
+    pack = Pack("hdr-colour", ["M_Graph", "M_Bright"])
+    shader = pack.graph("S_Thing", stream({"Color_a": "BaseColor"}, hdr=("Color_a",)))
+    pack.material("M_Graph", colors={"Color_a": TINT}, shader=shader)
+    pack.material("M_Bright", colors={"_BaseColor": (2, 0.4, 0.6, 1)})
+
+    # Unity makes a submesh per material that faces use, so a renderer's list skips `Empty`.
+    pack = Pack("empty-slot")
+    pack.write(
+        "Model.obj",
+        "mtllib Model.mtl\no Model\nusemtl Empty\nv 0 0 0\nv 1 0 0\nv 0 1 0\n"
+        "vt 0 0\nvt 1 0\nvt 0 1\nusemtl Imported\nf 1/1 2/2 3/3\n",
+    )
+    pack.write("Model.mtl", "newmtl Empty\nKd 1 1 1\nnewmtl Imported\nKd 1 1 1\n")
+    pack.meta("Model.obj")
+    pack.material("M_Real", {"_BaseMap": pack.texture("T_Real", BASE)})
+    pack.write(
+        "Model.prefab",
+        "\n".join(
+            [
+                "%YAML 1.1",
+                "%TAG !u! tag:unity3d.com,2011:",
+                "--- !u!33 &1",
+                "MeshFilter:",
+                "  m_GameObject: {fileID: 7}",
+                f"  m_Mesh: {{fileID: 4300000, guid: {guid(pack.name, 'Model.obj')}, type: 3}}",
+                "--- !u!23 &2",
+                "MeshRenderer:",
+                "  m_GameObject: {fileID: 7}",
+                "  m_Materials:",
+                f"  - {{fileID: 2100000, guid: {guid(pack.name, 'M_Real.mat')}, type: 2}}",
+            ]
+        )
+        + "\n",
+    )
 
     pack = Pack("only-texture", ["M_Thing"])
     pack.material("M_Thing", {"_Grid": pack.texture("T_Grid", BASE)})

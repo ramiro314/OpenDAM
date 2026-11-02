@@ -24,7 +24,12 @@ mod tests {
     const BASE: [u8; 3] = [200, 40, 40];
     const OTHER_BASE: [u8; 3] = [40, 200, 40];
     const NORMAL: [u8; 3] = [128, 128, 255];
-    const TINT: [f64; 4] = [0.2, 0.4, 0.6, 1.0];
+    /// `TINT` as a material stores it, in sRGB.
+    const STORED_TINT: [f64; 4] = [0.2, 0.4, 0.6, 1.0];
+    /// `STORED_TINT` with its red at glTF's limit, as a color past 1 exports.
+    const STORED_TINT_PAST_1: [f64; 4] = [1.0, 0.4, 0.6, 1.0];
+    /// `TINT` as a GLB's factor holds it, linear.
+    const TINT: [f64; 4] = [0.0331, 0.1329, 0.3185, 1.0];
 
     /// What a mask with no base exports as: white, with the mask in its alpha, so the flat colour
     /// shows through the factor. A mask bound as a base would be the mask's black.
@@ -218,11 +223,15 @@ mod tests {
     }
 
     fn is_tint(factor: &[f64]) -> bool {
+        is_colour(factor, TINT)
+    }
+
+    fn is_colour(factor: &[f64], want: [f64; 4]) -> bool {
         factor.len() == 4
             && factor
                 .iter()
-                .zip(TINT)
-                .all(|(got, want)| (got - want).abs() < 0.01)
+                .zip(want)
+                .all(|(got, want)| (got - want).abs() < 0.001)
     }
 
     /// Generated names: `Texture2D_a` shown as `A_BaseColor`, with a normal and an ORM map, bind
@@ -524,6 +533,30 @@ mod tests {
         };
         let m = glb.material("M_Thing");
         assert!(is_tint(&m.factor), "{m:?}");
+    }
+
+    /// An HDR colour stays as stored, whether its graph says so or a channel past 1 does.
+    #[tokio::test]
+    async fn an_hdr_colour_is_already_linear() {
+        let Some(glb) = convert("hdr-colour").await else {
+            return;
+        };
+        let m = glb.material("M_Graph");
+        assert!(is_colour(&m.factor, STORED_TINT), "{m:?}");
+        let m = glb.material("M_Bright");
+        assert!(
+            is_colour(&[1.0, m.factor[1], m.factor[2], 1.0], STORED_TINT_PAST_1),
+            "{m:?}"
+        );
+    }
+
+    /// An FBX slot no face uses takes no place in a prefab's list, which counts Unity's submeshes.
+    #[tokio::test]
+    async fn a_prefab_s_material_skips_a_slot_with_no_faces() {
+        let Some(glb) = convert("empty-slot").await else {
+            return;
+        };
+        assert_eq!(glb.base_of("Model").map(|(rgb, _)| rgb), Some(BASE));
     }
 
     /// Only texture: `_Grid` alone is the base.
