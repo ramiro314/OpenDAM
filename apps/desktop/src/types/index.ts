@@ -1114,11 +1114,20 @@ export type PlaceStep =
   | { kind: 'rename'; source: string[]; name: string }
   | { kind: 'exclude'; source: string[] };
 
+export type ImportPipeline = 'urp' | 'built-in' | 'hdrp';
+
 /** A Fab pack's source: a `.unitypackage` in the zip, or one pipeline folder of it */
 export interface ImportVariant {
   variant: string;
   subpath: string | null;
-  pipeline: 'urp' | 'built-in' | 'hdrp' | null;
+  pipeline: ImportPipeline | null;
+  ticked: boolean;
+  tree: ImportTree;
+}
+
+/** A render pipeline a Unity pack can keep of its nested packages */
+export interface ImportPipelineChoice {
+  pipeline: ImportPipeline;
   ticked: boolean;
   tree: ImportTree;
 }
@@ -1137,10 +1146,12 @@ export interface ImportCandidate {
   /** The target is `<Publisher>/<Pack>`, so it moves with the publisher */
   targetFollowsPublisher: boolean;
   variants: ImportVariant[];
+  /** Set when a Unity pack's nested packages name two or more render pipelines */
+  pipelines: ImportPipelineChoice[];
   /** An Unreal pack's `.uproject`, by its path in the zip */
   project?: string | null;
   steps: ImportStepRecord[];
-  /** null while a Fab pack has no variant ticked */
+  /** null while a Fab pack has no variant ticked, or a Unity pack no pipeline */
   tree: ImportTree | null;
 }
 
@@ -1166,6 +1177,8 @@ export interface ImportRequest {
   publisher: string;
   variant?: string;
   subpath?: string;
+  /** The render pipeline a `.unitypackage` keeps of its nested packages */
+  pipeline?: ImportPipeline;
   preset?: ImportPreset;
   place?: PlaceStep[];
   title?: string;

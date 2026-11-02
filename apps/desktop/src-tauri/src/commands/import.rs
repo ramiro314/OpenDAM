@@ -31,11 +31,13 @@ pub async fn scan_import(
 /// import dialog once a candidate's steps change. Nothing is written. With `unreal`, it is the
 /// estimate of the zip's Unreal project.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn preview_import(
     library_id: String,
     original_path: String,
     variant: Option<String>,
     subpath: Option<String>,
+    pipeline: Option<String>,
     place: Vec<PlaceStep>,
     unreal: Option<bool>,
     state: State<'_, Arc<AppState>>,
@@ -47,6 +49,7 @@ pub async fn preview_import(
             &original_path,
             variant.as_deref(),
             subpath.as_deref(),
+            pipeline.as_deref(),
             place,
             unreal.unwrap_or(false),
         )

@@ -7,12 +7,20 @@ import type {
   DriftSeen,
   ImportPackSteps,
   ImportPackSummary,
+  ImportPipeline,
   ImportRun,
   ImportStepRecord,
   ImportSummary,
   RemovePreview,
 } from '../types';
-import { cleanTarget, isLive, rebuildRefusal, upsertRun, useImportStore } from './imports';
+import {
+  cleanTarget,
+  isLive,
+  PIPELINE_LABELS,
+  rebuildRefusal,
+  upsertRun,
+  useImportStore,
+} from './imports';
 
 // An imported pack's Preparation (plan pack-import, UI): its steps with their toggles and
 // options, its target, its kept files, Rebuild, which first asks what to do about each
@@ -68,7 +76,11 @@ export function stepLabel(step: ImportStepRecord): string {
     case 'extract_unitypackage':
       if (typeof o.variant === 'string')
         return `Extract ${o.variant}${subpath ? `, folder ${subpath}` : ''}`;
-      return subpath ? `Extract the package's ${subpath}` : 'Extract the package';
+      return `${subpath ? `Extract the package's ${subpath}` : 'Extract the package'}${
+        typeof o.pipeline === 'string'
+          ? `, ${PIPELINE_LABELS[o.pipeline as ImportPipeline] ?? o.pipeline} only`
+          : ''
+      }`;
     case 'extract_zip':
       return subpath ? `Extract ${subpath} from the zip` : 'Extract the zip';
     case 'export_unreal':

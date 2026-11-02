@@ -90,9 +90,9 @@ pub type EventSink = Arc<dyn Fn(ImportEvent) + Send + Sync>;
 
 /// An Import pack request: a `.unitypackage` or `.zip` original, the pack's source inside it,
 /// the pack's target folder relative to the library root, and its publisher. The source is given
-/// explicitly: a `.unitypackage`, or one pipeline folder of it (`subpath`); in a zip, a variant
-/// `.unitypackage` (`variant`, and optionally its `subpath`), or a folder of the zip (`subpath`),
-/// else all of it.
+/// explicitly: a `.unitypackage`, or one pipeline folder of it (`subpath`), keeping one render
+/// pipeline's nested packages (`pipeline`); in a zip, a variant `.unitypackage` (`variant`, and
+/// optionally its `subpath`), or a folder of the zip (`subpath`), else all of it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportRequest {
@@ -106,6 +106,10 @@ pub struct ImportRequest {
     /// A folder of the package (a variant's, in a zip), or of the zip when there's no variant.
     #[serde(default)]
     pub subpath: Option<String>,
+    /// The render pipeline a `.unitypackage` keeps of its nested packages, as the scan offered.
+    /// Left out, it keeps them all. The extract step stores it, so a Rebuild repeats it.
+    #[serde(default)]
+    pub pipeline: Option<String>,
     /// The metadata preset (`unity`, `fab`, `kenney`, `none`). Left out, it is `unity` for a
     /// `.unitypackage`, `fab` for a zip's variant and `none` for a zip's folder.
     #[serde(default)]
@@ -738,12 +742,14 @@ impl Engine {
     /// The tree pack source `variant`/`subpath` of the original at `original_path` would build
     /// with the place steps `place` (`scan::preview_source`), read from the archive's index and
     /// writing nothing: the import dialog's preview once you change a candidate's steps.
+    #[allow(clippy::too_many_arguments)]
     pub async fn preview_import(
         &self,
         library_id: &str,
         original_path: &str,
         variant: Option<&str>,
         subpath: Option<&str>,
+        pipeline: Option<&str>,
         place: Vec<PlaceStep>,
         unreal: bool,
     ) -> Result<scan::Tree, String> {
@@ -755,12 +761,15 @@ impl Engine {
         let (original, kind) = original(original_path, &root)?;
         let variant = inner_path(variant, "variant")?;
         let subpath = inner_path(subpath, "sub-folder")?;
+        scan::check_pipeline(kind == "zip", pipeline)?;
+        let pipeline = pipeline.map(str::to_string);
         tokio::task::spawn_blocking(move || {
             scan::preview_source(
                 &original,
                 kind,
                 variant.as_deref(),
                 subpath.as_deref(),
+                pipeline.as_deref(),
                 &place,
                 unreal,
             )
@@ -871,6 +880,8 @@ impl Engine {
         if kind == "unitypackage" && variant.is_some() {
             return Err("A .unitypackage original has no variant: only a zip holds them".into());
         }
+        let pipeline = request.pipeline.as_deref();
+        scan::check_pipeline(kind == "zip", pipeline)?;
         let project = if request.unreal {
             Some(unreal_project(&original, kind, variant, subpath.as_deref()).await?)
         } else {
@@ -901,6 +912,9 @@ impl Engine {
         }
         if let Some(subpath) = &subpath {
             extract.insert("subpath".into(), subpath.as_str().into());
+        }
+        if let Some(pipeline) = pipeline {
+            extract.insert("pipeline".into(), pipeline.into());
         }
         let (extract_kind, extract) = if project.is_some() {
             ("export_unreal", unreal_glb::Options::default_json())
@@ -1621,6 +1635,7 @@ mod tests {
                 publisher: "Synthetic Studio".into(),
                 variant: None,
                 subpath: None,
+                pipeline: None,
                 preset: None,
                 place: Some(place),
                 title: None,
@@ -3659,6 +3674,7 @@ mod tests {
                 &scan.original_path,
                 Some(&ticked.variant),
                 ticked.subpath.as_deref(),
+                None,
                 place,
                 false,
             )
@@ -3677,7 +3693,7 @@ mod tests {
 
         let error = s
             .engine
-            .preview_import("lib", "/no/such.zip", None, None, vec![], false)
+            .preview_import("lib", "/no/such.zip", None, None, None, vec![], false)
             .await
             .unwrap_err();
         assert!(error.contains("can't be read"), "{error}");
@@ -3691,7 +3707,15 @@ mod tests {
             let engine = s.engine.clone();
             async move {
                 engine
-                    .preview_import("lib", &original, None, subpath.as_deref(), place, false)
+                    .preview_import(
+                        "lib",
+                        &original,
+                        None,
+                        subpath.as_deref(),
+                        None,
+                        place,
+                        false,
+                    )
                     .await
                     .unwrap()
             }

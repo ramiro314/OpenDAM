@@ -387,7 +387,8 @@ mod tests {
     fn synthetic() -> (tempfile::TempDir, Vec<ExtractedFile>) {
         let tmp = tempfile::tempdir().unwrap();
         let extraction =
-            extract_unitypackage(&fixture("synthetic.unitypackage"), tmp.path(), None).unwrap();
+            extract_unitypackage(&fixture("synthetic.unitypackage"), tmp.path(), None, None)
+                .unwrap();
         (tmp, extraction.files)
     }
 

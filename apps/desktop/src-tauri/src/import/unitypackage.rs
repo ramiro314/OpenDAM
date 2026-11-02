@@ -16,6 +16,10 @@
 //! `list_unitypackage` and `list_variant` read a package the same way and lay it out with the
 //! same code, but keep only each entry's size: an import's scan previews a build from them
 //! without writing anything (`super::scan`).
+//!
+//! An original `.unitypackage` can be extracted for one render pipeline: its loose files stay, and
+//! so do its nested packages naming that pipeline or none, and those naming another are skipped
+//! unread (`scan::keeps_package`). A Fab zip's variant never takes one.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -28,6 +32,7 @@ use flate2::read::MultiGzDecoder;
 use serde::{Deserialize, Serialize};
 use tar::EntryType;
 
+use super::scan::keeps_package;
 use super::zipfile;
 
 /// A file the extraction wrote.
@@ -86,18 +91,20 @@ pub struct Extraction {
 
 /// Extracts `package` into `target`, which must be empty or missing. With a `subpath` (a folder
 /// of the extracted layout, such as a render pipeline's), only the files below it are written,
-/// relative to it. A clash, a file that would land on another, fails the extraction. A failed
-/// extraction leaves the target as it found it: empty, or missing.
+/// relative to it. With a `pipeline`, nested packages naming another pipeline are skipped. A
+/// clash, a file that would land on another, fails the extraction. A failed extraction leaves the
+/// target as it found it: empty, or missing.
 pub fn extract_unitypackage(
     package: &Path,
     target: &Path,
     subpath: Option<&str>,
+    pipeline: Option<&str>,
 ) -> Result<Extraction> {
     let subpath = clean_subpath(subpath)?;
     into_empty(target, |target| {
         let original =
             File::open(package).with_context(|| format!("opening {}", package.display()))?;
-        extract_into(original, &[], target, subpath.as_deref())
+        extract_into(original, &[], target, subpath.as_deref(), pipeline)
     })
 }
 
@@ -117,7 +124,7 @@ pub fn extract_variant(
         let package = zip
             .by_index(index)
             .with_context(|| format!("reading {name} in the zip"))?;
-        extract_into(package, &[name], target, subpath.as_deref())
+        extract_into(package, &[name], target, subpath.as_deref(), None)
     })
 }
 
@@ -160,7 +167,11 @@ pub(super) fn into_empty(
 /// sizes and the entries it would skip, from the package's index alone: its `pathname` entries
 /// and its entry headers. No asset's bytes are kept and nothing is written. A nested package is
 /// listed from its stream as the outer one is read. It fails where the extraction would.
-pub fn list_unitypackage(package: &Path, subpath: Option<&str>) -> Result<Extraction> {
+pub fn list_unitypackage(
+    package: &Path,
+    subpath: Option<&str>,
+    pipeline: Option<&str>,
+) -> Result<Extraction> {
     let subpath = clean_subpath(subpath)?;
     let mut original =
         File::open(package).with_context(|| format!("opening {}", package.display()))?;
@@ -169,6 +180,7 @@ pub fn list_unitypackage(package: &Path, subpath: Option<&str>) -> Result<Extrac
         &mut original,
         &[],
         subpath.as_deref(),
+        pipeline,
     )
 }
 
@@ -186,6 +198,7 @@ pub fn list_variant(original: &Path, variant: &str, subpath: Option<&str>) -> Re
         &mut package,
         &[name],
         subpath.as_deref(),
+        None,
     )
 }
 
@@ -196,6 +209,7 @@ fn extract_into(
     chain: &[String],
     target: &Path,
     subpath: Option<&str>,
+    pipeline: Option<&str>,
 ) -> Result<Extraction> {
     // Entries are staged here, by number, until the pathnames are known, then renamed into place.
     let scratch = tempfile::Builder::new()
@@ -212,7 +226,7 @@ fn extract_into(
             .into_owned(),
         blobs: 0,
     };
-    let out = run(&mut disk, &mut package, chain, subpath)?;
+    let out = run(&mut disk, &mut package, chain, subpath, pipeline)?;
     scratch.close()?;
     Ok(out)
 }
@@ -223,10 +237,11 @@ fn run<S: Sink>(
     package: &mut dyn Read,
     chain: &[String],
     subpath: Option<&str>,
+    pipeline: Option<&str>,
 ) -> Result<Extraction> {
     let mut out = Extraction::default();
     let read = read_package(sink, package)?;
-    lay_out(sink, read, chain, subpath, "", &mut out)?;
+    lay_out(sink, read, chain, subpath, pipeline, "", &mut out)?;
     if let (Some(subpath), true) = (subpath, out.files.is_empty()) {
         bail!("the package holds no file under {subpath}");
     }
@@ -526,6 +541,7 @@ fn lay_out<S: Sink>(
     package: Package<S::Blob>,
     chain: &[String],
     subpath: Option<&str>,
+    pipeline: Option<&str>,
     dest: &str,
     out: &mut Extraction,
 ) -> Result<()> {
@@ -556,6 +572,10 @@ fn lay_out<S: Sink>(
     for item in items {
         let path = item.parts.join("/");
         if let Some(folder) = nested_folder(&item.parts) {
+            // Its bytes stay in the scratch folder, unread, until that goes.
+            if !keeps_package(&item.pathname, pipeline) {
+                continue;
+            }
             // A nested package becomes a folder named after it, where it sat. Its own `.meta`
             // describes a file that isn't written, so it's dropped, as `extract_unity.py` does.
             let (inner_subpath, inner_dest) = match subpath {
@@ -572,7 +592,15 @@ fn lay_out<S: Sink>(
             sink.nested(item.asset)
                 .and_then(|nested| {
                     let dest = join(dest, &inner_dest);
-                    lay_out(sink, nested, &inner_chain, inner_subpath, &dest, out)
+                    lay_out(
+                        sink,
+                        nested,
+                        &inner_chain,
+                        inner_subpath,
+                        pipeline,
+                        &dest,
+                        out,
+                    )
                 })
                 .with_context(|| format!("unpacking the nested package {}", item.pathname))?;
             continue;
@@ -728,7 +756,7 @@ pub(super) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("Pack");
         let extraction =
-            extract_unitypackage(&fixture("synthetic.unitypackage"), &target, None).unwrap();
+            extract_unitypackage(&fixture("synthetic.unitypackage"), &target, None, None).unwrap();
 
         let expected = golden("synthetic.extract.txt");
         assert_eq!(paths(&extraction), expected);
@@ -752,7 +780,8 @@ pub(super) mod tests {
     fn source_paths_are_unique_across_nesting() {
         let tmp = tempfile::tempdir().unwrap();
         let extraction =
-            extract_unitypackage(&fixture("synthetic.unitypackage"), tmp.path(), None).unwrap();
+            extract_unitypackage(&fixture("synthetic.unitypackage"), tmp.path(), None, None)
+                .unwrap();
 
         let rock = "Assets/Pack/Built-In/Built-In_Pack/Pack/Art/T_Rock.png";
         let houses = "Assets/Pack/Built-In/Built-In_Pack/Pack/Houses.unitypackage";
@@ -792,7 +821,7 @@ pub(super) mod tests {
         let absolute = Path::new("/tmp/opendam-pack-import-absolute.txt");
         let _ = fs::remove_file(absolute);
         let extraction =
-            extract_unitypackage(&fixture("escape.unitypackage"), &target, None).unwrap();
+            extract_unitypackage(&fixture("escape.unitypackage"), &target, None, None).unwrap();
 
         // The shared top folder `Esc/` is still dropped, and the first `b.txt` wins.
         let expected = ["Keep/a.txt", "Keep/a.txt.meta", "b.txt", "b.txt.meta"];
@@ -833,7 +862,7 @@ pub(super) mod tests {
             let bytes = fs::read(&original).unwrap();
             let mtime = fs::metadata(&original).unwrap().modified().unwrap();
             let tmp = tempfile::tempdir().unwrap();
-            extract_unitypackage(&original, tmp.path(), None).unwrap();
+            extract_unitypackage(&original, tmp.path(), None, None).unwrap();
             assert_eq!(fs::read(&original).unwrap(), bytes, "{name}");
             assert_eq!(
                 fs::metadata(&original).unwrap().modified().unwrap(),
@@ -848,9 +877,13 @@ pub(super) mod tests {
         let synthetic = fixture("synthetic.unitypackage");
         let tmp = tempfile::tempdir().unwrap();
         let art = tmp.path().join("art");
-        let extraction =
-            extract_unitypackage(&synthetic, &art, Some("Built-In/Built-In_Pack/Pack/Art"))
-                .unwrap();
+        let extraction = extract_unitypackage(
+            &synthetic,
+            &art,
+            Some("Built-In/Built-In_Pack/Pack/Art"),
+            None,
+        )
+        .unwrap();
         let expected: Vec<String> = golden("synthetic.extract.txt")
             .iter()
             .filter_map(|p| p.strip_prefix("Built-In/Built-In_Pack/Pack/Art/"))
@@ -862,8 +895,13 @@ pub(super) mod tests {
         // A sub-folder inside a nested package, and one that holds the nested package's folder.
         let inner = tmp.path().join("inner");
         let houses = "Built-In/Built-In_Pack/Pack/Houses";
-        let extraction =
-            extract_unitypackage(&synthetic, &inner, Some(&format!("{houses}/Built-In/"))).unwrap();
+        let extraction = extract_unitypackage(
+            &synthetic,
+            &inner,
+            Some(&format!("{houses}/Built-In/")),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             paths(&extraction),
             [
@@ -874,21 +912,26 @@ pub(super) mod tests {
             ]
         );
         let outer = tmp.path().join("outer");
-        let extraction =
-            extract_unitypackage(&synthetic, &outer, Some("Built-In/Built-In_Pack/Pack")).unwrap();
+        let extraction = extract_unitypackage(
+            &synthetic,
+            &outer,
+            Some("Built-In/Built-In_Pack/Pack"),
+            None,
+        )
+        .unwrap();
         assert!(paths(&extraction)
             .contains(&"Houses/Built-In/Built-In_Pack/Pack/Art/T_Rock.png".into()));
 
-        let err =
-            extract_unitypackage(&synthetic, &tmp.path().join("none"), Some("URP")).unwrap_err();
+        let err = extract_unitypackage(&synthetic, &tmp.path().join("none"), Some("URP"), None)
+            .unwrap_err();
         assert!(err.to_string().contains("no file under URP"), "{err}");
-        let err =
-            extract_unitypackage(&synthetic, &tmp.path().join("up"), Some("../x")).unwrap_err();
+        let err = extract_unitypackage(&synthetic, &tmp.path().join("up"), Some("../x"), None)
+            .unwrap_err();
         assert!(err.to_string().contains("invalid sub-folder"), "{err}");
     }
 
     /// A gzipped tar of `(member, type, bytes)` entries.
-    fn package(entries: &[(&str, EntryType, &[u8])]) -> Vec<u8> {
+    pub(in crate::import) fn package(entries: &[(&str, EntryType, &[u8])]) -> Vec<u8> {
         let mut tar = tar::Builder::new(Vec::new());
         for (name, kind, data) in entries {
             let mut header = tar::Header::new_gnu();
@@ -921,7 +964,8 @@ pub(super) mod tests {
             ]),
         )
         .unwrap();
-        let extraction = extract_unitypackage(&original, &tmp.path().join("t"), None).unwrap();
+        let extraction =
+            extract_unitypackage(&original, &tmp.path().join("t"), None, None).unwrap();
         assert_eq!(paths(&extraction), ["x.txt"]);
         let reasons: Vec<_> = extraction.skipped.iter().map(|s| s.reason).collect();
         assert_eq!(reasons, [SkipReason::Special, SkipReason::Special]);
@@ -938,14 +982,14 @@ pub(super) mod tests {
         )
         .unwrap();
         let missing = tmp.path().join("u");
-        let err = extract_unitypackage(&original, &missing, None).unwrap_err();
+        let err = extract_unitypackage(&original, &missing, None, None).unwrap_err();
         assert!(err.to_string().contains("x.txt would overwrite"), "{err}");
 
         // A failed extraction leaves the target as it found it, so it can be retried.
         assert!(!missing.exists());
         let empty = tmp.path().join("v");
         fs::create_dir(&empty).unwrap();
-        extract_unitypackage(&original, &empty, None).unwrap_err();
+        extract_unitypackage(&original, &empty, None, None).unwrap_err();
         assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
     }
 
@@ -964,7 +1008,7 @@ pub(super) mod tests {
         )
         .unwrap();
         let target = tmp.path().join("t");
-        let extraction = extract_unitypackage(&original, &target, None).unwrap();
+        let extraction = extract_unitypackage(&original, &target, None, None).unwrap();
         assert_eq!(paths(&extraction), ["x.txt"]);
         assert_eq!(fs::read(target.join("x.txt")).unwrap(), b"first");
         let skipped: Vec<_> = extraction
@@ -979,6 +1023,51 @@ pub(super) mod tests {
                 (vec!["g1//pathname".to_string()], SkipReason::Duplicate),
             ]
         );
+    }
+
+    #[test]
+    fn a_pipeline_keeps_loose_files_and_nested_packages_of_it_or_of_none() {
+        let original = fixture("pipelines.unitypackage");
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("urp");
+        let extraction = extract_unitypackage(&original, &target, None, Some("urp")).unwrap();
+
+        let expected = [
+            "Core/Shaders/Shaders URP 12x/Pipeline.txt",
+            "Core/Shaders/Shaders URP 12x/Pipeline.txt.meta",
+            "Core/Shaders/Shaders URP 14x-17x/Pipeline.txt",
+            "Core/Shaders/Shaders URP 14x-17x/Pipeline.txt.meta",
+            "Core/T_Bark.png",
+            "Core/T_Bark.png.meta",
+            "Extras/Stump.obj",
+            "Extras/Stump.obj.meta",
+            "Forest_URP/Pipeline.txt",
+            "Forest_URP/Pipeline.txt.meta",
+            "Forest_URP/Tree.obj",
+            "Forest_URP/Tree.obj.meta",
+            "Readme.txt",
+            "Readme.txt.meta",
+        ];
+        assert_eq!(paths(&extraction), expected);
+        assert_eq!(on_disk(&target), expected);
+        assert_eq!(
+            source_of(&extraction, "Forest_URP/Tree.obj"),
+            [
+                "Assets/Forest/Forest_URP.unitypackage",
+                "Assets/Trees/Tree.obj"
+            ]
+        );
+
+        // With no pipeline, every package lands, as it always has.
+        let whole = extract_unitypackage(&original, &tmp.path().join("all"), None, None).unwrap();
+        let folders: HashSet<&str> = whole
+            .files
+            .iter()
+            .filter_map(|f| f.path.rsplit_once('/').map(|(folder, _)| folder))
+            .collect();
+        for folder in ["Forest_URP", "Forest_Built-In", "Forest_HDRP"] {
+            assert!(folders.contains(folder), "{folders:?}");
+        }
     }
 
     #[test]
@@ -1003,7 +1092,7 @@ pub(super) mod tests {
             )
             .unwrap();
             let target = tmp.path().join(i.to_string());
-            let extraction = extract_unitypackage(&original, &target, None).unwrap();
+            let extraction = extract_unitypackage(&original, &target, None, None).unwrap();
             assert_eq!(paths(&extraction), expected);
             assert_eq!(on_disk(&target), expected);
         }
@@ -1013,8 +1102,8 @@ pub(super) mod tests {
     fn a_target_that_is_not_empty_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("mine.txt"), b"mine").unwrap();
-        let err =
-            extract_unitypackage(&fixture("synthetic.unitypackage"), tmp.path(), None).unwrap_err();
+        let err = extract_unitypackage(&fixture("synthetic.unitypackage"), tmp.path(), None, None)
+            .unwrap_err();
         assert!(err.to_string().contains("is not empty"), "{err}");
         assert_eq!(on_disk(tmp.path()), ["mine.txt"]);
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);

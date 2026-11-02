@@ -8,7 +8,9 @@ import {
   editTarget,
   originalName,
   patchCandidate,
+  pickPipeline,
   pickVariant,
+  PIPELINE_LABELS,
   setHoist,
   skippedText,
   treeKey,
@@ -16,7 +18,7 @@ import {
   type DraftCandidate,
   type ImportDraft,
 } from '../../store/imports';
-import type { ImportOffer, ImportTree, ImportVariant } from '../../types';
+import type { ImportOffer, ImportTree } from '../../types';
 import { IconInbox, IconX } from '../Icons';
 import dialog from '../Settings/SettingsDialog.module.css';
 import styles from './Imports.module.css';
@@ -33,12 +35,6 @@ const OFFER_LABELS: Record<ImportOffer['layout'], string> = {
   unreal: 'Fab Unreal project',
   kenney: 'Kenney bundle',
   zip: 'Any other zip',
-};
-
-const PIPELINES: Record<NonNullable<ImportVariant['pipeline']>, string> = {
-  urp: 'URP',
-  'built-in': 'Built-in',
-  hdrp: 'HDRP',
 };
 
 function plural(n: number, one: string, many = `${one}s`) {
@@ -135,6 +131,7 @@ function Candidate({
       : draft.kind === 'unitypackage'
         ? 'the whole package'
         : 'the whole zip';
+  const keeps = c.pipeline ? `, ${PIPELINE_LABELS[c.pipeline]} only` : '';
 
   return (
     <li className={styles.card} data-candidate={c.name}>
@@ -188,9 +185,31 @@ function Candidate({
                     {v.variant}
                     {v.subpath ? ` / ${v.subpath}` : ''}
                   </code>
-                  {v.pipeline && <span className={styles.preset}>{PIPELINES[v.pipeline]}</span>}
+                  {v.pipeline && (
+                    <span className={styles.preset}>{PIPELINE_LABELS[v.pipeline]}</span>
+                  )}
                 </label>
               ))}
+            </div>
+          )}
+          {c.pipelines.length > 0 && (
+            <div className={styles.section} data-pipeline-choice>
+              <span className={styles.sectionLabel}>Render pipeline</span>
+              {c.pipelines.map((p, j) => (
+                <label key={p.pipeline} className={styles.variant}>
+                  <input
+                    type="radio"
+                    name={`pipeline-${index}`}
+                    checked={p.ticked}
+                    onChange={() => edit((d) => pickPipeline(d, index, j))}
+                  />
+                  {PIPELINE_LABELS[p.pipeline]}
+                  <span className={styles.preset}>{plural(p.tree.files, 'file')}</span>
+                </label>
+              ))}
+              <span className={styles.hint}>
+                Keeps the loose files and the nested packages of this pipeline or of none.
+              </span>
             </div>
           )}
           <div className={styles.section}>
@@ -209,6 +228,7 @@ function Candidate({
               ) : (
                 <li className={styles.step}>
                   Extract <code>{extract}</code>
+                  {keeps}
                 </li>
               )}
               <li className={styles.step}>
@@ -300,7 +320,9 @@ function Candidate({
               <span className={styles.hint}>
                 {c.variants.length > 0 && c.variant === null
                   ? 'Tick a variant to see its folders.'
-                  : 'Reading the original…'}
+                  : c.pipelines.length > 0 && c.pipeline === null
+                    ? 'Tick a pipeline to see its folders.'
+                    : 'Reading the original…'}
               </span>
             )}
           </div>

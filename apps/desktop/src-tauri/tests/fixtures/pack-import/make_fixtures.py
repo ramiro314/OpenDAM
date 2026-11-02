@@ -25,6 +25,11 @@ committed, like `tests/fixtures/game-export/`. The fixtures grow with the plan's
 - `fab-unity-folders.zip`: the other Fab layout, one `Crypt/Crypt.unitypackage` whose
   `Assets/Crypt/` holds the same files under a wrapper per pipeline, `URP/URP_Crypt/` and
   `Built-In/Built-In_Crypt/`, beside a shared `Readme.txt`.
+- `pipelines.unitypackage`: a cached package with nested packages of three render pipelines, as
+  Nature Package is laid out: under the shared top folder `Forest/`, loose `Readme.txt` and
+  `Core/T_Bark.png`, `Forest_URP`, `Forest_Built-In` and `Forest_HDRP` packages with a `Tree.obj`
+  each, `Core/Shaders/` with one HDRP and two URP shader packages, and an `Extras` package naming
+  no pipeline.
 - `kenney.zip`: the Kenney All-in-1's layout under a shared top folder `Kenney/`:
   `<Category>/<Pack>/License.txt` with a Kenney header and CC0 text, for two packs and one under
   `Archive/`, with folder entries as zip tools write them. The pack titles have no kenney.nl page.
@@ -324,6 +329,44 @@ def fab_unity_folders() -> bytes:
     return z.finish()
 
 
+# A model the tree counts as one GLB. Nothing converts it in the scan's tests.
+OBJ = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"
+
+
+def forest_nested(prefix: str, pipeline: str | None, model: str | None) -> bytes:
+    """A nested package with a `Pipeline.txt` naming `pipeline`, and `model`."""
+    pkg = Package()
+    g = partial(guid, prefix)
+    if pipeline:
+        pkg.file(g(1), "Assets/Trees/Pipeline.txt", f"{pipeline}\n".encode())
+    if model:
+        pkg.file(g(2), f"Assets/Trees/{model}", OBJ)
+    return pkg.finish()
+
+
+def pipelines() -> bytes:
+    pkg = Package()
+    g = partial(guid, "f1")
+    pkg.folder(g(1), "Assets/Forest")
+    pkg.file(g(2), "Assets/Forest/Readme.txt", b"Forest, a pipelines fixture pack.\n")
+    pkg.file(g(3), "Assets/Forest/Core/T_Bark.png", png((80, 60, 40, 255)), texture_meta(g(3)))
+    for n, (name, prefix, pipeline, model) in enumerate(
+        [
+            ("Forest_URP", "f2", "URP", "Tree.obj"),
+            ("Forest_Built-In", "f3", "Built-In", "Tree.obj"),
+            ("Forest_HDRP", "f4", "HDRP", "Tree.obj"),
+            ("Core/Shaders/Shaders HDRP 12x", "f5", "HDRP 12", None),
+            ("Core/Shaders/Shaders URP 12x", "f6", "URP 12", None),
+            ("Core/Shaders/Shaders URP 14x-17x", "f7", "URP 14", None),
+            ("Extras", "f8", None, "Stump.obj"),
+        ],
+        start=10,
+    ):
+        nested = forest_nested(prefix, pipeline, model)
+        pkg.file(g(n), f"Assets/Forest/{name}.unitypackage", nested)
+    return pkg.finish()
+
+
 def kenney_license(title: str) -> bytes:
     """A Kenney `License.txt`: the title and version header, then CC0."""
     return f"""
@@ -439,6 +482,7 @@ def main() -> None:
     (HERE / "escape.unitypackage").write_bytes(escape())
     (HERE / "fab-unity.zip").write_bytes(fab_unity())
     (HERE / "fab-unity-folders.zip").write_bytes(fab_unity_folders())
+    (HERE / "pipelines.unitypackage").write_bytes(pipelines())
     (HERE / "kenney.zip").write_bytes(kenney())
     (HERE / "escape.zip").write_bytes(escape_zip())
     (HERE / "unreal.zip").write_bytes(unreal(source=False))

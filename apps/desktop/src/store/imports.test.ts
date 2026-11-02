@@ -3,6 +3,8 @@ import { api } from '../api';
 import type {
   ImportCandidate,
   ImportProgress,
+  ImportPipeline,
+  ImportPipelineChoice,
   ImportRequest,
   ImportRun,
   ImportScan,
@@ -27,6 +29,7 @@ import {
   originalLabel,
   packStatus,
   patchCandidate,
+  pickPipeline,
   pickVariant,
   placeSteps,
   progressText,
@@ -95,6 +98,7 @@ const fab: ImportCandidate = {
   target: 'Studio/Forest',
   targetError: null,
   targetFollowsPublisher: true,
+  pipelines: [],
   variants: [
     {
       variant: 'Forest_BiRP.unitypackage',
@@ -124,6 +128,7 @@ const kenney = (name: string, category: string, ticked = true): ImportCandidate 
   targetError: null,
   targetFollowsPublisher: false,
   variants: [],
+  pipelines: [],
   steps: [
     { kind: 'extract_zip', enabled: true, options: { subpath: `Kenney/${category}/${name}` } },
     {
@@ -144,6 +149,7 @@ const zipCandidate: ImportCandidate = {
   targetError: null,
   targetFollowsPublisher: false,
   variants: [],
+  pipelines: [],
   steps: [
     { kind: 'extract_zip', enabled: true, options: {} },
     { kind: 'flatten', enabled: true, options: {} },
@@ -171,6 +177,7 @@ const unrealCandidate: ImportCandidate = {
   targetError: null,
   targetFollowsPublisher: true,
   variants: [],
+  pipelines: [],
   project: 'Feif/Feif.uproject',
   steps: [
     { kind: 'export_unreal', enabled: true, options: { batch: 30 } },
@@ -632,6 +639,58 @@ describe('the draft', () => {
     expect(draftProblem(draft)).toBe('Forest: Tick the variant to import');
   });
 
+  const choice = (pipeline: ImportPipeline, files: number, ticked = false) => ({
+    pipeline,
+    ticked,
+    tree: tree(files),
+  });
+  const unityPack = (pipelines: ImportPipelineChoice[]): ImportCandidate => ({
+    ...fab,
+    preset: 'unity',
+    variants: [],
+    pipelines,
+    steps: fab.steps.filter((s) => s.kind !== 'hoist'),
+    tree: pipelines.find((p) => p.ticked)?.tree ?? null,
+  });
+  const unityScan = (pipelines: ImportPipelineChoice[]): ImportScan => ({
+    originalPath: '/originals/Medieval.unitypackage',
+    kind: 'unitypackage',
+    offers: [{ layout: 'unity', candidates: [unityPack(pipelines)] }],
+    unavailable: {},
+  });
+
+  test('a Unity pack of several pipelines opens on URP and asks for what you tick', () => {
+    let draft = draftFromScan(
+      'lib',
+      unityScan([choice('urp', 5, true), choice('built-in', 7), choice('hdrp', 9)])
+    );
+    const c = () => draft.candidates[0];
+    expect([c().pipeline, c().tree?.files, treeCurrent(c())]).toEqual(['urp', 5, true]);
+    expect(importRequest(draft, c()).pipeline).toBe('urp');
+
+    draft = pickPipeline(draft, 0, 1);
+    expect(c().pipelines.map((p) => p.ticked)).toEqual([false, true, false]);
+    expect([c().pipeline, c().tree?.files, treeCurrent(c())]).toEqual(['built-in', 7, true]);
+    expect(importRequest(draft, c()).pipeline).toBe('built-in');
+
+    // With other place steps the scan's tree doesn't apply, so it waits for a preview
+    draft = patchCandidate(draft, 0, { flatten: false });
+    draft = pickPipeline(draft, 0, 2);
+    expect(c().pipeline).toBe('hdrp');
+    expect(treeCurrent(c())).toBe(false);
+  });
+
+  test('a Unity pack with no URP waits for a pipeline, and one with no choice sends none', () => {
+    const draft = draftFromScan('lib', unityScan([choice('built-in', 7), choice('hdrp', 9)]));
+    expect(draft.candidates[0].pipeline).toBeNull();
+    expect(candidateProblem(draft, 0)).toBe('Tick the pipeline to import');
+
+    const none = draftFromScan('lib', unityScan([]));
+    expect(importRequest(none, none.candidates[0]).pipeline).toBeUndefined();
+    const fabDraft = draftFromScan('lib', fabScan);
+    expect(importRequest(fabDraft, fabDraft.candidates[0]).pipeline).toBeUndefined();
+  });
+
   test("the publisher moves the targets you didn't type, never a Kenney pack's", () => {
     let draft = editPublisher(draftFromScan('lib', fabScan), 'Woods Inc');
     expect(draft.candidates[0].target).toBe('Woods Inc/Forest');
@@ -934,7 +993,7 @@ describe('the dialog', () => {
   test('a step edit previews the tree of the new steps', async () => {
     await open(fabScan);
     const calls: unknown[] = [];
-    api.previewImport = async (libraryId, originalPath, variant, subpath, place) => {
+    api.previewImport = async (libraryId, originalPath, variant, subpath, _pipeline, place) => {
       calls.push({ libraryId, originalPath, variant, subpath, place });
       return tree(7);
     };
@@ -963,7 +1022,7 @@ describe('the dialog', () => {
       Art: { ...tree(7), warnings: [warning] },
       'Pack/Art': tree(7),
     };
-    api.previewImport = async (_libraryId, _originalPath, _variant, _subpath, place) => {
+    api.previewImport = async (_libraryId, _originalPath, _variant, _subpath, _pipeline, place) => {
       const hoist = place.find((s) => s.kind === 'hoist');
       return trees[hoist?.kind === 'hoist' ? hoist.folder : ''] ?? tree(7);
     };
@@ -1004,7 +1063,15 @@ describe('the dialog', () => {
   test("an Unreal pack's step edit previews its project's estimate", async () => {
     await open(unrealScan);
     const calls: unknown[] = [];
-    api.previewImport = async (_libraryId, _originalPath, variant, subpath, place, unreal) => {
+    api.previewImport = async (
+      _libraryId,
+      _originalPath,
+      variant,
+      subpath,
+      _pipeline,
+      place,
+      unreal
+    ) => {
       calls.push({ variant, subpath, place, unreal });
       return { ...tree(7), glbs: 4, estimate: true };
     };
