@@ -200,6 +200,55 @@ The packs, each with its library, offer and publisher:
 The Unity cache is `~/.local/share/unity3d/Asset Store-5.x`. If a regenerated baseline's counts
 differ from the Now column, stop and report it.
 
+### Captured before thumbnails
+
+Steps 4 and 5 ran on 2026-11-01, so this is where the later Piece 1 ticket and the gate find their
+results. Everything is under `~/.local/share/opendam-import-before-63efa51` (47 GB, with a
+`README.txt`):
+
+| Path | What it is |
+|---|---|
+| `v4/` | 63efa51 from `git archive`, built with its embedded frontend. Binary: `apps/desktop/src-tauri/target/debug/opendam-desktop` |
+| `before/` | Step 4's copy (`libs/`, `data/`, `cache/`), with version 4 app thumbnails. Never rebuild it |
+| `rebuild/` | Step 5's copy, the same thumbnails repointed. The Rebuild check rebuilds Ancient Ruins here |
+| `sheets/` | `<list>-before.png`, one sheet per path list |
+| `h/` | The build, capture and sheet scripts, the logs, and the baseline's fingerprints |
+
+The path lists are committed in `sheet-paths/`, one file per pack: 12 models each, 13 for Village
+and all 2 of Elven Long Bow's. Each file's first line names its baseline pack, and the Stylarts and
+Leartes packs are in the `Fab` library, the others in `Unity`. Lines hold baseline paths, so an
+after sheet is the same command with its own library and `--side current`:
+
+```sh
+packages/preview-engine/.venv/bin/python packages/preview-engine/tools/contact_sheet.py \
+  <after>/libs/Fab --pack Stylarts/StylizedVillage \
+  --paths docs/plans/import-material-fixes/sheet-paths/stylized-village.txt --side current \
+  --pack-map docs/plans/import-material-fixes/pack-map.tsv --out stylized-village-after.png
+```
+
+What the capture found:
+
+- **No `.glb` thumbnail is left, not even a failed model's.** All 2,750 finished GLBs have a 512 px
+  PNG. The 9 failed models are the 132-byte empty GLBs, and they end `error` with no thumbnail at
+  all, so the app has nothing to retry.
+- **Two Village tiles say "no PNG thumbnail" on purpose.** `SM_Bulidings` and `SM_Grass_Foliage` are
+  two of those 9, and Piece 1 should fill them in.
+- **24 Big Castle thumbnails are fully transparent.** 22 use a `Material.00x`-style slot with
+  `alphaMode: MASK` and no texture, the misnamed slots of "Evidence so far", so they are version 4's
+  output. `roof_inside_large_beam` is on the sheet as one of them. The other 2,
+  `window_c_inside_variant_b` and `_c`, have no material and weren't traced, so their cause is
+  unknown.
+- **It ran under the cap, and no cap kill happened.** The app's scope,
+  `opendam-capped-742933-20995.scope`, ran 3 min 31 s and peaked at 4 GB, by the user journal.
+  systemd doesn't keep a finished scope's limits, so a later probe read them: the same
+  `memory-cap.sh` in the same nested session gives `MemoryMax` 10 GiB, `MemorySwapMax` 0 and
+  `OOMPolicy=kill`. `before/h/watch.log` reads `scope=0M` throughout because the watcher looked for
+  a `MainPID`, which a scope doesn't have. Its other columns are sound, and `h/watch.sh` is fixed.
+- **Medieval Houses' list holds only URP paths.** A Built-In path would stop its after sheet once
+  Piece 2 sets the map's prefix. It builds with that prefix in the map.
+- **Some packs lack a category.** Wizard Room has no foliage, Lost Cave no roofs, and Fantasy
+  Adventure no walls or roofs, so those lists show what the pack has instead.
+
 ### How a slot finds its texture
 
 ```mermaid

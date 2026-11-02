@@ -1,0 +1,18 @@
+# Leartes Studios/AncientRuins
+# foliage
+Meshes/SM_Tree_1_Leaves.glb
+Meshes/SM_Bush.glb
+Meshes/SM_Leafy_Foliage_1.glb
+# walls
+Meshes/SM_Curved_Wall.glb
+Meshes/SM_Column.glb
+# roofs
+Meshes/SM_Roof_Large.glb
+Meshes/SM_Roof_Slope.glb
+# props
+Meshes/SM_Barrel.glb
+Meshes/SM_Large_Treasure_Chest.glb
+Meshes/SM_Large_Vase.glb
+# flat colours
+Meshes/SM_Tiny_Rock_1.glb
+Meshes/SM_Fountain_Water.glb

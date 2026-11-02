@@ -1,0 +1,19 @@
+# GameAssetFactory/Medieval Houses Modular Vol 1
+# URP copy only: the Built-In copy goes in Piece 2, so an after sheet could not show it
+# foliage
+Medieval_Houses_Vol1_URP_HDRP/Core/Models/Nature/SM_Maple_Tree_01.glb
+Medieval_Houses_Vol1_URP_HDRP/Core/Models/Nature/SM_Grass_01.glb
+Medieval_Houses_Vol1_URP_HDRP/Core/Models/Nature/SM_Fern_01.glb
+Medieval_Houses_Vol1_URP_HDRP/Core/Models/Nature/SM_Bush_01.glb
+# walls
+Medieval_Houses_Vol1_URP_HDRP/Medieval_Houses_Vol1/Models/SM_MH_01_Plaster_Wall_01.glb
+Medieval_Houses_Vol1_URP_HDRP/Medieval_Houses_Vol1/Models/SM_MH_01_Plaster_Wall_Window_01.glb
+# roofs
+Medieval_Houses_Vol1_URP_HDRP/Medieval_Houses_Vol1/Models/SM_MH_01_Slate_Porch_Roof_01.glb
+Medieval_Houses_Vol1_URP_HDRP/Medieval_Houses_Vol1/Models/SM_MH_01_Plaster_Wall_Roof_L_01.glb
+# props
+Medieval_Houses_Vol1_URP_HDRP/Medieval_Houses_Vol1/Models/SM_MH_01_Stone_Stairs_01.glb
+Medieval_Houses_Vol1_URP_HDRP/Medieval_Houses_Vol1/Models/SM_MH_01_Plaster_Wall_Door_01.glb
+Medieval_Houses_Vol1_URP_HDRP/Medieval_Houses_Vol1/Models/SM_MH_01_Stone_Floor_01.glb
+# flat colours
+Medieval_Houses_Vol1_URP_HDRP/Core/Models/SM_Plane_01.glb

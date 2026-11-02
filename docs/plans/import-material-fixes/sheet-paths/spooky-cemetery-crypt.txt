@@ -1,0 +1,18 @@
+# Stylarts/SpookyCemeteryCrypt
+# foliage
+Meshes/Foliage/SM_Tree_01.glb
+Meshes/Foliage/SM_Bush_01.glb
+# walls
+Meshes/Modular/Catedral_Walls/SM_Catedral_Wall_2m.glb
+Meshes/Modular/Catedral_Walls/SM_Catedral_Wall_Window.glb
+# roofs
+Meshes/Modular/Catedral_Walls/SM_Roof_2m.glb
+Meshes/Modular/Catedral_Walls/SM_Roof_Cap.glb
+# props
+Meshes/Assets/SM_Coffin.glb
+Meshes/Assets/SM_Candle_01.glb
+Meshes/Assets/SM_MLR_BPR_Statue_a_c1_LOD0.glb
+Meshes/Assets/SM_TombStone_01.glb
+Meshes/Assets/SM_Rock_05.glb
+# flat colours
+Meshes/Foliage/SM_Grass_A.glb
