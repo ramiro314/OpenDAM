@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tauri::{Emitter, State};
 
-use crate::commands::asset::{folder_range, render_columns};
+use crate::commands::asset::{folder_range, item_thumbnail, render_columns};
 use crate::db::{resolve_path, upsert_collection, upsert_tag, Database, LibraryHandle};
 use crate::export::packs::Origin;
 use crate::export::textures::Convention;
@@ -20,7 +20,7 @@ pub struct Cover {
     pub asset_id: String,
     /// Absolute
     pub file_path: String,
-    /// Absolute, when the file has a thumbnail
+    /// Absolute, the thumbnail it shows, a stand-in member's for a `.blend` in a group, if any
     pub thumbnail_path: Option<String>,
     pub extension: String,
     pub kind: String,
@@ -34,8 +34,9 @@ pub struct Cover {
 /// (`COVER_JOIN`), on the unique `file_path` index.
 fn cover_columns() -> String {
     format!(
-        "c.id AS cover_id, c.file_path AS cover_path, c.thumbnail_path AS cover_thumbnail,
+        "c.id AS cover_id, c.file_path AS cover_path, {} AS cover_thumbnail,
     c.extension AS cover_extension, c.kind AS cover_kind, {}",
+        item_thumbnail("c"),
         render_columns("c")
     )
 }
@@ -1371,6 +1372,64 @@ mod tests {
             (cover.bundled_preview, cover.fallback_render),
             (render, None)
         );
+    }
+
+    #[tokio::test]
+    async fn a_blend_cover_shows_its_render_or_a_stand_in_members_thumbnail() {
+        // The cover a card gets for the pack at `path`.
+        let cover_of = |library: LibraryHandle, path: &'static str| async move {
+            let cards = packs_below(std::slice::from_ref(&library), "", false)
+                .await
+                .unwrap();
+            let card = cards.into_iter().find(|c| c.path == path).unwrap();
+            (library, card.cover.unwrap())
+        };
+
+        // A `.blend` takes no preview, but a render that fits pictures it.
+        let library = library_handle(
+            "a",
+            &["kit/License.txt", "kit/rock.blend", "kit/Previews/rock.png"],
+        )
+        .await;
+        sqlx::query(
+            "UPDATE assets SET render_width = 512, render_height = 512
+             WHERE file_path = 'kit/Previews/rock.png'",
+        )
+        .execute(&library.pool)
+        .await
+        .unwrap();
+        let (_, cover) = cover_of(library, "kit").await;
+        assert_eq!(cover.file_path, "/libraries/a/kit/rock.blend");
+        assert_eq!(
+            cover.bundled_preview.as_deref(),
+            Some("/libraries/a/kit/Previews/rock.png")
+        );
+
+        // In a group it shows the member previewed for it, as its grid tile does.
+        let library = library_handle(
+            "a",
+            &[
+                "kit/License.txt",
+                "kit/Blend/rock.blend",
+                "kit/OBJ/rock.obj",
+            ],
+        )
+        .await;
+        sqlx::query(
+            "UPDATE assets SET thumbnail_path = '.opendam/thumbs/rock_obj.png'
+             WHERE file_path = 'kit/OBJ/rock.obj'",
+        )
+        .execute(&library.pool)
+        .await
+        .unwrap();
+        let (library, cover) = cover_of(library, "kit").await;
+        assert_eq!(cover.file_path, "/libraries/a/kit/Blend/rock.blend");
+        assert_eq!(
+            cover.thumbnail_path.as_deref(),
+            Some("/libraries/a/.opendam/thumbs/rock_obj.png")
+        );
+        let panel = pack_holding(&library, "kit").await.unwrap().unwrap();
+        assert_eq!(panel.cover, Some(cover));
     }
 
     #[tokio::test]

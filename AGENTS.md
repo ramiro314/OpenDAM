@@ -426,9 +426,10 @@ docs/plans                    Plans for this fork
     else the file's `image`, else its first `Preview*` image, else its first `Sample*` image, else
     its largest model, else its first image, else its first visible file; its license is yours,
     else the file's, else the license file's; and its source URL is yours, else the file's. The
-    largest model is the biggest grid item that is a model taking a preview, by its own size, ties
-    by path, from the sizes `derive` already has, so it reads no file. A `.blend` takes no preview,
-    so it never wins, and a model whose preview failed can (a known gap). Version and
+    largest model is the biggest grid item that is a model, by its own size, ties by path, from
+    the sizes `derive` already has, so it reads no file. It shows as the item's grid tile does: its
+    render, its thumbnail, or a stand-in member's. Known gap: a lone `.blend` with no render, or a
+    model whose preview failed, wins and shows an icon, because `derive` can't see either. Version and
     authors come from the file, else the license header, and the publisher only from the file
     (`pack_holding`). The file's license is its first entry with a `name`, an http(s) URL, or a
     `path` that is an indexed `txt`, `md` or `pdf` file in the pack (`PackageFile::license`).

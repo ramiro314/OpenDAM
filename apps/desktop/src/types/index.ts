@@ -234,7 +234,7 @@ export interface Cover {
   assetId: string;
   /** Absolute */
   filePath: string;
-  /** Absolute, when the file has a thumbnail */
+  /** Absolute, the thumbnail it shows, which may be a stand-in member's */
   thumbnailPath?: string | null;
   extension: string;
   kind: AssetKind;

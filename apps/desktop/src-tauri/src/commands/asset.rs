@@ -1074,20 +1074,28 @@ pub(crate) fn render_columns(item: &str) -> String {
     )
 }
 
-/// The columns of a `RawAssetRow` selected from `assets a`. A main item with no thumbnail
-/// of its own, such as a `.blend`, shows a member's (`structure::preview_stand_ins`).
+/// The thumbnail item `item` (an alias of `assets`) shows. A main item with no thumbnail of its
+/// own, such as a `.blend`, shows a member's (`structure::preview_stand_ins`).
+pub(crate) fn item_thumbnail(item: &str) -> String {
+    format!(
+        "COALESCE({item}.thumbnail_path, CASE WHEN {item}.group_id = {item}.id THEN
+        (SELECT m.thumbnail_path FROM assets m
+         WHERE m.group_id = {item}.id AND m.thumbnail_path IS NOT NULL
+         ORDER BY m.file_path LIMIT 1)
+    END)"
+    )
+}
+
+/// The columns of a `RawAssetRow` selected from `assets a`.
 static ASSET_COLUMNS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let thumbnail = item_thumbnail("a");
     let renders = render_columns("a");
     format!(
         r#"
     a.id, a.file_path, a.file_name, a.extension, a.kind,
     a.size_bytes, a.modified_at, a.indexed_at, a.rating,
     a.color_label, a.is_favorite, a.description,
-    COALESCE(a.thumbnail_path, CASE WHEN a.group_id = a.id THEN
-        (SELECT m.thumbnail_path FROM assets m
-         WHERE m.group_id = a.id AND m.thumbnail_path IS NOT NULL
-         ORDER BY m.file_path LIMIT 1)
-    END) AS thumbnail_path,
+    {thumbnail} AS thumbnail_path,
     a.preview_status, a.metadata,
     (SELECT json_group_array(tag_id) FROM asset_tags WHERE asset_id = a.id) AS tags,
     (SELECT json_group_array(collection_id) FROM collection_assets WHERE asset_id = a.id) AS collections,

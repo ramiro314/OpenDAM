@@ -832,8 +832,7 @@ fn bundled_previews(
 struct PackFiles<'a> {
     preview: Option<&'a str>,
     sample: Option<&'a str>,
-    /// The biggest grid item that is a model taking a preview, with its size in bytes, ties by
-    /// path. A `.blend` takes none, so as a cover it could show only an icon.
+    /// The biggest grid item that is a model, with its size in bytes, ties by path
     model: Option<(i64, &'a str)>,
     image: Option<&'a str>,
     visible: Option<&'a str>,
@@ -889,7 +888,7 @@ fn pack_files<'a>(
         // A grid item: a file on its own or a group's main item, never another member
         if role.is_none() && groups[i].is_none_or(|main| main == i) {
             first(&mut entry.visible, path);
-            if kind.is_model && crate::preview::needs_preview(&kind.ext) {
+            if kind.is_model {
                 biggest(&mut entry.model, sizes[i], path);
             }
         }
@@ -3834,14 +3833,14 @@ pub(crate) mod tests {
             .as_deref(),
             Some("kit/tree.glb")
         );
-        // A model that takes no preview would stay an icon, so a smaller one or an image wins.
+        // Any model counts, one that takes no preview too.
         assert_eq!(
             sized_cover(&[("kit/big.blend", 900), ("kit/rock.glb", 5)], &none).as_deref(),
-            Some("kit/rock.glb")
+            Some("kit/big.blend")
         );
         assert_eq!(
             sized_cover(&[("kit/big.blend", 900), ("kit/tile.png", 5)], &none).as_deref(),
-            Some("kit/tile.png")
+            Some("kit/big.blend")
         );
         // A preview and a sample still beat the biggest model.
         for image in ["kit/Preview.png", "kit/Sample.png"] {
