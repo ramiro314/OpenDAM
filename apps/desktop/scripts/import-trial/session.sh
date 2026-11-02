@@ -39,8 +39,12 @@ watch_memory() {
   available=$(awk '/^MemAvailable/ { print int($2 / 1024) }' /proc/meminfo)
   line="$(date +%T) stage=$TRIAL_STAGE available=${available}M"
   for scope in $(trial_scopes); do
-    peak=$(($(cat "$scope/memory.peak") / 1048576))
-    cap=$(cat "$scope/memory.max")
+    # A scope can end after trial_scopes lists it, and bash ends the caller's loop on arithmetic
+    # over nothing, which would stop the app mid-import.
+    peak=$(cat "$scope/memory.peak" 2>/dev/null)
+    cap=$(cat "$scope/memory.max" 2>/dev/null)
+    [[ -n $peak && -n $cap ]] || continue
+    peak=$((peak / 1048576))
     [[ $cap == max ]] || cap=$((cap / 1048576))
     line+=" $(basename "$scope" .scope)=${peak}M/${cap}"
   done

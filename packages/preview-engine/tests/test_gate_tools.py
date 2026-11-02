@@ -40,6 +40,13 @@ def tree_line(files: int = 1) -> dict:
     return {"t": RUN_START, "k": "tree", "v": {"path": "a.zip", "candidates": [candidate]}}
 
 
+def finished_lines(settled: bool = True) -> list[dict]:
+    return [
+        {"t": RUN_START, "k": "previews_final", "v": {"settled": settled}},
+        {"t": RUN_START, "k": "done", "v": True},
+    ]
+
+
 def library(folder: Path, status: str = "done", started: int | None = 1, ended: int | None = 2):
     db = folder / "libs/Fab/.opendam/library.sqlite"
     db.parent.mkdir(parents=True)
@@ -73,7 +80,7 @@ def check(folder: Path, stage: str = "s") -> subprocess.CompletedProcess:
 
 def test_a_finished_stage_passes(tmp_path):
     library(tmp_path)
-    write_log(tmp_path, "s", [tree_line(), {"t": RUN_START, "k": "done", "v": True}])
+    write_log(tmp_path, "s", [tree_line(), *finished_lines()])
 
     result = check(tmp_path)
 
@@ -101,9 +108,26 @@ def test_a_stage_cut_short_fails_though_its_packs_pass(tmp_path):
     assert "no true `done` line" in result.stderr
 
 
+def test_a_stage_whose_previews_timed_out_fails_though_its_packs_pass(tmp_path):
+    library(tmp_path)
+    write_log(tmp_path, "s", [tree_line(), *finished_lines(settled=False)])
+
+    result = check(tmp_path)
+
+    assert result.returncode == 1
+    assert "previews didn't settle" in result.stderr
+
+
+def test_a_stage_with_no_preview_line_fails(tmp_path):
+    library(tmp_path)
+    write_log(tmp_path, "s", [tree_line(), {"t": RUN_START, "k": "done", "v": True}])
+
+    assert check(tmp_path).returncode == 1
+
+
 def test_an_unfinished_run_fails_its_row_and_prints_the_stage(tmp_path):
     library(tmp_path, status="running", started=1, ended=None)
-    write_log(tmp_path, "s", [tree_line(), {"t": RUN_START, "k": "done", "v": True}])
+    write_log(tmp_path, "s", [tree_line(), *finished_lines()])
 
     result = check(tmp_path)
 
@@ -219,3 +243,22 @@ def test_a_stage_with_no_scopes_fails(tmp_path):
 
     assert result.returncode == 1
     assert "names no scope" in result.stdout
+
+
+def test_a_scope_that_ends_mid_sample_leaves_the_polling_loop_running(tmp_path):
+    (tmp_path / "h").mkdir()
+    script = f"""
+TRIAL_DIR={tmp_path} TRIAL_STAGE=s
+source <(sed -n '/^watch_memory()/,/^}}/p' "{SCRIPTS / "session.sh"}")
+trial_scopes() {{ echo {tmp_path}/gone.scope; }}
+for i in 1 2; do
+  watch_memory
+done
+echo the loop went on
+"""
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+
+    assert result.returncode == 0, result.stderr
+    assert "the loop went on" in result.stdout
+    assert "syntax error" not in result.stderr
+    assert len((tmp_path / "h/watch.log").read_text().splitlines()) == 2

@@ -9,7 +9,8 @@ which a conversion's GLBs are apart from its files (an Unreal tree's is only an 
 its GLBs must be above 0 and at most the estimate), the manifest's and the folder's. A run's
 warning fails its row too, as it can name a model that failed. The exit status is 1 when a row
 fails, when the log shows a dialog that didn't start, or when the stage didn't finish: it has no
-pack, or no `done` line that is true, so a stage cut short never reads as clean.
+pack, no `done` line that is true, or previews that didn't settle, so a stage cut short never reads
+as clean.
 """
 
 import argparse
@@ -168,7 +169,11 @@ def main() -> int:
         print("the stage's log has no true `done` line", file=sys.stderr)
     if not rows:
         print("the stage's log names no pack", file=sys.stderr)
-    bad = errors or not finished or not rows or any(row["verdict"] != "pass" for row in rows)
+    settled = any(line["k"] == "previews_final" and line["v"].get("settled") for line in log)
+    if not settled:
+        print("the stage's previews didn't settle", file=sys.stderr)
+    failed = any(row["verdict"] != "pass" for row in rows)
+    bad = errors or not finished or not rows or not settled or failed
     return 1 if bad else 0
 
 
