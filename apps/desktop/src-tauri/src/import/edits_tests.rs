@@ -405,6 +405,83 @@ mod tests {
         s.settled().await;
     }
 
+    /// Two levels of one model, both extracted from the package: a rename gives each the new
+    /// stem and its own `_LOD<n>`, moves each `.meta`, and records one step per source file. The
+    /// golden package holds one model, so the second level is added to the manifest by hand.
+    #[tokio::test]
+    async fn an_lod_group_records_a_rename_for_each_level() {
+        let s = setup().await;
+        let pack_id = s.import_golden().await;
+        for (from, to, source) in [
+            (
+                "Models/SM_Log.fbx",
+                "Models/SM_Log_LOD1.fbx",
+                "Art/Models/SM_Log_LOD1.fbx",
+            ),
+            (
+                "Models/SM_Log.fbx.meta",
+                "Models/SM_Log_LOD1.fbx.meta",
+                "Art/Models/SM_Log_LOD1.fbx.meta",
+            ),
+        ] {
+            std::fs::copy(s.live().join(from), s.live().join(to)).unwrap();
+            sqlx::query(
+                "INSERT INTO import_outputs
+                 SELECT pack_id, build_id, ?, size, mtime_ns, sha256, origin, ?
+                 FROM import_outputs WHERE path = ?",
+            )
+            .bind(in_pack(to))
+            .bind(serde_json::to_string(&wrapped(source)).unwrap())
+            .bind(in_pack(from))
+            .execute(&s.lib.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes,
+             modified_at, indexed_at)
+             SELECT 'lod1', ?, 'SM_Log_LOD1.fbx', extension, kind, size_bytes, modified_at,
+             indexed_at FROM assets WHERE file_path = ?",
+        )
+        .bind(in_pack("Models/SM_Log_LOD1.fbx"))
+        .bind(in_pack("Models/SM_Log.fbx"))
+        .execute(&s.lib.pool)
+        .await
+        .unwrap();
+        crate::structure::rebuild(&s.lib.pool, &s.lib.root_path)
+            .await
+            .unwrap();
+        let before = s.steps_of(&pack_id).await;
+
+        s.rename("Models/SM_Log_LOD1.fbx", "SM_Trunk")
+            .await
+            .unwrap();
+
+        for path in ["Models/SM_Trunk.fbx", "Models/SM_Trunk_LOD1.fbx"] {
+            s.with_meta(path, true).await;
+        }
+        for path in ["Models/SM_Log.fbx", "Models/SM_Log_LOD1.fbx"] {
+            s.with_meta(path, false).await;
+        }
+        assert_eq!(
+            s.recorded(&pack_id, &before).await,
+            [
+                step(
+                    "rename",
+                    json!({"source": wrapped("Art/Models/SM_Log.fbx"), "name": "SM_Trunk.fbx"})
+                ),
+                step(
+                    "rename",
+                    json!({
+                        "source": wrapped("Art/Models/SM_Log_LOD1.fbx"),
+                        "name": "SM_Trunk_LOD1.fbx"
+                    })
+                ),
+            ]
+        );
+        assert_eq!(s.steps_of(&pack_id).await.recipe_rev, before.recipe_rev + 1);
+    }
+
     /// A run queued after a rename's check, seen only by its transaction (`edits::record`):
     /// the rename is refused and undone, every file and `.meta` under its old name, and nothing
     /// is recorded, the run's row going with the rolled-back transaction.

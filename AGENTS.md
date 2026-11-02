@@ -453,6 +453,13 @@ docs/plans                    Plans for this fork
   under format folders, plan C11) holds its main item's id in `group_id` on every member, the
   main item included; a file on its own has `NULL`. The main item is chosen GLB > glTF > FBX >
   Blend > OBJ > others, ties by path ignoring case.
+  - A model's levels are one group too, in every library: models whose stems match less a final
+    `_LOD<n>`, in any case (`structure::split_lod`), in the same folder once format folders are
+    taken out. A name with no separator (`RockLOD1`) stays apart, and so does a level on its
+    own. The level comes before the format: the main item has no suffix, else `_LOD0`, else the
+    lowest level (`structure::member_rank`). A render matches by the same stem, and a model
+    exports from an FBX at its main item's level (`export::check::exported_fbx_of`), no suffix
+    being level 0, so only the main item exports.
   - A 2D stack (plan C13) is a group too: a sprite's scale and format copies (`Default/`,
     `Double/`, `Vector/`, the table in `structure.rs`), among images in no format group and no
     support files. Style and color folders (`Dark`, `Blue`) aren't in the table, so their
@@ -486,9 +493,12 @@ docs/plans                    Plans for this fork
     gives every member the union of the group's tags and collections and the main item's fields
     and export edits (`apply_unions`). An image's export `assetName` also reaches every source
     of its texture set (`export::edits::write`).
-  - Delete and rename reach every member and the bundled preview, unless another item shows the
-    same render (`item_files` in `commands/asset.rs`). A rename gives them all the new stem,
-    refuses before anything moves when a name is taken, and puts files back if a step fails.
+  - Delete and rename reach every member and every render of the item, its bundled preview
+    included, unless another item has the same render (`item_files` in `commands/asset.rs`). An
+    item records one render, so its others are found by name and the render rule
+    (`structure::renders`). A rename gives them all the new stem, each render and, in a group
+    with levels, each member keeping its own `_LOD<n>`, refuses before anything moves when a name
+    is taken, and puts files back if a step fails.
   - The preview queue skips members other than the main item, and their thumbnails stay on disk.
     An index run queues no new file itself: the pass it ends with queues every file but those
     members (support files' cover images included), so a member is never queued, even during a
