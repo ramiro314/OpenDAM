@@ -87,6 +87,17 @@ pub struct PendingModelThumbnail {
     pub asset_id: String,
     #[serde(rename = "modelPath")]
     pub model_path: String,
+    /// Keeps its old picture until this render, so a failure the session skipped can't hold it.
+    pub generating: bool,
+}
+
+/// A render `save_model_thumbnail` stored.
+#[derive(Serialize)]
+pub struct SavedModelThumbnail {
+    #[serde(rename = "thumbnailPath")]
+    pub thumbnail_path: String,
+    #[serde(rename = "groupId")]
+    pub group_id: Option<String>,
 }
 
 #[tauri::command]
@@ -100,13 +111,13 @@ pub async fn list_pending_model_thumbnails(
             .await
             .map_err(|e| e.to_string())?;
 
-        pending.extend(
-            rows.into_iter()
-                .map(|(asset_id, thumb)| PendingModelThumbnail {
-                    asset_id,
-                    model_path: resolve_path(&lib.root_path, &thumb),
-                }),
-        );
+        pending.extend(rows.into_iter().map(|(asset_id, model, generating)| {
+            PendingModelThumbnail {
+                asset_id,
+                model_path: resolve_path(&lib.root_path, &model),
+                generating,
+            }
+        }));
         if pending.len() as i64 >= limit {
             break;
         }
@@ -116,12 +127,12 @@ pub async fn list_pending_model_thumbnails(
 
 /// Stores a PNG thumbnail rendered by the frontend for a 3D model.
 /// Takes the raw PNG as the request body and the asset id in an `asset-id` header.
-/// Returns the absolute thumbnail path.
+/// Returns the absolute thumbnail path, and the asset's group.
 #[tauri::command]
 pub async fn save_model_thumbnail(
     request: tauri::ipc::Request<'_>,
     state: State<'_, Arc<AppState>>,
-) -> Result<String> {
+) -> Result<SavedModelThumbnail> {
     let asset_id = request
         .headers()
         .get("asset-id")
@@ -143,10 +154,13 @@ pub async fn save_model_thumbnail(
         }
 
         // The id was just matched against the DB, so it's safe to use as a file name.
-        let rel_thumb = save_model_render(&lib.pool, &lib.root_path, asset_id, png)
+        let saved = save_model_render(&lib.pool, &lib.root_path, asset_id, png)
             .await
             .map_err(|e| e.to_string())?;
-        return Ok(resolve_path(&lib.root_path, &rel_thumb));
+        return Ok(SavedModelThumbnail {
+            thumbnail_path: resolve_path(&lib.root_path, &saved.rel_thumb),
+            group_id: saved.group_id,
+        });
     }
     Err(format!("asset {} not found", asset_id))
 }

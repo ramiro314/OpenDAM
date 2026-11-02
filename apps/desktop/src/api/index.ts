@@ -20,6 +20,7 @@ import type {
   SearchResult,
   PreviewJob,
   PendingModelThumbnail,
+  SavedModelThumbnail,
   PreviewProgress,
   AiProvider,
   AiSettings,
@@ -148,9 +149,9 @@ export const api = {
   getPreviewProgress: () => invoke<PreviewProgress>('get_preview_progress'),
   listPendingModelThumbnails: (limit: number) =>
     invoke<PendingModelThumbnail[]>('list_pending_model_thumbnails', { limit }),
-  /** Sends the PNG as a raw body; returns the saved thumbnail's path. */
+  /** Sends the PNG as a raw body; returns the saved thumbnail's path and the asset's group. */
   saveModelThumbnail: (assetId: string, png: Uint8Array) =>
-    invoke<string>('save_model_thumbnail', png, { headers: { 'asset-id': assetId } }),
+    invoke<SavedModelThumbnail>('save_model_thumbnail', png, { headers: { 'asset-id': assetId } }),
   /** Reports a render that failed; returns whether the asset moved to `error`. */
   failModelThumbnail: (assetId: string) => invoke<boolean>('fail_model_thumbnail', { assetId }),
 

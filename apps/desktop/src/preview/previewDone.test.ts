@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { useGLTF } from '@react-three/drei';
 import { useAssetStore } from '../store';
-import { onPreviewDone } from './previewDone';
+import { modelsToRender, onModelRendered, onPreviewDone } from './previewDone';
 
 const realWindow = globalThis.window;
 const model = '/lib/.opendam/thumbs/a_preview.glb';
@@ -43,5 +43,55 @@ describe('onPreviewDone', () => {
     } finally {
       clear.mockRestore();
     }
+  });
+});
+
+describe('onModelRendered', () => {
+  const thumbnailPath = '/lib/.opendam/thumbs/m_thumb.new.png';
+
+  /** Runs `onModelRendered` and returns the ids refreshed and the asset ids patched. */
+  async function rendered(assetId: string, groupId: string | null) {
+    const refreshAssets = mock(async (_ids: string[]) => {});
+    const updateAssetPreview = mock((_id: string, _path: string) => {});
+    const real = useAssetStore.getState();
+    useAssetStore.setState({ refreshAssets, updateAssetPreview } as never);
+    try {
+      await onModelRendered(assetId, { thumbnailPath, groupId });
+    } finally {
+      useAssetStore.setState({
+        refreshAssets: real.refreshAssets,
+        updateAssetPreview: real.updateAssetPreview,
+      });
+    }
+    return {
+      refreshed: refreshAssets.mock.calls.map(([ids]) => ids),
+      patched: updateAssetPreview.mock.calls,
+    };
+  }
+
+  test("refreshes the group's card, which may show a stand-in's old file", async () => {
+    expect(await rendered('member', 'main')).toEqual({
+      refreshed: [['main']],
+      patched: [['member', thumbnailPath]],
+    });
+  });
+
+  test('a file on its own or a main item has no other card to refresh', async () => {
+    expect((await rendered('alone', null)).refreshed).toEqual([]);
+    expect((await rendered('main', 'main')).refreshed).toEqual([]);
+  });
+});
+
+describe('modelsToRender', () => {
+  const item = (assetId: string, generating: boolean) => ({
+    assetId,
+    modelPath: `/lib/${assetId}.glb`,
+    generating,
+  });
+
+  test('skips a failed first preview but never a model at generating', () => {
+    const skipped = new Set(['first', 'changed-again']);
+    const batch = [item('first', false), item('changed-again', true), item('new', false)];
+    expect(modelsToRender(batch, skipped).map((m) => m.assetId)).toEqual(['changed-again', 'new']);
   });
 });
