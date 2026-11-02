@@ -8,7 +8,7 @@ use tauri::{Emitter, State};
 use crate::db::{make_relative_path, resolve_path, upsert_tag, Database, LibraryHandle};
 use crate::import::{edits, engine};
 use crate::models::{
-    Asset, AssetPatch, FilterSpec, FolderRef, GroupMember, SearchPayload, SearchQuery,
+    Asset, AssetKind, AssetPatch, FilterSpec, FolderRef, GroupMember, SearchPayload, SearchQuery,
     SearchResult, SortSpec,
 };
 use crate::structure;
@@ -1666,8 +1666,8 @@ struct Move<'a> {
 /// reruns the library's structure pass. A file on its own takes `new_name`, with its extension
 /// added when the name has none, so a typed extension changes its format. A group's members take
 /// `new_name` as their stem, less the main item's extension if it ends with it, and each keeps
-/// its own extension (plan C21). In a group with `_LOD<n>` members, the stem also loses a final
-/// `_LOD<n>` of its own, and each file keeps its own. Either way the bundled preview takes the
+/// its own extension (plan C21). In a group of models with `_LOD<n>` members, the stem also loses
+/// a final `_LOD<n>` of its own, and each file keeps its own. Either way the bundled preview takes the
 /// new stem and keeps its extension. Inside an imported pack, each file's `.meta` is renamed
 /// right after it, and the renames are recorded as the pack's steps (`edits::record`) in the
 /// transaction that moves the rows. Nothing moves when a new name is taken, the pack's
@@ -1741,10 +1741,13 @@ pub(crate) async fn rename_asset_with(
         if stem.is_empty() {
             return Err("Asset file name cannot be empty, '.' or '..'".into());
         }
-        if files
-            .iter()
-            .any(|f| !f.is_render && !lod_suffix(f).is_empty())
-        {
+        // Only models group by level: a texture's copies can be named `T_LOD1` and share that stem
+        let levels = files.iter().any(|f| {
+            !f.is_render
+                && AssetKind::from_extension(&f.extension) == AssetKind::Model3d
+                && !lod_suffix(f).is_empty()
+        });
+        if levels {
             let base = structure::split_lod(stem).map_or(stem, |(base, _)| base);
             files
                 .iter()
@@ -3987,6 +3990,23 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(result, Ok(()));
         assert!(renamed);
+    }
+
+    #[tokio::test]
+    async fn a_copy_group_named_like_a_level_takes_the_new_name_as_it_is() {
+        let files = ["Kit/GLB/T_LOD1.png", "Kit/FBX/T_LOD1.png"];
+        for (typed, stem) in [("Stone", "Stone"), ("Stone_LOD2", "Stone_LOD2")] {
+            let (root, db, _pool) = library_in_folders(&files).await;
+
+            let result = rename_asset_with(&db, files[0], typed, fs_rename).await;
+
+            let renamed = files
+                .iter()
+                .all(|p| root.join(p.replace("T_LOD1", stem)).exists());
+            std::fs::remove_dir_all(&root).unwrap();
+            assert_eq!(result, Ok(()), "{typed}");
+            assert!(renamed, "{typed}");
+        }
     }
 
     #[tokio::test]

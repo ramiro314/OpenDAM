@@ -4363,10 +4363,13 @@ mod tests {
         let facts = Facts::fixture();
         let report = check_domain_with(
             &f,
+            // Members stand for their items: a collection holds every member of a group, and
+            // SM_Log and SM_Bush are offered only as members
             &[
-                "Kit/Models/SM_Log_LOD2.glb",
+                "Kit/Models/SM_Log_LOD10.fbx",
                 "Kit/Models/SM_Rock.glb",
-                "Kit/Models/SM_Bush.glb",
+                "Kit/Models/SM_Rock_LOD1.fbx",
+                "Kit/Models/SM_Bush_LOD1.fbx",
             ],
             &facts,
         )

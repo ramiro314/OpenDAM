@@ -3538,6 +3538,8 @@ pub(crate) mod tests {
             "_LOD1",
             "LOD1",
             "木_LOD",
+            // The suffix's four bytes would start inside the character
+            "木LOD1",
             "Rock_LOD99999999999",
         ] {
             assert_eq!(split_lod(stem), None, "{stem}");
