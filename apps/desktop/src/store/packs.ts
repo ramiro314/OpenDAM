@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { api } from '../api';
-import type { FolderRef, PackCard } from '../types';
+import type { Cover, FolderRef, PackCard } from '../types';
 import { scopeKey, type BrowseMode, type PacksScope } from '../utils/packsView';
 
 interface PacksStore {
@@ -19,6 +19,41 @@ interface PacksStore {
   /** Reloads the current scope's packs, for `library:updated` */
   refetch: () => Promise<void>;
   select: (key: string | null) => void;
+  /**
+   * Applies a finished preview to the covers it changes, so no card waits for `library:updated`,
+   * and reloads the packs when it is a member's of a group whose cover may show it
+   */
+  applyPreview: (preview: CoverPreview) => void;
+}
+
+/** A finished preview: its asset's thumbnail, and that asset's own file if it may be a render. */
+export interface CoverPreview {
+  assetId: string;
+  thumbnailPath: string | null;
+  render?: { filePath: string; previousThumbnailPath?: string };
+}
+
+/**
+ * `cover` with `preview` applied, or `cover` itself when it changes nothing: the thumbnail of the
+ * cover's own asset, and the new picture of a render it shows, as `updateAssetPreview` does for
+ * a cached asset.
+ */
+export function coverWithPreview(cover: Cover, preview: CoverPreview): Cover {
+  const { assetId, thumbnailPath, render } = preview;
+  let next = cover;
+  if (cover.assetId === assetId && (cover.thumbnailPath ?? null) !== thumbnailPath) {
+    next = { ...next, thumbnailPath };
+  }
+  if (!render) return next;
+  const shown = [render.filePath, render.previousThumbnailPath];
+  const picture = thumbnailPath ?? render.filePath;
+  for (const field of ['bundledPreview', 'fallbackRender'] as const) {
+    const current = next[field];
+    if (current && shown.includes(current) && current !== picture) {
+      next = { ...next, [field]: picture };
+    }
+  }
+  return next;
 }
 
 /** A card's key, unique across libraries. */
@@ -80,4 +115,19 @@ export const usePacksStore = create<PacksStore>()((set, get) => ({
   },
 
   select: (selected) => set({ selected }),
+
+  applyPreview: (preview) => {
+    const { packs } = get();
+    let changed = false;
+    const next = packs?.map((pack) => {
+      const cover = pack.cover && coverWithPreview(pack.cover, preview);
+      if (cover === pack.cover) return pack;
+      changed = true;
+      return { ...pack, cover };
+    });
+    if (changed) set({ packs: next });
+    // A member stands in only by the rule `get_packs` applies, so ask it what the card shows.
+    if (packs?.some((pack) => pack.cover?.memberIds.includes(preview.assetId)))
+      void get().refetch();
+  },
 }));

@@ -15,7 +15,7 @@ Supported operations (Phase 1):
 
 Phase 2 will add:
   - 3D thumbnails via assimp/Three.js headless or Blender headless
-  - PSD/EXR/HDR via OpenImageIO
+  - PSD/EXR via OpenImageIO
   - .max/.mat embedded preview extraction
   - HDRI sphere render
   - Shader-ball material preview
@@ -1044,23 +1044,17 @@ def model_meta(
         except Exception as e:
             res["preview_error"] = f"Illustrator preview failed: {e}"
 
-    elif ext in [".exr", ".hdr"]:
-        # OpenEXR / HDR tone-mapped thumbnail
+    elif ext == ".exr":
+        # OpenEXR tone-mapped thumbnail
         try:
             import numpy as np
+            import openexr_numpy
             from PIL import Image
 
-            if ext == ".exr":
-                import openexr_numpy
-
-                try:
-                    rgb = openexr_numpy.imread(source)
-                except Exception:
-                    rgb = openexr_numpy.imread(source, channel_names=["R"])
-            else:
-                import imageio.v2 as iio
-
-                rgb = iio.imread(source)
+            try:
+                rgb = openexr_numpy.imread(source)
+            except Exception:
+                rgb = openexr_numpy.imread(source, channel_names=["R"])
 
             # Fast strided downsample only if image is huge (e.g. 8k, 16k maps)
             max_dim = max(rgb.shape[:2])
@@ -1081,7 +1075,7 @@ def model_meta(
             img.save(out_path, format="JPEG", quality=95)
             res["thumbnail"] = str(out_path)
         except Exception as e:
-            res["preview_error"] = f"EXR/HDR preview failed: {e}"
+            res["preview_error"] = f"EXR preview failed: {e}"
 
     # If neither thumbnail nor preview_model was produced, mark ok=False
     if "thumbnail" not in res and "preview_model" not in res:

@@ -1,5 +1,5 @@
-import type { Asset } from '../../types';
-import { isWebviewDisplayable } from '../../utils/media';
+import type { Asset, Cover } from '../../types';
+import { imageOf, isWebviewDisplayable } from '../../utils/media';
 
 /**
  * What a grid or list tile shows: its bundled preview (a model's render shipped beside it that
@@ -12,6 +12,20 @@ type TileAsset = Pick<
   Asset,
   'bundledPreview' | 'fallbackRender' | 'thumbnailPath' | 'filePath' | 'extension' | 'kind'
 >;
+
+/** A pack's cover as the asset it is, for `tileMedia`. */
+export const coverAsset = (cover: Cover) => ({
+  ...cover,
+  thumbnailPath: cover.thumbnailPath ?? undefined,
+  bundledPreview: cover.bundledPreview ?? undefined,
+  fallbackRender: cover.fallbackRender ?? undefined,
+});
+
+/** The image the detail panel shows for a cover: as `imageOf` picks it, or a model's render. */
+export function coverImage(cover: Cover): string | undefined {
+  const asset = coverAsset(cover);
+  return asset.bundledPreview ?? imageOf(asset) ?? asset.fallbackRender;
+}
 
 /** The image media in the order a tile tries them. */
 const ORDER: TileMedia[] = ['bundled', 'thumbnail', 'fallback', 'original'];

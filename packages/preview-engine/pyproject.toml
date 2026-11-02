@@ -12,7 +12,6 @@ dependencies = [
   "assimp-py>=1.0.7", # FBX/3DS import (imported as assimp_py)
   "rhino3dm>=8.0.0", # .3dm
   "pypdfium2>=4.30.0", # .ai (PDF-compatible) previews
-  "imageio>=2.34", # HDR reader
   "openexr-numpy>=0.0.6", # EXR reader
   "unitypy>=1.25.4", # binary Unity .mat/.prefab/.unity to text (unity_binary_to_text)
 ]
@@ -24,9 +23,9 @@ dev = ["pytest>=9.1.1", "ruff"]
 [tool.uv]
 package = false
 
-# Tests import worker.py from this folder.
+# Tests import worker.py from this folder and the audit tools from tools/.
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = [".", "tools"]
 testpaths = ["tests"]
 
 [tool.ruff]

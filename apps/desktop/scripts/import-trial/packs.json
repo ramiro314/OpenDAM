@@ -1,0 +1,70 @@
+{
+  "imports": [
+    {
+      "lib": "fab",
+      "path": "~/Documents/AssetOriginals/Fab/StylizedWizardRoom.zip",
+      "publisher": "Stylarts",
+      "offer": "fab"
+    },
+    {
+      "lib": "fab",
+      "path": "~/Documents/AssetOriginals/Fab/StylizedVillage.zip",
+      "publisher": "Stylarts",
+      "offer": "fab"
+    },
+    {
+      "lib": "fab",
+      "path": "~/Documents/AssetOriginals/Fab/SpookyCemeteryCrypt.zip",
+      "publisher": "Stylarts",
+      "offer": "fab"
+    },
+    {
+      "lib": "fab",
+      "path": "~/Documents/AssetOriginals/Fab/StylizedElvenValley.zip",
+      "publisher": "Stylarts",
+      "offer": "fab"
+    },
+    {
+      "lib": "fab",
+      "path": "~/Documents/AssetOriginals/Fab/StylizedLostCave.zip",
+      "publisher": "Stylarts",
+      "offer": "fab"
+    },
+    {
+      "lib": "fab",
+      "path": "~/Documents/AssetOriginals/Fab/AncientRuins.zip",
+      "publisher": "Leartes Studios",
+      "offer": "fab"
+    },
+    {
+      "lib": "unity",
+      "path": "~/.local/share/unity3d/Asset Store-5.x/Manuel Wieser/3D ModelsPropsWeapons/Elven Long Bow.unitypackage",
+      "publisher": "Manuel Wieser",
+      "offer": "unity"
+    },
+    {
+      "lib": "unity",
+      "path": "~/.local/share/unity3d/Asset Store-5.x/Synty Studios/3D ModelsEnvironments/POLYGON - Prototype Pack - Art by Synty.unitypackage",
+      "publisher": "Synty Studios",
+      "offer": "unity"
+    },
+    {
+      "lib": "unity",
+      "path": "~/.local/share/unity3d/Asset Store-5.x/Staggart Creations/3D ModelsEnvironmentsFantasy/Fantasy Adventure Environment.unitypackage",
+      "publisher": "Staggart Creations",
+      "offer": "unity"
+    },
+    {
+      "lib": "unity",
+      "path": "~/.local/share/unity3d/Asset Store-5.x/Triplebrick/3D ModelsEnvironmentsHistoric/The Big Castle Kit.unitypackage",
+      "publisher": "Triplebrick",
+      "offer": "unity"
+    },
+    {
+      "lib": "unity",
+      "path": "~/.local/share/unity3d/Asset Store-5.x/GameAssetFactory/3D ModelsEnvironments/Medieval Houses Modular Vol 1.unitypackage",
+      "publisher": "GameAssetFactory",
+      "offer": "unity"
+    }
+  ]
+}

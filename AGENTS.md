@@ -74,7 +74,9 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               same terms, and place, the place
                               phase's flatten, hoist, rename and exclude steps over that tree, which
                               name a file by source path, move or drop its .meta with it, and fail
-                              naming the step and path on a clash or a source no longer produced,
+                              naming the step and path on a clash or a source no longer produced
+                              (a hoist whose folder is missing is a no-op, which the scan's preview
+                              reports in its tree's `warnings`),
                               scan, an original's candidate packs (Unity cache, Fab variants,
                               Kenney packs, any zip) with presets, default targets and steps and
                               a preview of each build's tree, made by the same extract and place
@@ -280,12 +282,13 @@ docs/plans                    Plans for this fork
 - **`DELETE` journaling on library DBs.** Library DBs use rollback journaling because WAL's `-shm`
   locking is unreliable on network shares. Keep `SqliteJournalMode::Delete` in `db.rs`.
 - **Batched writes.** Database writes go in transactions of about 200 rows, as `watcher.rs` does.
-- **Rust-native raster decoding.** Standard rasters (jpg, png, tga, tif, bmp, webp) are decoded in
-  Rust with the `image` crate. Only formats Rust can't decode go to Python.
+- **Rust-native raster decoding.** Standard rasters (jpg, png, tga, tif, bmp, webp) and Radiance
+  `.hdr` are decoded in Rust with the `image` crate. A `.hdr` thumbnail is tone mapped as the
+  worker's `.exr` one is. Only formats Rust can't decode go to Python.
 - **No upscaled thumbnails.** `generate_image_thumb` reads a raster's size from its header first.
   Sources 512 px or smaller that the webview can display (png, jpg, jpeg, webp, bmp, gif) get no
-  thumbnail, and the UI shows the original, chosen by extension (`utils/media.ts`). Smaller TGA
-  and TIFF get a PNG at their own size. A changed raster gets a fresh preview job (as does any
+  thumbnail, and the UI shows the original, chosen by extension (`utils/media.ts`). Smaller TGA,
+  TIFF and HDR get a PNG at their own size. A changed raster gets a fresh preview job (as does any
   changed file that takes a preview, see "A changed model gets a fresh preview"), and a job that
   clears or renames a thumbnail deletes the old `_thumb` file before it updates the row. Libraries
   made before this rule lose their upscaled thumbnails once, in the background, through
@@ -424,8 +427,15 @@ docs/plans                    Plans for this fork
     `structure::rebuild_library` before it emits `library:updated`, like the commands above.
     Each field falls back on its own, and your edits win: a pack's name is yours, else the
     `datapackage.json` `title`, else the license header's, else the folder's; its cover is yours,
-    else the file's `image`, else its first `Preview*` image; its license is yours, else the
-    file's, else the license file's; and its source URL is yours, else the file's. Version and
+    else the file's `image`, else its first `Preview*` image, else its first `Sample*` image, else
+    its largest model, else its first image, else its first visible file; its license is yours,
+    else the file's, else the license file's; and its source URL is yours, else the file's. The
+    largest model is the biggest grid item that is a model, by its own size, ties by path, from
+    the sizes `derive` already has, so it reads no file. It shows as the item's grid tile does: its
+    render, its thumbnail, or a stand-in member's. A finished preview updates its card without a
+    refetch, and a member's reloads the packs, so `item_thumbnail` alone picks the stand-in. Known
+    gap: a lone `.blend` with no render, or a model whose preview failed, wins and shows an icon,
+    because `derive` can't see either. Version and
     authors come from the file, else the license header, and the publisher only from the file
     (`pack_holding`). The file's license is its first entry with a `name`, an http(s) URL, or a
     `path` that is an indexed `txt`, `md` or `pdf` file in the pack (`PackageFile::license`).
@@ -496,7 +506,8 @@ docs/plans                    Plans for this fork
   the bundled preview first, then the thumbnail, then the fallback render, then the original,
   then an icon, and move to the next when one fails to load (`tileMedia`), so a model whose
   render is too small shows that render only until it has its own thumbnail. The detail panel
-  and the pack gallery show neither. `preview:done` carries the
+  and the pack gallery show neither for an asset, but a pack whose cover is a model shows its render
+  the same way on its card, its tree node and its panel (`commands::folder::Cover`). `preview:done` carries the
   finished file's `filePath` and its `previousThumbnailPath`, so cached models showing either as
   their bundled preview or fallback render switch to its new thumbnail, or to the render itself
   when the thumbnail was cleared (`updateAssetPreview`). An item is **pictured** when its bundled

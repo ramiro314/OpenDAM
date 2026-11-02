@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { useGLTF } from '@react-three/drei';
-import { useAssetStore } from '../store';
+import { useAssetStore, usePacksStore } from '../store';
 import { modelsToRender, onModelRendered, onPreviewDone, renderKey } from './previewDone';
 
 const realWindow = globalThis.window;
@@ -79,6 +79,20 @@ describe('onModelRendered', () => {
   test('a file on its own or a main item has no other card to refresh', async () => {
     expect((await rendered('alone', null)).refreshed).toEqual([]);
     expect((await rendered('main', 'main')).refreshed).toEqual([]);
+  });
+});
+
+describe('onModelRendered and pack cards', () => {
+  afterEach(() => usePacksStore.setState({ packs: null }));
+
+  test("moves a pack card off the old render's file", async () => {
+    const thumbnailPath = '/lib/.opendam/thumbs/m_thumb.new.png';
+    const cover = { assetId: 'm', thumbnailPath: '/lib/old.png', memberIds: [] };
+    usePacksStore.setState({ packs: [{ cover }] as never });
+
+    await onModelRendered('m', { thumbnailPath, groupId: null });
+
+    expect(usePacksStore.getState().packs?.[0].cover?.thumbnailPath).toBe(thumbnailPath);
   });
 });
 

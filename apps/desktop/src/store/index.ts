@@ -21,6 +21,7 @@ import type {
 } from '../types';
 import { api } from '../api';
 import { useFolderTreeStore } from './folderTree';
+import { usePacksStore } from './packs';
 import type { ImageScaling } from '../utils/imageScaling';
 import { PANEL_LIMITS, clampPanelWidth, type PanelSide } from '../utils/panelSize';
 import {
@@ -632,6 +633,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
   },
 
   updateAssetPreview: (id, thumbnailPath, previewModel, render) => {
+    usePacksStore.getState().applyPreview({ assetId: id, thumbnailPath, render });
     get().patchCached(id, (asset) => ({
       ...asset,
       thumbnailPath: thumbnailPath ?? undefined,

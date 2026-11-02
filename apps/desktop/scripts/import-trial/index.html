@@ -1,0 +1,86 @@
+<!doctype html>
+<title>Import trial</title>
+<body>
+  <pre>Import trial</pre>
+  <script>
+    // Stands in for the app's UI, so `modelThumbnailer` never runs and model rows keep their
+    // `_preview.glb` files. See run.sh. Every step is posted to the server, which appends it to
+    // h/log.jsonl. Scan each pack, start its first candidate, then wait for the queue to empty.
+    const invoke = (command, args) => window.__TAURI_INTERNALS__.invoke(command, args);
+    const log = (k, v) =>
+      fetch('/log', { method: 'POST', body: JSON.stringify({ t: Date.now(), k, v }) });
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const brief = (scan) =>
+      scan.offers.map((o) => ({
+        layout: o.layout,
+        n: o.candidates.length,
+        ticked: o.candidates.filter((c) => c.ticked).length,
+        first: o.candidates
+          .slice(0, 3)
+          .map((c) => [
+            c.name,
+            c.target,
+            c.publisher,
+            c.preset,
+            (c.steps || []).map((s) => s.kind),
+          ]),
+      }));
+
+    async function start(pack) {
+      const scan = await invoke('scan_import', { libraryId: pack.lib, originalPath: pack.path });
+      await log('scan', { path: pack.path, offers: brief(scan) });
+      const candidate = scan.offers.find((o) => o.layout === pack.offer).candidates[0];
+      const request = {
+        libraryId: pack.lib,
+        originalPath: pack.path,
+        target: `${pack.publisher}/${candidate.name}`,
+        publisher: pack.publisher,
+        preset: candidate.preset,
+      };
+      const variant = candidate.variants.find((v) => v.ticked);
+      if (variant) {
+        request.variant = variant.variant;
+        if (variant.subpath) request.subpath = variant.subpath;
+      }
+      await log('started', { path: pack.path, run: await invoke('start_import', { request }) });
+    }
+
+    async function waitForQueue(libraries) {
+      let last = '';
+      for (;;) {
+        const runs = {};
+        for (const lib of libraries) {
+          runs[lib] = await invoke('list_import_runs', { libraryId: lib });
+        }
+        const snapshot = JSON.stringify(runs);
+        if (snapshot !== last) await log('runs', runs);
+        last = snapshot;
+        const all = Object.values(runs).flat();
+        if (!all.some((r) => ['queued', 'running'].includes(r.status))) return all;
+        await sleep(15000);
+      }
+    }
+
+    (async () => {
+      const { imports } = await (await fetch('/packs.json')).json();
+      await log('start', imports.length);
+      let errors = 0;
+      for (const pack of imports) {
+        try {
+          await start(pack);
+        } catch (e) {
+          errors += 1;
+          await log('start_err', { path: pack.path, e: String(e) });
+        }
+      }
+      const runs = await waitForQueue([...new Set(imports.map((pack) => pack.lib))]);
+      const failed = runs.filter((r) => r.status !== 'done');
+      await log('result', {
+        runs: runs.length,
+        errors,
+        failed: failed.map((r) => [r.packs, r.status, r.error]),
+      });
+      await log('done', errors === 0 && failed.length === 0 && runs.length === imports.length);
+    })().catch((e) => log('done', String(e)));
+  </script>
+</body>

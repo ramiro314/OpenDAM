@@ -21,11 +21,11 @@ pub const THUMB_SIZE: u32 = 512;
 pub fn is_native_image(ext: &str) -> bool {
     matches!(
         ext.to_lowercase().as_str(),
-        "jpg" | "jpeg" | "png" | "bmp" | "gif" | "tif" | "tiff" | "tga" | "webp"
+        "jpg" | "jpeg" | "png" | "bmp" | "gif" | "tif" | "tiff" | "tga" | "webp" | "hdr"
     )
 }
 
-/// Whether a file with extension `ext` gets a preview job: models, layered and HDR images, and
+/// Whether a file with extension `ext` gets a preview job: models, layered and EXR images, and
 /// every raster `is_native_image` accepts.
 pub fn needs_preview(ext: &str) -> bool {
     matches!(
@@ -48,7 +48,6 @@ pub fn needs_preview(ext: &str) -> bool {
             | "psb"
             | "ai"
             | "exr"
-            | "hdr"
     ) || is_native_image(ext)
 }
 
@@ -64,7 +63,7 @@ pub fn is_webview_displayable(ext: &str) -> bool {
 /// Writes `asset_id`'s thumbnail for `source` into `thumb_dir` and returns its file name, or
 /// `None` when the original is shown instead. Thumbnails are never upscaled: a source
 /// `THUMB_SIZE` px or smaller gets no thumbnail if the webview can display it, and otherwise
-/// (TGA, TIFF) a PNG at its own size. Larger sources are downsampled with Triangle (bilinear)
+/// (TGA, TIFF, HDR) a PNG at its own size. Larger sources are downsampled with Triangle (bilinear)
 /// filtering, 4x-8x faster than Lanczos3.
 pub fn generate_image_thumb(
     source: &Path,
@@ -99,6 +98,13 @@ pub fn generate_image_thumb(
         )
     };
 
+    // After the resize, so it filters linear light and tone maps only the thumbnail's pixels.
+    let thumb = if ext == "hdr" {
+        tone_map(thumb.into_rgb32f()).into()
+    } else {
+        thumb
+    };
+
     let _ = std::fs::create_dir_all(thumb_dir);
     let output = thumb_dir.join(&file_name);
     if file_name.ends_with(".jpg") {
@@ -109,6 +115,17 @@ pub fn generate_image_thumb(
         thumb.save(&output)?;
     }
     Ok(Some(file_name))
+}
+
+/// Linear light as 8-bit RGB, as the worker's `.exr` branch does it: Reinhard, then gamma 2.2.
+fn tone_map(linear: image::Rgb32FImage) -> image::RgbImage {
+    let (width, height) = linear.dimensions();
+    let bytes = linear
+        .into_raw()
+        .into_iter()
+        .map(|c| ((c / (c + 1.0)).powf(1.0 / 2.2) * 255.0) as u8)
+        .collect();
+    image::RgbImage::from_raw(width, height, bytes).expect("one byte for each channel")
 }
 
 /// Runs `decode`, turning a panic into `Err`: a malformed file can panic inside
@@ -304,7 +321,7 @@ pub fn start_preview_worker(state: Arc<AppState>, requests: mpsc::Receiver<Worke
 
 /// SQL list of the extensions `is_native_image` accepts, matched against `assets.extension`.
 pub(crate) const NATIVE_EXTS_SQL: &str =
-    "('jpg','jpeg','png','bmp','gif','tif','tiff','tga','webp')";
+    "('jpg','jpeg','png','bmp','gif','tif','tiff','tga','webp','hdr')";
 
 /// A claimed job: (job_id, asset_id, file_path)
 type Job = (String, String, String);
@@ -1375,6 +1392,117 @@ mod tests {
         assert_eq!(
             image::image_dimensions(thumbs.join("t_thumb.png")).unwrap(),
             (512, 100)
+        );
+    }
+
+    /// Writes a Radiance `.hdr` of `width` x `height` px, `pixels` repeating along each row.
+    fn write_hdr(path: &Path, width: u32, height: u32, pixels: &[f32]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let hdr = image::Rgb32FImage::from_fn(width, height, |x, _| {
+            image::Rgb([pixels[x as usize % pixels.len()]; 3])
+        });
+        hdr.save_with_format(path, image::ImageFormat::Hdr).unwrap();
+    }
+
+    #[test]
+    fn small_hdr_gets_a_tone_mapped_native_size_png() {
+        let dir = tempfile::tempdir().unwrap();
+        // An upper-case extension, as most real ones have.
+        let source = dir.path().join("sky.HDR");
+        write_hdr(&source, 4, 2, &[0.0, 0.1, 1.0, 3.0]);
+        let thumbs = dir.path().join("thumbs");
+
+        let name = generate_image_thumb(&source, &thumbs, "a1").unwrap();
+        assert_eq!(name.as_deref(), Some("a1_thumb.png"));
+
+        let thumb = image::open(thumbs.join("a1_thumb.png")).unwrap().to_rgb8();
+        assert_eq!(thumb.dimensions(), (4, 2));
+        // Clipping linear light would give 0, 25, 255 and 255.
+        let row: Vec<u8> = (0..4).map(|x| thumb.get_pixel(x, 1).0[0]).collect();
+        assert_eq!(row, [0, 85, 186, 223]);
+    }
+
+    #[test]
+    fn large_hdr_is_downsampled_to_a_jpeg() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("sky.hdr");
+        write_hdr(&source, 1024, 32, &[1.0]);
+        let thumbs = dir.path().join("thumbs");
+
+        let name = generate_image_thumb(&source, &thumbs, "a1").unwrap();
+        assert_eq!(name.as_deref(), Some("a1_thumb.jpg"));
+
+        let thumb = image::open(thumbs.join("a1_thumb.jpg")).unwrap().to_rgb8();
+        assert_eq!(thumb.dimensions(), (512, 16));
+        assert!(thumb.get_pixel(256, 8).0[0].abs_diff(186) <= 2);
+    }
+
+    /// A `.hdr` whose header reads but whose pixels stop after its first bytes.
+    fn write_truncated_hdr(path: &Path) {
+        write_hdr(path, 64, 64, &[0.25, 1.0, 3.0]);
+        let bytes = std::fs::read(path).unwrap();
+        std::fs::write(path, &bytes[..bytes.len() / 2]).unwrap();
+        assert_eq!(image::image_dimensions(path).unwrap(), (64, 64));
+    }
+
+    #[test]
+    fn truncated_hdr_fails_and_writes_no_thumbnail() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("sky.hdr");
+        write_truncated_hdr(&source);
+        let thumbs = dir.path().join("thumbs");
+
+        assert!(generate_image_thumb(&source, &thumbs, "a1").is_err());
+        assert!(!thumbs.exists());
+    }
+
+    #[tokio::test]
+    async fn image_queue_hands_a_truncated_hdr_to_the_python_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_truncated_hdr(&root.join("hdri/sky.HDR"));
+        let lib = library_with_pending_job(root, "hdri/sky.HDR", "").await;
+
+        let (claimed, done) = process_image_jobs(&lib, 2).await;
+
+        assert!(claimed);
+        assert!(done.is_empty());
+        // Not done: the row keeps waiting, and the worker's answer settles it.
+        assert_eq!(
+            job_outcome(&lib.pool).await,
+            (Some(String::new()), "pending".into(), "fallback".into())
+        );
+        assert!(!root.join(".opendam/thumbs").exists());
+
+        // The image queue doesn't claim it again.
+        let (claimed, _) = process_image_jobs(&lib, 2).await;
+        assert!(!claimed);
+    }
+
+    #[test]
+    fn hdr_is_decoded_natively_and_exr_is_not() {
+        assert!(is_native_image("HDR") && needs_preview("HDR"));
+        assert!(!is_native_image("exr") && needs_preview("exr"));
+    }
+
+    #[tokio::test]
+    async fn image_queue_serves_an_upper_case_hdr_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_hdr(&root.join("hdri/sky.HDR"), 8, 4, &[1.0]);
+        let lib = library_with_pending_job(root, "hdri/sky.HDR", "").await;
+
+        let (claimed, done) = process_image_jobs(&lib, 2).await;
+
+        assert!(claimed);
+        assert_eq!(done.len(), 1);
+        assert_eq!(
+            job_outcome(&lib.pool).await,
+            (
+                Some(".opendam/thumbs/a1_thumb.png".into()),
+                "done".into(),
+                "done".into()
+            )
         );
     }
 

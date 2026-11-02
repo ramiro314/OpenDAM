@@ -28,7 +28,8 @@ pub enum PlaceStep {
     /// Merges the root's only folder into the root while nothing else there is an asset,
     /// repeatedly.
     Flatten,
-    /// Moves one folder's contents up to the root. A pack without the folder is left as it is.
+    /// Moves one folder's contents up to the root. A pack without the folder is left as it is,
+    /// which `place_listed` reports.
     Hoist { folder: String },
     /// Renames the file with this source path to `name`, in the folder it is in.
     Rename { source: Vec<String>, name: String },
@@ -50,27 +51,40 @@ impl fmt::Display for PlaceStep {
 /// Runs `steps` in order over the tree at `root`, whose files `files` lists, and keeps `files`
 /// in step with it, sorted by path.
 pub fn place(root: &Path, files: &mut Vec<ExtractedFile>, steps: &[PlaceStep]) -> Result<()> {
-    place_in(Tree::Disk(root), files, steps)
+    place_in(Tree::Disk(root), files, steps).map(drop)
 }
 
 /// Runs `steps` over `files` alone, as `place` would over a tree holding exactly those files,
-/// moving nothing on disk: an import's scan previews a build with it (`super::scan`).
-pub fn place_listed(files: &mut Vec<ExtractedFile>, steps: &[PlaceStep]) -> Result<()> {
+/// moving nothing on disk: an import's scan previews a build with it (`super::scan`). It returns
+/// a warning for each step that would do nothing: a `hoist` whose folder is missing.
+pub fn place_listed(files: &mut Vec<ExtractedFile>, steps: &[PlaceStep]) -> Result<Vec<String>> {
     place_in(Tree::Listed, files, steps)
 }
 
-fn place_in(tree: Tree, files: &mut Vec<ExtractedFile>, steps: &[PlaceStep]) -> Result<()> {
+fn place_in(
+    tree: Tree,
+    files: &mut Vec<ExtractedFile>,
+    steps: &[PlaceStep],
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
     for step in steps {
         let result = match step {
             PlaceStep::Flatten => flatten(tree, files),
-            PlaceStep::Hoist { folder } => hoist(tree, files, folder),
+            PlaceStep::Hoist { folder } => hoist(tree, files, folder).map(|found| {
+                if !found {
+                    warnings.push(format!(
+                        "{step}: no folder at {folder}, so this step moves nothing. \
+                         Give the folder's path from the pack root."
+                    ));
+                }
+            }),
             PlaceStep::Rename { source, name } => rename(tree, files, source, name),
             PlaceStep::Exclude { source } => exclude(tree, files, source),
         };
         result.map_err(|err| anyhow!("{step}: {err:#}"))?;
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(())
+    Ok(warnings)
 }
 
 /// The tree a place step works on: on disk below a folder, or only the file list (`Listed`),
@@ -203,14 +217,15 @@ fn is_loose(name: &str) -> bool {
     is_package_file(name) || LOOSE.iter().any(|l| ext.eq_ignore_ascii_case(l))
 }
 
-fn hoist(tree: Tree, files: &mut Vec<ExtractedFile>, folder: &str) -> Result<()> {
+/// Moves `folder`'s contents to the root, and says whether there was such a folder.
+fn hoist(tree: Tree, files: &mut Vec<ExtractedFile>, folder: &str) -> Result<bool> {
     let folder = match clean(folder) {
         Ok(parts) if !parts.is_empty() => parts.join("/"),
         _ => bail!("invalid folder {folder:?}"),
     };
     match tree.kind(files, &folder) {
-        Some(Kind::Folder) => merge(tree, files, &folder),
-        _ => Ok(()),
+        Some(Kind::Folder) => merge(tree, files, &folder).map(|()| true),
+        _ => Ok(false),
     }
 }
 
@@ -677,6 +692,78 @@ mod tests {
     }
 
     #[test]
+    fn a_listed_hoist_warns_when_its_folder_is_missing_and_changes_nothing() {
+        let layout = ["Art.txt", "Docs/a.txt", "Wrap/Art/x.fbx"];
+        for folder in ["Art", "Art.txt", "Meshes"] {
+            let (_tmp, mut files) = tree(&layout);
+            let hoist = PlaceStep::Hoist {
+                folder: folder.into(),
+            };
+            assert_eq!(
+                place_listed(&mut files, &[hoist]).unwrap(),
+                [format!(
+                    "hoist {folder}: no folder at {folder}, so this step moves nothing. \
+                     Give the folder's path from the pack root."
+                )]
+            );
+            assert_eq!(paths(&files), layout);
+        }
+    }
+
+    #[test]
+    fn a_listed_hoist_that_finds_its_folder_warns_nothing() {
+        let (_tmp, mut files) = synthetic();
+        assert_eq!(
+            place_listed(&mut files, &flatten_and_hoist_art()).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(paths(&files), golden("synthetic.place.txt"));
+    }
+
+    /// Wizard Room's shape: `TutorialInfo/` keeps `flatten` from reaching `Art/`, so only the
+    /// folder's whole path finds it.
+    #[test]
+    fn a_nested_hoist_moves_only_that_folder_up() {
+        let layout = [
+            "Stylarts.meta",
+            "Stylarts/WizardRoom.meta",
+            "Stylarts/WizardRoom/Art.meta",
+            "Stylarts/WizardRoom/Art/Models.meta",
+            "Stylarts/WizardRoom/Art/Models/SM_Book.fbx",
+            "Stylarts/WizardRoom/Art/Models/SM_Book.fbx.meta",
+            "Stylarts/WizardRoom/Scene/Room.unity",
+            "TutorialInfo/Readme.png",
+        ];
+        let flatten_and_hoist = [
+            PlaceStep::Flatten,
+            PlaceStep::Hoist {
+                folder: "Stylarts/WizardRoom/Art".into(),
+            },
+        ];
+        let (tmp, mut files) = tree(&layout);
+        place(tmp.path(), &mut files, &flatten_and_hoist).unwrap();
+        let expected = [
+            "Models.meta",
+            "Models/SM_Book.fbx",
+            "Models/SM_Book.fbx.meta",
+            "Stylarts.meta",
+            "Stylarts/WizardRoom.meta",
+            "Stylarts/WizardRoom/Scene/Room.unity",
+            "TutorialInfo/Readme.png",
+        ];
+        assert_eq!(paths(&files), expected);
+        assert_eq!(on_disk(tmp.path()), expected);
+        assert_eq!(empty_folders(tmp.path()), Vec::<String>::new());
+
+        let (_tmp, mut listed) = tree(&layout);
+        assert_eq!(
+            place_listed(&mut listed, &flatten_and_hoist).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(listed, files);
+    }
+
+    #[test]
     fn rename_fails_when_only_the_meta_would_overwrite_a_file() {
         let layout = ["a.png", "a.png.meta", "b.png.meta"];
         let (tmp, mut files) = tree(&layout);
@@ -772,7 +859,9 @@ mod tests {
             };
             let mut listed = on_disk.clone();
             let disk = place(tmp.path(), &mut on_disk, &steps).map_err(|e| e.to_string());
-            let list = place_listed(&mut listed, &steps).map_err(|e| e.to_string());
+            let list = place_listed(&mut listed, &steps)
+                .map(drop)
+                .map_err(|e| e.to_string());
             assert_eq!(list, disk, "{layout:?} {steps:?}");
             if disk.is_ok() {
                 assert_eq!(listed, on_disk, "{layout:?} {steps:?}");
