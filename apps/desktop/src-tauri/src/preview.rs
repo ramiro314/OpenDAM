@@ -575,7 +575,7 @@ pub(crate) async fn complete_job(
         && rel_thumb.as_deref().is_some_and(|t| t.ends_with(".glb"))
         && previous_thumb
             .as_deref()
-            .is_some_and(|t| !t.ends_with(".glb"));
+            .is_some_and(|t| !t.is_empty() && !t.ends_with(".glb"));
     let (status, rel_thumb) = if keeps_picture {
         ("generating", previous_thumb.clone())
     } else {
