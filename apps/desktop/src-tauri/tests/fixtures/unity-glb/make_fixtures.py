@@ -1,0 +1,348 @@
+"""Writes the Unity GLB converter's fixture packs (docs/plans/import-material-fixes/plan.md,
+Fixture tests) beside this script, replacing what is there:
+
+    python3 -I make_fixtures.py
+
+It uses only the Python standard library and fixes every GUID, so a rerun gives the same bytes.
+Its output is committed, like `tests/fixtures/pack-import/`. Real Asset Store content can't be.
+
+Each folder is one pack, so a case's by-name lookups reach only its own files. Every pack holds
+`Model.obj`, one triangle per material slot, and `Model.mtl`, which name the slots through `usemtl`
+and `newmtl`, with text `.mat`, `.meta` and `.shadergraph` files and solid 4 x 4 PNGs. The tests in
+`src/import/unity_glb_fixture_tests.rs` tell a texture by its colour:
+
+- BASE, OTHER_BASE, NORMAL, ORM and MASK are solid colours: only a role's right texture is BASE or
+  NORMAL, and MASK is black, so a mask read as a base shows.
+- TINT is the flat colour a material should show, and GREY one it should not.
+"""
+
+import hashlib
+import json
+import shutil
+import struct
+import zlib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+BASE = (200, 40, 40)
+OTHER_BASE = (40, 200, 40)
+NORMAL = (128, 128, 255)
+ORM = (10, 120, 220)
+MASK = (0, 0, 0)
+TINT = (0.2, 0.4, 0.6, 1)
+GREY = (0.8, 0.8, 0.8, 1)
+
+# The GUID of Unity's built-in resources, which a material on a built-in shader names.
+BUILT_IN = "0000000000000000f000000000000000"
+# The file ID every Shader Graph's main asset has in a material's `m_Shader`.
+GRAPH_FILE_ID = -6465566751694194690
+
+
+def guid(pack: str, name: str) -> str:
+    return hashlib.md5(f"{pack}/{name}".encode()).hexdigest()
+
+
+def png(rgb: tuple[int, int, int]) -> bytes:
+    """A 4 x 4 PNG of one colour."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    rows = (b"\0" + bytes(rgb) * 4) * 4
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(rows, 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+class Pack:
+    def __init__(self, name: str, slots: list[str]):
+        self.name = name
+        self.dir = HERE / name
+        self.dir.mkdir()
+        self.mtl(slots)
+
+    def write(self, name: str, text: str | bytes) -> None:
+        data = text.encode() if isinstance(text, str) else text
+        (self.dir / name).write_bytes(data)
+
+    def meta(self, name: str) -> None:
+        self.write(f"{name}.meta", f"fileFormatVersion: 2\nguid: {guid(self.name, name)}\n")
+
+    def mtl(self, slots: list[str]) -> None:
+        """The model, one triangle per slot, and a `.mtl` naming each."""
+        obj = ["mtllib Model.mtl", "o Model"]
+        for n, slot in enumerate(slots):
+            at = n * 3
+            obj += [f"v {at} 0 0", f"v {at + 1} 0 0", f"v {at} 1 0"]
+            obj += ["vt 0 0", "vt 1 0", "vt 0 1"]
+            obj += [f"usemtl {slot}", f"f {at + 1}/{at + 1} {at + 2}/{at + 2} {at + 3}/{at + 3}"]
+        self.write("Model.obj", "\n".join(obj) + "\n")
+        self.write("Model.mtl", "".join(f"newmtl {slot}\nKd 1 1 1\n" for slot in slots))
+
+    def texture(self, name: str, rgb: tuple[int, int, int]) -> str:
+        """Writes `name`.png and its `.meta`, and returns its GUID."""
+        self.write(f"{name}.png", png(rgb))
+        self.meta(f"{name}.png")
+        return guid(self.name, f"{name}.png")
+
+    def graph(self, name: str, text: str) -> str:
+        """Writes `name`.shadergraph and its `.meta`, and returns its GUID."""
+        self.write(f"{name}.shadergraph", text)
+        self.meta(f"{name}.shadergraph")
+        return guid(self.name, f"{name}.shadergraph")
+
+    def material(self, name: str, textures=None, colors=None, shader=None) -> None:
+        """Writes `name`.mat and its `.meta`, a material as Unity 2021 writes it: `textures`
+        maps a property to a texture's GUID, or `None` for an empty slot."""
+        lines = [
+            "%YAML 1.1",
+            "%TAG !u! tag:unity3d.com,2011:",
+            "--- !u!21 &2100000",
+            "Material:",
+            "  serializedVersion: 8",
+            f"  m_Name: {name}",
+        ]
+        if shader:
+            # Unity wraps the line here, past 80 columns.
+            lines += [f"  m_Shader: {{fileID: {GRAPH_FILE_ID}, guid: {shader},", "    type: 3}"]
+        else:
+            lines.append(f"  m_Shader: {{fileID: 46, guid: {BUILT_IN}, type: 0}}")
+        lines += ["  m_SavedProperties:", "    serializedVersion: 3", "    m_TexEnvs:"]
+        for prop, bound in (textures or {}).items():
+            target = f"{{fileID: 2800000, guid: {bound}, type: 3}}" if bound else "{fileID: 0}"
+            lines += [
+                f"    - {prop}:",
+                f"        m_Texture: {target}",
+                "        m_Scale: {x: 1, y: 1}",
+                "        m_Offset: {x: 0, y: 0}",
+            ]
+        lines += ["    m_Ints: []", "    m_Floats: []", "    m_Colors:"]
+        for prop, (r, g, b, a) in (colors or {}).items():
+            lines.append(f"    - {prop}: {{r: {r}, g: {g}, b: {b}, a: {a}}}")
+        self.write(f"{name}.mat", "\n".join(lines) + "\n")
+        self.meta(f"{name}.mat")
+
+
+def stream(properties: dict[str, str], override: dict[str, str] | None = None) -> str:
+    """A Shader Graph as Unity 2021 writes it: a stream of JSON objects, the graph, then one for
+    each property of `properties`, reference -> display name. `override` holds the references
+    set by hand: the generated one stays in `m_DefaultReferenceName`."""
+    override = override or {}
+    objects = [
+        {
+            "m_SGVersion": 3,
+            "m_Type": "UnityEditor.ShaderGraph.GraphData",
+            "m_Properties": [{"m_Id": ref} for ref in properties],
+        },
+        # A node has an `m_Name` too, which isn't a property's
+        {"m_Type": "UnityEditor.ShaderGraph.BlockNode", "m_Name": "SurfaceDescription.BaseColor"},
+    ]
+    for ref, shown in properties.items():
+        objects.append(
+            {
+                "m_Type": "UnityEditor.ShaderGraph.Internal.Texture2DShaderProperty",
+                "m_Name": shown,
+                "m_DefaultReferenceName": ref,
+                "m_OverrideReferenceName": override.get(ref, ""),
+            }
+        )
+    return "\n\n".join(json.dumps(o, indent=4) for o in objects) + "\n"
+
+
+def older(properties: dict[str, str]) -> str:
+    """A graph from before the stream: one object, its properties as escaped JSON text."""
+    return json.dumps(
+        {
+            "m_SerializedProperties": [
+                {
+                    "typeInfo": {"fullName": "UnityEditor.ShaderGraph.TextureShaderProperty"},
+                    "JSONnodeData": json.dumps({"m_Name": shown, "m_DefaultReferenceName": ref}),
+                }
+                for ref, shown in properties.items()
+            ]
+        },
+        indent=4,
+    )
+
+
+def graph_material(pack: Pack, properties: dict[str, tuple[str, tuple]], colors=None) -> None:
+    """`M_Thing`, whose graph shows each generated property, reference -> (display name, colour),
+    under its display name, each bound to a texture of that colour."""
+    shader = pack.graph("S_Thing", stream({ref: shown for ref, (shown, _) in properties.items()}))
+    textures = {
+        ref: pack.texture(f"T_{n}", rgb) for n, (ref, (_, rgb)) in enumerate(properties.items())
+    }
+    pack.material("M_Thing", textures, colors, shader)
+
+
+def main() -> None:
+    for old in HERE.iterdir():
+        if old.is_dir():
+            shutil.rmtree(old)
+
+    pack = Pack("generated-names", ["M_Thing"])
+    graph_material(
+        pack,
+        {
+            "Texture2D_a": ("A_BaseColor", BASE),
+            "Texture2D_b": ("NormalMap", NORMAL),
+            "Texture2D_c": ("Material 01 ORM", ORM),
+        },
+        {"_Color": TINT},
+    )
+
+    pack = Pack("override-reference", ["M_Thing"])
+    shader = pack.graph(
+        "S_Thing",
+        stream({"Texture2D_a": "A_BaseColor"}, {"Texture2D_a": "_Layer1"}),
+    )
+    pack.material("M_Thing", {"_Layer1": pack.texture("T_Base", BASE)}, shader=shader)
+
+    # B comes first in the material and in the graph.
+    pack = Pack("layers", ["M_Thing"])
+    graph_material(
+        pack,
+        {"Texture2D_a": ("B_BaseColor", OTHER_BASE), "Texture2D_b": ("A_BaseColor", BASE)},
+    )
+
+    pack = Pack("orm-word", ["M_Thing"])
+    graph_material(
+        pack,
+        {
+            "Texture2D_a": ("A_BaseColor", BASE),
+            "Texture2D_b": ("MaskedColorMask", ORM),
+            "Texture2D_c": ("UniformClouds", ORM),
+        },
+    )
+
+    pack = Pack("detail-normal", ["M_Thing"])
+    graph_material(
+        pack,
+        {
+            "Texture2D_a": ("A_BaseColor", BASE),
+            "Texture2D_b": ("Detail Map Normal", OTHER_BASE),
+            "Texture2D_c": ("Macro Normal", NORMAL),
+        },
+    )
+
+    pack = Pack("mask-only", ["M_Thing"])
+    graph_material(
+        pack,
+        {"Texture2D_a": ("OpacityMap", MASK), "Texture2D_b": ("GlitterTint", ORM)},
+        {"_Color": TINT},
+    )
+
+    pack = Pack("helper-mask", ["M_Thing"])
+    graph_material(
+        pack,
+        {"Texture2D_a": ("A_BaseColor", BASE), "Texture2D_b": ("GlitterMask", MASK)},
+    )
+
+    pack = Pack("blank-twin", ["MI_Wall"])
+    pack.material("MI_Wall", {"_BaseMap": None})
+    pack.material("M_Wall", {"_BaseMap": pack.texture("T_Wall", BASE)})
+
+    pack = Pack("twin-no-mat", ["MI_Wall"])
+    pack.material("M_Wall", {"_BaseMap": pack.texture("T_Wall", BASE)})
+
+    pack = Pack("twin-over-colours", ["MI_Wall"])
+    pack.material("MI_Wall", colors={"_BaseColor": TINT})
+    pack.material("M_Wall", {"_BaseMap": pack.texture("T_Wall", BASE)})
+
+    # A prefab names `MI_Wall.mat`, for a slot of the model's own name.
+    pack = Pack("twin-from-prefab", ["Imported"])
+    pack.material("MI_Wall", colors={"_BaseColor": TINT})
+    pack.material("M_Wall", {"_BaseMap": pack.texture("T_Wall", BASE)})
+    pack.meta("Model.obj")
+    pack.write(
+        "Model.prefab",
+        "%YAML 1.1\n"
+        "%TAG !u! tag:unity3d.com,2011:\n"
+        "--- !u!33 &1\n"
+        "MeshFilter:\n"
+        "  m_GameObject: {fileID: 7}\n"
+        f"  m_Mesh: {{fileID: 4300000, guid: {guid(pack.name, 'Model.obj')}, type: 3}}\n"
+        "--- !u!23 &2\n"
+        "MeshRenderer:\n"
+        "  m_GameObject: {fileID: 7}\n"
+        "  m_Materials:\n"
+        f"  - {{fileID: 2100000, guid: {guid(pack.name, 'MI_Wall.mat')}, type: 2}}\n",
+    )
+
+    # MI_Stone has no M_Stone, and MI_Roof's M_Roof has no textures.
+    pack = Pack("true-flat-colour", ["MI_Stone", "MI_Roof"])
+    pack.material("MI_Stone", colors={"_BaseColor": TINT})
+    pack.material("MI_Roof", colors={"_BaseColor": TINT})
+    pack.material("M_Roof", {"_BaseMap": None}, {"_BaseColor": GREY})
+
+    pack = Pack("flat-colour", ["M_Thing"])
+    shader = pack.graph("S_Thing", stream({"Color_a": "BaseColor Value"}))
+    pack.material("M_Thing", colors={"Color_a": TINT, "_Color": GREY}, shader=shader)
+
+    pack = Pack("only-texture", ["M_Thing"])
+    pack.material("M_Thing", {"_Grid": pack.texture("T_Grid", BASE)})
+
+    pack = Pack("generated-slot", ["M_Thing"])
+    pack.material(
+        "M_Thing",
+        {"_SampleTexture2D_abc123_Texture_1": pack.texture("T_Sample", BASE)},
+        {"_Color": TINT},
+    )
+
+    pack = Pack("lone-mask", ["M_Thing"])
+    graph_material(pack, {"Texture2D_x": ("OpacityMap", MASK)}, {"_Color": TINT})
+
+    pack = Pack("lone-normal", ["M_Thing"])
+    graph_material(pack, {"Texture2D_x": ("NormalMap", NORMAL)}, {"_Color": TINT})
+
+    # Takes a role, though no NOT_BASE word says so.
+    pack = Pack("lone-alpha", ["M_Thing"])
+    graph_material(pack, {"Texture2D_x": ("Alpha", MASK)}, {"_Color": TINT})
+
+    pack = Pack("lone-arm", ["M_Thing"])
+    pack.material("M_Thing", {"_ARM": pack.texture("T_Arm", ORM)}, {"_Color": TINT})
+
+    # `_BaseMap` and `_Normal` are found by their raw names, whatever the graph shows.
+    pack = Pack("raw-first", ["M_Thing"])
+    shader = pack.graph(
+        "S_Thing",
+        stream(
+            {
+                "Texture2D_a": "A_BaseColor",
+                "_BaseMap": "Detail",
+                "_Normal": "Second",
+                "Texture2D_b": "A_Normal",
+            }
+        ),
+    )
+    pack.material(
+        "M_Thing",
+        {
+            "Texture2D_a": pack.texture("T_Layer", OTHER_BASE),
+            "Texture2D_b": pack.texture("T_LayerNormal", OTHER_BASE),
+            "_BaseMap": pack.texture("T_Base", BASE),
+            "_Normal": pack.texture("T_Normal", NORMAL),
+        },
+        shader=shader,
+    )
+
+    # Neither graph gives a name, even the one that reads well up to its last object, so each lone
+    # texture stays unresolved.
+    cut_short = stream({"Texture2D_x": "A_BaseColor", "Texture2D_y": "Other"})[:-40]
+    for name, text in (
+        ("older-graph", older({"Texture2D_x": "A_BaseColor"})),
+        ("unreadable-graph", cut_short),
+    ):
+        pack = Pack(name, ["M_Thing"])
+        shader = pack.graph("S_Thing", text)
+        pack.material(
+            "M_Thing", {"Texture2D_x": pack.texture("T_Base", BASE)}, {"_Color": TINT}, shader
+        )
+
+
+main()

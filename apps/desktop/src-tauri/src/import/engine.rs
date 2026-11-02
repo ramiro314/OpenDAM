@@ -1483,6 +1483,10 @@ mod rebuild_tests;
 mod unity_glb_tests;
 
 #[cfg(test)]
+#[path = "unity_glb_fixture_tests.rs"]
+mod unity_glb_fixture_tests;
+
+#[cfg(test)]
 #[path = "unreal_glb_tests.rs"]
 mod unreal_glb_tests;
 

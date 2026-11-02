@@ -54,6 +54,15 @@ docs/plans/pack-import/plan.md R43-R46, record each with its cost):
   no alpha of its own; the rebind then binds the pack's file of that name), and an OBJ's copy
   has `mtllib` lines naming copies of the pack's first `.mtl` of each name, dropping one the
   pack has no file of that name for.
+
+What this adds to its heuristics (docs/plans/import-material-fixes/plan.md, Piece 1):
+
+- Each role looks at the property's raw name, then at its display name in the `.shadergraph` the
+  material's `m_Shader` names, which is how generated names like `Texture2D_27f0...` are read.
+  Colors read display names too.
+- A base color with neither takes the material's only texture (`UnityMaterial.only_texture`).
+- An opacity mask applies with no base color too, over the flat color.
+- A blank slot named `MI_X` uses `M_X` when that material has textures (`twin_material`).
 """
 
 import json
@@ -82,11 +91,14 @@ NOT_BASE = ["normal", "bump", "mask", "emis", "orm", "rough", "metal", "smooth",
 NORMAL_PROPS = ["bumpmap", "normal", "normalmap", "normaltex", "normaltexture"]
 ORM_PROPS = ["orm", "ormtex", "arm", "ormmap"]
 OPACITY_PROPS = ["opacitymask", "opacitymap", "opacity", "alphamask", "alphamap", "alpha"]
-COLOR_PROPS = ["basecolor", "color", "tint", "maincolor"]
+COLOR_PROPS = ["basecolorvalue", "basecolor", "color", "tint", "maincolor"]
 LOD_RE = re.compile(r"_lod[1-9]\d*$", re.IGNORECASE)
 # Collision meshes: Unreal-style `UCX_` and `_ConvexHulls`, and Unity `_Collider`/`_Collision`.
 COLLISION_RE = re.compile(r"^ucx_|_convexhulls?$|_collid(er|ers)$|_collision$", re.IGNORECASE)
 GUID_RE = re.compile(r"guid: ([0-9a-f]{32})")
+# A display name's words: `Material 01 ORM` is Material, 01, ORM, and `ORMMap` is ORM, Map.
+WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
+SPACE_RE = re.compile(r"\s*")
 
 
 def by_path(paths) -> list[Path]:
@@ -174,6 +186,56 @@ def norm(prop: str) -> str:
     return prop.lower().replace("_", "")
 
 
+def words(name: str) -> set[str]:
+    """`name`'s words, lowercased."""
+    return {word.lower() for word in WORD_RE.findall(name)}
+
+
+def is_normal(name: str) -> bool:
+    found = words(name)
+    return bool(found & {"normal", "normals"}) and not found & {"detail", "second"}
+
+
+def is_orm(name: str) -> bool:
+    return "orm" in words(name)
+
+
+def is_opacity(name: str) -> bool:
+    return bool(words(name) & {"opacity", "alpha"})
+
+
+def is_base(name: str) -> bool:
+    """Whether a name, lowercased with no separators, has a base color hint and no other role."""
+    return any(h in name for h in BASE_HINTS) and not any(n in name for n in NOT_BASE)
+
+
+GRAPHS: dict[Path, dict[str, str]] = {}
+
+
+def graph_names(path: Path) -> dict[str, str]:
+    """A Shader Graph's property references -> display names, cached per file. The file is a stream
+    of JSON objects, one per property among others. One that can't be read, or an older graph,
+    which is one object holding its properties as escaped text, gives none."""
+    if path not in GRAPHS:
+        names: dict[str, str] = {}
+        decoder = json.JSONDecoder()
+        try:
+            text = path.read_text(errors="replace").lstrip("\ufeff")
+            at = SPACE_RE.match(text).end()
+            while at < len(text):
+                found, end = decoder.raw_decode(text, at)
+                at = SPACE_RE.match(text, end).end()
+                if isinstance(found, dict) and "ShaderProperty" in str(found.get("m_Type")):
+                    ref = (found.get("m_OverrideReferenceName")
+                           or found.get("m_DefaultReferenceName"))
+                    if ref and found.get("m_Name"):
+                        names[ref] = found["m_Name"]
+        except (OSError, ValueError):
+            names = {}
+        GRAPHS[path] = names
+    return GRAPHS[path]
+
+
 class UnityMaterial:
     def __init__(self, path: Path, guids: dict[str, Path]):
         text = path.read_text(errors="replace")
@@ -182,26 +244,67 @@ class UnityMaterial:
         name = re.search(r"^\s+m_Name: (.+)$", block, re.MULTILINE)
         self.path = path
         self.name = name.group(1).strip() if name else path.stem
+        shader = re.search(r"m_Shader: \{fileID: -?\d+,\s*guid: ([0-9a-f]{32})", block)
+        graph = guids.get(shader.group(1)) if shader else None
+        names = graph_names(graph) if graph and graph.suffix.lower() == ".shadergraph" else {}
         self.textures: dict[str, Path] = {}
+        # (display name, texture), sorted, so `A_BaseColor` wins over `B_BaseColor`.
+        self.display: list[tuple[str, Path]] = []
         for prop, guid in re.findall(
             r"- (\w+):\n\s+m_Texture: \{fileID: -?\d+, guid: ([0-9a-f]{32})", text
         ):
             if guid in guids:
                 self.textures.setdefault(norm(prop), guids[guid])
-        self.colors: dict[str, tuple[float, ...]] = {}
+                if prop in names:
+                    self.display.append((names[prop], guids[guid]))
+        self.display.sort(key=lambda shown: shown[0])
+        colors: dict[str, tuple[float, ...]] = {}
         for prop, r, g, b, a in re.findall(
             r"- (\w+): \{r: ([-\d.e]+), g: ([-\d.e]+), b: ([-\d.e]+), a: ([-\d.e]+)\}", text
         ):
-            self.colors.setdefault(norm(prop), tuple(float(v) for v in (r, g, b, a)))
+            colors.setdefault(prop, tuple(float(v) for v in (r, g, b, a)))
+        self.colors: dict[str, tuple[float, ...]] = {}
+        for prop, color in colors.items():
+            self.colors.setdefault(norm(prop), color)
+        for prop in sorted(names.keys() & colors.keys(), key=names.get):
+            self.colors.setdefault(alnum(names[prop]), colors[prop])
         self.cutout = "_ALPHATEST_ON" in text or "TransparentCutout" in text
 
     def texture(self, props: list[str]) -> Path | None:
         return next((self.textures[p] for p in props if p in self.textures), None)
 
+    def role(self, props: list[str], shown_as) -> Path | None:
+        """The texture of a role's raw names, else the first whose display name `shown_as` takes."""
+        return self.texture(props) or next((t for name, t in self.display if shown_as(name)), None)
+
+    def normal(self) -> Path | None:
+        return self.role(NORMAL_PROPS, is_normal)
+
+    def orm(self) -> Path | None:
+        return self.role(ORM_PROPS, is_orm)
+
+    def opacity(self) -> Path | None:
+        return self.role(OPACITY_PROPS, is_opacity)
+
     def base(self) -> Path | None:
-        return self.texture(BASE_PROPS) or next(
-            (t for p, t in self.textures.items()
-             if any(h in p for h in BASE_HINTS) and not any(n in p for n in NOT_BASE)), None)
+        return (self.texture(BASE_PROPS)
+                or next((t for p, t in self.textures.items() if is_base(p)), None)
+                or next((t for name, t in self.display if is_base(alnum(name))), None)
+                or self.only_texture())
+
+    def only_texture(self) -> Path | None:
+        """The material's one bound texture, unless its names say it isn't a base color: a
+        generated `_SampleTexture...` slot, a generated `Texture2D_...` with no display name, a
+        NOT_BASE word in either name, or another role that already takes it."""
+        if len(self.textures) != 1:
+            return None
+        prop, texture = next(iter(self.textures.items()))
+        shown = [alnum(name) for name, _ in self.display]
+        if prop.startswith("sampletexture") or (prop.startswith("texture2d") and not shown):
+            return None
+        if any(n in name for n in NOT_BASE for name in [prop, *shown]):
+            return None
+        return None if texture in (self.normal(), self.orm(), self.opacity()) else texture
 
     def color(self) -> tuple[float, ...] | None:
         return next((self.colors[p] for p in COLOR_PROPS if p in self.colors), None)
@@ -259,32 +362,33 @@ def build_material(um: UnityMaterial, max_size: int, scratch: Scratch) -> bpy.ty
     nodes, links = mat.node_tree.nodes, mat.node_tree.links
     bsdf = next(n for n in nodes if n.type == "BSDF_PRINCIPLED")
     base = um.base()
-    mask = um.texture(OPACITY_PROPS)
+    mask = um.opacity()
+    alpha = None
     # The base color's alpha is only needed for a cutout with no separate opacity mask.
     if base and (img := image(base, max_size, False, scratch, keep_alpha=um.cutout and not mask)):
         tex = nodes.new("ShaderNodeTexImage")
         tex.image = img
         links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
         alpha = tex.outputs["Alpha"]
-        if mask and (mask_img := image(mask, max_size, True, scratch)):
-            mask_tex = nodes.new("ShaderNodeTexImage")
-            mask_tex.image = mask_img
-            alpha = mask_tex.outputs["Color"]  # a grayscale mask: its red channel
-        if um.cutout or mask:
-            clip = nodes.new("ShaderNodeMath")
-            clip.operation = "ROUND"  # alpha clip at 0.5 for the glTF exporter
-            links.new(alpha, clip.inputs[0])
-            links.new(clip.outputs[0], bsdf.inputs["Alpha"])
     elif color := um.color():
         bsdf.inputs["Base Color"].default_value = color
-    normal = um.texture(NORMAL_PROPS)
+    if mask and (mask_img := image(mask, max_size, True, scratch)):
+        mask_tex = nodes.new("ShaderNodeTexImage")
+        mask_tex.image = mask_img
+        alpha = mask_tex.outputs["Color"]  # a grayscale mask: its red channel
+    if alpha is not None and (um.cutout or mask):
+        clip = nodes.new("ShaderNodeMath")
+        clip.operation = "ROUND"  # alpha clip at 0.5 for the glTF exporter
+        links.new(alpha, clip.inputs[0])
+        links.new(clip.outputs[0], bsdf.inputs["Alpha"])
+    normal = um.normal()
     if normal and (img := image(normal, max_size, True, scratch)):
         tex = nodes.new("ShaderNodeTexImage")
         tex.image = img
         nmap = nodes.new("ShaderNodeNormalMap")
         links.new(tex.outputs["Color"], nmap.inputs["Color"])
         links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
-    orm = um.texture(ORM_PROPS)
+    orm = um.orm()
     if orm and (img := image(orm, max_size, True, scratch)):
         tex = nodes.new("ShaderNodeTexImage")
         tex.image = img
@@ -440,6 +544,11 @@ def convert(model: Path, target: Path, guids, by_mesh, by_name, images, mtls, ma
                 path = (guids.get(remap.get(slot_name, ""))
                         or by_name.get(slot_name.lower()))
                 um = material_for(path, guids) if path else None
+            if um is None or not um.textures:
+                # Blank, colors or not: the slot's own name, then that of the .mat it found.
+                slot_names = ([base_name(slot.material.name)] if slot.material else []) + (
+                    [um.path.stem] if um else [])
+                um = twin_material(slot_names, by_name, guids) or um
             if um is not None and not um.textures and not um.colors:
                 um = None  # a .mat in Unity's binary format: nothing readable in it
             if um is None:
@@ -493,6 +602,7 @@ class NamedMaterial(UnityMaterial):
         self.path = Path(f"name:{key}")
         self.name = key
         self.textures = textures
+        self.display = []
         self.colors = {}
         self.cutout = False
 
@@ -548,6 +658,15 @@ def material_for(path: Path, guids) -> UnityMaterial | None:
     if path not in MATERIALS:
         MATERIALS[path] = UnityMaterial(path, guids)
     return MATERIALS[path]
+
+
+def twin_material(names: list[str], by_name, guids) -> UnityMaterial | None:
+    """`M_X` for the first of `names` that is an `MI_X`, when that material has textures."""
+    for name in names:
+        if name[:3].lower() == "mi_" and (path := by_name.get("m_" + name[3:].lower())):
+            if (twin := material_for(path, guids)) and twin.textures:
+                return twin
+    return None
 
 
 def main() -> None:
