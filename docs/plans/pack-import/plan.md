@@ -455,6 +455,15 @@ changed. These are its deviations from the plan as written:
   - **Not through a link.** A manifest path that is no regular file now, or that a folder on the
     way reaches through a link, is left alone.
 
+Revised again 2026-11-01 while fixing empty GLBs (plan import-material-fixes, Piece 1). These are
+its deviations from the plan as written:
+
+- **R61 - A run's warnings hold more than skipped entries.** A model the conversion left with no
+  mesh and no animation lands as an empty GLB and warns with the reason `noMesh`, on every run
+  that places it, unless its file name is a collider's. An animation clip holds no mesh but isn't
+  empty. The list keeps its shape, so stored runs read as before,
+  and its heading reads "N warnings".
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:

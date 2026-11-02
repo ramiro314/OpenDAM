@@ -60,9 +60,13 @@ pub enum SkipReason {
     Special,
     /// An Unreal asset the editor's glTF exporter failed on, named by its `/Game` path.
     NotExported,
+    /// A model the conversion left with no mesh. Unlike the others it isn't skipped: its empty
+    /// GLB lands in the pack.
+    NoMesh,
 }
 
-/// An entry the extraction skipped, for the run's warnings.
+/// An entry the extraction skipped, or a model the conversion left with no mesh, for the run's
+/// warnings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkippedEntry {

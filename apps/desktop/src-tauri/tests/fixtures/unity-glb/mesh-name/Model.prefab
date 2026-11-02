@@ -1,0 +1,20 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!33 &01
+MeshFilter:
+  m_GameObject: {fileID: 07}
+  m_Mesh: {fileID: 4300000, guid: e4b65388afef8ae0ed7bfcf9466da59b, type: 3}
+--- !u!23 &02
+MeshRenderer:
+  m_GameObject: {fileID: 07}
+  m_Materials:
+  - {fileID: 2100000, guid: 420dab3da4b27dbd898902780e2520e3, type: 2}
+--- !u!33 &11
+MeshFilter:
+  m_GameObject: {fileID: 17}
+  m_Mesh: {fileID: 4300002, guid: e4b65388afef8ae0ed7bfcf9466da59b, type: 3}
+--- !u!23 &12
+MeshRenderer:
+  m_GameObject: {fileID: 17}
+  m_Materials:
+  - {fileID: 2100000, guid: 61cdb11ca18ad73856baa8e43c493c0c, type: 2}

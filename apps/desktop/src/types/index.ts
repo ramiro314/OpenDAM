@@ -989,10 +989,21 @@ export type ProposalDecision =
 
 // ── Pack import (docs/plans/pack-import/plan.md) ──────────────────────────
 
-/** An archive entry an extraction skipped, named by its path in the original */
+/**
+ * An archive entry an extraction skipped, or a model a conversion left with no mesh (`noMesh`, on a
+ * run only), named by its path in the original
+ */
 export interface SkippedEntry {
   sourcePath: string[];
-  reason: 'absolute' | 'escapes' | 'noName' | 'duplicate' | 'hardlink' | 'symlink' | 'special';
+  reason:
+    | 'absolute'
+    | 'escapes'
+    | 'noName'
+    | 'duplicate'
+    | 'hardlink'
+    | 'symlink'
+    | 'special'
+    | 'noMesh';
 }
 
 /** A folder of a build's tree, the pack root being `''` */

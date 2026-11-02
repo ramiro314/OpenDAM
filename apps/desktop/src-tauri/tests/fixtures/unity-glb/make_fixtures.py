@@ -8,7 +8,10 @@ Its output is committed, like `tests/fixtures/pack-import/`. Real Asset Store co
 
 Each folder is one pack, so a case's by-name lookups reach only its own files. Every pack holds
 `Model.obj`, one triangle per material slot, and `Model.mtl`, which name the slots through `usemtl`
-and `newmtl`, with text `.mat`, `.meta` and `.shadergraph` files and solid 4 x 4 PNGs. The tests in
+and `newmtl`, with text `.mat`, `.meta` and `.shadergraph` files and solid 4 x 4 PNGs. A pack about
+which meshes stay holds one triangle per named object instead, in a model of its own name when
+the file name is the case (`Pack.objects`). `mesh-name` and `exact-first` hold no model: an OBJ's
+object and mesh share a name, so their tests make `Model.fbx` under Blender. The tests in
 `src/import/unity_glb_fixture_tests.rs` tell a texture by its colour:
 
 - BASE, OTHER_BASE, NORMAL, ORM and MASK are solid colours: only a role's right texture is BASE or
@@ -63,11 +66,12 @@ def png(rgb: tuple[int, int, int], alpha: int | None = None) -> bytes:
 
 
 class Pack:
-    def __init__(self, name: str, slots: list[str]):
+    def __init__(self, name: str, slots: list[str] | None = None):
         self.name = name
         self.dir = HERE / name
         self.dir.mkdir()
-        self.mtl(slots)
+        if slots:
+            self.mtl(slots)
 
     def write(self, name: str, text: str | bytes) -> None:
         data = text.encode() if isinstance(text, str) else text
@@ -86,6 +90,17 @@ class Pack:
             obj += [f"usemtl {slot}", f"f {at + 1}/{at + 1} {at + 2}/{at + 2} {at + 3}/{at + 3}"]
         self.write("Model.obj", "\n".join(obj) + "\n")
         self.write("Model.mtl", "".join(f"newmtl {slot}\nKd 1 1 1\n" for slot in slots))
+
+    def objects(self, names: list[str], model: str = "Model") -> None:
+        """`model`.obj, one triangle per object of `names`, all on one slot, and its `.mtl`."""
+        obj = [f"mtllib {model}.mtl"]
+        for n, name in enumerate(names):
+            at = n * 3
+            obj += [f"o {name}", f"v {at} 0 0", f"v {at + 1} 0 0", f"v {at} 1 0"]
+            obj += ["vt 0 0", "vt 1 0", "vt 0 1"]
+            obj += ["usemtl Imported", f"f {at + 1}/{at + 1} {at + 2}/{at + 2} {at + 3}/{at + 3}"]
+        self.write(f"{model}.obj", "\n".join(obj) + "\n")
+        self.write(f"{model}.mtl", "newmtl Imported\nKd 1 1 1\n")
 
     def texture(self, name: str, rgb: tuple[int, int, int], alpha: int | None = None) -> str:
         """Writes `name`.png and its `.meta`, and returns its GUID."""
@@ -188,6 +203,40 @@ def graph_material(pack: Pack, properties: dict[str, tuple[str, tuple]], colors=
         ref: pack.texture(f"T_{n}", rgb) for n, (ref, (_, rgb)) in enumerate(properties.items())
     }
     pack.material("M_Thing", textures, colors, shader)
+
+
+def mapped_planes(pack: Pack, model: str, plain: bool = False) -> None:
+    """Two meshes, `Plane.099` and `Plane.100`, mapped by those exact names in `model`'s `.meta`,
+    and a prefab giving each its own material, `M_First` (BASE) and `M_Second` (OTHER_BASE). The
+    lists differ, so no single list finds them, and only with `plain` does `Plane` without its
+    suffix find anything: a third mesh, `M_Plain` (ORM), which an exact name must beat."""
+    meshes = [(4300000, "Plane.099", "M_First"), (4300002, "Plane.100", "M_Second")]
+    pack.material("M_First", {"_BaseMap": pack.texture("T_First", BASE)})
+    pack.material("M_Second", {"_BaseMap": pack.texture("T_Second", OTHER_BASE)})
+    if plain:
+        meshes.append((4300004, "Plane", "M_Plain"))
+        pack.material("M_Plain", {"_BaseMap": pack.texture("T_Plain", ORM)})
+    pack.write(
+        f"{model}.meta",
+        "fileFormatVersion: 2\n"
+        f"guid: {guid(pack.name, model)}\n"
+        "ModelImporter:\n"
+        "  fileIDToRecycleName:\n" + "".join(f"    {mesh}: {name}\n" for mesh, name, _ in meshes),
+    )
+    prefab = ["%YAML 1.1", "%TAG !u! tag:unity3d.com,2011:"]
+    for n, (mesh, _, material) in enumerate(meshes):
+        prefab += [
+            f"--- !u!33 &{n}1",
+            "MeshFilter:",
+            f"  m_GameObject: {{fileID: {n}7}}",
+            f"  m_Mesh: {{fileID: {mesh}, guid: {guid(pack.name, model)}, type: 3}}",
+            f"--- !u!23 &{n}2",
+            "MeshRenderer:",
+            f"  m_GameObject: {{fileID: {n}7}}",
+            "  m_Materials:",
+            f"  - {{fileID: 2100000, guid: {guid(pack.name, material + '.mat')}, type: 2}}",
+        ]
+    pack.write("Model.prefab", "\n".join(prefab) + "\n")
 
 
 def main() -> None:
@@ -553,6 +602,41 @@ def main() -> None:
         pack.material(
             "M_Thing", {"Texture2D_x": pack.texture("T_Base", BASE)}, {"_Color": TINT}, shader
         )
+
+    Pack("lod-only").objects(["Model_LOD1"])
+
+    # C's lowest level isn't 1, and listed last it doesn't come first.
+    Pack("lod-mixed").objects(["A_LOD0", "A_LOD1", "B_LOD1", "C_LOD3", "C_LOD2"])
+
+    # `Wall` and `Wall_LOD0` are both level 0, and the case of a suffix doesn't count.
+    Pack("lod-no-suffix").objects(["Wall", "Wall_LOD1", "Roof_LOD0", "Roof", "Roof_lod2"])
+
+    # Two objects of one name, which Blender's importer keeps apart by these suffixes, and one
+    # above their level, which goes only if the suffixes are read past.
+    Pack("lod-several").objects(["X_LOD1.001", "X_LOD1.002", "X_LOD2.001"])
+
+    # A collision mesh goes even here, where every level stays.
+    Pack("lod-file").objects(["X_LOD1", "X_LOD2", "X_Collider_LOD1"], "X_LOD1")
+
+    # `_LOD0` is level 0, so this file is no LOD and its other levels go.
+    Pack("lod0-file").objects(["X_LOD0", "X_LOD1"], "X_LOD0")
+
+    Pack("no-mesh").objects(["UCX_Model", "Model_Collider"])
+
+    # `_LOD<n>` hides no collision mesh, not even at the lowest level of its name.
+    Pack("no-mesh-lod").objects(["Model_Collider_LOD0", "Model_Collider_LOD1"])
+
+    Pack("collider-file").objects(["rock_collider"], "rock_collider")
+
+    Pack("collider-lod-file").objects(["Rock_Collider_LOD1"], "Rock_Collider_LOD1")
+
+    pack = Pack("exact-name")
+    pack.objects(["Plane.099", "Plane.100"])
+    mapped_planes(pack, "Model.obj")
+
+    mapped_planes(Pack("mesh-name"), "Model.fbx")
+
+    mapped_planes(Pack("exact-first"), "Model.fbx", plain=True)
 
 
 main()

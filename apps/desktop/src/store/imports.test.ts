@@ -36,6 +36,7 @@ import {
   skippedText,
   treeCurrent,
   useImportStore,
+  warningsHeading,
 } from './imports';
 
 const real = { ...api };
@@ -422,6 +423,17 @@ describe('progress and warnings', () => {
     expect(
       skippedText({ sourcePath: ['Inner.unitypackage', '../evil.txt'], reason: 'escapes' })
     ).toBe('Inner.unitypackage > ../evil.txt: climbs out of the pack');
+  });
+
+  test('a model left with no mesh has a reason of its own', () => {
+    expect(skippedText({ sourcePath: ['Art/SM_Empty.fbx'], reason: 'noMesh' })).toBe(
+      'Art/SM_Empty.fbx: no mesh left, so its GLB is empty'
+    );
+  });
+
+  test('the heading counts warnings of every reason', () => {
+    expect(warningsHeading(1)).toBe('1 warning');
+    expect(warningsHeading(2)).toBe('2 warnings');
   });
 });
 

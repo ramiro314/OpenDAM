@@ -229,11 +229,17 @@ const SKIP_REASONS: Record<SkippedEntry['reason'], string> = {
   hardlink: 'a hard link',
   symlink: 'a symbolic link',
   special: 'not a regular file',
+  noMesh: 'no mesh left, so its GLB is empty',
 };
 
-/** A skipped entry, named by its path in the original (nested packages joined by ` > `) */
+/** A run's warning, named by its path in the original (nested packages joined by ` > `) */
 export function skippedText(entry: SkippedEntry): string {
   return `${entry.sourcePath.join(' > ')}: ${SKIP_REASONS[entry.reason] ?? entry.reason}`;
+}
+
+/** The heading over a run's warnings, skipped entries and empty models alike */
+export function warningsHeading(count: number): string {
+  return count === 1 ? '1 warning' : `${count} warnings`;
 }
 
 /**

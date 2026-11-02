@@ -1189,6 +1189,7 @@ impl InsertJournal for InsertedRows {
 
 #[cfg(test)]
 mod tests {
+    use super::super::unitypackage::SkipReason;
     use super::*;
 
     fn output(origin: Origin, source: &[&str]) -> Output {
@@ -1200,6 +1201,45 @@ mod tests {
             source_path: source.iter().map(|s| s.to_string()).collect(),
             origin,
         }
+    }
+
+    fn stored_run(warnings: &str) -> RunSummary {
+        let row: RunRow = (
+            "r".into(),
+            "rebuild".into(),
+            "[]".into(),
+            "done".into(),
+            None,
+            0,
+            0,
+            None,
+            warnings.into(),
+            1,
+            None,
+            None,
+        );
+        summary("lib", row)
+    }
+
+    /// A run stored before models could warn reads as it did, and one of each reason reads too.
+    #[test]
+    fn a_stored_run_reads_its_warnings_of_either_kind() {
+        let skipped = SkippedEntry {
+            source_path: vec!["Inner.unitypackage".into(), "../a.txt".into()],
+            reason: SkipReason::Escapes,
+        };
+        let old = r#"[{"sourcePath":["Inner.unitypackage","../a.txt"],"reason":"escapes"}]"#;
+        assert_eq!(stored_run(old).warnings, std::slice::from_ref(&skipped));
+        assert_eq!(stored_run("[]").warnings, []);
+
+        let empty = SkippedEntry {
+            source_path: vec!["Art/SM_Empty.fbx".into()],
+            reason: SkipReason::NoMesh,
+        };
+        let both = [skipped, empty];
+        let stored = serde_json::to_string(&both).unwrap();
+        assert!(stored.contains(r#""reason":"noMesh""#), "{stored}");
+        assert_eq!(stored_run(&stored).warnings, both);
     }
 
     #[test]
