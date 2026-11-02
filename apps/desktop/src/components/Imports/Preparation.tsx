@@ -1,6 +1,12 @@
 import { useEffect } from 'react';
 import clsx from 'clsx';
-import { importOfPack, rebuildRefusal, skippedText, useImportStore } from '../../store/imports';
+import {
+  importOfPack,
+  rebuildRefusal,
+  skippedText,
+  useImportStore,
+  warningsHeading,
+} from '../../store/imports';
 import {
   busyReason,
   draftProblem,
@@ -151,11 +157,7 @@ export function Preparation({ libraryId, pack, originalPath, runShown = false }:
       )}
       {run && run.warnings.length > 0 && (
         <details className={styles.details} data-prep-warnings>
-          <summary>
-            {run.warnings.length === 1
-              ? '1 entry of the original was skipped'
-              : `${run.warnings.length} entries of the original were skipped`}
-          </summary>
+          <summary>{warningsHeading(run.warnings.length)}</summary>
           <ul>
             {run.warnings.map((w, i) => (
               <li key={i}>{skippedText(w)}</li>

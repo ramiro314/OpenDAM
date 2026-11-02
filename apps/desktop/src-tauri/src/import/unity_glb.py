@@ -28,7 +28,7 @@ as they are:
   texture (occlusion R, roughness G, metallic B, as glTF expects). Smoothness-based maps
   (`_MetallicGlossMap`, `_MaskMap`) aren't converted. Cutout materials get alpha clipping.
 - LOD1 and lower (`*_LOD1`...) and collision meshes (`UCX_*`, `*_ConvexHulls`) are dropped,
-  so the file shows one clean mesh.
+  so the file shows one clean mesh, unless a mesh has no better level (below).
 - Textures are downscaled to `maxTexture` px and embedded as JPEG (PNG when a cutout needs the
   base color's alpha), to keep the files small. The pack's original textures are what Unity
   should use; these GLBs are for browsing.
@@ -63,6 +63,14 @@ What this adds to its heuristics (docs/plans/import-material-fixes/plan.md, Piec
 - A base color with neither takes the material's only texture (`UnityMaterial.only_texture`).
 - An opacity mask applies with no base color too, over the flat color.
 - A blank slot named `MI_X` uses `M_X` when that material has textures (`twin_material`).
+- Each mesh keeps its own lowest level, so a model holding only `_LOD1` meshes keeps them. Meshes
+  group by name, less Blender's numeric suffix and `_LOD<n>` (`lod_of`), and every object at the
+  group's lowest level stays. A file that is itself a LOD keeps all, as the script does.
+- A prefab's mesh is looked up by the object's and the mesh's exact names first, since a `.meta`
+  can name `Plane.099`, and only then without Blender's numeric suffix.
+
+A model left with no mesh still writes its GLB. OpenDAM reads each GLB it places and warns of an
+empty one, on every run, since this script only sees uncached models.
 """
 
 import json
@@ -92,9 +100,12 @@ NORMAL_PROPS = ["bumpmap", "normal", "normalmap", "normaltex", "normaltexture"]
 ORM_PROPS = ["orm", "ormtex", "arm", "ormmap"]
 OPACITY_PROPS = ["opacitymask", "opacitymap", "opacity", "alphamask", "alphamap", "alpha"]
 COLOR_PROPS = ["basecolorvalue", "basecolor", "color", "tint", "maincolor"]
-LOD_RE = re.compile(r"_lod[1-9]\d*$", re.IGNORECASE)
+LOD_RE = re.compile(r"_lod(\d+)$", re.IGNORECASE)
 # Collision meshes: Unreal-style `UCX_` and `_ConvexHulls`, and Unity `_Collider`/`_Collision`.
-COLLISION_RE = re.compile(r"^ucx_|_convexhulls?$|_collid(er|ers)$|_collision$", re.IGNORECASE)
+# `import::unity_glb` keeps the same terms for a model's file name, which a test keeps equal.
+COLLISION_RE = re.compile(
+    r"^ucx_|_convexhull$|_convexhulls$|_collider$|_colliders$|_collision$", re.IGNORECASE
+)
 GUID_RE = re.compile(r"guid: ([0-9a-f]{32})")
 # A display name's words: `Material 01 ORM` is Material, 01, ORM, and `ORMMap` is ORM, Map.
 WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
@@ -461,6 +472,13 @@ def base_name(name: str) -> str:
     return re.sub(r"\.\d{3}$", "", name)
 
 
+def lod_of(name: str) -> tuple[str, int]:
+    """`name`, which has no numeric suffix, lowercased and without `_LOD<n>`, and n: the group a
+    mesh belongs to and its level there. No suffix is level 0, as `_LOD0` is."""
+    match = LOD_RE.search(name)
+    return (name[:match.start()].lower(), int(match.group(1))) if match else (name.lower(), 0)
+
+
 def obj_for_import(model: Path, mtls: dict[str, Path], scratch: Scratch) -> Path:
     """A copy of the OBJ at `model`, under its own name (Blender names an object without an `o`
     line after the file), whose `mtllib` lines name copies of the pack's `.mtl` files found by
@@ -518,18 +536,27 @@ def convert(model: Path, target: Path, guids, by_mesh, by_name, images, mtls, ma
     # (an OBJ's mesh IDs aren't named in its `.meta`).
     prefab_lists = list({tuple(m): m for (g, _), m in by_mesh.items() if g == fbx_guid}.values())
     remap = external_objects(meta) if meta.exists() else {}
-    lod_file = bool(LOD_RE.search(model.stem))
+    lod_file = lod_of(model.stem)[1] > 0
     built: dict[Path, bpy.types.Material] = {}
     matched = total = 0
     meshes = [o for o in bpy.data.objects if o.type == "MESH"]
+    # Each group's lowest level. A collision mesh joins none, so `X_Collider_LOD1` still goes.
+    lowest: dict[str, int] = {}
+    for obj in meshes:
+        group, level = lod_of(base_name(obj.name))
+        if not COLLISION_RE.search(group):
+            lowest[group] = min(level, lowest.get(group, level))
     for obj in list(bpy.data.objects):
         name = base_name(obj.name)
-        if (LOD_RE.search(name) and not lod_file) or COLLISION_RE.search(name):
+        group, level = lod_of(name)
+        if (level > lowest.get(group, 0) and not lod_file) or COLLISION_RE.search(name):
             bpy.data.objects.remove(obj)
             continue
         if obj.type != "MESH":
             continue
-        guids_for_obj = (prefab_by_name.get(name.lower())
+        guids_for_obj = (prefab_by_name.get(obj.name.lower())
+                         or prefab_by_name.get(obj.data.name.lower())
+                         or prefab_by_name.get(name.lower())
                          or prefab_by_name.get(base_name(obj.data.name).lower()))
         if guids_for_obj is None and len(prefab_lists) == 1:
             guids_for_obj = prefab_lists[0]

@@ -1,6 +1,7 @@
-//! How the Unity GLB converter finds a material's textures (plan import-material-fixes, Fixture
-//! tests): each case runs the step's `Conversion` over a pack of `tests/fixtures/unity-glb/` and
-//! reads the GLB's JSON. They run Blender, from `OPENDAM_BLENDER`, and skip without it outside CI.
+//! How the Unity GLB converter finds a material's textures and which meshes it keeps (plan
+//! import-material-fixes, Fixture tests): each case runs the step's `Conversion` over a pack of
+//! `tests/fixtures/unity-glb/` and reads the GLB's JSON. They run Blender, from `OPENDAM_BLENDER`,
+//! and skip without it outside CI.
 //!
 //! The tests sit in a `mod tests` block, as in every other file, so source scans that stop there
 //! (`structure::tests::metadata_writers`) read none of them.
@@ -17,6 +18,7 @@ mod tests {
     use crate::export::hashes::sha256_file;
     use crate::import::build::RunControl;
     use crate::import::unity_glb::{Conversion, Options, Staged, Tools, DEFAULT_MEMORY_MAX};
+    use crate::import::unitypackage::{SkipReason, SkippedEntry};
 
     // The fixtures' colours, as `make_fixtures.py` names them.
     const BASE: [u8; 3] = [200, 40, 40];
@@ -99,11 +101,40 @@ mod tests {
         fn images(&self) -> usize {
             self.json["images"].as_array().map_or(0, Vec::len)
         }
+
+        /// The GLB's nodes that hold a mesh, by name, sorted.
+        fn meshes(&self) -> Vec<&str> {
+            let nodes = self.json["nodes"].as_array();
+            let mut names: Vec<&str> = nodes
+                .into_iter()
+                .flatten()
+                .filter(|n| n["mesh"].is_u64())
+                .map(|n| n["name"].as_str().unwrap())
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// The base color of the material on the node called `name`'s mesh.
+        fn base_of(&self, name: &str) -> Option<([u8; 3], u8)> {
+            let nodes = self.json["nodes"].as_array().unwrap();
+            let node = nodes.iter().find(|n| n["name"] == name).unwrap();
+            let mesh = &self.json["meshes"][node["mesh"].as_u64().unwrap() as usize];
+            let material = mesh["primitives"][0]["material"].as_u64().unwrap() as usize;
+            self.material(self.json["materials"][material]["name"].as_str().unwrap())
+                .base
+        }
+    }
+
+    /// What one run of the step gave.
+    struct Run {
+        glb: Converted,
+        warnings: Vec<SkippedEntry>,
     }
 
     /// Runs the step over the files of the pack `case` that `keep` takes, with the conversion
-    /// cache at `cache`, and returns `Model.glb`. `None` when there's no test Blender.
-    async fn convert_in(case: &str, keep: fn(&str) -> bool, cache: &Path) -> Option<Converted> {
+    /// cache at `cache`, and returns the GLB called `name`. `None` when there's no test Blender.
+    async fn run_in(case: &str, name: &str, keep: fn(&str) -> bool, cache: &Path) -> Option<Run> {
         let blender = test_blender()?;
         let staging = tempfile::tempdir().unwrap();
         let mut files = Vec::new();
@@ -140,9 +171,23 @@ mod tests {
             control: Arc::new(RunControl::default()),
             progress: Arc::new(|_| {}),
         };
-        conversion.run().await.unwrap();
-        let (json, bin) = glb(&staging.path().join("Model.glb"));
-        Some(Converted { json, bin })
+        let mut warnings = Vec::new();
+        conversion.run(&mut warnings).await.unwrap();
+        let (json, bin) = glb(&staging.path().join(name));
+        Some(Run {
+            glb: Converted { json, bin },
+            warnings,
+        })
+    }
+
+    async fn convert_in(case: &str, keep: fn(&str) -> bool, cache: &Path) -> Option<Converted> {
+        let run = run_in(case, "Model.glb", keep, cache).await?;
+        Some(run.glb)
+    }
+
+    /// `run_in` over the whole pack, with a cache of its own.
+    async fn run_named(case: &str, name: &str) -> Option<Run> {
+        run_in(case, name, |_| true, tempfile::tempdir().unwrap().path()).await
     }
 
     async fn convert_without(case: &str, keep: fn(&str) -> bool) -> Option<Converted> {
@@ -603,6 +648,120 @@ mod tests {
             let m = glb.material("M_Thing");
             assert!(is_tint(&m.factor) && glb.images() == 0, "{case}: {m:?}");
         }
+    }
+
+    /// Which of a pack's meshes `Model.glb` keeps, with no warning.
+    async fn kept(case: &str) -> Option<Vec<String>> {
+        let run = run_named(case, "Model.glb").await?;
+        assert_eq!(run.warnings, [], "{case}");
+        Some(run.glb.meshes().iter().map(|n| n.to_string()).collect())
+    }
+
+    /// LOD only: a model holding only `_LOD1` meshes keeps them, with no warning.
+    #[tokio::test]
+    async fn a_model_holding_only_lod1_meshes_keeps_them() {
+        let Some(meshes) = kept("lod-only").await else {
+            return;
+        };
+        assert_eq!(meshes, ["Model_LOD1"]);
+    }
+
+    /// Mixed LODs: each mesh keeps its own lowest level, whichever that is.
+    #[tokio::test]
+    async fn each_mesh_keeps_its_own_lowest_level() {
+        let Some(meshes) = kept("lod-mixed").await else {
+            return;
+        };
+        assert_eq!(meshes, ["A_LOD0", "B_LOD1", "C_LOD2"]);
+    }
+
+    /// No suffix: `Wall` is level 0, so `Wall_LOD1` goes, and `Roof` and `Roof_LOD0` are one level.
+    #[tokio::test]
+    async fn no_suffix_and_lod0_are_both_level_0() {
+        let Some(meshes) = kept("lod-no-suffix").await else {
+            return;
+        };
+        assert_eq!(meshes, ["Roof", "Roof_LOD0", "Wall"]);
+    }
+
+    /// Several at one level: every object at the group's lowest level stays.
+    #[tokio::test]
+    async fn every_object_at_the_lowest_level_stays() {
+        let Some(meshes) = kept("lod-several").await else {
+            return;
+        };
+        assert_eq!(meshes, ["X_LOD1.001", "X_LOD1.002"]);
+    }
+
+    /// LOD file: a file that is itself a LOD keeps all, its name's level and any other.
+    #[tokio::test]
+    async fn a_file_that_is_a_lod_keeps_all() {
+        let Some(run) = run_named("lod-file", "X_LOD1.glb").await else {
+            return;
+        };
+        assert_eq!(run.glb.meshes(), ["X_LOD1", "X_LOD2"]);
+        assert_eq!(run.warnings, []);
+    }
+
+    /// The GLB in `cache`, with its modified time, so a second run can't pass by converting.
+    fn cached(cache: &Path) -> (PathBuf, std::time::SystemTime) {
+        let mut glbs = std::fs::read_dir(cache.join("glb")).unwrap();
+        let glb = glbs.next().unwrap().unwrap();
+        assert!(glbs.next().is_none());
+        (glb.path(), glb.metadata().unwrap().modified().unwrap())
+    }
+
+    /// No mesh, and No mesh, cache hit: a model left with only collision meshes warns, naming
+    /// its source path, on the run that converts it and on the one that finds it in the cache.
+    #[tokio::test]
+    async fn a_model_left_with_no_mesh_warns_on_every_run() {
+        let cache = tempfile::tempdir().unwrap();
+        let Some(first) = run_in("no-mesh", "Model.glb", |_| true, cache.path()).await else {
+            return;
+        };
+        let warning = SkippedEntry {
+            source_path: vec!["Model.obj".to_string()],
+            reason: SkipReason::NoMesh,
+        };
+        assert_eq!(first.glb.meshes(), Vec::<&str>::new());
+        assert_eq!(first.warnings, std::slice::from_ref(&warning));
+        let was = cached(cache.path());
+        let second = run_in("no-mesh", "Model.glb", |_| true, cache.path())
+            .await
+            .unwrap();
+        assert_eq!(cached(cache.path()), was, "the second run read the cache");
+        assert_eq!(second.warnings, [warning]);
+    }
+
+    /// Collider file: a model named as a collider is the known gap, and stays silent on the run
+    /// that converts it and on the one that finds it in the cache.
+    #[tokio::test]
+    async fn a_model_named_as_a_collider_stays_silent_on_every_run() {
+        let cache = tempfile::tempdir().unwrap();
+        let name = "rock_collider.glb";
+        let Some(first) = run_in("collider-file", name, |_| true, cache.path()).await else {
+            return;
+        };
+        assert_eq!(first.glb.meshes(), Vec::<&str>::new());
+        assert_eq!(first.warnings, []);
+        let was = cached(cache.path());
+        let second = run_in("collider-file", name, |_| true, cache.path())
+            .await
+            .unwrap();
+        assert_eq!(cached(cache.path()), was, "the second run read the cache");
+        assert_eq!(second.warnings, []);
+    }
+
+    /// Exact name: `Plane.099` and `Plane.100` each find their own prefab's material through the
+    /// exact names their `.meta` maps, which `Plane` isn't.
+    #[tokio::test]
+    async fn an_object_named_exactly_in_a_meta_finds_its_own_material() {
+        let Some(run) = run_named("exact-name", "Model.glb").await else {
+            return;
+        };
+        assert_eq!(run.glb.meshes(), ["Plane.099", "Plane.100"]);
+        assert!(is(run.glb.base_of("Plane.099"), BASE));
+        assert!(is(run.glb.base_of("Plane.100"), OTHER_BASE));
     }
 
     /// A byte order mark doesn't hide a graph's names.

@@ -1,0 +1,19 @@
+mtllib Model.mtl
+o X_LOD1.001
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl Imported
+f 1/1 2/2 3/3
+o X_LOD1.002
+v 3 0 0
+v 4 0 0
+v 3 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl Imported
+f 4/4 5/5 6/6

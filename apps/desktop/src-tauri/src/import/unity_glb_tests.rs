@@ -18,7 +18,9 @@ pub(super) mod tests {
     use crate::import::drift;
     use crate::import::engine::tests::{setup, whole_pass, Setup, TARGET};
     use crate::import::engine::*;
+    use crate::import::unity_glb::tests::glb_of;
     use crate::import::unitypackage::tests::fixture;
+    use crate::import::unitypackage::{SkipReason, SkippedEntry};
     use crate::preview::WorkerRequest;
 
     /// The synthetic package's prefix to every source path.
@@ -1037,6 +1039,63 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
             s.passes(&rebuild.id, "converting"),
             [whole_pass(models as u64)]
         );
+    }
+
+    /// A model left with no mesh reaches the run's warnings on every run that places its GLB: a
+    /// retry after another model failed the step, with its GLB from the cache, and a Rebuild with
+    /// unchanged inputs, with both from it.
+    #[tokio::test]
+    async fn an_empty_glb_warns_on_a_retry_and_on_a_rebuild_from_the_cache() {
+        let s = setup().await;
+        let dir = s.cache.path();
+        let (empty, full) = (dir.join("empty.glb"), dir.join("full.glb"));
+        glb_of(&empty, r#"{"asset":{"version":"2.0"}}"#);
+        glb_of(&full, r#"{"meshes":[{"primitives":[]}]}"#);
+        let version = crate::import::unity_glb::UNITY_GLB_VERSION;
+        let first = json!({"version": version, "models": [
+            {"model": "One/Empty.obj", "ok": true},
+            {"model": "Two/Full.obj", "ok": false, "error": "no"},
+        ]});
+        let retry = json!({"version": version, "models": [
+            {"model": "Two/Full.obj", "ok": true},
+        ]});
+        let log = dir.join("conversions.log");
+        s.stub_blender(&format!(
+            "for last; do :; done\nwork=$(dirname \"$last\")\n\
+             if [ -e '{log}' ]; then\n\
+             cp '{full}' \"$work/out/0.glb\"\nprintf '%s' '{retry}' > \"$last\"\n\
+             else\n\
+             cp '{empty}' \"$work/out/0.glb\"\nprintf '%s' '{first}' > \"$last\"\n\
+             fi\necho run >> '{log}'",
+            log = log.display(),
+            full = full.display(),
+            empty = empty.display(),
+        ))
+        .await;
+        let originals = tempfile::tempdir().unwrap();
+        let obj = b"o Thing\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+        let zip = zip_of(
+            originals.path(),
+            "models.zip",
+            &[("One/Empty.obj", obj), ("Two/Full.obj", obj)],
+        );
+        let (pack_id, failed) = s.import_zip_then_convert(&zip, "failed").await;
+        assert!(failed.error.unwrap().contains("Two/Full.obj"));
+
+        let warned = [SkippedEntry {
+            source_path: vec!["One/Empty.obj".into()],
+            reason: SkipReason::NoMesh,
+        }];
+        for conversions in [2, 2] {
+            let run = s
+                .engine
+                .rebuild_pack("lib", &pack_id, Vec::new())
+                .await
+                .unwrap();
+            let run = s.wait_for(&run.id, "done").await;
+            assert_eq!(run.warnings, warned);
+            assert_eq!(runs(&log), conversions);
+        }
     }
 
     /// A result from another version of the script, one that leaves a model out, and a model

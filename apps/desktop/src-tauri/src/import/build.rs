@@ -446,7 +446,7 @@ impl Plan {
 
 /// Builds pack `pack_id`, queued at `queued_rev` with the drift choices `chosen`: its first
 /// build, or a rebuild over the committed one. Fills `warnings` with the entries the extraction
-/// skipped.
+/// skipped and the models the conversion left with no mesh.
 pub async fn build(
     env: &BuildEnv<'_>,
     pack_id: &str,
@@ -972,7 +972,7 @@ async fn stage(
             control: env.control.clone(),
             progress: env.progress.clone(),
         }
-        .run()
+        .run(warnings)
         .await?;
         let generated = models
             .into_iter()

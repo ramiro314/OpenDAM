@@ -1,0 +1,46 @@
+mtllib Model.mtl
+o A_LOD0
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl Imported
+f 1/1 2/2 3/3
+o A_LOD1
+v 3 0 0
+v 4 0 0
+v 3 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl Imported
+f 4/4 5/5 6/6
+o B_LOD1
+v 6 0 0
+v 7 0 0
+v 6 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl Imported
+f 7/7 8/8 9/9
+o C_LOD3
+v 9 0 0
+v 10 0 0
+v 9 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl Imported
+f 10/10 11/11 12/12
+o C_LOD2
+v 12 0 0
+v 13 0 0
+v 12 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl Imported
+f 13/13 14/14 15/15

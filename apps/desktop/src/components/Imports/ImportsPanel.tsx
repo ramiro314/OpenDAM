@@ -13,6 +13,7 @@ import {
   progressText,
   skippedText,
   useImportStore,
+  warningsHeading,
   type PackRow,
 } from '../../store/imports';
 import { IconInbox, IconX } from '../Icons';
@@ -115,11 +116,7 @@ function Pack({ row, libraryId }: { row: PackRow; libraryId: string }) {
       )}
       {run && run.warnings.length > 0 && (
         <details className={styles.details}>
-          <summary>
-            {run.warnings.length === 1
-              ? '1 entry of the original was skipped'
-              : `${run.warnings.length} entries of the original were skipped`}
-          </summary>
+          <summary>{warningsHeading(run.warnings.length)}</summary>
           <ul>
             {run.warnings.map((w, i) => (
               <li key={i}>{skippedText(w)}</li>

@@ -113,7 +113,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               cap in settings (import.blenderMemoryMax), and cached in
                               ~/.cache/opendam/import/glb by a key over every input's source
                               path, final name and sha256 (and, with binary Unity files,
-                              unity_text.py's VERSION and the locked UnityPy), and unreal_glb, the
+                              unity_text.py's VERSION and the locked UnityPy). Each mesh keeps its
+                              own lowest `_LOD<n>`, and every placed GLB, new or cached, is read
+                              so one with no mesh warns on every run (`SkipReason::NoMesh`),
+                              unless its model is named as a collider, and unreal_glb, the
                               export_unreal step: a zip's content-only Unreal project (refused
                               with a Source/ folder) unzipped to a work copy with its plugins
                               enabled there only, exported to GLBs by the embedded

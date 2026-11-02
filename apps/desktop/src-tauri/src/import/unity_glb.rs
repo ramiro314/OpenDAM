@@ -19,6 +19,9 @@
 //!   **inputs hash** (`inputs_hash`), and for a pack holding binary Unity files, the converter's
 //!   version (`converter_version`), so a rebuild that only moved files between folders runs no
 //!   Blender at all, and one that dropped, renamed or changed an input converts again.
+//! - **A model left with no mesh.** Its empty GLB is still written and cached, so the step reads
+//!   each GLB it places, new or cached, and warns of an empty one on every run, unless the
+//!   model's file name is a collider's (`is_collider`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -29,6 +32,7 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 
 use super::build::{Progress, ProgressSink, RunControl, Stop};
+use super::unitypackage::{SkipReason, SkippedEntry};
 use crate::capped;
 use crate::export::blender::{self, Blender};
 use crate::export::hashes::sha256_bytes;
@@ -75,6 +79,16 @@ const UNITY_EXTENSIONS: [&str; 6] = ["meta", "mat", "prefab", "unity", "shadergr
 /// The Unity files the script reads as text that Unity 4 and 5 could also write in their binary
 /// serialization.
 const SERIALIZED_EXTENSIONS: [&str; 3] = ["mat", "prefab", "unity"];
+/// A collision mesh's name starts with one of these or ends with one of `COLLIDER_SUFFIXES`,
+/// lowercased: the terms of the script's `COLLISION_RE`, which a test keeps equal.
+const COLLIDER_PREFIXES: [&str; 1] = ["ucx_"];
+const COLLIDER_SUFFIXES: [&str; 5] = [
+    "_convexhull",
+    "_convexhulls",
+    "_collider",
+    "_colliders",
+    "_collision",
+];
 
 /// The step's options. `force` converts every model again, whatever the cache holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +292,38 @@ pub fn is_input(path: &str) -> bool {
             .iter()
             .any(|set| set.contains(&ext.as_str()))
     })
+}
+
+/// Whether the file at `path` is named as a collider: its meshes are all the script drops, so
+/// its empty GLB is the known collider gap, not something to warn of.
+fn is_collider(path: &str) -> bool {
+    let name = stem(split(path).1).to_lowercase();
+    COLLIDER_PREFIXES.iter().any(|p| name.starts_with(p))
+        || COLLIDER_SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+/// How many meshes the GLB at `path` holds, from its JSON chunk, the first, alone: the rest of a
+/// GLB can run to hundreds of MB.
+fn mesh_count(path: &Path) -> Result<usize, String> {
+    use std::io::Read;
+    #[derive(Deserialize)]
+    struct Gltf {
+        #[serde(default)]
+        meshes: Vec<serde::de::IgnoredAny>,
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut head = [0u8; 20];
+    file.read_exact(&mut head).map_err(|e| e.to_string())?;
+    if &head[..4] != b"glTF" || &head[16..] != b"JSON" {
+        return Err("it doesn't start with a JSON chunk".into());
+    }
+    let len = u32::from_le_bytes(head[12..16].try_into().unwrap());
+    let mut json = Vec::new();
+    file.take(len as u64)
+        .read_to_end(&mut json)
+        .map_err(|e| e.to_string())?;
+    let gltf: Gltf = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
+    Ok(gltf.meshes.len())
 }
 
 /// An input as the inputs hash reads it: a staged file Blender reads, and for a `.meta`, the
@@ -499,8 +545,9 @@ impl Conversion<'_> {
     }
 
     /// Writes each model's GLB into the staging folder, from the cache or from Blender, and
-    /// returns the models that got one. A model Blender fails on fails the step, naming it.
-    pub async fn run(&self) -> Result<Vec<Model>, Stop> {
+    /// returns the models that got one, adding to `warnings` each that holds no mesh. A model
+    /// Blender fails on fails the step, naming it.
+    pub async fn run(&self, warnings: &mut Vec<SkippedEntry>) -> Result<Vec<Model>, Stop> {
         let models = models(self.files);
         if models.is_empty() {
             return Ok(models);
@@ -561,14 +608,25 @@ impl Conversion<'_> {
         self.cancelled()?;
 
         let (staging, placed) = (self.staging.to_path_buf(), keyed.clone());
-        blocking(move || {
+        let empty = blocking(move || {
+            let mut empty = Vec::new();
             for (model, cached) in &placed {
-                std::fs::copy(cached, staging.join(&model.glb))
+                let glb = staging.join(&model.glb);
+                std::fs::copy(cached, &glb)
                     .map_err(|e| format!("Could not write {}: {e}", model.glb))?;
+                match mesh_count(&glb) {
+                    Ok(0) if !is_collider(&model.path) => empty.push(SkippedEntry {
+                        source_path: model.source_path.clone(),
+                        reason: SkipReason::NoMesh,
+                    }),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("Could not read {}: {e}", model.glb),
+                }
             }
-            Ok(())
+            Ok(empty)
         })
         .await?;
+        warnings.extend(empty);
         // Cached GLBs print nothing, and a Blender line may not have come.
         (self.progress)(Progress {
             step: "converting",
@@ -900,6 +958,90 @@ pub(crate) mod tests {
                 "the script reads .{ext}, which isn't copied"
             );
         }
+    }
+
+    /// Every term of the script's `COLLISION_RE` is one of Rust's, and the other way round.
+    #[test]
+    fn rust_keeps_the_terms_of_the_script_s_collision_re() {
+        let regex = SCRIPT
+            .split_once("COLLISION_RE = re.compile(\n    r\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .expect("the script declares COLLISION_RE")
+            .0;
+        let terms: Vec<&str> = regex.split('|').collect();
+        let prefixes: Vec<&str> = terms.iter().filter_map(|t| t.strip_prefix('^')).collect();
+        let suffixes: Vec<&str> = terms.iter().filter_map(|t| t.strip_suffix('$')).collect();
+        assert_eq!(prefixes, COLLIDER_PREFIXES);
+        assert_eq!(suffixes, COLLIDER_SUFFIXES);
+        assert_eq!(terms.len(), prefixes.len() + suffixes.len(), "{regex}");
+        for term in terms {
+            assert!(
+                term.trim_matches(['^', '$'])
+                    .bytes()
+                    .all(|b| b == b'_' || b.is_ascii_lowercase()),
+                "a term of plain letters: {term}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_collider_s_file_name_matches_as_the_script_matches_a_mesh_s() {
+        for path in [
+            "UCX_Rock.obj",
+            "Props/ucx_rock.fbx",
+            "Rock_ConvexHull.fbx",
+            "Rock_ConvexHulls.fbx",
+            "rock_collider.obj",
+            "Rock_COLLIDERS.obj",
+            "Rock_Collision.fbx",
+        ] {
+            assert!(is_collider(path), "{path}");
+        }
+        for path in [
+            "Rock.obj",
+            "SM_UCX_Rock.obj",
+            "Rock_Collider_LOD1.obj",
+            "Rock_Collisions.obj",
+            "rock_collider/Rock.obj",
+            "Rock_ConvexHull.Old.fbx",
+        ] {
+            assert!(!is_collider(path), "{path}");
+        }
+    }
+
+    /// A GLB of `json`'s JSON chunk, then a binary chunk the reader never reaches.
+    pub(crate) fn glb_of(path: &Path, json: &str) {
+        let mut bytes = b"glTF\x02\0\0\0\0\0\0\0".to_vec();
+        bytes.extend((json.len() as u32).to_le_bytes());
+        bytes.extend(b"JSON");
+        bytes.extend(json.as_bytes());
+        bytes.extend(b"\0\0\0\0BIN\0");
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_glb_s_meshes_are_counted_from_its_json_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.glb");
+        for (json, want) in [
+            (r#"{"asset":{"version":"2.0"}}"#, 0),
+            (r#"{"meshes":[]}  "#, 0),
+            (
+                r#"{"meshes":[{"name":"a","primitives":[]},{}],"nodes":[{}]}"#,
+                2,
+            ),
+        ] {
+            glb_of(&path, json);
+            assert_eq!(mesh_count(&path), Ok(want), "{json}");
+        }
+        std::fs::write(&path, "glTF").unwrap();
+        assert!(mesh_count(&path).is_err());
+        glb_of(&path, "{");
+        assert!(mesh_count(&path).is_err());
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[16..20].copy_from_slice(b"BIN\0");
+        std::fs::write(&path, bytes).unwrap();
+        assert!(mesh_count(&path).is_err());
     }
 
     #[test]
