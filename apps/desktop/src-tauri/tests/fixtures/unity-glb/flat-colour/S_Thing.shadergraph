@@ -17,5 +17,6 @@
     "m_Type": "UnityEditor.ShaderGraph.Internal.ColorShaderProperty",
     "m_Name": "BaseColor Value",
     "m_DefaultReferenceName": "Color_a",
-    "m_OverrideReferenceName": ""
+    "m_OverrideReferenceName": "",
+    "m_ColorMode": 0
 }

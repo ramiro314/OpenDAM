@@ -109,7 +109,7 @@ Problems the trial didn't show:
 | Topic | Decision |
 |---|---|
 | Texture source | Shader Graph display names only, with no filename rule |
-| Blank materials | Twin lookup, `MI_X` uses `M_X`. Flat colours stay flat and read `BaseColor Value` |
+| Blank materials | Twin lookup, `MI_X` uses `M_X`. Flat colours stay flat, read `BaseColor Value` and are written linear |
 | One-texture materials | Its only texture is its base, narrowly |
 | Exact names | Try the raw object and mesh name first |
 | Layered materials | First layer by name (A), no tints |
@@ -340,8 +340,10 @@ deviations.
   With the watcher change above, it gets a fresh preview. A byte-identical GLB keeps its mtime and
   queues nothing.
 - Expect most GLBs to change. In the prototype 157 of Ancient Ruins' 184 changed bytes though only
-  19 gained a texture, so a Rebuild after a bump requeues most of a pack's previews. Why the
-  other bytes changed wasn't traced.
+  19 gained a texture, so a Rebuild after a bump requeues most of a pack's previews. The other
+  bytes are image names: Blender names each glTF image after its scratch file, which `Scratch`
+  numbers by a counter, so a model's GLB changes when an earlier model uses more or fewer textures.
+  Its binary chunk stays the same, and so does its render.
 - In-app renames and excludes are recipe steps, so they survive. Kept files carry as before.
 - Nothing flags a pack as built by an older converter. A version bump means you Rebuild. Old
   cache entries stay until Clear in Settings' Import tools.
@@ -435,6 +437,8 @@ through `OPENDAM_BLENDER`, which CI's test job sets up.
 | Twin over colours | `MI_X` with colours only, textured `M_X` | `M_X`'s texture |
 | True flat colour | `MI_Y` with colours only, `M_Y` missing or untextured | `MI_Y`'s colour, no texture |
 | Flat colour | `BaseColor Value` only | That colour, no texture |
+| HDR colour | A graph's HDR colour, and a colour past 1 | As stored, not converted |
+| Empty slot | A slot no face uses, then the used one, and a prefab listing one material | That material on the used slot |
 | Only texture | `_Grid` alone | Base texture |
 | Generated slot | `_SampleTexture2D_..._Texture_1` alone | No base |
 | Lone mask | Lone `Texture2D_x` shown as `OpacityMap` | Cutout over the flat colour, not a base |
@@ -524,6 +528,76 @@ The rules:
   `T_Brown.png` say too large. A finished run's row shows its final figures.
 - **Piece 4:** Wizard Room shows 39 items. A rename keeps each `_LOD<n>`. U11 and U12 still pass.
 
+### Piece 1 result
+
+`opendam-unity-glb/5` was measured on 2026-11-02 in a clean throwaway profile
+(`apps/desktop/scripts/import-trial/run.sh`, folder `~/.local/share/opendam-import-v5-trial-2`):
+
+- **Runs.** All 11 ended `done`, with no error and no warning.
+- **`glb_audit.py compare`.** It passed. Every pack matches its GLB count with no unmatched GLB, no
+  map is lost, 389 GLBs gained full textures, and the only geometry changes are `SM_Bulidings.glb`
+  and `SM_Grass_Foliage.glb`, with the expected figures.
+- **Floors.** Every pack landed on its floor, with Medieval Houses at 384 of 386, except The Big
+  Castle Kit, which passed its floor of 257 with 263. The floors stay as they are.
+- **Rebuild.** Ancient Ruins in `rebuild-2/`, a fresh copy of `before/`, with the real UI, after
+  tagging and renaming one changed and one identical GLB. Rows, ids, tags and both renames
+  survived. All 171 changed GLBs took a new thumbnail file and their old one is gone. The 13
+  identical GLBs kept theirs and their mtime. It is 171, not the prototype's 157, because the
+  renames move models in the conversion's order, which renumbers later models' image names.
+  `rebuild/` holds a Rebuild from before the two fixes below, so don't reuse it.
+
+Review of that Rebuild's sheet found two converter bugs, which version 5 fixes, and neither changes
+a map's count:
+
+- **Flat colours were too pale.** `SM_Tree_1_Leaves` went near-white once rule 5 read its real
+  `BaseColor Value`. Unity stores a colour as sRGB, and the script wrote it straight into glTF's
+  linear factor. Colours are now converted, unless HDR, which Unity keeps linear. The audit can't
+  see this: both the pale GLB and the fixed one count as textured.
+- **A prefab's material could land on an empty slot.** The owner chose on 2026-11-02 to fix this
+  in version 5 rather than in a later version. The list counts Unity's submeshes, so it now skips
+  a slot no face uses. Six Big Castle GLBs gained their texture, and five `wall_outer_*_deco` GLBs
+  moved from the wrong map to `wall_outer_deco`. No other pack's slots changed.
+
+Each GLB under its pack's full count, by the list below. A GLB can use several of these materials,
+so a pack's lines can add up to more than its leftover GLBs:
+
+| Pack | GLBs | Reason | Materials, GLBs |
+|---|---|---|---|
+| Medieval Houses | 2 | Doubled import, see below | `M_Medieval_Environment_Default_01` 2 |
+| Ancient Ruins | 8 | Water | `M_Fountain_Water`, `M_Fountain_Water_Ripple`, `M_Fountain_Water_Splash`, `M_Water_Exterior`, 1 each |
+| | | Flat colour | `M_Tiny_Rocks` 3, `M_Grass` 1 |
+| Elven Long Bow | 1 | OBJ with no `.mtl` or prefab | `Arrow`, no material |
+| Fantasy Adventure | 10 | Slot no Unity file resolves | `lambert1` 3, 4 billboards 1 each, `VegetationAtlas1` 1 |
+| | | Water | `FAE_WaterCreek` 1 |
+| | | Collider-only | `FAE_Tree_Colliders` 1 |
+| Spooky Cemetery Crypt | 1 | Flat colour | `M_Grass_A` 1 |
+| Stylized Elven Valley | 9 | Flames and water | `M_Flame_01` 4, `MI_VFX_Water_Splash`, `M_Fountain_Water_Ripple`, `M_Water`, 1 each |
+| | | Flat colour | `M_LanternEmissive` 1 |
+| | | Slot no Unity file resolves | `M_Seagull` 1: no `.meta` in the pack holds its `_Base_Color` GUID |
+| Stylized Lost Cave | 10 | Flames, water and foam | `M_Flame_a` 1, `M_Flame_b` 2, `M_Flame_c` 2, `M_Water` 2, `M_FoamVolumetric`, `M_WaterfallFoam`, `M_WaterfallTop`, 1 each |
+| Stylized Village | 23 | Flat colour | `M_Emissive` 16, `MI_Emissive` 3, `M_Jug_Glass` 1 |
+| | | Clouds and water | 5 `M_Cloud_*` 1 each, `M_Water_03` 1 |
+| Stylized Wizard Room | 18 | OBJ with no `.mtl` or prefab | `SM_Walls2`, `SM_Books3_2` and their LODs, 12 |
+| | | Flat colour | `M_BasicFill` 6 |
+| POLYGON Prototype | 41 | Flat colour | `Generic_Glass_Opaque` 11, `Generic_Mountains` 3, `FX_GlowRing_01` 2, `Glass_01` 1 |
+| | | Clouds and water | `Generic_Cloud` 4, `Waterflow_01` 3, `Water_01` 2 |
+| | | Collider-only | 6 `*_Collision` models |
+| | | Hashed mesh IDs, see below | `SM_Bld_Base_Wall_Window_*`, 4 GLBs, 15 materials |
+| | | Slot no Unity file resolves | `lambert1683`, `lambert1997`, `lambert3` (particle meshes), `standardSurface1`, `Texture_01`, 1 each |
+| The Big Castle Kit | 30 | Flat colour | `showcase_plane` 1 |
+| | | Collider-only | 13 `*_collider` models, no material |
+| | | Slot no Unity file resolves | `Material.001` 2, `Material.002` 2, and 12 GLBs with a mesh that has no material and that no prefab fills, or whose prefab names a `.mat` the pack lacks |
+
+The list below doesn't cover two of these. The owner accepted them as recorded on 2026-11-02, with
+`M_Seagull`:
+
+- **Medieval Houses' 2.** Both copies' `SM_Plane_01` use one GUID, whose first file by path is
+  the Built-In `.mat`: generated names on the Standard shader, so no graph. The Outcome table
+  expects this until Piece 2 lands only the URP copy.
+- **Four Synty window walls have a Unity file.** Their prefabs list each mesh's materials, by file
+  IDs Unity hashes from the mesh's name. The `.meta` doesn't name them, and the one-list fallback
+  can't apply to two meshes with two lists.
+
 ### Leftovers
 
 Every GLB under its pack's full count must be explained by one of these:
@@ -605,6 +679,10 @@ reading the gate report. Piece 4 can land before or after.
 - **Collider-only models stay as grid items.** They make empty GLBs and failed previews (7 in the
   Synty and Fantasy Adventure samples).
 - **Models with no `.mtl` and no prefab stay untextured**, as do slots no Unity file resolves.
+- **Hashed mesh IDs aren't read.** Four Synty window walls stay untextured though their prefabs
+  list their materials (Piece 1 result).
+- **Conversions aren't byte-stable.** A GLB's image names follow a counter, so a rename or a
+  texture change in one model changes later models' bytes and requeues their previews.
 - **Mask-only foliage has flat RGB.** It counts as textured but has no colour detail.
 - **The audit can't see a wrong map.** It counts maps, so a role bound to the wrong texture only
   shows in the visual check.

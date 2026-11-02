@@ -55,11 +55,13 @@ docs/plans/pack-import/plan.md R43-R46, record each with its cost):
   has `mtllib` lines naming copies of the pack's first `.mtl` of each name, dropping one the
   pack has no file of that name for.
 
-What this adds to its heuristics (docs/plans/import-material-fixes/plan.md, Piece 1):
+What version 5 adds to its heuristics (docs/plans/import-material-fixes/plan.md, Piece 1):
 
 - Each role looks at the property's raw name, then at its display name in the `.shadergraph` the
   material's `m_Shader` names, which is how generated names like `Texture2D_27f0...` are read.
-  Colors read display names too.
+  Colors read display names too, and `BaseColor Value` comes before any other. Unity stores a
+  color as sRGB and glTF wants it linear, so each is converted, unless it is HDR, which Unity
+  keeps linear: its graph says so, or a channel is past 1.
 - A base color with neither takes the material's only texture (`UnityMaterial.only_texture`).
 - An opacity mask applies with no base color too, over the flat color.
 - A blank slot named `MI_X` uses `M_X` when that material has textures (`twin_material`).
@@ -70,6 +72,7 @@ What this adds to its heuristics (docs/plans/import-material-fixes/plan.md, Piec
   lose the mesh's transform or skin.
 - A prefab's mesh is looked up by the object's and the mesh's exact names first, since a `.meta`
   can name `Plane.099`, and only then without Blender's numeric suffix.
+- A renderer's material list counts Unity's submeshes, so it skips a slot no face uses.
 
 A model left with no mesh still writes its GLB. OpenDAM reads each GLB it places and warns of an
 empty one, on every run, since this script only sees uncached models.
@@ -88,7 +91,7 @@ import bpy
 
 # OpenDAM records it with each GLB and keys its cache by it: `import::unity_glb::UNITY_GLB_VERSION`,
 # which a test keeps equal. Bump both when the GLBs this writes change.
-VERSION = "opendam-unity-glb/4"
+VERSION = "opendam-unity-glb/5"
 
 # Property names are matched lowercased, without underscores: `_Base_Map` is `basemap`.
 BASE_PROPS = ["basemap", "maintex", "basecolormap", "mainbasemap", "base", "albedo", "albedomap",
@@ -222,15 +225,17 @@ def is_base(name: str) -> bool:
     return any(h in name for h in BASE_HINTS) and not any(n in name for n in NOT_BASE)
 
 
-GRAPHS: dict[Path, dict[str, str]] = {}
+GRAPHS: dict[Path, tuple[dict[str, str], set[str]]] = {}
 
 
-def graph_names(path: Path) -> dict[str, str]:
-    """A Shader Graph's property references -> display names, cached per file. The file is a stream
-    of JSON objects, one per property among others. One that can't be read, or an older graph,
-    which is one object holding its properties as escaped text, gives none."""
+def graph_properties(path: Path) -> tuple[dict[str, str], set[str]]:
+    """A Shader Graph's property references -> display names, and the references of its HDR colors,
+    cached per file. The file is a stream of JSON objects, one per property among others. One that
+    can't be read, or an older graph, which is one object holding its properties as escaped text,
+    gives none."""
     if path not in GRAPHS:
         names: dict[str, str] = {}
+        hdr: set[str] = set()
         decoder = json.JSONDecoder()
         try:
             text = path.read_text(errors="replace").lstrip("\ufeff")
@@ -244,10 +249,20 @@ def graph_names(path: Path) -> dict[str, str]:
                     name = found.get("m_Name")
                     if ref and name and isinstance(ref, str) and isinstance(name, str):
                         names[ref] = name
+                        if found.get("m_ColorMode") == 1:
+                            hdr.add(ref)
         except (OSError, ValueError, RecursionError):
-            names = {}
-        GRAPHS[path] = names
+            names, hdr = {}, set()
+        GRAPHS[path] = names, hdr
     return GRAPHS[path]
+
+
+def linear(color: tuple[float, ...]) -> tuple[float, ...]:
+    """An sRGB color, as Unity stores one, as the linear color glTF wants. Alpha stays."""
+    def channel(c: float) -> float:
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    return (*map(channel, color[:3]), *color[3:])
 
 
 class UnityMaterial:
@@ -260,7 +275,8 @@ class UnityMaterial:
         self.name = name.group(1).strip() if name else path.stem
         shader = re.search(r"m_Shader: \{fileID: -?\d+,\s*guid: ([0-9a-f]{32})", block)
         graph = guids.get(shader.group(1)) if shader else None
-        names = graph_names(graph) if graph and graph.suffix.lower() == ".shadergraph" else {}
+        is_graph = graph and graph.suffix.lower() == ".shadergraph"
+        names, hdr = graph_properties(graph) if is_graph else ({}, set())
         self.textures: dict[str, Path] = {}
         # (display name, texture), sorted, so `A_BaseColor` wins over `B_BaseColor`.
         self.display: list[tuple[str, Path]] = []
@@ -276,7 +292,9 @@ class UnityMaterial:
         for prop, r, g, b, a in re.findall(
             r"- (\w+): \{r: ([-\d.e]+), g: ([-\d.e]+), b: ([-\d.e]+), a: ([-\d.e]+)\}", text
         ):
-            colors.setdefault(prop, tuple(float(v) for v in (r, g, b, a)))
+            color = tuple(float(v) for v in (r, g, b, a))
+            # Unity keeps an HDR color linear. A shader with no graph only shows one past 1.
+            colors.setdefault(prop, color if prop in hdr or max(color[:3]) > 1 else linear(color))
         self.colors: dict[str, tuple[float, ...]] = {}
         for prop, color in colors.items():
             self.colors.setdefault(norm(prop), color)
@@ -578,11 +596,15 @@ def convert(model: Path, target: Path, guids, by_mesh, by_name, images, mtls, ma
         if not obj.material_slots and not guids_for_obj:
             if named_material([name, model.stem], images):
                 obj.data.materials.append(None)
+        # Unity makes one submesh per slot that faces use, and a renderer lists those, in order.
+        submeshes = {slot: i for i, slot in enumerate(
+            sorted({face.material_index for face in obj.data.polygons}))}
         for i, slot in enumerate(obj.material_slots):
             total += 1
             um = None
-            if guids_for_obj and i < len(guids_for_obj) and guids_for_obj[i] in guids:
-                um = material_for(guids[guids_for_obj[i]], guids)
+            at = submeshes.get(i, len(guids_for_obj or []))
+            if guids_for_obj and at < len(guids_for_obj) and guids_for_obj[at] in guids:
+                um = material_for(guids[guids_for_obj[at]], guids)
             elif slot.material is not None:
                 slot_name = base_name(slot.material.name)
                 path = (guids.get(remap.get(slot_name, ""))

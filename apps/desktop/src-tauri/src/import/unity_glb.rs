@@ -42,7 +42,7 @@ use crate::structure::split_lod;
 
 /// The script's version, which every GLB's cache key holds. The script declares it as
 /// `VERSION`, which a test keeps equal: bump both when the GLBs it writes change.
-pub const UNITY_GLB_VERSION: &str = "opendam-unity-glb/4";
+pub const UNITY_GLB_VERSION: &str = "opendam-unity-glb/5";
 
 /// The version of the preview engine's `unity_text.py`, which writes binary Unity files as text.
 /// It declares it as `VERSION`, which a test keeps equal: bump both when the text it writes
