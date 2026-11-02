@@ -1,9 +1,14 @@
+[1]
+
 {
     "m_SGVersion": 3,
     "m_Type": "UnityEditor.ShaderGraph.GraphData",
     "m_Properties": [
         {
             "m_Id": "Texture2D_x"
+        },
+        {
+            "m_Id": "Texture2D_y"
         }
     ]
 }
@@ -17,5 +22,12 @@
     "m_Type": "UnityEditor.ShaderGraph.Internal.Texture2DShaderProperty",
     "m_Name": 7,
     "m_DefaultReferenceName": "Texture2D_x",
+    "m_OverrideReferenceName": ""
+}
+
+{
+    "m_Type": "UnityEditor.ShaderGraph.Internal.Texture2DShaderProperty",
+    "m_Name": "Other",
+    "m_DefaultReferenceName": [1],
     "m_OverrideReferenceName": ""
 }

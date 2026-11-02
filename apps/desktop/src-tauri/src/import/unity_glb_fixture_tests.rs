@@ -249,6 +249,35 @@ mod tests {
         assert!(is(glb.material("M_Thing").normal, NORMAL));
     }
 
+    /// `Second Normal` sorts first but isn't the normal map, as `Detail Map Normal` isn't.
+    #[tokio::test]
+    async fn a_second_normal_is_not_the_normal_map() {
+        let Some(glb) = convert("second-normal").await else {
+            return;
+        };
+        assert!(is(glb.material("M_Thing").normal, NORMAL));
+    }
+
+    /// The plural is a normal map too.
+    #[tokio::test]
+    async fn normals_is_a_normal_word() {
+        let Some(glb) = convert("normals-word").await else {
+            return;
+        };
+        assert!(is(glb.material("M_Thing").normal, NORMAL));
+    }
+
+    /// `Opacity` is an opacity word, as `Alpha` is.
+    #[tokio::test]
+    async fn opacity_is_an_opacity_word() {
+        let Some(glb) = convert("opacity-word").await else {
+            return;
+        };
+        let m = glb.material("M_Thing");
+        assert_eq!(m.alpha_mode.as_deref(), Some("MASK"), "{m:?}");
+        assert!(is(m.base, BASE) && m.base.unwrap().1 == 0, "{m:?}");
+    }
+
     /// Mask only: an `OpacityMap` and a colour, no base: a cutout, with the colour as its factor.
     #[tokio::test]
     async fn a_mask_with_no_base_cuts_out_over_the_flat_colour() {
@@ -344,6 +373,7 @@ mod tests {
         for case in [
             "blank-twin",
             "twin-no-mat",
+            "twin-lower-case",
             "twin-over-colours",
             "twin-from-prefab",
         ] {
@@ -410,10 +440,49 @@ mod tests {
         assert!(is_tint(&m.factor) && m.base.is_none(), "{m:?}");
     }
 
+    /// A raw colour name beats a display name of the same word.
+    #[tokio::test]
+    async fn a_raw_colour_comes_before_a_display_name() {
+        let Some(glb) = convert("raw-colour-first").await else {
+            return;
+        };
+        let m = glb.material("M_Thing");
+        assert!(is_tint(&m.factor), "{m:?}");
+    }
+
+    /// Of two colours whose display names read the same, the one that sorts first wins.
+    #[tokio::test]
+    async fn colours_read_their_display_names_in_order() {
+        let Some(glb) = convert("colour-sort").await else {
+            return;
+        };
+        let m = glb.material("M_Thing");
+        assert!(is_tint(&m.factor), "{m:?}");
+    }
+
     /// Only texture: `_Grid` alone is the base.
     #[tokio::test]
     async fn a_material_s_only_texture_is_its_base() {
         let Some(glb) = convert("only-texture").await else {
+            return;
+        };
+        assert!(is(glb.material("M_Thing").base, BASE));
+    }
+
+    /// Two textures nothing claims: neither is the only texture, so the flat colour stays.
+    #[tokio::test]
+    async fn two_unclaimed_textures_leave_the_flat_colour() {
+        let Some(glb) = convert("two-textures").await else {
+            return;
+        };
+        let m = glb.material("M_Thing");
+        assert!(is_tint(&m.factor) && m.base.is_none(), "{m:?}");
+    }
+
+    /// A lone `Texture2D_x` with a neutral display name is the material's only texture.
+    #[tokio::test]
+    async fn a_lone_generated_name_with_a_display_name_is_the_base() {
+        let Some(glb) = convert("lone-neutral").await else {
             return;
         };
         assert!(is(glb.material("M_Thing").base, BASE));
@@ -479,8 +548,9 @@ mod tests {
     }
 
     /// Lone, graph missing: with no display name a lone `Texture2D_x` stays unresolved, so even
-    /// its mask is lost, as today. The same goes for an older graph, an unreadable one and a
-    /// property with a name that isn't a string.
+    /// its mask is lost, as today. The same goes for an older graph, an unreadable one, one with
+    /// names or references that aren't strings, and one that names it only in a keyword, which
+    /// is no property.
     #[tokio::test]
     async fn a_lone_generated_name_with_no_display_name_stays_unresolved() {
         let Some(glb) = convert_without("lone-mask", |n| !is_graph(n)).await else {
@@ -489,13 +559,27 @@ mod tests {
         let m = glb.material("M_Thing");
         assert!(m.alpha_mode.is_none() && is_tint(&m.factor), "{m:?}");
         assert_eq!(glb.images(), 0, "{m:?}");
-        for case in ["older-graph", "unreadable-graph", "odd-graph"] {
+        for case in [
+            "older-graph",
+            "unreadable-graph",
+            "odd-graph",
+            "keyword-graph",
+        ] {
             let Some(glb) = convert(case).await else {
                 return;
             };
             let m = glb.material("M_Thing");
             assert!(is_tint(&m.factor) && glb.images() == 0, "{case}: {m:?}");
         }
+    }
+
+    /// A byte order mark doesn't hide a graph's names.
+    #[tokio::test]
+    async fn a_graph_with_a_byte_order_mark_is_read() {
+        let Some(glb) = convert("bom-graph").await else {
+            return;
+        };
+        assert!(is(glb.material("M_Thing").base, BASE));
     }
 
     /// Raw names stay first: `_BaseMap` and `_Normal` keep their textures, though the graph shows

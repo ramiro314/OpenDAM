@@ -249,6 +249,29 @@ def main() -> None:
         },
     )
 
+    # `Second Normal` sorts first but isn't the normal map.
+    pack = Pack("second-normal", ["M_Thing"])
+    graph_material(
+        pack,
+        {
+            "Texture2D_a": ("A_BaseColor", BASE),
+            "Texture2D_b": ("Second Normal", OTHER_BASE),
+            "Texture2D_c": ("Stone Normal", NORMAL),
+        },
+    )
+
+    pack = Pack("normals-word", ["M_Thing"])
+    graph_material(
+        pack,
+        {"Texture2D_a": ("A_BaseColor", BASE), "Texture2D_b": ("Stone Normals", NORMAL)},
+    )
+
+    pack = Pack("opacity-word", ["M_Thing"])
+    graph_material(
+        pack,
+        {"Texture2D_a": ("A_BaseColor", BASE), "Texture2D_b": ("Opacity", MASK)},
+    )
+
     pack = Pack("mask-only", ["M_Thing"])
     graph_material(
         pack,
@@ -324,6 +347,9 @@ def main() -> None:
     pack = Pack("twin-no-mat", ["MI_Wall"])
     pack.material("M_Wall", {"_BaseMap": pack.texture("T_Wall", BASE)})
 
+    pack = Pack("twin-lower-case", ["mi_wall"])
+    pack.material("M_Wall", {"_BaseMap": pack.texture("T_Wall", BASE)})
+
     pack = Pack("twin-over-colours", ["MI_Wall"])
     pack.material("MI_Wall", colors={"_BaseColor": TINT})
     pack.material("M_Wall", {"_BaseMap": pack.texture("T_Wall", BASE)})
@@ -377,8 +403,30 @@ def main() -> None:
     colors = {"Color_a": TINT, "_BaseColor": GREY, "_Color": GREY}
     pack.material("M_Thing", colors=colors, shader=shader)
 
+    # `_Color` is raw, so it beats a display name of the same word.
+    pack = Pack("raw-colour-first", ["M_Thing"])
+    shader = pack.graph("S_Thing", stream({"Color_a": "Color"}))
+    pack.material("M_Thing", colors={"Color_a": GREY, "_Color": TINT}, shader=shader)
+
+    # Both display names read the same, and the one that sorts first wins, not the first property.
+    pack = Pack("colour-sort", ["M_Thing"])
+    shader = pack.graph("S_Thing", stream({"Color_a": "BaseColor", "Color_b": "Base Color"}))
+    pack.material("M_Thing", colors={"Color_a": GREY, "Color_b": TINT}, shader=shader)
+
     pack = Pack("only-texture", ["M_Thing"])
     pack.material("M_Thing", {"_Grid": pack.texture("T_Grid", BASE)})
+
+    # Two textures nothing claims: there's no only texture, so the colour stays.
+    pack = Pack("two-textures", ["M_Thing"])
+    pack.material(
+        "M_Thing",
+        {"_Grid": pack.texture("T_Grid", BASE), "_Other": pack.texture("T_Other", OTHER_BASE)},
+        {"_Color": TINT},
+    )
+
+    # A generated name with a display name is no generated name: it's the material's only texture.
+    pack = Pack("lone-neutral", ["M_Thing"])
+    graph_material(pack, {"Texture2D_x": ("Grid", BASE)}, {"_Color": TINT})
 
     pack = Pack("generated-slot", ["M_Thing"])
     pack.material(
@@ -408,6 +456,11 @@ def main() -> None:
     pack = Pack("lone-arm", ["M_Thing"])
     pack.material("M_Thing", {"_ARM": pack.texture("T_Arm", ORM)}, {"_Color": TINT})
 
+    # A byte order mark doesn't make a graph unreadable.
+    pack = Pack("bom-graph", ["M_Thing"])
+    shader = pack.graph("S_Thing", "\ufeff" + stream({"Texture2D_x": "A_BaseColor"}))
+    pack.material("M_Thing", {"Texture2D_x": pack.texture("T_Base", BASE)}, shader=shader)
+
     # `_BaseMap` and `_Normal` are found by their raw names, whatever the graph shows.
     pack = Pack("raw-first", ["M_Thing"])
     shader = pack.graph(
@@ -432,9 +485,18 @@ def main() -> None:
         shader=shader,
     )
 
-    # A name that isn't a string, among properties that read well.
-    good = stream({"Texture2D_x": "A_BaseColor"})
-    odd_graph = good.replace('"m_Name": "A_BaseColor"', '"m_Name": 7')
+    # Not an object, a name that isn't a string, and a reference that isn't, among properties
+    # that read well.
+    good = stream({"Texture2D_x": "A_BaseColor", "Texture2D_y": "Other"})
+    odd_graph = "[1]\n\n" + good.replace('"m_Name": "A_BaseColor"', '"m_Name": 7').replace(
+        '"m_DefaultReferenceName": "Texture2D_y"', '"m_DefaultReferenceName": [1]'
+    )
+    # A keyword has a name and a reference too, but is no property.
+    keyword = {
+        "m_Type": "UnityEditor.ShaderGraph.ShaderKeyword",
+        "m_Name": "A_BaseColor",
+        "m_DefaultReferenceName": "Texture2D_x",
+    }
 
     # None of these graphs gives a name, even the one that reads well up to its last object, so
     # each lone texture stays unresolved.
@@ -443,6 +505,7 @@ def main() -> None:
         ("older-graph", older({"Texture2D_x": "A_BaseColor"})),
         ("unreadable-graph", cut_short),
         ("odd-graph", odd_graph),
+        ("keyword-graph", json.dumps(keyword)),
     ):
         pack = Pack(name, ["M_Thing"])
         shader = pack.graph("S_Thing", text)
