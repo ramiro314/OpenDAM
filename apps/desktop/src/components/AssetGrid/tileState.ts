@@ -1,4 +1,4 @@
-import type { Asset } from '../../types';
+import type { Asset, Cover } from '../../types';
 import { isWebviewDisplayable } from '../../utils/media';
 
 /**
@@ -12,6 +12,14 @@ type TileAsset = Pick<
   Asset,
   'bundledPreview' | 'fallbackRender' | 'thumbnailPath' | 'filePath' | 'extension' | 'kind'
 >;
+
+/** A pack's cover as the asset it is, for `tileMedia`. */
+export const coverAsset = (cover: Cover) => ({
+  ...cover,
+  thumbnailPath: cover.thumbnailPath ?? undefined,
+  bundledPreview: cover.bundledPreview ?? undefined,
+  fallbackRender: cover.fallbackRender ?? undefined,
+});
 
 /** The image media in the order a tile tries them. */
 const ORDER: TileMedia[] = ['bundled', 'thumbnail', 'fallback', 'original'];

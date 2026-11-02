@@ -47,6 +47,7 @@ import {
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { api } from '../../api';
 import { imageOf } from '../../utils/media';
+import { coverAsset } from '../AssetGrid/tileState';
 import { formatSize, itemFileCount } from '../../utils/format';
 import { useImageScaling } from '../../hooks/useImageScaling';
 import { useBrowseView } from '../../hooks/useBrowseView';
@@ -442,9 +443,11 @@ export function DetailPanel() {
 }
 
 // ── Pack ──────────────────────────────────────────────────────────────────
-/** The image that stands for a cover, as `imageOf` picks it for an asset. */
-const coverImage = (cover: Cover) =>
-  imageOf({ ...cover, thumbnailPath: cover.thumbnailPath ?? undefined });
+/** The image that stands for a cover: as `imageOf` picks it for an asset, or a model's render. */
+const coverImage = (cover: Cover) => {
+  const asset = coverAsset(cover);
+  return asset.bundledPreview ?? imageOf(asset) ?? asset.fallbackRender;
+};
 
 /**
  * A pack's details (plan C18, plan pack-metadata-files C12): its cover, or the gallery image

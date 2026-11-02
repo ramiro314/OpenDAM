@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { type TileMedia, tileImage, tileMedia, tileState } from './tileState';
+import { type TileMedia, coverAsset, tileImage, tileMedia, tileState } from './tileState';
 
 const png = { kind: 'texture' as const, filePath: '/lib/rock.png', extension: 'png' };
 const thumbnailed = { ...png, thumbnailPath: '/lib/.opendam/thumbs/a_thumb.png' };
@@ -96,6 +96,30 @@ describe('tileMedia', () => {
     expect(tileMedia(thumbnailed, { failed: 'thumbnail' })).toBe('original');
     expect(tileMedia(thumbnailed, { failed: 'original' })).toBe('none');
     expect(tileMedia({ ...tga, thumbnailPath: '/t.png' }, { failed: 'thumbnail' })).toBe('none');
+  });
+});
+
+describe('coverAsset', () => {
+  const cover = { ...model, assetId: 'a', thumbnailPath: null };
+
+  test("a model cover shows its render, as the model's own tile does", () => {
+    const render = '/lib/Previews/ship.png';
+    const bundled = coverAsset({ ...cover, bundledPreview: render, fallbackRender: null });
+    expect(tileMedia(bundled)).toBe('bundled');
+    expect(tileImage(bundled, 'bundled')).toBe(render);
+    const small = coverAsset({ ...cover, bundledPreview: null, fallbackRender: render });
+    expect(tileMedia(small)).toBe('fallback');
+    expect(tileImage(small, 'fallback')).toBe(render);
+  });
+
+  test('a model cover with no render and no thumbnail yet shows the icon', () => {
+    const none = { ...cover, bundledPreview: null, fallbackRender: null };
+    expect(tileMedia(coverAsset(none))).toBe('none');
+    expect(tileMedia(coverAsset({ ...none, thumbnailPath: '/lib/t.glb' }))).toBe('none');
+  });
+
+  test('an arriving thumbnail replaces the icon', () => {
+    expect(tileMedia(coverAsset({ ...cover, thumbnailPath: '/lib/t.png' }))).toBe('thumbnail');
   });
 });
 

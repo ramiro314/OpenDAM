@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tauri::{Emitter, State};
 
-use crate::commands::asset::folder_range;
+use crate::commands::asset::{folder_range, render_columns};
 use crate::db::{resolve_path, upsert_collection, upsert_tag, Database, LibraryHandle};
 use crate::export::packs::Origin;
 use crate::export::textures::Convention;
@@ -13,43 +13,60 @@ use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
 
-/// A pack's cover image, with what a card needs to show it as a grid tile shows an asset.
+/// A pack's cover image or model, with what a card needs to show it as a grid tile shows an asset.
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Cover {
+    pub asset_id: String,
     /// Absolute
     pub file_path: String,
-    /// Absolute, when the image has a thumbnail
+    /// Absolute, when the file has a thumbnail
     pub thumbnail_path: Option<String>,
     pub extension: String,
     pub kind: String,
+    /// Absolute, a model's render that fits a card, as an asset's `bundled_preview`
+    pub bundled_preview: Option<String>,
+    /// Absolute, a model's render too small to fit one, as an asset's `fallback_render`
+    pub fallback_render: Option<String>,
 }
 
 /// The columns a cover is read from: its `folders` row `f` joined to the cover's asset row `c`
 /// (`COVER_JOIN`), on the unique `file_path` index.
-const COVER_COLUMNS: &str = "c.file_path AS cover_path, c.thumbnail_path AS cover_thumbnail,
-    c.extension AS cover_extension, c.kind AS cover_kind";
+fn cover_columns() -> String {
+    format!(
+        "c.id AS cover_id, c.file_path AS cover_path, c.thumbnail_path AS cover_thumbnail,
+    c.extension AS cover_extension, c.kind AS cover_kind, {}",
+        render_columns("c")
+    )
+}
 const COVER_JOIN: &str = "LEFT JOIN assets c ON c.file_path = json_extract(f.pack_json, '$.cover')";
 /// Joins a `folders` row `f` to your override of it `o`, for its mark and name.
 const MARK_JOIN: &str = "LEFT JOIN pack_overrides o ON o.path = f.path";
 
-/// A cover's columns, as `COVER_COLUMNS` names them.
-#[derive(sqlx::FromRow)]
+/// A cover's columns, as `cover_columns` names them.
+#[derive(Clone, sqlx::FromRow)]
 struct CoverRow {
+    cover_id: Option<String>,
     cover_path: Option<String>,
     cover_thumbnail: Option<String>,
     cover_extension: Option<String>,
     cover_kind: Option<String>,
+    bundled_preview: Option<String>,
+    fallback_render: Option<String>,
 }
 
 impl CoverRow {
     /// The cover with its paths made absolute below `root`, if the pack has one.
     fn into_cover(self, root: &Path) -> Option<Cover> {
+        let resolve = |path: Option<String>| path.map(|p| resolve_path(root, &p));
         Some(Cover {
+            asset_id: self.cover_id.unwrap_or_default(),
             file_path: resolve_path(root, &self.cover_path?),
-            thumbnail_path: self.cover_thumbnail.map(|t| resolve_path(root, &t)),
+            thumbnail_path: resolve(self.cover_thumbnail),
             extension: self.cover_extension.unwrap_or_default(),
             kind: self.cover_kind.unwrap_or_default(),
+            bundled_preview: resolve(self.bundled_preview),
+            fallback_render: resolve(self.fallback_render),
         })
     }
 }
@@ -141,12 +158,13 @@ pub(crate) async fn child_folders(
                 EXISTS (
                     SELECT 1 FROM folders k WHERE k.parent_path = f.path AND {}
                 ) AS has_visible_children,
-                {COVER_COLUMNS}, o.mark, CASE WHEN f.is_pack THEN o.name END AS renamed
+                {}, o.mark, CASE WHEN f.is_pack THEN o.name END AS renamed
          FROM folders f {COVER_JOIN} {MARK_JOIN}
          WHERE f.parent_path = ?
          ORDER BY f.name COLLATE NOCASE, f.path",
         shown_without_hidden("f"),
         shown_without_hidden("k"),
+        cover_columns(),
     );
     let rows: Vec<NodeRow> = sqlx::query_as(&sql)
         .bind(parent_path.trim_matches('/'))
@@ -259,9 +277,10 @@ pub(crate) async fn packs_below(
     let sql = format!(
         "SELECT f.path, f.parent_path, f.name AS folder_name,
                 json_extract(f.pack_json, '$.name') AS pack_name,
-                f.item_count, f.hidden_count, {COVER_COLUMNS}, o.mark
+                f.item_count, f.hidden_count, {}, o.mark
          FROM folders f {COVER_JOIN} {MARK_JOIN}
-         WHERE f.is_pack AND {below}"
+         WHERE f.is_pack AND {below}",
+        cover_columns(),
     );
     let mut cards = Vec::new();
     for library in libraries {
@@ -416,10 +435,10 @@ pub(crate) async fn pack_holding(
         .chain(&info.gallery)
         .map(String::as_str)
         .collect();
-    let covers: Vec<(String, Option<String>, String, String)> = sqlx::query_as(
-        "SELECT file_path, thumbnail_path, extension, kind FROM assets
-         WHERE file_path IN (SELECT value FROM json_each(?))",
-    )
+    let covers: Vec<CoverRow> = sqlx::query_as(&format!(
+        "SELECT {} FROM assets c WHERE c.file_path IN (SELECT value FROM json_each(?))",
+        cover_columns(),
+    ))
     .bind(serde_json::to_string(&images).expect("paths serialize"))
     .fetch_all(&library.pool)
     .await?;
@@ -430,13 +449,9 @@ pub(crate) async fn pack_holding(
     let cover_of = |path: &str| {
         covers
             .iter()
-            .find(|(p, ..)| p == path)
-            .map(|(p, thumbnail, extension, kind)| Cover {
-                file_path: resolve_path(root, p),
-                thumbnail_path: thumbnail.as_deref().map(|t| resolve_path(root, t)),
-                extension: extension.clone(),
-                kind: kind.clone(),
-            })
+            .find(|row| row.cover_path.as_deref() == Some(path))
+            .cloned()
+            .and_then(|row| row.into_cover(root))
     };
 
     Ok(Some(PackDetail {
@@ -1205,10 +1220,13 @@ mod tests {
         assert_eq!(
             car.cover,
             Some(Cover {
+                asset_id: "3D assets/Car Kit/Preview.png".into(),
                 file_path: "/libraries/a/3D assets/Car Kit/Preview.png".into(),
                 thumbnail_path: None,
                 extension: "png".into(),
                 kind: "texture".into(),
+                bundled_preview: None,
+                fallback_render: None,
             })
         );
         // The first image stands in when the pack has no preview or sample.
@@ -1309,6 +1327,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_model_cover_carries_its_render_on_the_card_the_node_and_the_panel() {
+        let library = library_handle(
+            "a",
+            &["kit/License.txt", "kit/sedan.glb", "kit/Previews/sedan.png"],
+        )
+        .await;
+        let covers = || async {
+            let libraries = std::slice::from_ref(&library);
+            let card = packs_below(libraries, "", false).await.unwrap().remove(0);
+            let node = child_folders(&library.pool, &library.root_path, "")
+                .await
+                .unwrap()
+                .remove(0);
+            let panel = pack_holding(&library, "kit").await.unwrap().unwrap();
+            let covers = [card.cover, node.cover, panel.cover].map(Option::unwrap);
+            assert!(covers.iter().all(|c| *c == covers[0]));
+            let [cover, ..] = covers;
+            (cover.asset_id.clone(), cover)
+        };
+        let render = Some("/libraries/a/kit/Previews/sedan.png".to_string());
+
+        // Too small to fit a card, or of unknown size, it waits behind the model's thumbnail.
+        let (id, cover) = covers().await;
+        assert_eq!(id, "kit/sedan.glb");
+        assert_eq!(cover.file_path, "/libraries/a/kit/sedan.glb");
+        assert_eq!(cover.thumbnail_path, None);
+        assert_eq!(
+            (cover.bundled_preview, cover.fallback_render),
+            (None, render.clone())
+        );
+
+        // One that fits pictures the model, which then has no thumbnail of its own.
+        sqlx::query(
+            "UPDATE assets SET render_width = 512, render_height = 512
+             WHERE file_path = 'kit/Previews/sedan.png'",
+        )
+        .execute(&library.pool)
+        .await
+        .unwrap();
+        let (_, cover) = covers().await;
+        assert_eq!(
+            (cover.bundled_preview, cover.fallback_render),
+            (render, None)
+        );
+    }
+
+    #[tokio::test]
     async fn a_packs_detail_is_found_from_the_pack_or_any_folder_inside_it() {
         let library = library_handle(
             "a",
@@ -1340,10 +1405,13 @@ mod tests {
         .unwrap();
 
         let image = |path: &str, thumbnail: Option<&str>| Cover {
+            asset_id: path.into(),
             file_path: format!("/libraries/a/{path}"),
             thumbnail_path: thumbnail.map(|t| format!("/libraries/a/{t}")),
             extension: "png".into(),
             kind: "texture".into(),
+            bundled_preview: None,
+            fallback_render: None,
         };
         let detail = pack_holding(&library, "3D assets/Car Kit").await.unwrap();
         assert_eq!(

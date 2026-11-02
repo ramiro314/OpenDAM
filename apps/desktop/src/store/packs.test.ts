@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { api } from '../api';
-import type { PackCard } from '../types';
+import type { Cover, PackCard } from '../types';
 import { scopeKey, type PacksScope } from '../utils/packsView';
-import { packKey, usePacksStore } from './packs';
+import { coverWithPreview, packKey, usePacksStore } from './packs';
 
 const realGetPacks = api.getPacks;
 
@@ -24,7 +24,61 @@ afterEach(() => {
   usePacksStore.setState({ key: null, scope: null, packs: null, selected: null, mode: 'packs' });
 });
 
+const model: Cover = {
+  assetId: 'm1',
+  filePath: '/lib/kit/rock.glb',
+  extension: 'glb',
+  kind: '3d_model',
+};
+
+describe('coverWithPreview', () => {
+  const thumb = '/lib/.opendam/thumbs/m1_thumb.png';
+
+  test("a cover takes its own asset's thumbnail, and no other's", () => {
+    const done = { assetId: 'm1', thumbnailPath: thumb };
+    expect(coverWithPreview(model, done).thumbnailPath).toBe(thumb);
+    expect(coverWithPreview(model, { ...done, assetId: 'm2' })).toBe(model);
+  });
+
+  test('a cover that changes nothing stays the same object', () => {
+    const cover = { ...model, thumbnailPath: thumb };
+    expect(coverWithPreview(cover, { assetId: 'm1', thumbnailPath: thumb })).toBe(cover);
+  });
+
+  test("a model's render switches to the render's thumbnail, and back when it is cleared", () => {
+    const render = '/lib/kit/Previews/rock.png';
+    const renderThumb = '/lib/.opendam/thumbs/r1_thumb.png';
+    for (const field of ['bundledPreview', 'fallbackRender'] as const) {
+      const shown = { ...model, [field]: render };
+      const done = { assetId: 'r1', thumbnailPath: renderThumb, render: { filePath: render } };
+      const thumbed = coverWithPreview(shown, done);
+      expect(thumbed[field]).toBe(renderThumb);
+      const cleared = {
+        assetId: 'r1',
+        thumbnailPath: null,
+        render: { filePath: render, previousThumbnailPath: renderThumb },
+      };
+      expect(coverWithPreview(thumbed, cleared)[field]).toBe(render);
+    }
+  });
+});
+
 describe('usePacksStore', () => {
+  test('a finished preview reaches the card it covers, and only that card', () => {
+    const rock = { ...card('kit/rock'), cover: model };
+    const other = { ...card('kit/other'), cover: { ...model, assetId: 'm2' } };
+    usePacksStore.setState({ packs: [rock, other] });
+
+    store().applyPreview({ assetId: 'm1', thumbnailPath: '/thumb.png' });
+    expect(store().packs?.[0].cover?.thumbnailPath).toBe('/thumb.png');
+    expect(store().packs?.[1]).toBe(other);
+
+    // A preview that is no cover's leaves the list as it is, so no card renders again
+    const packs = store().packs;
+    store().applyPreview({ assetId: 'unrelated', thumbnailPath: '/other.png' });
+    expect(store().packs).toBe(packs);
+  });
+
   test('a failed load leaves no packs, so the node shows Assets', async () => {
     api.getPacks = async () => {
       throw new Error('Library kenney is not open');

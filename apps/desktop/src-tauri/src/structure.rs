@@ -99,8 +99,8 @@ pub struct PackInfo {
     pub name: String,
     /// The cover's path: the image you chose, while it is an image in the pack, else the
     /// `datapackage.json` image, on the same terms, else the first `Preview*` cover image, else
-    /// the first `Sample*` one, else the pack's first image, else its first visible file (a
-    /// model, whose thumbnail shows), each by path
+    /// the first `Sample*` one, else its largest model (`PackFiles::model`), else the pack's
+    /// first image, else its first visible file, each by path
     pub cover: Option<String>,
     /// Every cover image of the pack (its `Preview*` and `Sample*` images), by path
     #[serde(default)]
@@ -505,9 +505,10 @@ impl FileKind {
 ///    and the support files below it.
 /// 8. **Pack info** (C9): each pack's `datapackage.json`, which `read_package` reads, its cover,
 ///    which is the image you chose when it is still in the pack, else the file's `image` on the
-///    same terms, its gallery and license file, which `read_license` reads, its name, which is
-///    yours, else the file's `title`, else the license's header name, else the folder's, and the
-///    files below it by kind with their total size. The file's license `path` is kept as its
+///    same terms, else the files' own order (`PackFiles::cover`), its gallery and license file,
+///    which `read_license` reads, its name, which is yours, else the file's `title`, else the
+///    license's header name, else the folder's, and the files below it by kind with their total
+///    size. The file's license `path` is kept as its
 ///    license only when it names an indexed `txt`, `md` or `pdf` file in the pack, and the license
 ///    shown is the first entry with a `name`, a URL or such a file.
 ///
@@ -647,7 +648,7 @@ pub fn derive<'a>(
             }
         }
     }
-    let mut info = pack_files(&packs, &paths, &kinds, &roles, &groups);
+    let mut info = pack_files(&packs, &paths, &sizes, &kinds, &roles, &groups);
     let mut contents = pack_contents(&packs, &paths, &kinds, &sizes);
     let mut packages: HashMap<&str, PackageFile> = packs
         .iter()
@@ -826,11 +827,14 @@ fn bundled_previews(
     bundled
 }
 
-/// The files of one pack that its info is chosen from, each the first by path.
+/// The files of one pack that its info is chosen from, each the first by path but `model`.
 #[derive(Default)]
 struct PackFiles<'a> {
     preview: Option<&'a str>,
     sample: Option<&'a str>,
+    /// The biggest grid item that is a model taking a preview, with its size in bytes, ties by
+    /// path. A `.blend` takes none, so as a cover it could show only an icon.
+    model: Option<(i64, &'a str)>,
     image: Option<&'a str>,
     visible: Option<&'a str>,
     license: Option<&'a str>,
@@ -841,7 +845,11 @@ struct PackFiles<'a> {
 
 impl<'a> PackFiles<'a> {
     fn cover(&self) -> Option<&'a str> {
-        self.preview.or(self.sample).or(self.image).or(self.visible)
+        self.preview
+            .or(self.sample)
+            .or(self.model.map(|(_, path)| path))
+            .or(self.image)
+            .or(self.visible)
     }
 }
 
@@ -852,10 +860,18 @@ fn first<'a>(slot: &mut Option<&'a str>, path: &'a str) {
     }
 }
 
+/// Keeps the bigger of `slot` and `path`, the lesser path when their sizes tie.
+fn biggest<'a>(slot: &mut Option<(i64, &'a str)>, size: i64, path: &'a str) {
+    if slot.is_none_or(|(s, p)| size > s || (size == s && path < p)) {
+        *slot = Some((size, path));
+    }
+}
+
 /// The files each pack's info is chosen from. A file belongs to the innermost pack above it.
 fn pack_files<'a>(
     packs: &BTreeSet<&str>,
     paths: &[&'a str],
+    sizes: &[i64],
     kinds: &[FileKind],
     roles: &[Option<SupportRole>],
     groups: &[Option<usize>],
@@ -873,6 +889,9 @@ fn pack_files<'a>(
         // A grid item: a file on its own or a group's main item, never another member
         if role.is_none() && groups[i].is_none_or(|main| main == i) {
             first(&mut entry.visible, path);
+            if kind.is_model && crate::preview::needs_preview(&kind.ext) {
+                biggest(&mut entry.model, sizes[i], path);
+            }
         }
         if kind.is_image {
             first(&mut entry.image, path);
@@ -3695,7 +3714,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_packs_cover_is_its_first_preview_then_sample_then_image_then_visible_file() {
+    fn a_packs_cover_is_its_first_preview_then_sample_then_model_then_image_then_visible_file() {
         let cover = |paths: &[&str]| info(&derive(paths.iter().copied()), "kit").cover.clone();
         let base = [
             "kit/License.txt",
@@ -3703,12 +3722,21 @@ pub(crate) mod tests {
             "kit/Models/barrel.glb",
         ];
         let with = |extra: &[&'static str]| [&base[..], extra].concat();
-        // With no image, the first visible file: a model, whose thumbnail shows.
+        // With no preview or sample, a model, over any image; here two tie, so by path.
         assert_eq!(cover(&base).as_deref(), Some("kit/Models/barrel.glb"));
         assert_eq!(cover(&["kit/License.txt"]), None);
         assert_eq!(
             cover(&with(&["kit/Tiles/b.png", "kit/Tiles/a.png"])).as_deref(),
+            Some("kit/Models/barrel.glb")
+        );
+        // With no model, the first image, then the first visible file.
+        assert_eq!(
+            cover(&["kit/License.txt", "kit/Tiles/b.png", "kit/Tiles/a.png"]).as_deref(),
             Some("kit/Tiles/a.png")
+        );
+        assert_eq!(
+            cover(&["kit/License.txt", "kit/b.wav", "kit/a.wav"]).as_deref(),
+            Some("kit/a.wav")
         );
         assert_eq!(
             cover(&with(&[
@@ -3747,6 +3775,103 @@ pub(crate) mod tests {
         assert_eq!(
             cover(&with(&["kit/Sample.png", "kit/Sources/Preview.png"])).as_deref(),
             Some("kit/Sources/Preview.png")
+        );
+    }
+
+    /// The cover of a pack holding `files`, each a path and its size, with a license marking it.
+    fn sized_cover(files: &[(&'static str, i64)], overrides: &Overrides) -> Option<String> {
+        let structure = super::derive(
+            files.iter().copied().chain([("kit/License.txt", 1)]),
+            overrides,
+            &UnityMaterials::new(),
+            |_| LicenseText::default(),
+            |_| PackageMeta {
+                image: Some("kit/Art/hero.png".to_string()),
+                ..PackageMeta::default()
+            },
+            |_| None,
+        );
+        info(&structure, "kit").cover.clone()
+    }
+
+    #[test]
+    fn a_packs_largest_model_is_its_biggest_visible_model_item_by_size_ties_by_path() {
+        let none = Overrides::new();
+        // The biggest model, whatever its path or the size of an image or a sound
+        assert_eq!(
+            sized_cover(
+                &[
+                    ("kit/a.glb", 10),
+                    ("kit/z.glb", 30),
+                    ("kit/m.glb", 20),
+                    ("kit/huge.png", 900),
+                    ("kit/huge.wav", 900),
+                ],
+                &none
+            )
+            .as_deref(),
+            Some("kit/z.glb")
+        );
+        // Models that tie go by path.
+        assert_eq!(
+            sized_cover(
+                &[("kit/b.glb", 7), ("kit/a.glb", 7), ("kit/c.glb", 1)],
+                &none
+            )
+            .as_deref(),
+            Some("kit/a.glb")
+        );
+        // A group's main item, by its own size: a bigger member isn't a grid item.
+        assert_eq!(
+            sized_cover(
+                &[
+                    ("kit/rock.glb", 5),
+                    ("kit/rock.fbx", 500),
+                    ("kit/tree.glb", 9)
+                ],
+                &none
+            )
+            .as_deref(),
+            Some("kit/tree.glb")
+        );
+        // A model that takes no preview would stay an icon, so a smaller one or an image wins.
+        assert_eq!(
+            sized_cover(&[("kit/big.blend", 900), ("kit/rock.glb", 5)], &none).as_deref(),
+            Some("kit/rock.glb")
+        );
+        assert_eq!(
+            sized_cover(&[("kit/big.blend", 900), ("kit/tile.png", 5)], &none).as_deref(),
+            Some("kit/tile.png")
+        );
+        // A preview and a sample still beat the biggest model.
+        for image in ["kit/Preview.png", "kit/Sample.png"] {
+            assert_eq!(
+                sized_cover(&[("kit/rock.glb", 900), (image, 1)], &none).as_deref(),
+                Some(image)
+            );
+        }
+    }
+
+    #[test]
+    fn your_cover_and_the_datapackage_image_beat_the_largest_model() {
+        let package = [
+            ("kit/rock.glb", 900),
+            ("kit/Art/hero.png", 1),
+            ("kit/Art/mine.png", 1),
+            ("kit/datapackage.json", 1),
+        ];
+        assert_eq!(
+            sized_cover(&package, &Overrides::new()).as_deref(),
+            Some("kit/Art/hero.png")
+        );
+        let edit = PackOverride {
+            cover_path: Some("kit/Art/mine.png".to_string()),
+            ..PackOverride::default()
+        };
+        let overrides = Overrides::from([("kit".to_string(), edit)]);
+        assert_eq!(
+            sized_cover(&package, &overrides).as_deref(),
+            Some("kit/Art/mine.png")
         );
     }
 
