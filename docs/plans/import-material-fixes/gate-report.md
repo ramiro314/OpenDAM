@@ -7,9 +7,9 @@ Import pack dialog with its default steps and no typed hoist, and the app's own 
 drew every thumbnail. The driver is `apps/desktop/scripts/import-trial/` (`gate.js`, `run.sh` with
 `TRIAL_UI`, `gate_check.py`, `gate-sheets.sh`), and `floors.tsv` beside this report holds the floors.
 
-**The deletion stays on hold.** The owner's review rejected models in four packs and Waterways (see
-[The owner's review](#the-owners-review)), and LostRuins' missing mesh still needs a decision.
-Nothing here deleted, or touched, the old libraries.
+**The deletion stays on hold** until the owner answers every row of
+[Decisions that hold the deletion](#decisions-that-hold-the-deletion). Nothing here deleted, or
+touched, the old libraries.
 
 | Run | Result | What holds it |
 |---|---|---|
@@ -17,6 +17,25 @@ Nothing here deleted, or touched, the old libraries.
 | `LostRuins.zip`, Unreal route | **Hold** | `SM_column04` is missing with no warning, see below |
 | `Waterways.zip`, Unreal route | Checks **pass**, review **failed** | `SM_Fern_01` rejected |
 | Kenney build | **Pass** | Nothing |
+
+## Decisions that hold the deletion
+
+All are open. Each is the owner's to answer: accept the item as it is, or have it fixed first. A
+fix to rows 2 to 7 changes the Unity converter, so it needs a version bump, a Rebuild and a new
+11-pack gate run, and a floor may only rise from it, never fall. A fix to row 1 or 8 changes the
+Unreal export, and that pack runs again. The causes are in the sections linked.
+
+| # | Item | Decision needed | Accept means | Fix means |
+|---|---|---|---|---|
+| 1 | [`SM_column04`](#lostruins-unreal-route), 1 LostRuins mesh with no GLB | Accept it missing, or fix the export | The new library lacks this mesh | The export reads the zip's `Meshes/` folder, not only the registry. LostRuins runs again |
+| 2 | [POLYGON's lost tint](#all-11-packs), 162 GLBs white, were yellow | Accept the white, or fix the converter | They stay white, with their grid texture | `_Base_Color` applies over an only-texture base |
+| 3 | [Billboards](#the-owners-review), 15 Fantasy Adventure GLBs | Accept the crossed cards, or drop them | Trees keep the solid cards, as at version 4 | A billboard beside a real mesh is dropped, and the plan's expected geometry list grows |
+| 4 | [Branch cutouts](#the-owners-review), 3 Fantasy Adventure materials | Accept solid branches, or fix the rule | `FAE_WillowBranch`, `FAE_PalmBranch` and `FAE_PineBranch` stay solid | A cutout rule that also reads the shader |
+| 5 | [`tree_b`'s slots](#the-owners-review), Big Castle | Accept it, or have the swap proved and fixed | Bark on the cards, leaves on the tree | A prefab's list follows Unity's submesh order, and the reach is measured first |
+| 6 | [`ivy_a` and `grassPlane`](#the-owners-review), Big Castle | Accept them, or look for their materials | The white card and the sliver stay | The slots' materials are found, if any file holds them. The camera is a separate change |
+| 7 | [`SM_Books3_2` and `SM_Walls2`](#the-owners-review), 12 Wizard Room GLBs | Accept plain white, or allow a name rule | The plan's accepted gap stands | A narrow name rule for this pack, which the plan otherwise rejects |
+| 8 | [Ferns](#the-owners-review), 4 Waterways GLBs | Accept the blocky leaves, or trace them | They stay as they are | `MI_Fern_02`'s graph is read first, because the cause isn't known. Waterways runs again |
+| 9 | [Other colour changes](#all-11-packs): `SM_Frame`, `SM_Grass_A`, `SM_Plane_01` | Confirm them as intended | They are the plan's own fixes, and the review didn't mark them | Nothing to fix unless the owner rejects one |
 
 ## All 11 packs
 
@@ -146,7 +165,9 @@ to be recovered.
 all 657 packages under `Content/`, and every one is in the registry, so none is skipped the way
 `SM_column04` is. The 161 of an export type, 146 static meshes, 9 skeletal meshes and 6 animations,
 are exactly the 161 the export recorded, with none failed. `SM_Cylinder` and `Cylinder1` have no
-GLB and need none: both are `ObjectRedirector` packages to `SM_CylinderFog`, which exported.
+GLB and need none: both are `ObjectRedirector` packages to `SM_CylinderFog`, which exported. The
+census, `report/diag3/census.txt` in the gate's folder, is the only basis for this. It replaces an
+earlier comparison by name and folder, which covered only 147 packages.
 
 **Leftovers.** All 47 GLBs under the full count are explained. Each material was traced through
 its parents in the zip's `.uasset` files, and a GLB can use several:
