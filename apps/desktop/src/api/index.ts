@@ -149,11 +149,17 @@ export const api = {
   getPreviewProgress: () => invoke<PreviewProgress>('get_preview_progress'),
   listPendingModelThumbnails: (limit: number) =>
     invoke<PendingModelThumbnail[]>('list_pending_model_thumbnails', { limit }),
-  /** Sends the PNG as a raw body; returns the saved thumbnail's path and the asset's group. */
-  saveModelThumbnail: (assetId: string, png: Uint8Array) =>
-    invoke<SavedModelThumbnail>('save_model_thumbnail', png, { headers: { 'asset-id': assetId } }),
+  /**
+   * Sends the PNG as a raw body. Returns the saved thumbnail's path and the asset's group, or null
+   * when the model changed since `modifiedAt` and the render was dropped.
+   */
+  saveModelThumbnail: (assetId: string, modifiedAt: number, png: Uint8Array) =>
+    invoke<SavedModelThumbnail | null>('save_model_thumbnail', png, {
+      headers: { 'asset-id': assetId, 'modified-at': String(modifiedAt) },
+    }),
   /** Reports a render that failed; returns whether the asset moved to `error`. */
-  failModelThumbnail: (assetId: string) => invoke<boolean>('fail_model_thumbnail', { assetId }),
+  failModelThumbnail: (assetId: string, modifiedAt: number) =>
+    invoke<boolean>('fail_model_thumbnail', { assetId, modifiedAt }),
 
   // Reveal in file manager / open with default app
   revealInFileManager: (filePath: string) => invoke<void>('reveal_in_file_manager', { filePath }),

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { useGLTF } from '@react-three/drei';
 import { useAssetStore } from '../store';
-import { modelsToRender, onModelRendered, onPreviewDone } from './previewDone';
+import { modelsToRender, onModelRendered, onPreviewDone, renderKey } from './previewDone';
 
 const realWindow = globalThis.window;
 const model = '/lib/.opendam/thumbs/a_preview.glb';
@@ -83,15 +83,21 @@ describe('onModelRendered', () => {
 });
 
 describe('modelsToRender', () => {
-  const item = (assetId: string, generating: boolean) => ({
+  const item = (assetId: string, generating: boolean, modifiedAt = 1) => ({
     assetId,
     modelPath: `/lib/${assetId}.glb`,
     generating,
+    modifiedAt,
   });
 
   test('skips a failed first preview but never a model at generating', () => {
-    const skipped = new Set(['first', 'changed-again']);
+    const skipped = new Set([item('first', false), item('changed-again', true)].map(renderKey));
     const batch = [item('first', false), item('changed-again', true), item('new', false)];
     expect(modelsToRender(batch, skipped).map((m) => m.assetId)).toEqual(['changed-again', 'new']);
+  });
+
+  test('a first preview that failed gets a new try once its model changes', () => {
+    const skipped = new Set([renderKey(item('first', false, 1))]);
+    expect(modelsToRender([item('first', false, 2)], skipped)).toHaveLength(1);
   });
 });

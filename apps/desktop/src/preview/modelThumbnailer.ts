@@ -4,7 +4,7 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { api } from '../api';
 import { useAssetStore } from '../store';
-import { modelsToRender, onModelRendered } from './previewDone';
+import { modelsToRender, onModelRendered, renderKey } from './previewDone';
 
 const SIZE = 512;
 const BATCH = 20;
@@ -63,8 +63,8 @@ export function startModelThumbnailer(): () => void {
   }
 
   async function run() {
-    // Models that failed this session. A first preview's failure isn't recorded anywhere, so it's
-    // retried on next launch (`modelsToRender`).
+    // Renders that failed this session. A first preview's failure isn't recorded anywhere, so it's
+    // retried on next launch or when the model changes (`modelsToRender`).
     const skipped = new Set<string>();
 
     while (!stopped) {
@@ -77,25 +77,25 @@ export function startModelThumbnailer(): () => void {
         continue;
       }
 
-      for (const { assetId, modelPath } of batch) {
+      for (const item of batch) {
+        const { assetId, modelPath, modifiedAt } = item;
         if (stopped) return;
         try {
-          await onModelRendered(
-            assetId,
-            await api.saveModelThumbnail(assetId, await render(modelPath))
-          );
+          const png = await render(modelPath);
+          const saved = await api.saveModelThumbnail(assetId, modifiedAt, png);
+          if (saved) await onModelRendered(assetId, saved);
         } catch (err) {
           // A lost context or a stop mid-render says nothing about the model; retry later.
           if (stopped || renderer.getContext().isContextLost()) return;
           console.warn(`3D thumbnail failed for ${modelPath}:`, err);
           // A changed model becomes an error, which Regenerate retries. A report that didn't get
           // through leaves it `generating`, so it is tried again, after a pause.
-          const reported = await api.failModelThumbnail(assetId).catch(async () => {
+          const reported = await api.failModelThumbnail(assetId, modifiedAt).catch(async () => {
             await sleep(IDLE_POLL_MS);
             return false;
           });
           if (reported) await useAssetStore.getState().refreshAssets([assetId]);
-          else skipped.add(assetId);
+          else skipped.add(renderKey(item));
         }
       }
     }

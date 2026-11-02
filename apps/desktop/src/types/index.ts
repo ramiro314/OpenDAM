@@ -347,6 +347,8 @@ export interface PendingModelThumbnail {
   modelPath: string;
   /** Keeps its old picture until this render */
   generating: boolean;
+  /** The token its render is saved or failed with */
+  modifiedAt: number;
 }
 
 /** What `save_model_thumbnail` stored */

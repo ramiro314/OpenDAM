@@ -37,10 +37,16 @@ export async function onModelRendered(assetId: string, saved: SavedModelThumbnai
   if (saved.groupId && saved.groupId !== assetId) await store.refreshAssets([saved.groupId]);
 }
 
+/** What `skipped` remembers a failed render by: a changed model's new GLB deserves a new try. */
+export function renderKey({ assetId, modifiedAt }: PendingModelThumbnail) {
+  return `${assetId}@${modifiedAt}`;
+}
+
 /**
- * The models to render now. `skipped` holds this session's failed first previews, whose rows can't
- * show that they failed. A model at `generating` is always tried: its failures leave that state.
+ * The models to render now. `skipped` holds this session's failed first previews (`renderKey`),
+ * whose rows can't show that they failed. A model at `generating` is always tried: its failures
+ * leave that state.
  */
 export function modelsToRender(batch: PendingModelThumbnail[], skipped: Set<string>) {
-  return batch.filter((item) => item.generating || !skipped.has(item.assetId));
+  return batch.filter((item) => item.generating || !skipped.has(renderKey(item)));
 }
