@@ -1498,6 +1498,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changed_file_that_takes_no_preview_keeps_the_thumbnail_it_has() {
+        for status in ["done", "error"] {
+            let (dir, db, lib) = temp_library().await;
+            let source = dir.path().join("ship.blend");
+            std::fs::write(&source, "v1").unwrap();
+            reindex(&db, &lib).await;
+            sqlx::query("UPDATE assets SET preview_status = ?, thumbnail_path = 'ship.png'")
+                .bind(status)
+                .execute(&lib.pool)
+                .await
+                .unwrap();
+
+            std::fs::write(&source, "version 2").unwrap();
+            reindex(&db, &lib).await;
+
+            assert_eq!(
+                preview_state(&lib.pool).await,
+                (Some("ship.png".into()), "done".into(), 0),
+                "from {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn changed_group_member_stays_off_the_queue_with_its_thumbnail() {
         let (dir, db, lib) = temp_library().await;
         let [glb, fbx, obj, tree] = write_grouped_kit(dir.path());

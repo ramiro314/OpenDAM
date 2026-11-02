@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::db::resolve_path;
 use crate::models::PreviewJob;
-use crate::preview::{save_model_render, AWAITING_RENDER};
+use crate::preview::{models_awaiting_render, save_model_render, AWAITING_RENDER};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -94,15 +94,9 @@ pub async fn list_pending_model_thumbnails(
 ) -> Result<Vec<PendingModelThumbnail>> {
     let mut pending = Vec::new();
     for lib in state.db.get_all_libraries().await {
-        let rows: Vec<(String, String)> = sqlx::query_as(&format!(
-            "SELECT id, CASE preview_status WHEN 'generating'
-                 THEN json_extract(metadata, '$.preview_model') ELSE thumbnail_path END
-             FROM assets WHERE {AWAITING_RENDER} LIMIT ?"
-        ))
-        .bind(limit - pending.len() as i64)
-        .fetch_all(&lib.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+        let rows = models_awaiting_render(&lib.pool, limit - pending.len() as i64)
+            .await
+            .map_err(|e| e.to_string())?;
 
         pending.extend(
             rows.into_iter()

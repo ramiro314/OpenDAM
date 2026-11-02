@@ -344,6 +344,23 @@ pub(crate) const ACTIVE_JOBS: &str = "('pending', 'queued', 'processing', 'fallb
 pub(crate) const AWAITING_RENDER: &str =
     "(thumbnail_path LIKE '%.glb' OR preview_status = 'generating')";
 
+/// Up to `limit` assets awaiting a render (`AWAITING_RENDER`), each as its id and its preview GLB,
+/// relative to the library root: `generating` keeps its old picture as its thumbnail, so its GLB
+/// is its `preview_model`.
+pub(crate) async fn models_awaiting_render(
+    pool: &Pool<Sqlite>,
+    limit: i64,
+) -> sqlx::Result<Vec<(String, String)>> {
+    sqlx::query_as(&format!(
+        "SELECT id, CASE preview_status WHEN 'generating'
+             THEN json_extract(metadata, '$.preview_model') ELSE thumbnail_path END
+         FROM assets WHERE {AWAITING_RENDER} LIMIT ?"
+    ))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// The assets with a waiting job.
 pub(crate) async fn assets_waiting_for_jobs(
     pool: &Pool<Sqlite>,
@@ -1686,16 +1703,18 @@ mod tests {
         );
     }
 
+    /// Where a model's job leaves asset `m1`'s GLB.
+    const GLB: &str = ".opendam/thumbs/m1_preview.glb";
+
     /// A model's job whose GLB is left to render, as `python_queue_round` finishes it.
     async fn finish_with_glb(pool: &Pool<Sqlite>, root: &Path, job: &str) -> PreviewDone {
-        let glb = ".opendam/thumbs/m1_preview.glb";
         complete_job(
             pool,
             root,
             job,
             "m1",
-            Some(glb.to_string()),
-            Some(root.join(glb).to_string_lossy().into_owned()),
+            Some(GLB.to_string()),
+            Some(root.join(GLB).to_string_lossy().into_owned()),
             &EngineReport::default(),
         )
         .await
@@ -1739,17 +1758,15 @@ mod tests {
             (Some(old.to_string()), "generating".to_string())
         );
         assert!(root.join(old).is_file());
-        let (model, awaiting): (String, i64) = sqlx::query_as(&format!(
-            "SELECT json_extract(metadata, '$.preview_model'), {AWAITING_RENDER} FROM assets"
-        ))
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(model, ".opendam/thumbs/m1_preview.glb");
-        assert_eq!(awaiting, 1, "the thumbnailer picks it up");
+        assert_eq!(
+            models_awaiting_render(&pool, 10).await.unwrap(),
+            [("m1".to_string(), GLB.to_string())],
+            "the thumbnailer renders the GLB, not the old picture"
+        );
 
         let new = save_model_render(&pool, root, "m1", b"new").await.unwrap();
 
+        assert_eq!(models_awaiting_render(&pool, 10).await.unwrap(), []);
         assert_ne!(new, old, "a new URL, so the webview loads the new picture");
         assert_eq!(
             thumb_and_status(&pool).await,
@@ -1759,9 +1776,10 @@ mod tests {
         assert!(!root.join(old).exists(), "the old picture goes with it");
     }
 
-    #[tokio::test]
-    async fn a_first_preview_still_holds_its_glb_as_the_thumbnail() {
+    /// A library holding only asset `m1`, a model waiting on its first preview.
+    async fn library_with_new_model() -> (tempfile::TempDir, Pool<Sqlite>) {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".opendam/thumbs")).unwrap();
         let pool = crate::db::memory_library_pool().await;
         sqlx::query(
             "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes,
@@ -1771,34 +1789,104 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        (dir, pool)
+    }
 
-        finish_with_glb(&pool, dir.path(), "j1").await;
+    /// The names in the library's `.opendam/thumbs`, sorted.
+    fn thumb_files(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root.join(".opendam/thumbs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn a_first_preview_holds_its_glb_until_its_render_replaces_it_and_keeps_the_file() {
+        let (dir, pool) = library_with_new_model().await;
+        let root = dir.path();
+        std::fs::write(root.join(GLB), "glb").unwrap();
+
+        finish_with_glb(&pool, root, "j1").await;
 
         assert_eq!(
             thumb_and_status(&pool).await,
-            (
-                Some(".opendam/thumbs/m1_preview.glb".to_string()),
-                "done".to_string()
-            )
+            (Some(GLB.to_string()), "done".to_string())
         );
+
+        let new = save_model_render(&pool, root, "m1", b"new").await.unwrap();
+
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(new), "done".to_string())
+        );
+        assert!(root.join(GLB).is_file(), "the 3D viewer still loads it");
+    }
+
+    #[tokio::test]
+    async fn a_second_render_replaces_the_first_by_a_new_name() {
+        let (dir, pool) = library_with_new_model().await;
+        let root = dir.path();
+
+        let first = save_model_render(&pool, root, "m1", b"one").await.unwrap();
+        let second = save_model_render(&pool, root, "m1", b"two").await.unwrap();
+
+        assert_ne!(first, second);
+        let (_, name) = second.rsplit_once('/').unwrap();
+        assert_eq!(thumb_files(root), [name], "the first render is deleted");
+        assert_eq!(std::fs::read(root.join(&second)).unwrap(), b"two");
+    }
+
+    /// The thumbnailer's selection gets a GLB by the row's state, not by whichever column is set:
+    /// here `m1` is a first preview and `m2` a re-render, with both columns telling them apart.
+    #[tokio::test]
+    async fn the_thumbnailer_gets_a_first_previews_thumbnail_and_a_re_renders_model() {
+        let pool = crate::db::memory_library_pool().await;
+        for (id, thumb, status, metadata) in [
+            ("m1", "held.glb", "done", r#"{"preview_model":"other.glb"}"#),
+            (
+                "m2",
+                "old.png",
+                "generating",
+                r#"{"preview_model":"new.glb"}"#,
+            ),
+            ("m3", "own.png", "done", r#"{"preview_model":"own.glb"}"#),
+        ] {
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes,
+                    modified_at, indexed_at, thumbnail_path, preview_status, metadata)
+                 VALUES (?1, ?1, ?1, 'glb', '3d_model', 1, 0, 0, ?2, ?3, ?4)",
+            )
+            .bind(id)
+            .bind(thumb)
+            .bind(status)
+            .bind(metadata)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let mut awaiting = models_awaiting_render(&pool, 10).await.unwrap();
+        awaiting.sort();
+
+        assert_eq!(
+            awaiting,
+            [
+                ("m1".to_string(), "held.glb".to_string()),
+                ("m2".to_string(), "new.glb".to_string()),
+            ]
+        );
+        assert_eq!(models_awaiting_render(&pool, 1).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn a_render_finishing_after_the_model_changed_leaves_it_pending() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join(".opendam/thumbs")).unwrap();
-        let pool = crate::db::memory_library_pool().await;
-        sqlx::query(
-            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes,
-                modified_at, indexed_at, preview_status)
-             VALUES ('m1', 'm.glb', 'm.glb', 'glb', '3d_model', 1, 0, 0, 'pending')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let (dir, pool) = library_with_new_model().await;
 
-        let new = save_model_render(&pool, root, "m1", b"new").await.unwrap();
+        let new = save_model_render(&pool, dir.path(), "m1", b"new")
+            .await
+            .unwrap();
 
         assert_eq!(
             thumb_and_status(&pool).await,
