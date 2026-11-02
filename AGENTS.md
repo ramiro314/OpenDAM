@@ -74,7 +74,9 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               same terms, and place, the place
                               phase's flatten, hoist, rename and exclude steps over that tree, which
                               name a file by source path, move or drop its .meta with it, and fail
-                              naming the step and path on a clash or a source no longer produced,
+                              naming the step and path on a clash or a source no longer produced
+                              (a hoist whose folder is missing is a no-op, which the scan's preview
+                              reports in its tree's `warnings`),
                               scan, an original's candidate packs (Unity cache, Fab variants,
                               Kenney packs, any zip) with presets, default targets and steps and
                               a preview of each build's tree, made by the same extract and place

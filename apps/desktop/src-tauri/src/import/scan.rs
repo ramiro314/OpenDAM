@@ -116,6 +116,8 @@ pub struct Tree {
     pub glbs: u64,
     /// The entries the extraction would skip.
     pub skipped: Vec<SkippedEntry>,
+    /// The steps that would do nothing, each with why: a hoist whose folder is missing.
+    pub warnings: Vec<String>,
     /// Why the build would fail, when it would: an unreadable archive, a clash in a step, an
     /// Unreal project with a `Source/` folder.
     pub error: Option<String>,
@@ -180,6 +182,7 @@ impl Tree {
             files,
             glbs,
             skipped: Vec::new(),
+            warnings: Vec::new(),
             error: None,
             estimate: false,
         }
@@ -202,9 +205,10 @@ fn preview(listing: Result<Extraction>, place: &[PlaceStep], convert: bool) -> T
         Ok(extraction) => extraction,
         Err(err) => return Tree::failed(err, Vec::new()),
     };
-    if let Err(err) = place_listed(&mut extraction.files, place) {
-        return Tree::failed(err, extraction.skipped);
-    }
+    let warnings = match place_listed(&mut extraction.files, place) {
+        Ok(warnings) => warnings,
+        Err(err) => return Tree::failed(err, extraction.skipped),
+    };
     if let Some(path) = metadata::clash(&extraction.files) {
         let err = anyhow::anyhow!(metadata::clash_message(path));
         return Tree::failed(err, extraction.skipped);
@@ -212,6 +216,7 @@ fn preview(listing: Result<Extraction>, place: &[PlaceStep], convert: bool) -> T
     let files = extraction.files.iter().map(|f| f.path.as_str());
     Tree {
         skipped: extraction.skipped,
+        warnings,
         ..Tree::of(files.chain([metadata::FILE]), convert)
     }
 }
@@ -716,10 +721,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("Pack");
         let mut extraction = extract(&root).unwrap();
+        let warnings = place_listed(&mut extraction.files.clone(), steps).unwrap();
         place(&root, &mut extraction.files, steps).unwrap();
         std::fs::write(root.join(metadata::FILE), "{}").unwrap();
         Tree {
             skipped: extraction.skipped,
+            warnings,
             ..Tree::of(on_disk(&root).iter().map(String::as_str), convert)
         }
     }
@@ -911,6 +918,40 @@ mod tests {
             assert_eq!(variant.tree, expected, "{:?}", variant.subpath);
         }
         assert_eq!(pack.tree.as_ref(), Some(&pack.variants[2].tree));
+        // The whole package holds `Art` only below its pipeline folders, and the scan says so.
+        assert_eq!(
+            pack.variants[0].tree.warnings,
+            ["hoist Art: no folder at Art, so this step moves nothing. Give the folder's path from the pack root."]
+        );
+        assert_eq!(pack.variants[2].tree.warnings, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_preview_warns_of_a_missing_hoist_until_its_path_finds_the_folder() {
+        let original = fixture("fab-unity-folders.zip");
+        let preview = |folder: &str| {
+            let place = [
+                PlaceStep::Flatten,
+                PlaceStep::Hoist {
+                    folder: folder.into(),
+                },
+            ];
+            let variant = Some("Crypt/Crypt.unitypackage");
+            preview_source(&original, "zip", variant, None, &place, false)
+        };
+        let missing = preview("Art");
+        assert_eq!(missing.warnings.len(), 1, "{missing:?}");
+        assert!(missing.warnings[0].starts_with("hoist Art: "));
+        assert!(missing
+            .folders
+            .iter()
+            .any(|f| f.path == "URP/URP_Crypt/Art"));
+
+        let found = preview("URP/URP_Crypt/Art");
+        assert_eq!(found.warnings, Vec::<String>::new());
+        assert_eq!(found.files, missing.files);
+        assert!(found.folders.iter().any(|f| f.path == "Materials"));
+        assert!(!found.folders.iter().any(|f| f.path == "URP/URP_Crypt/Art"));
     }
 
     #[test]
