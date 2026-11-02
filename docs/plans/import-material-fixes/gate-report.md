@@ -7,15 +7,15 @@ Import pack dialog with its default steps and no typed hoist, and the app's own 
 drew every thumbnail. The driver is `apps/desktop/scripts/import-trial/` (`gate.js`, `run.sh` with
 `TRIAL_UI`, `gate_check.py`, `gate-sheets.sh`), and `floors.tsv` beside this report holds the floors.
 
-**The deletion stays on hold.** LostRuins and POLYGON Prototype's lost tint need your decision, and
-the sheets need your review.
+**The deletion stays on hold.** The owner's review rejected models in four packs and Waterways (see
+[The owner's review](#the-owners-review)), and LostRuins' missing mesh still needs a decision.
 Nothing here deleted, or touched, the old libraries.
 
 | Run | Result | What holds it |
 |---|---|---|
-| All 11 packs | **Pass**, sheets awaiting review | POLYGON's lost tint, see below. Your review of the sheets |
-| `LostRuins.zip`, Unreal route | **Hold** | `SM_column04` is missing with no warning, see below. Your review of the sheet |
-| `Waterways.zip`, Unreal route | **Pass**, sheet awaiting review | Your review of the sheet |
+| All 11 packs | Checks **pass**, review **failed** | Rejected models in Fantasy Adventure, Wizard Room, POLYGON and Big Castle |
+| `LostRuins.zip`, Unreal route | **Hold** | `SM_column04` is missing with no warning, see below |
+| `Waterways.zip`, Unreal route | Checks **pass**, review **failed** | `SM_Fern_01` rejected |
 | Kenney build | **Pass** | Nothing |
 
 ## All 11 packs
@@ -189,11 +189,29 @@ The zip's other files aren't lost, but they aren't in the library either:
 
 ## Sheets
 
-The owner's review is the step this work can't do. There are 11 before and 11 after sheets, from
-the same path lists in `sheet-paths/`, and sheets of 12 models each for LostRuins and Waterways
-from `sheet-paths/unreal/`. They are the app's own thumbnails, in
-`~/.local/share/opendam-import-before-63efa51/sheets/` and
+There are 11 before and 11 after sheets, from the same path lists in `sheet-paths/`, and sheets of
+12 models each for LostRuins and Waterways from `sheet-paths/unreal/`. They are the app's own
+thumbnails, in `~/.local/share/opendam-import-before-63efa51/sheets/` and
 `~/.local/share/opendam-import-gate/report/sheets/`.
+
+## The owner's review
+
+The owner reviewed the sheets and rejected the models below as still needing work. Every automated
+check passed on them, so this is what the audit can't see. Each cause was traced in the GLB and its
+source files, except where the table says it wasn't. None is fixed here: a fix changes the converter.
+
+| Models | What shows | Cause | Fix would need |
+|---|---|---|---|
+| Fantasy Adventure `FAE_Birch_A`, `FAE_Pine_A`, `FAE_Tree_A`, `FAE_Willow_A` | Solid crossed cards around the tree | Each GLB keeps its `_Billboard` mesh, an opaque far-distance stand-in, beside `_LOD0`. 15 of the pack's GLBs do. It looked the same at version 4, so it is no regression | Dropping a billboard beside a real mesh. That changes geometry, so the plan's expected list changes too |
+| `FAE_Willow_A`, also `FAE_PalmBranch` and `FAE_PineBranch` materials | Solid pink branch cards | The cutout is read from `_ALPHATEST_ON`, which 3 of the 6 `FAE_TreeBranch` materials lack, on one shared shader. `FAE_Willow_Branch.png` is 62% transparent, but the GLB drops its alpha | A cutout rule that also reads the shader, after checking that the graph clips |
+| POLYGON `SM_Buildings_Door_01`, `..._RoofAngledCornerInner_1x1_01` | White, were yellow | The lost tint above, on 162 GLBs | Applying `_Base_Color` over an only-texture base. Version 5's own change |
+| Big Castle `tree_b` | Big pink cards, thin scraps | Slots look swapped. The FBX has `branch.001` on 48 faces, then `Apple1.001` on 3,196, and the prefab lists `bark`, then `tree_b_branch`. So the 48 big cards get bark and the 3,196-face tree gets the leaf map. The likely cause is that Unity's submesh order differs from Blender's slot order. That is inferred, not proved, and how many other GLBs it reaches is unknown | Matching a prefab's list to Unity's submesh order |
+| Big Castle `ivy_a`, `grassPlane` | White card behind the ivy, a grey sliver | Each has a mesh with no material, the plan's "slot no Unity file resolves" (`Plane.081` on the ivy). `grassPlane` also faces edge on to the thumbnail's fixed camera | Finding the slot's real material, if any file holds it. The camera is a separate change |
+| Wizard Room `SM_Books3_2` | Plain white | Confirmed by GUID: no prefab or scene names this mesh, and it has no `.mtl`, so no Unity file assigns a material. The same holds for `SM_Walls2`, the plan's 12 GLBs with their LODs. `M_Book*.mat` files exist, but linking them is the filename rule this plan rejected | An owner's decision: accept the gap, or allow a name rule for it |
+| Waterways `SM_Fern_01` | Blocky leaf ends | **Cause not found.** Its GLB is `MASK`, but the baked base is 96% opaque, as is the bake of `SM_Fern_02`, `_03` and `_04`, 4 of the pack's 9 `MASK` materials. Why Unreal's bake keeps so little of the mask wasn't traced | Reading `MI_Fern_02`'s material graph in the editor |
+
+No other model was marked. The owner's rejection of `SM_Books3_2` also reopens a gap the plan had
+accepted, and so may apply to `ivy_a` and `grassPlane`.
 
 ## How to read this again
 
