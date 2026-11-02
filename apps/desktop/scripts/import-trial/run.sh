@@ -27,7 +27,8 @@
 #   TRIAL_UI       set to drive the real frontend
 #   TRIAL_STAGE    this run's name, for its logs h/app-<stage>.log and h/log-<stage>.jsonl
 #                  (default run, whose log stays h/log.jsonl). A folder this script made can be
-#                  opened again under a new stage, to build more packs in the same profile.
+#                  opened again under a new stage, to build more packs in the same profile, once
+#                  no h/log.jsonl is left in it.
 #   TRIAL_MIN_AVAILABLE_MB  MemAvailable below which the app is stopped (default 1500), so a trial
 #                  can't take the machine down with it
 #   OPENDAM_MEMORY_MAX  the app's memory cap (default 10G, see scripts/memory-cap.sh)
@@ -62,6 +63,13 @@ if [[ -n $(ls -A "$TRIAL_DIR") ]]; then
   fi
   if [[ -e $TRIAL_DIR/h/log-$stage.jsonl ]]; then
     echo "$TRIAL_DIR already ran stage $stage." >&2
+    exit 1
+  fi
+  # A default run's log, or an interrupted stage's. The next stage would delete it, leaving a stage
+  # no check can read, and only a person knows which stage it belongs to.
+  if [[ -e $TRIAL_DIR/h/log.jsonl ]]; then
+    echo "$TRIAL_DIR still holds h/log.jsonl, which the next stage would delete. Rename it to" \
+      "h/log-<its stage>.jsonl first." >&2
     exit 1
   fi
   reopening=1

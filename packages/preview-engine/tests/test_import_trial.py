@@ -106,6 +106,21 @@ def test_a_profile_never_runs_a_stage_twice(tmp_path):
     assert PAST_THE_CHECK not in result.stderr
 
 
+def test_a_stage_never_deletes_the_log_of_an_earlier_run(tmp_path):
+    folder = tmp_path / "trial"
+    (folder / "h").mkdir(parents=True)
+    (folder / "h/trial").touch()
+    log = folder / "h/log.jsonl"
+    log.write_text("the first run\n")
+
+    result = run_trial(tmp_path, folder, stage="kenney")
+
+    assert result.returncode == 1
+    assert "still holds h/log.jsonl" in result.stderr
+    assert PAST_THE_CHECK not in result.stderr
+    assert log.read_text() == "the first run\n"
+
+
 def test_the_default_stage_never_reopens_a_profile(tmp_path):
     folder = tmp_path / "trial"
     (folder / "h").mkdir(parents=True)
