@@ -187,19 +187,6 @@ wheels = [
 ]
 
 [[package]]
-name = "imageio"
-version = "2.38.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-    { name = "pillow" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/f3/cd/69e4ac55b6dafdd2b5f32075236841a3945dea7323d0232d80f28c37cea8/imageio-2.38.1.tar.gz", hash = "sha256:6769f1f01c4dd46448307863a787c9a22fa4dbe11c0c88f525c6e410fdfd7983", size = 403667, upload-time = "2026-10-08T14:35:32.961Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/7d/8a/3b7f62b9df56460959f1b9bef094248d2a4d7f393c5b0d2da8efcdf0e40e/imageio-2.38.1-py3-none-any.whl", hash = "sha256:36d23eb7423d2fb63f637098758edb3d2df3687f7125e0a5ce8596572022dcf9", size = 328389, upload-time = "2026-10-08T14:35:31.075Z" },
-]
-
-[[package]]
 name = "imath"
 version = "0.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -299,7 +286,6 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "assimp-py" },
-    { name = "imageio" },
     { name = "numpy" },
     { name = "olefile" },
     { name = "openexr-numpy" },
@@ -320,7 +306,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "assimp-py", specifier = ">=1.0.7" },
-    { name = "imageio", specifier = ">=2.34" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "olefile", specifier = ">=0.46" },
     { name = "openexr-numpy", specifier = ">=0.0.6" },
