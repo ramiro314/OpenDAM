@@ -2024,6 +2024,30 @@ done
     }
 
     #[tokio::test]
+    async fn a_failed_job_clears_a_stale_preview_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = stub_engine(dir.path(), ANSWER_2, "exit 1");
+        let lib = library_with_pending_job(dir.path(), "models/ship.fbx", "").await;
+        sqlx::query("UPDATE assets SET preview_reason = 'Too large to preview'")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+
+        let outcomes = queue_round(&mut engine, std::slice::from_ref(&lib)).await;
+
+        assert!(
+            matches!(&outcomes[..], [Err((_, _, None))]),
+            "the job fails with no reason: {outcomes:?}"
+        );
+        let (status, reason): (String, Option<String>) =
+            sqlx::query_as("SELECT preview_status, preview_reason FROM assets WHERE id = 'a1'")
+                .fetch_one(&lib.pool)
+                .await
+                .unwrap();
+        assert_eq!((status.as_str(), reason), ("error", None));
+    }
+
+    #[tokio::test]
     async fn a_job_that_kills_the_worker_unpublishes_and_a_new_one_starts_at_once() {
         let dir = tempfile::tempdir().unwrap();
         // Every process exits on its job, as a crash does

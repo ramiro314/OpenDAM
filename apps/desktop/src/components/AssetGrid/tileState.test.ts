@@ -129,6 +129,18 @@ describe('coverAsset', () => {
     expect(tileMedia(coverAsset({ ...none, thumbnailPath: '/lib/t.glb' }))).toBe('none');
   });
 
+  test('a cover with a preview reason never loads its original', () => {
+    const huge = {
+      ...png,
+      assetId: 'a',
+      memberIds: [],
+      previewReason: 'Too large to preview (29027 x 29027 px)',
+    };
+    expect(tileMedia(coverAsset(huge))).toBe('none');
+    expect(coverImage(huge)).toBeUndefined();
+    expect(tileMedia(coverAsset({ ...huge, previewReason: null }))).toBe('original');
+  });
+
   test('an arriving thumbnail replaces the icon', () => {
     expect(tileMedia(coverAsset({ ...cover, thumbnailPath: '/lib/t.png' }))).toBe('thumbnail');
   });

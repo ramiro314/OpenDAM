@@ -53,12 +53,22 @@ describe('previewMessage', () => {
   });
 
   test('a file with no reason keeps the messages it has', () => {
-    expect(previewMessage({ previewStatus: 'none' }).title).toBe('No preview available');
-    expect(previewMessage({ previewStatus: 'done' }).title).toBe('No preview available');
-    expect(previewMessage({ previewStatus: 'error' }).title).toBe(
-      'Preview generation failed previously'
-    );
-    expect(previewMessage({ previewStatus: 'none' }).canGenerate).toBe(true);
+    const generate = 'Click below to run the preview engine worker for this file';
+    const generating = {
+      title: 'Generating preview…',
+      sub: 'Please wait while the worker renders the model',
+      canGenerate: true,
+    };
+    const idle = { title: 'No preview available', sub: generate, canGenerate: true };
+    expect(previewMessage({ previewStatus: 'none' })).toEqual(idle);
+    expect(previewMessage({ previewStatus: 'done' })).toEqual(idle);
+    expect(previewMessage({ previewStatus: 'error' })).toEqual({
+      title: 'Preview generation failed previously',
+      sub: generate,
+      canGenerate: true,
+    });
+    expect(previewMessage({ previewStatus: 'pending' })).toEqual(generating);
+    expect(previewMessage({ previewStatus: 'generating' })).toEqual(generating);
   });
 
   test('a job running again says so, even over a reason', () => {

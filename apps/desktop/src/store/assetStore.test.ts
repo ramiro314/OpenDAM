@@ -724,6 +724,16 @@ describe('useAssetStore updateAssetPreview', () => {
     expect(useAssetStore.getState().assetAt(0)?.previewReason).toBeUndefined();
   });
 
+  test('a failed job with no reason clears a stale one', async () => {
+    await loadAsset();
+    useAssetStore.getState().failPreview('a1', 'Too large to preview');
+
+    useAssetStore.getState().failPreview('a1', null);
+
+    expect(useAssetStore.getState().assetAt(0)?.previewStatus).toBe('error');
+    expect(useAssetStore.getState().assetAt(0)?.previewReason).toBeUndefined();
+  });
+
   test('a new thumbnail replaces the stored path', async () => {
     await loadAsset();
 

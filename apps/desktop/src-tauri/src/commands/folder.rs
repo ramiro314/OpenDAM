@@ -1469,6 +1469,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cover_carries_its_preview_reason_to_the_card_and_the_panel() {
+        let reason = "Too large to preview (29027 x 29027 px)";
+        let library = library_handle(
+            "a",
+            &[
+                "3D assets/Car Kit/License.txt",
+                "3D assets/Car Kit/Preview.png",
+            ],
+        )
+        .await;
+        sqlx::query("UPDATE assets SET preview_reason = ? WHERE file_path LIKE '%Preview.png'")
+            .bind(reason)
+            .execute(&library.pool)
+            .await
+            .unwrap();
+
+        let packs = packs_below(std::slice::from_ref(&library), "", false)
+            .await
+            .unwrap();
+        let card = packs[0].cover.as_ref().unwrap();
+        assert_eq!(card.preview_reason.as_deref(), Some(reason));
+
+        let detail = pack_holding(&library, "3D assets/Car Kit").await.unwrap();
+        let panel = detail.unwrap().cover.unwrap();
+        assert_eq!(panel.preview_reason.as_deref(), Some(reason));
+    }
+
+    #[tokio::test]
     async fn a_packs_detail_is_found_from_the_pack_or_any_folder_inside_it() {
         let library = library_handle(
             "a",
