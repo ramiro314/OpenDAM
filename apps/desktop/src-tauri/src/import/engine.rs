@@ -12,8 +12,10 @@
 //! meanwhile (a build suspended past the 10 minutes, say): what its build did on disk, committed
 //! or rolled back, is what happened. The end overwrites only `running` and `interrupted`.
 //!
-//! Progress arrives as `import:progress` events and status changes as `import:updated`. Cancel
-//! takes effect only before a build takes the library's lock (`build::RunControl`).
+//! Progress arrives as `import:progress` events and status changes as `import:updated`. A run's
+//! row gets its progress from the heartbeat and, for good, from the update that ends the run
+//! (`Reached`). Cancel takes effect only before a build takes the library's lock
+//! (`build::RunControl`).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -38,6 +40,7 @@ use super::remove;
 use super::scan::{self, Scan};
 use super::tools;
 use super::unity_glb;
+use super::unitypackage::SkippedEntry;
 use super::unreal_glb;
 use crate::db::{Database, LibraryHandle};
 use crate::preview::WorkerRequest;
@@ -226,22 +229,19 @@ impl Engine {
             match self.next_run().await {
                 Some((library, run)) => {
                     let (this, lib, run_id) = (self.clone(), library.clone(), run.id.clone());
+                    let reached = Arc::<Mutex<Reached>>::default();
+                    let reports = reached.clone();
                     // A panic ends the run, not the engine. A pack it left mid-swap keeps its
                     // journal, for recovery.
-                    if let Err(e) = tokio::spawn(async move { this.execute(&lib, run).await }).await
-                    {
+                    let ran =
+                        tokio::spawn(async move { this.execute(&lib, run, reports).await }).await;
+                    if let Err(e) = ran {
                         tracing::error!("Import run {run_id} stopped: {e}");
                         self.set_active(None);
-                        // As at a run's end: over `running` or `interrupted` only.
-                        let _ = sqlx::query(
-                            "UPDATE import_runs SET status = 'failed', finished_at = ?,
-                             error = 'The run stopped unexpectedly'
-                             WHERE id = ? AND status IN ('running', 'interrupted')",
-                        )
-                        .bind(now_ms())
-                        .bind(&run_id)
-                        .execute(&library.pool)
-                        .await;
+                        let reached = *reached.lock().unwrap_or_else(|e| e.into_inner());
+                        let error = Some("The run stopped unexpectedly");
+                        let _ =
+                            record_end(&library.pool, &run_id, "failed", error, &[], reached).await;
                         self.updated(&library, &run_id).await;
                     }
                 }
@@ -436,7 +436,7 @@ impl Engine {
         None
     }
 
-    async fn execute(&self, library: &LibraryHandle, run: Queued) {
+    async fn execute(&self, library: &LibraryHandle, run: Queued, reached: Arc<Mutex<Reached>>) {
         let _cache = self.cache_use.read().await;
         let control = Arc::new(RunControl::default());
         let cancelled_before = self
@@ -493,12 +493,11 @@ impl Engine {
         }
         self.updated(library, &run.id).await;
 
-        let latest: Arc<Mutex<Option<Progress>>> = Default::default();
         // Aborted on drop, so a panicking build doesn't leave it beating.
         let heartbeat = AbortOnDrop(tokio::spawn(beat(
             library.pool.clone(),
             run.id.clone(),
-            latest.clone(),
+            reached.clone(),
         )));
         let tools = self.tools().await;
         let unreal = self.unreal_tools().await;
@@ -506,11 +505,11 @@ impl Engine {
         let mut outcome = Ok(());
         for pack in &run.packs {
             let progress: build::ProgressSink = Arc::new({
-                let (events, latest) = (self.events.clone(), latest.clone());
+                let (events, reached) = (self.events.clone(), reached.clone());
                 let (run_id, library_id, pack_id) =
                     (run.id.clone(), library.id.clone(), pack.pack_id.clone());
                 move |p: Progress| {
-                    *latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+                    reached.lock().unwrap_or_else(|e| e.into_inner()).report(p);
                     events(ImportEvent::Progress(ImportProgress {
                         run_id: run_id.clone(),
                         library_id: library_id.clone(),
@@ -565,24 +564,15 @@ impl Engine {
             Err(Stop::Cancelled) => ("cancelled", None),
             Err(Stop::Failed(message)) => ("failed", Some(message.clone())),
         };
-        let phase = latest
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .map(|p| p.step);
-        // A finished build wins over `interrupted`, which another machine sets when this run's
-        // heartbeat stopped for 10 minutes (a suspend mid-build): the end says what the build did
-        // on disk. Any status other than `running` and `interrupted` is kept.
-        let finished = sqlx::query(
-            "UPDATE import_runs SET status = ?, error = ?, warnings = ?, phase = ?,
-             finished_at = ? WHERE id = ? AND status IN ('running', 'interrupted')",
+        let reached = *reached.lock().unwrap_or_else(|e| e.into_inner());
+        let finished = record_end(
+            &library.pool,
+            &run.id,
+            status,
+            error.as_deref(),
+            &warnings,
+            reached,
         )
-        .bind(status)
-        .bind(&error)
-        .bind(json!(warnings).to_string())
-        .bind(phase)
-        .bind(now_ms())
-        .bind(&run.id)
-        .execute(&library.pool)
         .await;
         if let Err(e) = finished {
             tracing::error!("Could not record the end of import run {}: {e}", run.id);
@@ -1293,11 +1283,63 @@ impl Drop for AbortOnDrop {
 }
 
 /// Rewrites a running run's heartbeat, with its latest progress, every 30 s until aborted.
-async fn beat(pool: Pool<Sqlite>, run_id: String, latest: Arc<Mutex<Option<Progress>>>) {
+/// What a run has reported, which its heartbeat and its end write to its row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Reached {
+    /// The latest report, which names the run's phase.
+    latest: Option<Progress>,
+    /// The figures a run ends on: its latest report with counts, as the steps after the last
+    /// hashing have none. Hashing doesn't replace another step's figures, as a build hashes
+    /// what it converted and then its `datapackage.json`, or a smaller pass its bigger one.
+    figures: Option<Progress>,
+}
+
+impl Reached {
+    fn report(&mut self, p: Progress) {
+        self.latest = Some(p);
+        let ahead = |kept: Progress| {
+            p.step == build::HASHING && (kept.step != build::HASHING || kept.total > p.total)
+        };
+        if p.total > 0 && !self.figures.is_some_and(ahead) {
+            self.figures = Some(p);
+        }
+    }
+}
+
+/// Records how run `run_id` ended and what it reached, in one update. A finished build wins over
+/// `interrupted`, which another machine sets when this run's heartbeat stopped for 10 minutes (a
+/// suspend mid-build): the end says what the build did on disk. Any status other than `running`
+/// and `interrupted` is kept.
+async fn record_end(
+    pool: &Pool<Sqlite>,
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+    warnings: &[SkippedEntry],
+    reached: Reached,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE import_runs SET status = ?, error = ?, warnings = ?, phase = ?, progress_done = ?,
+         progress_total = ?, finished_at = ? WHERE id = ? AND status IN ('running', 'interrupted')",
+    )
+    .bind(status)
+    .bind(error)
+    .bind(json!(warnings).to_string())
+    .bind(reached.latest.map(|p| p.step))
+    .bind(reached.figures.map_or(0, |p| p.done as i64))
+    .bind(reached.figures.map_or(0, |p| p.total as i64))
+    .bind(now_ms())
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn beat(pool: Pool<Sqlite>, run_id: String, reached: Arc<Mutex<Reached>>) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
     loop {
         ticks.tick().await;
-        let progress = *latest.lock().unwrap_or_else(|e| e.into_inner());
+        let progress = reached.lock().unwrap_or_else(|e| e.into_inner()).latest;
         let _ = sqlx::query(
             "UPDATE import_runs SET heartbeat_at = ?, phase = COALESCE(?, phase),
              progress_done = ?, progress_total = ? WHERE id = ? AND status = 'running'",
@@ -2354,6 +2396,104 @@ mod tests {
         assert_eq!(s.count("SELECT COUNT(*) FROM import_outputs").await, 0);
         assert_eq!(s.pack().await, ("failed".into(), None, None));
         s.other_asset_untouched().await;
+    }
+
+    /// The run's row as `list_import_runs` reads it.
+    async fn listed(s: &Setup, run_id: &str) -> RunSummary {
+        let runs = s.engine.list_runs("lib").await.unwrap();
+        runs.into_iter().find(|r| r.id == run_id).unwrap()
+    }
+
+    fn report(step: &'static str, done: u64, total: u64) -> Progress {
+        Progress { step, done, total }
+    }
+
+    #[test]
+    fn a_run_s_figures_outlast_steps_without_counts_and_later_hashing() {
+        let mut reached = Reached::default();
+        for p in [
+            report("extracting", 0, 0),
+            report(build::HASHING, 0, 900),
+            report(build::HASHING, 900, 900),
+            report("converting", 0, 184),
+        ] {
+            reached.report(p);
+        }
+        assert_eq!(reached.figures, Some(report("converting", 0, 184)));
+        for p in [
+            report("converting", 184, 184),
+            report(build::HASHING, 184, 184),
+            report("writing metadata", 0, 0),
+            report(build::HASHING, 1, 1),
+            report("settling", 0, 0),
+        ] {
+            reached.report(p);
+        }
+        assert_eq!(reached.figures, Some(report("converting", 184, 184)));
+        assert_eq!(reached.latest, Some(report("settling", 0, 0)));
+
+        // With nothing converted, a smaller hashing pass leaves the bigger one's figures.
+        let mut reached = Reached::default();
+        reached.report(report(build::HASHING, 900, 900));
+        reached.report(report(build::HASHING, 0, 1));
+        assert_eq!(reached.figures, Some(report(build::HASHING, 900, 900)));
+    }
+
+    /// No heartbeat fires in a test's run, so each row's figures come from the run's end.
+    #[tokio::test]
+    async fn a_run_that_ends_before_a_heartbeat_reads_back_its_final_figures() {
+        let s = setup().await;
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        s.wait_for(&run.id, "done").await;
+
+        let files = s.count("SELECT COUNT(*) FROM import_outputs").await;
+        assert!(files > 0);
+        let row = listed(&s, &run.id).await;
+        assert_eq!(row.phase.as_deref(), Some("settling"));
+        assert_eq!((row.progress_done, row.progress_total), (files, files));
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_reads_back_the_figures_it_reached() {
+        let s = setup().await;
+        s.engine.hooks().fail(Point::MoveIn);
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        s.wait_for(&run.id, "failed").await;
+
+        let row = listed(&s, &run.id).await;
+        assert_eq!(row.phase.as_deref(), Some("swapping"));
+        assert!(row.progress_total > 0);
+        assert_eq!(row.progress_done, row.progress_total);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_reads_back_the_figures_it_reached() {
+        let s = setup().await;
+        let pause = s.engine.hooks().pause(Point::Staged);
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        pause.reached.notified().await;
+        s.engine.cancel_run("lib", &run.id).await.unwrap();
+        pause.release.notify_one();
+        s.wait_for(&run.id, "cancelled").await;
+
+        let row = listed(&s, &run.id).await;
+        assert_eq!(row.phase.as_deref(), Some(build::HASHING));
+        assert!(row.progress_total > 0);
+        assert_eq!(row.progress_done, row.progress_total);
+    }
+
+    #[tokio::test]
+    async fn a_run_that_panics_reads_back_the_figures_it_reached() {
+        let s = setup().await;
+        s.engine.hooks().crash(Point::Staged);
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        s.wait_for(&run.id, "failed").await;
+
+        let row = listed(&s, &run.id).await;
+        assert_eq!(row.error.as_deref(), Some("The run stopped unexpectedly"));
+        assert_eq!(row.phase.as_deref(), Some(build::HASHING));
+        assert!(row.progress_total > 0);
+        assert_eq!(row.progress_done, row.progress_total);
     }
 
     #[tokio::test]

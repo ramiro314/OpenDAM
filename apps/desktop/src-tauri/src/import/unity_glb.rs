@@ -568,6 +568,12 @@ impl Conversion<'_> {
             Ok(())
         })
         .await?;
+        // Cached GLBs print nothing, and a Blender line may not have come.
+        (self.progress)(Progress {
+            step: "converting",
+            done: models.len() as u64,
+            total: models.len() as u64,
+        });
         Ok(models)
     }
 

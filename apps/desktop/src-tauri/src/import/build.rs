@@ -271,6 +271,9 @@ impl Hooks {
     }
 }
 
+/// The step `hash_staged` reports.
+pub const HASHING: &str = "hashing";
+
 /// A build's progress, for `import:progress`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Progress {
@@ -1093,7 +1096,7 @@ async fn hash_staged(
                 return Err(Stop::Cancelled);
             }
             progress(Progress {
-                step: "hashing",
+                step: HASHING,
                 done: done as u64,
                 total,
             });
@@ -1122,6 +1125,13 @@ async fn hash_staged(
                 }
             }
             outputs.push(output);
+        }
+        if total > 0 {
+            progress(Progress {
+                step: HASHING,
+                done: total,
+                total,
+            });
         }
         Ok(outputs)
     })

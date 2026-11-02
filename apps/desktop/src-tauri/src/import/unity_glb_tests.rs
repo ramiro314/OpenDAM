@@ -932,6 +932,51 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
         );
     }
 
+    /// A run that stops converting reads back the conversion's figures, not the hashing's before
+    /// it.
+    #[tokio::test]
+    async fn a_run_that_fails_converting_reads_back_how_far_it_got() {
+        let s = setup().await;
+        failed_with_stub_blender(&s, "exit 1").await;
+        let row = s.engine.list_runs("lib").await.unwrap().remove(0);
+        assert_eq!(row.phase.as_deref(), Some("converting"));
+        assert_eq!((row.progress_done, row.progress_total), (0, 1));
+    }
+
+    /// A build hashes after it converts, and what it converted is the figure a finished run
+    /// reads back, not the hashing's.
+    #[tokio::test]
+    async fn a_run_reads_back_what_it_converted_even_from_the_cache() {
+        let s = setup().await;
+        let Some(_log) = s.logged_blender().await else {
+            return;
+        };
+        let run = s
+            .engine
+            .start_import(s.request(vec![PlaceStep::Flatten]))
+            .await
+            .unwrap();
+        s.wait_for(&run.id, "done").await;
+        let models: i64 = s
+            .count("SELECT COUNT(*) FROM import_outputs WHERE origin = 'generated' AND path LIKE '%.glb'")
+            .await;
+        let row = s.engine.list_runs("lib").await.unwrap().remove(0);
+        assert_eq!(row.phase.as_deref(), Some("settling"));
+        assert_eq!((row.progress_done, row.progress_total), (models, models));
+
+        // Every GLB cached: Blender prints no line, and the figures still reach the end.
+        let pack_id = run.packs[0].pack_id.clone();
+        let rebuild = s
+            .engine
+            .rebuild_pack("lib", &pack_id, Vec::new())
+            .await
+            .unwrap();
+        s.wait_for(&rebuild.id, "done").await;
+        let row = s.engine.list_runs("lib").await.unwrap();
+        let row = row.iter().find(|r| r.id == rebuild.id).unwrap();
+        assert_eq!((row.progress_done, row.progress_total), (models, models));
+    }
+
     /// A result from another version of the script, one that leaves a model out, and a model
     /// reported converted with no GLB written each fail the step.
     #[tokio::test]
