@@ -2068,6 +2068,41 @@ mod tests {
         assert_eq!(stamp(&original), before, "the original is unchanged");
     }
 
+    /// What the dialog sends for a scan's Fab offer leaves the title unset, so the pack's title is
+    /// its folder's name, in words as the scan named it.
+    #[tokio::test]
+    async fn a_fab_zip_named_in_camel_case_imports_titled_in_words() {
+        let s = setup().await;
+        let originals = tempfile::tempdir().unwrap();
+        let original = originals.path().join("StylizedVillage.zip");
+        std::fs::copy(fixture("fab-unity.zip"), &original).unwrap();
+        let original = original.to_string_lossy().into_owned();
+
+        let scan = s.engine.scan("lib", &original).await.unwrap();
+        let pack = &scan.offers[0].candidates[0];
+        let variant = pack.variants.iter().find(|v| v.ticked).unwrap();
+        let request = ImportRequest {
+            original_path: original.clone(),
+            publisher: "Stylarts".into(),
+            ..s.zip_request(
+                "fab-unity.zip",
+                Some(&variant.variant),
+                variant.subpath.as_deref(),
+                &format!("Stylarts/{}", pack.name),
+            )
+        };
+        let run = s.engine.start_import(request).await.unwrap();
+        s.wait_for(&run.id, "done").await;
+
+        let package = s
+            .dir
+            .path()
+            .join("Stylarts/Stylized Village/datapackage.json");
+        let package: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(package).unwrap()).unwrap();
+        assert_eq!(package["title"], "Stylized Village", "{package}");
+    }
+
     #[tokio::test]
     async fn a_fab_variant_and_a_pipeline_folder_build_from_inside_the_zip() {
         let s = setup().await;
