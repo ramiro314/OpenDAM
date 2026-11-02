@@ -7,14 +7,14 @@ Import pack dialog with its default steps and no typed hoist, and the app's own 
 drew every thumbnail. The driver is `apps/desktop/scripts/import-trial/` (`gate.js`, `run.sh` with
 `TRIAL_UI`, `gate_check.py`, `gate-sheets.sh`), and `floors.tsv` beside this report holds the floors.
 
-**The deletion stays on hold.** Two runs need your decision, and the sheets need your review.
+**The deletion stays on hold.** LostRuins needs your decision, and the sheets need your review.
 Nothing here deleted, or touched, the old libraries.
 
 | Run | Result | What holds it |
 |---|---|---|
 | All 11 packs | **Pass**, sheets awaiting review | Your review of the sheets |
 | `LostRuins.zip`, Unreal route | **Hold** | `SM_column04` is missing with no warning, see below. Your review of the sheet |
-| `Waterways.zip`, Unreal route | **Not run** | The memory check fails: 10.9 GB available, 24 GB needed |
+| `Waterways.zip`, Unreal route | **Pass**, sheet awaiting review | Your review of the sheet |
 | Kenney build | **Pass** | Nothing |
 
 ## All 11 packs
@@ -80,22 +80,68 @@ So `unreal_glb.py`, which exports what the asset registry lists, skips a mesh th
 and the run can't tell. Why the registry misses this one is unknown. It is the only mesh of this
 pack it misses, by name against the zip's `.uasset` files. Reading the zip's `Meshes/` folder
 rather than trusting the registry would catch it, and that fix belongs to its own ticket. That
-editor run ended with exit status 139 after its script had finished. It used `-nullrhi`, which the
-app's sessions don't, and the gate's own sessions weren't affected.
+editor run, and the one in the Waterways section, ended with exit status 139 after its script had
+finished. They used `-nullrhi`, which the app's sessions don't, and the gate's own sessions weren't
+affected.
 
 ## Waterways, Unreal route
 
-**Not run.** The memory check failed, and the plan says to stop and ask:
+**The memory check.** It passed on the third reading, on the plan's terms, and the run started
+right after it:
 
-| Check | Needed | Found |
+| Check | Needed | Found at 13:17 |
 |---|---|---|
-| `import.unrealMemoryMax` | Its default of 20G | Default, unchanged |
-| `MemAvailable` | At least 24 GB | **10.9 GB** |
+| `import.unrealMemoryMax` | Its default of 20G | Default, no setting stored |
+| `MemAvailable` | At least 24 GB | 24.4 GB |
 | Benchmarks and other Unreal runs | None | None |
-| Disk | At least 20 GB free | 1.2 TB |
+| Disk | At least 20 GB free | 1,169 GB |
 
-The rest of the machine's 31 GB is in use outside this work, mostly Chrome (4.7 GB), Steam (3.9 GB)
-and terminals and agent sessions, and swap is full. None of that was this ticket's to close.
+The first two readings failed, at 10.9 GB and then 20.8 GB once the owner had closed their apps,
+with about 7 GB held by the kernel and what looked like the NVIDIA driver. The owner chose to
+reboot. The gate's profile, and the three runs above, are from before that reboot, and this run
+reopened the same profile. The check was not waived.
+
+**The run.** It ended `done` with no error, no warning and no failed model in 13 minutes, across 6
+editor sessions. All 6 ended without a cap kill, in the app log or the watcher's, and no session had
+to be recovered.
+
+| Measure | Result |
+|---|---|
+| GLBs | 161, above 0 and within the scan's estimate of 655 |
+| Fully textured | 114 of 161 |
+| Peak memory, the editor's scope | 12.7 GB of its 20 GB cap, in the first session |
+| Peak memory, the app's scope | 8.9 GB of its 10 GB cap |
+| Lowest `MemAvailable` during the run | 12.1 GB |
+| Thumbnails | All 161 GLBs have a PNG from the app |
+| Disk | 2.4 GB |
+
+**No mesh is missing.** LostRuins' finding was checked here too, against every `.uasset` in the zip:
+all 146 static meshes and 15 skeletal meshes and animations have a GLB. `SM_Cylinder` and
+`Cylinder1` have none, and need none: an editor run shows both are `ObjectRedirector` packages to
+`SM_CylinderFog`, which exported.
+
+**Leftovers.** All 47 GLBs under the full count are explained. Each material was traced through
+its parents in the zip's `.uasset` files, and a GLB can use several:
+
+| Reason | Materials, GLBs |
+|---|---|
+| Water, waterfalls, fog and depth fade, built from shaders | `MI_DepthFade*` 10, `MI_Waterfall_0*` 11, `MI_Water_Animated` 3, `MI_Waterfall_Transperant_02` 2, `MI_Fog_04` 1 |
+| Flat colour, whose master's one texture is `T_Noise_M` | `MI_Brown_02` 5, `MI_Green_0*` 4, `MI_Metal_0*` 3, `MI_White` 3, `MI_Pink*` 2, `MI_Blue_01` 1 |
+| Flat colour, with no texture through any parent | `MI_Potion_Color_0*` 16, `MM_PotionColors` 1, `MI_PlaneGrass_04` 1 |
+| The engine's default material, on a slot with none | `WorldGridMaterial` on `SM_Plane_Sun`, 1 |
+
+The `T_Noise_M` materials lose that noise's variation. That it isn't a colour map is read from its
+name and from its being the master's only texture, not from the material graph.
+
+**Two things the count hides.** `SM_Butterfly_Plane`, `SM_CavernHull` and `SM_Vine_05` count as
+textured only through a baked `WorldGridMaterial_BaseColor`, the engine's default grid, so they
+aren't real textures. And the import dialog warned `hoist Meshes: no folder at Meshes`, though the
+hoist worked and every mesh sits at the pack's root. The likely cause is the scan's estimate, which
+gives `Content/Cylinder1.uasset` a GLB, so its `flatten` keeps `Waterways/`. It would mislead
+someone importing this pack.
+
+**Worth a look on the sheet.** `SK_Snake` draws as a thin straight line, `SM_RockWall_01` as a dark
+scrap with a vine, and `SM_Waterblock_01` as a thin sliver.
 
 ## Kenney build
 
@@ -125,10 +171,10 @@ The zip's other files aren't lost, but they aren't in the library either:
 ## Sheets
 
 The owner's review is the step this work can't do. There are 11 before and 11 after sheets, from
-the same path lists in `sheet-paths/`, and a LostRuins sheet of 12 models from
-`sheet-paths/unreal/lost-ruins.txt`. They are the app's own thumbnails, in
+the same path lists in `sheet-paths/`, and sheets of 12 models each for LostRuins and Waterways
+from `sheet-paths/unreal/`. They are the app's own thumbnails, in
 `~/.local/share/opendam-import-before-63efa51/sheets/` and
-`~/.local/share/opendam-import-gate/report/sheets/`. Waterways has no sheet.
+`~/.local/share/opendam-import-gate/report/sheets/`.
 
 ## How to read this again
 
