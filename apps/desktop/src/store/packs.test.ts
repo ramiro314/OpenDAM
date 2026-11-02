@@ -70,6 +70,21 @@ describe('coverWithPreview', () => {
       expect(coverWithPreview(thumbed, cleared)[field]).toBe(render);
     }
   });
+
+  test("another file's preview leaves a cover's render alone", () => {
+    const other = {
+      assetId: 'r2',
+      thumbnailPath: '/lib/.opendam/thumbs/r2_thumb.png',
+      render: {
+        filePath: '/lib/kit/Previews/other.png',
+        previousThumbnailPath: '/lib/.opendam/thumbs/r2_old.png',
+      },
+    };
+    for (const field of ['bundledPreview', 'fallbackRender'] as const) {
+      const shown = { ...model, [field]: '/lib/kit/Previews/rock.png' };
+      expect(coverWithPreview(shown, other)).toBe(shown);
+    }
+  });
 });
 
 describe('usePacksStore', () => {
@@ -86,6 +101,20 @@ describe('usePacksStore', () => {
     const packs = store().packs;
     store().applyPreview({ assetId: 'unrelated', thumbnailPath: '/other.png' });
     expect(store().packs).toBe(packs);
+
+    // Nor does one that carries a render no card shows
+    const rendered = {
+      ...card('kit/rendered'),
+      cover: { ...model, bundledPreview: '/render.png' },
+    };
+    usePacksStore.setState({ packs: [rendered] });
+    const shown = store().packs;
+    store().applyPreview({
+      assetId: 'unrelated',
+      thumbnailPath: '/other.png',
+      render: { filePath: '/other-render.png', previousThumbnailPath: '/old.png' },
+    });
+    expect(store().packs).toBe(shown);
   });
 
   test("a member's preview reloads the packs, so the card shows what the grid's rule picks", async () => {
