@@ -1,0 +1,10 @@
+{
+  "settleMinutes": 30,
+  "imports": [
+    {
+      "lib": "fab",
+      "path": "~/Documents/AssetOriginals/Fab/Waterways.zip",
+      "offer": "unreal"
+    }
+  ]
+}
