@@ -1372,6 +1372,14 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
     const TOO_LARGE: &str = "Too large to preview (29027 x 29027 px)";
+    /// A PNG whose header claims 1024 x 1024 RGB, under the limit and past `THUMB_SIZE`, and which
+    /// has no pixels, so its decode fails for a reason other than its size.
+    const HEADER_WITH_NO_PIXELS: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x08, 0x02, 0x00, 0x00, 0x00, 0xf0,
+        0x7f, 0xbc, 0xd4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x44, 0x41, 0x54, 0x35, 0xaf, 0x06, 0x1e,
+        0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
 
     #[test]
     fn raster_past_the_decoders_limit_is_refused_from_its_header() {
@@ -1384,6 +1392,34 @@ mod tests {
 
         assert_eq!(thumb, ImageThumb::TooLarge(TOO_LARGE.into()));
         assert!(!thumbs.exists());
+    }
+
+    #[tokio::test]
+    async fn a_decode_failure_under_the_limit_is_not_called_too_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let source = root.join("broken.png");
+        std::fs::write(&source, HEADER_WITH_NO_PIXELS).unwrap();
+        let thumbs = root.join(".opendam/thumbs");
+
+        assert!(generate_image_thumb(&source, &thumbs, "a1").is_err());
+
+        let lib = library_with_pending_job(root, "broken.png", ".opendam/thumbs/none.png").await;
+        let (_, done, refused) = process_image_jobs(&lib, 2).await;
+
+        assert!(done.is_empty());
+        assert!(refused.is_empty());
+        // The Python queue gets its try, and the asset keeps today's message and Retry.
+        let job: String = sqlx::query_scalar("SELECT status FROM preview_jobs WHERE id = 'j1'")
+            .fetch_one(&lib.pool)
+            .await
+            .unwrap();
+        assert_eq!(job, "fallback");
+        let reason: Option<String> = sqlx::query_scalar("SELECT preview_reason FROM assets")
+            .fetch_one(&lib.pool)
+            .await
+            .unwrap();
+        assert_eq!(reason, None);
     }
 
     #[tokio::test]
