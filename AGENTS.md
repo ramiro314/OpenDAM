@@ -124,7 +124,7 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               so one with no mesh and no animation warns on every run
                               (`SkipReason::NoMesh`), unless its model is named as a collider.
                               A version bump changes every GLB's key, so a Rebuild reconverts
-                              the pack, and nothing flags a pack built by an older version,
+                              the pack, and nothing flags a pack built by an older version;
                               and unreal_glb, the
                               export_unreal step: a zip's content-only Unreal project (refused
                               with a Source/ folder) unzipped to a work copy with its plugins

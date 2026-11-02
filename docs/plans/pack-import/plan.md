@@ -464,7 +464,7 @@ its deviations from the plan as written:
   empty. The list keeps its shape, so stored runs read as before,
   and its heading reads "N warnings".
 
-Revised again 2026-11-01 for `opendam-unity-glb/5` (plan import-material-fixes, Piece 1). D28 kept
+Revised again 2026-11-02 for `opendam-unity-glb/5` (plan import-material-fixes, Piece 1). D28 kept
 the script's heuristics as they were. Real packs needed more, so these are its deviations from it:
 
 - **R62 - A material's maps can come from its Shader Graph.** `.shadergraph` is now an input, so
