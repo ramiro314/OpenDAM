@@ -68,6 +68,11 @@ export interface Asset {
   thumbnailPath?: string;
   /** Whether a preview job is pending/running */
   previewStatus: 'none' | 'pending' | 'generating' | 'done' | 'error';
+  /**
+   * Why the file stays without a preview, such as a raster too large to decode. The UI shows this
+   * and never loads the original.
+   */
+  previewReason?: string;
   metadata: AssetMeta;
   /**
    * For the main item of a group (one model in several formats, a file's copies under format
@@ -238,6 +243,8 @@ export interface Cover {
   thumbnailPath?: string | null;
   extension: string;
   kind: AssetKind;
+  /** As an asset's `previewReason` */
+  previewReason?: string | null;
   /** Absolute, as an asset's `bundledPreview` */
   bundledPreview?: string | null;
   /** Absolute, as an asset's `fallbackRender` */

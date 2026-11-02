@@ -20,6 +20,10 @@ const rendered = {
 };
 
 describe('tileMedia', () => {
+  test('a file with a preview reason never loads its original', () => {
+    expect(tileMedia({ ...png, previewReason: 'Too large to preview' })).toBe('none');
+  });
+
   test('prefers the thumbnail, then the original image', () => {
     expect(tileMedia(thumbnailed)).toBe('thumbnail');
     expect(tileMedia(png)).toBe('original');

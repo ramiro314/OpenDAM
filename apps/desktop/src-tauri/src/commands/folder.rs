@@ -24,6 +24,8 @@ pub struct Cover {
     pub thumbnail_path: Option<String>,
     pub extension: String,
     pub kind: String,
+    /// Why it stays without a preview, as an asset's `preview_reason`
+    pub preview_reason: Option<String>,
     /// Absolute, a model's render that fits a card, as an asset's `bundled_preview`
     pub bundled_preview: Option<String>,
     /// Absolute, a model's render too small to fit one, as an asset's `fallback_render`
@@ -38,7 +40,7 @@ pub struct Cover {
 fn cover_columns() -> String {
     format!(
         "c.id AS cover_id, c.file_path AS cover_path, {} AS cover_thumbnail,
-    c.extension AS cover_extension, c.kind AS cover_kind,
+    c.extension AS cover_extension, c.kind AS cover_kind, c.preview_reason AS cover_reason,
     CASE WHEN c.group_id = c.id AND c.thumbnail_path IS NULL THEN
         (SELECT json_group_array(m.id) FROM assets m WHERE m.group_id = c.id AND m.id <> c.id)
     END AS cover_members, {}",
@@ -58,6 +60,7 @@ struct CoverRow {
     cover_thumbnail: Option<String>,
     cover_extension: Option<String>,
     cover_kind: Option<String>,
+    cover_reason: Option<String>,
     cover_members: Option<String>,
     bundled_preview: Option<String>,
     fallback_render: Option<String>,
@@ -73,6 +76,7 @@ impl CoverRow {
             thumbnail_path: resolve(self.cover_thumbnail),
             extension: self.cover_extension.unwrap_or_default(),
             kind: self.cover_kind.unwrap_or_default(),
+            preview_reason: self.cover_reason,
             bundled_preview: resolve(self.bundled_preview),
             fallback_render: resolve(self.fallback_render),
             member_ids: self
@@ -1237,6 +1241,7 @@ mod tests {
                 thumbnail_path: None,
                 extension: "png".into(),
                 kind: "texture".into(),
+                preview_reason: None,
                 bundled_preview: None,
                 fallback_render: None,
                 member_ids: Vec::new(),
@@ -1500,6 +1505,7 @@ mod tests {
             thumbnail_path: thumbnail.map(|t| format!("/libraries/a/{t}")),
             extension: "png".into(),
             kind: "texture".into(),
+            preview_reason: None,
             bundled_preview: None,
             fallback_render: None,
             member_ids: Vec::new(),

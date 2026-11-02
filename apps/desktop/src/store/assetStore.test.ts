@@ -709,6 +709,21 @@ describe('useAssetStore updateAssetPreview', () => {
     expect(s.assetAt(0)?.previewStatus).toBe('done');
   });
 
+  test('a failed job stores its reason, and a later preview clears it', async () => {
+    await loadAsset();
+    const reason = 'Too large to preview (29027 x 29027 px)';
+
+    useAssetStore.getState().failPreview('a1', reason);
+    expect(useAssetStore.getState().assetAt(0)?.previewStatus).toBe('error');
+    expect(useAssetStore.getState().assetAt(0)?.previewReason).toBe(reason);
+
+    useAssetStore.getState().setPreviewStatus('a1', 'pending');
+    expect(useAssetStore.getState().assetAt(0)?.previewReason).toBe(reason);
+
+    useAssetStore.getState().updateAssetPreview('a1', null);
+    expect(useAssetStore.getState().assetAt(0)?.previewReason).toBeUndefined();
+  });
+
   test('a new thumbnail replaces the stored path', async () => {
     await loadAsset();
 

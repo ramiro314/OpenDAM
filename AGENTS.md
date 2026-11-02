@@ -291,6 +291,14 @@ docs/plans                    Plans for this fork
   clears or renames a thumbnail deletes the old `_thumb` file before it updates the row. Libraries
   made before this rule lose their upscaled thumbnails once, in the background, through
   `thumb_cleanup.rs`, which records `thumbs_no_upscale` in the library's `library_meta` table.
+- **A raster past the decoder's limit stays without a preview.** `generate_image_thumb` reads
+  the size from the header, and the decoder refuses a raster past its memory limit before it
+  reads a pixel (`ImageError::Limits`). `preview::refuse_job` then ends the job, with no Python
+  fallback: it clears any thumbnail and stores the reason in `assets.preview_reason`
+  (`db::add_preview_columns`), never in `metadata`. The asset goes to `error`, because the
+  structure pass requeues every `none`, so nothing retries until the file changes or you ask
+  again. Any finished job clears the reason. The UI shows the reason and never loads an original
+  that has one (`imageOf`, `tileMedia`).
 - **One persistent Python worker.** The worker is a long-lived JSON-over-stdio daemon. Send it
   requests over the existing stream; one process serves every file. The queue starts it eagerly
   and asks each new process its `engine_info`, publishing the answer in

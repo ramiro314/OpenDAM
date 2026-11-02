@@ -110,6 +110,14 @@ pub struct Asset {
     pub thumbnail_path: Option<String>,
     #[serde(rename = "previewStatus")]
     pub preview_status: String,
+    /// Why the file stays without a preview, such as a raster too large to decode. The UI shows
+    /// this and never loads the original. Absent for any other file.
+    #[serde(
+        rename = "previewReason",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub preview_reason: Option<String>,
     pub metadata: HashMap<String, serde_json::Value>,
     /// For the main item of a format group, every member's extension, its own first: the card's
     /// badge (`GLB +2`). Absent for a file on its own.
