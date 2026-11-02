@@ -11,16 +11,18 @@ mod tests {
 
     use serde_json::{json, Value};
 
-    use crate::import::engine::tests::{setup, setup_with, Setup};
+    use crate::import::engine::tests::{setup, setup_with, whole_pass, Setup};
     use crate::import::engine::*;
     use crate::import::unitypackage::tests::{fixture, on_disk};
     use crate::import::unitypackage::SkipReason;
     use crate::import::unreal_glb::tests::{write_editor, write_version};
+    use crate::import::unreal_glb::STEP;
 
     const TARGET: &str = "Fab/unreal";
 
     /// A stub editor below `root`: each session logs itself and its `GLTF_BATCH` to
-    /// `sessions.log`, keeps a copy of the `.uproject` it opened as `uproject.<n>`, then writes
+    /// `sessions.log`, keeps a copy of the `.uproject` it opened as `uproject.<n>`, says how
+    /// many assets the project has and how many are left, as the script does, then writes
     /// a GLB for at most `GLTF_BATCH` of the project's `SM_*.uasset` files that have none in
     /// `GLTF_OUT` yet, and the number left to `.gltf-remaining`. The session numbered in a
     /// `stall` file, and every one after it, writes no GLB. An asset named in a `fail` file (by
@@ -40,6 +42,15 @@ cp "$1" '{r}/uproject.'$n
 case "$2" in -ExecutePythonScript=*) [ -f "${{2#-ExecutePythonScript=}}" ] || exit 3;; *) exit 4;; esac
 stall=$(cat '{r}/stall' 2>/dev/null || echo 999)
 content="$(dirname "$1")/Content"
+all=0; todo=0
+for asset in $(cd "$content" && find . -name 'SM_*.uasset' | sort); do
+  all=$((all + 1))
+  rel=${{asset#./}}; rel=${{rel%.uasset}}
+  [ -e "$GLTF_OUT/$rel.glb" ] && continue
+  grep -qx "/Game/$rel" "$GLTF_OUT/.gltf-failed" 2>/dev/null && continue
+  todo=$((todo + 1))
+done
+echo "LogPython: [gltf] $all assets, $todo left, exporting up to $GLTF_BATCH (stub)"
 made=0; wrote=0; left=0
 for asset in $(cd "$content" && find . -name 'SM_*.uasset' | sort); do
   rel=${{asset#./}}; rel=${{rel%.uasset}}
@@ -154,6 +165,48 @@ echo "$left" > "$GLTF_OUT/.gltf-remaining""#
             crate::export::hashes::sha256_file(path).unwrap(),
             std::fs::metadata(path).unwrap().modified().unwrap(),
         )
+    }
+
+    /// A finished run reads back what it exported, also when a rebuild exports nothing because
+    /// the cache holds it all.
+    #[tokio::test]
+    async fn a_run_reads_back_what_it_exported_even_from_the_cache() {
+        let s = setup_with(false).await;
+        let root = s.stub_unreal().await;
+        let run = s
+            .engine
+            .start_import(s.unreal_request("unreal.zip"))
+            .await
+            .unwrap();
+        tokio::spawn(s.engine.clone().start());
+        s.wait_for(&run.id, "done").await;
+        let exported = s.cached_glbs() as i64;
+        assert!(exported > 0);
+        // The live view gets one final figure, though the last asset's line and the step both
+        // say it.
+        assert_eq!(s.passes(&run.id, STEP), [whole_pass(exported as u64)]);
+        let figures = |run_id: String| {
+            let engine = s.engine.clone();
+            async move {
+                let runs = engine.list_runs("lib").await.unwrap();
+                let row = runs.into_iter().find(|r| r.id == run_id).unwrap();
+                (row.progress_done, row.progress_total)
+            }
+        };
+        assert_eq!(figures(run.id.clone()).await, (exported, exported));
+
+        let sessions_before = sessions(&root).len();
+        let pack_id = run.packs[0].pack_id.clone();
+        let rebuild = s
+            .engine
+            .rebuild_pack("lib", &pack_id, Vec::new())
+            .await
+            .unwrap();
+        s.wait_for(&rebuild.id, "done").await;
+        assert_eq!(sessions(&root).len(), sessions_before, "no editor ran");
+        let total = exported as u64;
+        assert_eq!(s.passes(&rebuild.id, STEP), [[(total, total)]]);
+        assert_eq!(figures(rebuild.id).await, (exported, exported));
     }
 
     /// A9: the step runs the editor in batches, resumes from the cache after a session that
@@ -424,6 +477,12 @@ echo "$left" > "$GLTF_OUT/.gltf-remaining""#
         );
         assert_eq!(s.cached_glbs(), 2);
         s.no_work_folder();
+
+        // SM_B counts as done, as the script's own count does, and the warning says it failed.
+        let row = s.engine.list_runs("lib").await.unwrap().remove(0);
+        assert_eq!((row.progress_done, row.progress_total), (3, 3));
+        assert_eq!(row.warnings.len(), 1);
+        assert_eq!(s.passes(&run.id, STEP), [whole_pass(3)]);
     }
 
     /// A project with a `Source/` folder is refused with the reason: by the scan, which offers

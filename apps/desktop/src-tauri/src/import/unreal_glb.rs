@@ -52,7 +52,7 @@ const PLUGINS: [&str; 2] = ["PythonScriptPlugin", "GLTFExporter"];
 /// The files of a project that come along as its docs, at its root or below `Content/`.
 const DOCS: [&str; 4] = ["txt", "md", "pdf", "rtf"];
 
-const STEP: &str = "exporting from Unreal";
+pub(super) const STEP: &str = "exporting from Unreal";
 const NO_PROJECT: &str = "The zip holds no Unreal project (.uproject)";
 
 /// The step's options: how many assets one editor session exports at most.
@@ -528,6 +528,13 @@ impl Export<'_> {
             Ok(files)
         })
         .await?;
+        // A finished export runs no editor, and a session's lines may not all have come.
+        let exported = (record.exported.len() + record.failed.len()) as u64;
+        (self.progress)(Progress {
+            step: STEP,
+            done: exported,
+            total: exported,
+        });
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let mut skipped = listing.skipped;
         skipped.extend(record.failed.iter().map(|game| SkippedEntry {
