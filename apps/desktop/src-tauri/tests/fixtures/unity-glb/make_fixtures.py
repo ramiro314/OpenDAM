@@ -135,9 +135,14 @@ class Pack:
 
 def stream(properties: dict[str, str], override: dict[str, str] | None = None) -> str:
     """A Shader Graph as Unity 2021 writes it: a stream of JSON objects, the graph, then one for
-    each property of `properties`, reference -> display name. `override` holds the references
-    set by hand: the generated one stays in `m_DefaultReferenceName`."""
+    each property of `properties`, reference -> display name, a color for a generated `Color_`
+    reference and a texture otherwise. `override` holds the references set by hand: the generated
+    one stays in `m_DefaultReferenceName`."""
     override = override or {}
+
+    def kind(ref: str) -> str:
+        return "Color" if ref.startswith("Color_") else "Texture2D"
+
     objects = [
         {
             "m_SGVersion": 3,
@@ -150,7 +155,7 @@ def stream(properties: dict[str, str], override: dict[str, str] | None = None) -
     for ref, shown in properties.items():
         objects.append(
             {
-                "m_Type": "UnityEditor.ShaderGraph.Internal.Texture2DShaderProperty",
+                "m_Type": f"UnityEditor.ShaderGraph.Internal.{kind(ref)}ShaderProperty",
                 "m_Name": shown,
                 "m_DefaultReferenceName": ref,
                 "m_OverrideReferenceName": override.get(ref, ""),
@@ -348,6 +353,11 @@ def main() -> None:
     pack.material("M_Wall", {"_BaseMap": pack.texture("T_Wall", BASE)})
 
     pack = Pack("twin-lower-case", ["mi_wall"])
+    pack.material("M_Wall", {"_BaseMap": pack.texture("T_Wall", BASE)})
+
+    # `SM_` is no `MI_`, so `M_Wall` is no twin of this slot.
+    pack = Pack("not-a-twin", ["SM_Wall"])
+    pack.material("SM_Wall", colors={"_BaseColor": TINT})
     pack.material("M_Wall", {"_BaseMap": pack.texture("T_Wall", BASE)})
 
     pack = Pack("twin-over-colours", ["MI_Wall"])

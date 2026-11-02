@@ -384,6 +384,17 @@ mod tests {
         }
     }
 
+    /// Only an `MI_X` has a twin: `SM_Wall` keeps its colour beside a textured `M_Wall`.
+    #[tokio::test]
+    async fn a_slot_not_named_mi_has_no_twin() {
+        let Some(glb) = convert("not-a-twin").await else {
+            return;
+        };
+        let m = glb.material("SM_Wall");
+        assert!(is_tint(&m.factor) && m.base.is_none(), "{m:?}");
+        assert_eq!(glb.images(), 0, "{m:?}");
+    }
+
     /// An `MI_X` with its own texture keeps it, though `M_X` has one too.
     #[tokio::test]
     async fn a_textured_mi_slot_keeps_its_own_texture() {

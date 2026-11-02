@@ -17,14 +17,14 @@
 }
 
 {
-    "m_Type": "UnityEditor.ShaderGraph.Internal.Texture2DShaderProperty",
+    "m_Type": "UnityEditor.ShaderGraph.Internal.ColorShaderProperty",
     "m_Name": "BaseColor",
     "m_DefaultReferenceName": "Color_a",
     "m_OverrideReferenceName": ""
 }
 
 {
-    "m_Type": "UnityEditor.ShaderGraph.Internal.Texture2DShaderProperty",
+    "m_Type": "UnityEditor.ShaderGraph.Internal.ColorShaderProperty",
     "m_Name": "Base Color",
     "m_DefaultReferenceName": "Color_b",
     "m_OverrideReferenceName": ""
