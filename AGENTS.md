@@ -282,12 +282,13 @@ docs/plans                    Plans for this fork
 - **`DELETE` journaling on library DBs.** Library DBs use rollback journaling because WAL's `-shm`
   locking is unreliable on network shares. Keep `SqliteJournalMode::Delete` in `db.rs`.
 - **Batched writes.** Database writes go in transactions of about 200 rows, as `watcher.rs` does.
-- **Rust-native raster decoding.** Standard rasters (jpg, png, tga, tif, bmp, webp) are decoded in
-  Rust with the `image` crate. Only formats Rust can't decode go to Python.
+- **Rust-native raster decoding.** Standard rasters (jpg, png, tga, tif, bmp, webp) and Radiance
+  `.hdr` are decoded in Rust with the `image` crate. A `.hdr` thumbnail is tone mapped as the
+  worker's `.exr` one is. Only formats Rust can't decode go to Python.
 - **No upscaled thumbnails.** `generate_image_thumb` reads a raster's size from its header first.
   Sources 512 px or smaller that the webview can display (png, jpg, jpeg, webp, bmp, gif) get no
-  thumbnail, and the UI shows the original, chosen by extension (`utils/media.ts`). Smaller TGA
-  and TIFF get a PNG at their own size. A changed raster gets a fresh preview job, and a job that
+  thumbnail, and the UI shows the original, chosen by extension (`utils/media.ts`). Smaller TGA,
+  TIFF and HDR get a PNG at their own size. A changed raster gets a fresh preview job, and a job that
   clears or renames a thumbnail deletes the old `_thumb` file before it updates the row. Libraries
   made before this rule lose their upscaled thumbnails once, in the background, through
   `thumb_cleanup.rs`, which records `thumbs_no_upscale` in the library's `library_meta` table.
