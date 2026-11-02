@@ -165,6 +165,41 @@ Do these first, in order. Steps 4 and 5 must finish before the version bump.
    Ruins. In the prototype 157 of those 184 GLBs changed bytes and 27 stayed identical, so it
    exercises both paths. Never rebuild the baseline or step 4's copy.
 
+To regenerate the baseline:
+
+1. Make a worktree at 63efa51, run `mise install && make deps`, and build the debug binary.
+2. Point `XDG_DATA_HOME` and `XDG_CACHE_HOME` at a new folder outside `~/.cache`, and set
+   `OPENDAM_NO_KEYRING=1`, `OPENDAM_PYTHON` and `OPENDAM_WORKER` to that worktree's preview engine.
+3. Launch once to create the master DB, then add libraries `unity`, `fab` and `kenney` to its
+   `libraries` table, with roots under that folder.
+4. Serve a page on port 1420 from a small local server, and run the binary under
+   `scripts/memory-cap.sh` inside `dbus-run-session -- env -u DISPLAY kwin_wayland --virtual
+   --no-lockscreen --width 1400 --height 900 --socket <name> --exit-with-session <script>`.
+5. For each pack below, the page calls `scan_import` with `libraryId` and `originalPath`, takes the
+   offer whose `layout` matches and its first candidate, and calls `start_import` with
+   `libraryId`, `originalPath`, `target` (`<publisher>/<name>`), `publisher`, `preset`, and the
+   ticked variant's `variant` and `subpath`. It polls `list_import_runs` until none is queued or
+   running.
+
+The packs, each with its library, offer and publisher:
+
+| Original | Library, offer | Publisher |
+|---|---|---|
+| `~/Documents/AssetOriginals/Fab/StylizedWizardRoom.zip` | `fab`, `fab` | Stylarts |
+| `.../Fab/StylizedVillage.zip` | `fab`, `fab` | Stylarts |
+| `.../Fab/SpookyCemeteryCrypt.zip` | `fab`, `fab` | Stylarts |
+| `.../Fab/StylizedElvenValley.zip` | `fab`, `fab` | Stylarts |
+| `.../Fab/StylizedLostCave.zip` | `fab`, `fab` | Stylarts |
+| `.../Fab/AncientRuins.zip` | `fab`, `fab` | Leartes Studios |
+| Unity cache, `Elven Long Bow.unitypackage` | `unity`, `unity` | Manuel Wieser |
+| Unity cache, `POLYGON - Prototype Pack - Art by Synty.unitypackage` | `unity`, `unity` | Synty Studios |
+| Unity cache, `Fantasy Adventure Environment.unitypackage` | `unity`, `unity` | Staggart Creations |
+| Unity cache, `The Big Castle Kit.unitypackage` | `unity`, `unity` | Triplebrick |
+| Unity cache, `Medieval Houses Modular Vol 1.unitypackage` | `unity`, `unity` | GameAssetFactory |
+
+The Unity cache is `~/.local/share/unity3d/Asset Store-5.x`. If a regenerated baseline's counts
+differ from the Now column, stop and report it.
+
 ### Captured before thumbnails
 
 Steps 4 and 5 ran on 2026-11-01, so this is where the later Piece 1 ticket and the gate find their
@@ -213,41 +248,6 @@ What the capture found:
   Piece 2 sets the map's prefix. It builds with that prefix in the map.
 - **Some packs lack a category.** Wizard Room has no foliage, Lost Cave no roofs, and Fantasy
   Adventure no walls or roofs, so those lists show what the pack has instead.
-
-To regenerate the baseline:
-
-1. Make a worktree at 63efa51, run `mise install && make deps`, and build the debug binary.
-2. Point `XDG_DATA_HOME` and `XDG_CACHE_HOME` at a new folder outside `~/.cache`, and set
-   `OPENDAM_NO_KEYRING=1`, `OPENDAM_PYTHON` and `OPENDAM_WORKER` to that worktree's preview engine.
-3. Launch once to create the master DB, then add libraries `unity`, `fab` and `kenney` to its
-   `libraries` table, with roots under that folder.
-4. Serve a page on port 1420 from a small local server, and run the binary under
-   `scripts/memory-cap.sh` inside `dbus-run-session -- env -u DISPLAY kwin_wayland --virtual
-   --no-lockscreen --width 1400 --height 900 --socket <name> --exit-with-session <script>`.
-5. For each pack below, the page calls `scan_import` with `libraryId` and `originalPath`, takes the
-   offer whose `layout` matches and its first candidate, and calls `start_import` with
-   `libraryId`, `originalPath`, `target` (`<publisher>/<name>`), `publisher`, `preset`, and the
-   ticked variant's `variant` and `subpath`. It polls `list_import_runs` until none is queued or
-   running.
-
-The packs, each with its library, offer and publisher:
-
-| Original | Library, offer | Publisher |
-|---|---|---|
-| `~/Documents/AssetOriginals/Fab/StylizedWizardRoom.zip` | `fab`, `fab` | Stylarts |
-| `.../Fab/StylizedVillage.zip` | `fab`, `fab` | Stylarts |
-| `.../Fab/SpookyCemeteryCrypt.zip` | `fab`, `fab` | Stylarts |
-| `.../Fab/StylizedElvenValley.zip` | `fab`, `fab` | Stylarts |
-| `.../Fab/StylizedLostCave.zip` | `fab`, `fab` | Stylarts |
-| `.../Fab/AncientRuins.zip` | `fab`, `fab` | Leartes Studios |
-| Unity cache, `Elven Long Bow.unitypackage` | `unity`, `unity` | Manuel Wieser |
-| Unity cache, `POLYGON - Prototype Pack - Art by Synty.unitypackage` | `unity`, `unity` | Synty Studios |
-| Unity cache, `Fantasy Adventure Environment.unitypackage` | `unity`, `unity` | Staggart Creations |
-| Unity cache, `The Big Castle Kit.unitypackage` | `unity`, `unity` | Triplebrick |
-| Unity cache, `Medieval Houses Modular Vol 1.unitypackage` | `unity`, `unity` | GameAssetFactory |
-
-The Unity cache is `~/.local/share/unity3d/Asset Store-5.x`. If a regenerated baseline's counts
-differ from the Now column, stop and report it.
 
 ### How a slot finds its texture
 
