@@ -615,30 +615,61 @@ pub(crate) async fn complete_job(
             .map_or((None, None), |(file, thumb): (String, Option<String>)| {
                 (Some(file), thumb)
             });
+    store_job_result(
+        pool,
+        root_path,
+        asset_id,
+        file_path,
+        previous_thumb,
+        rel_thumb,
+        model_path,
+        report,
+    )
+    .await
+}
+
+/// `complete_job`'s writes, given the `previous_thumb` it read. A render may land after that read,
+/// until the update below bumps the revision, so a kept picture is whatever the row holds by then:
+/// the update leaves `thumbnail_path` alone and reads it back, and no file is deleted.
+#[allow(clippy::too_many_arguments)]
+async fn store_job_result(
+    pool: &Pool<Sqlite>,
+    root_path: &Path,
+    asset_id: &str,
+    file_path: Option<String>,
+    previous_thumb: Option<String>,
+    rel_thumb: Option<String>,
+    model_path: Option<String>,
+    report: &EngineReport,
+) -> PreviewDone {
     let keeps_picture = model_path.is_some()
         && rel_thumb.as_deref().is_some_and(|t| t.ends_with(".glb"))
         && previous_thumb
             .as_deref()
             .is_some_and(|t| !t.is_empty() && !t.ends_with(".glb"));
-    let (status, rel_thumb) = if keeps_picture {
-        ("generating", previous_thumb.clone())
-    } else {
-        ("done", rel_thumb)
-    };
-    delete_replaced_thumb(pool, root_path, asset_id, rel_thumb.as_deref()).await;
+    let status = if keeps_picture { "generating" } else { "done" };
+    if !keeps_picture {
+        delete_replaced_thumb(pool, root_path, asset_id, rel_thumb.as_deref()).await;
+    }
+    let mut rel_thumb = rel_thumb;
     if let Some(ref model_path) = model_path {
         let rel_model = make_relative_path(root_path, Path::new(model_path));
-        let _ = sqlx::query(
-            "UPDATE assets SET preview_status = ?, thumbnail_path = ?, metadata = json_set(coalesce(nullif(metadata, ''), '{}'), '$.preview_model', ?), preview_version = ?, preview_textures = ?, preview_reason = NULL, preview_revision = preview_revision + 1 WHERE id = ?"
+        let stored: Option<Option<String>> = sqlx::query_scalar(
+            "UPDATE assets SET preview_status = ?, thumbnail_path = CASE WHEN ? THEN thumbnail_path ELSE ? END, metadata = json_set(coalesce(nullif(metadata, ''), '{}'), '$.preview_model', ?), preview_version = ?, preview_textures = ?, preview_reason = NULL, preview_revision = preview_revision + 1 WHERE id = ? RETURNING thumbnail_path"
         )
         .bind(status)
+        .bind(keeps_picture)
         .bind(&rel_thumb)
         .bind(&rel_model)
         .bind(report.version)
         .bind(&report.textures)
         .bind(asset_id)
-        .execute(pool)
-        .await;
+        .fetch_optional(pool)
+        .await
+        .unwrap_or_default();
+        if keeps_picture {
+            rel_thumb = stored.flatten().or_else(|| previous_thumb.clone());
+        }
     } else {
         let _ = sqlx::query(
             "UPDATE assets SET preview_status = 'done', thumbnail_path = ?, preview_version = ?, preview_textures = ?, preview_reason = NULL WHERE id = ?",
@@ -2413,6 +2444,42 @@ mod tests {
         assert!(saved.is_err());
         assert_eq!(thumb_files(root), ["m1_thumb.png"]);
         assert_eq!(thumb_and_status(&pool).await.0.as_deref(), Some(old));
+    }
+
+    #[tokio::test]
+    async fn a_render_landing_as_a_job_finishes_stays_the_kept_picture() {
+        let (dir, pool) = library_with_new_model().await;
+        let root = dir.path();
+        let (old, landed) = (
+            ".opendam/thumbs/m1_thumb.png".to_string(),
+            ".opendam/thumbs/m1_thumb.landed.png",
+        );
+        std::fs::write(root.join(landed), "landed").unwrap();
+        sqlx::query("UPDATE assets SET thumbnail_path = ?")
+            .bind(landed)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The job read `old` before the render saved `landed` and deleted it.
+        let done = store_job_result(
+            &pool,
+            root,
+            "m1",
+            None,
+            Some(old),
+            Some(GLB.to_string()),
+            Some(root.join(GLB).to_string_lossy().into_owned()),
+            &EngineReport::default(),
+        )
+        .await;
+
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(landed.to_string()), "generating".to_string())
+        );
+        assert!(root.join(landed).is_file(), "the row's picture stays");
+        assert_eq!(done.thumb_path.as_deref(), root.join(landed).to_str());
     }
 
     #[tokio::test]
