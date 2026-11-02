@@ -1194,7 +1194,7 @@ pub async fn get_asset(id: String, state: State<'_, Arc<AppState>>) -> Result<As
 }
 
 /// The files of the group asset `id` belongs to, for the detail panel: the main item first, then
-/// the others in the order the group picks its main item by (`structure::format_rank`), ties by
+/// the others in the order the group picks its main item by (`structure::member_rank`), ties by
 /// path ignoring case. A file on its own is listed alone.
 #[tauri::command]
 pub async fn get_group_members(
@@ -1230,7 +1230,7 @@ async fn group_members(lib: &LibraryHandle, id: &str) -> sqlx::Result<Vec<GroupM
     rows.sort_by_cached_key(|m| {
         (
             !m.is_main,
-            structure::format_rank(&m.row.extension),
+            structure::member_rank(&m.row.file_name, &m.row.extension),
             m.row.file_path.to_ascii_lowercase(),
             m.row.file_path.clone(),
         )
@@ -1666,12 +1666,13 @@ struct Move<'a> {
 /// reruns the library's structure pass. A file on its own takes `new_name`, with its extension
 /// added when the name has none, so a typed extension changes its format. A group's members take
 /// `new_name` as their stem, less the main item's extension if it ends with it, and each keeps
-/// its own extension (plan C21). Either way the bundled preview takes the new stem and keeps its
-/// extension. Inside an imported pack, each file's `.meta` is renamed right after it, and the
-/// renames are recorded as the pack's steps (`edits::record`) in the transaction that moves the
-/// rows. Nothing moves when a new name is taken, the pack's `datapackage.json` is among the
-/// files, or a run is building the pack, and a failed rename or row write puts the files already
-/// renamed back.
+/// its own extension (plan C21). In a group with `_LOD<n>` members, the stem also loses a final
+/// `_LOD<n>` of its own, and each file keeps its own. Either way the bundled preview takes the
+/// new stem and keeps its extension. Inside an imported pack, each file's `.meta` is renamed
+/// right after it, and the renames are recorded as the pack's steps (`edits::record`) in the
+/// transaction that moves the rows. Nothing moves when a new name is taken, the pack's
+/// `datapackage.json` is among the files, or a run is building the pack, and a failed rename or
+/// row write puts the files already renamed back.
 pub(crate) async fn rename_asset_with(
     db: &Database,
     id: &str,
@@ -1702,6 +1703,15 @@ pub(crate) async fn rename_asset_with(
         Some((_, ext)) => (format!("{stem}.{ext}"), f.extension.clone()),
         None => (stem.to_string(), f.extension.clone()),
     };
+    // A file's own `_LOD<n>`, as its name spells it
+    let lod_suffix = |f: &ItemFile| {
+        let stem = f
+            .file_name
+            .rsplit_once('.')
+            .map_or(f.file_name.as_str(), |(stem, _)| stem);
+        let base = structure::split_lod(stem).map_or(stem, |(base, _)| base);
+        stem[base.len()..].to_string()
+    };
     let names: Vec<(String, String)> = if files.iter().filter(|f| !f.is_render).count() == 1 {
         let old_ext = &main.extension;
         let (name, ext) = match trimmed.rsplit_once('.') {
@@ -1731,7 +1741,18 @@ pub(crate) async fn rename_asset_with(
         if stem.is_empty() {
             return Err("Asset file name cannot be empty, '.' or '..'".into());
         }
-        files.iter().map(|f| with_stem(f, stem)).collect()
+        if files
+            .iter()
+            .any(|f| !f.is_render && !lod_suffix(f).is_empty())
+        {
+            let base = structure::split_lod(stem).map_or(stem, |(base, _)| base);
+            files
+                .iter()
+                .map(|f| with_stem(f, &format!("{base}{}", lod_suffix(f))))
+                .collect()
+        } else {
+            files.iter().map(|f| with_stem(f, stem)).collect()
+        }
     };
     let paths: Vec<&str> = files.iter().map(|f| f.file_path.as_str()).collect();
     let sidecars = edits::prepare(&lib.pool, &lib.root_path, &paths, true)
@@ -3859,6 +3880,166 @@ mod tests {
             derived.bundled_previews,
             [(after[0].to_string(), after[1].to_string())]
         );
+    }
+
+    /// A model with no suffix and two levels, in two formats each, with its render.
+    const ROCK_LODS: [&str; 6] = [
+        "Kit/Models/Rock.glb",
+        "Kit/Models/Rock.obj",
+        "Kit/Models/Rock_LOD1.glb",
+        "Kit/Models/Rock_lod1.obj",
+        "Kit/Models/Rock_LOD2.glb",
+        "Kit/Previews/Rock.png",
+    ];
+
+    /// The names of `paths` with `Rock` replaced by `stem`.
+    fn rock_lods(stem: &str, paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|p| p.replace("Rock", stem)).collect()
+    }
+
+    #[tokio::test]
+    async fn renaming_an_lod_group_keeps_each_files_own_suffix() {
+        let (root, db, pool) = library_in_folders(&ROCK_LODS).await;
+
+        // The name as typed may repeat the main item's extension
+        let result = rename_asset_with(&db, ROCK_LODS[0], "Stone.glb", fs_rename).await;
+
+        let derived = crate::structure::tests::derived_rows(&pool).await;
+        let renamed = rock_lods("Stone", &ROCK_LODS);
+        let moved = renamed.iter().all(|p| root.join(p).exists());
+        let gone = ROCK_LODS.iter().any(|p| root.join(p).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(moved && !gone);
+        let after: Vec<&str> = renamed.iter().map(String::as_str).collect();
+        assert_eq!(derived, crate::structure::tests::fresh_pass(&after).await);
+        assert_eq!(
+            derived.bundled_previews,
+            [(renamed[0].clone(), renamed[5].clone())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_typed_lod_suffix_is_the_groups_own_not_a_second_one() {
+        let files = [
+            "Kit/Rock_LOD0.glb",
+            "Kit/Rock_LOD1.glb",
+            "Kit/Previews/Rock_LOD0.png",
+        ];
+        // The panel starts from the main item's name, so `Stone_LOD0` means the stem `Stone`,
+        // and so does any other level typed
+        for typed in ["Stone", "Stone_LOD0.glb", "Stone_lod3"] {
+            let (root, db, _pool) = library_in_folders(&files).await;
+            let result = rename_asset_with(&db, files[0], typed, fs_rename).await;
+            let disk = rock_lods("Stone", &files)
+                .iter()
+                .all(|p| root.join(p).exists());
+            std::fs::remove_dir_all(&root).unwrap();
+            assert_eq!(result, Ok(()), "{typed}");
+            assert!(disk, "{typed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn renaming_an_lod_group_to_its_own_name_moves_nothing() {
+        let files = ["Kit/Rock_LOD0.glb", "Kit/Rock_LOD1.glb"];
+        let (root, db, pool) = library_in_folders(&files).await;
+        let before = crate::structure::tests::derived_rows(&pool).await;
+
+        let result = rename_asset_with(&db, files[0], "Rock_LOD0.glb", fs_rename).await;
+
+        let after = crate::structure::tests::derived_rows(&pool).await;
+        let kept = files.iter().all(|p| root.join(p).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(kept);
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn an_lod_rename_onto_a_taken_level_moves_nothing() {
+        let files = [
+            "Kit/Rock_LOD0.glb",
+            "Kit/Rock_LOD1.glb",
+            "Kit/Stone_LOD1.glb",
+        ];
+        let (root, db, _pool) = library_in_folders(&files).await;
+
+        let result = rename_asset_with(&db, files[0], "Stone", fs_rename).await;
+
+        let kept = files.iter().all(|p| root.join(p).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            result,
+            Err("Nothing was renamed, because these names are taken: Kit/Stone_LOD1.glb".into())
+        );
+        assert!(kept);
+    }
+
+    #[tokio::test]
+    async fn a_lone_level_takes_the_new_name_as_it_is() {
+        let files = ["Kit/Rock_LOD2.glb"];
+        let (root, db, _pool) = library_in_folders(&files).await;
+
+        let result = rename_asset_with(&db, files[0], "Stone", fs_rename).await;
+
+        let renamed = root.join("Kit/Stone.glb").exists();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(renamed);
+    }
+
+    #[tokio::test]
+    async fn a_format_group_with_no_levels_keeps_a_typed_suffix() {
+        let files = ["Kit/Rock.glb", "Kit/Rock.fbx"];
+        let (root, db, _pool) = library_in_folders(&files).await;
+
+        let result = rename_asset_with(&db, files[0], "Stone_LOD1", fs_rename).await;
+
+        let renamed = ["Kit/Stone_LOD1.glb", "Kit/Stone_LOD1.fbx"]
+            .iter()
+            .all(|p| root.join(p).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(renamed);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_lod_group_trashes_every_level_and_lists_them_in_order() {
+        let (root, db, pool) = library_in_folders(&ROCK_LODS).await;
+        register_libraries(&db).await;
+        let lib = db.library_of_asset(ROCK_LODS[0]).await.unwrap().unwrap();
+        let members: Vec<String> = group_members(&lib, ROCK_LODS[0])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.asset.file_name)
+            .collect();
+
+        let result = delete_asset_with(&db, &lib, ROCK_LODS[4], true, |p: &Path| {
+            std::fs::remove_file(p)
+        })
+        .await;
+
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let gone = ROCK_LODS.iter().all(|p| !root.join(p).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            members,
+            [
+                "Rock.glb",
+                "Rock.obj",
+                "Rock_LOD1.glb",
+                "Rock_lod1.obj",
+                "Rock_LOD2.glb"
+            ]
+        );
+        assert!(gone);
+        assert_eq!(left, 0);
     }
 
     #[tokio::test]

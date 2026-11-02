@@ -456,6 +456,11 @@ impl FileKind {
         }
     }
 
+    /// The stem a model groups and matches its renders by: its own, less a final `_LOD<n>`.
+    fn model_stem(&self) -> &str {
+        split_lod(&self.stem).map_or(self.stem.as_str(), |(base, _)| base)
+    }
+
     fn stem_starts_with(&self, stems: &[&str]) -> bool {
         stems.iter().any(|s| self.stem.starts_with(s))
     }
@@ -494,8 +499,9 @@ impl FileKind {
 /// 3. **Support roles** (C10): in a pack's own folder, or in a marked folder inside a pack, docs
 ///    are `Doc` and `Preview*`/`Sample*` images are `Cover`. A `.mat` in `unity`, an imported
 ///    pack's Unity material, is `Unity` wherever it is.
-/// 4. **Format groups** (C11, `format_groups`): one model shipped in several formats, and the
-///    copies of a file under format folders, form one grid item led by its main item.
+/// 4. **Format groups** (C11, `format_groups`): one model shipped in several formats or `_LOD<n>`
+///    levels, and the copies of a file under format folders, form one grid item led by its main
+///    item.
 /// 5. **Bundled previews** (C12, `model_previews`): a render of a model is a `ModelPreview`
 ///    support file, and the model's main item records it: its first render by path that fits a
 ///    card (`fits`), else its first by path. `render_size` gives each render's size.
@@ -758,11 +764,11 @@ pub fn cover_allowed(pack: &str, path: &str) -> bool {
 
 /// The renders among `paths` (plan C12): an image in a folder named `Previews`, `Preview` or
 /// `Renders`, ignoring case, renders each model below that folder's parent whose lowercase stem
-/// equals its own. Each render becomes a `ModelPreview` support file in `roles`, and is returned
-/// with the models it renders, by input index. An image that already has a role, or renders no
-/// model, stays as it is. So does one the webview can't display itself (`.dds`, `.tga`): its
-/// card would show nothing whenever it has no thumbnail, while the model it renders lost its own
-/// place on the preview queue.
+/// equals its own, either less a final `_LOD<n>`. Each render becomes a `ModelPreview` support
+/// file in `roles`, and is returned with the models it renders, by input index. An image that
+/// already has a role, or renders no model, stays as it is. So does one the webview can't display
+/// itself (`.dds`, `.tga`): its card would show nothing whenever it has no thumbnail, while the
+/// model it renders lost its own place on the preview queue.
 fn model_previews(
     paths: &[&str],
     kinds: &[FileKind],
@@ -771,7 +777,7 @@ fn model_previews(
     let mut models: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, kind) in kinds.iter().enumerate() {
         if kind.is_model {
-            models.entry(kind.stem.as_str()).or_default().push(i);
+            models.entry(kind.model_stem()).or_default().push(i);
         }
     }
     let mut renders = Vec::new();
@@ -789,7 +795,7 @@ fn model_previews(
         }
         let below = format!("{parent}/");
         let rendered: Vec<usize> = models
-            .get(kind.stem.as_str())
+            .get(kind.model_stem())
             .into_iter()
             .flatten()
             .copied()
@@ -1263,6 +1269,29 @@ pub fn format_rank(ext: &str) -> usize {
         .unwrap_or(MAIN_FORMATS.len())
 }
 
+/// `stem` split at a final `_LOD<n>`, in any case: the name before it and its level. `None` for a
+/// stem with no such suffix, one with no separator (`RockLOD1`) or nothing before it (`_LOD1`).
+pub fn split_lod(stem: &str) -> Option<(&str, u32)> {
+    let digits = stem.trim_end_matches(|c: char| c.is_ascii_digit());
+    let (base, mark) = digits.split_at_checked(digits.len().checked_sub(4)?)?;
+    if base.is_empty() || !mark.eq_ignore_ascii_case("_lod") {
+        return None;
+    }
+    Some((base, stem[digits.len()..].parse().ok()?))
+}
+
+/// A model's place among its group's files, by its `file_name` and `extension`, lower is better:
+/// no `_LOD<n>` suffix, then each level from `_LOD0` up, each by `format_rank`.
+pub fn member_rank(file_name: &str, extension: &str) -> (Option<u32>, usize) {
+    let stem = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(stem, _)| stem);
+    (
+        split_lod(stem).map(|(_, level)| level),
+        format_rank(extension),
+    )
+}
+
 /// The format a folder named `name` holds copies in, if it is a format folder.
 fn format_folder(name: &str) -> Option<&'static str> {
     let name = name.to_ascii_lowercase();
@@ -1296,10 +1325,10 @@ fn strip_format_folders(dir: &str) -> (String, Option<usize>) {
 
 /// The format groups of `paths` (plan C11), as `Structure::groups` holds them:
 ///
-/// - **Models** group when their lowercase stems are equal, and so are their folders once
-///   format folders are taken out (`Models/GLB format/barrel.glb`, `Models/FBX format/barrel.fbx`),
-///   which includes models side by side in one folder. The main item has the best
-///   `format_rank`.
+/// - **Models** group when their lowercase stems are equal less a final `_LOD<n>` (`split_lod`),
+///   and so are their folders once format folders are taken out (`Models/GLB format/barrel.glb`,
+///   `Models/FBX format/barrel.fbx`), which includes models side by side in one folder. The main
+///   item has no suffix, else `_LOD0`, else the lowest level, then the best `format_rank`.
 /// - **Other files under format folders** group the same way when their extensions are equal
 ///   too, such as a kit's `colormap.png` copies. The main item is the copy under the best format
 ///   folder.
@@ -1312,16 +1341,22 @@ fn format_groups(
 ) -> Vec<Option<usize>> {
     // (folder without format folders, stem, extension of a copy that isn't a model)
     type Key<'k> = (String, &'k str, Option<&'k str>);
-    let mut candidates: HashMap<Key, Vec<(usize, usize)>> = HashMap::new();
+    // (level of a model with an `_LOD<n>` suffix, format)
+    type Rank = (Option<u32>, usize);
+    let mut candidates: HashMap<Key, Vec<(Rank, usize)>> = HashMap::new();
     for (i, (path, kind)) in paths.iter().zip(kinds).enumerate() {
         if roles[i].is_some() {
             continue;
         }
         let (dir, best_folder) = strip_format_folders(split_dir(path).0);
         let (key, rank) = if kind.is_model {
-            ((dir, kind.stem.as_str(), None), format_rank(&kind.ext))
+            let rank = member_rank(split_dir(path).1, &kind.ext);
+            ((dir, kind.model_stem(), None), rank)
         } else if let Some(rank) = best_folder {
-            ((dir, kind.stem.as_str(), Some(kind.ext.as_str())), rank)
+            (
+                (dir, kind.stem.as_str(), Some(kind.ext.as_str())),
+                (None, rank),
+            )
         } else {
             continue;
         };
@@ -2116,7 +2151,7 @@ async fn apply_previews(
 
 /// The member that is previewed for its group, by index into `files`, for each group whose main
 /// item's format takes no preview, such as a `.blend` beside an `.obj`, and that isn't pictured
-/// (`Structure::pictured`): the previewable member that ranks first by format, then by path ignoring case. The
+/// (`Structure::pictured`): the previewable member that ranks first (`member_rank`), then by path ignoring case. The
 /// card shows its thumbnail (`commands::asset`'s `ASSET_COLUMNS`), and `preview::claim_jobs`
 /// lets its job through.
 fn preview_stand_ins(files: &[FileRow], structure: &Structure) -> HashSet<usize> {
@@ -2124,7 +2159,7 @@ fn preview_stand_ins(files: &[FileRow], structure: &Structure) -> HashSet<usize>
     let key = |i: usize| {
         let file = &files[i];
         (
-            format_rank(&file.extension),
+            member_rank(split_dir(&file.file_path).1, &file.extension),
             file.file_path.to_ascii_lowercase(),
             file.file_path.clone(),
         )
@@ -3484,6 +3519,118 @@ pub(crate) mod tests {
         ] {
             assert!(format_folder(name).is_none(), "{name}");
         }
+    }
+
+    #[test]
+    fn split_lod_takes_a_final_lod_suffix_in_any_case() {
+        assert_eq!(split_lod("Rock_LOD1"), Some(("Rock", 1)));
+        assert_eq!(split_lod("rock_lod0"), Some(("rock", 0)));
+        assert_eq!(split_lod("Rock_Lod12"), Some(("Rock", 12)));
+        assert_eq!(split_lod("a_LOD1_LOD2"), Some(("a_LOD1", 2)));
+        for stem in [
+            "Rock",
+            "RockLOD1",
+            "Rock-LOD1",
+            "Rock_LOD",
+            "Rock_LOD1a",
+            "Rock_LOD1.001",
+            "ivy_a_lod",
+            "_LOD1",
+            "LOD1",
+            "木_LOD",
+            "Rock_LOD99999999999",
+        ] {
+            assert_eq!(split_lod(stem), None, "{stem}");
+        }
+    }
+
+    #[test]
+    fn a_models_lod_files_are_one_item_led_by_the_file_with_no_suffix() {
+        let paths = [
+            "Meshes/SM_Walls2.glb",
+            "Meshes/SM_Walls2.obj",
+            "Meshes/SM_Walls2_LOD1.glb",
+            "Meshes/SM_Walls2_LOD1.obj",
+            "Meshes/SM_Walls2_lod2.glb",
+        ];
+        assert_eq!(groups_of(&paths), [paths.to_vec()]);
+    }
+
+    #[test]
+    fn with_no_plain_file_lod0_leads_then_the_lowest_level_by_number() {
+        let lod0 = ["a/X_LOD2.glb", "a/X_LOD0.obj", "a/x_lod1.glb"];
+        assert_eq!(
+            groups_of(&lod0),
+            [vec!["a/X_LOD0.obj", "a/X_LOD2.glb", "a/x_lod1.glb"]]
+        );
+        let lowest = ["a/X_LOD10.glb", "a/X_LOD2.fbx", "a/X_LOD3.glb"];
+        assert_eq!(
+            groups_of(&lowest),
+            [vec!["a/X_LOD2.fbx", "a/X_LOD10.glb", "a/X_LOD3.glb"]]
+        );
+    }
+
+    #[test]
+    fn levels_rank_before_formats_and_formats_within_a_level() {
+        // No suffix beats `_LOD0` whatever the format, and a level's GLB leads its other formats
+        let plain = ["a/X.obj", "a/X_LOD0.glb"];
+        assert_eq!(groups_of(&plain), [plain.to_vec()]);
+        let level = ["a/X_LOD1.fbx", "a/X_LOD1.glb", "a/X_LOD2.glb"];
+        assert_eq!(
+            groups_of(&level),
+            [vec!["a/X_LOD1.glb", "a/X_LOD1.fbx", "a/X_LOD2.glb"]]
+        );
+    }
+
+    #[test]
+    fn a_name_with_no_separator_a_lone_level_and_other_folders_stay_apart() {
+        assert!(grouped(&["a/RockLOD1.glb", "a/Rock.glb"]).is_empty());
+        assert!(grouped(&["a/Rock_LOD1.glb"]).is_empty());
+        assert!(grouped(&["a/Rock_LOD0.glb", "b/Rock_LOD1.glb"]).is_empty());
+        assert!(grouped(&["a/ivy_a_lod.glb", "a/ivy_a.glb"]).is_empty());
+        // Across format folders it is one folder, as every format group is
+        let split = ["a/GLB/Rock_LOD0.glb", "a/FBX/Rock_LOD1.fbx"];
+        assert_eq!(groups_of(&split), [split.to_vec()]);
+    }
+
+    #[test]
+    fn only_models_group_by_level() {
+        let paths = [
+            "a/GLB/T_LOD1.png",
+            "a/GLB/T_LOD0.png",
+            "a/T.tga",
+            "a/T_LOD1.tga",
+        ];
+        assert!(grouped(&paths).is_empty());
+    }
+
+    #[test]
+    fn a_render_matches_a_models_levels_by_stem_without_the_suffix() {
+        for (render, models) in [
+            (
+                "kit/Previews/Rock.png",
+                ["kit/Rock_LOD0.glb", "kit/Rock_LOD1.glb"],
+            ),
+            (
+                "kit/Previews/Rock_LOD0.png",
+                ["kit/Rock.glb", "kit/Rock_LOD1.glb"],
+            ),
+            (
+                "kit/Previews/Rock_LOD1.png",
+                ["kit/Rock.glb", "kit/Rock_LOD1.fbx"],
+            ),
+        ] {
+            let paths = [render, models[0], models[1]];
+            let structure = derive(paths);
+            assert_eq!(structure.roles[0], Some(SupportRole::ModelPreview));
+            assert_eq!(structure.groups, [None, Some(1), Some(1)]);
+            assert_eq!(structure.bundled_previews, [None, Some(0), None]);
+        }
+        // A lone level has its render too, and no level of another name does
+        let lone = derive(["kit/Previews/Rock.png", "kit/Rock_LOD2.glb"]);
+        assert_eq!(lone.bundled_previews, [None, Some(0)]);
+        let other = derive(["kit/Previews/RockLOD1.png", "kit/Rock.glb"]);
+        assert_eq!(other.roles[0], None);
     }
 
     #[test]
@@ -5121,6 +5268,45 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(rebuild(&pool, unmounted()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_lod_groups_members_leave_the_queue_and_a_stand_in_is_its_lowest_level() {
+        let paths = [
+            "Kit/Tree_LOD0.glb",
+            "Kit/Tree_LOD1.glb",
+            "Kit/Tree_LOD1.fbx",
+        ];
+        assert_eq!(groups_of(&paths), [paths.to_vec()]);
+        let pool = memory_library_pool().await;
+        for path in paths {
+            insert_with_preview(&pool, path, "pending").await;
+            add_job(&pool, path, "pending").await;
+        }
+        rebuild(&pool, unmounted()).await.unwrap();
+        assert_eq!(
+            previews(&pool).await,
+            (
+                pairs(&[
+                    (paths[0], "pending"),
+                    (paths[2], "none"),
+                    (paths[1], "none")
+                ]),
+                pairs(&[(paths[0], "pending")]),
+            )
+        );
+
+        // The `.blend` leads, so the lowest level stands in, whatever the other levels' formats
+        let paths = ["Kit/Bob.blend", "Kit/Bob_LOD2.glb", "Kit/Bob_LOD1.obj"];
+        assert_eq!(groups_of(&paths), [vec![paths[0], paths[1], paths[2]]]);
+        let pool = memory_library_pool().await;
+        insert_with_preview(&pool, paths[0], "none").await;
+        for path in &paths[1..] {
+            insert_with_preview(&pool, path, "pending").await;
+            add_job(&pool, path, "pending").await;
+        }
+        rebuild(&pool, unmounted()).await.unwrap();
+        assert_eq!(previews(&pool).await.1, pairs(&[(paths[2], "pending")]));
     }
 
     #[tokio::test]
@@ -6949,6 +7135,36 @@ pub(crate) mod tests {
         );
         // The GLB's rating, favorite and description; the FBX's color label, the GLB having none.
         assert_eq!(sedan_fields(&pool).await, each(&SEDAN, "2 green 1 sedan"));
+    }
+
+    #[tokio::test]
+    async fn levels_that_were_apart_share_their_metadata_once_they_group() {
+        let paths = ["Kit/Rock_LOD0.glb", "Kit/Rock_LOD1.glb"];
+        let pool = memory_library_pool().await;
+        for path in paths {
+            insert_path(&pool, path).await;
+        }
+        run(
+            &pool,
+            "INSERT INTO asset_tags (asset_id, tag_id) VALUES ('Kit/Rock_LOD1.glb', 'stone');
+             UPDATE assets SET rating = 3 WHERE file_name = 'Rock_LOD0.glb';
+             UPDATE assets SET rating = 5 WHERE file_name = 'Rock_LOD1.glb'",
+        )
+        .await;
+
+        rebuild(&pool, unmounted()).await.unwrap();
+
+        assert_eq!(
+            rows(&pool, "SELECT asset_id, tag_id FROM asset_tags").await,
+            each(&paths, "stone")
+        );
+        assert_eq!(
+            rows(&pool, "SELECT file_name, CAST(rating AS TEXT) FROM assets").await,
+            [
+                ("Rock_LOD0.glb".into(), "3".into()),
+                ("Rock_LOD1.glb".into(), "3".into())
+            ]
+        );
     }
 
     #[tokio::test]

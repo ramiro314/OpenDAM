@@ -357,7 +357,8 @@ pub(crate) fn exported_kind(item: &ItemRow, facts: Option<&Result<FbxFacts, Stri
 }
 
 /// The FBX each of `items` exports from (A5), by item id, for each that is a format group with
-/// an FBX member, or a lone FBX file, a group of one.
+/// an FBX member at the item's own LOD level (no `_LOD<n>` suffix is level 0), or a lone FBX
+/// file, a group of one.
 pub(crate) async fn exported_fbx_of(
     pool: &sqlx::Pool<sqlx::Sqlite>,
     items: &[ItemRow],
@@ -370,9 +371,20 @@ pub(crate) async fn exported_fbx_of(
     .bind(serde_json::to_string(&item_ids).expect("ids serialize"))
     .fetch_all(pool)
     .await?;
+    let level = |name: &str| {
+        let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+        structure::split_lod(stem).map_or(0, |(_, level)| level)
+    };
+    let levels: HashMap<&str, u32> = items
+        .iter()
+        .map(|item| (item.id.as_str(), level(&item.file_name)))
+        .collect();
     let mut fbx_paths: HashMap<&str, Vec<&str>> = HashMap::new();
     for (group, path) in &group_fbx {
-        fbx_paths.entry(group).or_default().push(path);
+        let name = path.rsplit('/').next().unwrap_or(path);
+        if levels.get(group.as_str()) == Some(&level(name)) {
+            fbx_paths.entry(group).or_default().push(path);
+        }
     }
     for item in items {
         if item.extension.eq_ignore_ascii_case("fbx") {
@@ -4328,6 +4340,64 @@ mod tests {
             ]
         );
         assert_eq!(facts.read_files(), [unity]);
+    }
+
+    /// An LOD group is one export item, its main item, and exports from an FBX at that item's
+    /// level, even when another level's sorts first or is the group's only FBX.
+    #[tokio::test]
+    async fn an_lod_group_exports_only_its_main_item_at_its_own_level() {
+        let f = fixture().await;
+        let fbx = fixture_bytes("Dungeon Props/Models/SM_Bench.fbx");
+        add_file(&f, "Kit/datapackage.json", br#"{"name": "kit"}"#).await;
+        // `X_LOD10.fbx` sorts before `X_LOD2.fbx`
+        add_file(&f, "Kit/Models/SM_Log_LOD2.glb", b"glTF").await;
+        add_file(&f, "Kit/Models/SM_Log_LOD2.fbx", &fbx).await;
+        add_file(&f, "Kit/Models/SM_Log_LOD10.fbx", &fbx).await;
+        // `_LOD0` is the level of a file with no suffix
+        add_file(&f, "Kit/Models/SM_Rock.glb", b"glTF").await;
+        add_file(&f, "Kit/Models/SM_Rock_LOD0.fbx", &fbx).await;
+        add_file(&f, "Kit/Models/SM_Rock_LOD1.fbx", &fbx).await;
+        // Only a lower level has an FBX, which is no export of the main item
+        add_file(&f, "Kit/Models/SM_Bush.glb", b"glTF").await;
+        add_file(&f, "Kit/Models/SM_Bush_LOD1.fbx", &fbx).await;
+        let facts = Facts::fixture();
+        let report = check_domain_with(
+            &f,
+            &[
+                "Kit/Models/SM_Log_LOD2.glb",
+                "Kit/Models/SM_Rock.glb",
+                "Kit/Models/SM_Bush.glb",
+            ],
+            &facts,
+        )
+        .await;
+
+        let items: Vec<&str> = report
+            .assets
+            .iter()
+            .map(|a| a.asset.file_path.as_str())
+            .collect();
+        assert_eq!(
+            items,
+            [
+                "Kit/Models/SM_Bush.glb",
+                "Kit/Models/SM_Log_LOD2.glb",
+                "Kit/Models/SM_Rock.glb",
+            ]
+        );
+        let read = facts.read_files();
+        assert_eq!(
+            read,
+            ["Kit/Models/SM_Log_LOD2.fbx", "Kit/Models/SM_Rock_LOD0.fbx"]
+        );
+        assert_eq!(
+            messages(&report),
+            [
+                "Kit/Models/SM_Bush.glb: it has no FBX file: a model exports from its group's FBX",
+                "Kit/Models/SM_Log_LOD2.glb: its FBX Kit/Models/SM_Log_LOD2.fbx can't be read for export: no facts for Kit/Models/SM_Log_LOD2.fbx",
+                "Kit/Models/SM_Rock.glb: its FBX Kit/Models/SM_Rock_LOD0.fbx can't be read for export: no facts for Kit/Models/SM_Rock_LOD0.fbx",
+            ]
+        );
     }
 
     /// `Facts` that answers only once `reads` reads are in flight together.
