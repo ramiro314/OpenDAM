@@ -15,12 +15,21 @@
   let asked = false;
   let scan = null;
   let scanError = null;
+  let refused = [];
 
   // server.py sends every IPC call of the frontend's one call site through here.
   window.__gateInvoke = async (command, args, options) => {
     if (command === 'plugin:dialog|open') {
       asked = true;
       return picked;
+    }
+    if (command === 'start_import') {
+      try {
+        return await real(command, args, options);
+      } catch (e) {
+        refused.push(`${args.request.target}: ${e}`);
+        throw e;
+      }
     }
     if (command !== 'scan_import') return real(command, args, options);
     scan = null;
@@ -125,8 +134,17 @@
     const candidates = scan.offers[offer].candidates;
     await log('tree', { path: pack.path, candidates: candidates.map(brief) });
     await log('submit', { path: pack.path, label: submit.textContent });
+    refused = [];
     submit.click();
-    await until(() => !$('#import-dialog'), 'closed dialog', 3600);
+    // A refused pack leaves the dialog open, so stop waiting once Import is done with its packs.
+    await until(
+      () =>
+        !$('#import-dialog') ||
+        (refused.length > 0 && $('#import-submit')?.textContent !== 'Importing…'),
+      'closed dialog',
+      3600
+    );
+    if (refused.length > 0) throw new Error(`refused: ${refused.join('; ')}`);
     return candidates.filter((candidate) => candidate.ticked).length;
   }
 

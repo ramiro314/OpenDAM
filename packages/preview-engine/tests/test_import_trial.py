@@ -22,7 +22,9 @@ def executable(path: Path, text: str = "#!/bin/sh\nexit 0\n") -> None:
     path.chmod(0o755)
 
 
-def run_trial(tmp_path: Path, folder: Path) -> subprocess.CompletedProcess:
+def run_trial(
+    tmp_path: Path, folder: Path, stage: str | None = None
+) -> subprocess.CompletedProcess:
     repo = tmp_path / "repo"
     executable(repo / "apps/desktop/src-tauri/target/debug/opendam-desktop")
     executable(tmp_path / "bin/python3")
@@ -31,6 +33,9 @@ def run_trial(tmp_path: Path, folder: Path) -> subprocess.CompletedProcess:
         "PATH": f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}",
     }
     env.pop("TRIAL_PACKS", None)
+    env.pop("TRIAL_STAGE", None)
+    if stage:
+        env["TRIAL_STAGE"] = stage
     return subprocess.run([RUN, folder], env=env, capture_output=True, text=True, timeout=30)
 
 
@@ -64,3 +69,49 @@ def test_a_new_or_empty_folder_gets_past_the_check(tmp_path, exists):
     assert REFUSED not in result.stderr
     assert PAST_THE_CHECK in result.stderr
     assert (folder / "h").is_dir()
+
+
+def test_a_stage_opens_no_folder_the_script_did_not_make(tmp_path):
+    folder = tmp_path / "baseline"
+    (folder / "h").mkdir(parents=True)
+    sentinel = folder / "sentinel"
+    sentinel.write_text("keep me")
+
+    result = run_trial(tmp_path, folder, stage="kenney")
+
+    assert result.returncode == 1
+    assert REFUSED in result.stderr
+    assert PAST_THE_CHECK not in result.stderr
+    assert not (folder / "h/trial").exists()
+
+
+def test_a_profile_of_its_own_opens_under_a_new_stage(tmp_path):
+    folder = tmp_path / "trial"
+    (folder / "h").mkdir(parents=True)
+    (folder / "h/trial").touch()
+
+    assert PAST_THE_CHECK in run_trial(tmp_path, folder, stage="kenney").stderr
+
+
+def test_a_profile_never_runs_a_stage_twice(tmp_path):
+    folder = tmp_path / "trial"
+    (folder / "h").mkdir(parents=True)
+    (folder / "h/trial").touch()
+    (folder / "h/log-kenney.jsonl").write_text("{}\n")
+
+    result = run_trial(tmp_path, folder, stage="kenney")
+
+    assert result.returncode == 1
+    assert "already ran stage kenney" in result.stderr
+    assert PAST_THE_CHECK not in result.stderr
+
+
+def test_the_default_stage_never_reopens_a_profile(tmp_path):
+    folder = tmp_path / "trial"
+    (folder / "h").mkdir(parents=True)
+    (folder / "h/trial").touch()
+
+    result = run_trial(tmp_path, folder)
+
+    assert result.returncode == 1
+    assert REFUSED in result.stderr

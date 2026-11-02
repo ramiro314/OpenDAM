@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # Searches a gate profile for cap kills and OOM lines, stage by stage, and prints the memory peaks
-# the report quotes. It reads each stage's app log, and the journals for that stage's window and
-# scopes, so another worktree's scope can't count.
+# the report quotes. Each stage's window comes from the first and last timestamps of its own log,
+# h/log-<stage>.jsonl, so this works on any profile, across reboots. It reads that stage's app log,
+# the user journal for the stage's window and scopes, so another worktree's scope can't count, and
+# the kernel journal for the window, whose OOM lines name no trial, so one from anywhere stands
+# against the stage until a person explains it.
 #
 #   apps/desktop/scripts/import-trial/gate-caps.sh <trial folder>
 #
-# Each line of its table: a stage, then its boot (0 now, -1 the one before) and its window.
+# The exit status is 1 on a kill, an OOM line or a guard stop, and also when a stage can't be
+# checked: no timestamps, no app log, no scopes, or a journal that doesn't reach back to its window.
+# A check that couldn't look never reads as a clean stage.
 set -uo pipefail
+shopt -s nullglob
 
 if (($# != 1)); then
   echo "usage: $0 <trial folder>" >&2
@@ -14,27 +20,93 @@ if (($# != 1)); then
 fi
 h=$1/h
 kills='killed by the memory cap|killed at the .* memory cap|oom-kill|out of memory|exit(ed)? (code|status) 137'
-day=2026-11-02
-while read -r stage boot since until; do
-  log=$h/app-$stage.log
-  echo "== $stage ($since to $until, boot $boot)"
-  echo "app log matches: $(grep -ciE "$kills" "$log")"
-  grep -iE "$kills" "$log" | cut -c1-200 | head -5
-  mapfile -t pids < <(grep "stage=$stage " "$h/watch.log" | grep -oE 'opendam-capped-[0-9]+-' | sort -u)
-  scopes=$(IFS='|'; echo "${pids[*]}")
-  journal=$(journalctl --user -b "$boot" --since "$day $since" --until "$day $until" --no-pager 2>/dev/null)
-  echo "scopes: ${pids[*]}"
-  echo "user journal OOM lines for them: $(grep -E "$scopes" <<<"$journal" | grep -ciE 'oom')"
-  # The app's own stop_leftovers (capped.rs), after a child has ended. A cap kill shows above.
-  echo "scope clean-ups, client request: $(grep -E "$scopes" <<<"$journal" | grep -c 'on client request')"
-  echo "other kills: $(grep -E "$scopes" <<<"$journal" | grep -iE 'killed' | grep -vc 'on client request')"
-  echo "editor sessions the app says were killed: $(grep -c 'the Unreal Editor was' "$log")"
-  echo "kernel OOM lines in the window: $(journalctl -k -b "$boot" --since "$day $since" --until "$day $until" --no-pager 2>/dev/null | grep -ciE 'out of memory|oom-kill|oom_reaper')"
-  grep -E "$scopes" <<<"$journal" | grep -oE 'opendam-capped-.*Consumed.*' | sed -E 's/\.scope: Consumed .* wall clock time, / peak /' | sort -t' ' -k3 -h | tail -8
-  echo "guard stops: $(grep -c "low memory" <(grep -A1 "stage=$stage " "$h/watch.log"))"
-done <<'STAGES'
-packs -1 11:15:00 11:36:30
-lost-ruins -1 11:36:30 11:48:00
-kenney -1 11:48:00 12:40:30
-waterways 0 13:17:00 13:35:00
-STAGES
+status=0
+
+fail() {
+  echo "FAIL: $*"
+  status=1
+}
+
+# The Unix time of a journal's oldest entry.
+oldest() {
+  "$@" -q -o short-unix --no-pager 2>/dev/null | head -n 1 | cut -d. -f1
+}
+
+logs=("$h"/log-*.jsonl)
+[[ -f $h/log.jsonl ]] && logs+=("$h/log.jsonl")
+if ((${#logs[@]} == 0)); then
+  fail "no stage log in $h"
+fi
+user_oldest=$(oldest journalctl --user)
+kernel_oldest=$(oldest journalctl _TRANSPORT=kernel)
+
+for log in "${logs[@]}"; do
+  stage=$(basename "$log" .jsonl)
+  stage=${stage#log-}
+  [[ $stage == log ]] && stage=run
+  first=$(head -n 1 "$log" | grep -oE '^\{"t":[0-9]+' | grep -oE '[0-9]+$')
+  last=$(tail -n 1 "$log" | grep -oE '^\{"t":[0-9]+' | grep -oE '[0-9]+$')
+  if [[ -z $first || -z $last ]]; then
+    fail "$stage: its log has no timestamps, so it has no window"
+    continue
+  fi
+  since=$((first / 1000 - 60))
+  until=$((last / 1000 + 60))
+  echo "== $stage ($(date -d "@$since" '+%F %T') to $(date -d "@$until" '+%T'))"
+
+  app=$h/app-$stage.log
+  if [[ -f $app ]]; then
+    matches=$(grep -ciE "$kills" "$app")
+    echo "app log matches: $matches"
+    grep -iE "$kills" "$app" | cut -c1-200 | head -5
+    ((matches == 0)) || fail "$stage: the app log holds a cap kill"
+    killed=$(grep -c 'the Unreal Editor was' "$app")
+    echo "editor sessions the app says were killed: $killed"
+    ((killed == 0)) || fail "$stage: the app says an editor session was killed"
+  else
+    fail "$stage: no app log"
+  fi
+
+  if [[ -z $user_oldest || $user_oldest -gt $since ]]; then
+    fail "$stage: the user journal doesn't reach back to this window"
+  fi
+  if [[ -z $kernel_oldest || $kernel_oldest -gt $since ]]; then
+    fail "$stage: the kernel journal doesn't reach back to this window"
+  fi
+
+  mapfile -t prefixes < <(grep "stage=$stage " "$h/watch.log" 2>/dev/null |
+    grep -oE 'opendam-capped-[0-9]+-' | sort -u)
+  if ((${#prefixes[@]} == 0)); then
+    fail "$stage: watch.log names no scope of this stage"
+  else
+    scopes=$(
+      IFS='|'
+      echo "${prefixes[*]}"
+    )
+    echo "scopes: ${prefixes[*]}"
+    lines=$(journalctl --user --since "@$since" --until "@$until" --no-pager 2>/dev/null |
+      grep -E "$scopes")
+    [[ -n $lines ]] || fail "$stage: the user journal holds nothing of its scopes"
+    ooms=$(grep -ciE 'oom' <<<"$lines")
+    # The app's own stop_leftovers (capped.rs), after a child has ended. A cap kill shows above.
+    cleanups=$(grep -c 'on client request' <<<"$lines")
+    others=$(grep -iE 'killed' <<<"$lines" | grep -vc 'on client request')
+    echo "user journal OOM lines for them: $ooms"
+    echo "scope clean-ups, client request: $cleanups"
+    echo "other kills: $others"
+    ((ooms == 0)) || fail "$stage: the user journal holds an OOM line"
+    ((others == 0)) || fail "$stage: the user journal holds a kill"
+    grep -oE 'opendam-capped-.*Consumed.*' <<<"$lines" |
+      sed -E 's/\.scope: Consumed .* wall clock time, / peak /' | sort -t' ' -k3 -h | tail -8
+  fi
+
+  kernel=$(journalctl _TRANSPORT=kernel --since "@$since" --until "@$until" --no-pager 2>/dev/null |
+    grep -ciE 'out of memory|oom-kill|oom_reaper')
+  echo "kernel OOM lines in the window: $kernel"
+  ((kernel == 0)) || fail "$stage: the kernel journal holds an OOM line"
+
+  guard=$(grep -A1 "stage=$stage " "$h/watch.log" 2>/dev/null | grep -c 'low memory')
+  echo "guard stops: $guard"
+  ((guard == 0)) || fail "$stage: the memory guard stopped it"
+done
+exit "$status"

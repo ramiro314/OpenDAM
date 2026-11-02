@@ -8,7 +8,8 @@ isn't `done` with no error, the pack isn't built, or its files don't match: the 
 which a conversion's GLBs are apart from its files (an Unreal tree's is only an estimate, so there
 its GLBs must be above 0 and at most the estimate), the manifest's and the folder's. A run's
 warning fails its row too, as it can name a model that failed. The exit status is 1 when a row
-fails, or when the log shows a dialog that didn't start.
+fails, when the log shows a dialog that didn't start, or when the stage didn't finish: it has no
+pack, or no `done` line that is true, so a stage cut short never reads as clean.
 """
 
 import argparse
@@ -101,7 +102,8 @@ def check(candidate: dict, found, libs: Path) -> dict:
         problems.append("no run")
     else:
         row["run"] = run["status"]
-        row["seconds"] = round((run["finished_at"] - run["started_at"]) / 1000)
+        if run["started_at"] is not None and run["finished_at"] is not None:
+            row["seconds"] = round((run["finished_at"] - run["started_at"]) / 1000)
         warnings = json.loads(run["warnings"])
         row["warnings"] = len(warnings)
         if warnings:
@@ -161,7 +163,12 @@ def main() -> int:
     reasons = Counter(str(entry.get("reason")) for _, entry in skipped)
     for reason, count in reasons.most_common():
         print(f"  {count} {reason}", file=sys.stderr)
-    bad = errors or any(row["verdict"] != "pass" for row in rows)
+    finished = any(line["k"] == "done" and line["v"] is True for line in log)
+    if not finished:
+        print("the stage's log has no true `done` line", file=sys.stderr)
+    if not rows:
+        print("the stage's log names no pack", file=sys.stderr)
+    bad = errors or not finished or not rows or any(row["verdict"] != "pass" for row in rows)
     return 1 if bad else 0
 
 
