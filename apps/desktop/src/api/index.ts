@@ -62,6 +62,7 @@ import type {
   ImportSummary,
   ImportLocated,
   ImportTree,
+  ImportPipeline,
   PlaceStep,
 } from '../types';
 
@@ -271,6 +272,7 @@ export const api = {
     originalPath: string,
     variant: string | null,
     subpath: string | null,
+    pipeline: ImportPipeline | null,
     place: PlaceStep[],
     unreal = false
   ) =>
@@ -279,6 +281,7 @@ export const api = {
       originalPath,
       variant,
       subpath,
+      pipeline,
       place,
       unreal,
     }),

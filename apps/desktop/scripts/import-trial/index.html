@@ -42,6 +42,8 @@
         request.variant = variant.variant;
         if (variant.subpath) request.subpath = variant.subpath;
       }
+      const pipeline = candidate.pipelines.find((p) => p.ticked);
+      if (pipeline) request.pipeline = pipeline.pipeline;
       await log('started', { path: pack.path, run: await invoke('start_import', { request }) });
     }
 

@@ -165,6 +165,9 @@ describe('the steps', () => {
     expect(stepLabel(step('extract_unitypackage', { variant: 'URP.unitypackage' }))).toBe(
       'Extract URP.unitypackage'
     );
+    expect(stepLabel(step('extract_unitypackage', { pipeline: 'urp' }))).toBe(
+      'Extract the package, URP only'
+    );
     expect(stepLabel(step('extract_zip', { subpath: 'Models' }))).toBe(
       'Extract Models from the zip'
     );

@@ -66,7 +66,8 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               and takes, and the GLB of "Show as exported" (exported_view)
     src/import/               Pack import from originals (docs/plans/pack-import/plan.md): unitypackage,
                               the extract_unitypackage step, which unpacks a .unitypackage into a
-                              folder tree (every file and .meta, nested packages as folders), gives
+                              folder tree (every file and .meta, nested packages as folders, or
+                              one render pipeline's), gives
                               each file its source path and skips and reports unsafe and duplicate
                               entries, writing only regular files and folders (also from a variant
                               package read straight from a zip, `extract_variant`), zipfile, the
@@ -81,7 +82,16 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               Kenney packs, any zip) with presets, default targets and steps and
                               a preview of each build's tree, made by the same extract and place
                               code run over the archive's index (`list_*`, `place_listed`), which
-                              reads no file body and writes nothing,
+                              reads no file body and writes nothing. A `.unitypackage` whose nested
+                              packages name two or more render pipelines, so that choosing leaves
+                              one out, offers each, URP ticked, none ticked without one, and the
+                              extract step stores the choice as its `pipeline` option, so a
+                              Rebuild repeats it: the build keeps loose files and nested packages
+                              naming that pipeline, among others or alone, or none
+                              (`scan::keeps_package`). `scan::package_pipelines` reads a package's
+                              file name, stricter than `scan::pipeline`, which only labels Fab
+                              variants: `Standard Assets` names no pipeline. A zip's variant is
+                              refused a pipeline,
                               records, the import tables (imports, import_packs, import_steps,
                               import_outputs, import_moves, import_runs) and the step edits and
                               rebuilds they refuse while a run for the pack is queued or running

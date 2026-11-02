@@ -35,6 +35,7 @@ use super::drift::{self, Chosen, KeptFile};
 use super::metadata::{self, KenneyLicense, Lookup, MetadataStep};
 use super::place::{place, PlaceStep};
 use super::records::{self, InsertedRows, ManifestRow, Origin, Output, Recipe};
+use super::scan;
 use super::unity_glb::{self, Conversion};
 use super::unitypackage::{extract_unitypackage, extract_variant, ExtractedFile, SkippedEntry};
 use super::unreal_glb;
@@ -344,6 +345,8 @@ enum Extract {
     Unitypackage {
         variant: Option<String>,
         subpath: Option<String>,
+        /// The render pipeline a `.unitypackage` original keeps of its nested packages.
+        pipeline: Option<String>,
     },
     /// A zip original, or one folder of it.
     Zip { subpath: Option<String> },
@@ -411,9 +414,12 @@ impl Plan {
                             "A .unitypackage original has no variant".into()
                         });
                     }
+                    let pipeline = text("pipeline");
+                    scan::check_pipeline(zip, pipeline.as_deref())?;
                     extracts.push(Extract::Unitypackage {
                         variant,
                         subpath: text("subpath"),
+                        pipeline,
                     });
                 }
                 "extract_zip" if zip => extracts.push(Extract::Zip {
@@ -878,10 +884,17 @@ async fn stage(
                     Extract::Unitypackage {
                         variant: None,
                         subpath,
-                    } => extract_unitypackage(&original, &to, subpath.as_deref()),
+                        pipeline,
+                    } => extract_unitypackage(
+                        &original,
+                        &to,
+                        subpath.as_deref(),
+                        pipeline.as_deref(),
+                    ),
                     Extract::Unitypackage {
                         variant: Some(variant),
                         subpath,
+                        ..
                     } => extract_variant(&original, variant, &to, subpath.as_deref()),
                     Extract::Zip { subpath } => extract_zip(&original, &to, subpath.as_deref()),
                     Extract::Unreal(_) => unreachable!("exported above"),

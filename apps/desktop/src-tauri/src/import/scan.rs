@@ -11,7 +11,8 @@
 //! The rows of the plan's table it detects, each offered when it matches, so a zip matching
 //! several is offered as each:
 //! - a `.unitypackage` (Unity cache): one pack named after the file, whose publisher is the
-//!   folder below `Asset Store*/` in its path;
+//!   folder below `Asset Store*/` in its path. When its nested packages name two or more render
+//!   pipelines, it offers each as a choice, URP ticked, and the extract step keeps the ticked one;
 //! - a zip holding `.unitypackage` files (Fab): one pack named after the zip, in words
 //!   (`split_camel_case`), with every package and every pipeline-named top folder of one as a
 //!   variant, URP ticked;
@@ -86,11 +87,15 @@ pub struct Candidate {
     pub target_error: Option<String>,
     /// A Fab pack's variants, else none. At most one is ticked.
     pub variants: Vec<Variant>,
+    /// The render pipelines a Unity pack's nested packages name, when they name two or more,
+    /// else none. At most one is ticked.
+    pub pipelines: Vec<PipelineChoice>,
     /// An Unreal pack's `.uproject`, by its path in the zip.
     pub project: Option<String>,
     /// The default steps, the extract step naming the ticked variant's source.
     pub steps: Vec<StepRecord>,
-    /// The build's tree from the ticked source, or `None` while a Fab pack has no variant ticked.
+    /// The build's tree from the ticked source, or `None` while a Fab pack has no variant ticked
+    /// or a Unity pack no pipeline.
     pub tree: Option<Tree>,
 }
 
@@ -104,6 +109,17 @@ pub struct Variant {
     pub subpath: Option<String>,
     /// The render pipeline its name names: `urp`, `built-in` or `hdrp`.
     pub pipeline: Option<&'static str>,
+    pub ticked: bool,
+    pub tree: Tree,
+}
+
+/// A render pipeline a `.unitypackage`'s build can keep: its loose files, its nested packages
+/// naming this pipeline and those naming none.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineChoice {
+    /// `urp`, `built-in` or `hdrp`, as `pipeline` reads them.
+    pub pipeline: &'static str,
     pub ticked: bool,
     pub tree: Tree,
 }
@@ -227,14 +243,15 @@ fn preview(listing: Result<Extraction>, place: &[PlaceStep], convert: bool) -> T
 
 /// The tree of one source of `original`, of kind `kind`, placed by `place`: what the import
 /// dialog shows once you change a candidate's place steps. The source is a `.unitypackage`'s
-/// `subpath`, or a zip's `variant` package (and its `subpath`), else the zip's `subpath`. A
-/// package's tree counts the GLBs `unity_glb` would write, as `detect`'s do. With `unreal`, it is
+/// `subpath` for one `pipeline`, or a zip's `variant` package (and its `subpath`), else the zip's
+/// `subpath`. A package's tree counts the GLBs `unity_glb` would write, as `detect`'s do. With `unreal`, it is
 /// the estimate of the zip's Unreal project, as `detect` gives an Unreal pack's.
 pub fn preview_source(
     original: &Path,
     kind: &str,
     variant: Option<&str>,
     subpath: Option<&str>,
+    pipeline: Option<&str>,
     place: &[PlaceStep],
     unreal: bool,
 ) -> Tree {
@@ -253,7 +270,7 @@ pub fn preview_source(
         };
     }
     let listing = match (kind, variant) {
-        ("unitypackage", _) => list_unitypackage(original, subpath),
+        ("unitypackage", _) => list_unitypackage(original, subpath, pipeline),
         (_, Some(variant)) => list_variant(original, variant, subpath),
         (_, None) => index_zip(original).and_then(|index| index.list(subpath)),
     };
@@ -281,28 +298,152 @@ fn below_folder(extraction: &Extraction, folder: &str) -> Extraction {
     }
 }
 
+/// The files of `extraction` a build for `pipeline` keeps, as a listing for it would give them,
+/// so a scan offering pipelines reads the package once. Every file and skipped entry is read
+/// through the nested packages on its source path.
+fn for_pipeline(extraction: &Extraction, pipeline: &str) -> Extraction {
+    let kept = |source_path: &[String]| {
+        nested_packages(source_path).all(|package| keeps_package(package, Some(pipeline)))
+    };
+    Extraction {
+        files: extraction
+            .files
+            .iter()
+            .filter(|f| kept(&f.source_path))
+            .cloned()
+            .collect(),
+        skipped: extraction
+            .skipped
+            .iter()
+            .filter(|s| kept(&s.source_path))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// The nested packages a source path of a `.unitypackage` original goes through, outermost first.
+fn nested_packages(source_path: &[String]) -> impl Iterator<Item = &str> {
+    let chain = source_path.split_last().map_or(&[][..], |(_, chain)| chain);
+    chain.iter().map(String::as_str)
+}
+
+/// The render pipelines the nested packages of `extraction` name, URP first, when choosing among
+/// them would leave a package out. So one pipeline, or one package listing two, has no choice.
+fn nested_pipelines(extraction: &Extraction) -> Vec<&'static str> {
+    let packages: std::collections::BTreeSet<&str> = extraction
+        .files
+        .iter()
+        .flat_map(|f| nested_packages(&f.source_path))
+        .collect();
+    let named: std::collections::BTreeSet<&'static str> = packages
+        .iter()
+        .flat_map(|package| package_pipelines(package))
+        .collect();
+    let chooses = packages
+        .iter()
+        .any(|package| named.iter().any(|p| !keeps_package(package, Some(p))));
+    if !chooses {
+        return Vec::new();
+    }
+    PIPELINES
+        .into_iter()
+        .filter(|p| named.contains(p))
+        .collect()
+}
+
+/// The pipelines `pipeline` reads, in the order the dialog offers them.
+pub const PIPELINES: [&str; 3] = ["urp", "built-in", "hdrp"];
+
+/// Refuses a pipeline an original can't be built for: one `pipeline` doesn't read, or any for a
+/// zip's variant, which is already one pipeline's source.
+pub fn check_pipeline(zip: bool, chosen: Option<&str>) -> Result<(), String> {
+    let Some(chosen) = chosen else {
+        return Ok(());
+    };
+    if zip {
+        return Err("A zip's package has no pipeline choice: pick its variant".into());
+    }
+    if !PIPELINES.contains(&chosen) {
+        return Err(format!("{chosen:?} isn't a render pipeline"));
+    }
+    Ok(())
+}
+
+/// A `.unitypackage`'s file name without its folders and extension.
+fn package_stem(path: &str) -> &str {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file.rsplit_once('.').map_or(file, |(stem, _)| stem)
+}
+
+/// Every render pipeline a `.unitypackage`'s file name names, so `X_URP_HDRP` names two. This one
+/// decides what a build leaves out, so it is stricter than `pipeline`: `Standard` and `Universal`
+/// count only as a name's last word or before `Render`, `RP` or `Pipeline`, never in `Standard
+/// Assets`.
+fn package_pipelines(path: &str) -> Vec<&'static str> {
+    let words = name_words(package_stem(path));
+    let has = |word: &str| words.iter().any(|w| w == word);
+    let means_pipeline = |word: &str| {
+        words.iter().enumerate().any(|(i, w)| {
+            *w == word
+                && words
+                    .get(i + 1)
+                    .is_none_or(|next| ["render", "rp", "pipeline"].contains(&next.as_str()))
+        })
+    };
+    let mut named = Vec::new();
+    if has("urp") || means_pipeline("universal") {
+        named.push("urp");
+    }
+    if has("hdrp") {
+        named.push("hdrp");
+    }
+    if has("birp") || has("builtin") || means_pipeline("standard") || says_built_in(&words) {
+        named.push("built-in");
+    }
+    named
+}
+
+/// Whether a build for the pipeline `chosen` keeps the nested package at `path`: with no choice
+/// every one, else one naming that pipeline, among others or alone, or none.
+pub fn keeps_package(path: &str, chosen: Option<&str>) -> bool {
+    let Some(chosen) = chosen else {
+        return true;
+    };
+    let named = package_pipelines(path);
+    named.is_empty() || named.contains(&chosen)
+}
+
 /// The render pipeline a package's or folder's name names, read by its words:
 /// `URP`/`Universal`, `Built-In`/`BiRP`/`Standard`, `HDRP`.
 pub fn pipeline(name: &str) -> Option<&'static str> {
-    let lower = name.to_ascii_lowercase();
-    let words: Vec<&str> = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect();
+    let lower = name_words(name);
+    let words: Vec<&str> = lower.iter().map(String::as_str).collect();
     let has = |w: &str| words.contains(&w);
     if has("urp") || has("universal") {
         Some("urp")
     } else if has("hdrp") {
         Some("hdrp")
-    } else if has("birp")
-        || has("standard")
-        || has("builtin")
-        || words.windows(2).any(|p| p == ["built", "in"])
-    {
+    } else if has("birp") || has("standard") || has("builtin") || says_built_in(&words) {
         Some("built-in")
     } else {
         None
     }
+}
+
+/// A name's lower-case words.
+fn name_words(name: &str) -> Vec<String> {
+    name.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether `Built` comes right before `In` in `words`.
+fn says_built_in<S: AsRef<str>>(words: &[S]) -> bool {
+    words
+        .windows(2)
+        .any(|pair| pair[0].as_ref() == "built" && pair[1].as_ref() == "in")
 }
 
 fn place_steps(steps: &[PlaceStep]) -> impl Iterator<Item = StepRecord> + '_ {
@@ -401,15 +542,35 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
     if kind == "unitypackage" {
         let publisher = cache_publisher(original).unwrap_or_else(|| publisher.to_string());
         let place = [PlaceStep::Flatten];
-        let listing = list_unitypackage(original, None);
-        let mut steps = vec![step("extract_unitypackage", source(None, None))];
+        let listing = list_unitypackage(original, None, None);
+        let pipelines: Vec<PipelineChoice> = match &listing {
+            Ok(listing) => nested_pipelines(listing)
+                .into_iter()
+                .map(|pipeline| PipelineChoice {
+                    pipeline,
+                    ticked: pipeline == "urp",
+                    tree: preview(Ok(for_pipeline(listing, pipeline)), &place, true),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let ticked = pipelines.iter().find(|p| p.ticked);
+        let mut extract = source(None, None);
+        if let Some(choice) = ticked {
+            extract["pipeline"] = choice.pipeline.into();
+        }
+        let mut steps = vec![step("extract_unitypackage", extract)];
         steps.extend(place_steps(&place));
         steps.extend([unity_glb(), metadata("unity", &publisher)]);
         return Ok(vec![Offer {
             layout: "unity",
             candidates: vec![Candidate {
                 target: publisher_target(&publisher, &name),
-                tree: Some(preview(listing, &place, true)),
+                tree: match ticked {
+                    Some(choice) => Some(choice.tree.clone()),
+                    None if pipelines.is_empty() => Some(preview(listing, &place, true)),
+                    None => None,
+                },
                 name,
                 ticked: true,
                 preset: "unity",
@@ -417,6 +578,7 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
                 target_error: None,
                 target_follows_publisher: true,
                 variants: Vec::new(),
+                pipelines,
                 project: None,
                 steps,
             }],
@@ -457,6 +619,7 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
             target_error: None,
             target_follows_publisher: false,
             variants: Vec::new(),
+            pipelines: Vec::new(),
             project: None,
             steps,
         }],
@@ -483,7 +646,6 @@ fn fab(original: &Path, zip: &Extraction, name: &str, publisher: &str) -> Option
     let mut variants = Vec::new();
     for package in zip.files.iter().filter(|f| is_package(&f.path)) {
         let in_zip = package.source_path[0].as_str();
-        let file_name = package.path.rsplit('/').next().unwrap_or(&package.path);
         let listing = list_variant(original, in_zip, None);
         let folders: Vec<(String, &'static str)> = match &listing {
             Ok(listing) => {
@@ -509,7 +671,7 @@ fn fab(original: &Path, zip: &Extraction, name: &str, publisher: &str) -> Option
         variants.push(Variant {
             variant: in_zip.to_string(),
             subpath: None,
-            pipeline: pipeline(file_name.rsplit_once('.').map_or(file_name, |(s, _)| s)),
+            pipeline: pipeline(package_stem(in_zip)),
             ticked: false,
             tree: preview(listing, &place, true),
         });
@@ -552,6 +714,7 @@ fn fab(original: &Path, zip: &Extraction, name: &str, publisher: &str) -> Option
             target_error: None,
             target_follows_publisher: true,
             variants,
+            pipelines: Vec::new(),
             project: None,
             steps,
             tree,
@@ -592,6 +755,7 @@ fn unreal(index: &ZipIndex, zip: &Extraction, name: &str, publisher: &str) -> Op
             target_follows_publisher: true,
             target_error: None,
             variants: Vec::new(),
+            pipelines: Vec::new(),
             project: project.map(|p| p.path()),
             steps,
             tree: Some(tree),
@@ -736,6 +900,7 @@ fn kenney(index: &ZipIndex, zip: &Extraction, name: &str) -> Option<Offer> {
                 target_error: None,
                 target_follows_publisher: false,
                 variants: Vec::new(),
+                pipelines: Vec::new(),
                 project: None,
                 steps: vec![
                     step("extract_zip", source(None, subpath)),
@@ -759,7 +924,7 @@ fn kenney(index: &ZipIndex, zip: &Extraction, name: &str) -> Option<Offer> {
 mod tests {
     use super::*;
     use crate::import::place::place;
-    use crate::import::unitypackage::tests::{fixture, on_disk};
+    use crate::import::unitypackage::tests::{fixture, on_disk, package};
     use crate::import::unitypackage::{extract_unitypackage, extract_variant};
     use crate::import::zipfile::{extract_zip, list_zip};
 
@@ -836,7 +1001,7 @@ mod tests {
             ]
         );
         let expected = built(
-            |to| extract_unitypackage(&original, to, None),
+            |to| extract_unitypackage(&original, to, None, None),
             &flatten(),
             true,
         );
@@ -1133,7 +1298,7 @@ mod tests {
                 },
             ];
             let variant = Some("Crypt/Crypt.unitypackage");
-            preview_source(&original, "zip", variant, None, &place, false)
+            preview_source(&original, "zip", variant, None, None, &place, false)
         };
         let missing = preview("Art");
         assert_eq!(missing.warnings.len(), 1, "{missing:?}");
@@ -1480,7 +1645,7 @@ mod tests {
         let offers = detect(&original, "zip", "Fab").unwrap();
         let scanned = offers[0].candidates[0].tree.clone().unwrap();
         let preview =
-            |place: &[PlaceStep]| preview_source(&original, "zip", None, None, place, true);
+            |place: &[PlaceStep]| preview_source(&original, "zip", None, None, None, place, true);
         assert_eq!(preview(&unreal_place()), scanned);
         // Without hoist Meshes, the meshes stay in their folder, still an estimate.
         let flat = preview(&[PlaceStep::Flatten]);
@@ -1488,9 +1653,17 @@ mod tests {
         assert_eq!((flat.files, flat.glbs), (scanned.files, scanned.glbs));
         assert!(flat.folders.iter().any(|f| f.path == "Meshes"), "{flat:?}");
         // The project's refusal, and a zip without one, show as the tree's error.
-        let source = preview_source(&fixture("unreal-source.zip"), "zip", None, None, &[], true);
+        let source = preview_source(
+            &fixture("unreal-source.zip"),
+            "zip",
+            None,
+            None,
+            None,
+            &[],
+            true,
+        );
         assert!(source.error.unwrap().contains("has a Source/ folder"));
-        let none = preview_source(&fixture("kenney.zip"), "zip", None, None, &[], true);
+        let none = preview_source(&fixture("kenney.zip"), "zip", None, None, None, &[], true);
         assert_eq!(
             none.error.as_deref(),
             Some("the zip holds no Unreal project (.uproject)")
@@ -1573,7 +1746,7 @@ mod tests {
                 built(|to| extract_zip(&original, to, None), &flatten(), false)
             } else {
                 built(
-                    |to| extract_unitypackage(&original, to, None),
+                    |to| extract_unitypackage(&original, to, None, None),
                     &flatten(),
                     true,
                 )
@@ -1595,7 +1768,7 @@ mod tests {
                 folder: "Art".into(),
             },
         ];
-        let listing = list_unitypackage(&fixture("synthetic.unitypackage"), None);
+        let listing = list_unitypackage(&fixture("synthetic.unitypackage"), None, None);
         let tree = preview(listing, &steps, true);
         assert_eq!(
             tree.error.as_deref(),
@@ -1646,14 +1819,14 @@ mod tests {
             Some("Built-In/Built-In_Pack/Pack/Houses"),
         ] {
             let to = tmp.path().join(format!("u{}", subpath.unwrap_or("").len()));
-            let written = extract_unitypackage(&synthetic, &to, subpath).unwrap();
-            let listed = list_unitypackage(&synthetic, subpath).unwrap();
+            let written = extract_unitypackage(&synthetic, &to, subpath, None).unwrap();
+            let listed = list_unitypackage(&synthetic, subpath, None).unwrap();
             assert_eq!(listed.files, written.files, "{subpath:?}");
             assert_eq!(listed.skipped, written.skipped, "{subpath:?}");
         }
         let escape = fixture("escape.unitypackage");
-        let written = extract_unitypackage(&escape, &tmp.path().join("e"), None).unwrap();
-        let listed = list_unitypackage(&escape, None).unwrap();
+        let written = extract_unitypackage(&escape, &tmp.path().join("e"), None, None).unwrap();
+        let listed = list_unitypackage(&escape, None, None).unwrap();
         assert_eq!(
             (listed.files, listed.skipped),
             (written.files, written.skipped)
@@ -1683,8 +1856,22 @@ mod tests {
         // Errors match too: no file under the sub-folder.
         let err = list_zip(&fixture("kenney.zip"), Some("Nope")).unwrap_err();
         assert_eq!(err.to_string(), "the zip holds no file under Nope");
-        let err = list_unitypackage(&synthetic, Some("Nope")).unwrap_err();
+        let err = list_unitypackage(&synthetic, Some("Nope"), None).unwrap_err();
         assert_eq!(err.to_string(), "the package holds no file under Nope");
+
+        // A pipeline's listing is the whole one's, read through its source paths.
+        let pipelines = fixture("pipelines.unitypackage");
+        let whole = list_unitypackage(&pipelines, None, None).unwrap();
+        for pipeline in PIPELINES {
+            let to = tmp.path().join(pipeline);
+            let written = extract_unitypackage(&pipelines, &to, None, Some(pipeline)).unwrap();
+            let listed = list_unitypackage(&pipelines, None, Some(pipeline)).unwrap();
+            assert_eq!(listed.files, written.files, "{pipeline}");
+            assert_eq!(listed.skipped, written.skipped, "{pipeline}");
+            let filtered = for_pipeline(&whole, pipeline);
+            assert_eq!(filtered.files, written.files, "{pipeline}");
+            assert_eq!(filtered.skipped, written.skipped, "{pipeline}");
+        }
     }
 
     #[test]
@@ -1740,6 +1927,312 @@ mod tests {
         ] {
             assert_eq!(pipeline(name), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn a_nested_package_is_kept_when_it_names_the_choice_or_no_pipeline() {
+        let houses = "Assets/Pack/Medieval_Houses_URP_HDRP.unitypackage";
+        let built_in = "Assets/Pack/Medieval_Houses_Built-In.unitypackage";
+        let shaders = "Assets/Core/Shaders/Shaders URP 14x-17x.unitypackage";
+        let old = "Assets/Pack/Built-in Old Version TreeCreator.unitypackage";
+        let overlay = "Assets/Pack/HDRP.unitypackage";
+        let extras = "Assets/Pack/Extras.unitypackage";
+        for (path, urp) in [
+            (houses, true),
+            (shaders, true),
+            (built_in, false),
+            (old, false),
+            (overlay, false),
+            (extras, true),
+        ] {
+            assert_eq!(keeps_package(path, Some("urp")), urp, "{path}");
+            assert!(keeps_package(path, None), "{path}");
+        }
+        // A name listing two pipelines is kept for either.
+        assert!(keeps_package(houses, Some("hdrp")));
+        assert!(!keeps_package(houses, Some("built-in")));
+        // `Standard` and `Universal` name a pipeline only where they stand for one.
+        for path in [
+            "Assets/Standard Assets.unitypackage",
+            "Assets/Standard Materials.unitypackage",
+            "Assets/Universal Sounds.unitypackage",
+        ] {
+            assert_eq!(package_pipelines(path), Vec::<&str>::new(), "{path}");
+            assert!(keeps_package(path, Some("urp")), "{path}");
+        }
+        for (path, named) in [
+            ("Assets/Pack_Standard.unitypackage", "built-in"),
+            ("Assets/Standard.unitypackage", "built-in"),
+            ("Assets/Standard Render Pipeline.unitypackage", "built-in"),
+            ("Assets/Pack Standard RP.unitypackage", "built-in"),
+            ("Assets/Pack_Universal.unitypackage", "urp"),
+            ("Assets/Universal Render Pipeline.unitypackage", "urp"),
+        ] {
+            assert_eq!(package_pipelines(path), [named], "{path}");
+        }
+        // `pipeline`, which only labels a Fab variant, keeps its wider reading.
+        assert_eq!(pipeline("Standard Assets"), Some("built-in"));
+        // Words of the file name only: its folders don't count.
+        assert!(keeps_package(
+            "Assets/URP/Packs/Extras.unitypackage",
+            Some("hdrp")
+        ));
+    }
+
+    /// The tree a build for `pipeline` makes of the fixture `pipelines.unitypackage`.
+    fn pipeline_built(pipeline: &str) -> Tree {
+        let original = fixture("pipelines.unitypackage");
+        built(
+            |to| extract_unitypackage(&original, to, None, Some(pipeline)),
+            &flatten(),
+            true,
+        )
+    }
+
+    #[test]
+    fn a_package_of_several_pipelines_offers_each_with_urp_ticked() {
+        let original = fixture("pipelines.unitypackage");
+        let offers = detect(&original, "unitypackage", "Pub").unwrap();
+        let pack = &offers[0].candidates[0];
+        let choices: Vec<_> = pack
+            .pipelines
+            .iter()
+            .map(|p| (p.pipeline, p.ticked))
+            .collect();
+        assert_eq!(
+            choices,
+            [("urp", true), ("built-in", false), ("hdrp", false)]
+        );
+        assert_eq!(
+            pack.steps[0].options,
+            json!({ "pipeline": "urp" }),
+            "the extract step stores the choice"
+        );
+        assert_eq!(pack.tree.as_ref(), Some(&pack.pipelines[0].tree));
+
+        // Each choice's tree is what its build lands, what a listing for it gives, and what the
+        // dialog's preview asks for.
+        let place = flatten();
+        for choice in &pack.pipelines {
+            let name = choice.pipeline;
+            assert_eq!(choice.tree, pipeline_built(name), "{name}");
+            let tree = preview_source(
+                &original,
+                "unitypackage",
+                None,
+                None,
+                Some(name),
+                &place,
+                false,
+            );
+            assert_eq!(tree, choice.tree, "{name}");
+        }
+
+        let urp = &pack.pipelines[0].tree;
+        let folders: Vec<_> = urp.folders.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            folders,
+            [
+                "",
+                "Core",
+                "Core/Shaders",
+                "Core/Shaders/Shaders URP 12x",
+                "Core/Shaders/Shaders URP 14x-17x",
+                "Extras",
+                "Extras/Stumps_URP",
+                "Forest_URP",
+            ]
+        );
+        assert_eq!(urp.glbs, 2, "the URP tree and the extras' stump: {urp:?}");
+        // A loose file stays whatever its name reads as: the two loose files, their `.meta`
+        // files and `datapackage.json`.
+        assert_eq!(urp.folders[0].files, 5, "{urp:?}");
+        let listed = for_pipeline(&list_unitypackage(&original, None, None).unwrap(), "urp");
+        assert!(listed.files.iter().any(|f| f.path == "HDRP Manual.txt"));
+        // Only a kept package's skipped entry shows, as the build reports it.
+        let skipped: Vec<_> = urp.skipped.iter().map(|s| &s.source_path[1]).collect();
+        assert_eq!(skipped, ["../Escape_URP.txt"]);
+        assert!(pack.pipelines[1]
+            .tree
+            .folders
+            .iter()
+            .any(|f| f.path == "Forest_Built-In"));
+        assert!(pack.pipelines[2]
+            .tree
+            .folders
+            .iter()
+            .any(|f| f.path == "Core/Shaders/Shaders HDRP 12x"));
+    }
+
+    /// A `.unitypackage` of `Readme.txt`, a loose `HDRP Manual.txt` and one nested package per
+    /// name, each holding a file.
+    fn package_of(tmp: &Path, names: &[&str]) -> std::path::PathBuf {
+        use tar::EntryType::Regular;
+        let inner = package(&[
+            ("i/asset", Regular, b"x"),
+            ("i/pathname", Regular, b"Assets/Pack/x.txt"),
+        ]);
+        let pathnames: Vec<(String, String)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (format!("g{i}"), format!("Assets/Pack/{name}.unitypackage")))
+            .collect();
+        let members: Vec<(String, String, String)> = pathnames
+            .iter()
+            .map(|(guid, pathname)| {
+                let asset = format!("{guid}/asset");
+                (asset, format!("{guid}/pathname"), pathname.clone())
+            })
+            .collect();
+        let mut entries: Vec<(&str, tar::EntryType, &[u8])> = vec![
+            ("r/asset", Regular, b"readme"),
+            ("r/pathname", Regular, b"Assets/Pack/Readme.txt"),
+            ("m/asset", Regular, b"manual"),
+            ("m/pathname", Regular, b"Assets/Pack/HDRP Manual.txt"),
+        ];
+        for (asset, name, pathname) in &members {
+            entries.push((asset, Regular, &inner));
+            entries.push((name, Regular, pathname.as_bytes()));
+        }
+        let original = tmp.join("original.unitypackage");
+        std::fs::write(&original, package(&entries)).unwrap();
+        original
+    }
+
+    #[test]
+    fn a_package_of_one_pipeline_or_none_offers_no_choice() {
+        let tmp = tempfile::tempdir().unwrap();
+        for names in [
+            &[][..],
+            &["Extras"],
+            &["Pack_URP"],
+            &["Pack_HDRP", "Extras"],
+            &["Shaders URP 12x", "Shaders URP 14x-17x"],
+            // Listing two pipelines leaves nothing to choose: both keep it.
+            &["Pack_URP_HDRP"],
+            &["Pack_URP_HDRP", "Other_URP_HDRP"],
+            // These name no pipeline, so a real one stands alone.
+            &["Pack_URP", "Standard Assets"],
+            &["Pack_HDRP", "Universal Sounds"],
+        ] {
+            let original = package_of(tmp.path(), names);
+            let offers = detect(&original, "unitypackage", "").unwrap();
+            let pack = &offers[0].candidates[0];
+            assert!(pack.pipelines.is_empty(), "{names:?}");
+            assert_eq!(pack.steps[0].options, json!({}), "{names:?}");
+            let whole = built(
+                |to| extract_unitypackage(&original, to, None, None),
+                &flatten(),
+                true,
+            );
+            assert_eq!(pack.tree.as_ref(), Some(&whole), "{names:?}");
+        }
+    }
+
+    #[test]
+    fn pipelines_named_only_below_the_first_level_offer_a_choice() {
+        use tar::EntryType::Regular;
+        let tmp = tempfile::tempdir().unwrap();
+        let leaf = package(&[
+            ("i/asset", Regular, b"x"),
+            ("i/pathname", Regular, b"Assets/Leaf/x.txt"),
+        ]);
+        let middle = package(&[
+            ("u/asset", Regular, &leaf),
+            ("u/pathname", Regular, b"Assets/Mid/Leaf_URP.unitypackage"),
+            ("h/asset", Regular, &leaf),
+            ("h/pathname", Regular, b"Assets/Mid/Leaf_HDRP.unitypackage"),
+        ]);
+        let original = tmp.path().join("original.unitypackage");
+        let entries: [(&str, tar::EntryType, &[u8]); 4] = [
+            ("r/asset", Regular, b"readme"),
+            ("r/pathname", Regular, b"Assets/Pack/Readme.txt"),
+            ("m/asset", Regular, &middle),
+            ("m/pathname", Regular, b"Assets/Pack/Middle.unitypackage"),
+        ];
+        std::fs::write(&original, package(&entries)).unwrap();
+
+        let offers = detect(&original, "unitypackage", "").unwrap();
+        let pack = &offers[0].candidates[0];
+        let choices: Vec<_> = pack.pipelines.iter().map(|p| p.pipeline).collect();
+        assert_eq!(choices, ["urp", "hdrp"]);
+        for choice in &pack.pipelines {
+            let expected = built(
+                |to| extract_unitypackage(&original, to, None, Some(choice.pipeline)),
+                &flatten(),
+                true,
+            );
+            assert_eq!(choice.tree, expected, "{}", choice.pipeline);
+        }
+    }
+
+    #[test]
+    fn a_package_listing_two_pipelines_lands_for_either_and_offers_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let names = ["Pack_URP_HDRP", "Pack_Built-In", "Shaders_HDRP"];
+        let original = package_of(tmp.path(), &names);
+        let offers = detect(&original, "unitypackage", "").unwrap();
+        let pack = &offers[0].candidates[0];
+        let choices: Vec<_> = pack
+            .pipelines
+            .iter()
+            .map(|p| (p.pipeline, p.ticked))
+            .collect();
+        assert_eq!(
+            choices,
+            [("urp", true), ("built-in", false), ("hdrp", false)]
+        );
+        // Which nested packages each choice keeps, by source path, as `flatten` may move them.
+        let kept = |pipeline: &str| {
+            let listing = list_unitypackage(&original, None, Some(pipeline)).unwrap();
+            let packages = listing.files.iter().filter(|f| f.source_path.len() > 1);
+            let stems = packages.map(|f| package_stem(&f.source_path[0]).to_string());
+            stems.collect::<std::collections::BTreeSet<_>>()
+        };
+        let stems = |names: &[&str]| names.iter().map(|n| n.to_string()).collect();
+        assert_eq!(kept("hdrp"), stems(&["Pack_URP_HDRP", "Shaders_HDRP"]));
+        assert_eq!(kept("urp"), stems(&["Pack_URP_HDRP"]));
+        assert_eq!(kept("built-in"), stems(&["Pack_Built-In"]));
+        for choice in &pack.pipelines {
+            let expected = built(
+                |to| extract_unitypackage(&original, to, None, Some(choice.pipeline)),
+                &flatten(),
+                true,
+            );
+            assert_eq!(choice.tree, expected, "{}", choice.pipeline);
+        }
+    }
+
+    #[test]
+    fn a_package_of_several_pipelines_without_urp_ticks_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = package_of(tmp.path(), &["Pack_HDRP", "Pack_Built-In"]);
+        let offers = detect(&original, "unitypackage", "").unwrap();
+        let pack = &offers[0].candidates[0];
+        let choices: Vec<_> = pack
+            .pipelines
+            .iter()
+            .map(|p| (p.pipeline, p.ticked))
+            .collect();
+        assert_eq!(choices, [("built-in", false), ("hdrp", false)]);
+        assert_eq!(pack.steps[0].options, json!({}));
+        assert!(pack.tree.is_none());
+    }
+
+    #[test]
+    fn a_fab_zip_offers_no_pipeline_choice_and_refuses_one() {
+        for name in ["fab-unity.zip", "fab-unity-folders.zip"] {
+            let offers = detect(&fixture(name), "zip", "").unwrap();
+            assert!(offers
+                .iter()
+                .flat_map(|o| &o.candidates)
+                .all(|c| c.pipelines.is_empty()));
+        }
+        assert_eq!(check_pipeline(false, None), Ok(()));
+        assert_eq!(check_pipeline(true, None), Ok(()));
+        assert_eq!(check_pipeline(false, Some("built-in")), Ok(()));
+        assert!(check_pipeline(false, Some("URP")).is_err());
+        assert!(check_pipeline(true, Some("urp")).is_err());
     }
 
     #[test]

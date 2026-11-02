@@ -4,6 +4,8 @@ import type {
   ImportCandidate,
   ImportOffer,
   ImportPackSummary,
+  ImportPipeline,
+  ImportPipelineChoice,
   ImportPreset,
   ImportProgress,
   ImportRequest,
@@ -255,6 +257,12 @@ export function escapeClosesPanel(
 
 // ── The Import pack dialog's draft ────────────────────────────────────────
 
+export const PIPELINE_LABELS: Record<ImportPipeline, string> = {
+  urp: 'URP',
+  'built-in': 'Built-in',
+  hdrp: 'HDRP',
+};
+
 /** A candidate pack as the dialog edits it */
 export interface DraftCandidate {
   name: string;
@@ -270,6 +278,10 @@ export interface DraftCandidate {
   variants: ImportVariant[];
   /** The ticked variant, or null (none ticked, or no variants) */
   variant: number | null;
+  /** The render pipelines a Unity pack's nested packages name, when it can choose */
+  pipelines: ImportPipelineChoice[];
+  /** The ticked pipeline, or null (none ticked, or no choice) */
+  pipeline: ImportPipeline | null;
   /** The extract step's sub-folder of a zip, for a Kenney pack */
   subpath: string | null;
   flatten: boolean;
@@ -338,11 +350,15 @@ export function setHoist(draft: ImportDraft, i: number, on: boolean): ImportDraf
   return patchCandidate(draft, i, { hoistOn: on, hoist: folder });
 }
 
-/** The source of a candidate's tree: its ticked variant and sub-folder */
-function source(c: DraftCandidate): { variant: string | null; subpath: string | null } {
+/** The source of a candidate's tree: its ticked variant, sub-folder and pipeline */
+function source(c: DraftCandidate): {
+  variant: string | null;
+  subpath: string | null;
+  pipeline: ImportPipeline | null;
+} {
   const v = c.variant === null ? null : c.variants[c.variant];
-  if (v) return { variant: v.variant, subpath: v.subpath };
-  return { variant: null, subpath: c.subpath };
+  if (v) return { variant: v.variant, subpath: v.subpath, pipeline: null };
+  return { variant: null, subpath: c.subpath, pipeline: c.pipeline };
 }
 
 /** What a candidate's tree depends on: its source and place steps */
@@ -374,6 +390,8 @@ function draftCandidate(c: ImportCandidate): DraftCandidate {
     targetError: c.targetError,
     variants: c.variants,
     variant: variant >= 0 ? variant : null,
+    pipelines: c.pipelines,
+    pipeline: c.pipelines.find((p) => p.ticked)?.pipeline ?? null,
     subpath: c.variants.length ? null : ((extract?.options.subpath as string | undefined) ?? null),
     flatten,
     hoistOn: typeof hoist === 'string',
@@ -449,6 +467,21 @@ export function pickVariant(draft: ImportDraft, i: number, v: number): ImportDra
   });
 }
 
+/** Ticks pipeline `p` of candidate `i`, the one its build keeps of its nested packages */
+export function pickPipeline(draft: ImportDraft, i: number, p: number): ImportDraft {
+  const c = draft.candidates[i];
+  const pipelines = c.pipelines.map((choice, j) => ({ ...choice, ticked: j === p }));
+  const pipeline = pipelines[p].pipeline;
+  const next = { ...c, pipelines, pipeline };
+  // The scan's tree is for the place steps it proposed
+  const scanned = JSON.stringify(placeSteps(next)) === JSON.stringify(c.scannedPlace);
+  return patchCandidate(draft, i, {
+    pipelines,
+    pipeline,
+    ...(scanned ? { tree: pipelines[p].tree, treeKey: treeKey(next) } : {}),
+  });
+}
+
 /** Two targets that are the same or one holds the other, on whole path components */
 export function nests(a: string, b: string): boolean {
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
@@ -479,6 +512,7 @@ export function candidateProblem(draft: ImportDraft, i: number): string | null {
   );
   if (other) return `${target} would nest with ${cleanTarget(other.target)}, also ticked`;
   if (c.variants.length > 0 && c.variant === null) return 'Tick the variant to import';
+  if (c.pipelines.length > 0 && c.pipeline === null) return 'Tick the pipeline to import';
   if (c.hoistOn && !c.hoist.trim()) return 'Name the folder to move up';
   if (!treeCurrent(c)) return 'Previewing the steps…';
   if (c.tree?.error) return `The build would fail: ${c.tree.error}`;
@@ -497,7 +531,7 @@ export function draftProblem(draft: ImportDraft): string | null {
 
 /** The `start_import` request of candidate `c` */
 export function importRequest(draft: ImportDraft, c: DraftCandidate): ImportRequest {
-  const { variant, subpath } = source(c);
+  const { variant, subpath, pipeline } = source(c);
   const request: ImportRequest = {
     libraryId: draft.libraryId,
     originalPath: draft.originalPath,
@@ -508,6 +542,7 @@ export function importRequest(draft: ImportDraft, c: DraftCandidate): ImportRequ
   };
   if (variant) request.variant = variant;
   if (subpath) request.subpath = subpath;
+  if (pipeline) request.pipeline = pipeline;
   if (c.title.trim()) request.title = c.title.trim();
   if (c.version.trim()) request.version = c.version.trim();
   if (c.license.trim()) request.license = c.license.trim();
@@ -775,8 +810,9 @@ export const useImportStore = create<ImportStore>()((set, get) => {
       const c = draft?.candidates[i];
       if (!draft || !c || treeCurrent(c)) return;
       if (c.variants.length > 0 && c.variant === null) return;
+      if (c.pipelines.length > 0 && c.pipeline === null) return;
       const key = treeKey(c);
-      const { variant, subpath } = source(c);
+      const { variant, subpath, pipeline } = source(c);
       let tree: ImportTree;
       try {
         tree = await api.previewImport(
@@ -784,6 +820,7 @@ export const useImportStore = create<ImportStore>()((set, get) => {
           draft.originalPath,
           variant,
           subpath,
+          pipeline,
           placeSteps(c),
           c.unreal !== null
         );

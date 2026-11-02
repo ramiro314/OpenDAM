@@ -598,6 +598,40 @@ The list below doesn't cover two of these. The owner accepted them as recorded o
   IDs Unity hashes from the mesh's name. The `.meta` doesn't name them, and the one-list fallback
   can't apply to two meshes with two lists.
 
+### Pipeline choice result
+
+Measured on 2026-11-02 in a clean throwaway profile (`apps/desktop/scripts/import-trial/run.sh`,
+folder `~/.local/share/opendam-import-pipeline-trial-2`), with default steps:
+
+- **Runs.** Both ended `done`, with no error and no warning. Each extract step stores
+  `{"pipeline":"urp"}`.
+- **Medieval Houses.** It keeps its URP copy, 2.0 GB, with no `Built-In` file. `flatten` removes
+  `Medieval_Houses_Vol1_URP_HDRP/`, so the map's current prefix is empty. `SM_Plane_01` is textured
+  and the pack reaches 193 of 193.
+- **Nature Package.** It keeps its base content, `URP/` and both URP shader sets, 2.1 GB and 38 GLBs,
+  and skips `HDRP/`, the HDRP shader sets and the Built-In package. Its loose manuals stay, the HDRP
+  one included, because they are loose files. It has no baseline or floor: 24 of its 38 are fully
+  textured, and the others are mostly `billboards_All`.
+- **`glb_audit.py compare`.** It passed with this Medieval Houses over the 10 other packs of
+  `opendam-import-v5-trial-2`: every pack matches its count, no GLB is unmatched, the only absences
+  are the 193 Built-In GLBs, no map is lost, and the only geometry changes are the two expected.
+
+Where this differs from the plan as written:
+
+- **A package with no URP ticks nothing.** Two pipelines without URP open with none ticked and no
+  tree, and Import asks for one, as a Fab pack's variants do.
+- **The filter doesn't use `pipeline()` itself.** `pipeline()` gives one answer and takes any
+  `Standard` as Built-in. That only labels a Fab variant, but a filter on it would leave out content:
+  HDRP would drop `X_URP_HDRP`, and URP would drop `Standard Assets`. So `package_pipelines` reads
+  every pipeline a nested package's name lists, and takes `Standard` and `Universal` only as a
+  name's last word or before `Render`, `RP` or `Pipeline`. Medieval Houses therefore offers URP,
+  Built-in and HDRP, with URP and HDRP keeping the same files.
+- **A choice must leave something out.** The offer appears when choosing among the named pipelines
+  would leave a package out, so a lone `X_URP_HDRP` has no choice, though it names two.
+- **The scan reads a package once.** Each choice's tree filters the whole listing by source path
+  (`for_pipeline`), because Medieval Houses takes a full read of 2.9 GB per listing. A test keeps
+  it equal to a listing for that pipeline and to what the extraction writes.
+
 ### Leftovers
 
 Every GLB under its pack's full count must be explained by one of these:

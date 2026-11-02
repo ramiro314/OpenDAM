@@ -364,6 +364,71 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn a_rebuild_repeats_the_pipeline_the_import_chose() {
+        let s = setup().await;
+        let original = crate::import::unitypackage::tests::fixture("pipelines.unitypackage");
+        let mut request = s.request(vec![PlaceStep::Flatten]);
+        request.original_path = original.to_string_lossy().into_owned();
+        request.pipeline = Some("hdrp".into());
+        let run = s.engine.start_import(request).await.unwrap();
+        s.wait_for(&run.id, "done").await;
+        let pack_id = run.packs[0].pack_id.clone();
+
+        let lands = |path: &str| s.live().join(path).exists();
+        let check = || {
+            assert!(lands("Readme.txt"), "the loose files stay");
+            assert!(lands("Extras/Stump.obj"), "a package naming none stays");
+            assert!(lands("Forest_HDRP/Tree.obj"), "the chosen pipeline's stays");
+            assert!(lands("Core/Shaders/Shaders HDRP 12x/Pipeline.txt"));
+            assert!(!lands("Forest_URP"), "another pipeline's is skipped");
+            assert!(!lands("Forest_Built-In"));
+            assert!(!lands("Core/Shaders/Shaders URP 12x"));
+        };
+        check();
+        let tree = on_disk(&s.live());
+        assert_eq!(
+            s.strings("SELECT options FROM import_steps WHERE kind = 'extract_unitypackage'")
+                .await,
+            [r#"{"pipeline":"hdrp"}"#]
+        );
+
+        let build = s.current_build().await;
+        s.rebuild_until(&pack_id, "done").await;
+        assert_ne!(s.current_build().await, build, "a new build ran");
+        check();
+        assert_eq!(on_disk(&s.live()), tree);
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_needs_a_unitypackage_and_a_name_the_scan_offers() {
+        let s = setup().await;
+        let mut typed = s.request(vec![]);
+        typed.pipeline = Some("vulkan".into());
+        let err = s.engine.start_import(typed).await.unwrap_err();
+        assert_eq!(err, r#""vulkan" isn't a render pipeline"#);
+
+        let variant = Some("Crypt/Crypt_URP.unitypackage");
+        let mut fab = s.zip_request("fab-unity.zip", variant, None, "Fab/Crypt");
+        fab.pipeline = Some("urp".into());
+        let err = s.engine.start_import(fab).await.unwrap_err();
+        assert!(err.contains("no pipeline choice"), "{err}");
+
+        // A recipe that reaches the build another way is refused there too.
+        let extract = |kind: &str, options| records::Step {
+            kind: kind.into(),
+            enabled: true,
+            options,
+        };
+        let steps = [extract("extract_unitypackage", json!({ "pipeline": "x" }))];
+        assert!(build::check_steps("unitypackage", &steps).is_err());
+        let steps = [extract(
+            "extract_unitypackage",
+            json!({ "variant": "A.unitypackage", "pipeline": "urp" }),
+        )];
+        assert!(build::check_steps("zip", &steps).is_err());
+    }
+
+    #[tokio::test]
     async fn renames_that_swap_two_names_keep_each_file_s_row_and_tags() {
         let s = setup().await;
         let pack_id = s.import_golden().await;
