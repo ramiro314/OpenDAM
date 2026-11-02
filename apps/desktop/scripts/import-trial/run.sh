@@ -56,8 +56,8 @@ TRIAL_DIR=$(realpath "$1")
 reopening=
 if [[ -n $(ls -A "$TRIAL_DIR") ]]; then
   if [[ $stage == run || ! -e $TRIAL_DIR/h/trial ]]; then
-    echo "$TRIAL_DIR isn't empty. A trial only runs in a new folder, or in a profile of its own" \
-      "under a new TRIAL_STAGE." >&2
+    echo "$TRIAL_DIR isn't empty. A trial only runs in a new folder." \
+      "A profile this script made opens again under a new TRIAL_STAGE." >&2
     exit 1
   fi
   if [[ -e $TRIAL_DIR/h/log-$stage.jsonl ]]; then
