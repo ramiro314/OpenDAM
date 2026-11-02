@@ -3700,6 +3700,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_preview_for_a_pipeline_is_the_scan_s_tree_of_that_choice() {
+        let s = setup().await;
+        let original = fixture("pipelines.unitypackage")
+            .to_string_lossy()
+            .into_owned();
+        let scan = s.engine.scan("lib", &original).await.unwrap();
+        let preview = |pipeline: Option<&'static str>, place: Vec<PlaceStep>| {
+            s.engine
+                .preview_import("lib", &original, None, None, pipeline, place, false)
+        };
+        let choices = &scan.offers[0].candidates[0].pipelines;
+        assert_eq!(choices.len(), 3);
+        for choice in choices {
+            let place = vec![PlaceStep::Flatten];
+            let tree = preview(Some(choice.pipeline), place).await.unwrap();
+            assert_eq!(tree, choice.tree, "{}", choice.pipeline);
+        }
+        let whole = preview(None, vec![PlaceStep::Flatten]).await.unwrap();
+        assert!(whole.files > choices[0].tree.files, "{whole:?}");
+
+        let err = preview(Some("vulkan"), vec![]).await.unwrap_err();
+        assert_eq!(err, r#""vulkan" isn't a render pipeline"#);
+        let fab = fixture("fab-unity.zip").to_string_lossy().into_owned();
+        let err = s
+            .engine
+            .preview_import(
+                "lib",
+                &fab,
+                Some("Crypt/Crypt_URP.unitypackage"),
+                None,
+                Some("urp"),
+                vec![],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("no pipeline choice"), "{err}");
+    }
+
+    #[tokio::test]
     async fn a_preview_of_a_package_or_a_plain_zip_is_the_scan_s_tree_and_only_a_package_converts()
     {
         let s = setup().await;

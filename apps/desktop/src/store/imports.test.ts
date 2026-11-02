@@ -119,6 +119,26 @@ const fab: ImportCandidate = {
   tree: tree(4),
 };
 
+const choice = (pipeline: ImportPipeline, files: number, ticked = false) => ({
+  pipeline,
+  ticked,
+  tree: tree(files),
+});
+const unityPack = (pipelines: ImportPipelineChoice[]): ImportCandidate => ({
+  ...fab,
+  preset: 'unity',
+  variants: [],
+  pipelines,
+  steps: fab.steps.filter((s) => s.kind !== 'hoist'),
+  tree: pipelines.find((p) => p.ticked)?.tree ?? null,
+});
+const unityScan = (pipelines: ImportPipelineChoice[]): ImportScan => ({
+  originalPath: '/originals/Medieval.unitypackage',
+  kind: 'unitypackage',
+  offers: [{ layout: 'unity', candidates: [unityPack(pipelines)] }],
+  unavailable: {},
+});
+
 const kenney = (name: string, category: string, ticked = true): ImportCandidate => ({
   name,
   ticked,
@@ -639,26 +659,6 @@ describe('the draft', () => {
     expect(draftProblem(draft)).toBe('Forest: Tick the variant to import');
   });
 
-  const choice = (pipeline: ImportPipeline, files: number, ticked = false) => ({
-    pipeline,
-    ticked,
-    tree: tree(files),
-  });
-  const unityPack = (pipelines: ImportPipelineChoice[]): ImportCandidate => ({
-    ...fab,
-    preset: 'unity',
-    variants: [],
-    pipelines,
-    steps: fab.steps.filter((s) => s.kind !== 'hoist'),
-    tree: pipelines.find((p) => p.ticked)?.tree ?? null,
-  });
-  const unityScan = (pipelines: ImportPipelineChoice[]): ImportScan => ({
-    originalPath: '/originals/Medieval.unitypackage',
-    kind: 'unitypackage',
-    offers: [{ layout: 'unity', candidates: [unityPack(pipelines)] }],
-    unavailable: {},
-  });
-
   test('a Unity pack of several pipelines opens on URP and asks for what you tick', () => {
     let draft = draftFromScan(
       'lib',
@@ -988,6 +988,36 @@ describe('the dialog', () => {
     expect(await submitted).toBe(true);
     expect(requests.map((r) => r.target)).toEqual(['3D assets/Car Kit', 'Archive/Old Kit']);
     expect(useImportStore.getState().dialog).toBeNull();
+  });
+
+  test('a step edit previews the tree of the ticked pipeline', async () => {
+    await open(unityScan([choice('urp', 5, true), choice('built-in', 7)]));
+    const calls: unknown[] = [];
+    api.previewImport = async (_libraryId, _originalPath, variant, subpath, pipeline, place) => {
+      calls.push({ variant, subpath, pipeline, place });
+      return tree(8);
+    };
+    const store = useImportStore.getState();
+    store.edit((d) => pickPipeline(d, 0, 1));
+    store.edit((d) => patchCandidate(d, 0, { flatten: false }));
+    await store.refreshTree(0);
+    expect(calls).toEqual([{ variant: null, subpath: null, pipeline: 'built-in', place: [] }]);
+    const c = useImportStore.getState().draft!.candidates[0];
+    expect([c.tree?.files, treeCurrent(c)]).toEqual([8, true]);
+  });
+
+  test('a step edit previews nothing while no pipeline is ticked', async () => {
+    await open(unityScan([choice('built-in', 7), choice('hdrp', 9)]));
+    let calls = 0;
+    api.previewImport = async () => {
+      calls += 1;
+      return tree(8);
+    };
+    const store = useImportStore.getState();
+    store.edit((d) => patchCandidate(d, 0, { flatten: false }));
+    await store.refreshTree(0);
+    expect(calls).toBe(0);
+    expect(useImportStore.getState().draft!.candidates[0].tree).toBeNull();
   });
 
   test('a step edit previews the tree of the new steps', async () => {

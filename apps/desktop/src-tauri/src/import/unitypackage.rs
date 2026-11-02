@@ -1041,10 +1041,14 @@ pub(super) mod tests {
             "Core/T_Bark.png.meta",
             "Extras/Stump.obj",
             "Extras/Stump.obj.meta",
+            "Extras/Stumps_URP/Pipeline.txt",
+            "Extras/Stumps_URP/Pipeline.txt.meta",
             "Forest_URP/Pipeline.txt",
             "Forest_URP/Pipeline.txt.meta",
             "Forest_URP/Tree.obj",
             "Forest_URP/Tree.obj.meta",
+            "HDRP Manual.txt",
+            "HDRP Manual.txt.meta",
             "Readme.txt",
             "Readme.txt.meta",
         ];
@@ -1058,6 +1062,38 @@ pub(super) mod tests {
             ]
         );
 
+        // A package below a kept one is judged too, and only a kept package's skipped entries
+        // are reported.
+        assert_eq!(
+            source_of(&extraction, "Extras/Stumps_URP/Pipeline.txt"),
+            [
+                "Assets/Forest/Extras.unitypackage",
+                "Assets/Trees/Stumps_URP.unitypackage",
+                "Assets/Trees/Pipeline.txt"
+            ]
+        );
+        let skipped: Vec<_> = extraction
+            .skipped
+            .iter()
+            .map(|s| (s.source_path.as_slice(), s.reason))
+            .collect();
+        assert_eq!(
+            skipped,
+            [(
+                &[
+                    "Assets/Forest/Forest_URP.unitypackage".to_string(),
+                    "../Escape_URP.txt".to_string()
+                ][..],
+                SkipReason::Escapes
+            )]
+        );
+
+        // Everything below a skipped package goes with it, a package naming none included.
+        let target = tmp.path().join("hdrp");
+        let hdrp = extract_unitypackage(&original, &target, None, Some("hdrp")).unwrap();
+        assert!(paths(&hdrp).contains(&"Forest_HDRP/Bark/Bark.obj".to_string()));
+        assert!(!paths(&extraction).iter().any(|p| p.contains("Bark.obj")));
+
         // With no pipeline, every package lands, as it always has.
         let whole = extract_unitypackage(&original, &tmp.path().join("all"), None, None).unwrap();
         let folders: HashSet<&str> = whole
@@ -1065,7 +1101,14 @@ pub(super) mod tests {
             .iter()
             .filter_map(|f| f.path.rsplit_once('/').map(|(folder, _)| folder))
             .collect();
-        for folder in ["Forest_URP", "Forest_Built-In", "Forest_HDRP"] {
+        for folder in [
+            "Forest_URP",
+            "Forest_Built-In",
+            "Forest_HDRP",
+            "Forest_HDRP/Bark",
+            "Extras/Stumps_URP",
+            "Extras/Stumps_HDRP",
+        ] {
             assert!(folders.contains(folder), "{folders:?}");
         }
     }

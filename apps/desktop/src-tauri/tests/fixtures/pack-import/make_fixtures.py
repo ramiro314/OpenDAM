@@ -26,10 +26,12 @@ committed, like `tests/fixtures/game-export/`. The fixtures grow with the plan's
   `Assets/Crypt/` holds the same files under a wrapper per pipeline, `URP/URP_Crypt/` and
   `Built-In/Built-In_Crypt/`, beside a shared `Readme.txt`.
 - `pipelines.unitypackage`: a cached package with nested packages of three render pipelines, as
-  Nature Package is laid out: under the shared top folder `Forest/`, loose `Readme.txt` and
-  `Core/T_Bark.png`, `Forest_URP`, `Forest_Built-In` and `Forest_HDRP` packages with a `Tree.obj`
-  each, `Core/Shaders/` with one HDRP and two URP shader packages, and an `Extras` package naming
-  no pipeline.
+  Nature Package is laid out: under the shared top folder `Forest/`, loose `Readme.txt`,
+  `HDRP Manual.txt` (which only a package's name would filter) and `Core/T_Bark.png`,
+  `Forest_URP`, `Forest_Built-In` and `Forest_HDRP` packages with a `Tree.obj` and an escaping
+  pathname each, `Core/Shaders/` with one HDRP and two URP shader packages, and an `Extras`
+  package naming no pipeline. Packages nest a level further: `Extras` holds a URP and an HDRP
+  package, and `Forest_HDRP` a `Bark` package naming none.
 - `kenney.zip`: the Kenney All-in-1's layout under a shared top folder `Kenney/`:
   `<Category>/<Pack>/License.txt` with a Kenney header and CC0 text, for two packs and one under
   `Archive/`, with folder entries as zip tools write them. The pack titles have no kenney.nl page.
@@ -333,14 +335,25 @@ def fab_unity_folders() -> bytes:
 OBJ = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"
 
 
-def forest_nested(prefix: str, pipeline: str | None, model: str | None) -> bytes:
-    """A nested package with a `Pipeline.txt` naming `pipeline`, and `model`."""
+def forest_nested(
+    prefix: str,
+    pipeline: str | None,
+    model: str | None,
+    escapes: str | None = None,
+    nested: dict[str, bytes] | None = None,
+) -> bytes:
+    """A nested package with a `Pipeline.txt` naming `pipeline`, `model`, an entry escaping as
+    `../<escapes>`, which extraction skips, and each of `nested` as a package of its own."""
     pkg = Package()
     g = partial(guid, prefix)
     if pipeline:
         pkg.file(g(1), "Assets/Trees/Pipeline.txt", f"{pipeline}\n".encode())
     if model:
         pkg.file(g(2), f"Assets/Trees/{model}", OBJ)
+    if escapes:
+        pkg.file(g(3), f"../{escapes}", b"escapes\n")
+    for n, (name, package) in enumerate((nested or {}).items(), start=4):
+        pkg.file(g(n), f"Assets/Trees/{name}.unitypackage", package)
     return pkg.finish()
 
 
@@ -350,20 +363,23 @@ def pipelines() -> bytes:
     pkg.folder(g(1), "Assets/Forest")
     pkg.file(g(2), "Assets/Forest/Readme.txt", b"Forest, a pipelines fixture pack.\n")
     pkg.file(g(3), "Assets/Forest/Core/T_Bark.png", png((80, 60, 40, 255)), texture_meta(g(3)))
-    for n, (name, prefix, pipeline, model) in enumerate(
-        [
-            ("Forest_URP", "f2", "URP", "Tree.obj"),
-            ("Forest_Built-In", "f3", "Built-In", "Tree.obj"),
-            ("Forest_HDRP", "f4", "HDRP", "Tree.obj"),
-            ("Core/Shaders/Shaders HDRP 12x", "f5", "HDRP 12", None),
-            ("Core/Shaders/Shaders URP 12x", "f6", "URP 12", None),
-            ("Core/Shaders/Shaders URP 14x-17x", "f7", "URP 14", None),
-            ("Extras", "f8", None, "Stump.obj"),
-        ],
-        start=10,
-    ):
-        nested = forest_nested(prefix, pipeline, model)
-        pkg.file(g(n), f"Assets/Forest/{name}.unitypackage", nested)
+    pkg.file(g(4), "Assets/Forest/HDRP Manual.txt", b"The HDRP manual, a loose file.\n")
+    bark = forest_nested("f9", None, "Bark.obj")
+    stumps = {
+        "Stumps_URP": forest_nested("fa", "URP stumps", None),
+        "Stumps_HDRP": forest_nested("fb", "HDRP stumps", None),
+    }
+    packages = {
+        "Forest_URP": forest_nested("f2", "URP", "Tree.obj", "Escape_URP.txt"),
+        "Forest_Built-In": forest_nested("f3", "Built-In", "Tree.obj", "Escape_Built-In.txt"),
+        "Forest_HDRP": forest_nested("f4", "HDRP", "Tree.obj", "Escape_HDRP.txt", {"Bark": bark}),
+        "Core/Shaders/Shaders HDRP 12x": forest_nested("f5", "HDRP 12", None),
+        "Core/Shaders/Shaders URP 12x": forest_nested("f6", "URP 12", None),
+        "Core/Shaders/Shaders URP 14x-17x": forest_nested("f7", "URP 14", None),
+        "Extras": forest_nested("f8", None, "Stump.obj", nested=stumps),
+    }
+    for n, (name, package) in enumerate(packages.items(), start=10):
+        pkg.file(g(n), f"Assets/Forest/{name}.unitypackage", package)
     return pkg.finish()
 
 

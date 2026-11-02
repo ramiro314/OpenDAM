@@ -1971,10 +1971,19 @@ mod tests {
                 "Core/Shaders/Shaders URP 12x",
                 "Core/Shaders/Shaders URP 14x-17x",
                 "Extras",
+                "Extras/Stumps_URP",
                 "Forest_URP",
             ]
         );
         assert_eq!(urp.glbs, 2, "the URP tree and the extras' stump: {urp:?}");
+        // A loose file stays whatever its name reads as: the two loose files, their `.meta`
+        // files and `datapackage.json`.
+        assert_eq!(urp.folders[0].files, 5, "{urp:?}");
+        let listed = for_pipeline(&list_unitypackage(&original, None, None).unwrap(), "urp");
+        assert!(listed.files.iter().any(|f| f.path == "HDRP Manual.txt"));
+        // Only a kept package's skipped entry shows, as the build reports it.
+        let skipped: Vec<_> = urp.skipped.iter().map(|s| &s.source_path[1]).collect();
+        assert_eq!(skipped, ["../Escape_URP.txt"]);
         assert!(pack.pipelines[1]
             .tree
             .folders
@@ -1987,7 +1996,8 @@ mod tests {
             .any(|f| f.path == "Core/Shaders/Shaders HDRP 12x"));
     }
 
-    /// A `.unitypackage` of `Readme.txt` and one nested package per name, each holding a file.
+    /// A `.unitypackage` of `Readme.txt`, a loose `HDRP Manual.txt` and one nested package per
+    /// name, each holding a file.
     fn package_of(tmp: &Path, names: &[&str]) -> std::path::PathBuf {
         use tar::EntryType::Regular;
         let inner = package(&[
@@ -2009,6 +2019,8 @@ mod tests {
         let mut entries: Vec<(&str, tar::EntryType, &[u8])> = vec![
             ("r/asset", Regular, b"readme"),
             ("r/pathname", Regular, b"Assets/Pack/Readme.txt"),
+            ("m/asset", Regular, b"manual"),
+            ("m/pathname", Regular, b"Assets/Pack/HDRP Manual.txt"),
         ];
         for (asset, name, pathname) in &members {
             entries.push((asset, Regular, &inner));
@@ -2040,6 +2052,43 @@ mod tests {
                 true,
             );
             assert_eq!(pack.tree.as_ref(), Some(&whole), "{names:?}");
+        }
+    }
+
+    #[test]
+    fn pipelines_named_only_below_the_first_level_offer_a_choice() {
+        use tar::EntryType::Regular;
+        let tmp = tempfile::tempdir().unwrap();
+        let leaf = package(&[
+            ("i/asset", Regular, b"x"),
+            ("i/pathname", Regular, b"Assets/Leaf/x.txt"),
+        ]);
+        let middle = package(&[
+            ("u/asset", Regular, &leaf),
+            ("u/pathname", Regular, b"Assets/Mid/Leaf_URP.unitypackage"),
+            ("h/asset", Regular, &leaf),
+            ("h/pathname", Regular, b"Assets/Mid/Leaf_HDRP.unitypackage"),
+        ]);
+        let original = tmp.path().join("original.unitypackage");
+        let entries: [(&str, tar::EntryType, &[u8]); 4] = [
+            ("r/asset", Regular, b"readme"),
+            ("r/pathname", Regular, b"Assets/Pack/Readme.txt"),
+            ("m/asset", Regular, &middle),
+            ("m/pathname", Regular, b"Assets/Pack/Middle.unitypackage"),
+        ];
+        std::fs::write(&original, package(&entries)).unwrap();
+
+        let offers = detect(&original, "unitypackage", "").unwrap();
+        let pack = &offers[0].candidates[0];
+        let choices: Vec<_> = pack.pipelines.iter().map(|p| p.pipeline).collect();
+        assert_eq!(choices, ["urp", "hdrp"]);
+        for choice in &pack.pipelines {
+            let expected = built(
+                |to| extract_unitypackage(&original, to, None, Some(choice.pipeline)),
+                &flatten(),
+                true,
+            );
+            assert_eq!(choice.tree, expected, "{}", choice.pipeline);
         }
     }
 
