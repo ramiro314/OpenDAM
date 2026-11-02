@@ -10,7 +10,13 @@ export type TileMedia = 'bundled' | 'thumbnail' | 'fallback' | 'original' | 'vid
 
 type TileAsset = Pick<
   Asset,
-  'bundledPreview' | 'fallbackRender' | 'thumbnailPath' | 'filePath' | 'extension' | 'kind'
+  | 'bundledPreview'
+  | 'fallbackRender'
+  | 'thumbnailPath'
+  | 'filePath'
+  | 'extension'
+  | 'kind'
+  | 'previewReason'
 >;
 
 /** A pack's cover as the asset it is, for `tileMedia`. */
@@ -19,6 +25,7 @@ export const coverAsset = (cover: Cover) => ({
   thumbnailPath: cover.thumbnailPath ?? undefined,
   bundledPreview: cover.bundledPreview ?? undefined,
   fallbackRender: cover.fallbackRender ?? undefined,
+  previewReason: cover.previewReason ?? undefined,
 });
 
 /** The image the detail panel shows for a cover: as `imageOf` picks it, or a model's render. */
@@ -32,7 +39,8 @@ const ORDER: TileMedia[] = ['bundled', 'thumbnail', 'fallback', 'original'];
 
 /**
  * The media a tile shows for `asset`: its bundled preview, then its thumbnail, then its fallback
- * render, then the original if the webview can display it. `failed` is the media that failed to
+ * render, then the original if the webview can display it and it has no `previewReason`, since
+ * an image too large to decode would stall the webview too. `failed` is the media that failed to
  * load, and the tile falls back to the next one in that order, or from the original or a video to
  * the icon. `withVideo` lets a video show a frame (grid cards do, list rows don't).
  */
@@ -48,7 +56,10 @@ export function tileMedia(
       (media === 'bundled' && asset.bundledPreview) ||
       (media === 'thumbnail' && thumbnail) ||
       (media === 'fallback' && asset.fallbackRender) ||
-      (media === 'original' && isWebviewDisplayable(asset.extension) && asset.filePath)
+      (media === 'original' &&
+        !asset.previewReason &&
+        isWebviewDisplayable(asset.extension) &&
+        asset.filePath)
   );
   if (shown) return shown;
   if (withVideo && asset.kind === 'video' && asset.filePath) return 'video';

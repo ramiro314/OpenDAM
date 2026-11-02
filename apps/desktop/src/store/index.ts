@@ -300,6 +300,11 @@ interface AssetStore extends PageCache {
     render?: { filePath: string; previousThumbnailPath?: string }
   ) => void;
   setPreviewStatus: (id: string, status: Asset['previewStatus']) => void;
+  /**
+   * Marks a preview failed. With `reason`, why the file stays without one, its thumbnail goes too,
+   * as `preview::refuse_job` deleted it. Any other failure leaves the row's thumbnail.
+   */
+  failPreview: (id: string, reason?: string | null) => void;
   /** Bumps `path`'s revision in `modelRevisions` */
   bumpModelRevision: (path: string) => void;
   /** Re-fetches the given assets that are cached or pinned; other ids are ignored */
@@ -638,6 +643,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       ...asset,
       thumbnailPath: thumbnailPath ?? undefined,
       previewStatus: 'done',
+      previewReason: undefined,
       metadata: previewModel ? { ...asset.metadata, preview_model: previewModel } : asset.metadata,
     }));
     if (!render) return;
@@ -655,6 +661,15 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
 
   setPreviewStatus: (id, status) => {
     get().patchCached(id, (asset) => ({ ...asset, previewStatus: status }));
+  },
+
+  failPreview: (id, reason) => {
+    get().patchCached(id, (asset) => ({
+      ...asset,
+      previewStatus: 'error',
+      previewReason: reason ?? undefined,
+      thumbnailPath: reason ? undefined : asset.thumbnailPath,
+    }));
   },
 
   bumpModelRevision: (path) =>

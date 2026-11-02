@@ -709,6 +709,44 @@ describe('useAssetStore updateAssetPreview', () => {
     expect(s.assetAt(0)?.previewStatus).toBe('done');
   });
 
+  test('a failed job stores its reason, and a later preview clears it', async () => {
+    await loadAsset();
+    const reason = 'Too large to preview (29027 x 29027 px)';
+
+    useAssetStore.getState().failPreview('a1', reason);
+    expect(useAssetStore.getState().assetAt(0)?.previewStatus).toBe('error');
+    expect(useAssetStore.getState().assetAt(0)?.previewReason).toBe(reason);
+
+    useAssetStore.getState().setPreviewStatus('a1', 'pending');
+    expect(useAssetStore.getState().assetAt(0)?.previewReason).toBe(reason);
+
+    useAssetStore.getState().updateAssetPreview('a1', null);
+    expect(useAssetStore.getState().assetAt(0)?.previewReason).toBeUndefined();
+  });
+
+  test('a refused job drops the thumbnail it deleted, and a plain failure keeps it', async () => {
+    await loadAsset();
+    const thumb = '/lib/.opendam/thumbs/a1_thumb.jpg';
+
+    useAssetStore.getState().updateAssetPreview('a1', thumb);
+    useAssetStore.getState().failPreview('a1', null);
+    expect(useAssetStore.getState().assetAt(0)?.thumbnailPath).toBe(thumb);
+
+    useAssetStore.getState().failPreview('a1', 'Too large to preview');
+    expect(useAssetStore.getState().assetAt(0)?.thumbnailPath).toBeUndefined();
+    expect(useAssetStore.getState().pinned.get('a1')?.thumbnailPath).toBeUndefined();
+  });
+
+  test('a failed job with no reason clears a stale one', async () => {
+    await loadAsset();
+    useAssetStore.getState().failPreview('a1', 'Too large to preview');
+
+    useAssetStore.getState().failPreview('a1', null);
+
+    expect(useAssetStore.getState().assetAt(0)?.previewStatus).toBe('error');
+    expect(useAssetStore.getState().assetAt(0)?.previewReason).toBeUndefined();
+  });
+
   test('a new thumbnail replaces the stored path', async () => {
     await loadAsset();
 

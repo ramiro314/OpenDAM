@@ -3,7 +3,7 @@ import clsx from 'clsx';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import type { Asset } from '../../types';
 import { ThreeViewer } from '../DetailPanel/ThreeViewer';
-import { isWebviewDisplayable } from '../../utils/media';
+import { imageOf, quickLookNote } from '../../utils/media';
 import { useImageScaling } from '../../hooks/useImageScaling';
 import { IconStar, IconModel3D, IconImage, IconVideo, IconFileText } from '../Icons';
 import styles from './QuickLookModal.module.css';
@@ -122,11 +122,7 @@ export const QuickLookModal = memo(function QuickLookModal({ asset, isOpen }: Qu
     asset.kind === 'video' ||
     ['mp4', 'webm', 'mov', 'mkv', 'avi'].includes(asset.extension.toLowerCase());
 
-  const imagePath = isWebviewDisplayable(asset.extension)
-    ? asset.filePath
-    : asset.thumbnailPath && !asset.thumbnailPath.endsWith('.glb')
-      ? asset.thumbnailPath
-      : undefined;
+  const imagePath = imageOf(asset);
 
   const formatSize = (bytes: number): string => {
     if (bytes < 1024) return `${bytes} B`;
@@ -194,7 +190,7 @@ export const QuickLookModal = memo(function QuickLookModal({ asset, isOpen }: Qu
                 <IconImage size={64} />
               )}
               <p className={styles.placeholderExt}>.{asset.extension.toUpperCase()}</p>
-              <p className={styles.placeholderText}>No preview generated yet</p>
+              <p className={styles.placeholderText}>{quickLookNote(asset)}</p>
             </div>
           )}
         </div>
