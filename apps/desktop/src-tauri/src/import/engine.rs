@@ -513,7 +513,14 @@ impl Engine {
                 let (run_id, library_id, pack_id) =
                     (run.id.clone(), library.id.clone(), pack.pack_id.clone());
                 move |p: Progress| {
-                    reached.lock().unwrap_or_else(|e| e.into_inner()).report(p);
+                    let mut run = reached.lock().unwrap_or_else(|e| e.into_inner());
+                    // A step's own last line and its final report can say the same.
+                    let repeated = run.latest == Some(p);
+                    run.report(p);
+                    drop(run);
+                    if repeated {
+                        return;
+                    }
                     events(ImportEvent::Progress(ImportProgress {
                         run_id: run_id.clone(),
                         library_id: library_id.clone(),
@@ -1708,6 +1715,26 @@ mod tests {
                 .unwrap()
         }
 
+        /// What run `run_id` reported for `step` as `import:progress` carries it, each pass in
+        /// turn, a pass starting at 0 or at the step's first report. Reports without counts
+        /// are left out.
+        pub(super) fn passes(&self, run_id: &str, step: &str) -> Vec<Vec<(u64, u64)>> {
+            let mut passes: Vec<Vec<(u64, u64)>> = Vec::new();
+            for event in self.events.lock().unwrap().iter() {
+                let ImportEvent::Progress(p) = event else {
+                    continue;
+                };
+                if p.run_id != run_id || p.step != step || p.total == 0 {
+                    continue;
+                }
+                if p.done == 0 || passes.is_empty() {
+                    passes.push(Vec::new());
+                }
+                passes.last_mut().unwrap().push((p.done, p.total));
+            }
+            passes
+        }
+
         /// Waits for the build to report `step`.
         pub(super) async fn wait_for_step(&self, step: &str) {
             for _ in 0..1500 {
@@ -2429,6 +2456,12 @@ mod tests {
         Progress { step, done, total }
     }
 
+    /// A whole pass over `total` items as `Setup::passes` reads it: every count once, ending in
+    /// one `total` of `total`.
+    pub(super) fn whole_pass(total: u64) -> Vec<(u64, u64)> {
+        (0..=total).map(|done| (done, total)).collect()
+    }
+
     #[test]
     fn a_run_s_figures_outlast_steps_without_counts_and_later_hashing() {
         let mut reached = Reached::default();
@@ -2489,6 +2522,38 @@ mod tests {
         reached.report(report(build::HASHING, 300, 300));
         reached.report(report("swapping", 0, 0));
         assert_eq!(reached.figures(), Some(report(build::HASHING, 300, 300)));
+    }
+
+    /// A pack's figures are its own: a later pack's smaller finished pass replaces them, and a
+    /// later pack that reports no counts leaves none.
+    #[test]
+    fn the_next_pack_starts_from_no_figures() {
+        let mut reached = Reached::default();
+        reached.report(report(build::HASHING, 900, 900));
+        reached.next_pack();
+        assert_eq!(reached.figures(), None);
+        reached.report(report(build::HASHING, 300, 300));
+        assert_eq!(reached.figures(), Some(report(build::HASHING, 300, 300)));
+
+        reached.next_pack();
+        reached.report(report("removing", 0, 0));
+        assert_eq!(reached.figures(), None);
+        assert_eq!(reached.latest, Some(report("removing", 0, 0)));
+    }
+
+    /// The live view reads these events: a hashing pass reports each file as it starts it, then
+    /// the finished count once.
+    #[tokio::test]
+    async fn a_hashing_pass_reports_each_count_once_and_ends_at_its_total() {
+        let s = setup().await;
+        let run = s.engine.start_import(s.golden_request()).await.unwrap();
+        s.wait_for(&run.id, "done").await;
+
+        let files = s.count("SELECT COUNT(*) FROM import_outputs").await;
+        assert_eq!(
+            s.passes(&run.id, build::HASHING),
+            [whole_pass(files as u64)]
+        );
     }
 
     /// A run with two packs, the first bigger, that fails halfway through hashing the second,

@@ -16,7 +16,7 @@ mod tests {
 
     use crate::export::blender::test_blender;
     use crate::import::drift;
-    use crate::import::engine::tests::{setup, Setup, TARGET};
+    use crate::import::engine::tests::{setup, whole_pass, Setup, TARGET};
     use crate::import::engine::*;
     use crate::import::unitypackage::tests::fixture;
     use crate::preview::WorkerRequest;
@@ -965,10 +965,11 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
         pause.release.notify_one();
         s.wait_for(&run.id, "failed").await;
 
-        let converted = s.events.lock().unwrap().iter().any(|e| {
-            matches!(e, ImportEvent::Progress(p) if p.step == "converting" && p.done == p.total)
-        });
-        assert!(converted, "the conversion finished first");
+        assert_eq!(
+            s.passes(&run.id, "converting"),
+            [whole_pass(1)],
+            "the conversion finished first"
+        );
         let row = s.engine.list_runs("lib").await.unwrap().remove(0);
         assert_eq!(row.phase.as_deref(), Some("hashing"));
         assert_eq!((row.progress_done, row.progress_total), (0, 1));
@@ -995,6 +996,16 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
         assert_eq!(row.phase.as_deref(), Some("settling"));
         assert_eq!((row.progress_done, row.progress_total), (models, models));
 
+        // The live view gets one final figure, though Blender's last line and the step both say
+        // it, and each hashing pass, of the extracted, the converted and the metadata, ends
+        // once at its total.
+        assert_eq!(s.passes(&run.id, "converting"), [whole_pass(models as u64)]);
+        let hashing = s.passes(&run.id, "hashing");
+        assert_eq!(hashing.len(), 3, "{hashing:?}");
+        for pass in hashing {
+            assert_eq!(pass, whole_pass(pass.len() as u64 - 1));
+        }
+
         // Every GLB cached: Blender prints no line, and the figures still reach the end.
         let pack_id = run.packs[0].pack_id.clone();
         let rebuild = s
@@ -1006,6 +1017,10 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
         let row = s.engine.list_runs("lib").await.unwrap();
         let row = row.iter().find(|r| r.id == rebuild.id).unwrap();
         assert_eq!((row.progress_done, row.progress_total), (models, models));
+        assert_eq!(
+            s.passes(&rebuild.id, "converting"),
+            [whole_pass(models as u64)]
+        );
     }
 
     /// A result from another version of the script, one that leaves a model out, and a model

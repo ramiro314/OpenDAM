@@ -52,7 +52,7 @@ const PLUGINS: [&str; 2] = ["PythonScriptPlugin", "GLTFExporter"];
 /// The files of a project that come along as its docs, at its root or below `Content/`.
 const DOCS: [&str; 4] = ["txt", "md", "pdf", "rtf"];
 
-const STEP: &str = "exporting from Unreal";
+pub(super) const STEP: &str = "exporting from Unreal";
 const NO_PROJECT: &str = "The zip holds no Unreal project (.uproject)";
 
 /// The step's options: how many assets one editor session exports at most.
