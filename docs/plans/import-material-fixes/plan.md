@@ -674,6 +674,8 @@ has at least 20 GB free. Record the scope's peak memory. If 24 GB can't be freed
 
 Unreal packs have no floors, because this work never ran them. These first runs set their numbers.
 
+The gate's results are in [gate-report.md](gate-report.md).
+
 **Any failed run, cap kill, missed floor, lost map, unmatched GLB other than the expected absences,
 unexplained leftover or unexplained geometry change holds the deletion until the owner decides.**
 Never raise a cap or lower a floor to pass. The owner deletes the old libraries by hand after

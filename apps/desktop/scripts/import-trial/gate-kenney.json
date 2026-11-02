@@ -1,0 +1,10 @@
+{
+  "settleMinutes": 60,
+  "imports": [
+    {
+      "lib": "kenney",
+      "path": "~/Documents/AssetOriginals/Kenney/Kenney Game Assets All-in-1 3.7.0.zip",
+      "offer": "kenney"
+    }
+  ]
+}

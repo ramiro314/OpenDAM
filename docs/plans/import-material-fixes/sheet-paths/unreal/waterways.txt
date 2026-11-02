@@ -1,0 +1,19 @@
+# Fab/Waterways
+# foliage
+SM_Fern_01.glb
+SM_Grass_01.glb
+SM_Flower_01.glb
+# rocks and walls
+SM_LargeRock_01.glb
+SM_RockWall_01.glb
+# props
+SM_Boat.glb
+SM_Bridge.glb
+SM_Chest.glb
+SM_Statue_01.glb
+# flat colours
+SM_Potion_01.glb
+# water
+SM_Waterblock_01.glb
+# rigged
+Animations/SK_Snake.glb
