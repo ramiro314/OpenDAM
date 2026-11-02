@@ -83,12 +83,15 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               a preview of each build's tree, made by the same extract and place
                               code run over the archive's index (`list_*`, `place_listed`), which
                               reads no file body and writes nothing. A `.unitypackage` whose nested
-                              packages name two or more render pipelines (`scan::pipeline`, by
-                              file name) offers each, URP ticked, none ticked without one, and
-                              the extract step stores the choice as its `pipeline` option, so a
+                              packages name two or more render pipelines, so that choosing leaves
+                              one out, offers each, URP ticked, none ticked without one, and the
+                              extract step stores the choice as its `pipeline` option, so a
                               Rebuild repeats it: the build keeps loose files and nested packages
-                              naming that pipeline or none (`scan::keeps_package`). A zip's
-                              variant is refused a pipeline,
+                              naming that pipeline, among others or alone, or none
+                              (`scan::keeps_package`). `scan::package_pipelines` reads a package's
+                              file name, stricter than `scan::pipeline`, which only labels Fab
+                              variants: `Standard Assets` names no pipeline. A zip's variant is
+                              refused a pipeline,
                               records, the import tables (imports, import_packs, import_steps,
                               import_outputs, import_moves, import_runs) and the step edits and
                               rebuilds they refuse while a run for the pack is queued or running

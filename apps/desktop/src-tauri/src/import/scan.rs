@@ -327,16 +327,22 @@ fn nested_packages(source_path: &[String]) -> impl Iterator<Item = &str> {
     chain.iter().map(String::as_str)
 }
 
-/// The render pipelines the nested packages of `extraction` name, URP first, when they name two
-/// or more. A package naming one or none has nothing to choose.
+/// The render pipelines the nested packages of `extraction` name, URP first, when choosing among
+/// them would leave a package out. So one pipeline, or one package listing two, has no choice.
 fn nested_pipelines(extraction: &Extraction) -> Vec<&'static str> {
-    let named: std::collections::BTreeSet<&'static str> = extraction
+    let packages: std::collections::BTreeSet<&str> = extraction
         .files
         .iter()
         .flat_map(|f| nested_packages(&f.source_path))
-        .filter_map(package_pipeline)
         .collect();
-    if named.len() < 2 {
+    let named: std::collections::BTreeSet<&'static str> = packages
+        .iter()
+        .flat_map(|package| package_pipelines(package))
+        .collect();
+    let chooses = packages
+        .iter()
+        .any(|package| named.iter().any(|p| !keeps_package(package, Some(p))));
+    if !chooses {
         return Vec::new();
     }
     PIPELINES
@@ -363,43 +369,81 @@ pub fn check_pipeline(zip: bool, chosen: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// The render pipeline a `.unitypackage`'s path names, in the words of its file name.
-fn package_pipeline(path: &str) -> Option<&'static str> {
+/// A `.unitypackage`'s file name without its folders and extension.
+fn package_stem(path: &str) -> &str {
     let file = path.rsplit('/').next().unwrap_or(path);
-    pipeline(file.rsplit_once('.').map_or(file, |(stem, _)| stem))
+    file.rsplit_once('.').map_or(file, |(stem, _)| stem)
+}
+
+/// Every render pipeline a `.unitypackage`'s file name names, so `X_URP_HDRP` names two. This one
+/// decides what a build leaves out, so it is stricter than `pipeline`: `Standard` and `Universal`
+/// count only as a name's last word or before `Render`, `RP` or `Pipeline`, never in `Standard
+/// Assets`.
+fn package_pipelines(path: &str) -> Vec<&'static str> {
+    let words = name_words(package_stem(path));
+    let has = |word: &str| words.iter().any(|w| w == word);
+    let means_pipeline = |word: &str| {
+        words.iter().enumerate().any(|(i, w)| {
+            *w == word
+                && words
+                    .get(i + 1)
+                    .is_none_or(|next| ["render", "rp", "pipeline"].contains(&next.as_str()))
+        })
+    };
+    let mut named = Vec::new();
+    if has("urp") || means_pipeline("universal") {
+        named.push("urp");
+    }
+    if has("hdrp") {
+        named.push("hdrp");
+    }
+    if has("birp") || has("builtin") || means_pipeline("standard") || says_built_in(&words) {
+        named.push("built-in");
+    }
+    named
 }
 
 /// Whether a build for the pipeline `chosen` keeps the nested package at `path`: with no choice
-/// every one, else one naming that pipeline or none.
+/// every one, else one naming that pipeline, among others or alone, or none.
 pub fn keeps_package(path: &str, chosen: Option<&str>) -> bool {
-    match (chosen, package_pipeline(path)) {
-        (Some(chosen), Some(named)) => chosen == named,
-        _ => true,
-    }
+    let Some(chosen) = chosen else {
+        return true;
+    };
+    let named = package_pipelines(path);
+    named.is_empty() || named.contains(&chosen)
 }
 
 /// The render pipeline a package's or folder's name names, read by its words:
 /// `URP`/`Universal`, `Built-In`/`BiRP`/`Standard`, `HDRP`.
 pub fn pipeline(name: &str) -> Option<&'static str> {
-    let lower = name.to_ascii_lowercase();
-    let words: Vec<&str> = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect();
+    let lower = name_words(name);
+    let words: Vec<&str> = lower.iter().map(String::as_str).collect();
     let has = |w: &str| words.contains(&w);
     if has("urp") || has("universal") {
         Some("urp")
     } else if has("hdrp") {
         Some("hdrp")
-    } else if has("birp")
-        || has("standard")
-        || has("builtin")
-        || words.windows(2).any(|p| p == ["built", "in"])
-    {
+    } else if has("birp") || has("standard") || has("builtin") || says_built_in(&words) {
         Some("built-in")
     } else {
         None
     }
+}
+
+/// A name's lower-case words.
+fn name_words(name: &str) -> Vec<String> {
+    name.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether `Built` comes right before `In` in `words`.
+fn says_built_in<S: AsRef<str>>(words: &[S]) -> bool {
+    words
+        .windows(2)
+        .any(|pair| pair[0].as_ref() == "built" && pair[1].as_ref() == "in")
 }
 
 fn place_steps(steps: &[PlaceStep]) -> impl Iterator<Item = StepRecord> + '_ {
@@ -627,7 +671,7 @@ fn fab(original: &Path, zip: &Extraction, name: &str, publisher: &str) -> Option
         variants.push(Variant {
             variant: in_zip.to_string(),
             subpath: None,
-            pipeline: package_pipeline(in_zip),
+            pipeline: pipeline(package_stem(in_zip)),
             ticked: false,
             tree: preview(listing, &place, true),
         });
@@ -1904,6 +1948,30 @@ mod tests {
             assert_eq!(keeps_package(path, Some("urp")), urp, "{path}");
             assert!(keeps_package(path, None), "{path}");
         }
+        // A name listing two pipelines is kept for either.
+        assert!(keeps_package(houses, Some("hdrp")));
+        assert!(!keeps_package(houses, Some("built-in")));
+        // `Standard` and `Universal` name a pipeline only where they stand for one.
+        for path in [
+            "Assets/Standard Assets.unitypackage",
+            "Assets/Standard Materials.unitypackage",
+            "Assets/Universal Sounds.unitypackage",
+        ] {
+            assert_eq!(package_pipelines(path), Vec::<&str>::new(), "{path}");
+            assert!(keeps_package(path, Some("urp")), "{path}");
+        }
+        for (path, named) in [
+            ("Assets/Pack_Standard.unitypackage", "built-in"),
+            ("Assets/Standard.unitypackage", "built-in"),
+            ("Assets/Standard Render Pipeline.unitypackage", "built-in"),
+            ("Assets/Pack Standard RP.unitypackage", "built-in"),
+            ("Assets/Pack_Universal.unitypackage", "urp"),
+            ("Assets/Universal Render Pipeline.unitypackage", "urp"),
+        ] {
+            assert_eq!(package_pipelines(path), [named], "{path}");
+        }
+        // `pipeline`, which only labels a Fab variant, keeps its wider reading.
+        assert_eq!(pipeline("Standard Assets"), Some("built-in"));
         // Words of the file name only: its folders don't count.
         assert!(keeps_package(
             "Assets/URP/Packs/Extras.unitypackage",
@@ -2040,6 +2108,12 @@ mod tests {
             &["Pack_URP"],
             &["Pack_HDRP", "Extras"],
             &["Shaders URP 12x", "Shaders URP 14x-17x"],
+            // Listing two pipelines leaves nothing to choose: both keep it.
+            &["Pack_URP_HDRP"],
+            &["Pack_URP_HDRP", "Other_URP_HDRP"],
+            // These name no pipeline, so a real one stands alone.
+            &["Pack_URP", "Standard Assets"],
+            &["Pack_HDRP", "Universal Sounds"],
         ] {
             let original = package_of(tmp.path(), names);
             let offers = detect(&original, "unitypackage", "").unwrap();
@@ -2082,6 +2156,43 @@ mod tests {
         let pack = &offers[0].candidates[0];
         let choices: Vec<_> = pack.pipelines.iter().map(|p| p.pipeline).collect();
         assert_eq!(choices, ["urp", "hdrp"]);
+        for choice in &pack.pipelines {
+            let expected = built(
+                |to| extract_unitypackage(&original, to, None, Some(choice.pipeline)),
+                &flatten(),
+                true,
+            );
+            assert_eq!(choice.tree, expected, "{}", choice.pipeline);
+        }
+    }
+
+    #[test]
+    fn a_package_listing_two_pipelines_lands_for_either_and_offers_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let names = ["Pack_URP_HDRP", "Pack_Built-In", "Shaders_HDRP"];
+        let original = package_of(tmp.path(), &names);
+        let offers = detect(&original, "unitypackage", "").unwrap();
+        let pack = &offers[0].candidates[0];
+        let choices: Vec<_> = pack
+            .pipelines
+            .iter()
+            .map(|p| (p.pipeline, p.ticked))
+            .collect();
+        assert_eq!(
+            choices,
+            [("urp", true), ("built-in", false), ("hdrp", false)]
+        );
+        // Which nested packages each choice keeps, by source path, as `flatten` may move them.
+        let kept = |pipeline: &str| {
+            let listing = list_unitypackage(&original, None, Some(pipeline)).unwrap();
+            let packages = listing.files.iter().filter(|f| f.source_path.len() > 1);
+            let stems = packages.map(|f| package_stem(&f.source_path[0]).to_string());
+            stems.collect::<std::collections::BTreeSet<_>>()
+        };
+        let stems = |names: &[&str]| names.iter().map(|n| n.to_string()).collect();
+        assert_eq!(kept("hdrp"), stems(&["Pack_URP_HDRP", "Shaders_HDRP"]));
+        assert_eq!(kept("urp"), stems(&["Pack_URP_HDRP"]));
+        assert_eq!(kept("built-in"), stems(&["Pack_Built-In"]));
         for choice in &pack.pipelines {
             let expected = built(
                 |to| extract_unitypackage(&original, to, None, Some(choice.pipeline)),
