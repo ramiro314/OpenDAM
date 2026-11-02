@@ -782,7 +782,7 @@ export const useImportStore = create<ImportStore>()((set, get) => {
           c.unreal !== null
         );
       } catch (err) {
-        tree = { folders: [], files: 0, glbs: 0, skipped: [], error: String(err) };
+        tree = { folders: [], files: 0, glbs: 0, skipped: [], warnings: [], error: String(err) };
       }
       const now = sameDraft(draft.libraryId, draft.originalPath);
       if (!now || !now.candidates[i] || treeKey(now.candidates[i]) !== key) return;

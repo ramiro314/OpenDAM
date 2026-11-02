@@ -45,7 +45,7 @@ function plural(n: number, one: string, many = `${one}s`) {
   return `${n.toLocaleString()} ${n === 1 ? one : many}`;
 }
 
-function Tree({ tree, converts }: { tree: ImportTree; converts: boolean }) {
+export function Tree({ tree, converts }: { tree: ImportTree; converts: boolean }) {
   if (tree.error) return <span className={styles.errorText}>{tree.error}</span>;
   const shown = tree.folders.slice(0, TREE_ROWS);
   return (
@@ -56,6 +56,11 @@ function Tree({ tree, converts }: { tree: ImportTree; converts: boolean }) {
         {tree.estimate &&
           ` · at most ${plural(tree.glbs, 'model')}, an estimate: only the Unreal Editor knows which assets are meshes`}
       </span>
+      {tree.warnings.map((w) => (
+        <span key={w} className={styles.warningText} data-tree-warning>
+          {w}
+        </span>
+      ))}
       <ul className={styles.tree}>
         {shown.map((f) => {
           const depth = f.path ? f.path.split('/').length : 0;

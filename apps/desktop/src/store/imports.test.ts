@@ -51,6 +51,7 @@ const tree = (files: number, error: string | null = null): ImportTree => ({
   files,
   glbs: 0,
   skipped: [],
+  warnings: [],
   error,
 });
 
@@ -941,6 +942,51 @@ describe('the dialog', () => {
     ]);
     const c = useImportStore.getState().draft!.candidates[0];
     expect([c.tree?.files, treeCurrent(c)]).toEqual([7, true]);
+  });
+
+  test('a hoist warning follows the tree of the steps it was previewed for', async () => {
+    await open(fabScan);
+    const warning = 'hoist Art: no folder at Art';
+    const trees: Record<string, ImportTree> = {
+      Art: { ...tree(7), warnings: [warning] },
+      'Pack/Art': tree(7),
+    };
+    api.previewImport = async (_libraryId, _originalPath, _variant, _subpath, place) => {
+      const hoist = place.find((s) => s.kind === 'hoist');
+      return trees[hoist?.kind === 'hoist' ? hoist.folder : ''] ?? tree(7);
+    };
+    const store = useImportStore.getState();
+    const warnings = async (hoist: string) => {
+      store.edit((d) => patchCandidate(d, 0, { hoist }));
+      await store.refreshTree(0);
+      const c = useImportStore.getState().draft!.candidates[0];
+      expect(treeCurrent(c)).toBe(true);
+      return c.tree?.warnings;
+    };
+    expect(await warnings('Pack/Art')).toEqual([]);
+    expect(await warnings('Art')).toEqual([warning]);
+    expect(await warnings('Pack/Art')).toEqual([]);
+
+    // A preview that fails drops the warning for its error
+    await warnings('Art');
+    api.previewImport = async () => {
+      throw 'gone';
+    };
+    expect(await warnings('Other')).toEqual([]);
+  });
+
+  test('a scanned tree and a picked variant keep their own warnings', async () => {
+    const warned = { ...tree(4), warnings: ['hoist Art: no folder at Art'] };
+    const [builtIn, urp] = fab.variants;
+    const candidate = { ...fab, tree: warned, variants: [builtIn, { ...urp, tree: warned }] };
+    await open({ ...fabScan, offers: [{ layout: 'fab', candidates: [candidate] }] });
+    const warnings = () => useImportStore.getState().draft!.candidates[0].tree?.warnings;
+    expect(warnings()).toEqual(warned.warnings);
+    const store = useImportStore.getState();
+    store.edit((d) => pickVariant(d, 0, 0));
+    expect(warnings()).toEqual([]);
+    store.edit((d) => pickVariant(d, 0, 1));
+    expect(warnings()).toEqual(warned.warnings);
   });
 
   test("an Unreal pack's step edit previews its project's estimate", async () => {

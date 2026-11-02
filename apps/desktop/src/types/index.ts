@@ -987,6 +987,8 @@ export interface ImportTree {
   /** The GLBs the conversion would write */
   glbs: number;
   skipped: SkippedEntry[];
+  /** The steps that would do nothing, each with why: a hoist whose folder is missing */
+  warnings: string[];
   /** Why the build would fail, when it would */
   error: string | null;
   /** An Unreal pack's tree: its `glbs` are at most so many */
