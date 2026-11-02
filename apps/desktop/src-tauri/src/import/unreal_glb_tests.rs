@@ -156,6 +156,43 @@ echo "$left" > "$GLTF_OUT/.gltf-remaining""#
         )
     }
 
+    /// A finished run reads back what it exported, also when a rebuild exports nothing because
+    /// the cache holds it all.
+    #[tokio::test]
+    async fn a_run_reads_back_what_it_exported_even_from_the_cache() {
+        let s = setup_with(false).await;
+        let root = s.stub_unreal().await;
+        let run = s
+            .engine
+            .start_import(s.unreal_request("unreal.zip"))
+            .await
+            .unwrap();
+        tokio::spawn(s.engine.clone().start());
+        s.wait_for(&run.id, "done").await;
+        let exported = s.cached_glbs() as i64;
+        assert!(exported > 0);
+        let figures = |run_id: String| {
+            let engine = s.engine.clone();
+            async move {
+                let runs = engine.list_runs("lib").await.unwrap();
+                let row = runs.into_iter().find(|r| r.id == run_id).unwrap();
+                (row.progress_done, row.progress_total)
+            }
+        };
+        assert_eq!(figures(run.id.clone()).await, (exported, exported));
+
+        let sessions_before = sessions(&root).len();
+        let pack_id = run.packs[0].pack_id.clone();
+        let rebuild = s
+            .engine
+            .rebuild_pack("lib", &pack_id, Vec::new())
+            .await
+            .unwrap();
+        s.wait_for(&rebuild.id, "done").await;
+        assert_eq!(sessions(&root).len(), sessions_before, "no editor ran");
+        assert_eq!(figures(rebuild.id).await, (exported, exported));
+    }
+
     /// A9: the step runs the editor in batches, resumes from the cache after a session that
     /// made no progress failed it, and a rebuild after a finished export runs no editor. The
     /// work copy's `.uproject` has the plugins on, and the zip is untouched.

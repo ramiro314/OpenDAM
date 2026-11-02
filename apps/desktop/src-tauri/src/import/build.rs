@@ -86,6 +86,8 @@ impl RunControl {
 /// the records as a killed process would).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Point {
+    /// A hashing pass, before it starts. A failure stops the pass halfway.
+    Hashing,
     /// Staged, its manifest rows written, before step 1.
     Staged,
     /// Step 3's journal written, before step 4.
@@ -1080,6 +1082,8 @@ async fn hash_staged(
     files: Vec<(ExtractedFile, Origin)>,
     unchanged: &Arc<Unchanged>,
 ) -> Result<Vec<Output>, Stop> {
+    env.hooks.stop(Point::Hashing).await;
+    let fails_halfway = env.hooks.fails(Point::Hashing);
     let (to, target, control, progress, unchanged) = (
         staging.to_path_buf(),
         recipe.target.clone(),
@@ -1100,6 +1104,9 @@ async fn hash_staged(
                 done: done as u64,
                 total,
             });
+            if fails_halfway && done as u64 == total / 2 {
+                return Err(Stop::Failed("injected failure at Hashing".into()));
+            }
             let path = to.join(&rel);
             let read = |e: std::io::Error| format!("The staged {rel} can't be read: {e}");
             let (size, mtime_ns) = file_stamp(&path).map_err(read)?;

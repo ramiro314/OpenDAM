@@ -504,6 +504,10 @@ impl Engine {
         let mut warnings = Vec::new();
         let mut outcome = Ok(());
         for pack in &run.packs {
+            reached
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .next_pack();
             let progress: build::ProgressSink = Arc::new({
                 let (events, reached) = (self.events.clone(), reached.clone());
                 let (run_id, library_id, pack_id) =
@@ -1282,27 +1286,43 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Rewrites a running run's heartbeat, with its latest progress, every 30 s until aborted.
 /// What a run has reported, which its heartbeat and its end write to its row.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Reached {
     /// The latest report, which names the run's phase.
     latest: Option<Progress>,
-    /// The figures a run ends on: its latest report with counts, as the steps after the last
-    /// hashing have none. Hashing doesn't replace another step's figures, as a build hashes
-    /// what it converted and then its `datapackage.json`, or a smaller pass its bigger one.
-    figures: Option<Progress>,
+    /// This pack's latest report with counts: the steps after the last hashing have none.
+    counted: Option<Progress>,
+    /// This pack's figures from a finished step. Hashing doesn't replace another step's, as a
+    /// build hashes what it converted and then its `datapackage.json`, or a smaller pass a
+    /// bigger one's.
+    finished: Option<Progress>,
 }
 
 impl Reached {
     fn report(&mut self, p: Progress) {
         self.latest = Some(p);
-        let ahead = |kept: Progress| {
+        if p.total == 0 {
+            return;
+        }
+        self.counted = Some(p);
+        let outranked = |kept: Progress| {
             p.step == build::HASHING && (kept.step != build::HASHING || kept.total > p.total)
         };
-        if p.total > 0 && !self.figures.is_some_and(ahead) {
-            self.figures = Some(p);
+        if p.done >= p.total && !self.finished.is_some_and(outranked) {
+            self.finished = Some(p);
         }
+    }
+
+    /// A run reports on one pack at a time, and ends on the last one's figures.
+    fn next_pack(&mut self) {
+        (self.counted, self.finished) = (None, None);
+    }
+
+    /// The figures a run ends on: the step it stopped in, else its pack's finished figures.
+    fn figures(&self) -> Option<Progress> {
+        let stopped = self.counted.filter(|p| p.done < p.total);
+        stopped.or(self.finished)
     }
 }
 
@@ -1326,8 +1346,8 @@ async fn record_end(
     .bind(error)
     .bind(json!(warnings).to_string())
     .bind(reached.latest.map(|p| p.step))
-    .bind(reached.figures.map_or(0, |p| p.done as i64))
-    .bind(reached.figures.map_or(0, |p| p.total as i64))
+    .bind(reached.figures().map_or(0, |p| p.done as i64))
+    .bind(reached.figures().map_or(0, |p| p.total as i64))
     .bind(now_ms())
     .bind(run_id)
     .execute(pool)
@@ -1335,6 +1355,7 @@ async fn record_end(
     Ok(())
 }
 
+/// Rewrites a running run's heartbeat, with its latest progress, every 30 s until aborted.
 async fn beat(pool: Pool<Sqlite>, run_id: String, reached: Arc<Mutex<Reached>>) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
     loop {
@@ -2419,7 +2440,7 @@ mod tests {
         ] {
             reached.report(p);
         }
-        assert_eq!(reached.figures, Some(report("converting", 0, 184)));
+        assert_eq!(reached.figures(), Some(report("converting", 0, 184)));
         for p in [
             report("converting", 184, 184),
             report(build::HASHING, 184, 184),
@@ -2429,14 +2450,88 @@ mod tests {
         ] {
             reached.report(p);
         }
-        assert_eq!(reached.figures, Some(report("converting", 184, 184)));
+        assert_eq!(reached.figures(), Some(report("converting", 184, 184)));
         assert_eq!(reached.latest, Some(report("settling", 0, 0)));
 
         // With nothing converted, a smaller hashing pass leaves the bigger one's figures.
         let mut reached = Reached::default();
         reached.report(report(build::HASHING, 900, 900));
-        reached.report(report(build::HASHING, 0, 1));
-        assert_eq!(reached.figures, Some(report(build::HASHING, 900, 900)));
+        reached.report(report(build::HASHING, 1, 1));
+        assert_eq!(reached.figures(), Some(report(build::HASHING, 900, 900)));
+    }
+
+    /// Only a finished step's figures stay: one that never reached its total doesn't outlast
+    /// the hashing after it.
+    #[test]
+    fn an_unfinished_step_s_figures_don_t_stick() {
+        let mut reached = Reached::default();
+        reached.report(report("unzipping the Unreal project", 0, 5_000_000));
+        reached.report(report(build::HASHING, 12, 12));
+        assert_eq!(reached.figures(), Some(report(build::HASHING, 12, 12)));
+    }
+
+    /// A run that stops partway through a pass reads back that pass, whatever finished before.
+    #[test]
+    fn a_stopped_run_s_figures_are_the_pass_it_stopped_in() {
+        let mut reached = Reached::default();
+        reached.report(report("converting", 184, 184));
+        reached.report(report(build::HASHING, 50, 184));
+        assert_eq!(reached.figures(), Some(report(build::HASHING, 50, 184)));
+
+        reached.next_pack();
+        reached.report(report(build::HASHING, 900, 900));
+        reached.next_pack();
+        reached.report(report(build::HASHING, 5, 300));
+        assert_eq!(reached.figures(), Some(report(build::HASHING, 5, 300)));
+
+        // Finished, then stopped in a step with no counts: the pack's figures stay.
+        let mut reached = Reached::default();
+        reached.report(report(build::HASHING, 300, 300));
+        reached.report(report("swapping", 0, 0));
+        assert_eq!(reached.figures(), Some(report(build::HASHING, 300, 300)));
+    }
+
+    /// A run with two packs, the first bigger, that fails halfway through hashing the second,
+    /// reads back that pass. Nothing queues such a run yet, so the test merges two.
+    #[tokio::test]
+    async fn a_run_that_stops_hashing_its_second_pack_reads_back_that_pass() {
+        let s = setup_with(false).await;
+        let first = s.engine.start_import(s.golden_request()).await.unwrap();
+        let second = s
+            .engine
+            .start_import(s.zip_request("kenney.zip", None, None, "K"))
+            .await
+            .unwrap();
+        let mut packs = first.packs.clone();
+        packs.extend(second.packs.clone());
+        sqlx::query("UPDATE import_runs SET packs = ? WHERE id = ?")
+            .bind(json!(packs).to_string())
+            .bind(&first.id)
+            .execute(&s.lib.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM import_runs WHERE id = ?")
+            .bind(&second.id)
+            .execute(&s.lib.pool)
+            .await
+            .unwrap();
+
+        let pause = s.engine.hooks().pause(Point::Committed);
+        tokio::spawn(s.engine.clone().start());
+        pause.reached.notified().await;
+        s.engine.hooks().fail(Point::Hashing);
+        pause.release.notify_one();
+        s.wait_for(&first.id, "failed").await;
+
+        let row = listed(&s, &first.id).await;
+        assert_eq!(row.error.as_deref(), Some("injected failure at Hashing"));
+        assert_eq!(row.phase.as_deref(), Some(build::HASHING));
+        assert!(row.progress_total > 0);
+        assert_eq!(row.progress_done, row.progress_total / 2);
+        assert!(
+            row.progress_total < s.count("SELECT COUNT(*) FROM import_outputs").await,
+            "the second pack is the smaller, so a bigger pass's figures would show"
+        );
     }
 
     /// No heartbeat fires in a test's run, so each row's figures come from the run's end.

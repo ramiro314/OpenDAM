@@ -943,6 +943,37 @@ bpy.ops.export_scene.fbx(filepath={fbx:?}, path_mode="RELATIVE", embed_textures=
         assert_eq!((row.progress_done, row.progress_total), (0, 1));
     }
 
+    /// A run that stops hashing what it converted reads back that pass, not the finished
+    /// conversion's figures.
+    #[tokio::test]
+    async fn a_run_that_fails_hashing_after_converting_reads_back_that_pass() {
+        let s = setup().await;
+        let Some(_log) = s.logged_blender().await else {
+            return;
+        };
+        let pause = s.engine.hooks().pause(Point::Hashing);
+        let run = s
+            .engine
+            .start_import(s.request(vec![PlaceStep::Flatten]))
+            .await
+            .unwrap();
+        // The extracted files' pass runs through, and the converted files' fails.
+        pause.reached.notified().await;
+        pause.release.notify_one();
+        pause.reached.notified().await;
+        s.engine.hooks().fail(Point::Hashing);
+        pause.release.notify_one();
+        s.wait_for(&run.id, "failed").await;
+
+        let converted = s.events.lock().unwrap().iter().any(|e| {
+            matches!(e, ImportEvent::Progress(p) if p.step == "converting" && p.done == p.total)
+        });
+        assert!(converted, "the conversion finished first");
+        let row = s.engine.list_runs("lib").await.unwrap().remove(0);
+        assert_eq!(row.phase.as_deref(), Some("hashing"));
+        assert_eq!((row.progress_done, row.progress_total), (0, 1));
+    }
+
     /// A build hashes after it converts, and what it converted is the figure a finished run
     /// reads back, not the hashing's.
     #[tokio::test]

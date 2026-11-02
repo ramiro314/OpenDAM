@@ -528,6 +528,13 @@ impl Export<'_> {
             Ok(files)
         })
         .await?;
+        // A finished export runs no editor, and a session's lines may not all have come.
+        let exported = (record.exported.len() + record.failed.len()) as u64;
+        (self.progress)(Progress {
+            step: STEP,
+            done: exported,
+            total: exported,
+        });
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let mut skipped = listing.skipped;
         skipped.extend(record.failed.iter().map(|game| SkippedEntry {
