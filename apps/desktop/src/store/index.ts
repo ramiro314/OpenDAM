@@ -300,7 +300,10 @@ interface AssetStore extends PageCache {
     render?: { filePath: string; previousThumbnailPath?: string }
   ) => void;
   setPreviewStatus: (id: string, status: Asset['previewStatus']) => void;
-  /** Marks a preview failed, with why the file stays without one if that is known */
+  /**
+   * Marks a preview failed. With `reason`, why the file stays without one, its thumbnail goes too,
+   * as `preview::refuse_job` deleted it. Any other failure leaves the row's thumbnail.
+   */
   failPreview: (id: string, reason?: string | null) => void;
   /** Bumps `path`'s revision in `modelRevisions` */
   bumpModelRevision: (path: string) => void;
@@ -665,6 +668,7 @@ export const useAssetStore = create<AssetStore>()((set, get) => ({
       ...asset,
       previewStatus: 'error',
       previewReason: reason ?? undefined,
+      thumbnailPath: reason ? undefined : asset.thumbnailPath,
     }));
   },
 

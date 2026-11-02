@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { imageOf, isWebviewDisplayable, previewMessage } from './media';
+import { imageOf, isWebviewDisplayable, previewMessage, quickLookNote } from './media';
 
 describe('isWebviewDisplayable', () => {
   test('accepts the formats the webview displays, in any case', () => {
@@ -40,6 +40,17 @@ describe('imageOf', () => {
   test('a file with a preview reason never loads its original', () => {
     const previewReason = 'Too large to preview (29027 x 29027 px)';
     expect(imageOf({ extension: 'png', filePath: '/lib/huge.png', previewReason })).toBe(undefined);
+  });
+});
+
+describe('quickLookNote', () => {
+  test('a preview reason replaces the note', () => {
+    const previewReason = 'Too large to preview (29027 x 29027 px)';
+    expect(quickLookNote({ previewReason })).toBe(previewReason);
+  });
+
+  test('a file with no reason keeps the note it has', () => {
+    expect(quickLookNote({})).toBe('No preview generated yet');
   });
 });
 

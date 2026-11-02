@@ -22,6 +22,11 @@ export function imageOf(
   return undefined;
 }
 
+/** What Quick Look says about `asset` when it has nothing to show. */
+export function quickLookNote(asset: Pick<Asset, 'previewReason'>): string {
+  return asset.previewReason ?? 'No preview generated yet';
+}
+
 /** What the detail panel says about `asset` when it has nothing to show. */
 export function previewMessage(asset: Pick<Asset, 'previewStatus' | 'previewReason'>): {
   title: string;
