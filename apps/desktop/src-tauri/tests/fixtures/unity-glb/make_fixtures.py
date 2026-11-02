@@ -10,8 +10,8 @@ Each folder is one pack, so a case's by-name lookups reach only its own files. E
 `Model.obj`, one triangle per material slot, and `Model.mtl`, which name the slots through `usemtl`
 and `newmtl`, with text `.mat`, `.meta` and `.shadergraph` files and solid 4 x 4 PNGs. A pack about
 which meshes stay holds one triangle per named object instead, in a model of its own name when
-the file name is the case (`Pack.objects`). `mesh-name` holds no model: an OBJ's object and mesh
-share a name, so its test makes `Model.fbx` under Blender. The tests in
+the file name is the case (`Pack.objects`). `mesh-name` and `exact-first` hold no model: an OBJ's
+object and mesh share a name, so their tests make `Model.fbx` under Blender. The tests in
 `src/import/unity_glb_fixture_tests.rs` tell a texture by its colour:
 
 - BASE, OTHER_BASE, NORMAL, ORM and MASK are solid colours: only a role's right texture is BASE or
@@ -205,23 +205,26 @@ def graph_material(pack: Pack, properties: dict[str, tuple[str, tuple]], colors=
     pack.material("M_Thing", textures, colors, shader)
 
 
-def mapped_planes(pack: Pack, model: str) -> None:
+def mapped_planes(pack: Pack, model: str, plain: bool = False) -> None:
     """Two meshes, `Plane.099` and `Plane.100`, mapped by those exact names in `model`'s `.meta`,
     and a prefab giving each its own material, `M_First` (BASE) and `M_Second` (OTHER_BASE). The
-    lists differ, so neither `Plane` without its suffix nor a single list finds them."""
+    lists differ, so no single list finds them, and only with `plain` does `Plane` without its
+    suffix find anything: a third mesh, `M_Plain` (ORM), which an exact name must beat."""
+    meshes = [(4300000, "Plane.099", "M_First"), (4300002, "Plane.100", "M_Second")]
     pack.material("M_First", {"_BaseMap": pack.texture("T_First", BASE)})
     pack.material("M_Second", {"_BaseMap": pack.texture("T_Second", OTHER_BASE)})
+    if plain:
+        meshes.append((4300004, "Plane", "M_Plain"))
+        pack.material("M_Plain", {"_BaseMap": pack.texture("T_Plain", ORM)})
     pack.write(
         f"{model}.meta",
         "fileFormatVersion: 2\n"
         f"guid: {guid(pack.name, model)}\n"
         "ModelImporter:\n"
-        "  fileIDToRecycleName:\n"
-        "    4300000: Plane.099\n"
-        "    4300002: Plane.100\n",
+        "  fileIDToRecycleName:\n" + "".join(f"    {mesh}: {name}\n" for mesh, name, _ in meshes),
     )
     prefab = ["%YAML 1.1", "%TAG !u! tag:unity3d.com,2011:"]
-    for n, (mesh, material) in enumerate(((4300000, "M_First"), (4300002, "M_Second"))):
+    for n, (mesh, _, material) in enumerate(meshes):
         prefab += [
             f"--- !u!33 &{n}1",
             "MeshFilter:",
@@ -629,6 +632,8 @@ def main() -> None:
     mapped_planes(pack, "Model.obj")
 
     mapped_planes(Pack("mesh-name"), "Model.fbx")
+
+    mapped_planes(Pack("exact-first"), "Model.fbx", plain=True)
 
 
 main()

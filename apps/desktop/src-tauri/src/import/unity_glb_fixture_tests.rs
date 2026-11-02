@@ -797,15 +797,14 @@ mod tests {
         assert!(is(run.glb.base_of("Plane.100"), OTHER_BASE));
     }
 
-    /// `Model.fbx`, whose objects `Thing` and `Other` hold the meshes `Plane.099` and `Plane.100`,
-    /// made by `blender`.
-    async fn renamed_meshes_fbx(blender: &Path, fbx: &Path) {
+    /// `Model.fbx`, made by `blender`, of one plane per (object name, mesh name).
+    async fn fbx_of(blender: &Path, fbx: &Path, planes: &[(&str, &str)]) {
         let script = format!(
             r#"
 import bpy
 bpy.ops.object.select_all(action="SELECT")
 bpy.ops.object.delete()
-for n, (name, mesh) in enumerate((("Thing", "Plane.099"), ("Other", "Plane.100"))):
+for n, (name, mesh) in enumerate({planes:?}):
     bpy.ops.mesh.primitive_plane_add(location=(n * 3, 0, 0))
     obj = bpy.context.active_object
     obj.name = name
@@ -834,25 +833,44 @@ bpy.ops.export_scene.fbx(filepath={fbx:?})
         );
     }
 
+    /// Runs the step over the pack `case` with a `Model.fbx` of `planes` beside its files.
+    async fn run_with_fbx(case: &str, planes: &[(&str, &str)]) -> Option<Run> {
+        let blender = test_blender()?;
+        let pack = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(fixtures().join(case)).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), pack.path().join(entry.file_name())).unwrap();
+        }
+        fbx_of(&blender, &pack.path().join("Model.fbx"), planes).await;
+        let cache = tempfile::tempdir().unwrap();
+        run_over(pack.path(), "Model.glb", |_| true, cache.path()).await
+    }
+
     /// Exact name, by the mesh: objects the `.meta` doesn't name find their materials through
     /// their meshes' exact names, which `Plane` isn't.
     #[tokio::test]
     async fn a_mesh_named_exactly_in_a_meta_finds_its_object_s_material() {
-        let Some(blender) = test_blender() else {
+        let planes = [("Thing", "Plane.099"), ("Other", "Plane.100")];
+        let Some(run) = run_with_fbx("mesh-name", &planes).await else {
             return;
         };
-        let pack = tempfile::tempdir().unwrap();
-        for entry in std::fs::read_dir(fixtures().join("mesh-name")).unwrap() {
-            let entry = entry.unwrap();
-            std::fs::copy(entry.path(), pack.path().join(entry.file_name())).unwrap();
-        }
-        renamed_meshes_fbx(&blender, &pack.path().join("Model.fbx")).await;
-        let cache = tempfile::tempdir().unwrap();
-        let run = run_over(pack.path(), "Model.glb", |_| true, cache.path())
-            .await
-            .unwrap();
         assert_eq!(run.glb.meshes(), ["Other", "Thing"]);
         assert!(is(run.glb.base_of("Thing"), BASE));
+        assert!(is(run.glb.base_of("Other"), OTHER_BASE));
+    }
+
+    /// Exact names come first: the `.meta` also maps `Plane` to another material, which an object
+    /// named `Plane.099` and an object holding a mesh named `Plane.100` would find without their
+    /// suffixes. The first's mesh and the second's object are named nowhere, so each stands on
+    /// its own exact lookup.
+    #[tokio::test]
+    async fn an_exact_name_comes_before_the_name_without_its_suffix() {
+        let planes = [("Plane.099", "Thing"), ("Other", "Plane.100")];
+        let Some(run) = run_with_fbx("exact-first", &planes).await else {
+            return;
+        };
+        assert_eq!(run.glb.meshes(), ["Other", "Plane.099"]);
+        assert!(is(run.glb.base_of("Plane.099"), BASE));
         assert!(is(run.glb.base_of("Other"), OTHER_BASE));
     }
 
