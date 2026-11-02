@@ -1169,6 +1169,17 @@ mod tests {
             ]),
             "fab unreal kenney zip"
         );
+        // Two projects are refused, not none.
+        assert_eq!(
+            layouts_of(&[
+                "One/One.uproject",
+                "Two/Two.uproject",
+                "Kit A/License.txt",
+                "Kit A/Pack.unitypackage",
+                "Kit B/License.txt",
+            ]),
+            "fab unreal kenney zip"
+        );
 
         assert_eq!(
             layouts_of(&[
@@ -1178,6 +1189,17 @@ mod tests {
                 "Kenney/3D assets/Car Kit/Unity package/Car Kit.UnityPackage",
                 "Kenney/3D assets/Nature Kit/License.txt",
                 "Kenney/Archive/Old Kit/License.txt",
+            ]),
+            "kenney fab zip"
+        );
+        // One folder more than packages is enough.
+        assert_eq!(
+            layouts_of(&[
+                "Kit A/License.txt",
+                "Kit A/Unity/A.unitypackage",
+                "Kit B/License.txt",
+                "Kit B/Unity/B.unitypackage",
+                "Kit C/License.txt",
             ]),
             "kenney fab zip"
         );
