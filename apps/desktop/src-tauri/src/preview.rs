@@ -370,6 +370,40 @@ pub(crate) const WAITING_JOBS: &str = "('pending', 'queued', 'fallback')";
 /// The job states of a job not yet finished: waiting, or running.
 pub(crate) const ACTIVE_JOBS: &str = "('pending', 'queued', 'processing', 'fallback')";
 
+/// The assets whose preview GLB waits for the frontend to render it (`modelThumbnailer`): a first
+/// preview holds the GLB as its thumbnail, and a fresh one keeps its old picture, `generating`
+/// (`complete_job`).
+pub(crate) const AWAITING_RENDER: &str =
+    "(thumbnail_path LIKE '%.glb' OR preview_status = 'generating')";
+
+/// An asset awaiting a render (`AWAITING_RENDER`). `model` is its preview GLB, relative to the
+/// library root. `revision` counts the GLBs jobs wrote for it, so it is the token its render is
+/// saved or failed with: the row no longer holds it once a newer GLB exists.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct AwaitingRender {
+    pub id: String,
+    pub model: String,
+    pub generating: bool,
+    pub revision: i64,
+}
+
+/// Up to `limit` assets awaiting a render. A `generating` one keeps its old picture as its
+/// thumbnail, so its GLB is its `preview_model`.
+pub(crate) async fn models_awaiting_render(
+    pool: &Pool<Sqlite>,
+    limit: i64,
+) -> sqlx::Result<Vec<AwaitingRender>> {
+    sqlx::query_as(&format!(
+        "SELECT id, CASE preview_status WHEN 'generating'
+             THEN json_extract(metadata, '$.preview_model') ELSE thumbnail_path END AS model,
+             preview_status = 'generating' AS generating, preview_revision AS revision
+         FROM assets WHERE {AWAITING_RENDER} LIMIT ?"
+    ))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// The assets with a waiting job.
 pub(crate) async fn assets_waiting_for_jobs(
     pool: &Pool<Sqlite>,
@@ -554,7 +588,9 @@ impl EngineReport {
 /// `rel_thumb` clears `thumbnail_path`, and an old `_thumb` file the new path doesn't name is
 /// deleted first. `rel_thumb` is relative to the library root; `model_path` is absolute. The
 /// engine's `report` replaces the old one in `preview_version` and `preview_textures`, outside
-/// the searched `metadata`.
+/// the searched `metadata`. A GLB left to render is no picture yet, so an asset that has one
+/// keeps it, at `generating`, until `save_model_render`. Each GLB bumps `preview_revision`, which
+/// drops any render still in flight of the one it replaced.
 pub(crate) async fn complete_job(
     pool: &Pool<Sqlite>,
     root_path: &Path,
@@ -579,19 +615,61 @@ pub(crate) async fn complete_job(
             .map_or((None, None), |(file, thumb): (String, Option<String>)| {
                 (Some(file), thumb)
             });
-    delete_replaced_thumb(pool, root_path, asset_id, rel_thumb.as_deref()).await;
+    store_job_result(
+        pool,
+        root_path,
+        asset_id,
+        file_path,
+        previous_thumb,
+        rel_thumb,
+        model_path,
+        report,
+    )
+    .await
+}
+
+/// `complete_job`'s writes, given the `previous_thumb` it read. A render may land after that read,
+/// until the update below bumps the revision, so a kept picture is whatever the row holds by then:
+/// the update leaves `thumbnail_path` alone and reads it back, and no file is deleted.
+#[allow(clippy::too_many_arguments)]
+async fn store_job_result(
+    pool: &Pool<Sqlite>,
+    root_path: &Path,
+    asset_id: &str,
+    file_path: Option<String>,
+    previous_thumb: Option<String>,
+    rel_thumb: Option<String>,
+    model_path: Option<String>,
+    report: &EngineReport,
+) -> PreviewDone {
+    let keeps_picture = model_path.is_some()
+        && rel_thumb.as_deref().is_some_and(|t| t.ends_with(".glb"))
+        && previous_thumb
+            .as_deref()
+            .is_some_and(|t| !t.is_empty() && !t.ends_with(".glb"));
+    let status = if keeps_picture { "generating" } else { "done" };
+    if !keeps_picture {
+        delete_replaced_thumb(pool, root_path, asset_id, rel_thumb.as_deref()).await;
+    }
+    let mut rel_thumb = rel_thumb;
     if let Some(ref model_path) = model_path {
         let rel_model = make_relative_path(root_path, Path::new(model_path));
-        let _ = sqlx::query(
-            "UPDATE assets SET preview_status = 'done', thumbnail_path = ?, metadata = json_set(coalesce(nullif(metadata, ''), '{}'), '$.preview_model', ?), preview_version = ?, preview_textures = ?, preview_reason = NULL WHERE id = ?"
+        let stored: Option<Option<String>> = sqlx::query_scalar(
+            "UPDATE assets SET preview_status = ?, thumbnail_path = CASE WHEN ? THEN thumbnail_path ELSE ? END, metadata = json_set(coalesce(nullif(metadata, ''), '{}'), '$.preview_model', ?), preview_version = ?, preview_textures = ?, preview_reason = NULL, preview_revision = preview_revision + 1 WHERE id = ? RETURNING thumbnail_path"
         )
+        .bind(status)
+        .bind(keeps_picture)
         .bind(&rel_thumb)
         .bind(&rel_model)
         .bind(report.version)
         .bind(&report.textures)
         .bind(asset_id)
-        .execute(pool)
-        .await;
+        .fetch_optional(pool)
+        .await
+        .unwrap_or_default();
+        if keeps_picture {
+            rel_thumb = stored.flatten().or_else(|| previous_thumb.clone());
+        }
     } else {
         let _ = sqlx::query(
             "UPDATE assets SET preview_status = 'done', thumbnail_path = ?, preview_version = ?, preview_textures = ?, preview_reason = NULL WHERE id = ?",
@@ -611,6 +689,85 @@ pub(crate) async fn complete_job(
         thumb_path: rel_thumb.as_ref().map(|r| resolve_path(root_path, r)),
         model_path,
     }
+}
+
+/// A saved render: its library-relative path, and the group of the asset it pictures, whose main
+/// item's card may show it as a stand-in.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SavedRender {
+    pub rel_thumb: String,
+    pub group_id: Option<String>,
+}
+
+/// Stores the PNG the frontend rendered from asset `asset_id`'s preview GLB, as listed at
+/// `revision`. Each render gets a name of its own, so a card showing the old picture loads the
+/// new one rather than the webview's cached copy. A job queued since stays `pending`. Once a job
+/// has written a newer GLB the row and its picture stay as they are, and this returns `None`: the
+/// render shows an older GLB than the one the row now waits on.
+pub(crate) async fn save_model_render(
+    pool: &Pool<Sqlite>,
+    root_path: &Path,
+    asset_id: &str,
+    revision: i64,
+    png: &[u8],
+) -> std::io::Result<Option<SavedRender>> {
+    let old: Option<String> = sqlx::query_scalar("SELECT thumbnail_path FROM assets WHERE id = ?")
+        .bind(asset_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(std::io::Error::other)?
+        .flatten();
+    let rel_thumb = format!(
+        ".opendam/thumbs/{asset_id}_thumb.{}.png",
+        uuid::Uuid::new_v4().simple()
+    );
+    let abs_thumb = PathBuf::from(resolve_path(root_path, &rel_thumb));
+    tokio::fs::write(&abs_thumb, png).await?;
+    let updated: sqlx::Result<Option<Option<String>>> = sqlx::query_scalar(
+        "UPDATE assets SET thumbnail_path = ?,
+            preview_status = CASE preview_status WHEN 'generating' THEN 'done' ELSE preview_status END
+         WHERE id = ? AND preview_revision = ? RETURNING group_id",
+    )
+    .bind(&rel_thumb)
+    .bind(asset_id)
+    .bind(revision)
+    .fetch_optional(pool)
+    .await;
+    // No row names the new file unless the update landed, and nothing else would ever delete it.
+    let group_id = match updated {
+        Ok(Some(group_id)) => group_id,
+        outcome => {
+            remove_thumb_file(&abs_thumb).await;
+            return outcome.map(|_| None).map_err(std::io::Error::other);
+        }
+    };
+    if let Some(old) = old.and_then(|old| owned_thumb_file(root_path, &old)) {
+        remove_thumb_file(&old).await;
+    }
+    Ok(Some(SavedRender {
+        rel_thumb,
+        group_id,
+    }))
+}
+
+/// Moves asset `asset_id` from `generating` to `error` when its GLB, as listed at `revision`,
+/// can't be rendered, which frees Regenerate. Its old picture stays. Returns whether the row
+/// moved: a first preview, a model queued again since, or one with a newer GLB has nothing to
+/// fail.
+pub(crate) async fn fail_model_render(
+    pool: &Pool<Sqlite>,
+    asset_id: &str,
+    revision: i64,
+) -> sqlx::Result<bool> {
+    let moved = sqlx::query(
+        "UPDATE assets SET preview_status = 'error', preview_reason = NULL
+         WHERE id = ? AND preview_revision = ? AND preview_status = 'generating'",
+    )
+    .bind(asset_id)
+    .bind(revision)
+    .execute(pool)
+    .await?;
+    Ok(moved.rows_affected() > 0)
 }
 
 /// Deletes the asset's current `_thumb` file under `.opendam/thumbs` unless it is
@@ -1966,6 +2123,437 @@ mod tests {
         );
     }
 
+    /// Where a model's job leaves asset `m1`'s GLB.
+    const GLB: &str = ".opendam/thumbs/m1_preview.glb";
+
+    /// A model's job whose GLB is left to render, as `python_queue_round` finishes it.
+    async fn finish_with_glb(pool: &Pool<Sqlite>, root: &Path, job: &str) -> PreviewDone {
+        complete_job(
+            pool,
+            root,
+            job,
+            "m1",
+            Some(GLB.to_string()),
+            Some(root.join(GLB).to_string_lossy().into_owned()),
+            &EngineReport::default(),
+        )
+        .await
+    }
+
+    /// Asset `m1`'s current revision.
+    async fn revision(pool: &Pool<Sqlite>) -> i64 {
+        sqlx::query_scalar("SELECT preview_revision FROM assets WHERE id = 'm1'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Asset `m1`'s render of its current GLB, saved.
+    async fn save_render(pool: &Pool<Sqlite>, root: &Path, png: &[u8]) -> SavedRender {
+        save_model_render(pool, root, "m1", revision(pool).await, png)
+            .await
+            .unwrap()
+            .expect("no newer GLB")
+    }
+
+    /// The (id, model, generating) of up to `limit` assets awaiting a render.
+    async fn awaiting(pool: &Pool<Sqlite>, limit: i64) -> Vec<(String, String, bool)> {
+        let rows = models_awaiting_render(pool, limit).await.unwrap();
+        rows.into_iter()
+            .map(|r| (r.id, r.model, r.generating))
+            .collect()
+    }
+
+    async fn thumb_and_status(pool: &Pool<Sqlite>) -> (Option<String>, String) {
+        sqlx::query_as("SELECT thumbnail_path, preview_status FROM assets WHERE id = 'm1'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_rerun_model_keeps_its_picture_until_its_render_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let thumbs = root.join(".opendam/thumbs");
+        std::fs::create_dir_all(&thumbs).unwrap();
+        let old = ".opendam/thumbs/m1_thumb.png";
+        std::fs::write(root.join(old), "old").unwrap();
+        let pool = crate::db::memory_library_pool().await;
+        sqlx::query(
+            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes,
+                modified_at, indexed_at, thumbnail_path, preview_status)
+             VALUES ('m1', 'm.glb', 'm.glb', 'glb', '3d_model', 1, 0, 0, ?, 'pending')",
+        )
+        .bind(old)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let done = finish_with_glb(&pool, root, "j1").await;
+
+        assert_eq!(
+            done.thumb_path.as_deref(),
+            root.join(old).to_str(),
+            "the card keeps its picture"
+        );
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(old.to_string()), "generating".to_string())
+        );
+        assert!(root.join(old).is_file());
+        assert_eq!(
+            awaiting(&pool, 10).await,
+            [("m1".to_string(), GLB.to_string(), true)],
+            "the thumbnailer renders the GLB, not the old picture"
+        );
+
+        let new = save_render(&pool, root, b"new").await.rel_thumb;
+
+        assert_eq!(awaiting(&pool, 10).await, []);
+        assert_ne!(new, old, "a new URL, so the webview loads the new picture");
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(new.clone()), "done".to_string())
+        );
+        assert_eq!(std::fs::read(root.join(&new)).unwrap(), b"new");
+        assert!(!root.join(old).exists(), "the old picture goes with it");
+    }
+
+    /// A library holding only asset `m1`, a model waiting on its first preview.
+    async fn library_with_new_model() -> (tempfile::TempDir, Pool<Sqlite>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".opendam/thumbs")).unwrap();
+        let pool = crate::db::memory_library_pool().await;
+        sqlx::query(
+            "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes,
+                modified_at, indexed_at, preview_status)
+             VALUES ('m1', 'm.glb', 'm.glb', 'glb', '3d_model', 1, 0, 0, 'pending')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        (dir, pool)
+    }
+
+    /// The names in the library's `.opendam/thumbs`, sorted.
+    fn thumb_files(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root.join(".opendam/thumbs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn a_first_preview_holds_its_glb_until_its_render_replaces_it_and_keeps_the_file() {
+        let (dir, pool) = library_with_new_model().await;
+        let root = dir.path();
+        std::fs::write(root.join(GLB), "glb").unwrap();
+
+        finish_with_glb(&pool, root, "j1").await;
+
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(GLB.to_string()), "done".to_string())
+        );
+
+        let new = save_render(&pool, root, b"new").await.rel_thumb;
+
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(new), "done".to_string())
+        );
+        assert!(root.join(GLB).is_file(), "the 3D viewer still loads it");
+    }
+
+    #[tokio::test]
+    async fn a_second_render_replaces_the_first_by_a_new_name() {
+        let (dir, pool) = library_with_new_model().await;
+        let root = dir.path();
+
+        let first = save_render(&pool, root, b"one").await;
+        let second = save_render(&pool, root, b"two").await;
+        let (first, second) = (first.rel_thumb, second.rel_thumb);
+
+        assert_ne!(first, second);
+        let (_, name) = second.rsplit_once('/').unwrap();
+        assert_eq!(thumb_files(root), [name], "the first render is deleted");
+        assert_eq!(std::fs::read(root.join(&second)).unwrap(), b"two");
+    }
+
+    /// The thumbnailer's selection gets a GLB by the row's state, not by whichever column is set:
+    /// here `m1` is a first preview and `m2` a re-render, with both columns telling them apart.
+    #[tokio::test]
+    async fn the_thumbnailer_gets_a_first_previews_thumbnail_and_a_re_renders_model() {
+        let pool = crate::db::memory_library_pool().await;
+        for (id, thumb, status, metadata) in [
+            ("m1", "held.glb", "done", r#"{"preview_model":"other.glb"}"#),
+            (
+                "m2",
+                "old.png",
+                "generating",
+                r#"{"preview_model":"new.glb"}"#,
+            ),
+            ("m3", "own.png", "done", r#"{"preview_model":"own.glb"}"#),
+        ] {
+            sqlx::query(
+                "INSERT INTO assets (id, file_path, file_name, extension, kind, size_bytes,
+                    modified_at, indexed_at, thumbnail_path, preview_status, metadata)
+                 VALUES (?1, ?1, ?1, 'glb', '3d_model', 1, 0, 0, ?2, ?3, ?4)",
+            )
+            .bind(id)
+            .bind(thumb)
+            .bind(status)
+            .bind(metadata)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let mut listed = awaiting(&pool, 10).await;
+        listed.sort();
+
+        assert_eq!(
+            listed,
+            [
+                ("m1".to_string(), "held.glb".to_string(), false),
+                ("m2".to_string(), "new.glb".to_string(), true),
+            ]
+        );
+        assert_eq!(awaiting(&pool, 1).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_saved_render_names_the_group_whose_card_may_show_it() {
+        let (dir, pool) = library_with_new_model().await;
+
+        let alone = save_render(&pool, dir.path(), b"png").await;
+        assert_eq!(alone.group_id, None);
+
+        sqlx::query("UPDATE assets SET group_id = 'main'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let member = save_render(&pool, dir.path(), b"png").await;
+        assert_eq!(member.group_id.as_deref(), Some("main"));
+    }
+
+    #[tokio::test]
+    async fn the_thumbnailer_gets_each_model_with_its_revision() {
+        let (_dir, pool) = library_with_new_model().await;
+        sqlx::query("UPDATE assets SET thumbnail_path = 'held.glb', preview_revision = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let listed = models_awaiting_render(&pool, 10).await.unwrap();
+
+        assert_eq!(listed[0].revision, 7);
+    }
+
+    /// `m1` at `generating`, showing `old`, at revision 2: the thumbnailer listed job A's GLB at
+    /// revision 1, and job B replaced it before that render came back. Nothing else on the row
+    /// changes, as when the model changed before A finished.
+    async fn changed_during_its_render(pool: &Pool<Sqlite>, root: &Path, old: &str) {
+        std::fs::write(root.join(old), "old").unwrap();
+        sqlx::query("UPDATE assets SET thumbnail_path = ?")
+            .bind(old)
+            .execute(pool)
+            .await
+            .unwrap();
+        finish_with_glb(pool, root, "j1").await;
+        assert_eq!(revision(pool).await, 1);
+        finish_with_glb(pool, root, "j2").await;
+        assert_eq!(revision(pool).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_render_of_an_older_glb_leaves_the_newer_one_waiting() {
+        let (dir, pool) = library_with_new_model().await;
+        let root = dir.path();
+        let old = ".opendam/thumbs/m1_thumb.png";
+        changed_during_its_render(&pool, root, old).await;
+
+        let saved = save_model_render(&pool, root, "m1", 1, b"older").await;
+
+        assert_eq!(saved.unwrap(), None);
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(old.to_string()), "generating".to_string())
+        );
+        assert_eq!(thumb_files(root), ["m1_thumb.png"], "the render is dropped");
+        assert_eq!(
+            awaiting(&pool, 10).await,
+            [("m1".to_string(), GLB.to_string(), true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_render_of_an_older_glb_leaves_the_newer_one_waiting() {
+        let (dir, pool) = library_with_new_model().await;
+        let old = ".opendam/thumbs/m1_thumb.png";
+        changed_during_its_render(&pool, dir.path(), old).await;
+
+        assert!(!fail_model_render(&pool, "m1", 1).await.unwrap());
+
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(old.to_string()), "generating".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_render_of_a_first_preview_that_changed_keeps_its_held_glb() {
+        let (dir, pool) = library_with_new_model().await;
+        let root = dir.path();
+        finish_with_glb(&pool, root, "j1").await;
+        finish_with_glb(&pool, root, "j2").await;
+
+        let saved = save_model_render(&pool, root, "m1", 1, b"older").await;
+
+        assert_eq!(saved.unwrap(), None);
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(GLB.to_string()), "done".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_render_whose_row_update_fails_leaves_no_file_behind() {
+        let (dir, pool) = library_with_new_model().await;
+        let root = dir.path();
+        let old = ".opendam/thumbs/m1_thumb.png";
+        std::fs::write(root.join(old), "old").unwrap();
+        sqlx::query("UPDATE assets SET thumbnail_path = ?")
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER busy BEFORE UPDATE OF thumbnail_path ON assets
+             BEGIN SELECT RAISE(ABORT, 'database is locked'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let saved = save_model_render(&pool, root, "m1", 0, b"new").await;
+
+        assert!(saved.is_err());
+        assert_eq!(thumb_files(root), ["m1_thumb.png"]);
+        assert_eq!(thumb_and_status(&pool).await.0.as_deref(), Some(old));
+    }
+
+    #[tokio::test]
+    async fn a_render_landing_as_a_job_finishes_stays_the_kept_picture() {
+        let (dir, pool) = library_with_new_model().await;
+        let root = dir.path();
+        let (old, landed) = (
+            ".opendam/thumbs/m1_thumb.png".to_string(),
+            ".opendam/thumbs/m1_thumb.landed.png",
+        );
+        std::fs::write(root.join(landed), "landed").unwrap();
+        sqlx::query("UPDATE assets SET thumbnail_path = ?")
+            .bind(landed)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The job read `old` before the render saved `landed` and deleted it.
+        let done = store_job_result(
+            &pool,
+            root,
+            "m1",
+            None,
+            Some(old),
+            Some(GLB.to_string()),
+            Some(root.join(GLB).to_string_lossy().into_owned()),
+            &EngineReport::default(),
+        )
+        .await;
+
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(landed.to_string()), "generating".to_string())
+        );
+        assert!(root.join(landed).is_file(), "the row's picture stays");
+        assert_eq!(done.thumb_path.as_deref(), root.join(landed).to_str());
+    }
+
+    #[tokio::test]
+    async fn a_failed_render_clears_a_stale_preview_reason() {
+        let (dir, pool) = library_with_new_model().await;
+        let old = ".opendam/thumbs/m1_thumb.png";
+        sqlx::query("UPDATE assets SET thumbnail_path = ?")
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        finish_with_glb(&pool, dir.path(), "j1").await;
+        sqlx::query("UPDATE assets SET preview_reason = 'Too large to preview'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(fail_model_render(&pool, "m1", 1).await.unwrap());
+
+        let reason: Option<String> = sqlx::query_scalar("SELECT preview_reason FROM assets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reason, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_render_leaves_the_model_retriable_with_its_picture() {
+        let (dir, pool) = library_with_new_model().await;
+        let root = dir.path();
+        let old = ".opendam/thumbs/m1_thumb.png";
+        sqlx::query("UPDATE assets SET thumbnail_path = ?")
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        finish_with_glb(&pool, root, "j1").await;
+
+        assert!(fail_model_render(&pool, "m1", 1).await.unwrap());
+
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(old.to_string()), "error".to_string())
+        );
+        assert_eq!(awaiting(&pool, 10).await, []);
+    }
+
+    #[tokio::test]
+    async fn only_a_model_at_generating_fails_its_render() {
+        let (dir, pool) = library_with_new_model().await;
+
+        assert!(!fail_model_render(&pool, "m1", 0).await.unwrap(), "pending");
+
+        finish_with_glb(&pool, dir.path(), "j1").await;
+
+        assert!(!fail_model_render(&pool, "m1", 1).await.unwrap(), "first");
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(GLB.to_string()), "done".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_render_finishing_after_the_model_changed_leaves_it_pending() {
+        let (dir, pool) = library_with_new_model().await;
+
+        let new = save_render(&pool, dir.path(), b"new").await.rel_thumb;
+
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(new), "pending".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn model_job_deletes_a_renamed_thumb_but_keeps_its_new_model() {
         let dir = tempfile::tempdir().unwrap();
@@ -1980,7 +2568,7 @@ mod tests {
         let lib =
             library_with_pending_job(root, "models/ship.fbx", ".opendam/thumbs/a1_thumb.jpg").await;
 
-        // A re-preview with no thumbnail stores the model as one, as Python jobs do.
+        // A re-preview with no thumbnail leaves the model to render, and the old picture stands.
         let model_abs = model.to_string_lossy().to_string();
         complete_job(
             &lib.pool,
@@ -1992,7 +2580,7 @@ mod tests {
             &EngineReport::default(),
         )
         .await;
-        assert!(!old_thumb.exists());
+        assert!(old_thumb.exists());
         assert!(model.exists());
 
         // A later job that writes a thumbnail keeps the model the row pointed at, which is
@@ -2007,6 +2595,7 @@ mod tests {
             &EngineReport::default(),
         )
         .await;
+        assert!(!old_thumb.exists());
         assert!(model.exists());
     }
 

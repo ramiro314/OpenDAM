@@ -723,6 +723,8 @@ fn search_filter(query: &SearchQuery, split: bool) -> SqlFilter {
             filter.push("a.preview_status IN ('none', 'error')", [])
         }
         Some("has_preview") => filter.push("a.preview_status = 'done'", []),
+        // A model whose job is done and whose picture is still rendering is waiting too.
+        Some("pending") => filter.push("a.preview_status IN ('pending', 'generating')", []),
         Some(ps) => filter.push("a.preview_status = ?", [ps.to_string()]),
     }
     filter.push_file_in("{f}.extension", &f.extensions);
@@ -4693,6 +4695,29 @@ mod tests {
             }
         }
         assert!(nonzero > 20, "only {nonzero} folder counts were above 0");
+    }
+
+    #[tokio::test]
+    async fn the_pending_filter_holds_a_model_waiting_on_its_render() {
+        let pool = attribute_library().await;
+        for (id, status) in [("m1", "pending"), ("m3", "generating")] {
+            sqlx::query("UPDATE assets SET preview_status = ? WHERE id = ?")
+                .bind(status)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let pools = [pool];
+        let search = |status: &str| {
+            let query = serde_json::json!({ "filter": { "previewStatus": status } });
+            let pools = &pools;
+            async move { search_ids(pools, query).await }
+        };
+
+        assert_eq!(search("pending").await, ["m1", "m3"]);
+        assert_eq!(search("generating").await, ["m3"]);
+        assert_eq!(search("done").await, ["m2", "p1"]);
     }
 
     #[tokio::test]

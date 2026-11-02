@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { useGLTF } from '@react-three/drei';
-import { useAssetStore } from '../store';
-import { onPreviewDone } from './previewDone';
+import { useAssetStore, usePacksStore } from '../store';
+import { modelsToRender, onModelRendered, onPreviewDone, renderKey } from './previewDone';
 
 const realWindow = globalThis.window;
 const model = '/lib/.opendam/thumbs/a_preview.glb';
@@ -43,5 +43,75 @@ describe('onPreviewDone', () => {
     } finally {
       clear.mockRestore();
     }
+  });
+});
+
+describe('onModelRendered', () => {
+  const thumbnailPath = '/lib/.opendam/thumbs/m_thumb.new.png';
+
+  /** Runs `onModelRendered` and returns the ids refreshed and the asset ids patched. */
+  async function rendered(assetId: string, groupId: string | null) {
+    const refreshAssets = mock(async (_ids: string[]) => {});
+    const updateAssetPreview = mock((_id: string, _path: string) => {});
+    const real = useAssetStore.getState();
+    useAssetStore.setState({ refreshAssets, updateAssetPreview } as never);
+    try {
+      await onModelRendered(assetId, { thumbnailPath, groupId });
+    } finally {
+      useAssetStore.setState({
+        refreshAssets: real.refreshAssets,
+        updateAssetPreview: real.updateAssetPreview,
+      });
+    }
+    return {
+      refreshed: refreshAssets.mock.calls.map(([ids]) => ids),
+      patched: updateAssetPreview.mock.calls,
+    };
+  }
+
+  test("refreshes the group's card, which may show a stand-in's old file", async () => {
+    expect(await rendered('member', 'main')).toEqual({
+      refreshed: [['main']],
+      patched: [['member', thumbnailPath]],
+    });
+  });
+
+  test('a file on its own or a main item has no other card to refresh', async () => {
+    expect((await rendered('alone', null)).refreshed).toEqual([]);
+    expect((await rendered('main', 'main')).refreshed).toEqual([]);
+  });
+});
+
+describe('onModelRendered and pack cards', () => {
+  afterEach(() => usePacksStore.setState({ packs: null }));
+
+  test("moves a pack card off the old render's file", async () => {
+    const thumbnailPath = '/lib/.opendam/thumbs/m_thumb.new.png';
+    const cover = { assetId: 'm', thumbnailPath: '/lib/old.png', memberIds: [] };
+    usePacksStore.setState({ packs: [{ cover }] as never });
+
+    await onModelRendered('m', { thumbnailPath, groupId: null });
+
+    expect(usePacksStore.getState().packs?.[0].cover?.thumbnailPath).toBe(thumbnailPath);
+  });
+});
+
+describe('modelsToRender', () => {
+  const item = (assetId: string, generating: boolean, revision = 1) => ({
+    assetId,
+    modelPath: `/lib/${assetId}.glb`,
+    generating,
+    revision,
+  });
+
+  test('skips a failed first preview but never a model at generating', () => {
+    const skipped = new Set([item('first', false), item('changed-again', true)].map(renderKey));
+    const batch = [item('first', false), item('changed-again', true), item('new', false)];
+    expect(modelsToRender(batch, skipped).map((m) => m.assetId)).toEqual(['changed-again', 'new']);
+  });
+
+  test('a first preview that failed gets a new try with a new GLB', () => {
+    const skipped = new Set([renderKey(item('first', false, 1))]);
+    expect(modelsToRender([item('first', false, 2)], skipped)).toHaveLength(1);
   });
 });

@@ -359,6 +359,16 @@ export interface PreviewProgress {
 export interface PendingModelThumbnail {
   assetId: string;
   modelPath: string;
+  /** Keeps its old picture until this render */
+  generating: boolean;
+  /** The token its render is saved or failed with */
+  revision: number;
+}
+
+/** What `save_model_thumbnail` stored */
+export interface SavedModelThumbnail {
+  thumbnailPath: string;
+  groupId: string | null;
 }
 
 // ── IPC / Command interfaces (Tauri invoke payloads) ─────────────────────

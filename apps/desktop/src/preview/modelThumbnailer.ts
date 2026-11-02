@@ -4,6 +4,7 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { api } from '../api';
 import { useAssetStore } from '../store';
+import { modelsToRender, onModelRendered, renderKey } from './previewDone';
 
 const SIZE = 512;
 const BATCH = 20;
@@ -62,28 +63,39 @@ export function startModelThumbnailer(): () => void {
   }
 
   async function run() {
-    // Models that failed this session. Not recorded anywhere, so they're retried on next launch.
+    // Renders that failed this session. A first preview's failure isn't recorded anywhere, so it's
+    // retried on next launch or with a new GLB (`modelsToRender`).
     const skipped = new Set<string>();
 
     while (!stopped) {
-      const batch = (
-        await api.listPendingModelThumbnails(BATCH + skipped.size).catch(() => [])
-      ).filter((item) => !skipped.has(item.assetId));
+      const batch = modelsToRender(
+        await api.listPendingModelThumbnails(BATCH + skipped.size).catch(() => []),
+        skipped
+      );
       if (batch.length === 0) {
         await sleep(IDLE_POLL_MS);
         continue;
       }
 
-      for (const { assetId, modelPath } of batch) {
+      for (const item of batch) {
+        const { assetId, modelPath, revision } = item;
         if (stopped) return;
         try {
-          const thumbnailPath = await api.saveModelThumbnail(assetId, await render(modelPath));
-          useAssetStore.getState().updateAssetPreview(assetId, thumbnailPath);
+          const png = await render(modelPath);
+          const saved = await api.saveModelThumbnail(assetId, revision, png);
+          if (saved) await onModelRendered(assetId, saved);
         } catch (err) {
           // A lost context or a stop mid-render says nothing about the model; retry later.
           if (stopped || renderer.getContext().isContextLost()) return;
           console.warn(`3D thumbnail failed for ${modelPath}:`, err);
-          skipped.add(assetId);
+          // A changed model becomes an error, which Regenerate retries. A report that didn't get
+          // through leaves it `generating`, so it is tried again, after a pause.
+          const reported = await api.failModelThumbnail(assetId, revision).catch(async () => {
+            await sleep(IDLE_POLL_MS);
+            return false;
+          });
+          if (reported) await useAssetStore.getState().refreshAssets([assetId]);
+          else skipped.add(renderKey(item));
         }
       }
     }

@@ -20,6 +20,7 @@ import type {
   SearchResult,
   PreviewJob,
   PendingModelThumbnail,
+  SavedModelThumbnail,
   PreviewProgress,
   AiProvider,
   AiSettings,
@@ -148,9 +149,17 @@ export const api = {
   getPreviewProgress: () => invoke<PreviewProgress>('get_preview_progress'),
   listPendingModelThumbnails: (limit: number) =>
     invoke<PendingModelThumbnail[]>('list_pending_model_thumbnails', { limit }),
-  /** Sends the PNG as a raw body; returns the saved thumbnail's path. */
-  saveModelThumbnail: (assetId: string, png: Uint8Array) =>
-    invoke<string>('save_model_thumbnail', png, { headers: { 'asset-id': assetId } }),
+  /**
+   * Sends the PNG as a raw body. Returns the saved thumbnail's path and the asset's group, or null
+   * when a newer GLB than `revision` exists and the render was dropped.
+   */
+  saveModelThumbnail: (assetId: string, revision: number, png: Uint8Array) =>
+    invoke<SavedModelThumbnail | null>('save_model_thumbnail', png, {
+      headers: { 'asset-id': assetId, 'preview-revision': String(revision) },
+    }),
+  /** Reports a render that failed; returns whether the asset moved to `error`. */
+  failModelThumbnail: (assetId: string, revision: number) =>
+    invoke<boolean>('fail_model_thumbnail', { assetId, revision }),
 
   // Reveal in file manager / open with default app
   revealInFileManager: (filePath: string) => invoke<void>('reveal_in_file_manager', { filePath }),

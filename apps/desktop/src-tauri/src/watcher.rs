@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 use crate::db::{make_relative_path, Database, LibraryHandle};
 use crate::models::AssetKind;
-use crate::preview::is_native_image;
+use crate::preview::needs_preview;
 
 // ── Advisory lock guard ─────────────────────────────────────────────────────
 
@@ -792,15 +792,15 @@ pub async fn index_pool(
             let mut preview_status = "none";
             let mut thumbnail_path = None;
 
-            if crate::preview::needs_preview(&ext) {
+            if needs_preview(&ext) {
                 preview_status = "pending";
             }
 
             let (id, is_update) =
                 if let Some((existing_id, _, _, existing_thumb)) = existing_map.get(&rel_path) {
-                    // A changed raster is re-previewed (see `commit_asset_batch`): it may have
-                    // crossed THUMB_SIZE either way. Other kinds keep their preview.
-                    if !is_native_image(&ext) && existing_thumb.is_some() {
+                    // A changed file that takes a preview is re-previewed (see
+                    // `commit_asset_batch`). Other kinds keep what they have.
+                    if !needs_preview(&ext) && existing_thumb.is_some() {
                         thumbnail_path = existing_thumb.clone();
                         preview_status = "done";
                     }
@@ -894,10 +894,12 @@ async fn commit_asset_batch(
     let mut tx = pool.begin().await?;
 
     for item in batch {
-        if item.is_update && is_native_image(&item.extension) {
-            // A changed raster gets a fresh preview, and keeps its old thumbnail until then. A job
-            // that hasn't started reads the new file, so it is reused. A 'processing' one may be
-            // decoding the old pixels, so the change gets a job of its own.
+        if item.is_update && needs_preview(&item.extension) {
+            // A changed file gets a fresh preview, and keeps its old thumbnail until then: a
+            // raster may have crossed THUMB_SIZE either way, and a model's look may have changed.
+            // A job that hasn't started reads the new file, so it is reused. A 'processing' one
+            // may be reading the old bytes, so the change gets a job of its own. The structure
+            // pass takes a group member or a pictured item back off the queue.
             sqlx::query(
                 "UPDATE assets SET size_bytes = ?, modified_at = ?, preview_status = 'pending' WHERE id = ?",
             )
@@ -1441,30 +1443,138 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn changed_model_keeps_its_preview() {
-        let (dir, db, lib) = temp_library().await;
-        let source = dir.path().join("ship.glb");
+    /// `ship.glb` indexed with a finished preview, showing `.opendam/thumbs/s.png`.
+    async fn previewed_model(lib: &LibraryHandle, db: &Database) -> PathBuf {
+        let source = lib.root_path.join("ship.glb");
         std::fs::write(&source, "v1").unwrap();
-        reindex(&db, &lib).await;
-        sqlx::query("UPDATE preview_jobs SET status = 'done'")
-            .execute(&lib.pool)
-            .await
-            .unwrap();
-        sqlx::query(
+        reindex(db, lib).await;
+        for sql in [
+            "UPDATE preview_jobs SET status = 'done'",
             "UPDATE assets SET preview_status = 'done', thumbnail_path = '.opendam/thumbs/s.png'",
-        )
-        .execute(&lib.pool)
-        .await
-        .unwrap();
+        ] {
+            sqlx::query(sql).execute(&lib.pool).await.unwrap();
+        }
+        source
+    }
+
+    #[tokio::test]
+    async fn changed_model_gets_a_fresh_preview_and_keeps_its_thumbnail_until_then() {
+        let (_dir, db, lib) = temp_library().await;
+        let source = previewed_model(&lib, &db).await;
 
         std::fs::write(&source, "version 2").unwrap();
         reindex(&db, &lib).await;
 
         assert_eq!(
             preview_state(&lib.pool).await,
+            (Some(".opendam/thumbs/s.png".into()), "pending".into(), 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_model_queues_nothing() {
+        let (_dir, db, lib) = temp_library().await;
+        previewed_model(&lib, &db).await;
+
+        reindex(&db, &lib).await;
+
+        assert_eq!(
+            preview_state(&lib.pool).await,
             (Some(".opendam/thumbs/s.png".into()), "done".into(), 0)
         );
+    }
+
+    #[tokio::test]
+    async fn changed_file_that_takes_no_preview_stays_unqueued() {
+        let (dir, db, lib) = temp_library().await;
+        let source = dir.path().join("ship.blend");
+        std::fs::write(&source, "v1").unwrap();
+        reindex(&db, &lib).await;
+
+        std::fs::write(&source, "version 2").unwrap();
+        reindex(&db, &lib).await;
+
+        assert_eq!(preview_state(&lib.pool).await, (None, "none".into(), 0));
+    }
+
+    #[tokio::test]
+    async fn changed_file_that_takes_no_preview_keeps_the_thumbnail_it_has() {
+        for status in ["done", "error"] {
+            let (dir, db, lib) = temp_library().await;
+            let source = dir.path().join("ship.blend");
+            std::fs::write(&source, "v1").unwrap();
+            reindex(&db, &lib).await;
+            sqlx::query("UPDATE assets SET preview_status = ?, thumbnail_path = 'ship.png'")
+                .bind(status)
+                .execute(&lib.pool)
+                .await
+                .unwrap();
+
+            std::fs::write(&source, "version 2").unwrap();
+            reindex(&db, &lib).await;
+
+            assert_eq!(
+                preview_state(&lib.pool).await,
+                (Some("ship.png".into()), "done".into(), 0),
+                "from {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_group_member_stays_off_the_queue_with_its_thumbnail() {
+        let (dir, db, lib) = temp_library().await;
+        let [glb, fbx, obj, tree] = write_grouped_kit(dir.path());
+        reindex(&db, &lib).await;
+        sqlx::query("DELETE FROM preview_jobs")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE assets SET preview_status = 'done', thumbnail_path = 'old.png'")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+
+        std::fs::write(dir.path().join(fbx), "a changed model").unwrap();
+        reindex(&db, &lib).await;
+
+        assert_eq!(
+            queued(&lib.pool).await,
+            (
+                pairs(&[(fbx, "none"), (glb, "done"), (obj, "done"), (tree, "done")]),
+                vec![],
+            )
+        );
+        let kept: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM assets WHERE thumbnail_path = 'old.png'")
+                .fetch_one(&lib.pool)
+                .await
+                .unwrap();
+        assert_eq!(kept, 4);
+    }
+
+    #[tokio::test]
+    async fn changed_pictured_model_stays_off_the_queue() {
+        let (dir, db, lib) = temp_library().await;
+        std::fs::create_dir_all(dir.path().join("kit/Previews")).unwrap();
+        let (model, render) = ("kit/rock.glb", "kit/Previews/rock.png");
+        std::fs::write(dir.path().join(model), "v1").unwrap();
+        write_png(&dir.path().join(render), 512, 512);
+        reindex(&db, &lib).await;
+        sqlx::query("DELETE FROM preview_jobs")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+
+        std::fs::write(dir.path().join(model), "version 2").unwrap();
+        reindex(&db, &lib).await;
+
+        let (assets, jobs) = queued(&lib.pool).await;
+        assert!(
+            assets.contains(&(model.to_string(), "none".to_string())),
+            "{assets:?}"
+        );
+        assert_eq!(jobs, vec![]);
     }
 
     // ── The advisory lock ───────────────────────────────────────────────────

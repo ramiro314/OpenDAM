@@ -7,6 +7,9 @@ use uuid::Uuid;
 
 use crate::db::resolve_path;
 use crate::models::PreviewJob;
+use crate::preview::{
+    fail_model_render, models_awaiting_render, save_model_render, AWAITING_RENDER,
+};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -84,6 +87,19 @@ pub struct PendingModelThumbnail {
     pub asset_id: String,
     #[serde(rename = "modelPath")]
     pub model_path: String,
+    /// Keeps its old picture until this render, so a failure the session skipped can't hold it.
+    pub generating: bool,
+    /// The token its render is saved or failed with.
+    pub revision: i64,
+}
+
+/// A render `save_model_thumbnail` stored.
+#[derive(Serialize)]
+pub struct SavedModelThumbnail {
+    #[serde(rename = "thumbnailPath")]
+    pub thumbnail_path: String,
+    #[serde(rename = "groupId")]
+    pub group_id: Option<String>,
 }
 
 #[tauri::command]
@@ -93,21 +109,16 @@ pub async fn list_pending_model_thumbnails(
 ) -> Result<Vec<PendingModelThumbnail>> {
     let mut pending = Vec::new();
     for lib in state.db.get_all_libraries().await {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, thumbnail_path FROM assets WHERE thumbnail_path LIKE '%.glb' LIMIT ?",
-        )
-        .bind(limit - pending.len() as i64)
-        .fetch_all(&lib.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+        let rows = models_awaiting_render(&lib.pool, limit - pending.len() as i64)
+            .await
+            .map_err(|e| e.to_string())?;
 
-        pending.extend(
-            rows.into_iter()
-                .map(|(asset_id, thumb)| PendingModelThumbnail {
-                    asset_id,
-                    model_path: resolve_path(&lib.root_path, &thumb),
-                }),
-        );
+        pending.extend(rows.into_iter().map(|row| PendingModelThumbnail {
+            asset_id: row.id,
+            model_path: resolve_path(&lib.root_path, &row.model),
+            generating: row.generating,
+            revision: row.revision,
+        }));
         if pending.len() as i64 >= limit {
             break;
         }
@@ -116,18 +127,24 @@ pub async fn list_pending_model_thumbnails(
 }
 
 /// Stores a PNG thumbnail rendered by the frontend for a 3D model.
-/// Takes the raw PNG as the request body and the asset id in an `asset-id` header.
-/// Returns the absolute thumbnail path.
+/// Takes the raw PNG as the request body, and the asset id and the `revision` it was listed with
+/// in `asset-id` and `preview-revision` headers. Returns the absolute thumbnail path and the
+/// asset's group, or nothing when a newer GLB exists and the render was dropped.
 #[tauri::command]
 pub async fn save_model_thumbnail(
     request: tauri::ipc::Request<'_>,
     state: State<'_, Arc<AppState>>,
-) -> Result<String> {
+) -> Result<Option<SavedModelThumbnail>> {
     let asset_id = request
         .headers()
         .get("asset-id")
         .and_then(|v| v.to_str().ok())
         .ok_or("missing asset-id header")?;
+    let revision: i64 = request
+        .headers()
+        .get("preview-revision")
+        .and_then(|v| v.to_str().ok()?.parse().ok())
+        .ok_or("missing preview-revision header")?;
     let png = match request.body() {
         InvokeBody::Raw(png) if !png.is_empty() => png,
         _ => return Err("expected a raw PNG body".to_string()),
@@ -144,20 +161,36 @@ pub async fn save_model_thumbnail(
         }
 
         // The id was just matched against the DB, so it's safe to use as a file name.
-        let rel_thumb = format!(".opendam/thumbs/{}_thumb.png", asset_id);
-        let abs_thumb = resolve_path(&lib.root_path, &rel_thumb);
-        tokio::fs::write(&abs_thumb, png)
+        let saved = save_model_render(&lib.pool, &lib.root_path, asset_id, revision, png)
             .await
             .map_err(|e| e.to_string())?;
-        sqlx::query("UPDATE assets SET thumbnail_path = ? WHERE id = ?")
-            .bind(&rel_thumb)
-            .bind(asset_id)
-            .execute(&lib.pool)
-            .await
-            .map_err(|e| e.to_string())?;
-        return Ok(abs_thumb);
+        return Ok(saved.map(|saved| SavedModelThumbnail {
+            thumbnail_path: resolve_path(&lib.root_path, &saved.rel_thumb),
+            group_id: saved.group_id,
+        }));
     }
     Err(format!("asset {} not found", asset_id))
+}
+
+/// Reports that the frontend can't render asset `asset_id`'s preview GLB, as listed at
+/// `revision`. Returns whether that moved the asset to `error`, where Regenerate can retry it.
+#[tauri::command]
+pub async fn fail_model_thumbnail(
+    asset_id: String,
+    revision: i64,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool> {
+    let Some(lib) = state
+        .db
+        .library_of_asset(&asset_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(false);
+    };
+    fail_model_render(&lib.pool, &asset_id, revision)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Preview queue totals across all libraries, for the status bar.
@@ -180,11 +213,12 @@ pub async fn get_preview_progress(state: State<'_, Arc<AppState>>) -> Result<Pre
         .fetch_one(&lib.pool)
         .await
         .map_err(|e| e.to_string())?;
-        let (awaiting,): (i64,) =
-            sqlx::query_as("SELECT count(*) FROM assets WHERE thumbnail_path LIKE '%.glb'")
-                .fetch_one(&lib.pool)
-                .await
-                .map_err(|e| e.to_string())?;
+        let (awaiting,): (i64,) = sqlx::query_as(&format!(
+            "SELECT count(*) FROM assets WHERE {AWAITING_RENDER}"
+        ))
+        .fetch_one(&lib.pool)
+        .await
+        .map_err(|e| e.to_string())?;
         progress.total += total;
         progress.finished += finished;
         progress.models_awaiting_render += awaiting;
