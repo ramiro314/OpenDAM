@@ -5,7 +5,7 @@
 //! The tests sit in a `mod tests` block, as in every other file, so source scans that stop there
 //! (`structure::tests::metadata_writers`) read none of them.
 
-mod tests {
+pub(super) mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -111,7 +111,7 @@ mod tests {
     }
 
     /// A GLB's JSON chunk and binary chunk.
-    fn glb(path: &Path) -> (Value, Vec<u8>) {
+    pub(in crate::import::engine) fn glb(path: &Path) -> (Value, Vec<u8>) {
         let bytes = std::fs::read(path).unwrap();
         assert_eq!(&bytes[..4], b"glTF");
         let chunk = |at: usize| {
@@ -586,7 +586,7 @@ mod tests {
         bytes.into_inner()
     }
 
-    fn near(color: [u8; 3], want: [u8; 3]) -> bool {
+    pub(in crate::import::engine) fn near(color: [u8; 3], want: [u8; 3]) -> bool {
         color
             .iter()
             .zip(want)

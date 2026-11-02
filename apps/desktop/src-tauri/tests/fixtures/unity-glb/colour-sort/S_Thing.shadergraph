@@ -1,0 +1,31 @@
+{
+    "m_SGVersion": 3,
+    "m_Type": "UnityEditor.ShaderGraph.GraphData",
+    "m_Properties": [
+        {
+            "m_Id": "Color_a"
+        },
+        {
+            "m_Id": "Color_b"
+        }
+    ]
+}
+
+{
+    "m_Type": "UnityEditor.ShaderGraph.BlockNode",
+    "m_Name": "SurfaceDescription.BaseColor"
+}
+
+{
+    "m_Type": "UnityEditor.ShaderGraph.Internal.ColorShaderProperty",
+    "m_Name": "BaseColor",
+    "m_DefaultReferenceName": "Color_a",
+    "m_OverrideReferenceName": ""
+}
+
+{
+    "m_Type": "UnityEditor.ShaderGraph.Internal.ColorShaderProperty",
+    "m_Name": "Base Color",
+    "m_DefaultReferenceName": "Color_b",
+    "m_OverrideReferenceName": ""
+}

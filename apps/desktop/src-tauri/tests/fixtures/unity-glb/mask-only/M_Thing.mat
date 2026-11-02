@@ -1,0 +1,23 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!21 &2100000
+Material:
+  serializedVersion: 8
+  m_Name: M_Thing
+  m_Shader: {fileID: -6465566751694194690, guid: 512235d742b6f578498eacb8b347d4d2,
+    type: 3}
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs:
+    - Texture2D_a:
+        m_Texture: {fileID: 2800000, guid: 5a16fd66eb26224e13720623d55ca182, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - Texture2D_b:
+        m_Texture: {fileID: 2800000, guid: afbf3d1381d2707530503fbc5d9d4f76, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    m_Ints: []
+    m_Floats: []
+    m_Colors:
+    - _Color: {r: 0.2, g: 0.4, b: 0.6, a: 1}

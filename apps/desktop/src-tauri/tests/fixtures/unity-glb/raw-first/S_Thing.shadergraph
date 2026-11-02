@@ -1,0 +1,51 @@
+{
+    "m_SGVersion": 3,
+    "m_Type": "UnityEditor.ShaderGraph.GraphData",
+    "m_Properties": [
+        {
+            "m_Id": "Texture2D_a"
+        },
+        {
+            "m_Id": "_BaseMap"
+        },
+        {
+            "m_Id": "_Normal"
+        },
+        {
+            "m_Id": "Texture2D_b"
+        }
+    ]
+}
+
+{
+    "m_Type": "UnityEditor.ShaderGraph.BlockNode",
+    "m_Name": "SurfaceDescription.BaseColor"
+}
+
+{
+    "m_Type": "UnityEditor.ShaderGraph.Internal.Texture2DShaderProperty",
+    "m_Name": "A_BaseColor",
+    "m_DefaultReferenceName": "Texture2D_a",
+    "m_OverrideReferenceName": ""
+}
+
+{
+    "m_Type": "UnityEditor.ShaderGraph.Internal.Texture2DShaderProperty",
+    "m_Name": "Detail",
+    "m_DefaultReferenceName": "_BaseMap",
+    "m_OverrideReferenceName": ""
+}
+
+{
+    "m_Type": "UnityEditor.ShaderGraph.Internal.Texture2DShaderProperty",
+    "m_Name": "Second",
+    "m_DefaultReferenceName": "_Normal",
+    "m_OverrideReferenceName": ""
+}
+
+{
+    "m_Type": "UnityEditor.ShaderGraph.Internal.Texture2DShaderProperty",
+    "m_Name": "A_Normal",
+    "m_DefaultReferenceName": "Texture2D_b",
+    "m_OverrideReferenceName": ""
+}

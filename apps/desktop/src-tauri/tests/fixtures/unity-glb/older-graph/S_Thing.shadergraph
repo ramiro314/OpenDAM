@@ -1,0 +1,10 @@
+{
+    "m_SerializedProperties": [
+        {
+            "typeInfo": {
+                "fullName": "UnityEditor.ShaderGraph.TextureShaderProperty"
+            },
+            "JSONnodeData": "{\"m_Name\": \"A_BaseColor\", \"m_DefaultReferenceName\": \"Texture2D_x\"}"
+        }
+    ]
+}

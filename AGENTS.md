@@ -135,6 +135,8 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               Unity, Fab and Kenney datapackage.json files gen_datapackage.py and
                               gen_kenney_datapackage.py write), each named with its sha256 in
                               expected/README.md
+    tests/fixtures/unity-glb/  The Unity GLB converter's fixture packs, one folder per case, made by
+                              make_fixtures.py (stdlib only) and committed with its output
     tests/fixtures/game-export/  The export's fixture library, made by make_fixtures.py under Blender and
                               committed with its output, and fbx_facts.json, its FBX files' facts,
                               which test_fbx_facts.py checks and the Check's tests read

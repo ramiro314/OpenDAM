@@ -1,0 +1,19 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!21 &2100000
+Material:
+  serializedVersion: 8
+  m_Name: M_Cutout
+  m_Shader: {fileID: -6465566751694194690, guid: d865b11d8e4f83ebf56199c0e56635cc,
+    type: 3}
+  m_ShaderKeywords: _ALPHATEST_ON
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs:
+    - _BaseMap:
+        m_Texture: {fileID: 2800000, guid: a55ff6ffba80792f5033f0e7914e3c85, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    m_Ints: []
+    m_Floats: []
+    m_Colors:

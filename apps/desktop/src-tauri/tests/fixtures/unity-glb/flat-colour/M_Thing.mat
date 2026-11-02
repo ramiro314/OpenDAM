@@ -1,0 +1,17 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!21 &2100000
+Material:
+  serializedVersion: 8
+  m_Name: M_Thing
+  m_Shader: {fileID: -6465566751694194690, guid: e49178c418855214ef71d1ef11e5d123,
+    type: 3}
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs:
+    m_Ints: []
+    m_Floats: []
+    m_Colors:
+    - Color_a: {r: 0.2, g: 0.4, b: 0.6, a: 1}
+    - _BaseColor: {r: 0.8, g: 0.8, b: 0.8, a: 1}
+    - _Color: {r: 0.8, g: 0.8, b: 0.8, a: 1}

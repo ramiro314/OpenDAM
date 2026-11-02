@@ -68,9 +68,10 @@ const MODEL_EXTENSIONS: [&str; 2] = ["fbx", "obj"];
 /// The files the script loads as textures. It reads them from its job (`imageExtensions`), so
 /// this is the one list of them.
 const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "tga", "tif", "tiff", "psd", "bmp"];
-/// The other files Blender reads besides the models: Unity's `.meta`, `.mat`, `.prefab` and
-/// `.unity`, and an OBJ's `.mtl`. A test keeps every extension the script names among these.
-const UNITY_EXTENSIONS: [&str; 5] = ["meta", "mat", "prefab", "unity", "mtl"];
+/// The other files Blender reads besides the models: Unity's `.meta`, `.mat`, `.prefab`, `.unity`
+/// and `.shadergraph`, and an OBJ's `.mtl`. A test keeps every extension the script names among
+/// these.
+const UNITY_EXTENSIONS: [&str; 6] = ["meta", "mat", "prefab", "unity", "shadergraph", "mtl"];
 /// The Unity files the script reads as text that Unity 4 and 5 could also write in their binary
 /// serialization.
 const SERIALIZED_EXTENSIONS: [&str; 3] = ["mat", "prefab", "unity"];
@@ -881,7 +882,15 @@ pub(crate) mod tests {
             })
             .collect();
         for ext in [
-            "meta", "prefab", "unity", "mat", "mtl", "fbx", "jpg", "jpeg",
+            "meta",
+            "prefab",
+            "unity",
+            "mat",
+            "shadergraph",
+            "mtl",
+            "fbx",
+            "jpg",
+            "jpeg",
         ] {
             assert!(named.contains(&ext), "the scan finds .{ext}: {named:?}");
         }
@@ -934,6 +943,33 @@ pub(crate) mod tests {
         });
         assert_eq!(got, want);
         assert_eq!(models(&[staged("Readme.txt")]), []);
+    }
+
+    #[test]
+    fn blender_reads_models_textures_and_unity_files_including_shader_graphs() {
+        for path in [
+            "Models/SM_Log.fbx",
+            "Models/SM_Log.OBJ",
+            "Models/SM_Log.mtl",
+            "Textures/T_Log_D.PNG",
+            "Materials/M_Log.mat",
+            "Materials/M_Log.mat.meta",
+            "Prefabs/SM_Log.prefab",
+            "Scenes/Demo.unity",
+            "Shaders/S_Layered.shadergraph",
+            "Shaders/S_Layered.ShaderGraph",
+        ] {
+            assert!(is_input(path), "{path}");
+        }
+        for path in [
+            "Readme.txt",
+            "Shaders/S_Layered.shadersubgraph",
+            "Shaders/S_Standard.shader",
+            "shadergraph",
+            ".shadergraph",
+        ] {
+            assert!(!is_input(path), "{path}");
+        }
     }
 
     fn input(path: &str, source: &str, sha256: &str) -> Input {
