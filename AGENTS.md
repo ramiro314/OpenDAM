@@ -285,7 +285,8 @@ docs/plans                    Plans for this fork
 - **No upscaled thumbnails.** `generate_image_thumb` reads a raster's size from its header first.
   Sources 512 px or smaller that the webview can display (png, jpg, jpeg, webp, bmp, gif) get no
   thumbnail, and the UI shows the original, chosen by extension (`utils/media.ts`). Smaller TGA
-  and TIFF get a PNG at their own size. A changed raster gets a fresh preview job, and a job that
+  and TIFF get a PNG at their own size. A changed raster gets a fresh preview job (as does any
+  changed file that takes a preview, see "A changed model gets a fresh preview"), and a job that
   clears or renames a thumbnail deletes the old `_thumb` file before it updates the row. Libraries
   made before this rule lose their upscaled thumbnails once, in the background, through
   `thumb_cleanup.rs`, which records `thumbs_no_upscale` in the library's `library_meta` table.
@@ -534,6 +535,15 @@ docs/plans                    Plans for this fork
     FBX/3DS preview is left, done or waiting, so jobs an older process served are redone later.
   - `packages/preview-engine/tools/measure_textures.py` measures all of this on a real library
     without writing to it. Run it under `scripts/memory-cap.sh`.
+- **A changed model gets a fresh preview.** An index run that finds a changed file that takes a
+  preview (`preview::needs_preview`) marks it `pending` and queues a job, keeping its thumbnail
+  (`watcher::commit_asset_batch`), and the pass it ends with takes a group member or a pictured
+  item back off the queue. A model's job only writes its preview GLB, and the frontend renders
+  the picture (`modelThumbnailer`), so an asset with a picture keeps it at `generating` until
+  `preview::save_model_render` stores the PNG under a new name, which also makes the webview load
+  it rather than its cached copy (`complete_job`, `AWAITING_RENDER`). A first preview holds the
+  GLB as its `thumbnail_path` until then. A staged file with the previous build's bytes keeps its
+  mtime, so a Rebuild queues nothing for it.
 - **Source hashes are a memo.** `file_hashes` (library DB) holds a sha256 per file path,
   relative to the library root, with the size and mtime (nanoseconds) it was taken at. Only the
   game export's Check writes it (`export::hashes`): a row is used while the file keeps that size

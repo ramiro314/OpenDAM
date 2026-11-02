@@ -98,7 +98,7 @@ pub(crate) async fn run_pass(
     process(lib, &candidates, batch_size, stop_before_commit).await
 }
 
-/// Only rasters: a model's thumbnail is also named `<id>_thumb.png`. An asset with an active job
+/// Only rasters: a model's thumbnail is a `_thumb` file too. An asset with an active job
 /// is left to it, since the job applies the size rule and deletes the old file itself.
 async fn read_candidates(lib: &LibraryHandle) -> sqlx::Result<Vec<Candidate>> {
     sqlx::query_as(&format!(

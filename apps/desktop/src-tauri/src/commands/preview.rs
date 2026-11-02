@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::db::resolve_path;
 use crate::models::PreviewJob;
+use crate::preview::{save_model_render, AWAITING_RENDER};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -93,9 +94,11 @@ pub async fn list_pending_model_thumbnails(
 ) -> Result<Vec<PendingModelThumbnail>> {
     let mut pending = Vec::new();
     for lib in state.db.get_all_libraries().await {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, thumbnail_path FROM assets WHERE thumbnail_path LIKE '%.glb' LIMIT ?",
-        )
+        let rows: Vec<(String, String)> = sqlx::query_as(&format!(
+            "SELECT id, CASE preview_status WHEN 'generating'
+                 THEN json_extract(metadata, '$.preview_model') ELSE thumbnail_path END
+             FROM assets WHERE {AWAITING_RENDER} LIMIT ?"
+        ))
         .bind(limit - pending.len() as i64)
         .fetch_all(&lib.pool)
         .await
@@ -144,18 +147,10 @@ pub async fn save_model_thumbnail(
         }
 
         // The id was just matched against the DB, so it's safe to use as a file name.
-        let rel_thumb = format!(".opendam/thumbs/{}_thumb.png", asset_id);
-        let abs_thumb = resolve_path(&lib.root_path, &rel_thumb);
-        tokio::fs::write(&abs_thumb, png)
+        let rel_thumb = save_model_render(&lib.pool, &lib.root_path, asset_id, png)
             .await
             .map_err(|e| e.to_string())?;
-        sqlx::query("UPDATE assets SET thumbnail_path = ? WHERE id = ?")
-            .bind(&rel_thumb)
-            .bind(asset_id)
-            .execute(&lib.pool)
-            .await
-            .map_err(|e| e.to_string())?;
-        return Ok(abs_thumb);
+        return Ok(resolve_path(&lib.root_path, &rel_thumb));
     }
     Err(format!("asset {} not found", asset_id))
 }
@@ -180,11 +175,12 @@ pub async fn get_preview_progress(state: State<'_, Arc<AppState>>) -> Result<Pre
         .fetch_one(&lib.pool)
         .await
         .map_err(|e| e.to_string())?;
-        let (awaiting,): (i64,) =
-            sqlx::query_as("SELECT count(*) FROM assets WHERE thumbnail_path LIKE '%.glb'")
-                .fetch_one(&lib.pool)
-                .await
-                .map_err(|e| e.to_string())?;
+        let (awaiting,): (i64,) = sqlx::query_as(&format!(
+            "SELECT count(*) FROM assets WHERE {AWAITING_RENDER}"
+        ))
+        .fetch_one(&lib.pool)
+        .await
+        .map_err(|e| e.to_string())?;
         progress.total += total;
         progress.finished += finished;
         progress.models_awaiting_render += awaiting;

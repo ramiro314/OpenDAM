@@ -230,9 +230,16 @@ mod tests {
         .unwrap();
         assert_eq!(grouped, 1);
         s.no_work_left();
+        let glb_row = format!("{TARGET}/Art/Models/SM_Log.glb");
+        for sql in [
+            "DELETE FROM preview_jobs",
+            "UPDATE assets SET preview_status = 'done'",
+        ] {
+            sqlx::query(sql).execute(&s.lib.pool).await.unwrap();
+        }
 
         // Hoisting Houses moves files and keeps every name and the T_Rock.png order: the cached
-        // GLB comes back, with its bytes and its mtime.
+        // GLB comes back, with its bytes and its mtime, and queues no preview.
         s.edit(&pack_id, |steps| insert(steps, hoist("Houses")))
             .await;
         s.rebuilt(&pack_id).await;
@@ -243,6 +250,15 @@ mod tests {
             std::fs::metadata(&hoisted).unwrap().modified().unwrap(),
             mtime
         );
+        let (status, jobs): (String, i64) = sqlx::query_as(
+            "SELECT a.preview_status, COUNT(p.id) FROM assets a
+             LEFT JOIN preview_jobs p ON p.asset_id = a.id WHERE a.file_path = ?",
+        )
+        .bind(&glb_row)
+        .fetch_one(&s.lib.pool)
+        .await
+        .unwrap();
+        assert_eq!((status.as_str(), jobs), ("done", 0));
         assert!(s
             .live()
             .join("Built-In/Built-In_Pack/Pack/Art/T_Rock.png")
