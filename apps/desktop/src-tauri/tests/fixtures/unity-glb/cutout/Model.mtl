@@ -1,0 +1,4 @@
+newmtl M_Base
+Kd 1 1 1
+newmtl M_Flat
+Kd 1 1 1

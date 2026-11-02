@@ -228,9 +228,10 @@ def graph_names(path: Path) -> dict[str, str]:
                 if isinstance(found, dict) and "ShaderProperty" in str(found.get("m_Type")):
                     ref = (found.get("m_OverrideReferenceName")
                            or found.get("m_DefaultReferenceName"))
-                    if ref and found.get("m_Name"):
-                        names[ref] = found["m_Name"]
-        except (OSError, ValueError):
+                    name = found.get("m_Name")
+                    if ref and name and isinstance(ref, str) and isinstance(name, str):
+                        names[ref] = name
+        except (OSError, ValueError, RecursionError):
             names = {}
         GRAPHS[path] = names
     return GRAPHS[path]
@@ -285,6 +286,12 @@ class UnityMaterial:
 
     def opacity(self) -> Path | None:
         return self.role(OPACITY_PROPS, is_opacity)
+
+    def mask(self, base: Path | None) -> Path | None:
+        """The opacity mask beside `base`. A display name doesn't make the base its own mask:
+        `Albedo Alpha` is a base holding its alpha, not a grayscale mask to read red from."""
+        return self.texture(OPACITY_PROPS) or next(
+            (t for name, t in self.display if is_opacity(name) and t != base), None)
 
     def base(self) -> Path | None:
         return (self.texture(BASE_PROPS)
@@ -362,7 +369,7 @@ def build_material(um: UnityMaterial, max_size: int, scratch: Scratch) -> bpy.ty
     nodes, links = mat.node_tree.nodes, mat.node_tree.links
     bsdf = next(n for n in nodes if n.type == "BSDF_PRINCIPLED")
     base = um.base()
-    mask = um.opacity()
+    mask = um.mask(base)
     alpha = None
     # The base color's alpha is only needed for a cutout with no separate opacity mask.
     if base and (img := image(base, max_size, False, scratch, keep_alpha=um.cutout and not mask)):

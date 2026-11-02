@@ -20,6 +20,7 @@ mod tests {
 
     // The fixtures' colours, as `make_fixtures.py` names them.
     const BASE: [u8; 3] = [200, 40, 40];
+    const OTHER_BASE: [u8; 3] = [40, 200, 40];
     const NORMAL: [u8; 3] = [128, 128, 255];
     const TINT: [f64; 4] = [0.2, 0.4, 0.6, 1.0];
 
@@ -258,6 +259,59 @@ mod tests {
         assert!(is(m.base, BASE) && m.alpha_mode.is_none(), "{m:?}");
     }
 
+    /// Base and mask, the foliage cutout: the base's colour, cut by the separate mask.
+    #[tokio::test]
+    async fn a_mask_beside_a_base_cuts_it_out() {
+        let Some(glb) = convert("base-and-mask").await else {
+            return;
+        };
+        let m = glb.material("M_Thing");
+        assert_eq!(m.alpha_mode.as_deref(), Some("MASK"), "{m:?}");
+        assert!(is(m.base, BASE) && m.base.unwrap().1 == 0, "{m:?}");
+    }
+
+    /// A cutout with no mask reads its base's alpha, and with no base it has nothing to cut with.
+    #[tokio::test]
+    async fn a_cutout_with_no_mask_uses_its_base_s_alpha() {
+        let Some(glb) = convert("cutout").await else {
+            return;
+        };
+        let m = glb.material("M_Base");
+        assert_eq!(m.alpha_mode.as_deref(), Some("MASK"), "{m:?}");
+        assert!(is(m.base, BASE) && m.base.unwrap().1 == 0, "{m:?}");
+        let m = glb.material("M_Flat");
+        assert!(m.alpha_mode.is_none() && m.base.is_none(), "{m:?}");
+        assert!(is_tint(&m.factor), "{m:?}");
+    }
+
+    /// A base with `Alpha` in its display name isn't its own mask: an opaque material stays
+    /// opaque, and a cutout reads the texture's alpha, not its high red channel.
+    #[tokio::test]
+    async fn a_base_with_alpha_in_its_display_name_is_not_its_own_mask() {
+        for case in ["base-alpha-raw", "base-alpha-generated"] {
+            let Some(glb) = convert(case).await else {
+                return;
+            };
+            let m = glb.material("M_Opaque");
+            assert!(is(m.base, BASE) && m.alpha_mode.is_none(), "{case}: {m:?}");
+            let m = glb.material("M_Cutout");
+            assert_eq!(m.alpha_mode.as_deref(), Some("MASK"), "{case}: {m:?}");
+            assert!(is(m.base, BASE), "{case}: {m:?}");
+            assert_eq!(m.base.unwrap().1, 0, "{case}: {m:?}");
+        }
+    }
+
+    /// `Albedo Alpha` sorts before `OpacityMap`, whose texture is still the mask.
+    #[tokio::test]
+    async fn a_real_mask_is_found_past_a_base_with_alpha_in_its_name() {
+        let Some(glb) = convert("base-alpha-and-mask").await else {
+            return;
+        };
+        let m = glb.material("M_Thing");
+        assert_eq!(m.alpha_mode.as_deref(), Some("MASK"), "{m:?}");
+        assert!(is(m.base, BASE) && m.base.unwrap().1 == 0, "{m:?}");
+    }
+
     /// Blank twin, Twin with no .mat, Twin over colours, and a prefab naming the blank `MI_X`
     /// for a slot of another name: each uses `M_X`'s texture.
     #[tokio::test]
@@ -273,6 +327,38 @@ mod tests {
             };
             assert!(is(glb.material("M_Wall").base, BASE), "{case}");
         }
+    }
+
+    /// An `MI_X` with its own texture keeps it, though `M_X` has one too.
+    #[tokio::test]
+    async fn a_textured_mi_slot_keeps_its_own_texture() {
+        let Some(glb) = convert("textured-mi").await else {
+            return;
+        };
+        assert!(is(glb.material("MI_Wall").base, OTHER_BASE));
+    }
+
+    /// The twin comes before a texture named after the slot.
+    #[tokio::test]
+    async fn the_twin_comes_before_a_texture_named_after_the_slot() {
+        let Some(glb) = convert("twin-before-named").await else {
+            return;
+        };
+        assert!(is(glb.material("M_Wall").base, BASE));
+    }
+
+    /// With no twin, a texture named after the slot is the last resort, for a slot with no `.mat`
+    /// and for a blank one, and a `.mat` with colours keeps them.
+    #[tokio::test]
+    async fn a_texture_named_after_the_slot_is_the_last_resort() {
+        let Some(glb) = convert("named-last").await else {
+            return;
+        };
+        for name in ["MI_Gone", "MI_Blank"] {
+            assert!(is(glb.material(name).base, BASE), "{name}");
+        }
+        let m = glb.material("MI_Stone");
+        assert!(is_tint(&m.factor) && m.base.is_none(), "{m:?}");
     }
 
     /// True flat colour: `MI_Stone` has no `M_Stone`, and `MI_Roof`'s `M_Roof` has no texture, so
@@ -329,6 +415,18 @@ mod tests {
         assert!(is_cutout(&m), "{m:?}");
     }
 
+    /// A lone texture with a `NOT_BASE` word and no role is no base, by raw name or display name.
+    #[tokio::test]
+    async fn a_lone_texture_with_a_not_base_word_is_not_a_base() {
+        let Some(glb) = convert("lone-not-base").await else {
+            return;
+        };
+        for name in ["M_Raw", "M_Shown"] {
+            let m = glb.material(name);
+            assert!(m.base.is_none() && is_tint(&m.factor), "{name}: {m:?}");
+        }
+    }
+
     /// Lone normal: a lone `Texture2D_x` shown as `NormalMap` is a normal map, not a base.
     #[tokio::test]
     async fn a_lone_normal_map_is_not_a_base() {
@@ -356,7 +454,8 @@ mod tests {
     }
 
     /// Lone, graph missing: with no display name a lone `Texture2D_x` stays unresolved, so even
-    /// its mask is lost, as today. The same goes for an older graph and an unreadable one.
+    /// its mask is lost, as today. The same goes for an older graph, an unreadable one and a
+    /// property with a name that isn't a string.
     #[tokio::test]
     async fn a_lone_generated_name_with_no_display_name_stays_unresolved() {
         let Some(glb) = convert_without("lone-mask", |n| !is_graph(n)).await else {
@@ -365,7 +464,7 @@ mod tests {
         let m = glb.material("M_Thing");
         assert!(m.alpha_mode.is_none() && is_tint(&m.factor), "{m:?}");
         assert_eq!(glb.images(), 0, "{m:?}");
-        for case in ["older-graph", "unreadable-graph"] {
+        for case in ["older-graph", "unreadable-graph", "odd-graph"] {
             let Some(glb) = convert(case).await else {
                 return;
             };

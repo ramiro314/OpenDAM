@@ -1,0 +1,26 @@
+mtllib Model.mtl
+o Model
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl MI_Gone
+f 1/1 2/2 3/3
+v 3 0 0
+v 4 0 0
+v 3 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl MI_Blank
+f 4/4 5/5 6/6
+v 6 0 0
+v 7 0 0
+v 6 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl MI_Stone
+f 7/7 8/8 9/9

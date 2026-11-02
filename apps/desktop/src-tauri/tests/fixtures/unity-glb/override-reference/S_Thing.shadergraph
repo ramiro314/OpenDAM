@@ -4,6 +4,9 @@
     "m_Properties": [
         {
             "m_Id": "Texture2D_a"
+        },
+        {
+            "m_Id": "Texture2D_b"
         }
     ]
 }
@@ -18,4 +21,11 @@
     "m_Name": "A_BaseColor",
     "m_DefaultReferenceName": "Texture2D_a",
     "m_OverrideReferenceName": "_Layer1"
+}
+
+{
+    "m_Type": "UnityEditor.ShaderGraph.Internal.Texture2DShaderProperty",
+    "m_Name": "Other",
+    "m_DefaultReferenceName": "Texture2D_b",
+    "m_OverrideReferenceName": "_Layer2"
 }

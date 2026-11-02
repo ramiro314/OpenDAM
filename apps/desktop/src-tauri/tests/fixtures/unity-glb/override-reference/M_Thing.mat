@@ -13,6 +13,10 @@ Material:
         m_Texture: {fileID: 2800000, guid: de3845786f100cde7c36e046266157d0, type: 3}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
+    - _Layer2:
+        m_Texture: {fileID: 2800000, guid: a93603e0ef86f6f16493e2088fc12b86, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
     m_Ints: []
     m_Floats: []
     m_Colors:

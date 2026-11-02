@@ -13,6 +13,8 @@ and `newmtl`, with text `.mat`, `.meta` and `.shadergraph` files and solid 4 x 4
 
 - BASE, OTHER_BASE, NORMAL, ORM and MASK are solid colours: only a role's right texture is BASE or
   NORMAL, and MASK is black, so a mask read as a base shows.
+- An alpha base is BASE with an alpha of 0. Its red is high, so a clip that read its red channel
+  as a mask keeps what its own alpha cuts.
 - TINT is the flat colour a material should show, and GREY one it should not.
 """
 
@@ -43,17 +45,18 @@ def guid(pack: str, name: str) -> str:
     return hashlib.md5(f"{pack}/{name}".encode()).hexdigest()
 
 
-def png(rgb: tuple[int, int, int]) -> bytes:
-    """A 4 x 4 PNG of one colour."""
+def png(rgb: tuple[int, int, int], alpha: int | None = None) -> bytes:
+    """A 4 x 4 PNG of one colour, with an alpha channel when `alpha` is given."""
 
     def chunk(kind: bytes, data: bytes) -> bytes:
         body = kind + data
         return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
 
-    rows = (b"\0" + bytes(rgb) * 4) * 4
+    pixel = bytes(rgb) if alpha is None else bytes(rgb) + bytes([alpha])
+    rows = (b"\0" + pixel * 4) * 4
     return (
         b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 0))
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 4, 8, 2 if alpha is None else 6, 0, 0, 0))
         + chunk(b"IDAT", zlib.compress(rows, 9))
         + chunk(b"IEND", b"")
     )
@@ -84,9 +87,9 @@ class Pack:
         self.write("Model.obj", "\n".join(obj) + "\n")
         self.write("Model.mtl", "".join(f"newmtl {slot}\nKd 1 1 1\n" for slot in slots))
 
-    def texture(self, name: str, rgb: tuple[int, int, int]) -> str:
+    def texture(self, name: str, rgb: tuple[int, int, int], alpha: int | None = None) -> str:
         """Writes `name`.png and its `.meta`, and returns its GUID."""
-        self.write(f"{name}.png", png(rgb))
+        self.write(f"{name}.png", png(rgb, alpha))
         self.meta(f"{name}.png")
         return guid(self.name, f"{name}.png")
 
@@ -96,7 +99,7 @@ class Pack:
         self.meta(f"{name}.shadergraph")
         return guid(self.name, f"{name}.shadergraph")
 
-    def material(self, name: str, textures=None, colors=None, shader=None) -> None:
+    def material(self, name: str, textures=None, colors=None, shader=None, cutout=False) -> None:
         """Writes `name`.mat and its `.meta`, a material as Unity 2021 writes it: `textures`
         maps a property to a texture's GUID, or `None` for an empty slot."""
         lines = [
@@ -112,6 +115,8 @@ class Pack:
             lines += [f"  m_Shader: {{fileID: {GRAPH_FILE_ID}, guid: {shader},", "    type: 3}"]
         else:
             lines.append(f"  m_Shader: {{fileID: 46, guid: {BUILT_IN}, type: 0}}")
+        if cutout:
+            lines.append("  m_ShaderKeywords: _ALPHATEST_ON")
         lines += ["  m_SavedProperties:", "    serializedVersion: 3", "    m_TexEnvs:"]
         for prop, bound in (textures or {}).items():
             target = f"{{fileID: 2800000, guid: {bound}, type: 3}}" if bound else "{fileID: 0}"
@@ -197,11 +202,19 @@ def main() -> None:
     )
 
     pack = Pack("override-reference", ["M_Thing"])
+    # Two textures, so the only-texture rule can't find the base without the override.
     shader = pack.graph(
         "S_Thing",
-        stream({"Texture2D_a": "A_BaseColor"}, {"Texture2D_a": "_Layer1"}),
+        stream(
+            {"Texture2D_a": "A_BaseColor", "Texture2D_b": "Other"},
+            {"Texture2D_a": "_Layer1", "Texture2D_b": "_Layer2"},
+        ),
     )
-    pack.material("M_Thing", {"_Layer1": pack.texture("T_Base", BASE)}, shader=shader)
+    pack.material(
+        "M_Thing",
+        {"_Layer1": pack.texture("T_Base", BASE), "_Layer2": pack.texture("T_Other", OTHER_BASE)},
+        shader=shader,
+    )
 
     # B comes first in the material and in the graph.
     pack = Pack("layers", ["M_Thing"])
@@ -243,6 +256,43 @@ def main() -> None:
         {"Texture2D_a": ("A_BaseColor", BASE), "Texture2D_b": ("GlitterMask", MASK)},
     )
 
+    pack = Pack("base-and-mask", ["M_Thing"])
+    graph_material(
+        pack,
+        {"Texture2D_a": ("A_BaseColor", BASE), "Texture2D_b": ("OpacityMap", MASK)},
+    )
+
+    # A cutout with no mask: the base's own alpha, or nothing to cut with.
+    pack = Pack("cutout", ["M_Base", "M_Flat"])
+    pack.material("M_Base", {"_BaseMap": pack.texture("T_Base", BASE, 0)}, cutout=True)
+    pack.material("M_Flat", colors={"_Color": TINT}, cutout=True)
+
+    # A base whose display name says it holds its alpha, by raw name and by display name, each in
+    # an opaque material and a cutout.
+    for name, prop, shown in (
+        ("base-alpha-raw", "_BaseMap", "Albedo (RGB) Alpha (A)"),
+        ("base-alpha-generated", "Texture2D_x", "Albedo Alpha"),
+    ):
+        pack = Pack(name, ["M_Opaque", "M_Cutout"])
+        shader = pack.graph("S_Thing", stream({prop: shown}))
+        base = pack.texture("T_Base", BASE, 0)
+        pack.material("M_Opaque", {prop: base}, shader=shader)
+        pack.material("M_Cutout", {prop: base}, shader=shader, cutout=True)
+
+    # `Albedo Alpha` sorts first, and the real mask must still be found after it.
+    pack = Pack("base-alpha-and-mask", ["M_Thing"])
+    shader = pack.graph(
+        "S_Thing", stream({"Texture2D_a": "Albedo Alpha", "Texture2D_b": "OpacityMap"})
+    )
+    pack.material(
+        "M_Thing",
+        {
+            "Texture2D_a": pack.texture("T_Base", BASE, 255),
+            "Texture2D_b": pack.texture("T_Mask", MASK),
+        },
+        shader=shader,
+    )
+
     pack = Pack("blank-twin", ["MI_Wall"])
     pack.material("MI_Wall", {"_BaseMap": None})
     pack.material("M_Wall", {"_BaseMap": pack.texture("T_Wall", BASE)})
@@ -274,6 +324,24 @@ def main() -> None:
         f"  - {{fileID: 2100000, guid: {guid(pack.name, 'MI_Wall.mat')}, type: 2}}\n",
     )
 
+    # MI_Wall has its own texture, so its twin's isn't wanted.
+    pack = Pack("textured-mi", ["MI_Wall"])
+    pack.material("MI_Wall", {"_BaseMap": pack.texture("T_Own", OTHER_BASE)})
+    pack.material("M_Wall", {"_BaseMap": pack.texture("T_Wall", BASE)})
+
+    # A texture named after the slot, which `named_material` would find: the twin comes first.
+    pack = Pack("twin-before-named", ["MI_Wall"])
+    pack.material("M_Wall", {"_BaseMap": pack.texture("T_Wall", BASE)})
+    pack.texture("MI_Wall_Diffuse", OTHER_BASE)
+
+    # With no twin, `named_material` finds the texture of a slot with no .mat, and of a blank
+    # one, but not of a .mat with colours.
+    pack = Pack("named-last", ["MI_Gone", "MI_Blank", "MI_Stone"])
+    pack.material("MI_Blank", {"_BaseMap": None})
+    pack.material("MI_Stone", colors={"_BaseColor": TINT})
+    for name in ("MI_Gone", "MI_Blank", "MI_Stone"):
+        pack.texture(f"{name}_Diffuse", BASE)
+
     # MI_Stone has no M_Stone, and MI_Roof's M_Roof has no textures.
     pack = Pack("true-flat-colour", ["MI_Stone", "MI_Roof"])
     pack.material("MI_Stone", colors={"_BaseColor": TINT})
@@ -299,6 +367,14 @@ def main() -> None:
 
     pack = Pack("lone-normal", ["M_Thing"])
     graph_material(pack, {"Texture2D_x": ("NormalMap", NORMAL)}, {"_Color": TINT})
+
+    # A NOT_BASE word in one name or the other, and no role that would refuse it anyway.
+    pack = Pack("lone-not-base", ["M_Raw", "M_Shown"])
+    pack.material("M_Raw", {"_EmissionMap": pack.texture("T_Glow", BASE)}, {"_Color": TINT})
+    shader = pack.graph("S_Thing", stream({"Texture2D_x": "Roughness"}))
+    pack.material(
+        "M_Shown", {"Texture2D_x": pack.texture("T_Rough", BASE)}, {"_Color": TINT}, shader
+    )
 
     # Takes a role, though no NOT_BASE word says so.
     pack = Pack("lone-alpha", ["M_Thing"])
@@ -331,12 +407,17 @@ def main() -> None:
         shader=shader,
     )
 
-    # Neither graph gives a name, even the one that reads well up to its last object, so each lone
-    # texture stays unresolved.
+    # A name that isn't a string, among properties that read well.
+    good = stream({"Texture2D_x": "A_BaseColor"})
+    odd_graph = good.replace('"m_Name": "A_BaseColor"', '"m_Name": 7')
+
+    # None of these graphs gives a name, even the one that reads well up to its last object, so
+    # each lone texture stays unresolved.
     cut_short = stream({"Texture2D_x": "A_BaseColor", "Texture2D_y": "Other"})[:-40]
     for name, text in (
         ("older-graph", older({"Texture2D_x": "A_BaseColor"})),
         ("unreadable-graph", cut_short),
+        ("odd-graph", odd_graph),
     ):
         pack = Pack(name, ["M_Thing"])
         shader = pack.graph("S_Thing", text)
