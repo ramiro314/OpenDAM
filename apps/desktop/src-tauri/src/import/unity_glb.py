@@ -65,7 +65,9 @@ What this adds to its heuristics (docs/plans/import-material-fixes/plan.md, Piec
 - A blank slot named `MI_X` uses `M_X` when that material has textures (`twin_material`).
 - Each mesh keeps its own lowest level, so a model holding only `_LOD1` meshes keeps them. Meshes
   group by name, less Blender's numeric suffix and `_LOD<n>` (`lod_of`), and every object at the
-  group's lowest level stays. A file that is itself a LOD keeps all, as the script does.
+  group's lowest level stays. A file that is itself a LOD keeps all, as the script does. An empty
+  or an armature stays for a mesh kept below it, whatever its own name, since removing it would
+  lose the mesh's transform or skin.
 - A prefab's mesh is looked up by the object's and the mesh's exact names first, since a `.meta`
   can name `Plane.099`, and only then without Blender's numeric suffix.
 
@@ -544,11 +546,20 @@ def convert(model: Path, target: Path, guids, by_mesh, by_name, images, mtls, ma
     for obj in meshes:
         group, level = lod_of(base_name(obj.name))
         lowest[group] = min(level, lowest.get(group, level))
+
+    def above_lowest(obj: bpy.types.Object) -> bool:
+        group, level = lod_of(base_name(obj.name))
+        return level > lowest.get(group, 0) and not lod_file
+
+    def is_collision(obj: bpy.types.Object) -> bool:
+        # By its group, so `_LOD<n>` hides no collision mesh: `X_Collider_LOD1` goes too.
+        return bool(COLLISION_RE.search(lod_of(base_name(obj.name))[0]))
+
+    kept = {o for o in meshes if not above_lowest(o) and not is_collision(o)}
     for obj in list(bpy.data.objects):
         name = base_name(obj.name)
-        group, level = lod_of(name)
-        # By its group, so `_LOD<n>` hides no collision mesh: `X_Collider_LOD1` goes too.
-        if (level > lowest.get(group, 0) and not lod_file) or COLLISION_RE.search(group):
+        holds_kept = obj.type != "MESH" and not kept.isdisjoint(obj.children_recursive)
+        if (above_lowest(obj) and not holds_kept) or is_collision(obj):
             bpy.data.objects.remove(obj)
             continue
         if obj.type != "MESH":

@@ -805,23 +805,83 @@ bpy.ops.export_scene.fbx(filepath={fbx:?})
         assert_eq!(run.warnings, []);
     }
 
+    /// An empty and an armature whose names sit above any mesh's level stay for the meshes kept
+    /// below them, or those would lose their transform and their skin. Ones with nothing kept
+    /// below them go, as `Wall_LOD2` under `Old_LOD1` does.
+    #[tokio::test]
+    async fn a_parent_stays_for_a_mesh_kept_below_it() {
+        let Some(blender) = test_blender() else {
+            return;
+        };
+        let pack = tempfile::tempdir().unwrap();
+        let fbx = pack.path().join("Model.fbx");
+        let script = format!(
+            r#"
+import bpy
+bpy.ops.object.select_all(action="SELECT")
+bpy.ops.object.delete()
+def empty(name):
+    bpy.ops.object.empty_add(location=(5, 0, 0))
+    bpy.context.active_object.name = name
+    return bpy.context.active_object
+def plane(name, parent):
+    bpy.ops.mesh.primitive_plane_add()
+    obj = bpy.context.active_object
+    obj.name = name
+    obj.parent = parent
+    return obj
+building = empty("Building_LOD1")
+plane("Wall_LOD1", building)
+plane("Roof_LOD1", building)
+plane("Wall_LOD2", empty("Old_LOD1"))
+empty("Spare_LOD1")
+bpy.ops.object.armature_add()
+rig = bpy.context.active_object
+rig.name = "Rig_LOD1"
+body = plane("Body_LOD1", rig)
+body.vertex_groups.new(name=rig.data.bones[0].name).add(range(4), 1.0, "REPLACE")
+body.modifiers.new("Rig", "ARMATURE").object = rig
+bpy.ops.export_scene.fbx(filepath={fbx:?})
+"#,
+            fbx = fbx.to_str().unwrap(),
+        );
+        run_script(&blender, script).await;
+        let cache = tempfile::tempdir().unwrap();
+        let run = run_over(pack.path(), "Model.glb", |_| true, cache.path())
+            .await
+            .unwrap();
+        assert_eq!(run.glb.meshes(), ["Body_LOD1", "Roof_LOD1", "Wall_LOD1"]);
+        let nodes = run.glb.json["nodes"].as_array().unwrap();
+        let index = |name: &str| nodes.iter().position(|n| n["name"] == name);
+        let building = &nodes[index("Building_LOD1").expect("the parent stays")];
+        for child in ["Wall_LOD1", "Roof_LOD1"] {
+            let child = serde_json::json!(index(child).unwrap());
+            assert!(building["children"].as_array().unwrap().contains(&child));
+        }
+        assert!(nodes[index("Body_LOD1").unwrap()]["skin"].is_u64());
+        assert_eq!((index("Old_LOD1"), index("Spare_LOD1")), (None, None));
+        assert_eq!(run.warnings, []);
+    }
+
     /// Collider file: a model named as a collider is the known gap, and stays silent on the run
     /// that converts it and on the one that finds it in the cache.
     #[tokio::test]
     async fn a_model_named_as_a_collider_stays_silent_on_every_run() {
-        let cache = tempfile::tempdir().unwrap();
-        let name = "rock_collider.glb";
-        let Some(first) = run_in("collider-file", name, |_| true, cache.path()).await else {
-            return;
-        };
-        assert_eq!(first.glb.meshes(), Vec::<&str>::new());
-        assert_eq!(first.warnings, []);
-        let was = cached(cache.path());
-        let second = run_in("collider-file", name, |_| true, cache.path())
-            .await
-            .unwrap();
-        assert_eq!(cached(cache.path()), was, "the second run read the cache");
-        assert_eq!(second.warnings, []);
+        for (case, name) in [
+            ("collider-file", "rock_collider.glb"),
+            ("collider-lod-file", "Rock_Collider_LOD1.glb"),
+        ] {
+            let cache = tempfile::tempdir().unwrap();
+            let Some(first) = run_in(case, name, |_| true, cache.path()).await else {
+                return;
+            };
+            assert_eq!(first.glb.meshes(), Vec::<&str>::new(), "{case}");
+            assert_eq!(first.warnings, [], "{case}");
+            let was = cached(cache.path());
+            let second = run_in(case, name, |_| true, cache.path()).await.unwrap();
+            assert_eq!(cached(cache.path()), was, "the second run read the cache");
+            assert_eq!(second.warnings, [], "{case}");
+        }
     }
 
     /// Exact name: `Plane.099` and `Plane.100` each find their own prefab's material through the

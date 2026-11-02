@@ -38,6 +38,7 @@ use crate::capped;
 use crate::export::blender::{self, Blender};
 use crate::export::hashes::sha256_bytes;
 use crate::preview::WorkerRequest;
+use crate::structure::split_lod;
 
 /// The script's version, which every GLB's cache key holds. The script declares it as
 /// `VERSION`, which a test keeps equal: bump both when the GLBs it writes change.
@@ -295,10 +296,12 @@ pub fn is_input(path: &str) -> bool {
     })
 }
 
-/// Whether the file at `path` is named as a collider: its meshes are all the script drops, so
-/// its empty GLB is the known collider gap, not something to warn of.
+/// Whether the file at `path` is named as a collider, with or without `_LOD<n>` as the script
+/// reads a mesh's name: its meshes are all the script drops, so its empty GLB is the known
+/// collider gap, not something to warn of.
 fn is_collider(path: &str) -> bool {
     let name = stem(split(path).1).to_lowercase();
+    let name = split_lod(&name).map_or(name.as_str(), |(base, _)| base);
     COLLIDER_PREFIXES.iter().any(|p| name.starts_with(p))
         || COLLIDER_SUFFIXES.iter().any(|s| name.ends_with(s))
 }
@@ -998,13 +1001,17 @@ pub(crate) mod tests {
             "rock_collider.obj",
             "Rock_COLLIDERS.obj",
             "Rock_Collision.fbx",
+            "Rock_Collider_LOD1.obj",
+            "Rock_Collider_LOD0.fbx",
+            "UCX_Rock_LOD2.fbx",
         ] {
             assert!(is_collider(path), "{path}");
         }
         for path in [
             "Rock.obj",
             "SM_UCX_Rock.obj",
-            "Rock_Collider_LOD1.obj",
+            "Rock_LOD1.obj",
+            "Rock_Collider_LODs.obj",
             "Rock_Collisions.obj",
             "rock_collider/Rock.obj",
             "Rock_ConvexHull.Old.fbx",

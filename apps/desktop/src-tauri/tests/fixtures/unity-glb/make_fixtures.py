@@ -628,6 +628,8 @@ def main() -> None:
 
     Pack("collider-file").objects(["rock_collider"], "rock_collider")
 
+    Pack("collider-lod-file").objects(["Rock_Collider_LOD1"], "Rock_Collider_LOD1")
+
     pack = Pack("exact-name")
     pack.objects(["Plane.099", "Plane.100"])
     mapped_planes(pack, "Model.obj")
