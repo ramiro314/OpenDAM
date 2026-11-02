@@ -55,11 +55,11 @@ docs/plans/pack-import/plan.md R43-R46, record each with its cost):
   has `mtllib` lines naming copies of the pack's first `.mtl` of each name, dropping one the
   pack has no file of that name for.
 
-What this adds to its heuristics (docs/plans/import-material-fixes/plan.md, Piece 1):
+What version 5 adds to its heuristics (docs/plans/import-material-fixes/plan.md, Piece 1):
 
 - Each role looks at the property's raw name, then at its display name in the `.shadergraph` the
   material's `m_Shader` names, which is how generated names like `Texture2D_27f0...` are read.
-  Colors read display names too.
+  Colors read display names too, and `BaseColor Value` comes before any other.
 - A base color with neither takes the material's only texture (`UnityMaterial.only_texture`).
 - An opacity mask applies with no base color too, over the flat color.
 - A blank slot named `MI_X` uses `M_X` when that material has textures (`twin_material`).
@@ -88,7 +88,7 @@ import bpy
 
 # OpenDAM records it with each GLB and keys its cache by it: `import::unity_glb::UNITY_GLB_VERSION`,
 # which a test keeps equal. Bump both when the GLBs this writes change.
-VERSION = "opendam-unity-glb/4"
+VERSION = "opendam-unity-glb/5"
 
 # Property names are matched lowercased, without underscores: `_Base_Map` is `basemap`.
 BASE_PROPS = ["basemap", "maintex", "basecolormap", "mainbasemap", "base", "albedo", "albedomap",

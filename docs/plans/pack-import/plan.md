@@ -464,6 +464,34 @@ its deviations from the plan as written:
   empty. The list keeps its shape, so stored runs read as before,
   and its heading reads "N warnings".
 
+Revised again 2026-11-01 for `opendam-unity-glb/5` (plan import-material-fixes, Piece 1). D28 kept
+the script's heuristics as they were. Real packs needed more, so these are its deviations from it:
+
+- **R62 - A material's maps can come from its Shader Graph.** `.shadergraph` is now an input, so
+  the inputs hash covers it. Each role reads the raw property name, then the property's display
+  name in the graph the material's `m_Shader` names, with the display names sorted, so layer A
+  wins. A missing, unreadable or older graph gives no names. Normal, ORM and opacity go by whole
+  words, so `Detail Map Normal` isn't a normal, `MaskedColorMask` isn't an ORM map and
+  `GlitterMask` isn't opacity. Colors read display names too, `BaseColor Value` first.
+- **R63 - What a material with no base color falls back to.**
+  - **Only texture.** Its one bound texture is its base, unless the name is generated or holds a
+    `NOT_BASE` word.
+  - **Twin.** A slot with no `.mat`, or a `.mat` with no textures, named `MI_X`, uses `M_X` when
+    that material has textures. A true flat color stays flat.
+  - **Mask.** An opacity mask applies with no base color too, over the flat color. Blender then
+    exports the mask as the `baseColorTexture`, so an audit counts it as textured though its RGB
+    is flat.
+- **R64 - Each mesh keeps its own lowest LOD.** The script's file-wide drop made an empty GLB of a
+  model holding only `_LOD1` meshes (R61 warns of what is still empty). Meshes group by name, less
+  Blender's numeric suffix and `_LOD<n>`, and every object at the group's lowest level stays,
+  with the empties and armatures above it.
+- **R65 - Exact names first.** A prefab's mesh is looked up by the object's and the mesh's raw
+  names, then without Blender's numeric suffix, since a `.meta` can name `Plane.099`.
+- **R66 - A version bump means a Rebuild.** Every GLB's key holds the version, so a pack's next
+  Rebuild reconverts every model. A GLB whose bytes changed keeps its row, id, tags and path and
+  gets a fresh preview, and a byte-identical one keeps its mtime and queues nothing. Nothing flags
+  a pack built by an older version, and old cache entries stay until Clear.
+
 ## Problem
 
 Packs reach the libraries through scripts in `~/Documents/Assets`, run by hand, in this order:
@@ -994,10 +1022,10 @@ whenever a target is edited:
 - **The script.** `unity_gltf.py` is embedded as `import/unity_glb.py` with a `VERSION`
   constant, and a test keeps it equal to the Rust `UNITY_GLB_VERSION`. Its material sources,
   property tables, LOD and collision dropping, and 1024 px JPEG/PNG embedding are kept as they
-  are (D28). It finds every file by name, never by its path from the model, and reads its
+  are (D28), with what R62-R65 add. It finds every file by name, never by its path from the model, and reads its
   first-wins lookups in path order (R43, R44).
 - **The work folder.** The step makes a work folder in the cache directory holding the staged
-  pack's Unity files (`.meta`, `.mat`, `.prefab`, `.unity`), models and textures.
+  pack's Unity files (`.meta`, `.mat`, `.prefab`, `.unity`, `.shadergraph`), models and textures.
 - **Binary Unity files.** Binary `.mat`, `.prefab` and `.unity` files are rewritten to text in
   that work folder only, by a new preview-worker request, `unity_binary_to_text`, with UnityPy
   added to `packages/preview-engine` (D17). The files in the library keep their original bytes.
@@ -1665,7 +1693,7 @@ files go with their tags, ratings and collections, as on any delete (D27).
 - **Name lookups have limits.** Paths that differ only by case are ordered as the file system
   lists them, which the key can't capture. Generic per-model file names share the first
   folder's files (R43).
-- **Conversion heuristics are unchanged.** Smoothness maps (`_MetallicGlossMap`, HDRP
+- **Conversion heuristics have limits.** Smoothness maps (`_MetallicGlossMap`, HDRP
   `_MaskMap`) still aren't converted. HDRP-only packs convert less well than URP and Built-in.
 - **No bulk import.** There's no Unity-cache scan and no watched inbox. Each original is
   imported through the dialog (D7). Re-importing 21 cached packages means 21 dialog passes.

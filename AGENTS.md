@@ -113,10 +113,16 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               cap in settings (import.blenderMemoryMax), and cached in
                               ~/.cache/opendam/import/glb by a key over every input's source
                               path, final name and sha256 (and, with binary Unity files,
-                              unity_text.py's VERSION and the locked UnityPy). Each mesh keeps its
+                              unity_text.py's VERSION and the locked UnityPy). A material's maps
+                              come from its raw property names, then the display names in its
+                              `.shadergraph` (an input), and a base color with neither from its
+                              only texture, a blank `MI_X` slot uses `M_X`, and a mask applies
+                              with no base color too. Each mesh keeps its
                               own lowest `_LOD<n>`, and every placed GLB, new or cached, is read
                               so one with no mesh and no animation warns on every run
-                              (`SkipReason::NoMesh`), unless its model is named as a collider,
+                              (`SkipReason::NoMesh`), unless its model is named as a collider.
+                              A version bump changes every GLB's key, so a Rebuild reconverts
+                              the pack, and nothing flags a pack built by an older version,
                               and unreal_glb, the
                               export_unreal step: a zip's content-only Unreal project (refused
                               with a Source/ folder) unzipped to a work copy with its plugins
