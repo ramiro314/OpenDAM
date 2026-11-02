@@ -198,10 +198,17 @@ What the capture found:
   all, so the app has nothing to retry.
 - **Two Village tiles say "no PNG thumbnail" on purpose.** `SM_Bulidings` and `SM_Grass_Foliage` are
   two of those 9, and Piece 1 should fill them in.
-- **24 Big Castle thumbnails are fully transparent, and that is version 4's output.** 22 use a
-  `Material.00x`-style slot with `alphaMode: MASK` and no texture, the misnamed slots of "Evidence so
-  far". The other 2, `window_c_inside_variant_b` and `_c`, have no material and weren't traced.
-  `roof_inside_large_beam` is on the sheet as one of the 22.
+- **24 Big Castle thumbnails are fully transparent.** 22 use a `Material.00x`-style slot with
+  `alphaMode: MASK` and no texture, the misnamed slots of "Evidence so far", so they are version 4's
+  output. `roof_inside_large_beam` is on the sheet as one of them. The other 2,
+  `window_c_inside_variant_b` and `_c`, have no material and weren't traced, so their cause is
+  unknown.
+- **It ran under the cap, and no cap kill happened.** The app's scope,
+  `opendam-capped-742933-20995.scope`, ran 3 min 31 s and peaked at 4 GB, by the user journal.
+  systemd doesn't keep a finished scope's limits, so a later probe read them: the same
+  `memory-cap.sh` in the same nested session gives `MemoryMax` 10 GiB, `MemorySwapMax` 0 and
+  `OOMPolicy=kill`. `before/h/watch.log` reads `scope=0M` throughout because the watcher looked for
+  a `MainPID`, which a scope doesn't have. Its other columns are sound, and `h/watch.sh` is fixed.
 - **Medieval Houses' list holds only URP paths.** A Built-In path would stop its after sheet once
   Piece 2 sets the map's prefix. It builds with that prefix in the map.
 - **Some packs lack a category.** Wizard Room has no foliage, Lost Cave no roofs, and Fantasy
