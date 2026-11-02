@@ -60,7 +60,7 @@ for log in "${logs[@]}"; do
     echo "app log matches: $matches"
     grep -iE "$kills" "$app" | cut -c1-200 | head -5
     ((matches == 0)) || fail "$stage: the app log holds a cap kill"
-    killed=$(grep -c 'the Unreal Editor was' "$app")
+    killed=$(grep -ci 'the Unreal Editor was' "$app")
     echo "editor sessions the app says were killed: $killed"
     ((killed == 0)) || fail "$stage: the app says an editor session was killed"
   else

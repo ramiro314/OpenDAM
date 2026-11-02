@@ -235,6 +235,18 @@ def test_a_cap_kill_in_the_app_log_fails(tmp_path):
     assert caps(folder, fake_journal(tmp_path, OLD_ENOUGH, user=CONSUMED)).returncode == 1
 
 
+def test_a_session_killed_mid_batch_counts_as_a_killed_session(tmp_path):
+    folder = stage_folder(tmp_path)
+    (folder / "h/app-s.log").write_text(
+        "The Unreal Editor was stopped mid-batch; starting another\n"
+    )
+
+    result = caps(folder, fake_journal(tmp_path, OLD_ENOUGH, user=CONSUMED))
+
+    assert result.returncode == 1
+    assert "editor sessions the app says were killed: 1" in result.stdout
+
+
 def test_a_stage_with_no_scopes_fails(tmp_path):
     folder = stage_folder(tmp_path)
     (folder / "h/watch.log").write_text("10:00:00 stage=s available=9000M\n")
