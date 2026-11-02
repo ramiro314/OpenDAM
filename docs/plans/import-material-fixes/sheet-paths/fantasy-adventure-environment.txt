@@ -1,0 +1,17 @@
+# Staggart Creations/Fantasy Adventure Environment
+# foliage
+Models/Trees/FAE_Birch_A.glb
+Models/Trees/FAE_Pine_A.glb
+Models/Trees/FAE_Tree_A.glb
+Models/Trees/FAE_Willow_A.glb
+Models/Vegetation/FAE_Vegetation.glb
+# no walls or roofs in this pack, so rocks
+Models/Rocks/Cliff_A.glb
+Models/Rocks/RockCluster_A.glb
+_DemoScenes/Source/FAE_DemoMountain.glb
+# props
+Models/Objects/FAE_Branches.glb
+_DemoScenes/Source/FAE_Waterfall.glb
+# flat colours
+Models/Effects/CloudPlane.glb
+_DemoScenes/Source/FAE1_Creek.glb

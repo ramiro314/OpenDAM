@@ -1,0 +1,17 @@
+# Stylarts/StylizedWizardRoom
+# no foliage in this pack. walls
+Stylarts/WizardRoom/Art/Meshes/SM_Walls.glb
+Stylarts/WizardRoom/Art/Meshes/SM_Walls2.glb
+Stylarts/WizardRoom/Art/Meshes/SM_Fence.glb
+# roofs
+Stylarts/WizardRoom/Art/Meshes/SM_Chimney.glb
+Stylarts/WizardRoom/Art/Meshes/SM_Structure.glb
+# props
+Stylarts/WizardRoom/Art/Meshes/SM_Bookshelf.glb
+Stylarts/WizardRoom/Art/Meshes/SM_Desk.glb
+Stylarts/WizardRoom/Art/Meshes/SM_Chair.glb
+Stylarts/WizardRoom/Art/Meshes/SM_Candles.glb
+Stylarts/WizardRoom/Art/Meshes/SM_Carpet.glb
+# flat colours
+Stylarts/WizardRoom/Art/Meshes/SM_Frame.glb
+Stylarts/WizardRoom/Art/Meshes/SM_Books3_2.glb

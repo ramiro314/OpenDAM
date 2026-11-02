@@ -1,0 +1,18 @@
+# Synty Studios/POLYGON - Prototype Pack - Art by Synty
+# foliage
+PolygonGeneric/Models/SM_Gen_Env_Tree_01.glb
+PolygonGeneric/Models/SM_Gen_Env_Tree_Pine_01.glb
+PolygonGeneric/Models/SM_Gen_Env_Bush_01.glb
+# walls
+PolygonGeneric/Models/Base/SM_Bld_Base_Wall_Window_01.glb
+PolygonPrototype/Models/SM_Buildings_Column_1x3_01.glb
+# roofs
+PolygonGeneric/Models/Base/SM_Bld_Base_Roof_Cap_01.glb
+PolygonPrototype/Models/SM_Buildings_RoofAngledCornerInner_1x1_01.glb
+# props
+PolygonPrototype/Models/SM_Buildings_Door_01.glb
+PolygonGeneric/Models/SM_Gen_Prop_Barrel_Wood_01.glb
+# flat colours
+PolygonGeneric/Models/SM_Gen_Bld_Background_01.glb
+PolygonGeneric/Models/SM_Gen_Env_Water_Dip_01.glb
+PolygonGeneric/Models/SM_Gen_Env_Cloud_01.glb

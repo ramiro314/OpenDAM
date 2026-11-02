@@ -1,0 +1,18 @@
+# Stylarts/StylizedLostCave
+# foliage
+Meshes/SM_Bush.glb
+Meshes/SM_Fern_a.glb
+Meshes/SM_GlowingPlant_a.glb
+Meshes/SM_DeadTree_a.glb
+# walls
+Meshes/SM_LargeWall_6x9.glb
+Meshes/SM_MineArch.glb
+# no roofs in this pack, so the tunnel
+Meshes/SM_Tunnel_A.glb
+# props
+Meshes/SM_Barrel.glb
+Meshes/SM_Bench.glb
+# flat colours
+Meshes/SM_Candle_a.glb
+Meshes/SM_Waterfall_Top.glb
+Meshes/SM_WaterFall_Bottom_High.glb

@@ -1,0 +1,18 @@
+# Triplebrick/The Big Castle Kit
+# foliage
+castle/fbx/tree_b.glb
+castle/fbx/ivy_a.glb
+castle/fbx/grassPlane.glb
+# walls
+castle/fbx/wall_5x5.glb
+castle/fbx/arch_a.glb
+castle/fbx/column.glb
+# roofs
+castle/fbx/roof_deco_a.glb
+castle/fbx/roof_inside_large.glb
+# props
+castle/fbx/barrel_a.glb
+castle/fbx/cart_a.glb
+# flat colours
+castle/fbx/roof_inside_large_beam.glb
+castle/fbx/chair_d.glb

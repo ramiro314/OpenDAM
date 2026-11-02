@@ -1,0 +1,20 @@
+# Stylarts/StylizedVillage
+# foliage
+Meshes/SM_Tree_01.glb
+Meshes/SM_Grass_03.glb
+Meshes/SM_Grass_Foliage.glb
+# walls
+Meshes/BuildingParts/SM_Wall_A_0.glb
+Meshes/BuildingParts/SM_Wall_B_0.glb
+# roofs
+Meshes/SM_Canopy_01.glb
+Meshes/SM_MERGED_BP_Building_10.glb
+Meshes/SM_MERGED_BP_Building_08_5.glb
+# props
+Meshes/SM_Barrel_01.glb
+Meshes/SM_Well_01.glb
+Meshes/SM_CampFire_01.glb
+# flat colours
+Meshes/SM_Lamp_02.glb
+# empty at version 4
+Meshes/SM_Bulidings.glb

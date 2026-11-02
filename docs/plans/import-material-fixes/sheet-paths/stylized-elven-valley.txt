@@ -1,0 +1,18 @@
+# Stylarts/StylizedElvenValley
+# foliage
+Meshes/SM_Leaves01.glb
+Meshes/SM_BigTree_01.glb
+Meshes/SM_Ivy01.glb
+Meshes/SM_Grass_A.glb
+# walls
+Meshes/SM_Column_1.glb
+Meshes/SM_Interior_Arch.glb
+# roofs
+Meshes/SM_Roof_2.glb
+Meshes/SM_MidTile.glb
+# props
+Meshes/SM_Bench.glb
+Meshes/SM_Book_a.glb
+# flat colours
+Meshes/SM_Lantern.glb
+Meshes/SM_Candles01.glb
