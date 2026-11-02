@@ -24,9 +24,9 @@ dev = ["pytest>=9.1.1", "ruff"]
 [tool.uv]
 package = false
 
-# Tests import worker.py from this folder.
+# Tests import worker.py from this folder and the audit tools from tools/.
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = [".", "tools"]
 testpaths = ["tests"]
 
 [tool.ruff]
