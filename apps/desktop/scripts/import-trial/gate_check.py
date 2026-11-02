@@ -7,8 +7,8 @@ adds that pack's latest run, its manifest and the files in its folder, and fails
 isn't `done` with no error, the pack isn't built, or its files don't match: the tree's count, in
 which a conversion's GLBs are apart from its files (an Unreal tree's is only an estimate, so there
 its GLBs must be above 0 and at most the estimate), the manifest's and the folder's. A run's
-warnings are counted, as they name a model that failed. The exit status is 1 when a row fails, or
-when the log shows a dialog that didn't start.
+warning fails its row too, as it can name a model that failed. The exit status is 1 when a row
+fails, or when the log shows a dialog that didn't start.
 """
 
 import argparse
@@ -102,7 +102,10 @@ def check(candidate: dict, found, libs: Path) -> dict:
     else:
         row["run"] = run["status"]
         row["seconds"] = round((run["finished_at"] - run["started_at"]) / 1000)
-        row["warnings"] = len(json.loads(run["warnings"]))
+        warnings = json.loads(run["warnings"])
+        row["warnings"] = len(warnings)
+        if warnings:
+            problems.append(f"{len(warnings)} run warnings, such as a failed model")
         if run["status"] != "done" or run["error"]:
             problems.append(f"run {run['status']}: {run['error']}")
     if pack["status"] != "built":

@@ -7,12 +7,13 @@ Import pack dialog with its default steps and no typed hoist, and the app's own 
 drew every thumbnail. The driver is `apps/desktop/scripts/import-trial/` (`gate.js`, `run.sh` with
 `TRIAL_UI`, `gate_check.py`, `gate-sheets.sh`), and `floors.tsv` beside this report holds the floors.
 
-**The deletion stays on hold.** LostRuins needs your decision, and the sheets need your review.
+**The deletion stays on hold.** LostRuins and POLYGON Prototype's lost tint need your decision, and
+the sheets need your review.
 Nothing here deleted, or touched, the old libraries.
 
 | Run | Result | What holds it |
 |---|---|---|
-| All 11 packs | **Pass**, sheets awaiting review | Your review of the sheets |
+| All 11 packs | **Pass**, sheets awaiting review | POLYGON's lost tint, see below. Your review of the sheets |
 | `LostRuins.zip`, Unreal route | **Hold** | `SM_column04` is missing with no warning, see below. Your review of the sheet |
 | `Waterways.zip`, Unreal route | **Pass**, sheet awaiting review | Your review of the sheet |
 | Kenney build | **Pass** | Nothing |
@@ -55,6 +56,21 @@ plan's `Material.001` and `Material.002` leftovers, which have a cutout and no t
 card behind the plant, so their cutouts look wrong, and `grassPlane` is seen edge on. The audit
 can't judge these. `SM_Tree_01` on Village's has a pale patch in its leaves.
 
+**POLYGON Prototype lost a tint, and the audit can't see it.** 162 of its 950 GLBs use
+`PolygonPrototype_Grid_01`, including the column, door and roof corner on its sheet, which went from
+yellow to white. Its `.mat` holds a yellow `_Base_Color` and a `_Grid` texture. At version 4 the GLB
+took the colour and no texture. At version 5 the plan's only-texture rule binds `_Grid` as the
+base, and `build_material` applies a colour only when there is no base texture, so the yellow goes.
+The audit passes because it counts the map as gained. The floor of 909 depends on that rule, so
+the fix is a converter change, and a version bump, for its own ticket.
+
+**Other colour changes on the sheets are the plan's own fixes,** by each GLB's materials before and
+after:
+
+- Wizard Room's `SM_Frame`, white to black: `M_BasicFill` is black, as its file says (rule 5).
+- Spooky's `SM_Grass_A`, darker: its sRGB colour is now written linear.
+- Medieval Houses' `SM_Plane_01`, white to grey: it gained the texture that closes 193 of 193.
+
 **Memory.** No cap kill. The app's scope peaked at 9.8 GB of its 10 GB cap in this stage, which the
 scope's figure doesn't split into file cache and the app's own memory, so a larger import could
 reach the cap.
@@ -77,8 +93,9 @@ A separate run of the editor over a fresh copy of the project found why:
 - `unreal.load_asset` loads it, and `GLTFExporter.export_to_gltf` writes an 84 KB GLB of it.
 
 So `unreal_glb.py`, which exports what the asset registry lists, skips a mesh the registry misses,
-and the run can't tell. Why the registry misses this one is unknown. It is the only mesh of this
-pack it misses, by name against the zip's `.uasset` files. Reading the zip's `Meshes/` folder
+and the run can't tell. Why the registry misses this one is unknown. It is the only one it misses:
+a census of the 383 packages under `Content/` found the other 382 in the registry, and all 101
+assets of an export type by their own class have a GLB. Reading the zip's `Meshes/` folder
 rather than trusting the registry would catch it, and that fix belongs to its own ticket. That
 editor run, and the one in the Waterways section, ended with exit status 139 after its script had
 finished. They used `-nullrhi`, which the app's sessions don't, and the gate's own sessions weren't
@@ -115,10 +132,11 @@ to be recovered.
 | Thumbnails | All 161 GLBs have a PNG from the app |
 | Disk | 2.4 GB |
 
-**No mesh is missing.** LostRuins' finding was checked here too, against every `.uasset` in the zip:
-all 146 static meshes and 15 skeletal meshes and animations have a GLB. `SM_Cylinder` and
-`Cylinder1` have none, and need none: an editor run shows both are `ObjectRedirector` packages to
-`SM_CylinderFog`, which exported.
+**No mesh is missing.** LostRuins' finding was checked here too. An editor run read the class of
+all 657 packages under `Content/`, and every one is in the registry, so none is skipped the way
+`SM_column04` is. The 161 of an export type, 146 static meshes, 9 skeletal meshes and 6 animations,
+are exactly the 161 the export recorded, with none failed. `SM_Cylinder` and `Cylinder1` have no
+GLB and need none: both are `ObjectRedirector` packages to `SM_CylinderFog`, which exported.
 
 **Leftovers.** All 47 GLBs under the full count are explained. Each material was traced through
 its parents in the zip's `.uasset` files, and a GLB can use several:
@@ -127,7 +145,8 @@ its parents in the zip's `.uasset` files, and a GLB can use several:
 |---|---|
 | Water, waterfalls, fog and depth fade, built from shaders | `MI_DepthFade*` 10, `MI_Waterfall_0*` 11, `MI_Water_Animated` 3, `MI_Waterfall_Transperant_02` 2, `MI_Fog_04` 1 |
 | Flat colour, whose master's one texture is `T_Noise_M` | `MI_Brown_02` 5, `MI_Green_0*` 4, `MI_Metal_0*` 3, `MI_White` 3, `MI_Pink*` 2, `MI_Blue_01` 1 |
-| Flat colour, with no texture through any parent | `MI_Potion_Color_0*` 16, `MM_PotionColors` 1, `MI_PlaneGrass_04` 1 |
+| Flat colour, with no texture through any parent | `MI_Potion_Color_0*` 16, `MM_PotionColors` 1 |
+| A plain, empty material | `MI_PlaneGrass_04` on `SM_PlaneGrass`, 1: despite its name it is a `Material`, not an instance, so it has no parent. The editor reports no used texture and one expression, and the GLB takes the default grey |
 | The engine's default material, on a slot with none | `WorldGridMaterial` on `SM_Plane_Sun`, 1 |
 
 The `T_Noise_M` materials lose that noise's variation. That it isn't a colour map is read from its
