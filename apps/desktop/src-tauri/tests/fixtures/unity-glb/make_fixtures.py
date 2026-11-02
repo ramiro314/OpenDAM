@@ -10,8 +10,9 @@ Each folder is one pack, so a case's by-name lookups reach only its own files. E
 `Model.obj`, one triangle per material slot, and `Model.mtl`, which name the slots through `usemtl`
 and `newmtl`, with text `.mat`, `.meta` and `.shadergraph` files and solid 4 x 4 PNGs. A pack about
 which meshes stay holds one triangle per named object instead, in a model of its own name when
-the file name is the case (`Pack.objects`). The tests in `src/import/unity_glb_fixture_tests.rs`
-tell a texture by its colour:
+the file name is the case (`Pack.objects`). `mesh-name` holds no model: an OBJ's object and mesh
+share a name, so its test makes `Model.fbx` under Blender. The tests in
+`src/import/unity_glb_fixture_tests.rs` tell a texture by its colour:
 
 - BASE, OTHER_BASE, NORMAL, ORM and MASK are solid colours: only a role's right texture is BASE or
   NORMAL, and MASK is black, so a mask read as a base shows.
@@ -202,6 +203,37 @@ def graph_material(pack: Pack, properties: dict[str, tuple[str, tuple]], colors=
         ref: pack.texture(f"T_{n}", rgb) for n, (ref, (_, rgb)) in enumerate(properties.items())
     }
     pack.material("M_Thing", textures, colors, shader)
+
+
+def mapped_planes(pack: Pack, model: str) -> None:
+    """Two meshes, `Plane.099` and `Plane.100`, mapped by those exact names in `model`'s `.meta`,
+    and a prefab giving each its own material, `M_First` (BASE) and `M_Second` (OTHER_BASE). The
+    lists differ, so neither `Plane` without its suffix nor a single list finds them."""
+    pack.material("M_First", {"_BaseMap": pack.texture("T_First", BASE)})
+    pack.material("M_Second", {"_BaseMap": pack.texture("T_Second", OTHER_BASE)})
+    pack.write(
+        f"{model}.meta",
+        "fileFormatVersion: 2\n"
+        f"guid: {guid(pack.name, model)}\n"
+        "ModelImporter:\n"
+        "  fileIDToRecycleName:\n"
+        "    4300000: Plane.099\n"
+        "    4300002: Plane.100\n",
+    )
+    prefab = ["%YAML 1.1", "%TAG !u! tag:unity3d.com,2011:"]
+    for n, (mesh, material) in enumerate(((4300000, "M_First"), (4300002, "M_Second"))):
+        prefab += [
+            f"--- !u!33 &{n}1",
+            "MeshFilter:",
+            f"  m_GameObject: {{fileID: {n}7}}",
+            f"  m_Mesh: {{fileID: {mesh}, guid: {guid(pack.name, model)}, type: 3}}",
+            f"--- !u!23 &{n}2",
+            "MeshRenderer:",
+            f"  m_GameObject: {{fileID: {n}7}}",
+            "  m_Materials:",
+            f"  - {{fileID: 2100000, guid: {guid(pack.name, material + '.mat')}, type: 2}}",
+        ]
+    pack.write("Model.prefab", "\n".join(prefab) + "\n")
 
 
 def main() -> None:
@@ -576,45 +608,27 @@ def main() -> None:
     # `Wall` and `Wall_LOD0` are both level 0, and the case of a suffix doesn't count.
     Pack("lod-no-suffix").objects(["Wall", "Wall_LOD1", "Roof_LOD0", "Roof", "Roof_lod2"])
 
-    # Two objects of one name, which Blender's importer keeps apart by these suffixes.
-    Pack("lod-several").objects(["X_LOD1.001", "X_LOD1.002"])
+    # Two objects of one name, which Blender's importer keeps apart by these suffixes, and one
+    # above their level, which goes only if the suffixes are read past.
+    Pack("lod-several").objects(["X_LOD1.001", "X_LOD1.002", "X_LOD2.001"])
 
     Pack("lod-file").objects(["X_LOD1", "X_LOD2"], "X_LOD1")
 
-    # A collision mesh with a level joins no group, so it goes as one with none does.
-    Pack("no-mesh").objects(["UCX_Model", "Model_Collider", "Model_Collider_LOD1"])
+    # `_LOD0` is level 0, so this file is no LOD and its other levels go.
+    Pack("lod0-file").objects(["X_LOD0", "X_LOD1"], "X_LOD0")
+
+    Pack("no-mesh").objects(["UCX_Model", "Model_Collider"])
+
+    # A collision mesh joins no group, so with no other of its name it isn't its lowest level.
+    Pack("no-mesh-lod").objects(["Model_Collider_LOD1"])
 
     Pack("collider-file").objects(["rock_collider"], "rock_collider")
 
-    # Each object is mapped in the `.meta` by its exact name, to a different material list, so
-    # neither `Plane` without its suffix nor a single list finds them.
     pack = Pack("exact-name")
     pack.objects(["Plane.099", "Plane.100"])
-    pack.material("M_First", {"_BaseMap": pack.texture("T_First", BASE)})
-    pack.material("M_Second", {"_BaseMap": pack.texture("T_Second", OTHER_BASE)})
-    pack.write(
-        "Model.obj.meta",
-        "fileFormatVersion: 2\n"
-        f"guid: {guid(pack.name, 'Model.obj')}\n"
-        "ModelImporter:\n"
-        "  fileIDToRecycleName:\n"
-        "    4300000: Plane.099\n"
-        "    4300002: Plane.100\n",
-    )
-    prefab = ["%YAML 1.1", "%TAG !u! tag:unity3d.com,2011:"]
-    for n, (mesh, material) in enumerate(((4300000, "M_First"), (4300002, "M_Second"))):
-        prefab += [
-            f"--- !u!33 &{n}1",
-            "MeshFilter:",
-            f"  m_GameObject: {{fileID: {n}7}}",
-            f"  m_Mesh: {{fileID: {mesh}, guid: {guid(pack.name, 'Model.obj')}, type: 3}}",
-            f"--- !u!23 &{n}2",
-            "MeshRenderer:",
-            f"  m_GameObject: {{fileID: {n}7}}",
-            "  m_Materials:",
-            f"  - {{fileID: 2100000, guid: {guid(pack.name, material + '.mat')}, type: 2}}",
-        ]
-    pack.write("Model.prefab", "\n".join(prefab) + "\n")
+    mapped_planes(pack, "Model.obj")
+
+    mapped_planes(Pack("mesh-name"), "Model.fbx")
 
 
 main()

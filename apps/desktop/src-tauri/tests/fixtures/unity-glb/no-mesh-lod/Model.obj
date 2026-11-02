@@ -1,0 +1,10 @@
+mtllib Model.mtl
+o Model_Collider_LOD1
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl Imported
+f 1/1 2/2 3/3

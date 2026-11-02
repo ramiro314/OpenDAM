@@ -17,3 +17,12 @@ vt 1 0
 vt 0 1
 usemtl Imported
 f 4/4 5/5 6/6
+o X_LOD2.001
+v 6 0 0
+v 7 0 0
+v 6 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl Imported
+f 7/7 8/8 9/9

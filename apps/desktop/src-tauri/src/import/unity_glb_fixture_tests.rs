@@ -135,10 +135,20 @@ mod tests {
     /// Runs the step over the files of the pack `case` that `keep` takes, with the conversion
     /// cache at `cache`, and returns the GLB called `name`. `None` when there's no test Blender.
     async fn run_in(case: &str, name: &str, keep: fn(&str) -> bool, cache: &Path) -> Option<Run> {
+        run_over(&fixtures().join(case), name, keep, cache).await
+    }
+
+    /// `run_in` over the pack in `folder`.
+    async fn run_over(
+        folder: &Path,
+        name: &str,
+        keep: fn(&str) -> bool,
+        cache: &Path,
+    ) -> Option<Run> {
         let blender = test_blender()?;
         let staging = tempfile::tempdir().unwrap();
         let mut files = Vec::new();
-        for entry in std::fs::read_dir(fixtures().join(case)).unwrap() {
+        for entry in std::fs::read_dir(folder).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name().into_string().unwrap();
             if keep(&name) {
@@ -684,7 +694,8 @@ mod tests {
         assert_eq!(meshes, ["Roof", "Roof_LOD0", "Wall"]);
     }
 
-    /// Several at one level: every object at the group's lowest level stays.
+    /// Several at one level: every object at the group's lowest level stays, and `X_LOD2.001`,
+    /// of the same group past its numeric suffix, goes.
     #[tokio::test]
     async fn every_object_at_the_lowest_level_stays() {
         let Some(meshes) = kept("lod-several").await else {
@@ -700,6 +711,16 @@ mod tests {
             return;
         };
         assert_eq!(run.glb.meshes(), ["X_LOD1", "X_LOD2"]);
+        assert_eq!(run.warnings, []);
+    }
+
+    /// A `_LOD0` file is no LOD file: it is level 0, so its other levels go.
+    #[tokio::test]
+    async fn a_lod0_file_keeps_only_its_lowest_level() {
+        let Some(run) = run_named("lod0-file", "X_LOD0.glb").await else {
+            return;
+        };
+        assert_eq!(run.glb.meshes(), ["X_LOD0"]);
         assert_eq!(run.warnings, []);
     }
 
@@ -733,6 +754,18 @@ mod tests {
         assert_eq!(second.warnings, [warning]);
     }
 
+    /// A collision mesh with a level and no other of its name is no group's lowest level: it
+    /// goes, so the model warns, though each LOD-only mesh of another name stays.
+    #[tokio::test]
+    async fn a_collision_mesh_with_a_level_is_not_kept_as_its_lowest() {
+        let Some(run) = run_named("no-mesh-lod", "Model.glb").await else {
+            return;
+        };
+        assert_eq!(run.glb.meshes(), Vec::<&str>::new());
+        let reasons: Vec<SkipReason> = run.warnings.iter().map(|w| w.reason).collect();
+        assert_eq!(reasons, [SkipReason::NoMesh]);
+    }
+
     /// Collider file: a model named as a collider is the known gap, and stays silent on the run
     /// that converts it and on the one that finds it in the cache.
     #[tokio::test]
@@ -762,6 +795,65 @@ mod tests {
         assert_eq!(run.glb.meshes(), ["Plane.099", "Plane.100"]);
         assert!(is(run.glb.base_of("Plane.099"), BASE));
         assert!(is(run.glb.base_of("Plane.100"), OTHER_BASE));
+    }
+
+    /// `Model.fbx`, whose objects `Thing` and `Other` hold the meshes `Plane.099` and `Plane.100`,
+    /// made by `blender`.
+    async fn renamed_meshes_fbx(blender: &Path, fbx: &Path) {
+        let script = format!(
+            r#"
+import bpy
+bpy.ops.object.select_all(action="SELECT")
+bpy.ops.object.delete()
+for n, (name, mesh) in enumerate((("Thing", "Plane.099"), ("Other", "Plane.100"))):
+    bpy.ops.mesh.primitive_plane_add(location=(n * 3, 0, 0))
+    obj = bpy.context.active_object
+    obj.name = name
+    obj.data.name = mesh
+    obj.data.materials.append(bpy.data.materials.new("Imported"))
+bpy.ops.export_scene.fbx(filepath={fbx:?})
+"#,
+            fbx = fbx.to_str().unwrap(),
+        );
+        let made = tokio::process::Command::new(blender)
+            .args([
+                "-b",
+                "--factory-startup",
+                "--python-exit-code",
+                "1",
+                "--python-expr",
+            ])
+            .arg(script)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+    }
+
+    /// Exact name, by the mesh: objects the `.meta` doesn't name find their materials through
+    /// their meshes' exact names, which `Plane` isn't.
+    #[tokio::test]
+    async fn a_mesh_named_exactly_in_a_meta_finds_its_object_s_material() {
+        let Some(blender) = test_blender() else {
+            return;
+        };
+        let pack = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(fixtures().join("mesh-name")).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), pack.path().join(entry.file_name())).unwrap();
+        }
+        renamed_meshes_fbx(&blender, &pack.path().join("Model.fbx")).await;
+        let cache = tempfile::tempdir().unwrap();
+        let run = run_over(pack.path(), "Model.glb", |_| true, cache.path())
+            .await
+            .unwrap();
+        assert_eq!(run.glb.meshes(), ["Other", "Thing"]);
+        assert!(is(run.glb.base_of("Thing"), BASE));
+        assert!(is(run.glb.base_of("Other"), OTHER_BASE));
     }
 
     /// A byte order mark doesn't hide a graph's names.
