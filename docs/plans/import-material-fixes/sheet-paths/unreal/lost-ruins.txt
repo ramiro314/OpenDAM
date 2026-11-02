@@ -1,0 +1,17 @@
+# Fab/Lost Ruins
+# foliage
+SM_grass01.glb
+SM_ivy01.glb
+# walls and structure
+SM_wall01.glb
+SM_arch01_1.glb
+SM_column01.glb
+SM_stair01.glb
+# floors and cliffs
+SM_floor01.glb
+SM_cliff01.glb
+# props
+SM_chest.glb
+SM_sword.glb
+SM_candlestick01.glb
+SM_urn01.glb

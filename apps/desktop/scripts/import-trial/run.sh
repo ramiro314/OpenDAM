@@ -16,6 +16,9 @@
 #   python3 packages/preview-engine/tools/glb_audit.py manifest <folder>/libs/Fab \
 #     <folder>/libs/Unity --out <manifest outside the folder>
 #
+# A gate stage is also read by gate_check.py, which checks each pack against its dialog tree, and
+# gate-sheets.sh builds the after sheets from its thumbnails.
+#
 # Environment:
 #   TRIAL_REPO     the checkout holding the debug binary and the preview engine (default this
 #                  one). The baseline's is a worktree at 63efa51.

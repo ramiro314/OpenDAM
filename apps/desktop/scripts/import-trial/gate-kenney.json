@@ -1,5 +1,5 @@
 {
-  "settleMinutes": 180,
+  "settleMinutes": 60,
   "imports": [
     {
       "lib": "kenney",
