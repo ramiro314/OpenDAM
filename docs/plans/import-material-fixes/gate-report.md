@@ -43,8 +43,18 @@ jobs finished. `glb_audit.py compare` through `pack-map.tsv` passed:
 | Fantasy Adventure Environment | 36 | 26 | 26 | 19 | 809 |
 | Medieval Houses Vol 1 | 193 | 193 | 193 | 74 | 1,250 |
 
-**Leftovers.** Every leftover is explained: each pack's list, by material and count, is the plan's
-Piece 1 table. Medieval Houses' 2 are gone, because only its URP copy lands, so it has none.
+**Floors.** `floors.tsv` is the plan's Target column, value for value, and was committed before the
+first run started. `gate_plan_check.py` compares the two with the measured counts: every pack lands
+on its floor but The Big Castle Kit, 6 above it at 263. Those 6 are version 5's fix for a prefab
+material on an empty slot, which the plan records in "Piece 1 result", where it kept the floor at
+257. So its 30 leftover GLBs are the plan's 30, and the floor is 6 below them by the plan's choice.
+
+**Leftovers.** Every leftover is explained. `gate_plan_check.py` reads the plan's table in "Piece 1
+result" and matches each leftover material and GLB of the gate to a row. It found no leftover with
+no reason, and no count that differs from one a row states. It does fail when it should: given a
+manifest with an invented material and a textured GLB made untextured, it named both and exited 1.
+The one difference is Medieval Houses, whose 2 leftovers are gone, as the plan's Outcome table
+expects once only its URP copy lands.
 
 **Thumbnails.** All 2,386 GLBs that take a preview have a PNG from the app, except 7 collider-only
 models that end `error` (6 Synty, `FAE_Tree_Colliders`). Wizard Room's other 180 GLBs are LOD
@@ -71,9 +81,9 @@ after:
 - Spooky's `SM_Grass_A`, darker: its sRGB colour is now written linear.
 - Medieval Houses' `SM_Plane_01`, white to grey: it gained the texture that closes 193 of 193.
 
-**Memory.** No cap kill. The app's scope peaked at 9.8 GB of its 10 GB cap in this stage, which the
-scope's figure doesn't split into file cache and the app's own memory, so a larger import could
-reach the cap.
+**Memory.** No cap kill, see [Cap kills](#cap-kills). The app's scope peaked at 9.8 GB of its 10 GB
+cap in this stage, which the scope's figure doesn't split into file cache and the app's own memory,
+so a larger import could reach the cap. Blender's largest conversion peaked at 5.8 GB.
 
 ## LostRuins, Unreal route
 
@@ -187,6 +197,24 @@ The zip's other files aren't lost, but they aren't in the library either:
 - **36 assets end `error`, and they keep no preview:** 26 `.fbx` animations, which Assimp can't
   load, in the Animated Characters packs, and 10 `.ai` files.
 
+## Cap kills
+
+There were none, in any stage. `gate-caps.sh` searches each stage's app log, and the user and kernel
+journals for that stage's window and scopes:
+
+| Stage | App log | User journal OOM | Kernel OOM | Editor sessions killed | Guard stops | Largest peak |
+|---|---|---|---|---|---|---|
+| All 11 packs | 0 | 0 | 0 | 0 | 0 | 9.8 GB, the app, of 10 GB |
+| LostRuins | 0 | 0 | 0 | 0 | 0 | 5.7 GB, the editor, of 20 GB |
+| Kenney | 0 | 0 | 0 | 0 | 0 | 3.8 GB, the app, of 10 GB |
+| Waterways | 0 | 0 | 0 | 0 | 0 | 12.7 GB, the editor, of 20 GB |
+
+The journal also holds a `Killed unit cgroup ... with SIGKILL on client request` line at the end of
+each editor session, 4 for LostRuins and 6 for Waterways. These aren't cap kills: they are
+`stop_leftovers` in `capped.rs` clearing a scope after its session has ended, and the search counts
+them apart. Kenney's window holds a second scope that peaked at 3.8 GB, which is the LostRuins
+diagnostic, not the build.
+
 ## Sheets
 
 There are 11 before and 11 after sheets, from the same path lists in `sheet-paths/`, and sheets of
@@ -219,6 +247,8 @@ accepted, and so may apply to `ivy_a` and `grassPlane`.
 apps/desktop/scripts/import-trial/run.sh <new folder>  # TRIAL_UI=1 and TRIAL_STAGE=packs
 python3 -I apps/desktop/scripts/import-trial/gate_check.py <folder> packs
 apps/desktop/scripts/import-trial/gate-sheets.sh <folder> <out folder>
+python3 -I apps/desktop/scripts/import-trial/gate_plan_check.py <manifest>
+apps/desktop/scripts/import-trial/gate-caps.sh <folder>
 ```
 
 The later stages reopen the same folder, with `TRIAL_PACKS` set to their `gate-*.json` and a new
