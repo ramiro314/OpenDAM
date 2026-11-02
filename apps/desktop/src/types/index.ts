@@ -242,6 +242,8 @@ export interface Cover {
   bundledPreview?: string | null;
   /** Absolute, as an asset's `fallbackRender` */
   fallbackRender?: string | null;
+  /** The other files of a group whose main item has no thumbnail, which can stand in for it */
+  memberIds: string[];
 }
 
 /** One card of the Packs view (`get_packs`) */

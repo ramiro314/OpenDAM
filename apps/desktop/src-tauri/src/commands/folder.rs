@@ -28,6 +28,9 @@ pub struct Cover {
     pub bundled_preview: Option<String>,
     /// Absolute, a model's render too small to fit one, as an asset's `fallback_render`
     pub fallback_render: Option<String>,
+    /// The other files of a group whose main item has no thumbnail of its own, any of which can
+    /// stand in for it (`item_thumbnail`), so a card knows a member's preview may change it
+    pub member_ids: Vec<String>,
 }
 
 /// The columns a cover is read from: its `folders` row `f` joined to the cover's asset row `c`
@@ -35,7 +38,10 @@ pub struct Cover {
 fn cover_columns() -> String {
     format!(
         "c.id AS cover_id, c.file_path AS cover_path, {} AS cover_thumbnail,
-    c.extension AS cover_extension, c.kind AS cover_kind, {}",
+    c.extension AS cover_extension, c.kind AS cover_kind,
+    CASE WHEN c.group_id = c.id AND c.thumbnail_path IS NULL THEN
+        (SELECT json_group_array(m.id) FROM assets m WHERE m.group_id = c.id AND m.id <> c.id)
+    END AS cover_members, {}",
         item_thumbnail("c"),
         render_columns("c")
     )
@@ -52,6 +58,7 @@ struct CoverRow {
     cover_thumbnail: Option<String>,
     cover_extension: Option<String>,
     cover_kind: Option<String>,
+    cover_members: Option<String>,
     bundled_preview: Option<String>,
     fallback_render: Option<String>,
 }
@@ -68,6 +75,10 @@ impl CoverRow {
             kind: self.cover_kind.unwrap_or_default(),
             bundled_preview: resolve(self.bundled_preview),
             fallback_render: resolve(self.fallback_render),
+            member_ids: self
+                .cover_members
+                .and_then(|ids| serde_json::from_str(&ids).ok())
+                .unwrap_or_default(),
         })
     }
 }
@@ -1228,6 +1239,7 @@ mod tests {
                 kind: "texture".into(),
                 bundled_preview: None,
                 fallback_render: None,
+                member_ids: Vec::new(),
             })
         );
         // The first image stands in when the pack has no preview or sample.
@@ -1415,6 +1427,10 @@ mod tests {
             ],
         )
         .await;
+        let (library, cover) = cover_of(library, "kit").await;
+        assert_eq!(cover.thumbnail_path, None);
+        // It names the member, so that member's preview reaches the card.
+        assert_eq!(cover.member_ids, ["kit/OBJ/rock.obj"]);
         sqlx::query(
             "UPDATE assets SET thumbnail_path = '.opendam/thumbs/rock_obj.png'
              WHERE file_path = 'kit/OBJ/rock.obj'",
@@ -1430,6 +1446,21 @@ mod tests {
         );
         let panel = pack_holding(&library, "kit").await.unwrap().unwrap();
         assert_eq!(panel.cover, Some(cover));
+
+        // A main item's own thumbnail wins, so no member can change the card.
+        sqlx::query(
+            "UPDATE assets SET thumbnail_path = '.opendam/thumbs/rock.png'
+             WHERE file_path = 'kit/Blend/rock.blend'",
+        )
+        .execute(&library.pool)
+        .await
+        .unwrap();
+        let (_, cover) = cover_of(library, "kit").await;
+        assert_eq!(
+            cover.thumbnail_path.as_deref(),
+            Some("/libraries/a/.opendam/thumbs/rock.png")
+        );
+        assert!(cover.member_ids.is_empty());
     }
 
     #[tokio::test]
@@ -1471,6 +1502,7 @@ mod tests {
             kind: "texture".into(),
             bundled_preview: None,
             fallback_render: None,
+            member_ids: Vec::new(),
         };
         let detail = pack_holding(&library, "3D assets/Car Kit").await.unwrap();
         assert_eq!(

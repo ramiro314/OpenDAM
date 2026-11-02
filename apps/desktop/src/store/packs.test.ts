@@ -29,6 +29,7 @@ const model: Cover = {
   filePath: '/lib/kit/rock.glb',
   extension: 'glb',
   kind: '3d_model',
+  memberIds: [],
 };
 
 describe('coverWithPreview', () => {
@@ -43,6 +44,14 @@ describe('coverWithPreview', () => {
   test('a cover that changes nothing stays the same object', () => {
     const cover = { ...model, thumbnailPath: thumb };
     expect(coverWithPreview(cover, { assetId: 'm1', thumbnailPath: thumb })).toBe(cover);
+    expect(coverWithPreview(model, { assetId: 'm1', thumbnailPath: null })).toBe(model);
+  });
+
+  test("a job that clears its asset's thumbnail clears the cover's", () => {
+    const cover = { ...model, thumbnailPath: thumb };
+    expect(coverWithPreview(cover, { assetId: 'm1', thumbnailPath: null }).thumbnailPath).toBe(
+      null
+    );
   });
 
   test("a model's render switches to the render's thumbnail, and back when it is cleared", () => {
@@ -77,6 +86,30 @@ describe('usePacksStore', () => {
     const packs = store().packs;
     store().applyPreview({ assetId: 'unrelated', thumbnailPath: '/other.png' });
     expect(store().packs).toBe(packs);
+  });
+
+  test("a member's preview reloads the packs, so the card shows what the grid's rule picks", async () => {
+    const standIn = '/lib/.opendam/thumbs/obj_thumb.png';
+    const blend = { ...model, assetId: 'blend', memberIds: ['obj'] };
+    const before = { ...card('kit/rock'), cover: blend };
+    const after = { ...before, cover: { ...blend, thumbnailPath: standIn } };
+    const loads: string[] = [];
+    api.getPacks = async (_ids, underPath) => {
+      loads.push(underPath);
+      return [loads.length > 1 ? after : before];
+    };
+    await store().load(root);
+    expect(loads).toEqual(['']);
+
+    // Not a member of any cover: nothing to ask
+    store().applyPreview({ assetId: 'other', thumbnailPath: '/other.png' });
+    expect(loads).toEqual(['']);
+    // The cover isn't patched with it: a main's own thumbnail or an earlier member may win.
+    store().applyPreview({ assetId: 'obj', thumbnailPath: '/not-picked.png' });
+    expect(store().packs?.[0].cover?.thumbnailPath).toBeUndefined();
+    expect(loads).toEqual(['', '']);
+    await new Promise((resolve) => setTimeout(resolve));
+    expect(store().packs?.[0].cover?.thumbnailPath).toBe(standIn);
   });
 
   test('a failed load leaves no packs, so the node shows Assets', async () => {

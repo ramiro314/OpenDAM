@@ -19,7 +19,10 @@ interface PacksStore {
   /** Reloads the current scope's packs, for `library:updated` */
   refetch: () => Promise<void>;
   select: (key: string | null) => void;
-  /** Applies a finished preview to the covers it changes, so no card waits for a refetch */
+  /**
+   * Applies a finished preview to the covers it changes, so no card waits for `library:updated`,
+   * and reloads the packs when it is a member's of a group whose cover may show it
+   */
   applyPreview: (preview: CoverPreview) => void;
 }
 
@@ -38,7 +41,7 @@ export interface CoverPreview {
 export function coverWithPreview(cover: Cover, preview: CoverPreview): Cover {
   const { assetId, thumbnailPath, render } = preview;
   let next = cover;
-  if (cover.assetId === assetId && cover.thumbnailPath !== thumbnailPath) {
+  if (cover.assetId === assetId && (cover.thumbnailPath ?? null) !== thumbnailPath) {
     next = { ...next, thumbnailPath };
   }
   if (!render) return next;
@@ -123,5 +126,8 @@ export const usePacksStore = create<PacksStore>()((set, get) => ({
       return { ...pack, cover };
     });
     if (changed) set({ packs: next });
+    // A member stands in only by the rule `get_packs` applies, so ask it what the card shows.
+    if (packs?.some((pack) => pack.cover?.memberIds.includes(preview.assetId)))
+      void get().refetch();
   },
 }));

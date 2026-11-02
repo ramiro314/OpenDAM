@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { type TileMedia, coverAsset, tileImage, tileMedia, tileState } from './tileState';
+import {
+  type TileMedia,
+  coverAsset,
+  coverImage,
+  tileImage,
+  tileMedia,
+  tileState,
+} from './tileState';
 
 const png = { kind: 'texture' as const, filePath: '/lib/rock.png', extension: 'png' };
 const thumbnailed = { ...png, thumbnailPath: '/lib/.opendam/thumbs/a_thumb.png' };
@@ -100,7 +107,7 @@ describe('tileMedia', () => {
 });
 
 describe('coverAsset', () => {
-  const cover = { ...model, assetId: 'a', thumbnailPath: null };
+  const cover = { ...model, assetId: 'a', thumbnailPath: null, memberIds: [] };
 
   test("a model cover shows its render, as the model's own tile does", () => {
     const render = '/lib/Previews/ship.png';
@@ -120,6 +127,33 @@ describe('coverAsset', () => {
 
   test('an arriving thumbnail replaces the icon', () => {
     expect(tileMedia(coverAsset({ ...cover, thumbnailPath: '/lib/t.png' }))).toBe('thumbnail');
+  });
+});
+
+describe('coverImage', () => {
+  const render = '/lib/Previews/ship.png';
+  const thumbnail = '/lib/.opendam/thumbs/s_thumb.png';
+  const cover = { ...model, assetId: 'a', memberIds: [] };
+
+  test('a bundled preview comes before the thumbnail and a small render', () => {
+    const shown = { ...cover, bundledPreview: render, thumbnailPath: thumbnail };
+    expect(coverImage({ ...shown, fallbackRender: '/lib/small.png' })).toBe(render);
+  });
+
+  test("a small render shows only after the model's own thumbnail", () => {
+    const small = { ...cover, fallbackRender: render, bundledPreview: null };
+    expect(coverImage({ ...small, thumbnailPath: thumbnail })).toBe(thumbnail);
+    expect(coverImage({ ...small, thumbnailPath: null })).toBe(render);
+    expect(coverImage({ ...small, thumbnailPath: '/lib/t_preview.glb' })).toBe(render);
+  });
+
+  test('an image shows itself, not its thumbnail', () => {
+    const image = { ...png, assetId: 'a', memberIds: [], thumbnailPath: thumbnail };
+    expect(coverImage(image)).toBe(png.filePath);
+  });
+
+  test('a model with no picture has no image', () => {
+    expect(coverImage({ ...cover, thumbnailPath: null })).toBeUndefined();
   });
 });
 
