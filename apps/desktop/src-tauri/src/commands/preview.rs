@@ -90,8 +90,7 @@ pub struct PendingModelThumbnail {
     /// Keeps its old picture until this render, so a failure the session skipped can't hold it.
     pub generating: bool,
     /// The token its render is saved or failed with.
-    #[serde(rename = "modifiedAt")]
-    pub modified_at: i64,
+    pub revision: i64,
 }
 
 /// A render `save_model_thumbnail` stored.
@@ -118,7 +117,7 @@ pub async fn list_pending_model_thumbnails(
             asset_id: row.id,
             model_path: resolve_path(&lib.root_path, &row.model),
             generating: row.generating,
-            modified_at: row.modified_at,
+            revision: row.revision,
         }));
         if pending.len() as i64 >= limit {
             break;
@@ -128,9 +127,9 @@ pub async fn list_pending_model_thumbnails(
 }
 
 /// Stores a PNG thumbnail rendered by the frontend for a 3D model.
-/// Takes the raw PNG as the request body, and the asset id and the `modifiedAt` it was listed with
-/// in `asset-id` and `modified-at` headers. Returns the absolute thumbnail path and the asset's
-/// group, or nothing when the model changed since and the render was dropped.
+/// Takes the raw PNG as the request body, and the asset id and the `revision` it was listed with
+/// in `asset-id` and `preview-revision` headers. Returns the absolute thumbnail path and the
+/// asset's group, or nothing when a newer GLB exists and the render was dropped.
 #[tauri::command]
 pub async fn save_model_thumbnail(
     request: tauri::ipc::Request<'_>,
@@ -141,11 +140,11 @@ pub async fn save_model_thumbnail(
         .get("asset-id")
         .and_then(|v| v.to_str().ok())
         .ok_or("missing asset-id header")?;
-    let modified_at: i64 = request
+    let revision: i64 = request
         .headers()
-        .get("modified-at")
+        .get("preview-revision")
         .and_then(|v| v.to_str().ok()?.parse().ok())
-        .ok_or("missing modified-at header")?;
+        .ok_or("missing preview-revision header")?;
     let png = match request.body() {
         InvokeBody::Raw(png) if !png.is_empty() => png,
         _ => return Err("expected a raw PNG body".to_string()),
@@ -162,7 +161,7 @@ pub async fn save_model_thumbnail(
         }
 
         // The id was just matched against the DB, so it's safe to use as a file name.
-        let saved = save_model_render(&lib.pool, &lib.root_path, asset_id, modified_at, png)
+        let saved = save_model_render(&lib.pool, &lib.root_path, asset_id, revision, png)
             .await
             .map_err(|e| e.to_string())?;
         return Ok(saved.map(|saved| SavedModelThumbnail {
@@ -174,11 +173,11 @@ pub async fn save_model_thumbnail(
 }
 
 /// Reports that the frontend can't render asset `asset_id`'s preview GLB, as listed at
-/// `modified_at`. Returns whether that moved the asset to `error`, where Regenerate can retry it.
+/// `revision`. Returns whether that moved the asset to `error`, where Regenerate can retry it.
 #[tauri::command]
 pub async fn fail_model_thumbnail(
     asset_id: String,
-    modified_at: i64,
+    revision: i64,
     state: State<'_, Arc<AppState>>,
 ) -> Result<bool> {
     let Some(lib) = state
@@ -189,7 +188,7 @@ pub async fn fail_model_thumbnail(
     else {
         return Ok(false);
     };
-    fail_model_render(&lib.pool, &asset_id, modified_at)
+    fail_model_render(&lib.pool, &asset_id, revision)
         .await
         .map_err(|e| e.to_string())
 }

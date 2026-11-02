@@ -83,11 +83,11 @@ describe('onModelRendered', () => {
 });
 
 describe('modelsToRender', () => {
-  const item = (assetId: string, generating: boolean, modifiedAt = 1) => ({
+  const item = (assetId: string, generating: boolean, revision = 1) => ({
     assetId,
     modelPath: `/lib/${assetId}.glb`,
     generating,
-    modifiedAt,
+    revision,
   });
 
   test('skips a failed first preview but never a model at generating', () => {
@@ -96,7 +96,7 @@ describe('modelsToRender', () => {
     expect(modelsToRender(batch, skipped).map((m) => m.assetId)).toEqual(['changed-again', 'new']);
   });
 
-  test('a first preview that failed gets a new try once its model changes', () => {
+  test('a first preview that failed gets a new try with a new GLB', () => {
     const skipped = new Set([renderKey(item('first', false, 1))]);
     expect(modelsToRender([item('first', false, 2)], skipped)).toHaveLength(1);
   });

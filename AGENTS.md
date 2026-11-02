@@ -545,9 +545,9 @@ docs/plans                    Plans for this fork
   GLB as its `thumbnail_path` until then. A render that fails moves a `generating` asset to
   `error`, its picture kept, so Regenerate can retry it (`fail_model_render`). A new render
   replaces the file it follows, so the frontend refreshes its group's card, which may show it
-  as a stand-in (`onModelRendered`). A render or a failure names the `modified_at` its model was
-  listed with, and one for a model that changed since is dropped, so the row keeps waiting on
-  its newer GLB. A staged file with the previous build's bytes keeps its
+  as a stand-in (`onModelRendered`). `complete_job` bumps `preview_revision` with each GLB, and a
+  render or a failure names the revision it was listed with, so one of a replaced GLB is
+  dropped and the row keeps waiting on the newer one. A staged file with the previous build's bytes keeps its
   mtime, so a Rebuild queues nothing for it.
 - **Source hashes are a memo.** `file_hashes` (library DB) holds a sha256 per file path,
   relative to the library root, with the size and mtime (nanoseconds) it was taken at. Only the

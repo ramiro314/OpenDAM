@@ -64,7 +64,7 @@ export function startModelThumbnailer(): () => void {
 
   async function run() {
     // Renders that failed this session. A first preview's failure isn't recorded anywhere, so it's
-    // retried on next launch or when the model changes (`modelsToRender`).
+    // retried on next launch or with a new GLB (`modelsToRender`).
     const skipped = new Set<string>();
 
     while (!stopped) {
@@ -78,11 +78,11 @@ export function startModelThumbnailer(): () => void {
       }
 
       for (const item of batch) {
-        const { assetId, modelPath, modifiedAt } = item;
+        const { assetId, modelPath, revision } = item;
         if (stopped) return;
         try {
           const png = await render(modelPath);
-          const saved = await api.saveModelThumbnail(assetId, modifiedAt, png);
+          const saved = await api.saveModelThumbnail(assetId, revision, png);
           if (saved) await onModelRendered(assetId, saved);
         } catch (err) {
           // A lost context or a stop mid-render says nothing about the model; retry later.
@@ -90,7 +90,7 @@ export function startModelThumbnailer(): () => void {
           console.warn(`3D thumbnail failed for ${modelPath}:`, err);
           // A changed model becomes an error, which Regenerate retries. A report that didn't get
           // through leaves it `generating`, so it is tried again, after a pause.
-          const reported = await api.failModelThumbnail(assetId, modifiedAt).catch(async () => {
+          const reported = await api.failModelThumbnail(assetId, revision).catch(async () => {
             await sleep(IDLE_POLL_MS);
             return false;
           });

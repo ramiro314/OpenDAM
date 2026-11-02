@@ -37,9 +37,9 @@ export async function onModelRendered(assetId: string, saved: SavedModelThumbnai
   if (saved.groupId && saved.groupId !== assetId) await store.refreshAssets([saved.groupId]);
 }
 
-/** What `skipped` remembers a failed render by: a changed model's new GLB deserves a new try. */
-export function renderKey({ assetId, modifiedAt }: PendingModelThumbnail) {
-  return `${assetId}@${modifiedAt}`;
+/** What `skipped` remembers a failed render by: a new GLB deserves a new try. */
+export function renderKey({ assetId, revision }: PendingModelThumbnail) {
+  return `${assetId}@${revision}`;
 }
 
 /**
