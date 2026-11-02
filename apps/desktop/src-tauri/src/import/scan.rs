@@ -12,12 +12,13 @@
 //! several is offered as each:
 //! - a `.unitypackage` (Unity cache): one pack named after the file, whose publisher is the
 //!   folder below `Asset Store*/` in its path;
-//! - a zip holding `.unitypackage` files (Fab): one pack named after the zip, with every package
-//!   and every pipeline-named top folder of one as a variant, URP ticked;
-//! - a zip holding a `.uproject` (Fab Unreal): one pack named after the zip, refused when the
-//!   project has a `Source/` folder. Only the Unreal Editor knows which `.uasset` is a mesh or an
-//!   animation, so its tree is an estimate: a GLB for every `.uasset` below `Content/`, at most,
-//!   with the project's docs, placed by the pack's place steps;
+//! - a zip holding `.unitypackage` files (Fab): one pack named after the zip, in words
+//!   (`split_camel_case`), with every package and every pipeline-named top folder of one as a
+//!   variant, URP ticked;
+//! - a zip holding a `.uproject` (Fab Unreal): one pack named after the zip, in words too, refused
+//!   when the project has a `Source/` folder. Only the Unreal Editor knows which `.uasset` is a
+//!   mesh or an animation, so its tree is an estimate: a GLB for every `.uasset` below `Content/`,
+//!   at most, with the project's docs, placed by the pack's place steps;
 //! - a zip whose folders hold `License*.txt` files (the Kenney All-in-1): one pack per folder
 //!   directly holding one, at its path below a top folder every file shares, unticked under
 //!   `Archive` and `Early access`;
@@ -352,6 +353,32 @@ fn stem(original: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// A Fab zip's name in words, for its pack's title and target: `StylizedVillage` as `Stylized
+/// Village`. An acronym, or a number and the letters on it, stays one word (`HDRPack` as `HDR
+/// Pack`, `Stylized3DVillage` as `Stylized 3D Village`). A name with anything but letters and
+/// digits, such as a space, already has its separators and stays as it is.
+fn split_camel_case(name: &str) -> String {
+    if !name.chars().all(char::is_alphanumeric) {
+        return name.to_string();
+    }
+    let chars: Vec<char> = name.chars().collect();
+    let mut words = String::with_capacity(name.len());
+    for (i, &c) in chars.iter().enumerate() {
+        if i > 0 {
+            let before = chars[i - 1];
+            let after_lower = before.is_lowercase() && (c.is_uppercase() || c.is_numeric());
+            let ends_run = c.is_uppercase()
+                && (before.is_uppercase() || before.is_numeric())
+                && chars.get(i + 1).is_some_and(|next| next.is_lowercase());
+            if after_lower || ends_run {
+                words.push(' ');
+            }
+        }
+        words.push(c);
+    }
+    words
+}
+
 /// The folder below a Unity cache folder (`Asset Store-5.x/<Publisher>/<Category>/`) in the
 /// package's path.
 fn cache_publisher(package: &Path) -> Option<String> {
@@ -399,10 +426,11 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
     let index = index_zip(original)?;
     let zip = index.list(None)?;
     let mut offers = Vec::new();
-    if let Some(fab) = fab(original, &zip, &name, publisher) {
+    let words = split_camel_case(&name);
+    if let Some(fab) = fab(original, &zip, &words, publisher) {
         offers.push(fab);
     }
-    if let Some(unreal) = unreal(&index, &zip, &name, publisher) {
+    if let Some(unreal) = unreal(&index, &zip, &words, publisher) {
         offers.push(unreal);
     }
     if let Some(kenney) = kenney(&index, &zip, &name) {
@@ -854,6 +882,137 @@ mod tests {
         // With no publisher known, the target is the pack alone.
         let offers = detect(&fixture("synthetic.unitypackage"), "unitypackage", "").unwrap();
         assert_eq!(offers[0].candidates[0].target, "synthetic");
+    }
+
+    /// `name` in a fresh folder, a copy of the fixture `from`.
+    fn renamed_fixture(from: &str, name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join(name);
+        std::fs::copy(fixture(from), &original).unwrap();
+        (tmp, original)
+    }
+
+    #[test]
+    fn a_name_is_split_into_words_at_its_camel_case() {
+        // The zips Fab's packs come in.
+        for (name, words) in [
+            ("StylizedVillage", "Stylized Village"),
+            ("AncientRuins", "Ancient Ruins"),
+            ("SpookyCemeteryCrypt", "Spooky Cemetery Crypt"),
+            ("StylizedElvenValley", "Stylized Elven Valley"),
+            ("StylizedLostCave", "Stylized Lost Cave"),
+            ("StylizedWizardRoom", "Stylized Wizard Room"),
+            ("LostRuins", "Lost Ruins"),
+            ("Waterways", "Waterways"),
+        ] {
+            assert_eq!(split_camel_case(name), words);
+        }
+        // Acronyms and digits stay whole.
+        for (name, words) in [
+            ("HDRPack", "HDR Pack"),
+            ("URPStylizedVillage", "URP Stylized Village"),
+            ("StylizedURP", "Stylized URP"),
+            ("URP", "URP"),
+            ("Stylized3DVillage", "Stylized 3D Village"),
+            ("UE5Village", "UE5 Village"),
+            ("4KTextures", "4K Textures"),
+            ("MedievalVol1", "Medieval Vol 1"),
+            ("Castle2Town", "Castle 2 Town"),
+        ] {
+            assert_eq!(split_camel_case(name), words);
+        }
+    }
+
+    #[test]
+    fn a_name_that_has_separators_stays_as_it_is() {
+        for name in [
+            "Stylized Village",
+            "StylizedVillage (1)",
+            "Elven Long Bow",
+            "fab-unity",
+            "Stylized_VillagePack_v2",
+            "",
+        ] {
+            assert_eq!(split_camel_case(name), name);
+        }
+    }
+
+    #[test]
+    fn a_fab_or_unreal_pack_takes_the_zips_name_in_words_and_other_offers_keep_it() {
+        let (_tmp, original) = renamed_fixture("fab-unity.zip", "StylizedVillage.zip");
+        let offers = detect(&original, "zip", "Stylarts").unwrap();
+        assert_eq!(layouts(&offers), ["fab", "zip"]);
+        let (fab, zip) = (&offers[0].candidates[0], &offers[1].candidates[0]);
+        assert_eq!(
+            (fab.name.as_str(), fab.target.as_str()),
+            ("Stylized Village", "Stylarts/Stylized Village")
+        );
+        assert_eq!(
+            (zip.name.as_str(), zip.target.as_str()),
+            ("StylizedVillage", "StylizedVillage")
+        );
+
+        let (_tmp, original) = renamed_fixture("unreal.zip", "LostRuins.zip");
+        let offers = detect(&original, "zip", "Feif").unwrap();
+        assert_eq!(layouts(&offers), ["unreal", "zip"]);
+        let (unreal, zip) = (&offers[0].candidates[0], &offers[1].candidates[0]);
+        assert_eq!(
+            (unreal.name.as_str(), unreal.target.as_str()),
+            ("Lost Ruins", "Feif/Lost Ruins")
+        );
+        assert_eq!(zip.name, "LostRuins");
+
+        // With no publisher typed yet, the target is the pack alone.
+        let offers = detect(&original, "zip", "").unwrap();
+        assert_eq!(offers[0].candidates[0].target, "Lost Ruins");
+
+        let (_tmp, original) =
+            renamed_fixture("synthetic.unitypackage", "StylizedVillage.unitypackage");
+        let offers = detect(&original, "unitypackage", "Stylarts").unwrap();
+        let unity = &offers[0].candidates[0];
+        assert_eq!(
+            (unity.name.as_str(), unity.target.as_str()),
+            ("StylizedVillage", "Stylarts/StylizedVillage")
+        );
+    }
+
+    /// A run of the import trial's pack list is audited through the pack map (plan
+    /// import-material-fixes, "Matching against the baseline"), so each pack must land where the
+    /// map's `current_pack` column looks for it. The trial's page imports the first candidate of
+    /// a pack's offer at `<publisher>/<name>`.
+    #[test]
+    fn the_trial_packs_land_where_the_pack_map_looks_for_them() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let read = |path: &str| std::fs::read_to_string(repo.join(path)).unwrap();
+        let packs: serde_json::Value =
+            serde_json::from_str(&read("apps/desktop/scripts/import-trial/packs.json")).unwrap();
+        let map = read("docs/plans/import-material-fixes/pack-map.tsv");
+
+        let landed: std::collections::BTreeSet<String> = packs["imports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pack| {
+                let (offer, publisher) = (pack["offer"].as_str(), pack["publisher"].as_str());
+                let (offer, publisher) = (offer.unwrap(), publisher.unwrap());
+                let file = pack["path"].as_str().unwrap().rsplit('/').next().unwrap();
+                let (from, kind) = match offer {
+                    "unity" => ("synthetic.unitypackage", "unitypackage"),
+                    _ => ("fab-unity.zip", "zip"),
+                };
+                let (_tmp, original) = renamed_fixture(from, file);
+                let offers = detect(&original, kind, publisher).unwrap();
+                let offered = offers.iter().find(|o| o.layout == offer).unwrap();
+                format!("{publisher}/{}", offered.candidates[0].name)
+            })
+            .collect();
+        let mapped: std::collections::BTreeSet<String> = map
+            .lines()
+            .skip(1)
+            .map(|row| row.split('\t').nth(2).unwrap().to_string())
+            .collect();
+        assert_eq!(landed, mapped);
+        assert!(mapped.contains("Stylarts/Stylized Village"), "{mapped:?}");
     }
 
     #[test]

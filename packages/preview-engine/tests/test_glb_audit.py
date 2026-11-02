@@ -482,20 +482,40 @@ def test_the_committed_manifest_gives_the_plans_now_column():
     assert sum(path.startswith(BUILT_IN) for path in medieval) == 193
 
 
-# Piece 2 fills in the map (plan, "Matching against the baseline"), and these two tests with it.
-def test_the_committed_map_is_the_pre_piece_2_map():
+# The plan's "From Piece 2 on" table. A later ticket fills in Medieval Houses, and its row here.
+RENAMED = {
+    "Stylarts/StylizedVillage": "Stylarts/Stylized Village",
+    "Leartes Studios/AncientRuins": "Leartes Studios/Ancient Ruins",
+    "Stylarts/SpookyCemeteryCrypt": "Stylarts/Spooky Cemetery Crypt",
+    "Stylarts/StylizedElvenValley": "Stylarts/Stylized Elven Valley",
+    "Stylarts/StylizedLostCave": "Stylarts/Stylized Lost Cave",
+    "Stylarts/StylizedWizardRoom": "Stylarts/Stylized Wizard Room",
+}
+
+
+def test_the_committed_map_names_the_fab_packs_as_the_plan_does():
     pack_map = glb_audit.read_pack_map(PLAN / "pack-map.tsv")
     assert {r.baseline_pack: r.glbs for r in pack_map} == {p: n for p, (n, _) in NOW.items()}
     for r in pack_map:
-        assert r.baseline_pack == r.current_pack
+        assert r.current_pack == RENAMED.get(r.baseline_pack, r.baseline_pack)
         assert r.baseline_prefix == r.current_prefix == ""
 
 
-def test_the_baseline_passes_against_itself_through_the_committed_map():
-    manifest = glb_audit.read_manifest(PLAN / "baseline-v4.tsv")
-    result = glb_audit.compare(manifest, manifest, glb_audit.read_pack_map(PLAN / "pack-map.tsv"))
+def test_the_committed_map_matches_every_glb_under_the_new_names_and_only_there():
+    baseline = glb_audit.read_manifest(PLAN / "baseline-v4.tsv")
+    pack_map = glb_audit.read_pack_map(PLAN / "pack-map.tsv")
+
+    current = {RENAMED.get(pack, pack): glbs for pack, glbs in baseline.items()}
+    result = glb_audit.compare(baseline, current, pack_map)
     assert_passed(result)
+    assert result.matched == {p: n for p, (n, _) in NOW.items()}
     assert not result.geometry
+
+    # A pack still at its old name fails loudly, so the map can't pass by comparing nothing.
+    stale = glb_audit.compare(baseline, baseline, pack_map)
+    assert len(stale.short_packs) == len(RENAMED)
+    assert len(stale.unmatched_baseline) == sum(NOW[p][0] for p in RENAMED)
+    assert len(stale.unmatched_current) == sum(NOW[p][0] for p in RENAMED)
 
 
 PACK_MAP = (

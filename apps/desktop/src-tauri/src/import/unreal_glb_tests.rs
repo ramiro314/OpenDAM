@@ -167,6 +167,33 @@ echo "$left" > "$GLTF_OUT/.gltf-remaining""#
         )
     }
 
+    /// An Unreal offer takes its title from its folder too, by the same metadata step.
+    #[tokio::test]
+    async fn an_unreal_zip_named_in_camel_case_imports_titled_in_words() {
+        let s = setup_with(false).await;
+        s.stub_unreal().await;
+        let originals = tempfile::tempdir().unwrap();
+        let original = originals.path().join("LostRuins.zip");
+        std::fs::copy(fixture("unreal.zip"), &original).unwrap();
+        let original = original.to_string_lossy().into_owned();
+
+        let scan = s.engine.scan("lib", &original).await.unwrap();
+        let offer = scan.offers.iter().find(|o| o.layout == "unreal").unwrap();
+        let request = ImportRequest {
+            original_path: original.clone(),
+            target: format!("Fab/{}", offer.candidates[0].name),
+            ..s.unreal_request("unreal.zip")
+        };
+        let run = s.engine.start_import(request).await.unwrap();
+        tokio::spawn(s.engine.clone().start());
+        s.wait_for(&run.id, "done").await;
+
+        let package = s.dir.path().join("Fab/Lost Ruins/datapackage.json");
+        let package: Value =
+            serde_json::from_str(&std::fs::read_to_string(package).unwrap()).unwrap();
+        assert_eq!(package["title"], "Lost Ruins", "{package}");
+    }
+
     /// A finished run reads back what it exported, also when a rebuild exports nothing because
     /// the cache holds it all.
     #[tokio::test]
