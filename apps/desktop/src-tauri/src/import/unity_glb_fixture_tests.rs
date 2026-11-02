@@ -469,6 +469,27 @@ mod tests {
         assert!(is(glb.material("M_Thing").base, BASE));
     }
 
+    /// A base hint beside another role's word isn't a base: not `Albedo Mask`, which sorts first,
+    /// and not a raw `_ColorMask`.
+    #[tokio::test]
+    async fn a_name_with_a_base_hint_and_another_role_s_word_is_not_the_base() {
+        for case in ["display-not-base", "raw-not-base"] {
+            let Some(glb) = convert(case).await else {
+                return;
+            };
+            assert!(is(glb.material("M_Thing").base, BASE), "{case}");
+        }
+    }
+
+    /// A raw name's base hint comes before a display name's.
+    #[tokio::test]
+    async fn a_raw_base_hint_comes_before_a_display_name_s() {
+        let Some(glb) = convert("raw-hint-first").await else {
+            return;
+        };
+        assert!(is(glb.material("M_Thing").base, BASE));
+    }
+
     /// Two textures nothing claims: neither is the only texture, so the flat colour stays.
     #[tokio::test]
     async fn two_unclaimed_textures_leave_the_flat_colour() {

@@ -416,6 +416,37 @@ def main() -> None:
     pack = Pack("only-texture", ["M_Thing"])
     pack.material("M_Thing", {"_Grid": pack.texture("T_Grid", BASE)})
 
+    # A base hint and another role's word: `Albedo Mask` sorts first but isn't the base, and a
+    # raw `_ColorMask` isn't either.
+    pack = Pack("display-not-base", ["M_Thing"])
+    graph_material(
+        pack,
+        {"Texture2D_a": ("Albedo Mask", OTHER_BASE), "Texture2D_b": ("BaseColor", BASE)},
+    )
+
+    pack = Pack("raw-not-base", ["M_Thing"])
+    shader = pack.graph("S_Thing", stream({"Texture2D_x": "A_BaseColor"}))
+    pack.material(
+        "M_Thing",
+        {
+            "_ColorMask": pack.texture("T_Mask", OTHER_BASE),
+            "Texture2D_x": pack.texture("T_Base", BASE),
+        },
+        shader=shader,
+    )
+
+    # A raw name with a base hint, in none of the exact names, beats a display name's hint.
+    pack = Pack("raw-hint-first", ["M_Thing"])
+    shader = pack.graph("S_Thing", stream({"Texture2D_x": "A_BaseColor"}))
+    pack.material(
+        "M_Thing",
+        {
+            "Texture2D_x": pack.texture("T_Layer", OTHER_BASE),
+            "_LayerBaseColor": pack.texture("T_Base", BASE),
+        },
+        shader=shader,
+    )
+
     # Two textures nothing claims: there's no only texture, so the colour stays.
     pack = Pack("two-textures", ["M_Thing"])
     pack.material(
