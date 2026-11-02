@@ -459,8 +459,9 @@ Revised again 2026-11-01 while fixing empty GLBs (plan import-material-fixes, Pi
 its deviations from the plan as written:
 
 - **R61 - A run's warnings hold more than skipped entries.** A model the conversion left with no
-  mesh lands as an empty GLB and warns with the reason `noMesh`, on every run that places it,
-  unless its file name is a collider's. The list keeps its shape, so stored runs read as before,
+  mesh and no animation lands as an empty GLB and warns with the reason `noMesh`, on every run
+  that places it, unless its file name is a collider's. An animation clip holds no mesh but isn't
+  empty. The list keeps its shape, so stored runs read as before,
   and its heading reads "N warnings".
 
 ## Problem

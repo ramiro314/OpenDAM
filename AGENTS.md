@@ -115,8 +115,9 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               path, final name and sha256 (and, with binary Unity files,
                               unity_text.py's VERSION and the locked UnityPy). Each mesh keeps its
                               own lowest `_LOD<n>`, and every placed GLB, new or cached, is read
-                              so one with no mesh warns on every run (`SkipReason::NoMesh`),
-                              unless its model is named as a collider, and unreal_glb, the
+                              so one with no mesh and no animation warns on every run
+                              (`SkipReason::NoMesh`), unless its model is named as a collider,
+                              and unreal_glb, the
                               export_unreal step: a zip's content-only Unreal project (refused
                               with a Source/ folder) unzipped to a work copy with its plugins
                               enabled there only, exported to GLBs by the embedded

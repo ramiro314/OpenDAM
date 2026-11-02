@@ -21,7 +21,8 @@
 //!   Blender at all, and one that dropped, renamed or changed an input converts again.
 //! - **A model left with no mesh.** Its empty GLB is still written and cached, so the step reads
 //!   each GLB it places, new or cached, and warns of an empty one on every run, unless the
-//!   model's file name is a collider's (`is_collider`).
+//!   model's file name is a collider's (`is_collider`). An animation clip holds no mesh either,
+//!   but its GLB isn't empty (`is_empty_glb`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -302,14 +303,17 @@ fn is_collider(path: &str) -> bool {
         || COLLIDER_SUFFIXES.iter().any(|s| name.ends_with(s))
 }
 
-/// How many meshes the GLB at `path` holds, from its JSON chunk, the first, alone: the rest of a
-/// GLB can run to hundreds of MB.
-fn mesh_count(path: &Path) -> Result<usize, String> {
+/// Whether the GLB at `path` holds neither a mesh nor an animation (a clip such as `Hero@Run.fbx`
+/// holds no mesh), from its JSON chunk, the first, alone: the rest of a GLB can run to hundreds of
+/// MB.
+fn is_empty_glb(path: &Path) -> Result<bool, String> {
     use std::io::Read;
     #[derive(Deserialize)]
     struct Gltf {
         #[serde(default)]
         meshes: Vec<serde::de::IgnoredAny>,
+        #[serde(default)]
+        animations: Vec<serde::de::IgnoredAny>,
     }
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut head = [0u8; 20];
@@ -323,7 +327,7 @@ fn mesh_count(path: &Path) -> Result<usize, String> {
         .read_to_end(&mut json)
         .map_err(|e| e.to_string())?;
     let gltf: Gltf = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
-    Ok(gltf.meshes.len())
+    Ok(gltf.meshes.is_empty() && gltf.animations.is_empty())
 }
 
 /// An input as the inputs hash reads it: a staged file Blender reads, and for a `.meta`, the
@@ -614,8 +618,8 @@ impl Conversion<'_> {
                 let glb = staging.join(&model.glb);
                 std::fs::copy(cached, &glb)
                     .map_err(|e| format!("Could not write {}: {e}", model.glb))?;
-                match mesh_count(&glb) {
-                    Ok(0) if !is_collider(&model.path) => empty.push(SkippedEntry {
+                match is_empty_glb(&glb) {
+                    Ok(true) if !is_collider(&model.path) => empty.push(SkippedEntry {
                         source_path: model.source_path.clone(),
                         reason: SkipReason::NoMesh,
                     }),
@@ -1020,28 +1024,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_glb_s_meshes_are_counted_from_its_json_chunk() {
+    fn a_glb_is_empty_with_no_mesh_and_no_animation_in_its_json_chunk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.glb");
         for (json, want) in [
-            (r#"{"asset":{"version":"2.0"}}"#, 0),
-            (r#"{"meshes":[]}  "#, 0),
-            (
-                r#"{"meshes":[{"name":"a","primitives":[]},{}],"nodes":[{}]}"#,
-                2,
-            ),
+            (r#"{"asset":{"version":"2.0"}}"#, true),
+            (r#"{"meshes":[]}  "#, true),
+            (r#"{"meshes":[],"animations":[],"nodes":[{}]}"#, true),
+            (r#"{"meshes":[{"primitives":[]},{}],"nodes":[{}]}"#, false),
+            (r#"{"animations":[{"channels":[]}],"nodes":[{}]}"#, false),
         ] {
             glb_of(&path, json);
-            assert_eq!(mesh_count(&path), Ok(want), "{json}");
+            assert_eq!(is_empty_glb(&path), Ok(want), "{json}");
         }
         std::fs::write(&path, "glTF").unwrap();
-        assert!(mesh_count(&path).is_err());
+        assert!(is_empty_glb(&path).is_err());
         glb_of(&path, "{");
-        assert!(mesh_count(&path).is_err());
+        assert!(is_empty_glb(&path).is_err());
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[16..20].copy_from_slice(b"BIN\0");
         std::fs::write(&path, bytes).unwrap();
-        assert!(mesh_count(&path).is_err());
+        assert!(is_empty_glb(&path).is_err());
     }
 
     #[test]

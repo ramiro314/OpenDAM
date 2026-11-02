@@ -540,16 +540,15 @@ def convert(model: Path, target: Path, guids, by_mesh, by_name, images, mtls, ma
     built: dict[Path, bpy.types.Material] = {}
     matched = total = 0
     meshes = [o for o in bpy.data.objects if o.type == "MESH"]
-    # Each group's lowest level. A collision mesh joins none, so `X_Collider_LOD1` still goes.
     lowest: dict[str, int] = {}
     for obj in meshes:
         group, level = lod_of(base_name(obj.name))
-        if not COLLISION_RE.search(group):
-            lowest[group] = min(level, lowest.get(group, level))
+        lowest[group] = min(level, lowest.get(group, level))
     for obj in list(bpy.data.objects):
         name = base_name(obj.name)
         group, level = lod_of(name)
-        if (level > lowest.get(group, 0) and not lod_file) or COLLISION_RE.search(name):
+        # By its group, so `_LOD<n>` hides no collision mesh: `X_Collider_LOD1` goes too.
+        if (level > lowest.get(group, 0) and not lod_file) or COLLISION_RE.search(group):
             bpy.data.objects.remove(obj)
             continue
         if obj.type != "MESH":

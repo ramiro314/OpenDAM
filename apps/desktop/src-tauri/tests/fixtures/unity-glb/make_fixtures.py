@@ -615,15 +615,16 @@ def main() -> None:
     # above their level, which goes only if the suffixes are read past.
     Pack("lod-several").objects(["X_LOD1.001", "X_LOD1.002", "X_LOD2.001"])
 
-    Pack("lod-file").objects(["X_LOD1", "X_LOD2"], "X_LOD1")
+    # A collision mesh goes even here, where every level stays.
+    Pack("lod-file").objects(["X_LOD1", "X_LOD2", "X_Collider_LOD1"], "X_LOD1")
 
     # `_LOD0` is level 0, so this file is no LOD and its other levels go.
     Pack("lod0-file").objects(["X_LOD0", "X_LOD1"], "X_LOD0")
 
     Pack("no-mesh").objects(["UCX_Model", "Model_Collider"])
 
-    # A collision mesh joins no group, so with no other of its name it isn't its lowest level.
-    Pack("no-mesh-lod").objects(["Model_Collider_LOD1"])
+    # `_LOD<n>` hides no collision mesh, not even at the lowest level of its name.
+    Pack("no-mesh-lod").objects(["Model_Collider_LOD0", "Model_Collider_LOD1"])
 
     Pack("collider-file").objects(["rock_collider"], "rock_collider")
 
