@@ -692,7 +692,7 @@ pub(crate) async fn save_model_render(
     );
     let abs_thumb = PathBuf::from(resolve_path(root_path, &rel_thumb));
     tokio::fs::write(&abs_thumb, png).await?;
-    let group_id: Option<Option<String>> = sqlx::query_scalar(
+    let updated: sqlx::Result<Option<Option<String>>> = sqlx::query_scalar(
         "UPDATE assets SET thumbnail_path = ?,
             preview_status = CASE preview_status WHEN 'generating' THEN 'done' ELSE preview_status END
          WHERE id = ? AND preview_revision = ? RETURNING group_id",
@@ -701,11 +701,14 @@ pub(crate) async fn save_model_render(
     .bind(asset_id)
     .bind(revision)
     .fetch_optional(pool)
-    .await
-    .map_err(std::io::Error::other)?;
-    let Some(group_id) = group_id else {
-        remove_thumb_file(&abs_thumb).await;
-        return Ok(None);
+    .await;
+    // No row names the new file unless the update landed, and nothing else would ever delete it.
+    let group_id = match updated {
+        Ok(Some(group_id)) => group_id,
+        outcome => {
+            remove_thumb_file(&abs_thumb).await;
+            return outcome.map(|_| None).map_err(std::io::Error::other);
+        }
     };
     if let Some(old) = old.and_then(|old| owned_thumb_file(root_path, &old)) {
         remove_thumb_file(&old).await;
@@ -726,7 +729,7 @@ pub(crate) async fn fail_model_render(
     revision: i64,
 ) -> sqlx::Result<bool> {
     let moved = sqlx::query(
-        "UPDATE assets SET preview_status = 'error'
+        "UPDATE assets SET preview_status = 'error', preview_reason = NULL
          WHERE id = ? AND preview_revision = ? AND preview_status = 'generating'",
     )
     .bind(asset_id)
@@ -2384,6 +2387,56 @@ mod tests {
             thumb_and_status(&pool).await,
             (Some(GLB.to_string()), "done".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn a_render_whose_row_update_fails_leaves_no_file_behind() {
+        let (dir, pool) = library_with_new_model().await;
+        let root = dir.path();
+        let old = ".opendam/thumbs/m1_thumb.png";
+        std::fs::write(root.join(old), "old").unwrap();
+        sqlx::query("UPDATE assets SET thumbnail_path = ?")
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER busy BEFORE UPDATE OF thumbnail_path ON assets
+             BEGIN SELECT RAISE(ABORT, 'database is locked'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let saved = save_model_render(&pool, root, "m1", 0, b"new").await;
+
+        assert!(saved.is_err());
+        assert_eq!(thumb_files(root), ["m1_thumb.png"]);
+        assert_eq!(thumb_and_status(&pool).await.0.as_deref(), Some(old));
+    }
+
+    #[tokio::test]
+    async fn a_failed_render_clears_a_stale_preview_reason() {
+        let (dir, pool) = library_with_new_model().await;
+        let old = ".opendam/thumbs/m1_thumb.png";
+        sqlx::query("UPDATE assets SET thumbnail_path = ?")
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        finish_with_glb(&pool, dir.path(), "j1").await;
+        sqlx::query("UPDATE assets SET preview_reason = 'Too large to preview'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(fail_model_render(&pool, "m1", 1).await.unwrap());
+
+        let reason: Option<String> = sqlx::query_scalar("SELECT preview_reason FROM assets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reason, None);
     }
 
     #[tokio::test]
