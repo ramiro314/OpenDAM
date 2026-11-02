@@ -1314,6 +1314,48 @@ mod tests {
         assert!(thumb.get_pixel(256, 8).0[0].abs_diff(186) <= 2);
     }
 
+    /// A `.hdr` whose header reads but whose pixels stop after its first bytes.
+    fn write_truncated_hdr(path: &Path) {
+        write_hdr(path, 64, 64, &[0.25, 1.0, 3.0]);
+        let bytes = std::fs::read(path).unwrap();
+        std::fs::write(path, &bytes[..bytes.len() / 2]).unwrap();
+        assert_eq!(image::image_dimensions(path).unwrap(), (64, 64));
+    }
+
+    #[test]
+    fn truncated_hdr_fails_and_writes_no_thumbnail() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("sky.hdr");
+        write_truncated_hdr(&source);
+        let thumbs = dir.path().join("thumbs");
+
+        assert!(generate_image_thumb(&source, &thumbs, "a1").is_err());
+        assert!(!thumbs.exists());
+    }
+
+    #[tokio::test]
+    async fn image_queue_hands_a_truncated_hdr_to_the_python_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_truncated_hdr(&root.join("hdri/sky.HDR"));
+        let lib = library_with_pending_job(root, "hdri/sky.HDR", "").await;
+
+        let (claimed, done) = process_image_jobs(&lib, 2).await;
+
+        assert!(claimed);
+        assert!(done.is_empty());
+        // Not done: the row keeps waiting, and the worker's answer settles it.
+        assert_eq!(
+            job_outcome(&lib.pool).await,
+            (Some(String::new()), "pending".into(), "fallback".into())
+        );
+        assert!(!root.join(".opendam/thumbs").exists());
+
+        // The image queue doesn't claim it again.
+        let (claimed, _) = process_image_jobs(&lib, 2).await;
+        assert!(!claimed);
+    }
+
     #[test]
     fn hdr_is_decoded_natively_and_exr_is_not() {
         assert!(is_native_image("HDR") && needs_preview("HDR"));
