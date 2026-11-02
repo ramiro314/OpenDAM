@@ -1146,6 +1146,16 @@ mod tests {
                     "Unity/Pack.unitypackage",
                 ],
             ),
+            (
+                "one package inside a license folder and one outside",
+                &[
+                    "Kit A/License.txt",
+                    "Kit A/Unity/A.unitypackage",
+                    "Kit B/License.txt",
+                    "Kit C/License.txt",
+                    "Unity/Other.unitypackage",
+                ],
+            ),
         ] {
             assert_eq!(layouts_of(entries), "fab kenney zip", "{shape}");
         }
