@@ -233,6 +233,12 @@ def main() -> None:
         },
     )
 
+    pack = Pack("orm-map", ["M_Thing"])
+    graph_material(
+        pack,
+        {"Texture2D_a": ("A_BaseColor", BASE), "Texture2D_b": ("ORMMap", ORM)},
+    )
+
     pack = Pack("detail-normal", ["M_Thing"])
     graph_material(
         pack,
@@ -260,6 +266,24 @@ def main() -> None:
     graph_material(
         pack,
         {"Texture2D_a": ("A_BaseColor", BASE), "Texture2D_b": ("OpacityMap", MASK)},
+    )
+
+    # Raw opacity names, with a base, with none, and ahead of a display-named mask, which is
+    # white, so it would cut nothing.
+    pack = Pack("raw-mask", ["M_Base", "M_Flat", "M_First"])
+    mask = pack.texture("T_Mask", MASK)
+    base = pack.texture("T_Base", BASE)
+    shader = pack.graph("S_Thing", stream({"Texture2D_x": "A_OpacityMap"}))
+    pack.material("M_Base", {"_BaseMap": base, "_OpacityMap": mask})
+    pack.material("M_Flat", {"_OpacityMap": mask}, {"_Color": TINT})
+    pack.material(
+        "M_First",
+        {
+            "_BaseMap": base,
+            "_OpacityMask": mask,
+            "Texture2D_x": pack.texture("T_White", (255, 255, 255)),
+        },
+        shader=shader,
     )
 
     # A cutout with no mask: the base's own alpha, or nothing to cut with.
@@ -350,7 +374,8 @@ def main() -> None:
 
     pack = Pack("flat-colour", ["M_Thing"])
     shader = pack.graph("S_Thing", stream({"Color_a": "BaseColor Value"}))
-    pack.material("M_Thing", colors={"Color_a": TINT, "_Color": GREY}, shader=shader)
+    colors = {"Color_a": TINT, "_BaseColor": GREY, "_Color": GREY}
+    pack.material("M_Thing", colors=colors, shader=shader)
 
     pack = Pack("only-texture", ["M_Thing"])
     pack.material("M_Thing", {"_Grid": pack.texture("T_Grid", BASE)})

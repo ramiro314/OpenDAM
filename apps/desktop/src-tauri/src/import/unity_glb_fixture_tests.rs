@@ -230,6 +230,16 @@ mod tests {
         assert!(is(m.base, BASE) && !m.orm, "{m:?}");
     }
 
+    /// An acronym splits from the word after it: `ORMMap` is ORM, Map.
+    #[tokio::test]
+    async fn an_acronym_is_a_word_of_its_own() {
+        let Some(glb) = convert("orm-map").await else {
+            return;
+        };
+        let m = glb.material("M_Thing");
+        assert!(is(m.base, BASE) && m.orm, "{m:?}");
+    }
+
     /// Detail normal: `Detail Map Normal` sorts first but isn't the normal map.
     #[tokio::test]
     async fn a_detail_normal_is_not_the_normal_map() {
@@ -268,6 +278,21 @@ mod tests {
         let m = glb.material("M_Thing");
         assert_eq!(m.alpha_mode.as_deref(), Some("MASK"), "{m:?}");
         assert!(is(m.base, BASE) && m.base.unwrap().1 == 0, "{m:?}");
+    }
+
+    /// Raw opacity names cut out with a base and with none, and come before a display name.
+    #[tokio::test]
+    async fn a_raw_opacity_name_is_a_mask() {
+        let Some(glb) = convert("raw-mask").await else {
+            return;
+        };
+        for name in ["M_Base", "M_First"] {
+            let m = glb.material(name);
+            assert_eq!(m.alpha_mode.as_deref(), Some("MASK"), "{name}: {m:?}");
+            assert!(is(m.base, BASE) && m.base.unwrap().1 == 0, "{name}: {m:?}");
+        }
+        let m = glb.material("M_Flat");
+        assert!(is_cutout(&m), "{m:?}");
     }
 
     /// A cutout with no mask reads its base's alpha, and with no base it has nothing to cut with.
@@ -375,7 +400,7 @@ mod tests {
         assert_eq!(glb.images(), 0);
     }
 
-    /// Flat colour: `BaseColor Value` beats the `_Color` beside it.
+    /// Flat colour: `BaseColor Value` beats the `_BaseColor` and `_Color` beside it.
     #[tokio::test]
     async fn a_display_name_gives_the_flat_colour() {
         let Some(glb) = convert("flat-colour").await else {
