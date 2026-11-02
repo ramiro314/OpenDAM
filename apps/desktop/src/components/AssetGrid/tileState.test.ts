@@ -20,6 +20,10 @@ const rendered = {
 };
 
 describe('tileMedia', () => {
+  test('a file with a preview reason never loads its original', () => {
+    expect(tileMedia({ ...png, previewReason: 'Too large to preview' })).toBe('none');
+  });
+
   test('prefers the thumbnail, then the original image', () => {
     expect(tileMedia(thumbnailed)).toBe('thumbnail');
     expect(tileMedia(png)).toBe('original');
@@ -123,6 +127,18 @@ describe('coverAsset', () => {
     const none = { ...cover, bundledPreview: null, fallbackRender: null };
     expect(tileMedia(coverAsset(none))).toBe('none');
     expect(tileMedia(coverAsset({ ...none, thumbnailPath: '/lib/t.glb' }))).toBe('none');
+  });
+
+  test('a cover with a preview reason never loads its original', () => {
+    const huge = {
+      ...png,
+      assetId: 'a',
+      memberIds: [],
+      previewReason: 'Too large to preview (29027 x 29027 px)',
+    };
+    expect(tileMedia(coverAsset(huge))).toBe('none');
+    expect(coverImage(huge)).toBeUndefined();
+    expect(tileMedia(coverAsset({ ...huge, previewReason: null }))).toBe('original');
   });
 
   test('an arriving thumbnail replaces the icon', () => {

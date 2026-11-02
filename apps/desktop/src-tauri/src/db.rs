@@ -237,9 +237,10 @@ async fn add_run_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
 
 /// Backward compatibility: assets gained the preview engine version that made a preview and the
 /// engine's texture report (plan textured-fbx-previews C8), which `preview::complete_job`
-/// stores, and the count of preview GLBs written, which it bumps. Older rows read as `NULL`,
-/// version 1, and as revision 0. As with tag descriptions, any failure other than a column
-/// already being there is an error. None is indexed or searched.
+/// stores, the count of preview GLBs written, which it bumps, and the reason a file stays without
+/// a preview, which `preview::refuse_job` stores. Older rows read as `NULL`, version 1 with no
+/// reason, and as revision 0. As with tag descriptions, any failure other than a column already
+/// being there is an error. None is indexed or searched.
 async fn add_preview_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
     add_missing_columns(
         pool,
@@ -247,6 +248,7 @@ async fn add_preview_columns(pool: &Pool<Sqlite>) -> sqlx::Result<()> {
             ("assets", "preview_version", "INTEGER"),
             ("assets", "preview_textures", "TEXT"),
             ("assets", "preview_revision", "INTEGER NOT NULL DEFAULT 0"),
+            ("assets", "preview_reason", "TEXT"),
         ],
     )
     .await
@@ -1878,7 +1880,8 @@ mod tests {
         sqlx::query(
             "ALTER TABLE assets DROP COLUMN preview_version;
              ALTER TABLE assets DROP COLUMN preview_textures;
-             ALTER TABLE assets DROP COLUMN preview_revision;",
+             ALTER TABLE assets DROP COLUMN preview_revision;
+             ALTER TABLE assets DROP COLUMN preview_reason;",
         )
         .execute(&pool)
         .await
@@ -1887,13 +1890,14 @@ mod tests {
         add_preview_columns(&pool).await.unwrap();
         add_preview_columns(&pool).await.unwrap();
 
-        let row: (String, Option<i64>, Option<String>, i64) = sqlx::query_as(
-            "SELECT id, preview_version, preview_textures, preview_revision FROM assets",
+        let row: (String, Option<i64>, Option<String>, i64, Option<String>) = sqlx::query_as(
+            "SELECT id, preview_version, preview_textures, preview_revision, preview_reason
+             FROM assets",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(row, ("a1".to_string(), None, None, 0));
+        assert_eq!(row, ("a1".to_string(), None, None, 0, None));
     }
 
     #[tokio::test]

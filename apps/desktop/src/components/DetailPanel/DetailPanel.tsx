@@ -45,7 +45,7 @@ import {
 } from '../Icons';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { api } from '../../api';
-import { imageOf } from '../../utils/media';
+import { imageOf, previewMessage } from '../../utils/media';
 import { coverImage } from '../AssetGrid/tileState';
 import { formatSize, itemFileCount } from '../../utils/format';
 import { useImageScaling } from '../../hooks/useImageScaling';
@@ -1314,6 +1314,7 @@ function PreviewTab({ asset, onGeneratePreview }: { asset: Asset; onGeneratePrev
   const imagePath = imageOf(asset);
   const isPending = asset.previewStatus === 'pending' || asset.previewStatus === 'generating';
   const isError = asset.previewStatus === 'error';
+  const message = previewMessage(asset);
   const scaling = useImageScaling('contain');
 
   return (
@@ -1372,29 +1373,25 @@ function PreviewTab({ asset, onGeneratePreview }: { asset: Asset; onGeneratePrev
               <IconEye size={36} />
             )}
           </div>
-          <p className={styles.emptyStatusTitle}>
-            {isPending
-              ? 'Generating preview…'
-              : isError
-                ? 'Preview generation failed previously'
-                : 'No preview available'}
-          </p>
-          <p className={styles.emptyStatusSub}>
-            {isPending
-              ? 'Please wait while the worker renders the model'
-              : 'Click below to run the preview engine worker for this file'}
-          </p>
-          <button
-            id="detail-generate-preview"
-            className={clsx(styles.generateBtn, isPending && styles.generateBtnLoading)}
-            onClick={onGeneratePreview}
-            disabled={isPending}
-          >
-            <IconRefresh size={14} className={clsx(isPending && 'animate-spin')} />
-            <span>
-              {isPending ? 'Generating…' : isError ? 'Retry Generate Preview' : 'Generate Preview'}
-            </span>
-          </button>
+          <p className={styles.emptyStatusTitle}>{message.title}</p>
+          <p className={styles.emptyStatusSub}>{message.sub}</p>
+          {message.canGenerate && (
+            <button
+              id="detail-generate-preview"
+              className={clsx(styles.generateBtn, isPending && styles.generateBtnLoading)}
+              onClick={onGeneratePreview}
+              disabled={isPending}
+            >
+              <IconRefresh size={14} className={clsx(isPending && 'animate-spin')} />
+              <span>
+                {isPending
+                  ? 'Generating…'
+                  : isError
+                    ? 'Retry Generate Preview'
+                    : 'Generate Preview'}
+              </span>
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -1417,6 +1414,7 @@ function AssetPreview({
   const image = imageOf(asset);
   const isPending = asset.previewStatus === 'pending' || asset.previewStatus === 'generating';
   const isError = asset.previewStatus === 'error';
+  const message = previewMessage(asset);
 
   if (image) {
     return (
@@ -1454,7 +1452,8 @@ function AssetPreview({
   return (
     <div className={styles.thumbPlaceholder}>
       <span className={styles.thumbExt}>.{asset.extension}</span>
-      {onGeneratePreview && (
+      {!message.canGenerate && <span className={styles.thumbReason}>{message.title}</span>}
+      {onGeneratePreview && message.canGenerate && (
         <button
           className={styles.thumbGenerateBtn}
           onClick={onGeneratePreview}

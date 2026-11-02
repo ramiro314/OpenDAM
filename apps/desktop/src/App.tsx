@@ -80,9 +80,12 @@ export default function App() {
       onPreviewDone(event.payload)
     );
 
-    const unlistenError = listen<{ assetId: string }>('preview:error', (event) => {
-      useAssetStore.getState().setPreviewStatus(event.payload.assetId, 'error');
-    });
+    const unlistenError = listen<{ assetId: string; reason?: string | null }>(
+      'preview:error',
+      (event) => {
+        useAssetStore.getState().failPreview(event.payload.assetId, event.payload.reason);
+      }
+    );
 
     // Render grid thumbnails for 3D models the preview engine converted to .glb
     const stopModelThumbnailer = startModelThumbnailer();

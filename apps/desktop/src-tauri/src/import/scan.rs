@@ -23,6 +23,9 @@
 //!   `Archive` and `Early access`;
 //! - any zip, as one pack ("Any other zip").
 //!
+//! The offers follow that order, and the dialog opens on the first, except that the Kenney row
+//! comes first for a zip shaped as Kenney's (`opens_on_kenney`).
+//!
 //! The engine checks each default target against the library (`engine::Engine::scan`).
 
 use std::collections::BTreeMap;
@@ -403,7 +406,12 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
         offers.push(unreal);
     }
     if let Some(kenney) = kenney(&index, &zip, &name) {
-        offers.push(kenney);
+        let at = if opens_on_kenney(&zip) {
+            0
+        } else {
+            offers.len()
+        };
+        offers.insert(at, kenney);
     }
     let place = [PlaceStep::Flatten];
     let mut steps = vec![step("extract_zip", source(None, None))];
@@ -428,6 +436,12 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
     Ok(offers)
 }
 
+/// Whether `path` is a `.unitypackage` file.
+fn is_package(path: &str) -> bool {
+    path.rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && ext.eq_ignore_ascii_case("unitypackage"))
+}
+
 /// A zip holding `.unitypackage` files, at any depth: one pack, every package a variant, and so
 /// is each top folder of one whose name names a pipeline. A URP variant is ticked, else a lone
 /// one.
@@ -439,11 +453,7 @@ fn fab(original: &Path, zip: &Extraction, name: &str, publisher: &str) -> Option
         },
     ];
     let mut variants = Vec::new();
-    for package in zip.files.iter().filter(|f| {
-        f.path
-            .rsplit_once('.')
-            .is_some_and(|(stem, ext)| !stem.is_empty() && ext.eq_ignore_ascii_case("unitypackage"))
-    }) {
+    for package in zip.files.iter().filter(|f| is_package(&f.path)) {
         let in_zip = package.source_path[0].as_str();
         let file_name = package.path.rsplit('/').next().unwrap_or(&package.path);
         let listing = list_variant(original, in_zip, None);
@@ -596,12 +606,9 @@ fn unreal_preview(
 /// Categories whose packs are listed unticked.
 const UNTICKED: [&str; 2] = ["archive", "early access"];
 
-/// A zip whose folders hold `License*.txt` files: one pack per folder directly holding one, the
-/// outermost where they nest, at its path below a top folder every file shares (so
-/// `<Category>/<Pack>` in the Kenney All-in-1). `zip` is the whole zip's listing from `index`,
-/// and each pack's preview lists its folder from `index` as its build's `extract_zip` would,
-/// without reading the zip again.
-fn kenney(index: &ZipIndex, zip: &Extraction, name: &str) -> Option<Offer> {
+/// The folders directly holding a `License*.txt` file, sorted, the outermost where they nest.
+/// A file at the zip's root makes `""` the only one.
+fn license_folders(zip: &Extraction) -> Vec<&str> {
     let mut packs: Vec<&str> = zip
         .files
         .iter()
@@ -624,6 +631,36 @@ fn kenney(index: &ZipIndex, zip: &Extraction, name: &str) -> Option<Offer> {
             .iter()
             .any(|o| o != p && (o.is_empty() || below(p, o).is_some()))
     });
+    packs
+}
+
+/// Whether a zip matching `kenney` too is a bundle of licensed packs, some shipping a Unity
+/// package, rather than a Fab or an Unreal zip that happens to hold a license: no `.uproject`,
+/// every `.unitypackage` inside a license folder other than the root (`below` places nothing
+/// under `""`), and more license folders than `.unitypackage` files, so most packs have none.
+/// Reads names only.
+fn opens_on_kenney(zip: &Extraction) -> bool {
+    let folders = license_folders(zip);
+    let packages: Vec<&str> = zip
+        .files
+        .iter()
+        .map(|f| f.path.as_str())
+        .filter(|path| is_package(path))
+        .collect();
+    matches!(Project::find(zip), Ok(None))
+        && folders.len() > packages.len()
+        && packages
+            .iter()
+            .all(|p| folders.iter().any(|f| below(p, f).is_some()))
+}
+
+/// A zip whose folders hold `License*.txt` files: one pack per folder directly holding one, the
+/// outermost where they nest (`license_folders`), at its path below a top folder every file
+/// shares (so `<Category>/<Pack>` in the Kenney All-in-1). `zip` is the whole zip's listing from
+/// `index`, and each pack's preview lists its folder from `index` as its build's `extract_zip`
+/// would, without reading the zip again.
+fn kenney(index: &ZipIndex, zip: &Extraction, name: &str) -> Option<Offer> {
+    let packs = license_folders(zip);
     if packs.is_empty() {
         return None;
     }
@@ -1090,6 +1127,133 @@ mod tests {
         );
         let expected = built(|to| extract_zip(&original, to, None), &flatten(), false);
         assert_eq!(zip.tree.as_ref(), Some(&expected));
+    }
+
+    #[test]
+    fn only_a_zip_shaped_as_kenney_s_opens_on_kenney() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package = std::fs::read(fixture("synthetic.unitypackage")).unwrap();
+        let layouts_of = |entries: &[&str]| {
+            let path = tmp.path().join("original.zip");
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            for entry in entries {
+                zip.start_file(*entry, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                if entry.ends_with(".unitypackage") {
+                    std::io::Write::write_all(&mut zip, &package).unwrap();
+                }
+            }
+            zip.finish().unwrap();
+            let offers = detect(&path, "zip", "").unwrap();
+            layouts(&offers).join(" ")
+        };
+
+        for (shape, entries) in [
+            (
+                "a license at the root and one in a folder, the package at the root",
+                &["License.txt", "Docs/License.txt", "Pack.unitypackage"][..],
+            ),
+            (
+                "a license at the root and one in the package's folder",
+                &["License.txt", "URP/License.txt", "URP/Pack.unitypackage"],
+            ),
+            (
+                "wrapped in one licensed folder",
+                &["Pack/License.txt", "Pack/Pack.unitypackage"],
+            ),
+            (
+                "a wrapper's license over its variant's",
+                &[
+                    "Pack/License.txt",
+                    "Pack/URP/License.txt",
+                    "Pack/URP/Pack.unitypackage",
+                ],
+            ),
+            (
+                "two licensed variants",
+                &[
+                    "URP/License.txt",
+                    "URP/Pack.unitypackage",
+                    "HDRP/License.txt",
+                    "HDRP/Pack.unitypackage",
+                ],
+            ),
+            (
+                "a package outside the license folders",
+                &[
+                    "Kit A/License.txt",
+                    "Kit B/License.txt",
+                    "Kit C/License.txt",
+                    "Unity/Pack.unitypackage",
+                ],
+            ),
+            (
+                "one package inside a license folder and one outside",
+                &[
+                    "Kit A/License.txt",
+                    "Kit A/Unity/A.unitypackage",
+                    "Kit B/License.txt",
+                    "Kit C/License.txt",
+                    "Unity/Other.unitypackage",
+                ],
+            ),
+        ] {
+            assert_eq!(layouts_of(entries), "fab kenney zip", "{shape}");
+        }
+
+        // A project holds its plugins' licenses, and a package here keeps the other offers too.
+        assert_eq!(
+            layouts_of(&[
+                "Project/Project.uproject",
+                "Project/Content/A.uasset",
+                "Project/Plugins/One/License.txt",
+                "Project/Plugins/Two/License.txt",
+            ]),
+            "unreal kenney zip"
+        );
+        assert_eq!(
+            layouts_of(&[
+                "Project/Project.uproject",
+                "Project/Plugins/One/License.txt",
+                "Project/Plugins/Two/License.txt",
+                "Project/Plugins/Two/Pack.unitypackage",
+            ]),
+            "fab unreal kenney zip"
+        );
+        // Two projects are refused, not none.
+        assert_eq!(
+            layouts_of(&[
+                "One/One.uproject",
+                "Two/Two.uproject",
+                "Kit A/License.txt",
+                "Kit A/Pack.unitypackage",
+                "Kit B/License.txt",
+            ]),
+            "fab unreal kenney zip"
+        );
+
+        assert_eq!(
+            layouts_of(&[
+                "Kenney/2D assets/Tiles/License.txt",
+                "Kenney/2D assets/Tiles/Unity samples/Tiles.unitypackage",
+                "Kenney/3D assets/Car Kit/License.txt",
+                "Kenney/3D assets/Car Kit/Unity package/Car Kit.UnityPackage",
+                "Kenney/3D assets/Nature Kit/License.txt",
+                "Kenney/Archive/Old Kit/License.txt",
+            ]),
+            "kenney fab zip"
+        );
+        // One folder more than packages is enough.
+        assert_eq!(
+            layouts_of(&[
+                "Kit A/License.txt",
+                "Kit A/Unity/A.unitypackage",
+                "Kit B/License.txt",
+                "Kit B/Unity/B.unitypackage",
+                "Kit C/License.txt",
+            ]),
+            "kenney fab zip"
+        );
     }
 
     #[test]

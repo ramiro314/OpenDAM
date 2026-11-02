@@ -3,6 +3,7 @@ use crate::db::{make_relative_path, resolve_path, LibraryHandle};
 use crate::AppState;
 use anyhow::{anyhow, Result};
 use image::imageops::FilterType;
+use image::ImageError;
 use serde_json::json;
 use sqlx::{Pool, Sqlite};
 use std::ffi::OsString;
@@ -60,16 +61,22 @@ pub fn is_webview_displayable(ext: &str) -> bool {
     )
 }
 
-/// Writes `asset_id`'s thumbnail for `source` into `thumb_dir` and returns its file name, or
-/// `None` when the original is shown instead. Thumbnails are never upscaled: a source
-/// `THUMB_SIZE` px or smaller gets no thumbnail if the webview can display it, and otherwise
-/// (TGA, TIFF, HDR) a PNG at its own size. Larger sources are downsampled with Triangle (bilinear)
-/// filtering, 4x-8x faster than Lanczos3.
-pub fn generate_image_thumb(
-    source: &Path,
-    thumb_dir: &Path,
-    asset_id: &str,
-) -> Result<Option<String>> {
+/// What `generate_image_thumb` made of a raster.
+#[derive(Debug, PartialEq)]
+pub enum ImageThumb {
+    /// A thumbnail, by its file name in the thumbnail folder.
+    Written(String),
+    /// No thumbnail: the UI shows the original.
+    Original,
+    /// No preview at all, for this reason, because the raster is past the decoder's memory limit.
+    TooLarge(String),
+}
+
+/// Writes `asset_id`'s thumbnail for `source` into `thumb_dir`, if it gets one. Thumbnails are
+/// never upscaled: a source `THUMB_SIZE` px or smaller gets no thumbnail if the webview can
+/// display it, and otherwise (TGA, TIFF, HDR) a PNG at its own size. Larger sources are
+/// downsampled with Triangle (bilinear) filtering, 4x-8x faster than Lanczos3.
+pub fn generate_image_thumb(source: &Path, thumb_dir: &Path, asset_id: &str) -> Result<ImageThumb> {
     let ext = source
         .extension()
         .and_then(|s| s.to_str())
@@ -79,10 +86,18 @@ pub fn generate_image_thumb(
     let (width, height) = image::image_dimensions(source)?;
     let small = width.max(height) <= THUMB_SIZE;
     if small && is_webview_displayable(&ext) {
-        return Ok(None);
+        return Ok(ImageThumb::Original);
     }
 
-    let img = image::open(source)?;
+    // `open` reserves the decoded size against its limit before it reads a pixel.
+    let img = match image::open(source) {
+        Err(ImageError::Limits(_)) => {
+            return Ok(ImageThumb::TooLarge(format!(
+                "Too large to preview ({width} x {height} px)"
+            )))
+        }
+        img => img?,
+    };
     // Named by asset id: file names repeat across folders, asset ids don't.
     let (thumb, file_name) = if small {
         (img, format!("{}_thumb.png", asset_id))
@@ -114,7 +129,7 @@ pub fn generate_image_thumb(
     } else {
         thumb.save(&output)?;
     }
-    Ok(Some(file_name))
+    Ok(ImageThumb::Written(file_name))
 }
 
 /// Linear light as 8-bit RGB, as the worker's `.exr` branch does it: Reinhard, then gamma 2.2.
@@ -614,7 +629,7 @@ pub(crate) async fn complete_job(
     if let Some(ref model_path) = model_path {
         let rel_model = make_relative_path(root_path, Path::new(model_path));
         let _ = sqlx::query(
-            "UPDATE assets SET preview_status = ?, thumbnail_path = ?, metadata = json_set(coalesce(nullif(metadata, ''), '{}'), '$.preview_model', ?), preview_version = ?, preview_textures = ?, preview_revision = preview_revision + 1 WHERE id = ?"
+            "UPDATE assets SET preview_status = ?, thumbnail_path = ?, metadata = json_set(coalesce(nullif(metadata, ''), '{}'), '$.preview_model', ?), preview_version = ?, preview_textures = ?, preview_reason = NULL, preview_revision = preview_revision + 1 WHERE id = ?"
         )
         .bind(status)
         .bind(&rel_thumb)
@@ -626,7 +641,7 @@ pub(crate) async fn complete_job(
         .await;
     } else {
         let _ = sqlx::query(
-            "UPDATE assets SET preview_status = 'done', thumbnail_path = ?, preview_version = ?, preview_textures = ? WHERE id = ?",
+            "UPDATE assets SET preview_status = 'done', thumbnail_path = ?, preview_version = ?, preview_textures = ?, preview_reason = NULL WHERE id = ?",
         )
         .bind(&rel_thumb)
         .bind(report.version)
@@ -767,8 +782,8 @@ pub(crate) async fn remove_thumb_file(path: &Path) {
     }
 }
 
-/// A failed job: (job_id, asset_id)
-type FailedJob = (String, String);
+/// A failed job: (job_id, asset_id, why the asset stays without a preview, if it is known)
+type FailedJob = (String, String, Option<String>);
 
 async fn fail_job(pool: &Pool<Sqlite>, job_id: &str, asset_id: &str) {
     tracing::error!("Job {} failed", job_id);
@@ -776,18 +791,49 @@ async fn fail_job(pool: &Pool<Sqlite>, job_id: &str, asset_id: &str) {
         .bind(job_id)
         .execute(pool)
         .await;
-    let _ = sqlx::query("UPDATE assets SET preview_status = 'error' WHERE id = ?")
-        .bind(asset_id)
-        .execute(pool)
-        .await;
+    let _ = sqlx::query(
+        "UPDATE assets SET preview_status = 'error', preview_reason = NULL WHERE id = ?",
+    )
+    .bind(asset_id)
+    .execute(pool)
+    .await;
 }
 
-fn emit_error(state: &AppState, (job_id, asset_id): &FailedJob) {
+/// Ends a job whose file stays without a preview for `reason`, clearing any thumbnail it had, as
+/// a job does for a source with none. `error` keeps the asset off the queue, since the structure
+/// pass requeues every `none`, until the file changes or you ask again. `reason` goes in
+/// `preview_reason`, outside the searched `metadata`.
+async fn refuse_job(
+    pool: &Pool<Sqlite>,
+    root_path: &Path,
+    job_id: &str,
+    asset_id: &str,
+    reason: String,
+) -> FailedJob {
+    tracing::warn!("Job {} ended without a preview: {}", job_id, reason);
+    let _ = sqlx::query("UPDATE preview_jobs SET status = 'error', error_message = ? WHERE id = ?")
+        .bind(&reason)
+        .bind(job_id)
+        .execute(pool)
+        .await;
+    delete_replaced_thumb(pool, root_path, asset_id, None).await;
+    let _ = sqlx::query(
+        "UPDATE assets SET preview_status = 'error', thumbnail_path = NULL, preview_reason = ? WHERE id = ?",
+    )
+    .bind(&reason)
+    .bind(asset_id)
+    .execute(pool)
+    .await;
+    (job_id.to_string(), asset_id.to_string(), Some(reason))
+}
+
+fn emit_error(state: &AppState, (job_id, asset_id, reason): &FailedJob) {
     let _ = state.app_handle.emit(
         "preview:error",
         json!({
             "assetId": asset_id,
             "jobId": job_id,
+            "reason": reason,
         }),
     );
 }
@@ -803,10 +849,13 @@ async fn run_image_queue(state: Arc<AppState>) {
         let mut processed_any = false;
 
         for lib in state.db.get_all_libraries().await {
-            let (claimed, done) = process_image_jobs(&lib, parallelism).await;
+            let (claimed, done, refused) = process_image_jobs(&lib, parallelism).await;
             processed_any |= claimed;
             for d in &done {
                 emit_done(&state, d);
+            }
+            for r in &refused {
+                emit_error(&state, r);
             }
         }
 
@@ -816,12 +865,12 @@ async fn run_image_queue(state: Arc<AppState>) {
     }
 }
 
-/// Claims and runs one round of `lib`'s image jobs. Returns whether any job was claimed, and the
-/// jobs that finished, for `preview:done`.
+/// Claims and runs one round of `lib`'s image jobs. Returns whether any job was claimed, the
+/// jobs that finished, for `preview:done`, and the ones `refuse_job` ended, for `preview:error`.
 pub(crate) async fn process_image_jobs(
     lib: &LibraryHandle,
     parallelism: usize,
-) -> (bool, Vec<PreviewDone>) {
+) -> (bool, Vec<PreviewDone>, Vec<FailedJob>) {
     let filter = format!(
         "p.status IN ('queued', 'pending') AND lower(coalesce(a.extension, '')) IN {}",
         NATIVE_EXTS_SQL
@@ -856,10 +905,18 @@ pub(crate) async fn process_image_jobs(
     }
 
     let mut done = Vec::new();
+    let mut refused = Vec::new();
     for (job_id, asset_id, res) in results {
         match res {
-            Ok(thumb_file_name) => {
-                let rel_thumb = thumb_file_name.map(|f| format!(".opendam/thumbs/{}", f));
+            Ok(ImageThumb::TooLarge(reason)) => {
+                refused
+                    .push(refuse_job(&lib.pool, &lib.root_path, &job_id, &asset_id, reason).await);
+            }
+            Ok(thumb) => {
+                let rel_thumb = match thumb {
+                    ImageThumb::Written(file) => Some(format!(".opendam/thumbs/{file}")),
+                    _ => None,
+                };
                 done.push(
                     complete_job(
                         &lib.pool,
@@ -885,7 +942,7 @@ pub(crate) async fn process_image_jobs(
             }
         }
     }
-    (claimed, done)
+    (claimed, done, refused)
 }
 
 /// How long a new worker process has to answer `engine_info`.
@@ -1212,7 +1269,7 @@ async fn python_queue_round(
                 finished(Ok(done));
             } else {
                 fail_job(pool, &job_id, &asset_id).await;
-                finished(Err((job_id, asset_id)));
+                finished(Err((job_id, asset_id, None)));
             }
 
             // Yield execution between items to allow other async runtime tasks to progress
@@ -1337,9 +1394,9 @@ mod tests {
         write_image(&source, 64, 32);
         let thumbs = dir.path().join("thumbs");
 
-        let name = generate_image_thumb(&source, &thumbs, "a1").unwrap();
+        let thumb = generate_image_thumb(&source, &thumbs, "a1").unwrap();
 
-        assert_eq!(name, None);
+        assert_eq!(thumb, ImageThumb::Original);
         assert!(!thumbs.exists());
     }
 
@@ -1350,9 +1407,9 @@ mod tests {
         write_image(&source, 48, 20);
         let thumbs = dir.path().join("thumbs");
 
-        let name = generate_image_thumb(&source, &thumbs, "a1").unwrap();
+        let thumb = generate_image_thumb(&source, &thumbs, "a1").unwrap();
 
-        assert_eq!(name.as_deref(), Some("a1_thumb.png"));
+        assert_eq!(thumb, ImageThumb::Written("a1_thumb.png".into()));
         assert_eq!(
             image::image_dimensions(thumbs.join("a1_thumb.png")).unwrap(),
             (48, 20)
@@ -1366,9 +1423,9 @@ mod tests {
         write_image(&source, 1024, 40);
         let thumbs = dir.path().join("thumbs");
 
-        let name = generate_image_thumb(&source, &thumbs, "a1").unwrap();
+        let thumb = generate_image_thumb(&source, &thumbs, "a1").unwrap();
 
-        assert_eq!(name.as_deref(), Some("a1_thumb.png"));
+        assert_eq!(thumb, ImageThumb::Written("a1_thumb.png".into()));
         assert_eq!(
             image::image_dimensions(thumbs.join("a1_thumb.png")).unwrap(),
             (512, 20)
@@ -1384,10 +1441,13 @@ mod tests {
         write_image(&tif, 512, 100);
         let thumbs = dir.path().join("thumbs");
 
-        assert_eq!(generate_image_thumb(&png, &thumbs, "p").unwrap(), None);
         assert_eq!(
-            generate_image_thumb(&tif, &thumbs, "t").unwrap().as_deref(),
-            Some("t_thumb.png")
+            generate_image_thumb(&png, &thumbs, "p").unwrap(),
+            ImageThumb::Original
+        );
+        assert_eq!(
+            generate_image_thumb(&tif, &thumbs, "t").unwrap(),
+            ImageThumb::Written("t_thumb.png".into())
         );
         assert_eq!(
             image::image_dimensions(thumbs.join("t_thumb.png")).unwrap(),
@@ -1412,8 +1472,8 @@ mod tests {
         write_hdr(&source, 4, 2, &[0.0, 0.1, 1.0, 3.0]);
         let thumbs = dir.path().join("thumbs");
 
-        let name = generate_image_thumb(&source, &thumbs, "a1").unwrap();
-        assert_eq!(name.as_deref(), Some("a1_thumb.png"));
+        let thumb = generate_image_thumb(&source, &thumbs, "a1").unwrap();
+        assert_eq!(thumb, ImageThumb::Written("a1_thumb.png".into()));
 
         let thumb = image::open(thumbs.join("a1_thumb.png")).unwrap().to_rgb8();
         assert_eq!(thumb.dimensions(), (4, 2));
@@ -1429,8 +1489,8 @@ mod tests {
         write_hdr(&source, 1024, 32, &[1.0]);
         let thumbs = dir.path().join("thumbs");
 
-        let name = generate_image_thumb(&source, &thumbs, "a1").unwrap();
-        assert_eq!(name.as_deref(), Some("a1_thumb.jpg"));
+        let thumb = generate_image_thumb(&source, &thumbs, "a1").unwrap();
+        assert_eq!(thumb, ImageThumb::Written("a1_thumb.jpg".into()));
 
         let thumb = image::open(thumbs.join("a1_thumb.jpg")).unwrap().to_rgb8();
         assert_eq!(thumb.dimensions(), (512, 16));
@@ -1463,7 +1523,7 @@ mod tests {
         write_truncated_hdr(&root.join("hdri/sky.HDR"));
         let lib = library_with_pending_job(root, "hdri/sky.HDR", "").await;
 
-        let (claimed, done) = process_image_jobs(&lib, 2).await;
+        let (claimed, done, _) = process_image_jobs(&lib, 2).await;
 
         assert!(claimed);
         assert!(done.is_empty());
@@ -1475,7 +1535,7 @@ mod tests {
         assert!(!root.join(".opendam/thumbs").exists());
 
         // The image queue doesn't claim it again.
-        let (claimed, _) = process_image_jobs(&lib, 2).await;
+        let (claimed, ..) = process_image_jobs(&lib, 2).await;
         assert!(!claimed);
     }
 
@@ -1492,7 +1552,7 @@ mod tests {
         write_hdr(&root.join("hdri/sky.HDR"), 8, 4, &[1.0]);
         let lib = library_with_pending_job(root, "hdri/sky.HDR", "").await;
 
-        let (claimed, done) = process_image_jobs(&lib, 2).await;
+        let (claimed, done, _) = process_image_jobs(&lib, 2).await;
 
         assert!(claimed);
         assert_eq!(done.len(), 1);
@@ -1552,6 +1612,144 @@ mod tests {
             .await
             .unwrap();
         (thumb, status, job)
+    }
+
+    /// A PNG whose header claims 29027 x 29027 RGB and which has no pixels: only the header can
+    /// be read, so any attempt to decode it fails some other way.
+    const HEADER_PAST_THE_LIMIT: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x71, 0x63, 0x00, 0x00, 0x71, 0x63, 0x08, 0x02, 0x00, 0x00, 0x00, 0x75,
+        0xea, 0x7f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x49, 0x44, 0x41, 0x54, 0x35, 0xaf, 0x06, 0x1e,
+        0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    const TOO_LARGE: &str = "Too large to preview (29027 x 29027 px)";
+    /// A PNG whose header claims 1024 x 1024 RGB, under the limit and past `THUMB_SIZE`, and which
+    /// has no pixels, so its decode fails for a reason other than its size.
+    const HEADER_WITH_NO_PIXELS: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x08, 0x02, 0x00, 0x00, 0x00, 0xf0,
+        0x7f, 0xbc, 0xd4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x44, 0x41, 0x54, 0x35, 0xaf, 0x06, 0x1e,
+        0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn raster_past_the_decoders_limit_is_refused_from_its_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("huge.png");
+        std::fs::write(&source, HEADER_PAST_THE_LIMIT).unwrap();
+        let thumbs = dir.path().join("thumbs");
+
+        let thumb = generate_image_thumb(&source, &thumbs, "a1").unwrap();
+
+        assert_eq!(thumb, ImageThumb::TooLarge(TOO_LARGE.into()));
+        assert!(!thumbs.exists());
+    }
+
+    #[tokio::test]
+    async fn a_decode_failure_under_the_limit_is_not_called_too_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let source = root.join("broken.png");
+        std::fs::write(&source, HEADER_WITH_NO_PIXELS).unwrap();
+        let thumbs = root.join(".opendam/thumbs");
+
+        assert!(generate_image_thumb(&source, &thumbs, "a1").is_err());
+
+        let lib = library_with_pending_job(root, "broken.png", ".opendam/thumbs/none.png").await;
+        let (_, done, refused) = process_image_jobs(&lib, 2).await;
+
+        assert!(done.is_empty());
+        assert!(refused.is_empty());
+        // The Python queue gets its try, and the asset keeps today's message and Retry.
+        let job: String = sqlx::query_scalar("SELECT status FROM preview_jobs WHERE id = 'j1'")
+            .fetch_one(&lib.pool)
+            .await
+            .unwrap();
+        assert_eq!(job, "fallback");
+        let reason: Option<String> = sqlx::query_scalar("SELECT preview_reason FROM assets")
+            .fetch_one(&lib.pool)
+            .await
+            .unwrap();
+        assert_eq!(reason, None);
+    }
+
+    #[tokio::test]
+    async fn job_for_a_raster_past_the_limit_stores_its_reason_and_clears_its_old_thumbnail() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let old_thumb = root.join(".opendam/thumbs/a1_thumb.png");
+        write_image(&old_thumb, 16, 16);
+        std::fs::create_dir_all(root.join("textures")).unwrap();
+        std::fs::write(root.join("textures/huge.png"), HEADER_PAST_THE_LIMIT).unwrap();
+        let lib =
+            library_with_pending_job(root, "textures/huge.png", ".opendam/thumbs/a1_thumb.png")
+                .await;
+
+        let (claimed, done, refused) = process_image_jobs(&lib, 2).await;
+
+        assert!(claimed);
+        assert!(done.is_empty());
+        assert_eq!(
+            refused,
+            [(
+                "j1".to_string(),
+                "a1".to_string(),
+                Some(TOO_LARGE.to_string())
+            )]
+        );
+        assert!(!old_thumb.exists());
+        assert_eq!(
+            job_outcome(&lib.pool).await,
+            (None, "error".into(), "error".into())
+        );
+        let (reason, metadata): (Option<String>, String) =
+            sqlx::query_as("SELECT preview_reason, metadata FROM assets WHERE id = 'a1'")
+                .fetch_one(&lib.pool)
+                .await
+                .unwrap();
+        assert_eq!(reason.as_deref(), Some(TOO_LARGE));
+        assert_eq!(metadata, "{}");
+        // The job is over: nothing is left for a queue to claim, here or as a Python fallback.
+        let waiting = assets_waiting_for_jobs(&lib.pool).await.unwrap();
+        assert!(waiting.is_empty());
+        assert!(!process_image_jobs(&lib, 2).await.0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_raster_stays_off_the_queue_after_a_structure_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("huge.png"), HEADER_PAST_THE_LIMIT).unwrap();
+        let lib = library_with_pending_job(root, "huge.png", ".opendam/thumbs/none.png").await;
+        process_image_jobs(&lib, 2).await;
+
+        crate::structure::rebuild(&lib.pool, root).await.unwrap();
+
+        assert_eq!(
+            job_outcome(&lib.pool).await,
+            (None, "error".into(), "error".into())
+        );
+        assert!(assets_waiting_for_jobs(&lib.pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_raster_that_shrank_loses_its_reason_when_its_preview_is_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_image(&root.join("rock.png"), 256, 256);
+        let lib = library_with_pending_job(root, "rock.png", ".opendam/thumbs/none.png").await;
+        sqlx::query("UPDATE assets SET preview_reason = 'Too large to preview'")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+
+        process_image_jobs(&lib, 2).await;
+
+        let reason: Option<String> = sqlx::query_scalar("SELECT preview_reason FROM assets")
+            .fetch_one(&lib.pool)
+            .await
+            .unwrap();
+        assert_eq!(reason, None);
     }
 
     /// A library at `/lib` holding `folders` rows, each `(path, is_pack)`.
@@ -1812,7 +2010,7 @@ mod tests {
             library_with_pending_job(root, "textures/rock.png", ".opendam/thumbs/a1_thumb.png")
                 .await;
 
-        let (claimed, done) = process_image_jobs(&lib, 2).await;
+        let (claimed, done, _) = process_image_jobs(&lib, 2).await;
 
         assert!(claimed);
         assert_eq!(done.len(), 1);
@@ -1842,7 +2040,7 @@ mod tests {
             library_with_pending_job(root, "textures/rock.png", ".opendam/thumbs/a1_thumb.png")
                 .await;
 
-        let (_, done) = process_image_jobs(&lib, 2).await;
+        let (_, done, _) = process_image_jobs(&lib, 2).await;
 
         assert_eq!(
             done[0].thumb_path.as_deref(),
@@ -2459,6 +2657,30 @@ done
     }
 
     #[tokio::test]
+    async fn a_failed_job_clears_a_stale_preview_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = stub_engine(dir.path(), ANSWER_2, "exit 1");
+        let lib = library_with_pending_job(dir.path(), "models/ship.fbx", "").await;
+        sqlx::query("UPDATE assets SET preview_reason = 'Too large to preview'")
+            .execute(&lib.pool)
+            .await
+            .unwrap();
+
+        let outcomes = queue_round(&mut engine, std::slice::from_ref(&lib)).await;
+
+        assert!(
+            matches!(&outcomes[..], [Err((_, _, None))]),
+            "the job fails with no reason: {outcomes:?}"
+        );
+        let (status, reason): (String, Option<String>) =
+            sqlx::query_as("SELECT preview_status, preview_reason FROM assets WHERE id = 'a1'")
+                .fetch_one(&lib.pool)
+                .await
+                .unwrap();
+        assert_eq!((status.as_str(), reason), ("error", None));
+    }
+
+    #[tokio::test]
     async fn a_job_that_kills_the_worker_unpublishes_and_a_new_one_starts_at_once() {
         let dir = tempfile::tempdir().unwrap();
         // Every process exits on its job, as a crash does
@@ -2467,7 +2689,7 @@ done
 
         let outcomes = queue_round(&mut engine, std::slice::from_ref(&lib)).await;
         assert!(
-            matches!(&outcomes[..], [Err((job, asset))] if job == "j1" && asset == "a1"),
+            matches!(&outcomes[..], [Err((job, asset, None))] if job == "j1" && asset == "a1"),
             "the job fails: {outcomes:?}"
         );
         let (_, status, job) = job_outcome(&lib.pool).await;
