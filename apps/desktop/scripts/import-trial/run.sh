@@ -50,10 +50,19 @@ if [[ ! -x $binary ]]; then
   echo "No debug binary at $binary. Run cargo build in apps/desktop/src-tauri first." >&2
   exit 1
 fi
+frontend=()
+if [[ -n ${TRIAL_UI:-} ]]; then
+  frontend=("$TRIAL_REPO/apps/desktop/dist")
+  if [[ ! -f ${frontend[0]}/index.html ]]; then
+    echo "No built frontend at ${frontend[0]}. Run bun run vite:build in apps/desktop first." >&2
+    exit 1
+  fi
+fi
 mkdir -p "$1"
 export TRIAL_DIR
 TRIAL_DIR=$(realpath "$1")
-# Only this script writes h/trial, so no other folder passes for one of its profiles.
+# Only this script writes h/trial, and only once the profile's libraries are in, so no other
+# folder passes for one of its profiles, and one whose setup failed is refused, not half reopened.
 reopening=
 if [[ -n $(ls -A "$TRIAL_DIR") ]]; then
   if [[ $stage == run || ! -e $TRIAL_DIR/h/trial ]]; then
@@ -75,16 +84,7 @@ if [[ -n $(ls -A "$TRIAL_DIR") ]]; then
   reopening=1
 fi
 mkdir -p "$TRIAL_DIR"/{data,cache,h,libs/Unity,libs/Fab,libs/Kenney}
-touch "$TRIAL_DIR/h/trial"
 
-frontend=()
-if [[ -n ${TRIAL_UI:-} ]]; then
-  frontend=("$TRIAL_REPO/apps/desktop/dist")
-  if [[ ! -f ${frontend[0]}/index.html ]]; then
-    echo "No built frontend at ${frontend[0]}. Run bun run vite:build in apps/desktop first." >&2
-    exit 1
-  fi
-fi
 python3 -I "$here/server.py" "$TRIAL_DIR" "${frontend[@]}" >"$TRIAL_DIR/h/server.log" 2>&1 &
 server=$!
 trap 'kill "$server"' EXIT
@@ -115,6 +115,7 @@ if [[ -z $reopening ]]; then
     ('unity', 'Unity', '[\"$TRIAL_DIR/libs/Unity\"]', 0),
     ('fab', 'Fab', '[\"$TRIAL_DIR/libs/Fab\"]', 0),
     ('kenney', 'Kenney', '[\"$TRIAL_DIR/libs/Kenney\"]', 0);"
+  touch "$TRIAL_DIR/h/trial"
 fi
 
 cp "$packs" "$TRIAL_DIR/h/packs.json"

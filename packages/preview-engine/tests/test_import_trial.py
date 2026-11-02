@@ -14,6 +14,8 @@ import pytest
 RUN = Path(__file__).resolve().parents[3] / "apps/desktop/scripts/import-trial/run.sh"
 REFUSED = "A trial only runs in a new folder."
 PAST_THE_CHECK = "The server couldn't start."
+# A server that stays up, for a run that goes on to its first launch.
+LASTING_SERVER = "#!/bin/sh\nexec sleep 30\n"
 
 
 def executable(path: Path, text: str = "#!/bin/sh\nexit 0\n") -> None:
@@ -23,11 +25,15 @@ def executable(path: Path, text: str = "#!/bin/sh\nexit 0\n") -> None:
 
 
 def run_trial(
-    tmp_path: Path, folder: Path, stage: str | None = None
+    tmp_path: Path,
+    folder: Path,
+    stage: str | None = None,
+    ui: bool = False,
+    server: str = "#!/bin/sh\nexit 0\n",
 ) -> subprocess.CompletedProcess:
     repo = tmp_path / "repo"
     executable(repo / "apps/desktop/src-tauri/target/debug/opendam-desktop")
-    executable(tmp_path / "bin/python3")
+    executable(tmp_path / "bin/python3", server)
     env = os.environ | {
         "TRIAL_REPO": str(repo),
         "PATH": f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}",
@@ -36,6 +42,9 @@ def run_trial(
     env.pop("TRIAL_STAGE", None)
     if stage:
         env["TRIAL_STAGE"] = stage
+    env.pop("TRIAL_UI", None)
+    if ui:
+        env["TRIAL_UI"] = "1"
     return subprocess.run([RUN, folder], env=env, capture_output=True, text=True, timeout=30)
 
 
@@ -130,3 +139,43 @@ def test_the_default_stage_never_reopens_a_profile(tmp_path):
 
     assert result.returncode == 1
     assert REFUSED in result.stderr
+
+
+def test_a_missing_frontend_stops_before_the_folder_is_touched(tmp_path):
+    folder = tmp_path / "trial"
+
+    result = run_trial(tmp_path, folder, ui=True)
+
+    assert result.returncode == 1
+    assert "No built frontend" in result.stderr
+    assert not folder.exists()
+
+
+def test_a_profile_whose_first_launch_failed_is_refused_not_reopened(tmp_path):
+    folder = tmp_path / "trial"
+    executable(tmp_path / "bin/dbus-run-session")
+
+    first = run_trial(tmp_path, folder, stage="packs", server=LASTING_SERVER)
+
+    assert first.returncode == 1
+    assert "made no master DB" in first.stderr
+    assert not (folder / "h/trial").exists()
+
+    second = run_trial(tmp_path, folder, stage="packs")
+
+    assert second.returncode == 1
+    assert REFUSED in second.stderr
+
+
+def test_a_set_up_profile_is_marked_as_one(tmp_path):
+    folder = tmp_path / "trial"
+    master = folder / "data/com.opendam.desktop"
+    executable(
+        tmp_path / "bin/dbus-run-session",
+        f'#!/bin/sh\nmkdir -p "{master}"\n: > "{master}/opendam.sqlite"\n',
+    )
+    executable(tmp_path / "bin/sqlite3")
+
+    run_trial(tmp_path, folder, stage="packs", server=LASTING_SERVER)
+
+    assert (folder / "h/trial").exists()
