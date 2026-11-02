@@ -4,10 +4,11 @@
 
 Each `tree` line of h/log-<stage>.jsonl gives a ticked pack's target and the dialog's tree. A row
 adds that pack's latest run, its manifest and the files in its folder, and fails when the run
-isn't `done` with no error, the pack isn't built, or its files don't match: the tree's count (an
-Unreal tree's is only an estimate, so there its GLBs must be above 0 and at most the estimate),
-the manifest's and the folder's. A tree counts the GLBs a conversion writes apart from its files. Failed models are read from the run's warnings. The exit status
-is 1 when a row fails, or when the log shows a dialog that didn't start.
+isn't `done` with no error, the pack isn't built, or its files don't match: the tree's count, in
+which a conversion's GLBs are apart from its files (an Unreal tree's is only an estimate, so there
+its GLBs must be above 0 and at most the estimate), the manifest's and the folder's. A run's
+warnings are counted, as they name a model that failed. The exit status is 1 when a row fails, or
+when the log shows a dialog that didn't start.
 """
 
 import argparse
