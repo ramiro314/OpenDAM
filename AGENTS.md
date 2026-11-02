@@ -484,9 +484,11 @@ docs/plans                    Plans for this fork
     gives every member the union of the group's tags and collections and the main item's fields
     and export edits (`apply_unions`). An image's export `assetName` also reaches every source
     of its texture set (`export::edits::write`).
-  - Delete and rename reach every member and the bundled preview, unless another item shows the
-    same render (`item_files` in `commands/asset.rs`). A rename gives them all the new stem, each
-    keeping its own `_LOD<n>` in a group with levels, refuses before anything moves when a name
+  - Delete and rename reach every member and every render of the item, its bundled preview
+    included, unless another item has the same render (`item_files` in `commands/asset.rs`). An
+    item records one render, so its others are found by name and the render rule
+    (`structure::renders`). A rename gives them all the new stem, each render and, in a group
+    with levels, each member keeping its own `_LOD<n>`, refuses before anything moves when a name
     is taken, and puts files back if a step fails.
   - The preview queue skips members other than the main item, and their thumbnails stay on disk.
     An index run queues no new file itself: the pass it ends with queues every file but those

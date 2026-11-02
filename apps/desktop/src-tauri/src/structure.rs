@@ -793,13 +793,12 @@ fn model_previews(
         if dir.is_empty() || !RENDER_FOLDERS.contains(&folder.to_ascii_lowercase().as_str()) {
             continue;
         }
-        let below = format!("{parent}/");
         let rendered: Vec<usize> = models
             .get(kind.model_stem())
             .into_iter()
             .flatten()
             .copied()
-            .filter(|&m| parent.is_empty() || paths[m].starts_with(&below))
+            .filter(|&m| reaches(parent, paths[m]))
             .collect();
         if !rendered.is_empty() {
             roles[i] = Some(SupportRole::ModelPreview);
@@ -807,6 +806,25 @@ fn model_previews(
         }
     }
     renders
+}
+
+/// Whether a render in a folder below `parent` can render the model at `model`: the model is
+/// below `parent` too, on whole path components, or `parent` is the library root.
+fn reaches(parent: &str, model: &str) -> bool {
+    parent.is_empty()
+        || model
+            .strip_prefix(parent)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether the file at `render`, which `model_previews` found to be a render, renders the file at
+/// `model`, by its rule: a model below its folder's parent, with its stem.
+pub fn renders(render: &str, model: &str) -> bool {
+    let (dir, name) = split_dir(render);
+    let kind = FileKind::of(split_dir(model).1);
+    kind.is_model
+        && FileKind::of(name).model_stem() == kind.model_stem()
+        && reaches(split_dir(dir).0, model)
 }
 
 /// `Structure::bundled_previews` for `renders` as `model_previews` returns them: each rendered
