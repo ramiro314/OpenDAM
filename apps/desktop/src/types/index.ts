@@ -229,14 +229,21 @@ export interface PackRef extends FolderRef {
   name: string;
 }
 
-/** A pack's cover image, shown as a grid tile shows an asset (`tileMedia`) */
+/** A pack's cover image or model, shown as a grid tile shows an asset (`tileMedia`) */
 export interface Cover {
+  assetId: string;
   /** Absolute */
   filePath: string;
-  /** Absolute, when the image has a thumbnail */
+  /** Absolute, the thumbnail it shows, which may be a stand-in member's */
   thumbnailPath?: string | null;
   extension: string;
   kind: AssetKind;
+  /** Absolute, as an asset's `bundledPreview` */
+  bundledPreview?: string | null;
+  /** Absolute, as an asset's `fallbackRender` */
+  fallbackRender?: string | null;
+  /** The other files of a group whose main item has no thumbnail, which can stand in for it */
+  memberIds: string[];
 }
 
 /** One card of the Packs view (`get_packs`) */

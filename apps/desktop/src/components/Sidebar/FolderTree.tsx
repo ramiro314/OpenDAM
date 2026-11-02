@@ -3,7 +3,7 @@ import clsx from 'clsx';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { useAssetStore, useFolderTreeStore, useLiveCountsStore } from '../../store';
 import type { Cover, FolderNode } from '../../types';
-import { tileMedia } from '../AssetGrid/tileState';
+import { coverAsset, tileImage, tileMedia } from '../AssetGrid/tileState';
 import { IconChevronDown, IconChevronRight, IconFolder, IconPackage } from '../Icons';
 import { folderCount, isFolderShown } from './sidebarHelpers';
 import styles from './Sidebar.module.css';
@@ -113,11 +113,8 @@ export function FolderTree({ libraryId, parentPath, onSelect, onMenu }: FolderTr
 /** A pack node's cover as a small tile, or the pack icon when it has none or it fails to load. */
 function PackIcon({ cover }: { cover?: Cover | null }) {
   const [failed, setFailed] = useState<string | null>(null);
-  const media = cover
-    ? tileMedia({ ...cover, thumbnailPath: cover.thumbnailPath ?? undefined })
-    : 'none';
-  const src =
-    media === 'thumbnail' ? cover?.thumbnailPath : media === 'original' ? cover?.filePath : null;
+  const asset = cover && coverAsset(cover);
+  const src = asset && tileImage(asset, tileMedia(asset));
   if (!src || failed === src) return <IconPackage size={13} className={styles.packIcon} />;
   return (
     <img

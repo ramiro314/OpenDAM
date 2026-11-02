@@ -20,7 +20,6 @@ import type {
   AssetKind,
   ColorLabel,
   Collection,
-  Cover,
   ExportEditPatch,
   GameDetail,
   GroupMember,
@@ -47,6 +46,7 @@ import {
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
 import { api } from '../../api';
 import { imageOf } from '../../utils/media';
+import { coverImage } from '../AssetGrid/tileState';
 import { formatSize, itemFileCount } from '../../utils/format';
 import { useImageScaling } from '../../hooks/useImageScaling';
 import { useBrowseView } from '../../hooks/useBrowseView';
@@ -442,10 +442,6 @@ export function DetailPanel() {
 }
 
 // ── Pack ──────────────────────────────────────────────────────────────────
-/** The image that stands for a cover, as `imageOf` picks it for an asset. */
-const coverImage = (cover: Cover) =>
-  imageOf({ ...cover, thumbnailPath: cover.thumbnailPath ?? undefined });
-
 /**
  * A pack's details (plan C18, plan pack-metadata-files C12): its cover, or the gallery image
  * clicked, its name, its gallery of `Preview*` and `Sample*` images, its version, publisher and

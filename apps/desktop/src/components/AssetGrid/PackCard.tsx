@@ -1,10 +1,10 @@
 import { memo, useEffect, useState } from 'react';
 import clsx from 'clsx';
 import { convertFileSrc } from '@tauri-apps/api/core';
-import type { Cover, PackCard as Pack } from '../../types';
+import type { PackCard as Pack } from '../../types';
 import { useImageScaling } from '../../hooks/useImageScaling';
 import { IconPackage } from '../Icons';
-import { tileMedia, tileState, type TileMedia } from './tileState';
+import { coverAsset, tileImage, tileMedia, tileState, type TileMedia } from './tileState';
 import styles from './PackCard.module.css';
 
 export interface PackCardProps {
@@ -18,12 +18,6 @@ export interface PackCardProps {
   onOpen: (pack: Pack) => void;
   onMenu: (e: React.MouseEvent, pack: Pack) => void;
 }
-
-/** A cover as the asset it is, for `tileMedia`. */
-const coverAsset = (cover: Cover) => ({
-  ...cover,
-  thumbnailPath: cover.thumbnailPath ?? undefined,
-});
 
 /**
  * One pack: its cover, name and parent folder, and its visible items, or "No visible items" when
@@ -46,11 +40,10 @@ export const PackCard = memo(function PackCard({
   useEffect(() => {
     setFailed(undefined);
     setLoaded(false);
-  }, [cover?.thumbnailPath, cover?.filePath]);
+  }, [cover?.bundledPreview, cover?.fallbackRender, cover?.thumbnailPath, cover?.filePath]);
 
   const media = cover ? tileMedia(cover, { failed }) : 'none';
-  const src =
-    media === 'thumbnail' ? cover?.thumbnailPath : media === 'original' ? cover?.filePath : null;
+  const src = cover && tileImage(cover, media);
   const items = pack.itemCount;
 
   return (
