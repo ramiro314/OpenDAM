@@ -1,6 +1,6 @@
 """Compares a gate's 11 packs with the plan's own tables, read-only.
 
-    python3 -I gate_plan_check.py <manifest> [<plan> <floors> <pack map>]
+    python3 -I gate_plan_check.py <manifest> [<plan> <floors>]
 
 Prints the plan's Target column beside floors.tsv and the measured counts, then each leftover GLB
 of each pack with the plan's reason for it, by the leftover table in "Piece 1 result", matching a
@@ -128,6 +128,9 @@ def stated_counts(cell: str) -> dict[str, int]:
 
 def main() -> int:
     args = [Path(arg) for arg in sys.argv[1:]]
+    if not 1 <= len(args) <= 3:
+        print(f"usage: {sys.argv[0]} <manifest> [<plan> <floors>]", file=sys.stderr)
+        return 2
     manifest = args[0]
     plan = args[1] if len(args) > 1 else PLAN_DIR / "plan.md"
     floors_file = args[2] if len(args) > 2 else PLAN_DIR / "floors.tsv"

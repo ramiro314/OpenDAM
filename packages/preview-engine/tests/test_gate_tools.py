@@ -137,6 +137,18 @@ def test_an_unfinished_run_fails_its_row_and_prints_the_stage(tmp_path):
     assert PACK in result.stdout
 
 
+def test_the_plan_check_takes_no_argument_it_would_ignore(tmp_path):
+    script = SCRIPTS / "gate_plan_check.py"
+    extra = ["manifest", "plan", "floors", "pack-map"]
+
+    result = subprocess.run(
+        [sys.executable, "-I", script, *extra], capture_output=True, text=True, timeout=30
+    )
+
+    assert result.returncode == 2
+    assert "usage:" in result.stderr
+
+
 def fake_journal(tmp_path: Path, oldest: int, user: str = "", kernel: str = "") -> dict:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
