@@ -7,7 +7,9 @@ use uuid::Uuid;
 
 use crate::db::resolve_path;
 use crate::models::PreviewJob;
-use crate::preview::{models_awaiting_render, save_model_render, AWAITING_RENDER};
+use crate::preview::{
+    fail_model_render, models_awaiting_render, save_model_render, AWAITING_RENDER,
+};
 use crate::AppState;
 
 type Result<T> = std::result::Result<T, String>;
@@ -147,6 +149,26 @@ pub async fn save_model_thumbnail(
         return Ok(resolve_path(&lib.root_path, &rel_thumb));
     }
     Err(format!("asset {} not found", asset_id))
+}
+
+/// Reports that the frontend can't render asset `asset_id`'s preview GLB. Returns whether that
+/// moved the asset to `error`, where Regenerate can retry it.
+#[tauri::command]
+pub async fn fail_model_thumbnail(
+    asset_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool> {
+    let Some(lib) = state
+        .db
+        .library_of_asset(&asset_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(false);
+    };
+    fail_model_render(&lib.pool, &asset_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Preview queue totals across all libraries, for the status bar.

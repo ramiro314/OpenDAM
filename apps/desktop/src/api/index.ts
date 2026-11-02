@@ -151,6 +151,8 @@ export const api = {
   /** Sends the PNG as a raw body; returns the saved thumbnail's path. */
   saveModelThumbnail: (assetId: string, png: Uint8Array) =>
     invoke<string>('save_model_thumbnail', png, { headers: { 'asset-id': assetId } }),
+  /** Reports a render that failed; returns whether the asset moved to `error`. */
+  failModelThumbnail: (assetId: string) => invoke<boolean>('fail_model_thumbnail', { assetId }),
 
   // Reveal in file manager / open with default app
   revealInFileManager: (filePath: string) => invoke<void>('reveal_in_file_manager', { filePath }),

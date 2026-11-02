@@ -62,7 +62,8 @@ export function startModelThumbnailer(): () => void {
   }
 
   async function run() {
-    // Models that failed this session. Not recorded anywhere, so they're retried on next launch.
+    // First previews that failed this session. Not recorded anywhere, so they're retried on next
+    // launch.
     const skipped = new Set<string>();
 
     while (!stopped) {
@@ -83,7 +84,10 @@ export function startModelThumbnailer(): () => void {
           // A lost context or a stop mid-render says nothing about the model; retry later.
           if (stopped || renderer.getContext().isContextLost()) return;
           console.warn(`3D thumbnail failed for ${modelPath}:`, err);
-          skipped.add(assetId);
+          // A changed model becomes an error, which Regenerate retries, so it mustn't be skipped.
+          const reported = await api.failModelThumbnail(assetId).catch(() => false);
+          if (reported) await useAssetStore.getState().refreshAssets([assetId]);
+          else skipped.add(assetId);
         }
       }
     }

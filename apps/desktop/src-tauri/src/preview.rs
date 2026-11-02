@@ -644,6 +644,19 @@ pub(crate) async fn save_model_render(
     Ok(rel_thumb)
 }
 
+/// Moves asset `asset_id` from `generating` to `error` when its GLB can't be rendered, which
+/// frees Regenerate. Its old picture stays. Returns whether the row moved: a first preview, or a
+/// model queued again since, has nothing to fail.
+pub(crate) async fn fail_model_render(pool: &Pool<Sqlite>, asset_id: &str) -> sqlx::Result<bool> {
+    let moved = sqlx::query(
+        "UPDATE assets SET preview_status = 'error' WHERE id = ? AND preview_status = 'generating'",
+    )
+    .bind(asset_id)
+    .execute(pool)
+    .await?;
+    Ok(moved.rows_affected() > 0)
+}
+
 /// Deletes the asset's current `_thumb` file under `.opendam/thumbs` unless it is
 /// `new_rel_thumb`, so a thumbnail that is cleared or renamed leaves no orphaned file. It runs
 /// before the row changes: if the app stops in between, the row points at a missing file and
@@ -1878,6 +1891,42 @@ mod tests {
             ]
         );
         assert_eq!(models_awaiting_render(&pool, 1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_render_leaves_the_model_retriable_with_its_picture() {
+        let (dir, pool) = library_with_new_model().await;
+        let root = dir.path();
+        let old = ".opendam/thumbs/m1_thumb.png";
+        sqlx::query("UPDATE assets SET thumbnail_path = ?")
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        finish_with_glb(&pool, root, "j1").await;
+
+        assert!(fail_model_render(&pool, "m1").await.unwrap());
+
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(old.to_string()), "error".to_string())
+        );
+        assert_eq!(models_awaiting_render(&pool, 10).await.unwrap(), []);
+    }
+
+    #[tokio::test]
+    async fn only_a_model_at_generating_fails_its_render() {
+        let (dir, pool) = library_with_new_model().await;
+
+        assert!(!fail_model_render(&pool, "m1").await.unwrap(), "pending");
+
+        finish_with_glb(&pool, dir.path(), "j1").await;
+
+        assert!(!fail_model_render(&pool, "m1").await.unwrap(), "first");
+        assert_eq!(
+            thumb_and_status(&pool).await,
+            (Some(GLB.to_string()), "done".to_string())
+        );
     }
 
     #[tokio::test]

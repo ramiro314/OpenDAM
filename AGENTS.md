@@ -542,7 +542,8 @@ docs/plans                    Plans for this fork
   the picture (`modelThumbnailer`), so an asset with a picture keeps it at `generating` until
   `preview::save_model_render` stores the PNG under a new name, which also makes the webview load
   it rather than its cached copy (`complete_job`, `AWAITING_RENDER`). A first preview holds the
-  GLB as its `thumbnail_path` until then. A staged file with the previous build's bytes keeps its
+  GLB as its `thumbnail_path` until then. A render that fails moves a `generating` asset to
+  `error`, its picture kept, so Regenerate can retry it (`fail_model_render`). A staged file with the previous build's bytes keeps its
   mtime, so a Rebuild queues nothing for it.
 - **Source hashes are a memo.** `file_hashes` (library DB) holds a sha256 per file path,
   relative to the library root, with the size and mtime (nanoseconds) it was taken at. Only the
