@@ -30,6 +30,9 @@ mod tests {
     const STORED_TINT_PAST_1: [f64; 4] = [1.0, 0.4, 0.6, 1.0];
     /// `TINT` as a GLB's factor holds it, linear.
     const TINT: [f64; 4] = [0.0331, 0.1329, 0.3185, 1.0];
+    /// `YELLOW` as a GLB's factor holds it, linear.
+    const YELLOW: [f64; 4] = [1.0, 0.6038, 0.0331, 1.0];
+    const WHITE: [f64; 4] = [1.0; 4];
 
     /// What a mask with no base exports as: white, with the mask in its alpha, so the flat colour
     /// shows through the factor. A mask bound as a base would be the mask's black.
@@ -455,6 +458,60 @@ mod tests {
         assert!(is(m.base, BASE) && m.base.unwrap().1 == 0, "{m:?}");
     }
 
+    /// A shader that clips on the base's alpha cuts out a material with no cutout keyword: a
+    /// graph's target, one reading an LOD sample's alpha (its slot 8), an older graph's threshold,
+    /// one with `FAE_TreeBranch`'s shape (a linked threshold of 0, and the alpha through a sub
+    /// graph) and a `.shader`'s tags. One with no cutout tag, a graph that leaves the clip to the
+    /// material, one whose target doesn't clip, one whose Alpha reads the base's red, one reading
+    /// an LOD sample's blue (its slot 7), one that clips on another texture's alpha and an older
+    /// graph whose threshold is 0 leave it opaque.
+    #[tokio::test]
+    async fn a_shader_that_clips_on_the_base_s_alpha_makes_a_cutout() {
+        let Some(glb) = convert("shader-clip").await else {
+            return;
+        };
+        for name in ["M_Graph", "M_Lod", "M_Older", "M_Linked", "M_Shader"] {
+            let m = glb.material(name);
+            assert_eq!(m.alpha_mode.as_deref(), Some("MASK"), "{name}: {m:?}");
+            assert!(is(m.base, BASE) && m.base.unwrap().1 == 0, "{name}: {m:?}");
+        }
+        for name in [
+            "M_Opaque",
+            "M_Override",
+            "M_NoClip",
+            "M_Red",
+            "M_LodBlue",
+            "M_OtherAlpha",
+            "M_NoThreshold",
+        ] {
+            let m = glb.material(name);
+            assert!(is(m.base, BASE) && m.alpha_mode.is_none(), "{name}: {m:?}");
+        }
+    }
+
+    /// A `.shader` is an input: the same pack with its `.shader` files left out, in the same
+    /// cache, converts again, and the material on the cutout one is opaque.
+    #[tokio::test]
+    async fn a_shader_left_out_converts_again_without_its_cutout() {
+        let cache = tempfile::tempdir().unwrap();
+        let Some(with) = convert_in("shader-clip", |_| true, cache.path()).await else {
+            return;
+        };
+        assert_eq!(
+            with.material("M_Shader").alpha_mode.as_deref(),
+            Some("MASK")
+        );
+        let without = convert_in("shader-clip", |n| !n.ends_with(".shader"), cache.path())
+            .await
+            .unwrap();
+        let m = without.material("M_Shader");
+        assert!(is(m.base, BASE) && m.alpha_mode.is_none(), "{m:?}");
+        assert_eq!(
+            without.material("M_Graph").alpha_mode.as_deref(),
+            Some("MASK")
+        );
+    }
+
     /// Blank twin, Twin with no .mat, Twin over colours, and a prefab naming the blank `MI_X`
     /// for a slot of another name: each uses `M_X`'s texture.
     #[tokio::test]
@@ -591,6 +648,24 @@ mod tests {
             return;
         };
         assert!(is(glb.material("M_Thing").base, BASE));
+    }
+
+    /// Only texture, tinted: the colour multiplies a base the only-texture rule found, as its
+    /// linear factor, and leaves a base found by raw or display name white.
+    #[tokio::test]
+    async fn only_an_only_texture_base_takes_the_colour() {
+        let Some(glb) = convert("only-texture-tint").await else {
+            return;
+        };
+        let m = glb.material("M_Grid");
+        assert!(is(m.base, BASE) && is_colour(&m.factor, YELLOW), "{m:?}");
+        for name in ["M_Raw", "M_Shown"] {
+            let m = glb.material(name);
+            assert!(
+                is(m.base, BASE) && is_colour(&m.factor, WHITE),
+                "{name}: {m:?}"
+            );
+        }
     }
 
     /// A base hint beside another role's word isn't a base: not `Albedo Mask`, which sorts first,

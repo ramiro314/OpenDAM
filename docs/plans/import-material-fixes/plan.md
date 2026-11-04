@@ -771,7 +771,12 @@ profile, as Piece 1 did, and reports the GLBs it changes.
    factor. POLYGON's 162 `PolygonPrototype_Grid_01` GLBs come out yellow with their grid, and only
    a material whose base came from that rule changes colour. Fixture: a material whose one texture
    is `_Grid`, with a yellow `_Base_Color`, and one whose base is found by name, with a colour that
-   stays unapplied.
+   stays unapplied. Result: a prototype run of the old and new script over the 11 packs' built
+   copies in the first gate's profile changed 163 of 2,566 GLBs, all in POLYGON, and only their
+   `baseColorFactor`: the 162 `PolygonPrototype_Grid_01` GLBs, to `[1, 0.4831, 0, 1]`, and
+   `SM_Buildings_WindowGlass_01`, whose `PolygonPrototype_Glass_01` is on the same grid shader
+   with `_Grid` its only texture, to its cyan `[0.0051, 0.6596, 0.8714, 1]`. No model failed, and
+   no texture, alpha mode or geometry changed.
 2. **Drop a billboard beside a real mesh.** In a file with other meshes, a mesh object whose name,
    without Blender's numeric suffix, ends `_Billboard` in any case is dropped, as a higher LOD is.
    A file whose only mesh is a billboard keeps it. Fantasy Adventure's 15 GLBs lose their crossed
@@ -932,7 +937,10 @@ Item 4 found the cause it expected, measured on 2026-11-04 against the first gat
   map is gained or lost. No vertex, primitive or mesh count changes. So `floors.tsv` stands.
 
 The fix orders a slot by its first face in Blender's import, which keeps the file's face order.
-It lands at version 5, and item 6's bump reconverts it.
+It lands at version 5, and item 6's bump reconverts it. It was measured at `32a54e1`, before items
+1 to 3 merged. None of them changes which material a slot takes: they change a factor, an
+`alphaMode` and which meshes stay, and the billboards are in Fantasy Adventure, which no slot
+change reaches.
 
 ## Evidence so far
 

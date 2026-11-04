@@ -1,0 +1,24 @@
+newmtl M_Graph
+Kd 1 1 1
+newmtl M_Lod
+Kd 1 1 1
+newmtl M_Older
+Kd 1 1 1
+newmtl M_Linked
+Kd 1 1 1
+newmtl M_Shader
+Kd 1 1 1
+newmtl M_Opaque
+Kd 1 1 1
+newmtl M_Override
+Kd 1 1 1
+newmtl M_NoClip
+Kd 1 1 1
+newmtl M_Red
+Kd 1 1 1
+newmtl M_LodBlue
+Kd 1 1 1
+newmtl M_OtherAlpha
+Kd 1 1 1
+newmtl M_NoThreshold
+Kd 1 1 1
