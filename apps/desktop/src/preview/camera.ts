@@ -70,6 +70,20 @@ export function seenArea(faces: Float32Array, direction: THREE.Vector3): number 
   return seen;
 }
 
+/**
+ * The direction from a model's center to the camera, for the thumbnailer. A model whose shape
+ * can't be read, such as one too large to hold its faces, gets the usual view, as every model did
+ * before, rather than failing its thumbnail.
+ */
+export function cameraDirection(model: THREE.Object3D): THREE.Vector3 {
+  try {
+    return viewDirection(measureShape(model));
+  } catch (err) {
+    console.warn('3D thumbnail camera fell back to the usual view:', err);
+    return VIEW_DIRECTION.clone();
+  }
+}
+
 /** The camera's up: world up, unless the camera looks almost straight up or down */
 export function cameraUp(direction: THREE.Vector3): THREE.Vector3 {
   return Math.abs(direction.y) > 0.99 ? new THREE.Vector3(0, 0, -1) : new THREE.Vector3(0, 1, 0);

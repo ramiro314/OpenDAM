@@ -1,7 +1,8 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import * as THREE from 'three';
 import {
   VIEW_DIRECTION,
+  cameraDirection,
   cameraUp,
   measureShape,
   seenArea,
@@ -223,6 +224,21 @@ describe('measureShape', () => {
   test('a model with no mesh keeps the usual view', () => {
     expect(viewDirection(measureShape(new THREE.Group()))).toEqual(VIEW_DIRECTION);
   });
+});
+
+test('cameraDirection gives the usual view to a model it cannot measure', () => {
+  const warn = spyOn(console, 'warn').mockImplementation(() => {});
+  const broken = new THREE.Group();
+  broken.updateWorldMatrix = () => {
+    throw new RangeError('Array buffer allocation failed');
+  };
+  expect(cameraDirection(broken)).toEqual(VIEW_DIRECTION);
+  expect(warn).toHaveBeenCalledTimes(1);
+  warn.mockRestore();
+
+  const plane = new THREE.Mesh(new THREE.PlaneGeometry(4, 2));
+  plane.quaternion.setFromUnitVectors(v(0, 0, 1), edgeOn);
+  expect(cameraDirection(plane)).toEqual(viewDirection(measureShape(plane)));
 });
 
 test('cameraUp leaves world up unless the camera looks straight down', () => {

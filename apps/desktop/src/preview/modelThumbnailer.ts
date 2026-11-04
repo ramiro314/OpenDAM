@@ -4,7 +4,7 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { api } from '../api';
 import { useAssetStore } from '../store';
-import { cameraUp, measureShape, viewDirection } from './camera';
+import { cameraDirection, cameraUp } from './camera';
 import { modelsToRender, onModelRendered, renderKey } from './previewDone';
 
 const SIZE = 512;
@@ -48,7 +48,7 @@ export function startModelThumbnailer(): () => void {
 
       const camera = new THREE.PerspectiveCamera(30, 1, sphere.radius / 100, sphere.radius * 100);
       const distance = (sphere.radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2))) * 1.05;
-      const direction = viewDirection(measureShape(model));
+      const direction = cameraDirection(model);
       camera.position.copy(sphere.center).addScaledVector(direction, distance);
       camera.up.copy(cameraUp(direction));
       camera.lookAt(sphere.center);
