@@ -910,6 +910,17 @@ profile, as Piece 1 did, and reports the GLBs it changes.
     Animated Characters packs, and any `.ai` that can't be previewed, end with a reason the UI
     shows (`preview_reason`), such as "Animation, no mesh", not a bare error.
 
+    Result (2026-11-04): the `.ai` branch used PIL's `Image` without importing it, and another
+    branch's `from PIL import Image` makes it a local name of `model_meta`, so every page that
+    rendered past 1440 px failed with `UnboundLocalError`, all 10 of Kenney's among them. With
+    the import, all 10 render, and a page now renders at the thumbnail's size rather than at 3x
+    and shrunk (Kenney's 4500 pt backgrounds were a 13,500 px bitmap). The 26 animations hold a
+    58-bone skeleton and two takes and no mesh, so Assimp refuses them with an empty message:
+    the worker reads the node tree on a failed FBX and answers "Animation, no mesh" (or "No
+    mesh"), and an `.ai` pdfium can't open "No PDF content to preview". Run over the gate's 36
+    files, the worker gives 10 thumbnails and 26 reasons. The gate's library keeps its 36
+    `error` rows until each is regenerated, since nothing requeues them.
+
 **Audit.**
 
 12. **The engine's grid isn't a texture.** `glb_audit.py` counts a base texture baked from

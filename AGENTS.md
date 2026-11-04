@@ -325,7 +325,10 @@ docs/plans                    Plans for this fork
   (`db::add_preview_columns`), never in `metadata`. The asset goes to `error`, because the
   structure pass requeues every `none`, so nothing retries until the file changes or you ask
   again. Any finished job clears the reason. The UI shows the reason and never loads an original
-  that has one (`imageOf`, `tileMedia`).
+  that has one (`imageOf`, `tileMedia`). A worker result with `ok: false` and a `reason` ends
+  through `refuse_job` the same way: an FBX 7 whose node tree holds no mesh ("Animation, no mesh"
+  or "No mesh", `worker.fbx_without_mesh`) and an `.ai` pdfium can't open. Any other failure
+  stays a bare `error`, which the UI offers to retry.
 - **One persistent Python worker.** The worker is a long-lived JSON-over-stdio daemon. Send it
   requests over the existing stream; one process serves every file. The queue starts it eagerly
   and asks each new process its `engine_info`, publishing the answer in
