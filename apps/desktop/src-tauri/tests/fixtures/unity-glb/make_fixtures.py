@@ -218,11 +218,18 @@ def older(properties: dict[str, str]) -> str:
 
 
 def clip_stream(
-    prop: str, alpha_from: int = 7, clip: bool = True, override: bool = False, shown: str = "Base"
+    prop: str,
+    alpha_from: int = 7,
+    clip: bool = True,
+    override: bool = False,
+    shown: str = "Base",
+    node: str = "SampleTexture2DNode",
 ) -> str:
     """A Shader Graph as Unity 2021 writes it whose Alpha block reads output `alpha_from` of a
-    sample of the texture property `prop`, shown as `shown` (7 is its alpha, 4 its red), and
-    whose target clips when `clip` is set, or leaves that to the material with `override`."""
+    `node` sample of the texture property `prop`, shown as `shown`, and whose target clips when
+    `clip` is set, or leaves that to the material with `override`. A `SampleTexture2DNode`'s alpha
+    is 7 and its red 4. A `SampleTexture2DLODNode`'s are one higher, past its LOD input: its alpha
+    is 8, and its 7 is blue."""
 
     def edge(out_node: str, out_slot: int, in_node: str, in_slot: int) -> dict:
         return {
@@ -250,7 +257,7 @@ def clip_stream(
             "m_ObjectId": "property",
             "m_Property": {"m_Id": "base"},
         },
-        {"m_Type": "UnityEditor.ShaderGraph.SampleTexture2DNode", "m_ObjectId": "sample"},
+        {"m_Type": f"UnityEditor.ShaderGraph.{node}", "m_ObjectId": "sample"},
         {
             "m_Type": "UnityEditor.ShaderGraph.BlockNode",
             "m_ObjectId": "alpha",
@@ -803,16 +810,18 @@ def main() -> None:
             "M_Thing", {"Texture2D_x": pack.texture("T_Base", BASE)}, {"_Color": TINT}, shader
         )
 
-    # A shader that clips sets no keyword in the material. These four clip on their base's
-    # alpha: a graph's target, an older graph's threshold, one with `FAE_TreeBranch`'s shape (a
-    # linked threshold of 0, and its alpha through a sub graph) and a `.shader`'s tags. The other
-    # six don't: a `.shader` with no cutout tag, a graph leaving the clip to the material, one
-    # whose target doesn't clip, one whose Alpha reads the base's red, one that clips on another
+    # A shader that clips sets no keyword in the material. These five clip on their base's
+    # alpha: a graph's target, one reading an LOD sample's alpha, an older graph's threshold, one
+    # with `FAE_TreeBranch`'s shape (a linked threshold of 0, and its alpha through a sub graph)
+    # and a `.shader`'s tags. The other seven don't: a `.shader` with no cutout tag, a graph
+    # leaving the clip to the material, one whose target doesn't clip, one whose Alpha reads the
+    # base's red, one reading an LOD sample's blue (its slot 7), one that clips on another
     # texture's alpha, and an older graph whose threshold is 0.
     pack = Pack(
         "shader-clip",
         [
             "M_Graph",
+            "M_Lod",
             "M_Older",
             "M_Linked",
             "M_Shader",
@@ -820,6 +829,7 @@ def main() -> None:
             "M_Override",
             "M_NoClip",
             "M_Red",
+            "M_LodBlue",
             "M_OtherAlpha",
             "M_NoThreshold",
         ],
@@ -828,6 +838,12 @@ def main() -> None:
     other = pack.texture("T_Other", MASK, 0)
     for name, prop, shader, file_id in (
         ("M_Graph", "_BaseMap", pack.graph("S_Graph", clip_stream("_BaseMap")), GRAPH_FILE_ID),
+        (
+            "M_Lod",
+            "_BaseMap",
+            pack.graph("S_Lod", clip_stream("_BaseMap", 8, node="SampleTexture2DLODNode")),
+            GRAPH_FILE_ID,
+        ),
         ("M_Older", "_MainTex", pack.graph("S_Older", older_clip("_MainTex", 0.5)), GRAPH_FILE_ID),
         (
             "M_Linked",
@@ -858,6 +874,12 @@ def main() -> None:
             "M_Red",
             "_BaseMap",
             pack.graph("S_Red", clip_stream("_BaseMap", alpha_from=4)),
+            GRAPH_FILE_ID,
+        ),
+        (
+            "M_LodBlue",
+            "_BaseMap",
+            pack.graph("S_LodBlue", clip_stream("_BaseMap", 7, node="SampleTexture2DLODNode")),
             GRAPH_FILE_ID,
         ),
         (

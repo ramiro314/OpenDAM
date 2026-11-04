@@ -267,8 +267,10 @@ def graph_properties(path: Path) -> tuple[dict[str, str], set[str]]:
     return GRAPHS[path]
 
 
-# A sample node's texture input and its alpha output, the same slot IDs in both graph formats.
-SAMPLE_TEXTURE, SAMPLE_ALPHA = 1, 7
+# A sample node's texture input, and its alpha output by node type, the same slot IDs in both graph
+# formats. The LOD sample's LOD input is slot 4, so its outputs are one higher: its 7 is blue.
+SAMPLE_TEXTURE = 1
+SAMPLE_ALPHA = {"SampleTexture2DNode": 7, "SampleTexture2DLODNode": 8}
 # What `clipped_on` gives a `.shader` that clips: its code isn't traced, so whichever texture is
 # the material's base.
 ANY_BASE = frozenset({"*"})
@@ -365,10 +367,10 @@ def graph_clips(text: str) -> frozenset[str]:
         if (node, out) in seen:
             continue
         seen.add((node, out))
-        kind = nodes.get(node, ("", None))[0]
-        if kind.rsplit(".", 1)[-1] in ("SampleTexture2DNode", "SampleTexture2DLODNode"):
+        kind = nodes.get(node, ("", None))[0].rsplit(".", 1)[-1]
+        if kind in SAMPLE_ALPHA:
             # A sample ends the walk: its UVs may read other textures, but not as alpha.
-            if out == SAMPLE_ALPHA:
+            if out == SAMPLE_ALPHA[kind]:
                 clipped.update(nodes.get(source, ("", None))[1]
                                for slot, source, _ in into.get(node, []) if slot == SAMPLE_TEXTURE)
             continue
