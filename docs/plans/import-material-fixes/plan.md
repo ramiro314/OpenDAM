@@ -725,7 +725,7 @@ And the rest:
 | `tree_b` with no fix | If item 4 stops without a fix, the bump goes ahead and the fix waits for version 7 (decided 2026-11-04) |
 | Build hoist warning | Only a build whose preview was an estimate warns on a hoist that found no folder (decided 2026-11-04) |
 | Second gate | All four runs again in a new clean profile, once the converter, Unreal, hoist, camera and audit work has merged |
-| Floors | The second gate runs against today's `floors.tsv`, which may not fall. Its report proposes the measured counts as new floors, for the owner to accept |
+| Floors | The second gate runs against today's `floors.tsv`, which may not fall. Its report proposes the measured counts as new floors, for the owner to accept. `floors.tsv` holds the 11 Unity and Fab packs only, so the Unreal packs have no floor to miss |
 | Issue #261 | The second gate's pull request says "Part of #261", and the owner closes the issue after the review |
 
 ### Work
@@ -824,7 +824,9 @@ profile, as Piece 1 did, and reports the GLBs it changes.
 12. **The engine's grid isn't a texture.** `glb_audit.py` counts a base texture baked from
     `WorldGridMaterial` (an image named `WorldGridMaterial_BaseColor`) as untextured. With a test in
     `test_glb_audit.py`. Waterways' fully textured count becomes 111 of 161, for
-    `SM_Butterfly_Plane`, `SM_CavernHull` and `SM_Vine_05`.
+    `SM_Butterfly_Plane`, `SM_CavernHull` and `SM_Vine_05`. This lowers no floor: `floors.tsv`
+    has no row for Waterways or LostRuins, and the drop from the first gate's 114 is the audit's
+    new reading, not a lost texture.
 
 **Investigations.** Neither holds the second gate or the deletion. Each reports its cause in its
 pull request and in this plan. It fixes the cause in the same ticket only when the fix is small and
@@ -852,6 +854,9 @@ Unreal one a ticket that bumps `UNREAL_GLB_VERSION`.
       listed is there.
     - LostRuins has 102 GLBs, and no package of an export type is left without one or a warning.
     - Waterways' dialog shows no hoist warning, and its textured count is read with item 12's audit.
+      LostRuins and Waterways still have no row in `floors.tsv`, so they pass on the Unreal rows'
+      terms, not by a floor. Waterways' expected count under that audit is 111 of 161, and a lower
+      one must be explained. The report proposes their first floors with the others'.
     - No pack's build warns about a hoist, Wizard Room's included.
 
     Its results go in `gate-report-2.md` beside the first report, with after sheets from the same
