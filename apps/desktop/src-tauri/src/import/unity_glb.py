@@ -74,6 +74,13 @@ What version 5 adds to its heuristics (docs/plans/import-material-fixes/plan.md,
   can name `Plane.099`, and only then without Blender's numeric suffix.
 - A renderer's material list counts Unity's submeshes, so it skips a slot no face uses.
 
+What version 6 adds (docs/plans/import-material-fixes/plan.md, After the first gate). Until its
+bump, the cache key still holds version 5:
+
+- Unity orders a mesh's submeshes by each slot's first face, not by the FBX's slot order, and a
+  renderer's list follows them, so Big Castle's `tree_b` gets its leaves on its cards. An FBX that
+  goes through `assimp` comes back with its faces grouped by slot, so it keeps its slot order.
+
 A model left with no mesh still writes its GLB. OpenDAM reads each GLB it places and warns of an
 empty one, on every run, since this script only sees uncached models.
 """
@@ -596,9 +603,10 @@ def convert(model: Path, target: Path, guids, by_mesh, by_name, images, mtls, ma
         if not obj.material_slots and not guids_for_obj:
             if named_material([name, model.stem], images):
                 obj.data.materials.append(None)
-        # Unity makes one submesh per slot that faces use, and a renderer lists those, in order.
+        # Unity makes one submesh per slot that faces use, in the order of each slot's first face,
+        # and a renderer lists those, in order. The importer keeps the file's face order.
         submeshes = {slot: i for i, slot in enumerate(
-            sorted({face.material_index for face in obj.data.polygons}))}
+            dict.fromkeys(face.material_index for face in obj.data.polygons))}
         for i, slot in enumerate(obj.material_slots):
             total += 1
             um = None

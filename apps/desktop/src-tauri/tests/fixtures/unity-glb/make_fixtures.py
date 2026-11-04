@@ -10,8 +10,9 @@ Each folder is one pack, so a case's by-name lookups reach only its own files. E
 `Model.obj`, one triangle per material slot, and `Model.mtl`, which name the slots through `usemtl`
 and `newmtl`, with text `.mat`, `.meta` and `.shadergraph` files and solid 4 x 4 PNGs. A pack about
 which meshes stay holds one triangle per named object instead, in a model of its own name when
-the file name is the case (`Pack.objects`). `mesh-name` and `exact-first` hold no model: an OBJ's
-object and mesh share a name, so their tests make `Model.fbx` under Blender. The tests in
+the file name is the case (`Pack.objects`). `mesh-name`, `exact-first` and `submesh-order` hold
+no model: an OBJ's object and mesh share a name, and its slots follow its faces, so their tests
+make `Model.fbx` under Blender. The tests in
 `src/import/unity_glb_fixture_tests.rs` tell a texture by its colour:
 
 - BASE, OTHER_BASE, NORMAL, ORM and MASK are solid colours: only a role's right texture is BASE or
@@ -679,6 +680,38 @@ def main() -> None:
     mapped_planes(Pack("mesh-name"), "Model.fbx")
 
     mapped_planes(Pack("exact-first"), "Model.fbx", plain=True)
+
+    # Big Castle's `tree_b`: the FBX lists `Leaf` before `Bark`, but a `Bark` face comes first,
+    # so Unity's first submesh is the bark, and the prefab lists `M_Bark` first. The test makes
+    # `Model.fbx` under Blender, with one mesh, `Tree`.
+    pack = Pack("submesh-order")
+    pack.material("M_Bark", {"_BaseMap": pack.texture("T_Bark", BASE)})
+    pack.material("M_Leaf", {"_BaseMap": pack.texture("T_Leaf", OTHER_BASE)})
+    pack.write(
+        "Model.fbx.meta",
+        f"fileFormatVersion: 2\nguid: {guid(pack.name, 'Model.fbx')}\n"
+        "ModelImporter:\n  fileIDToRecycleName:\n    4300000: Tree\n",
+    )
+    pack.write(
+        "Model.prefab",
+        "\n".join(
+            [
+                "%YAML 1.1",
+                "%TAG !u! tag:unity3d.com,2011:",
+                "--- !u!33 &1",
+                "MeshFilter:",
+                "  m_GameObject: {fileID: 7}",
+                f"  m_Mesh: {{fileID: 4300000, guid: {guid(pack.name, 'Model.fbx')}, type: 3}}",
+                "--- !u!23 &2",
+                "MeshRenderer:",
+                "  m_GameObject: {fileID: 7}",
+                "  m_Materials:",
+                f"  - {{fileID: 2100000, guid: {guid(pack.name, 'M_Bark.mat')}, type: 2}}",
+                f"  - {{fileID: 2100000, guid: {guid(pack.name, 'M_Leaf.mat')}, type: 2}}",
+            ]
+        )
+        + "\n",
+    )
 
 
 main()

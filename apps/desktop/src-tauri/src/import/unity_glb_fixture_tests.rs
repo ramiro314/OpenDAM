@@ -43,6 +43,9 @@ mod tests {
         name.ends_with(".shadergraph")
     }
 
+    /// A texture's first pixel, as colour and alpha.
+    type Pixel = ([u8; 3], u8);
+
     /// A conversion's GLB.
     struct Converted {
         json: Value,
@@ -128,6 +131,28 @@ mod tests {
             let material = mesh["primitives"][0]["material"].as_u64().unwrap() as usize;
             self.material(self.json["materials"][material]["name"].as_str().unwrap())
                 .base
+        }
+
+        /// Each primitive of the node called `name`'s mesh, as its triangle count and its
+        /// material's base color, most triangles first.
+        fn primitives(&self, name: &str) -> Vec<(u64, Option<Pixel>)> {
+            let nodes = self.json["nodes"].as_array().unwrap();
+            let node = nodes.iter().find(|n| n["name"] == name).unwrap();
+            let mesh = &self.json["meshes"][node["mesh"].as_u64().unwrap() as usize];
+            let mut found: Vec<_> = mesh["primitives"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| {
+                    let indices = p["indices"].as_u64().unwrap() as usize;
+                    let triangles = self.json["accessors"][indices]["count"].as_u64().unwrap() / 3;
+                    let material = p["material"].as_u64().unwrap() as usize;
+                    let name = self.json["materials"][material]["name"].as_str().unwrap();
+                    (triangles, self.material(name).base)
+                })
+                .collect();
+            found.sort_by_key(|(triangles, _)| std::cmp::Reverse(*triangles));
+            found
         }
     }
 
@@ -950,35 +975,40 @@ bpy.ops.export_scene.fbx(filepath={fbx:?})
         );
     }
 
-    /// `Model.fbx`, made by `blender`, of one plane per (object name, mesh name).
-    async fn fbx_of(blender: &Path, fbx: &Path, planes: &[(&str, &str)]) {
-        let script = format!(
+    /// A Blender script that makes one plane per (object name, mesh name).
+    fn planes(planes: &[(&str, &str)]) -> String {
+        format!(
             r#"
-import bpy
-bpy.ops.object.select_all(action="SELECT")
-bpy.ops.object.delete()
 for n, (name, mesh) in enumerate({planes:?}):
     bpy.ops.mesh.primitive_plane_add(location=(n * 3, 0, 0))
     obj = bpy.context.active_object
     obj.name = name
     obj.data.name = mesh
     obj.data.materials.append(bpy.data.materials.new("Imported"))
-bpy.ops.export_scene.fbx(filepath={fbx:?})
-"#,
-            fbx = fbx.to_str().unwrap(),
-        );
-        run_script(blender, script).await;
+"#
+        )
     }
 
-    /// Runs the step over the pack `case` with a `Model.fbx` of `planes` beside its files.
-    async fn run_with_fbx(case: &str, planes: &[(&str, &str)]) -> Option<Run> {
+    /// Runs the step over the pack `case` with a `Model.fbx` beside its files, which `make`, a
+    /// Blender script, builds in an empty scene.
+    async fn run_with_fbx(case: &str, make: &str) -> Option<Run> {
         let blender = test_blender()?;
         let pack = tempfile::tempdir().unwrap();
         for entry in std::fs::read_dir(fixtures().join(case)).unwrap() {
             let entry = entry.unwrap();
             std::fs::copy(entry.path(), pack.path().join(entry.file_name())).unwrap();
         }
-        fbx_of(&blender, &pack.path().join("Model.fbx"), planes).await;
+        let script = format!(
+            r#"
+import bpy
+bpy.ops.object.select_all(action="SELECT")
+bpy.ops.object.delete()
+{make}
+bpy.ops.export_scene.fbx(filepath={fbx:?})
+"#,
+            fbx = pack.path().join("Model.fbx").to_str().unwrap(),
+        );
+        run_script(&blender, script).await;
         let cache = tempfile::tempdir().unwrap();
         run_over(pack.path(), "Model.glb", |_| true, cache.path()).await
     }
@@ -987,8 +1017,8 @@ bpy.ops.export_scene.fbx(filepath={fbx:?})
     /// their meshes' exact names, which `Plane` isn't.
     #[tokio::test]
     async fn a_mesh_named_exactly_in_a_meta_finds_its_object_s_material() {
-        let planes = [("Thing", "Plane.099"), ("Other", "Plane.100")];
-        let Some(run) = run_with_fbx("mesh-name", &planes).await else {
+        let meshes = [("Thing", "Plane.099"), ("Other", "Plane.100")];
+        let Some(run) = run_with_fbx("mesh-name", &planes(&meshes)).await else {
             return;
         };
         assert_eq!(run.glb.meshes(), ["Other", "Thing"]);
@@ -1002,13 +1032,40 @@ bpy.ops.export_scene.fbx(filepath={fbx:?})
     /// its own exact lookup.
     #[tokio::test]
     async fn an_exact_name_comes_before_the_name_without_its_suffix() {
-        let planes = [("Plane.099", "Thing"), ("Other", "Plane.100")];
-        let Some(run) = run_with_fbx("exact-first", &planes).await else {
+        let meshes = [("Plane.099", "Thing"), ("Other", "Plane.100")];
+        let Some(run) = run_with_fbx("exact-first", &planes(&meshes)).await else {
             return;
         };
         assert_eq!(run.glb.meshes(), ["Other", "Plane.099"]);
         assert!(is(run.glb.base_of("Plane.099"), BASE));
         assert!(is(run.glb.base_of("Other"), OTHER_BASE));
+    }
+
+    /// Submesh order: `Tree`'s FBX lists `Leaf` before `Bark`, but its first face is a bark one,
+    /// and Unity orders a mesh's submeshes by each slot's first face. So the prefab's first
+    /// material, `M_Bark`, goes on the two bark faces and `M_Leaf` on the leaf, as on Big Castle's
+    /// `tree_b`.
+    #[tokio::test]
+    async fn a_prefab_s_list_follows_each_slot_s_first_face() {
+        let make = r#"
+mesh = bpy.data.meshes.new("Tree")
+quad = lambda x: [(x, 0, 0), (x + 1, 0, 0), (x + 1, 1, 0), (x, 1, 0)]
+mesh.from_pydata(quad(0) + quad(2) + quad(4), [], [(0, 1, 2, 3), (4, 5, 6, 7), (8, 9, 10, 11)])
+mesh.uv_layers.new()
+mesh.materials.append(bpy.data.materials.new("Leaf"))
+mesh.materials.append(bpy.data.materials.new("Bark"))
+mesh.polygons.foreach_set("material_index", [1, 0, 1])
+bpy.context.collection.objects.link(bpy.data.objects.new("Tree", mesh))
+"#;
+        let Some(run) = run_with_fbx("submesh-order", make).await else {
+            return;
+        };
+        let primitives = run.glb.primitives("Tree");
+        assert_eq!(primitives.len(), 2, "{primitives:?}");
+        let (bark, leaf) = (&primitives[0], &primitives[1]);
+        assert_eq!((bark.0, leaf.0), (4, 2), "{primitives:?}");
+        assert!(is(bark.1, BASE), "{primitives:?}");
+        assert!(is(leaf.1, OTHER_BASE), "{primitives:?}");
     }
 
     /// A byte order mark doesn't hide a graph's names.
