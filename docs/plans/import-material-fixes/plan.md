@@ -720,10 +720,9 @@ And the rest:
 | Investigations | Report the cause, and fix it in the same ticket only when the fix is small and not in a converter |
 | A converter cause found later | It waits for a later bump, version 7, and doesn't hold the deletion |
 | Kenney's errors | A preview where one can be made, else a clear reason, not a bare error |
-| Hoist warning | An estimate's preview says the hoist is checked when the export runs, and the build warns on a hoist that was a no-op |
+| Hoist warning | An estimate's preview says the hoist is checked when the export runs, and that build warns on a hoist that was a no-op. Only a build whose preview was an estimate warns, so Wizard Room's default `hoist Art` doesn't (narrowed 2026-11-04) |
 | Camera | It changes only previews made after it. Nothing requeues existing thumbnails |
-| `tree_b` with no fix | If item 4 stops without a fix, the bump goes ahead and the fix waits for version 7 (decided 2026-11-04) |
-| Build hoist warning | Only a build whose preview was an estimate warns on a hoist that found no folder (decided 2026-11-04) |
+| `tree_b` with no fix | If the `tree_b` ticket (Work item 4) stops without a fix, the bump (Work item 6) goes ahead and the fix waits for version 7 (decided 2026-11-04) |
 | Second gate | All four runs again in a new clean profile, once the converter, Unreal, hoist, camera and audit work has merged |
 | Floors | The second gate runs against today's `floors.tsv`, which may not fall. Its report proposes the measured counts as new floors, for the owner to accept. `floors.tsv` holds the 11 Unity and Fab packs only, so the Unreal packs have no floor to miss |
 | Issue #261 | The second gate's pull request says "Part of #261", and the owner closes the issue after the review |
