@@ -30,6 +30,9 @@ mod tests {
     const STORED_TINT_PAST_1: [f64; 4] = [1.0, 0.4, 0.6, 1.0];
     /// `TINT` as a GLB's factor holds it, linear.
     const TINT: [f64; 4] = [0.0331, 0.1329, 0.3185, 1.0];
+    /// `YELLOW` as a GLB's factor holds it, linear.
+    const YELLOW: [f64; 4] = [1.0, 0.6038, 0.0331, 1.0];
+    const WHITE: [f64; 4] = [1.0; 4];
 
     /// What a mask with no base exports as: white, with the mask in its alpha, so the flat colour
     /// shows through the factor. A mask bound as a base would be the mask's black.
@@ -566,6 +569,24 @@ mod tests {
             return;
         };
         assert!(is(glb.material("M_Thing").base, BASE));
+    }
+
+    /// Only texture, tinted: the colour multiplies a base the only-texture rule found, as its
+    /// linear factor, and leaves a base found by raw or display name white.
+    #[tokio::test]
+    async fn only_an_only_texture_base_takes_the_colour() {
+        let Some(glb) = convert("only-texture-tint").await else {
+            return;
+        };
+        let m = glb.material("M_Grid");
+        assert!(is(m.base, BASE) && is_colour(&m.factor, YELLOW), "{m:?}");
+        for name in ["M_Raw", "M_Shown"] {
+            let m = glb.material(name);
+            assert!(
+                is(m.base, BASE) && is_colour(&m.factor, WHITE),
+                "{name}: {m:?}"
+            );
+        }
     }
 
     /// A base hint beside another role's word isn't a base: not `Albedo Mask`, which sorts first,
