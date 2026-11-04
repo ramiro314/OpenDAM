@@ -1107,6 +1107,8 @@ def fbx_without_mesh(source: str) -> str | None:
     Why the FBX at `source` has no preview when its node tree holds no mesh: "Animation, no
     mesh" when it has animation curves, as an animation exported on its own does, else "No
     mesh". None when it holds a mesh or isn't readable, so the converter's own error stands.
+    Only FBX 7 is read: FBX 6 writes a Model as `[name, subtype]`, its geometry inside it, and
+    its animation under `Takes`, and Assimp refuses many FBX 6 files that hold meshes.
     """
     import fbx_nodes
 
@@ -1115,7 +1117,7 @@ def fbx_without_mesh(source: str) -> str | None:
     except OSError, fbx_nodes.FbxError:
         return None
     objects = doc.sections.get("Objects")
-    if objects is None:
+    if objects is None or doc.version < 7000:
         return None
     if any(o.name == "Model" and o.props[2:3] == ["Mesh"] for o in objects.children):
         return None

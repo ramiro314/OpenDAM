@@ -1275,6 +1275,8 @@ async fn python_queue_round(
                         }
                         report = EngineReport::of_result(res);
                     } else if let Some(why) = res.get("reason").and_then(|v| v.as_str()) {
+                        // `preview_error` keeps the converter's own message, for the log
+                        tracing::warn!("Python returned a reason, {why:?}: {:?}", res);
                         reason = Some(why.to_string());
                     } else {
                         tracing::error!("Python returned ok=false: {:?}", res);

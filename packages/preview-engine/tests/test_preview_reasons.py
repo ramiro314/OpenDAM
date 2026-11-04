@@ -95,6 +95,23 @@ def test_an_fbx_with_nothing_in_it_ends_with_no_mesh(tmp_path):
     assert res["reason"] == res["error"] == "No mesh"
 
 
+def test_an_fbx_6_is_a_bare_error(tmp_path):
+    # FBX 6 writes a Model as name and subtype, with its geometry inside it, and Assimp refuses
+    # many FBX 6 files, meshes and all
+    source = tmp_path / "old.fbx"
+    source.write_text(
+        "; FBX 6.1.0 project file\nFBXHeaderExtension:  {\n\tFBXVersion: 6100\n}\n"
+        'Objects:  {\n\tModel: "Model::Cube", "Mesh" {\n\t\tVertices: 0,0,0,1,0,0,0,1,0\n'
+        "\t\tPolygonVertexIndex: 0,1,-3\n\t}\n}\n"
+    )
+
+    res = preview(source, tmp_path)
+
+    assert res["ok"] is False
+    assert "reason" not in res
+    assert res["error"].startswith("FBX/3DS convert failed")
+
+
 def test_an_fbx_with_a_mesh_that_fails_to_convert_is_a_bare_error(tmp_path, monkeypatch):
     import assimp_py
 
