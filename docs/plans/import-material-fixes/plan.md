@@ -600,14 +600,19 @@ The list below doesn't cover two of these. The owner accepted them as recorded o
   IDs Unity hashes from the mesh's name. The `.meta` doesn't name them, and the one-list fallback
   can't apply to two meshes with two lists.
 
-**Big Castle's ivy cards and `grassPlane` have no material in any file.** The owner accepted them on
-2026-11-03 if no file held their materials, and Work item 5 searched on 2026-11-04. Its subjects
-are 6 of the 12 GLBs above:
+**Big Castle's ivy cards and `grassPlane` have no material in any file.** On 2026-11-03 the owner
+accepted `ivy_a` and `grassPlane` if no file held their materials (decision 6), and Work item 5
+searched on 2026-11-04. The search found the same gap in 4 more ivy GLBs, which the owner's
+decision doesn't name: they are recorded here on the strength of that finding. All 6 are among the
+12 GLBs above:
 
-- **The ivy.** In `ivy_a`, `ivy_a_lod`, `ivy_b`, `ivy_b_lod` and `ivy_c`, one or two planes have
-  no material (`ivy_a`'s `Plane.052`, whose mesh is `Plane.081`). The FBX gives its one material,
-  `leavePlane`, to the leaf cards only. Each ivy prefab places the bark and the leaf cards and
-  leaves these planes out, so in Unity the prefab has no background card at all.
+- **The ivy.** One or two planes have no material in each of these GLBs: `ivy_a`'s `Plane.052`
+  (whose mesh is `Plane.081`), `ivy_a_lod`'s `Plane.056`, `ivy_b`'s `Plane.053`, `ivy_b_lod`'s
+  `Plane.057`, and `ivy_c`'s `Plane.060` and `Plane.061`. No FBX gives them a material:
+  `ivy_a` and `ivy_a_lod` give their one material, `leavePlane`, only to the leaf cards, and
+  `ivy_b`, `ivy_b_lod` and `ivy_c` have none. The `ivy_a`, `ivy_b` and `ivy_c` prefabs,
+  checked by each `m_Mesh` file ID against the FBX `.meta` files, place each model's bark and leaf
+  cards and none of these planes. So in Unity the ivy has no background card at all.
 - **`grassPlane`.** Its FBX has no material, and no prefab or scene places it.
 
 Where the search looked:
@@ -795,8 +800,9 @@ profile, as Piece 1 did, and reports the GLBs it changes.
    for the materials of `Plane.081` and `grassPlane`'s mesh. If a file holds them, the converter
    learns to read it, with a fixture. If none does, the ticket records them as accepted leftovers
    in [Piece 1 result](#piece-1-result), and the converter doesn't change. Searched on
-   2026-11-04: no file holds them, so they are recorded there as accepted, with the 4 other ivy
-   GLBs that have the same unplaced planes.
+   2026-11-04: no file holds them, so they are recorded there as accepted. The 4 other ivy GLBs
+   with the same unplaced planes are recorded with them, as this search's finding: the owner's
+   decision names only `ivy_a` and `grassPlane`.
 6. **Bump to `opendam-unity-glb/6`.** Once items 1 to 5 have merged: `VERSION` and
    `UNITY_GLB_VERSION` move together, the docstring lists what changed, and `CLAUDE.md`'s
    `src/import` notes record the new rules. Every built Unity pack needs a Rebuild, as
