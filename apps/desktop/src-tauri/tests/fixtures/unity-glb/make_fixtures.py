@@ -217,10 +217,12 @@ def older(properties: dict[str, str]) -> str:
     )
 
 
-def clip_stream(prop: str, alpha_from: int = 7, clip: bool = True, override: bool = False) -> str:
+def clip_stream(
+    prop: str, alpha_from: int = 7, clip: bool = True, override: bool = False, shown: str = "Base"
+) -> str:
     """A Shader Graph as Unity 2021 writes it whose Alpha block reads output `alpha_from` of a
-    sample of the texture property `prop` (7 is its alpha, 4 its red), and whose target clips
-    when `clip` is set, or leaves that to the material with `override`."""
+    sample of the texture property `prop`, shown as `shown` (7 is its alpha, 4 its red), and
+    whose target clips when `clip` is set, or leaves that to the material with `override`."""
 
     def edge(out_node: str, out_slot: int, in_node: str, in_slot: int) -> dict:
         return {
@@ -239,7 +241,7 @@ def clip_stream(prop: str, alpha_from: int = 7, clip: bool = True, override: boo
         {
             "m_Type": "UnityEditor.ShaderGraph.Internal.Texture2DShaderProperty",
             "m_ObjectId": "base",
-            "m_Name": "Base",
+            "m_Name": shown,
             "m_DefaultReferenceName": "Texture2D_x",
             "m_OverrideReferenceName": prop,
         },
@@ -264,10 +266,11 @@ def clip_stream(prop: str, alpha_from: int = 7, clip: bool = True, override: boo
     return "\n\n".join(json.dumps(o, indent=4) for o in objects) + "\n"
 
 
-def older_clip(prop: str, threshold: float) -> str:
-    """A graph from before the stream, as `FAE_TreeBranch` is: a PBR master node whose Alpha
-    reads the alpha of a sample of the texture property `prop`, and whose AlphaClipThreshold,
-    linked to nothing, is `threshold`."""
+def older_clip(prop: str, threshold: float, linked: bool = False) -> str:
+    """A graph from before the stream: a PBR master node whose Alpha reads the alpha of a sample
+    of the texture property `prop`, and whose AlphaClipThreshold is `threshold`. With `linked`,
+    it has `FAE_TreeBranch`'s shape: the threshold is linked to a `_Cutoff` property, and the
+    sample's alpha reaches Alpha through a sub graph (its `CrossfadeLOD`)."""
 
     def entry(kind: str, data: dict) -> dict:
         return {
@@ -310,9 +313,34 @@ def older_clip(prop: str, threshold: float) -> str:
             ),
             entry("SampleTexture2DNode", {"m_GuidSerialized": "sample"}),
         ],
-        "m_SerializableEdges": [edge("property", 0, "sample", 1), edge("sample", 7, "master", 7)],
+        "m_SerializableEdges": [edge("property", 0, "sample", 1)],
         "m_ActiveOutputNodeGuidSerialized": "master",
     }
+    if linked:
+        graph["m_SerializedProperties"].append(
+            entry(
+                "Internal.Vector1ShaderProperty",
+                {
+                    "m_Guid": {"m_GuidSerialized": "cutoff"},
+                    "m_Name": "Alpha clipping",
+                    "m_DefaultReferenceName": "Vector1_x",
+                    "m_OverrideReferenceName": "_Cutoff",
+                },
+            )
+        )
+        graph["m_SerializableNodes"] += [
+            entry(
+                "PropertyNode", {"m_GuidSerialized": "clip", "m_PropertyGuidSerialized": "cutoff"}
+            ),
+            entry("SubGraphNode", {"m_GuidSerialized": "crossfade"}),
+        ]
+        graph["m_SerializableEdges"] += [
+            edge("clip", 0, "master", 8),
+            edge("sample", 7, "crossfade", 1),
+            edge("crossfade", 2, "master", 7),
+        ]
+    else:
+        graph["m_SerializableEdges"].append(edge("sample", 7, "master", 7))
     return json.dumps(graph, indent=4)
 
 
@@ -775,18 +803,38 @@ def main() -> None:
             "M_Thing", {"Texture2D_x": pack.texture("T_Base", BASE)}, {"_Color": TINT}, shader
         )
 
-    # A shader that clips sets no keyword in the material. These three clip on their base's
-    # alpha: a graph's target, an older graph's threshold (as `FAE_TreeBranch`'s) and a `.shader`'s
-    # tags. The other four don't: a `.shader` with no cutout tag, a graph leaving the clip to the
-    # material, one whose Alpha reads the base's red, and an older graph whose threshold is 0.
+    # A shader that clips sets no keyword in the material. These four clip on their base's
+    # alpha: a graph's target, an older graph's threshold, one with `FAE_TreeBranch`'s shape (a
+    # linked threshold of 0, and its alpha through a sub graph) and a `.shader`'s tags. The other
+    # six don't: a `.shader` with no cutout tag, a graph leaving the clip to the material, one
+    # whose target doesn't clip, one whose Alpha reads the base's red, one that clips on another
+    # texture's alpha, and an older graph whose threshold is 0.
     pack = Pack(
         "shader-clip",
-        ["M_Graph", "M_Older", "M_Shader", "M_Opaque", "M_Override", "M_Red", "M_NoThreshold"],
+        [
+            "M_Graph",
+            "M_Older",
+            "M_Linked",
+            "M_Shader",
+            "M_Opaque",
+            "M_Override",
+            "M_NoClip",
+            "M_Red",
+            "M_OtherAlpha",
+            "M_NoThreshold",
+        ],
     )
     base = pack.texture("T_Base", BASE, 0)
+    other = pack.texture("T_Other", MASK, 0)
     for name, prop, shader, file_id in (
         ("M_Graph", "_BaseMap", pack.graph("S_Graph", clip_stream("_BaseMap")), GRAPH_FILE_ID),
         ("M_Older", "_MainTex", pack.graph("S_Older", older_clip("_MainTex", 0.5)), GRAPH_FILE_ID),
+        (
+            "M_Linked",
+            "_MainTex",
+            pack.graph("S_Linked", older_clip("_MainTex", 0, linked=True)),
+            GRAPH_FILE_ID,
+        ),
         (
             "M_Shader",
             "_MainTex",
@@ -798,6 +846,12 @@ def main() -> None:
             "M_Override",
             "_BaseMap",
             pack.graph("S_Override", clip_stream("_BaseMap", override=True)),
+            GRAPH_FILE_ID,
+        ),
+        (
+            "M_NoClip",
+            "_BaseMap",
+            pack.graph("S_NoClip", clip_stream("_BaseMap", clip=False)),
             GRAPH_FILE_ID,
         ),
         (
@@ -814,6 +868,9 @@ def main() -> None:
         ),
     ):
         pack.material(name, {prop: base}, shader=shader, file_id=file_id)
+    # The base is `_BaseMap`, and the graph clips on `_Detail`'s alpha.
+    shader = pack.graph("S_OtherAlpha", clip_stream("_Detail", shown="Detail"))
+    pack.material("M_OtherAlpha", {"_BaseMap": base, "_Detail": other}, shader=shader)
 
     Pack("lod-only").objects(["Model_LOD1"])
 

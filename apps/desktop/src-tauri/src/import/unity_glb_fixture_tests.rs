@@ -431,20 +431,29 @@ mod tests {
     }
 
     /// A shader that clips on the base's alpha cuts out a material with no cutout keyword: a
-    /// graph's target, an older graph's threshold (as `FAE_TreeBranch`'s) and a `.shader`'s tags.
-    /// One with no cutout tag, a graph that leaves the clip to the material, one whose Alpha reads
-    /// the base's red and an older graph whose threshold is 0 leave it opaque.
+    /// graph's target, an older graph's threshold, one with `FAE_TreeBranch`'s shape (a linked
+    /// threshold of 0, and the alpha through a sub graph) and a `.shader`'s tags. One with no
+    /// cutout tag, a graph that leaves the clip to the material, one whose target doesn't clip,
+    /// one whose Alpha reads the base's red, one that clips on another texture's alpha and an
+    /// older graph whose threshold is 0 leave it opaque.
     #[tokio::test]
     async fn a_shader_that_clips_on_the_base_s_alpha_makes_a_cutout() {
         let Some(glb) = convert("shader-clip").await else {
             return;
         };
-        for name in ["M_Graph", "M_Older", "M_Shader"] {
+        for name in ["M_Graph", "M_Older", "M_Linked", "M_Shader"] {
             let m = glb.material(name);
             assert_eq!(m.alpha_mode.as_deref(), Some("MASK"), "{name}: {m:?}");
             assert!(is(m.base, BASE) && m.base.unwrap().1 == 0, "{name}: {m:?}");
         }
-        for name in ["M_Opaque", "M_Override", "M_Red", "M_NoThreshold"] {
+        for name in [
+            "M_Opaque",
+            "M_Override",
+            "M_NoClip",
+            "M_Red",
+            "M_OtherAlpha",
+            "M_NoThreshold",
+        ] {
             let m = glb.material(name);
             assert!(is(m.base, BASE) && m.alpha_mode.is_none(), "{name}: {m:?}");
         }
