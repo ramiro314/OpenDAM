@@ -600,7 +600,7 @@ The list below doesn't cover two of these. The owner accepted them as recorded o
   IDs Unity hashes from the mesh's name. The `.meta` doesn't name them, and the one-list fallback
   can't apply to two meshes with two lists.
 
-**Big Castle's ivy cards and `grassPlane` have no material in any file.** On 2026-11-03 the owner
+**Big Castle's ivy background planes and `grassPlane` have no material in any file.** On 2026-11-03 the owner
 accepted `ivy_a` and `grassPlane` if no file held their materials (decision 6), and Work item 5
 searched on 2026-11-04. The search found the same gap in 4 more ivy GLBs, which the owner's
 decision doesn't name: they are recorded here on the strength of that finding. All 6 are among the
@@ -618,10 +618,13 @@ decision doesn't name: they are recorded here on the strength of that finding. A
 Where the search looked:
 
 - **Package.** The whole `.unitypackage`: every file in it is in the built pack.
-- **`.meta` files.** All 952. The FBX importers (`importMaterials: 0`, no `externalObjects`)
-  remap no material.
-- **Prefabs and scenes.** All 260 prefabs and 5 scenes. No scene places either FBX directly. A
-  scene's overrides on `ivy_a`'s prefab change only the bark's material.
+- **`.meta` files.** All 952. The importers of the six ivy FBX files (`ivy_a`, `ivy_b` and
+  `ivy_c`, each with its `_lod`) and of `grassPlane.fbx` (`importMaterials: 0`, no
+  `externalObjects`) remap no material.
+- **Prefabs and scenes.** All 260 prefabs and 5 scenes. No scene places any of those seven FBX
+  files directly: only the `ivy_a`, `ivy_b` and `ivy_c` prefabs refer to the ivy ones, and
+  nothing refers to `grassPlane.fbx`. The scenes' material overrides on the three ivy prefabs
+  change only the bark's renderers.
 - **The other assets.** The two binary terrain assets, read through `unity_text.py`, use
   `grass_basecolor.png` and `plant_dry_basecolor.png` as detail textures and `tree_b` as a tree.
 - **Materials and textures.** `grass.mat`, `ivy_a_bg_plane_basecolor.png` and
