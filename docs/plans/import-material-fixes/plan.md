@@ -690,7 +690,8 @@ The first gate ([gate-report.md](gate-report.md), measured at `39c679d`) held th
 owner's review rejected models in 5 packs, LostRuins lost a mesh with no warning, and the report
 listed 9 decisions and 6 other findings. The owner answered them on 2026-11-03, over four
 interview rounds. This section records those answers, the work they make, and the second gate
-run. The old libraries stay until the second gate passes and the owner has reviewed its sheets.
+run. Two more answers, on 2026-11-04, settled handoffs the plan's review found. The old
+libraries stay until the second gate passes and the owner has reviewed its sheets.
 
 ### Decisions on the gate report
 
@@ -721,6 +722,8 @@ And the rest:
 | Kenney's errors | A preview where one can be made, else a clear reason, not a bare error |
 | Hoist warning | An estimate's preview says the hoist is checked when the export runs, and the build warns on a hoist that was a no-op |
 | Camera | It changes only previews made after it. Nothing requeues existing thumbnails |
+| `tree_b` with no fix | If item 4 stops without a fix, the bump goes ahead and the fix waits for version 7 (decided 2026-11-04) |
+| Build hoist warning | Only a build whose preview was an estimate warns on a hoist that found no folder (decided 2026-11-04) |
 | Second gate | All four runs again in a new clean profile, once the converter, Unreal, hoist, camera and audit work has merged |
 | Floors | The second gate runs against today's `floors.tsv`, which may not fall. Its report proposes the measured counts as new floors, for the owner to accept |
 | Issue #261 | The second gate's pull request says "Part of #261", and the owner closes the issue after the review |
@@ -730,9 +733,12 @@ And the rest:
 Each item below is one ticket. The order they can land in is under [Order](#order).
 
 **Unity converter.** Items 1 to 5 change `unity_glb.py` and don't bump its version. Each lands with
-fixture tests in `tests/fixtures/unity-glb/`, and the cache key still holds `opendam-unity-glb/5`,
-so nothing reconverts until item 6. Each ticket that can measure its change on real packs does so
-with a prototype run in a throwaway profile, as Piece 1 did, and reports the GLBs it changes.
+fixture tests in `tests/fixtures/unity-glb/`, and the cache key still holds `opendam-unity-glb/5`.
+So nothing reconverts until item 6, except that item 3 adds `.shader` files as inputs, which
+changes the cache key of every pack that ships one: those packs reconvert at version 5 once item 3
+merges, with whichever fixes have merged by then. Item 6's bump reconverts everything anyway. Each
+ticket that can measure its change on real packs does so with a prototype run in a throwaway
+profile, as Piece 1 did, and reports the GLBs it changes.
 
 1. **Tint over an only-texture base.** When the base texture came from the only-texture rule (rule
    3 of Piece 1), the material's base colour becomes the glTF `baseColorFactor` over it, written
@@ -759,7 +765,8 @@ with a prototype run in a throwaway profile, as Piece 1 did, and reports the GLB
    the same mismatch reaches. Then match a prefab's material list to Unity's submesh order. The leaf
    map lands on the 48 cards and the bark on the tree. The ticket lists every GLB whose slots
    change. If the cause turns out to be something else, the ticket reports it and stops, and the fix
-   is shaped afresh.
+   is shaped afresh for version 7. Item 6 then goes ahead without it, `tree_b` goes under
+   [Known gaps](#known-gaps), and it doesn't hold the deletion.
 5. **`ivy_a` and `grassPlane`'s materials.** Search Big Castle's prefabs, scenes and `.meta` files
    for the materials of `Plane.081` and `grassPlane`'s mesh. If a file holds them, the converter
    learns to read it, with a fixture. If none does, the ticket records them as accepted leftovers
@@ -772,13 +779,16 @@ with a prototype run in a throwaway profile, as Piece 1 did, and reports the GLB
 **Unreal export.** Each item bumps `UNREAL_GLB_VERSION` itself when it changes the export.
 
 7. **Find meshes on disk, and warn on any left out.** `unreal_glb.py` lists the work copy's
-   `.uasset` packages under `Content/` from disk, rather than trusting
-   `get_assets_by_path`, loads each by path, and exports those of an export type by their own class.
-   An `ObjectRedirector` is skipped, and needs no GLB. Any package of an export type that ends with
-   no GLB and isn't recorded as failed becomes a warning in the run's warnings, naming it, so a mesh
-   lost this way can't read as complete again. Bump `UNREAL_GLB_VERSION`. Rust tests with the stub
-   editor cover a package the registry doesn't list and one left without a GLB. A LostRuins run
-   gives 102 GLBs, `SM_column04` among them.
+   `.uasset` packages under `Content/` from disk and compares them with `get_assets_by_path`. Assets
+   the registry lists export as today. Only a package the registry misses is loaded by path, and
+   exported when its own class is an export type. An `ObjectRedirector` is skipped, and needs no
+   GLB. Any package of an export type that ends with no GLB and isn't recorded as failed becomes a
+   warning in the run's warnings, naming it, so a mesh lost this way can't read as complete again.
+   Bump `UNREAL_GLB_VERSION`. Rust tests with the stub editor cover a package the registry doesn't
+   list and one left without a GLB. In the real editor, a LostRuins run gives 102 GLBs,
+   `SM_column04` among them, and a Waterways run, after the plan's memory check, gives 161 GLBs, no
+   GLB or warning for the redirectors `SM_Cylinder` and `Cylinder1`, and the editor's peak memory
+   against its 20 GB cap. Both are recorded in the pull request.
 8. **Waterways' ferns.** Read `MI_Fern_02`'s material graph in the editor and find why the bake
    keeps so little of its mask (the baked base is 96% opaque). If the cause is in the export, fix it
    there, bump `UNREAL_GLB_VERSION`, and run Waterways again. If it isn't, or isn't found, record
@@ -790,9 +800,13 @@ with a prototype run in a throwaway profile, as Piece 1 did, and reports the GLB
    which gives every `.uasset` a GLB, Waterways' root-level redirector `Content/Cylinder1.uasset`
    among them, so `flatten` keeps `Waterways/` and `hoist Meshes` finds nothing. For an estimate
    tree, the preview notes that the hoist is checked once the export runs, rather than warning.
-   The scan still reads no file body. A build whose hoist step finds no folder then adds a warning
-   to its run, so a hoist that really does nothing is still reported. Waterways' dialog no longer
-   warns, and its build doesn't either.
+   The scan still reads no file body. A build whose preview was an estimate, and whose hoist step
+   finds no folder, then adds a warning to its run, so a hoist that really does nothing is still
+   reported. Any other build warns as today, not at all, because its preview already showed the
+   warning: Wizard Room's default `hoist Art` moves nothing, and its build must not warn, or the
+   gate fails it. Waterways' dialog no longer warns, and its build doesn't either. Tests: an
+   estimate tree's preview gives the note and no warning, a build of an estimate with a missing
+   hoist folder warns, and a build of an exact tree with one doesn't.
 
 **Previews.**
 
@@ -834,9 +848,11 @@ Unreal one a ticket that bumps `UNREAL_GLB_VERSION`.
     `floors.tsv` and the expected geometry list as item 2 grew it, and also when:
     - POLYGON's 162 grid GLBs carry their yellow factor.
     - Fantasy Adventure's 15 GLBs have no billboard mesh, and the 3 branch materials are `MASK`.
-    - `tree_b`'s leaf map is on its cards, and every other slot change item 4 listed is there.
+    - If item 4 shipped a fix, `tree_b`'s leaf map is on its cards, and every other slot change it
+      listed is there.
     - LostRuins has 102 GLBs, and no package of an export type is left without one or a warning.
     - Waterways' dialog shows no hoist warning, and its textured count is read with item 12's audit.
+    - No pack's build warns about a hoist, Wizard Room's included.
 
     Its results go in `gate-report-2.md` beside the first report, with after sheets from the same
     path lists, registered as evidence, and a proposed floor per pack from the measured counts.
