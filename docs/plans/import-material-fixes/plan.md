@@ -825,6 +825,14 @@ profile, as Piece 1 did, and reports the GLBs it changes.
    there, bump `UNREAL_GLB_VERSION`, and run Waterways again. If it isn't, or isn't found, record
    what was learned under [Known gaps](#known-gaps) and change nothing.
 
+   Result (2026-11-04): the cause is in the export, but it isn't the mask. The export writes each
+   Nanite mesh's fallback geometry, and no small change fixes that, so this item landed as a
+   record under [Known gaps](#known-gaps) ("Unreal Nanite meshes export their fallback mesh"),
+   with no code change and no version bump. That departs from the route above. Its fix is a later
+   Unreal export ticket that bumps `UNREAL_GLB_VERSION`. The owner shapes it first, so it has no
+   number in this list or under [Order](#order) yet, and it doesn't hold the second gate: the
+   ferns stay as they are in it.
+
 **Import dialog.**
 
 9. **Hoist warning on an estimate.** An Unreal pack's tree is an estimate (`Project::estimate`),
@@ -961,11 +969,11 @@ Items 11, 13 and 14 can land before or after the second gate.
   UE 5.8 editor on a work copy of Waterways). The ferns' mask isn't lost: `MI_Fern_02`'s parent
   `MM_Plants` takes its opacity mask from `T_Fern_O`'s red channel, and that texture is itself
   99.3% at or above the 0.3333 cutoff, because the fern's leaflets are geometry and the mask only
-  trims specks. A `SIMPLE` bake matches the texture to 0.13% per pixel. The blocky leaf ends come
+  trims specks. A `SIMPLE` bake matches the texture to a mean absolute difference of 0.0013. The blocky leaf ends come
   from the geometry: the exporter writes render data, and a Nanite mesh's LOD 0 there is its
   fallback (relative error 1.0 here), so `SM_Fern_01` exports 5,621 of its 148,520 triangles,
   `SM_Fern_02` 2,826 of 78,152 and `SM_Fern_04` 1,047 of 17,728. `SM_Fern_03` isn't Nanite and
-  exports all 148,520. All 112 of Waterways' 146 static meshes that are Nanite export exactly
+  exports all 148,520, the same count as `SM_Fern_01`'s source, as the editor reports both. All 112 of Waterways' 146 static meshes that are Nanite export exactly
   their fallback's count, 111 of them reduced: 352,417 triangles in all, against 18,559,387 in
   their sources. No one-line change fixes it:
   - `export_source_model` alone writes the source geometry, but `MM_Plants` reads vertex colour
@@ -975,7 +983,7 @@ Items 11, 13 and 14 can land before or after the second gate.
   - The source model with a `SIMPLE` bake gives `SM_Fern_01` its rounded leaflets and its colour.
     But `SIMPLE` everywhere would break materials that really need mesh data, such as
     `MM_MasterWorldAligned`'s.
-  - Every source is too big to export whole: `SM_SmallStone_04` is 8,472,778 triangles, a 243 MB
+  - Exporting every source whole is too big: `SM_SmallStone_04` is 8,472,778 triangles, a 243 MB
     GLB, against 662 in its fallback.
 
   A fix is an Unreal export ticket that bumps `UNREAL_GLB_VERSION`, shaped first: which Nanite
