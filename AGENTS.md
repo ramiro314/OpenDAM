@@ -142,7 +142,11 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               unreal_glb.py (UNREAL_GLB_VERSION) in headless Unreal Editor
                               sessions of `batch` assets under import.unrealMemoryMax, the editor
                               found at import.unrealEditorRoot, each GLB cached as its session
-                              ends so an interrupted run resumes, and tools, what Settings'
+                              ends so an interrupted run resumes. It exports the asset registry's
+                              meshes and animations and the packages on disk below `Content/`
+                              the registry misses whose own class is one, loaded by path (a
+                              redirector needs none), and warns on any left without a GLB that
+                              didn't fail (`SkipReason::NoGlb`); and tools, what Settings'
                               Import tools section checks (assimp at import.assimpPath, the
                               Unreal Editor) and the conversion cache's size, which Clear
                               empties only while no run executes (Engine::cache_use)

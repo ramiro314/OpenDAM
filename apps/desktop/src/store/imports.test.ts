@@ -458,6 +458,15 @@ describe('progress and warnings', () => {
     );
   });
 
+  test('an Unreal package left without a GLB says whether the export failed on it', () => {
+    expect(skippedText({ sourcePath: ['/Game/Meshes/SM_A'], reason: 'notExported' })).toBe(
+      '/Game/Meshes/SM_A: the Unreal export failed on it'
+    );
+    expect(skippedText({ sourcePath: ['/Game/Meshes/SM_B'], reason: 'noGlb' })).toBe(
+      '/Game/Meshes/SM_B: a mesh or animation the export made no GLB of'
+    );
+  });
+
   test('the heading counts warnings of every reason', () => {
     expect(warningsHeading(1)).toBe('1 warning');
     expect(warningsHeading(2)).toBe('2 warnings');

@@ -29,7 +29,10 @@ mod tests {
     /// its path below `Content/`) gets no GLB either: as the script does, the session counts it
     /// in its batch, lists it in `.gltf-failed`, and later sessions skip it.
     /// With a `kill` file holding K, a session exits 137, as the memory cap kills it, once it
-    /// has written K GLBs.
+    /// has written K GLBs. Each session lists the `SM_*` packages in `.gltf-expected`, but for
+    /// those an `ObjectRedirector` (named in a `redirect` file), which get no GLB; one named in
+    /// an `unlisted` file is one the registry misses, which the script loads by path and exports
+    /// all the same; and one named in a `lose` file is listed but never exported nor failed.
     fn stub_editor(root: &Path) {
         let r = root.display();
         write_editor(
@@ -43,9 +46,14 @@ case "$2" in -ExecutePythonScript=*) [ -f "${{2#-ExecutePythonScript=}}" ] || ex
 stall=$(cat '{r}/stall' 2>/dev/null || echo 999)
 content="$(dirname "$1")/Content"
 all=0; todo=0
+: > "$GLTF_OUT/.gltf-expected"
 for asset in $(cd "$content" && find . -name 'SM_*.uasset' | sort); do
-  all=$((all + 1))
   rel=${{asset#./}}; rel=${{rel%.uasset}}
+  grep -qx "$rel" '{r}/redirect' 2>/dev/null && continue
+  grep -qx "$rel" '{r}/unlisted' 2>/dev/null && echo "LogPython: [gltf] found /Game/$rel, a StaticMesh the asset registry doesn't list"
+  echo "/Game/$rel" >> "$GLTF_OUT/.gltf-expected"
+  all=$((all + 1))
+  grep -qx "$rel" '{r}/lose' 2>/dev/null && continue
   [ -e "$GLTF_OUT/$rel.glb" ] && continue
   grep -qx "/Game/$rel" "$GLTF_OUT/.gltf-failed" 2>/dev/null && continue
   todo=$((todo + 1))
@@ -54,6 +62,8 @@ echo "LogPython: [gltf] $all assets, $todo left, exporting up to $GLTF_BATCH (st
 made=0; wrote=0; left=0
 for asset in $(cd "$content" && find . -name 'SM_*.uasset' | sort); do
   rel=${{asset#./}}; rel=${{rel%.uasset}}
+  grep -qx "$rel" '{r}/redirect' 2>/dev/null && continue
+  grep -qx "$rel" '{r}/lose' 2>/dev/null && continue
   glb="$GLTF_OUT/$rel.glb"
   [ -e "$glb" ] && continue
   grep -qx "/Game/$rel" "$GLTF_OUT/.gltf-failed" 2>/dev/null && continue
@@ -510,6 +520,78 @@ echo "$left" > "$GLTF_OUT/.gltf-remaining""#
         assert_eq!((row.progress_done, row.progress_total), (3, 3));
         assert_eq!(row.warnings.len(), 1);
         assert_eq!(s.passes(&run.id, STEP), [whole_pass(3)]);
+    }
+
+    /// A package the asset registry misses is exported all the same, and a redirector needs no
+    /// GLB and gives no warning.
+    #[tokio::test]
+    async fn a_package_the_registry_misses_exports_and_a_redirector_needs_no_glb() {
+        let s = setup_with(false).await;
+        let root = s.stub_unreal().await;
+        std::fs::write(root.join("unlisted"), "Fixture/Meshes/SM_B\n").unwrap();
+        std::fs::write(root.join("redirect"), "Fixture/Meshes/SM_C\n").unwrap();
+        let run = s
+            .engine
+            .start_import(s.unreal_request("unreal.zip"))
+            .await
+            .unwrap();
+        tokio::spawn(s.engine.clone().start());
+
+        let done = s.wait_for(&run.id, "done").await;
+        assert_eq!(
+            on_disk(&s.pack_dir()),
+            [
+                "README.md",
+                "Readme.txt",
+                "SM_A.glb",
+                "SM_B.glb",
+                "datapackage.json"
+            ]
+        );
+        assert_eq!(done.warnings, []);
+        s.no_work_folder();
+    }
+
+    /// A package of an export type the export leaves with no GLB, though the exporter didn't
+    /// fail on it, is a warning naming it, and a rebuild from the cache, which runs no editor,
+    /// warns again.
+    #[tokio::test]
+    async fn a_package_left_without_a_glb_is_a_warning_even_from_the_cache() {
+        let s = setup_with(false).await;
+        let root = s.stub_unreal().await;
+        std::fs::write(root.join("lose"), "Fixture/Meshes/SM_B\n").unwrap();
+        let run = s
+            .engine
+            .start_import(s.unreal_request("unreal.zip"))
+            .await
+            .unwrap();
+        tokio::spawn(s.engine.clone().start());
+
+        let lost = [(
+            vec!["/Game/Fixture/Meshes/SM_B".to_string()],
+            SkipReason::NoGlb,
+        )];
+        let warned = |warnings: &[crate::import::unitypackage::SkippedEntry]| {
+            warnings
+                .iter()
+                .map(|w| (w.source_path.clone(), w.reason))
+                .collect::<Vec<_>>()
+        };
+        let done = s.wait_for(&run.id, "done").await;
+        assert!(!s.pack_dir().join("SM_B.glb").exists());
+        assert!(s.pack_dir().join("SM_C.glb").is_file());
+        assert_eq!(warned(&done.warnings), lost);
+
+        let sessions_before = sessions(&root).len();
+        let pack_id = run.packs[0].pack_id.clone();
+        let rebuild = s
+            .engine
+            .rebuild_pack("lib", &pack_id, Vec::new())
+            .await
+            .unwrap();
+        let rebuilt = s.wait_for(&rebuild.id, "done").await;
+        assert_eq!(sessions(&root).len(), sessions_before, "no editor ran");
+        assert_eq!(warned(&rebuilt.warnings), lost);
     }
 
     /// A project with a `Source/` folder is refused with the reason: by the scan, which offers

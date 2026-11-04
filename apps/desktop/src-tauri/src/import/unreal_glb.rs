@@ -13,6 +13,10 @@
 //!   session. It restarts until nothing is left, and fails the step when a session makes no
 //!   progress. A session the cap kills after exporting something is followed by another; one
 //!   it kills before fails the step, naming the cap.
+//! - **What it exports.** The asset registry's meshes and animations, and the packages on disk
+//!   the registry misses whose own class is one, a redirector skipped. Each session lists the
+//!   packages it expects a GLB of, and any left with none that didn't fail is a warning
+//!   (`SkipReason::NoGlb`), so a mesh lost on the way can't read as complete.
 //! - **The cache.** Each GLB is kept at `<cache>/glb/<key>.glb` as soon as its session ends,
 //!   keyed by the original's sha256, its `/Game` path, `UNREAL_GLB_VERSION` and the editor's
 //!   version (`glb_key`), and a record of the run's exports so far (`Record`). The next run
@@ -34,7 +38,7 @@ use crate::export::hashes::sha256_bytes;
 
 /// The script's version, which every GLB's cache key holds. The script declares it as
 /// `VERSION`, which a test keeps equal: bump both when the GLBs it writes change.
-pub const UNREAL_GLB_VERSION: &str = "opendam-unreal-glb/2";
+pub const UNREAL_GLB_VERSION: &str = "opendam-unreal-glb/3";
 
 /// The export script, embedded so the installed app needs no file beside it.
 const SCRIPT: &str = include_str!("unreal_glb.py");
@@ -379,13 +383,24 @@ fn record_key(original_sha256: &str, editor_version: &str) -> String {
 }
 
 /// What the runs over one original have exported, by `/Game` path, rewritten after every
-/// session: the GLBs made, the assets the exporter failed on, and whether a session reported
-/// nothing left.
+/// session: the GLBs made, the assets the exporter failed on, whether a session reported
+/// nothing left, and the packages of an export type the last session listed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub exported: BTreeSet<String>,
     pub failed: BTreeSet<String>,
     pub complete: bool,
+    #[serde(default)]
+    pub expected: BTreeSet<String>,
+}
+
+impl Record {
+    /// The packages of an export type left with no GLB that the exporter didn't fail on.
+    fn lost(&self) -> impl Iterator<Item = &String> {
+        self.expected
+            .iter()
+            .filter(|game| !self.exported.contains(*game) && !self.failed.contains(*game))
+    }
 }
 
 /// One run of the step: the export of the zip `original` into the empty `staging` folder.
@@ -442,8 +457,8 @@ impl Export<'_> {
     }
 
     /// Writes the pack's GLBs and docs into the staging folder, as the extracted files, and
-    /// returns them with the entries skipped: the project's unsafe entries, and the assets the
-    /// exporter failed on.
+    /// returns them with the entries skipped: the project's unsafe entries, the assets the
+    /// exporter failed on, and those of an export type left with no GLB.
     pub async fn run(&self) -> Result<Extraction, Stop> {
         (self.progress)(Progress {
             step: STEP,
@@ -540,6 +555,10 @@ impl Export<'_> {
         skipped.extend(record.failed.iter().map(|game| SkippedEntry {
             source_path: vec![game.clone()],
             reason: SkipReason::NotExported,
+        }));
+        skipped.extend(record.lost().map(|game| SkippedEntry {
+            source_path: vec![game.clone()],
+            reason: SkipReason::NoGlb,
         }));
         Ok(Extraction { files, skipped })
     }
@@ -657,6 +676,9 @@ impl Export<'_> {
             let progressed = after.len() > before.len() || failed.len() > record.failed.len();
             record.exported = after;
             record.failed = failed;
+            if let Some(expected) = expected_in(&out).await {
+                record.expected = expected;
+            }
             let remaining = tokio::fs::read_to_string(out.join(".gltf-remaining"))
                 .await
                 .ok()
@@ -807,14 +829,26 @@ async fn exported_in(out: &Path) -> Result<BTreeSet<String>, Stop> {
 /// The `/Game` paths the script failed on in this work folder, from its `.gltf-failed`, one per
 /// line: a path can hold spaces (`/Game/My Pack/SM_Rock`).
 async fn failed_in(out: &Path) -> BTreeSet<String> {
-    let failed = tokio::fs::read_to_string(out.join(".gltf-failed"))
+    packages_in(&out.join(".gltf-failed"))
         .await
-        .unwrap_or_default();
-    failed
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
+        .unwrap_or_default()
+}
+
+/// The packages of an export type the last session listed, from its `.gltf-expected`, `None`
+/// when no session wrote one.
+async fn expected_in(out: &Path) -> Option<BTreeSet<String>> {
+    packages_in(&out.join(".gltf-expected")).await
+}
+
+/// The `/Game` paths in the script's list `file`, one per line.
+async fn packages_in(file: &Path) -> Option<BTreeSet<String>> {
+    let text = tokio::fs::read_to_string(file).await.ok()?;
+    Some(
+        text.lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// The `.ini` sections through which a project names code for the editor to run as it starts,
