@@ -518,6 +518,32 @@ The rules:
     is exactly `SM_Bulidings.glb` (0 to 2,116,110 vertices, 0 to 176 primitives) and
     `SM_Grass_Foliage.glb` (0 to 3,610 vertices, 0 to 1 primitive). Any other increase may be
     doubled geometry from a LOD group that didn't match, and blocks the merge until explained.
+  - From [After the first gate](#after-the-first-gate)'s item 2 on, the list also holds Fantasy
+    Adventure's 15 trees under `Models/Trees/`, each losing its `_Billboard` mesh: 2 meshes to 1,
+    one primitive fewer, and the billboard's vertices. 11 of them also lose the base and normal
+    map of their billboard's own material, which `glb_audit.py compare` lists as lost maps
+    (`base: 3 to 2 materials`, `normal: 2 to 1 materials`). Those 22 losses are expected, and no
+    other. The other 4 billboards had no texture (the "4 billboards" leftovers of
+    [Piece 1 result](#piece-1-result)), so those 4 GLBs become fully textured and the pack's
+    count rises from 26 to 30 of 36. Before is `baseline-v4.tsv`, which version 5 matched:
+
+    | GLB | Vertices | Primitives | Lost with the billboard |
+    |---|---|---|---|
+    | `FAE_Birch_A.glb` | 1,518 to 1,502 | 3 to 2 | Base and normal of `FAE_Birch_A_Billboard` |
+    | `FAE_Birch_B.glb` | 722 to 706 | 3 to 2 | Base and normal of `FAE_Birch_B_Billboard` |
+    | `FAE_Birch_C.glb` | 1,073 to 1,057 | 3 to 2 | Base and normal of `FAE_Birch_C_Billboard` |
+    | `FAE_Palm_A.glb` | 1,054 to 1,038 | 3 to 2 | Base and normal of `FAE_Palm_A_Billboard` |
+    | `FAE_Palm_B.glb` | 2,754 to 2,730 | 3 to 2 | None, its billboard was untextured |
+    | `FAE_Palm_C.glb` | 3,666 to 3,642 | 3 to 2 | None, its billboard was untextured |
+    | `FAE_Pine_A.glb` | 1,562 to 1,546 | 3 to 2 | Base and normal of `FAE_Pine_A_Billboard` |
+    | `FAE_Spruce_A.glb` | 1,713 to 1,697 | 3 to 2 | Base and normal of `FAE_Spruce_A_Billboard` |
+    | `FAE_Spruce_B.glb` | 1,481 to 1,465 | 3 to 2 | Base and normal of `FAE_Spruce_B_Billboard` |
+    | `FAE_Spruce_C.glb` | 1,426 to 1,410 | 3 to 2 | Base and normal of `FAE_Spruce_C_Billboard` |
+    | `FAE_Tree_A.glb` | 4,573 to 4,557 | 3 to 2 | Base and normal of `FAE_Tree_A_Billboard` |
+    | `FAE_Tree_B.glb` | 3,609 to 3,593 | 3 to 2 | Base and normal of `FAE_Tree_B_Billboard` |
+    | `FAE_Tree_C.glb` | 4,401 to 4,385 | 3 to 2 | Base and normal of `FAE_Tree_C_Billboard` |
+    | `FAE_Willow_A.glb` | 8,049 to 8,025 | 3 to 2 | None, its billboard was untextured |
+    | `FAE_Willow_B.glb` | 10,704 to 10,680 | 3 to 2 | None, its billboard was untextured |
   - Rebuilding Ancient Ruins in step 5's copy replaces each changed GLB's version 4 thumbnail,
     keeps a tag and a rename, and leaves byte-identical GLBs and their thumbnails alone.
 - **Piece 2:** the 6 Fab packs get a model cover, not a texture. Wizard Room's dialog warns about
@@ -756,7 +782,13 @@ profile, as Piece 1 did, and reports the GLBs it changes.
    A file whose only mesh is a billboard keeps it. Fantasy Adventure's 15 GLBs lose their crossed
    cards. The ticket adds those 15 GLBs, with their before and after vertex and primitive counts, to
    the expected geometry list (Piece 1 under [Each piece](#each-piece)), and, if one loses a map
-   with its billboard, names it there as expected.
+   with its billboard, names it there as expected. Measured on 2026-11-04 by a prototype run of
+   the script, before and after, over the first gate's Fantasy Adventure files, all 36 models:
+   exactly those 15 GLBs changed, and 11 of them lost their billboard's base and normal map,
+   the list's figures. A billboard that is a file's only mesh is in none of the 11 packs, so
+   only the fixtures cover it. The second gate's leftover check
+   (`gate_plan_check.py`) will find 4 fewer Fantasy Adventure leftovers than Piece 1 result's
+   table, the 4 untextured billboards.
 3. **A cutout read from the shader.** First check that `FAE_TreeBranch` clips on alpha in its shader
    file. Then a material on a shader that clips, and with no `_ALPHATEST_ON` or
    `TransparentCutout`, gets its base texture's alpha as a `MASK`. A `.shader` file becomes a
