@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import * as THREE from 'three';
-import { VIEW_DIRECTION, cameraUp, measureShape, viewDirection, type Shape } from './camera';
+import {
+  VIEW_DIRECTION,
+  cameraUp,
+  measureShape,
+  seenArea,
+  viewDirection,
+  type Shape,
+} from './camera';
 
 const v = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z);
 /** The angle between two directions, in degrees */
@@ -12,11 +19,11 @@ const edgeOn = v(1, 0, -1).normalize();
 /** A shape whose box is thinnest along `thin` */
 function shape(
   extents: [number, number, number],
-  { thin = edgeOn, normalSum = v(0, 0, 0), area = 1 } = {}
+  { thin = edgeOn, normalSum = v(0, 0, 0), area = 1, faces = new Float32Array() } = {}
 ): Shape {
   const long = (Math.abs(thin.y) > 0.9 ? v(1, 0, 0) : v(0, 1, 0)).cross(thin).normalize();
   const middle = thin.clone().cross(long);
-  return { box: { axes: [thin, middle, long], extents }, normalSum, area };
+  return { box: { axes: [thin, middle, long], extents }, normalSum, area, faces };
 }
 
 describe('viewDirection', () => {
@@ -49,11 +56,33 @@ describe('viewDirection', () => {
     expect(angle(viewDirection(card), back)).toBeLessThan(20);
   });
 
+  test('a curved card is faced where its faces point, not along its thinnest axis', () => {
+    // A short trough: its thinnest axis is its length, edge on to the usual view, and its faces
+    // point along its middle axis, +Y here, which the usual view sees from 29.5° above.
+    const trough = (normalSum: THREE.Vector3) => shape([0.5, 1, 2], { normalSum });
+    expect(viewDirection(trough(v(0, 0.64, 0)))).toEqual(VIEW_DIRECTION);
+    expect(angle(viewDirection(trough(v(0, -0.64, 0))), v(0, -1, 0))).toBeLessThan(20);
+  });
+
+  test('a new view that shows less of the drawn faces keeps the usual view', () => {
+    // A flat box edge on to the usual view whose drawn faces mostly face the usual view.
+    const toView = VIEW_DIRECTION.clone().multiplyScalar(0.9);
+    const toSide = edgeOn.clone().multiplyScalar(0.1);
+    const faces = new Float32Array([...toView.toArray(), 0, ...toSide.toArray(), 0]);
+    expect(viewDirection(shape([0.1, 2, 3], { faces }))).toEqual(VIEW_DIRECTION);
+  });
+
   test('a closed shape is not a card', () => {
     const back = v(0, 0, -1);
     const closed = shape([0.59, 0.8, 1.88], { thin: back, normalSum: v(0, 0, -0.5) });
     expect(viewDirection(closed)).toEqual(VIEW_DIRECTION);
   });
+});
+
+test('seenArea counts a one-sided face only from its front', () => {
+  const faces = new Float32Array([0, 0, 2, 0, 0, 0, 3, 1]);
+  expect(seenArea(faces, v(0, 0, 1))).toBeCloseTo(5);
+  expect(seenArea(faces, v(0, 0, -1))).toBeCloseTo(3);
 });
 
 describe('measureShape', () => {
@@ -71,6 +100,20 @@ describe('measureShape', () => {
     expect(measured.area).toBeCloseTo(8);
 
     expect(angle(viewDirection(measured), edgeOn)).toBeLessThan(20);
+  });
+
+  test('a mirrored card is read by the faces it draws', () => {
+    // Mirrored on X, the plane's corners wind the other way, but three.js still draws it facing
+    // +Z, which the usual view sees well.
+    const plane = new THREE.Mesh(new THREE.PlaneGeometry(4, 2));
+    plane.scale.set(-1, 1, 1);
+    const measured = measureShape(plane);
+    expect(angle(measured.normalSum, v(0, 0, 1))).toBeCloseTo(0);
+    expect(viewDirection(measured)).toEqual(VIEW_DIRECTION);
+
+    // Turned to face away from the usual view, it is faced from its drawn front.
+    plane.rotation.y = Math.PI;
+    expect(angle(viewDirection(measureShape(plane)), v(0, 0, -1))).toBeLessThan(20);
   });
 
   test('a cube keeps the usual view', () => {

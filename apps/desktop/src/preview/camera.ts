@@ -10,6 +10,8 @@ const SHEET_RATIO = 0.6;
 const MIN_FRONT_ANGLE = THREE.MathUtils.degToRad(20);
 /** A flat model's face outweighs the usual view this much, so the camera stays within 19.5° of it */
 const FACE_WEIGHT = 3;
+/** A new view must show this many times the drawn face area the usual view shows */
+const MIN_GAIN = 1.5;
 
 /** A model's oriented bounding box: its principal axes, thinnest first, and its extent along each */
 export interface OrientedBox {
@@ -23,6 +25,11 @@ export interface Shape {
   /** The sum of each triangle's normal times its area */
   normalSum: THREE.Vector3;
   area: number;
+  /**
+   * Each triangle as it is drawn: its normal times its area, then 1 when both its sides are
+   * drawn, else 0, four numbers a triangle
+   */
+  faces: Float32Array;
 }
 
 /**
@@ -30,23 +37,37 @@ export interface Shape {
  *
  * A model is flat when its oriented box is thin, or when its faces mostly point one way, as a
  * bent card's do. Its front is the side of its box's thinnest axis its faces face, or, when they
- * face both ways, the side nearer the usual view. When the usual view sees that front edge on or
- * from behind, the model is faced along the axis instead, leaning a little toward the usual view.
- * Anything else gets the usual three-quarter view.
+ * face both ways, the side nearer the usual view, and a card's front is where its faces point.
+ * When the usual view sees that front edge on or from behind, the model is faced from its front
+ * instead, leaning a little toward the usual view, as long as that shows clearly more of its
+ * drawn faces. Anything else gets the usual three-quarter view.
  */
-export function viewDirection({ box, normalSum, area }: Shape): THREE.Vector3 {
+export function viewDirection({ box, normalSum, area, faces }: Shape): THREE.Vector3 {
   const [thin, middle] = box.extents;
   const thinBox = middle > 0 && thin <= FLAT_RATIO * middle;
   const sheet = area > 0 && normalSum.length() >= SHEET_RATIO * area;
   if (!thinBox && !sheet) return VIEW_DIRECTION.clone();
 
-  const axis = box.axes[0].clone();
+  // A card faces where its faces point, which a curved one's thinnest axis may not.
+  const axis = thinBox ? box.axes[0].clone() : normalSum.clone().normalize();
   const facing = normalSum.dot(axis);
   const side =
     Math.abs(facing) >= 0.25 * area ? Math.sign(facing) : Math.sign(axis.dot(VIEW_DIRECTION)) || 1;
   const front = axis.multiplyScalar(side);
   if (front.dot(VIEW_DIRECTION) >= Math.sin(MIN_FRONT_ANGLE)) return VIEW_DIRECTION.clone();
-  return front.multiplyScalar(FACE_WEIGHT).add(VIEW_DIRECTION).normalize();
+  const faced = front.multiplyScalar(FACE_WEIGHT).add(VIEW_DIRECTION).normalize();
+  const gain = seenArea(faces, faced) >= MIN_GAIN * seenArea(faces, VIEW_DIRECTION);
+  return gain ? faced : VIEW_DIRECTION.clone();
+}
+
+/** The area of the drawn faces a camera in `direction` sees, as if none hid another */
+export function seenArea(faces: Float32Array, direction: THREE.Vector3): number {
+  let seen = 0;
+  for (let i = 0; i + 3 < faces.length; i += 4) {
+    const dot = faces[i] * direction.x + faces[i + 1] * direction.y + faces[i + 2] * direction.z;
+    seen += faces[i + 3] ? Math.abs(dot) : Math.max(0, dot);
+  }
+  return seen;
 }
 
 /** The camera's up: world up, unless the camera looks almost straight up or down */
@@ -75,6 +96,13 @@ export function measureShape(object: THREE.Object3D): Shape {
 
   const normalSum = new THREE.Vector3();
   let area = 0;
+  const triangles = meshes.reduce(
+    (n, mesh) =>
+      n + Math.floor((mesh.geometry.index ?? mesh.geometry.attributes.position).count / 3),
+    0
+  );
+  const faces = new Float32Array(triangles * 4);
+  let face = 0;
   const a = new THREE.Vector3();
   const b = new THREE.Vector3();
   const c = new THREE.Vector3();
@@ -82,6 +110,10 @@ export function measureShape(object: THREE.Object3D): Shape {
     const { index, attributes } = mesh.geometry;
     const position = attributes.position;
     const count = index ? index.count : position.count;
+    // A mirrored mesh draws its faces with the opposite winding (three.js flips its front face).
+    const winding = mesh.matrixWorld.determinant() < 0 ? -0.5 : 0.5;
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    const doubleSided = materials.every((material) => material.side === THREE.DoubleSide);
     const corner = (v: THREE.Vector3, i: number) =>
       v.fromBufferAttribute(position, index ? index.getX(i) : i).applyMatrix4(mesh.matrixWorld);
     for (let i = 0; i + 2 < count; i += 3) {
@@ -90,11 +122,14 @@ export function measureShape(object: THREE.Object3D): Shape {
       corner(c, i + 2).sub(a);
       const cross = b.cross(c);
       area += cross.length() / 2;
-      normalSum.addScaledVector(cross, 0.5);
+      cross.multiplyScalar(winding);
+      normalSum.add(cross);
+      faces.set([cross.x, cross.y, cross.z, doubleSided ? 1 : 0], face);
+      face += 4;
     }
   }
 
-  return { box: orientedBox(eachPoint), normalSum, area };
+  return { box: orientedBox(eachPoint), normalSum, area, faces };
 }
 
 /** The oriented bounding box of a point set, from its principal axes */
