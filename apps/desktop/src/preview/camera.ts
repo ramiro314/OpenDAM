@@ -1,0 +1,174 @@
+import * as THREE from 'three';
+
+/** Three-quarter view from above, like a product shot */
+export const VIEW_DIRECTION = new THREE.Vector3(1, 0.8, 1).normalize();
+/** A box whose thinnest side is at most this share of its middle one is flat */
+const FLAT_RATIO = 0.25;
+/** Faces whose normals sum to at least this share of their area point one way, as a card's do */
+const SHEET_RATIO = 0.6;
+/** The usual view keeps a flat model whose front it sees at least this steeply, as a floor's */
+const MIN_FRONT_ANGLE = THREE.MathUtils.degToRad(20);
+/** A flat model's face outweighs the usual view this much, so the camera stays within 19.5° of it */
+const FACE_WEIGHT = 3;
+
+/** A model's oriented bounding box: its principal axes, thinnest first, and its extent along each */
+export interface OrientedBox {
+  axes: [THREE.Vector3, THREE.Vector3, THREE.Vector3];
+  extents: [number, number, number];
+}
+
+/** What the camera reads of a model, in world space */
+export interface Shape {
+  box: OrientedBox;
+  /** The sum of each triangle's normal times its area */
+  normalSum: THREE.Vector3;
+  area: number;
+}
+
+/**
+ * The direction from a model's center to the camera.
+ *
+ * A model is flat when its oriented box is thin, or when its faces mostly point one way, as a
+ * bent card's do. Its front is the side of its box's thinnest axis its faces face, or, when they
+ * face both ways, the side nearer the usual view. When the usual view sees that front edge on or
+ * from behind, the model is faced along the axis instead, leaning a little toward the usual view.
+ * Anything else gets the usual three-quarter view.
+ */
+export function viewDirection({ box, normalSum, area }: Shape): THREE.Vector3 {
+  const [thin, middle] = box.extents;
+  const thinBox = middle > 0 && thin <= FLAT_RATIO * middle;
+  const sheet = area > 0 && normalSum.length() >= SHEET_RATIO * area;
+  if (!thinBox && !sheet) return VIEW_DIRECTION.clone();
+
+  const axis = box.axes[0].clone();
+  const facing = normalSum.dot(axis);
+  const side =
+    Math.abs(facing) >= 0.25 * area ? Math.sign(facing) : Math.sign(axis.dot(VIEW_DIRECTION)) || 1;
+  const front = axis.multiplyScalar(side);
+  if (front.dot(VIEW_DIRECTION) >= Math.sin(MIN_FRONT_ANGLE)) return VIEW_DIRECTION.clone();
+  return front.multiplyScalar(FACE_WEIGHT).add(VIEW_DIRECTION).normalize();
+}
+
+/** The camera's up: world up, unless the camera looks almost straight up or down */
+export function cameraUp(direction: THREE.Vector3): THREE.Vector3 {
+  return Math.abs(direction.y) > 0.99 ? new THREE.Vector3(0, 0, -1) : new THREE.Vector3(0, 1, 0);
+}
+
+/** Reads the shape of every mesh under `object`, with its world transform */
+export function measureShape(object: THREE.Object3D): Shape {
+  object.updateWorldMatrix(true, true);
+  const meshes: THREE.Mesh[] = [];
+  object.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+    if (mesh.isMesh && mesh.geometry.attributes.position) meshes.push(mesh);
+  });
+
+  const point = new THREE.Vector3();
+  const eachPoint = (visit: (p: THREE.Vector3) => void) => {
+    for (const mesh of meshes) {
+      const position = mesh.geometry.attributes.position;
+      for (let i = 0; i < position.count; i++) {
+        visit(point.fromBufferAttribute(position, i).applyMatrix4(mesh.matrixWorld));
+      }
+    }
+  };
+
+  const normalSum = new THREE.Vector3();
+  let area = 0;
+  const a = new THREE.Vector3();
+  const b = new THREE.Vector3();
+  const c = new THREE.Vector3();
+  for (const mesh of meshes) {
+    const { index, attributes } = mesh.geometry;
+    const position = attributes.position;
+    const count = index ? index.count : position.count;
+    const corner = (v: THREE.Vector3, i: number) =>
+      v.fromBufferAttribute(position, index ? index.getX(i) : i).applyMatrix4(mesh.matrixWorld);
+    for (let i = 0; i + 2 < count; i += 3) {
+      corner(a, i);
+      corner(b, i + 1).sub(a);
+      corner(c, i + 2).sub(a);
+      const cross = b.cross(c);
+      area += cross.length() / 2;
+      normalSum.addScaledVector(cross, 0.5);
+    }
+  }
+
+  return { box: orientedBox(eachPoint), normalSum, area };
+}
+
+/** The oriented bounding box of a point set, from its principal axes */
+export function orientedBox(eachPoint: (visit: (p: THREE.Vector3) => void) => void): OrientedBox {
+  const mean = new THREE.Vector3();
+  let n = 0;
+  eachPoint((p) => {
+    mean.add(p);
+    n++;
+  });
+  if (n === 0) return { axes: worldAxes(), extents: [0, 0, 0] };
+  mean.divideScalar(n);
+
+  const cov = [
+    [0, 0, 0],
+    [0, 0, 0],
+    [0, 0, 0],
+  ];
+  eachPoint((p) => {
+    const d = [p.x - mean.x, p.y - mean.y, p.z - mean.z];
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) cov[i][j] += d[i] * d[j];
+  });
+
+  const axes = eigenvectors(cov);
+  const lo = [Infinity, Infinity, Infinity];
+  const hi = [-Infinity, -Infinity, -Infinity];
+  eachPoint((p) => {
+    axes.forEach((axis, i) => {
+      const t = p.dot(axis);
+      lo[i] = Math.min(lo[i], t);
+      hi[i] = Math.max(hi[i], t);
+    });
+  });
+  const order = [0, 1, 2].sort((i, j) => hi[i] - lo[i] - (hi[j] - lo[j]));
+  return {
+    axes: order.map((i) => axes[i]) as OrientedBox['axes'],
+    extents: order.map((i) => hi[i] - lo[i]) as OrientedBox['extents'],
+  };
+}
+
+function worldAxes(): OrientedBox['axes'] {
+  return [new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 1)];
+}
+
+/** The eigenvectors of a symmetric 3x3 matrix, by Jacobi rotations (changes `m`) */
+function eigenvectors(m: number[][]): THREE.Vector3[] {
+  const v = [
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1],
+  ];
+  const scale = Math.abs(m[0][0]) + Math.abs(m[1][1]) + Math.abs(m[2][2]);
+  for (let sweep = 0; sweep < 50; sweep++) {
+    let p = 0;
+    let q = 1;
+    for (const [i, j] of [
+      [0, 2],
+      [1, 2],
+    ]) {
+      if (Math.abs(m[i][j]) > Math.abs(m[p][q])) [p, q] = [i, j];
+    }
+    if (Math.abs(m[p][q]) <= 1e-12 * scale) break;
+    const theta = 0.5 * Math.atan2(2 * m[p][q], m[q][q] - m[p][p]);
+    const cos = Math.cos(theta);
+    const sin = Math.sin(theta);
+    for (let k = 0; k < 3; k++) {
+      [m[k][p], m[k][q]] = [cos * m[k][p] - sin * m[k][q], sin * m[k][p] + cos * m[k][q]];
+    }
+    for (let k = 0; k < 3; k++) {
+      [m[p][k], m[q][k]] = [cos * m[p][k] - sin * m[q][k], sin * m[p][k] + cos * m[q][k]];
+    }
+    for (let k = 0; k < 3; k++) {
+      [v[k][p], v[k][q]] = [cos * v[k][p] - sin * v[k][q], sin * v[k][p] + cos * v[k][q]];
+    }
+  }
+  return [0, 1, 2].map((i) => new THREE.Vector3(v[0][i], v[1][i], v[2][i]));
+}

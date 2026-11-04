@@ -1029,6 +1029,8 @@ change reaches.
   it, as at version 4.
 - **A new thumbnail camera reaches only new previews.** Existing thumbnails keep their old view
   until they are regenerated.
+- **`SM_Waterblock_01` stays a sliver** (Work item 10, 2026-11-04). The camera faces it, but its
+  GLB is narrow ribbons that show as lines from every side, and its water is 17% opaque.
 - **Hashed mesh IDs aren't read.** Four Synty window walls stay untextured though their prefabs
   list their materials (Piece 1 result).
 - **Conversions aren't byte-stable.** A GLB's image names follow a counter, so a rename or a
