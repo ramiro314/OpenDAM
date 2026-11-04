@@ -758,6 +758,26 @@ mod tests {
         assert_eq!(run.warnings, []);
     }
 
+    /// Billboard: a `_Billboard` mesh goes beside a real mesh, in any case and past Blender's
+    /// numeric suffix, as a higher level does, and a name that only holds the word stays.
+    #[tokio::test]
+    async fn a_billboard_beside_a_real_mesh_is_dropped() {
+        let Some(meshes) = kept("billboard").await else {
+            return;
+        };
+        assert_eq!(meshes, ["Billboard_Sign", "Tree_LOD0"]);
+    }
+
+    /// Billboard only: a file whose only mesh is a billboard keeps it, and a collision mesh
+    /// beside it is no real mesh.
+    #[tokio::test]
+    async fn a_file_whose_only_mesh_is_a_billboard_keeps_it() {
+        let Some(meshes) = kept("billboard-only").await else {
+            return;
+        };
+        assert_eq!(meshes, ["Tree_billboard"]);
+    }
+
     /// The GLB in `cache`, with its modified time, so a second run can't pass by converting.
     fn cached(cache: &Path) -> (PathBuf, std::time::SystemTime) {
         let mut glbs = std::fs::read_dir(cache.join("glb")).unwrap();
