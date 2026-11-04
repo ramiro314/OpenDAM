@@ -76,6 +76,9 @@ What version 5 adds to its heuristics (docs/plans/import-material-fixes/plan.md,
 
 What follows version 5, for the bump to version 6 (the same plan, After the first gate):
 
+- A base the only-texture rule found is multiplied by the material's flat color, its glTF
+  `baseColorFactor` (`UnityMaterial.tint`). A base found by name keeps a white factor, whatever
+  color the material holds.
 - A mesh whose name, less Blender's numeric suffix, ends `_Billboard` in any case is dropped
   beside any other mesh the file keeps, as a higher level is: it is a far stand-in, crossed cards
   around a tree. A file whose only mesh is a billboard keeps it.
@@ -453,11 +456,19 @@ class UnityMaterial:
         return self.texture(OPACITY_PROPS) or next(
             (t for name, t in self.display if is_opacity(name) and t != base), None)
 
-    def base(self) -> Path | None:
+    def named_base(self) -> Path | None:
+        """The base color texture by raw property name, else by display name."""
         return (self.texture(BASE_PROPS)
                 or next((t for p, t in self.textures.items() if is_base(p)), None)
-                or next((t for name, t in self.display if is_base(alnum(name))), None)
-                or self.only_texture())
+                or next((t for name, t in self.display if is_base(alnum(name))), None))
+
+    def base(self) -> Path | None:
+        return self.named_base() or self.only_texture()
+
+    def tint(self) -> tuple[float, ...] | None:
+        """The color the base texture is multiplied by: the flat color, over a base only the
+        only-texture rule found. A base found by name keeps a white factor."""
+        return None if self.named_base() or not self.only_texture() else self.color()
 
     def only_texture(self) -> Path | None:
         """The material's one bound texture, unless its names say it isn't a base color: a
@@ -535,7 +546,19 @@ def build_material(um: UnityMaterial, max_size: int, scratch: Scratch) -> bpy.ty
     if base and (img := image(base, max_size, False, scratch, keep_alpha=um.cutout and not mask)):
         tex = nodes.new("ShaderNodeTexImage")
         tex.image = img
-        links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+        color = tex.outputs["Color"]
+        if tint := um.tint():
+            # Exported as the texture's `baseColorFactor`. Alpha stays the texture's.
+            mix = nodes.new("ShaderNodeMix")
+            mix.data_type = "RGBA"
+            mix.blend_type = "MULTIPLY"
+            mix.inputs["Factor"].default_value = 1
+            # The node's color sockets share their names with its float and vector ones.
+            a, b = (next(i for i in mix.inputs if i.identifier == f"{n}_Color") for n in "AB")
+            links.new(color, a)
+            b.default_value = (*tint[:3], 1)
+            color = next(o for o in mix.outputs if o.identifier == "Result_Color")
+        links.new(color, bsdf.inputs["Base Color"])
         alpha = tex.outputs["Alpha"]
     elif color := um.color():
         bsdf.inputs["Base Color"].default_value = color

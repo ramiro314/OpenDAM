@@ -19,7 +19,8 @@ object and mesh share a name, so their tests make `Model.fbx` under Blender. The
 - An alpha base is BASE with an alpha of 0. Its red is high, so a clip that read its red channel
   as a mask keeps what its own alpha cuts.
 - TINT is the flat colour a material should show, as Unity stores it, in sRGB, and GREY one it
-  should not.
+  should not. YELLOW is a colour an only-texture base shows under, and a base found by name
+  doesn't.
 """
 
 import hashlib
@@ -38,6 +39,8 @@ ORM = (10, 120, 220)
 MASK = (0, 0, 0)
 TINT = (0.2, 0.4, 0.6, 1)
 GREY = (0.8, 0.8, 0.8, 1)
+# POLYGON Prototype's grid colour, which only an only-texture base is multiplied by.
+YELLOW = (1, 0.8, 0.2, 1)
 
 # The GUID of Unity's built-in resources, which a material on a built-in shader names.
 BUILT_IN = "0000000000000000f000000000000000"
@@ -681,6 +684,14 @@ def main() -> None:
 
     pack = Pack("only-texture", ["M_Thing"])
     pack.material("M_Thing", {"_Grid": pack.texture("T_Grid", BASE)})
+
+    # The same colour over an only-texture base, and over bases found by raw and display name.
+    pack = Pack("only-texture-tint", ["M_Grid", "M_Raw", "M_Shown"])
+    colors = {"_Base_Color": YELLOW}
+    pack.material("M_Grid", {"_Grid": pack.texture("T_Grid", BASE)}, colors)
+    pack.material("M_Raw", {"_BaseMap": pack.texture("T_Raw", BASE)}, colors)
+    shader = pack.graph("S_Shown", stream({"Texture2D_a": "Albedo"}))
+    pack.material("M_Shown", {"Texture2D_a": pack.texture("T_Shown", BASE)}, colors, shader)
 
     # A base hint and another role's word: `Albedo Mask` sorts first but isn't the base, and a
     # raw `_ColorMask` isn't either.
