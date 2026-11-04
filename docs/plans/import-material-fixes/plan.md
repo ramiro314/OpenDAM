@@ -895,7 +895,16 @@ profile, as Piece 1 did, and reports the GLBs it changes.
 10. **A camera for flat models.** `modelThumbnailer` faces a flat model's largest side, where today
     its fixed camera can look at it edge on, so `grassPlane` and `SM_Waterblock_01` show as planes,
     not slivers. "Flat" is judged from the model's bounding box. Only previews made after the change
-    use it, and nothing requeues existing thumbnails.
+    use it, and nothing requeues existing thumbnails. As built (`preview/camera.ts`), and confirmed
+    by the owner on 2026-11-04:
+    - **The box is oriented** (the vertices' principal axes), since neither model is flat by an
+      axis-aligned one.
+    - **A card counts as flat** when its faces mostly point one way. `grassPlane` is a bent card
+      whose faces point away from the fixed camera, and no box calls it flat.
+    - **A flat model keeps today's view** when that view sees its front at 20° or more, as it
+      sees floors and walls, or when facing it wouldn't show 1.5 times the drawn faces.
+    - **The result:** 109 of the gate's 7,803 GLBs get the new view, and `SM_Waterblock_01`
+      isn't one of them (see [Known gaps](#known-gaps)).
 11. **Kenney's 36 preview errors.** Find why the 10 `.ai` files fail, though `.ai` already renders
     through pdfium, and preview what can be. The 26 `.fbx` animations Assimp can't load, in the
     Animated Characters packs, and any `.ai` that can't be previewed, end with a reason the UI
@@ -1029,6 +1038,10 @@ change reaches.
   it, as at version 4.
 - **A new thumbnail camera reaches only new previews.** Existing thumbnails keep their old view
   until they are regenerated.
+- **`SM_Waterblock_01` stays a sliver** (Work item 10, 2026-11-04). Its box is flat and today's
+  view sees it edge on, but its GLB is narrow ribbons that show as lines from every side, and its
+  water is 17% opaque. Facing its box would show only 1.27 times the drawn faces today's view
+  does, under the 1.5 the camera needs to move, so it keeps today's view.
 - **Hashed mesh IDs aren't read.** Four Synty window walls stay untextured though their prefabs
   list their materials (Piece 1 result).
 - **Conversions aren't byte-stable.** A GLB's image names follow a counter, so a rename or a
