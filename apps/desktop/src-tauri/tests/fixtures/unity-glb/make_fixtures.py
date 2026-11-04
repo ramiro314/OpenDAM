@@ -664,6 +664,15 @@ def main() -> None:
     # `_LOD0` is level 0, so this file is no LOD and its other levels go.
     Pack("lod0-file").objects(["X_LOD0", "X_LOD1"], "X_LOD0")
 
+    # A billboard goes beside a real mesh, in any case and past Blender's numeric suffix, and a
+    # name that only holds the word stays.
+    Pack("billboard").objects(
+        ["Tree_LOD0", "Tree_LOD1", "Tree_Billboard", "Bush_BILLBOARD.001", "Billboard_Sign"]
+    )
+
+    # A billboard is all this file has, beside a collision mesh, which is no real mesh.
+    Pack("billboard-only").objects(["Tree_billboard", "Tree_Collider"])
+
     Pack("no-mesh").objects(["UCX_Model", "Model_Collider"])
 
     # `_LOD<n>` hides no collision mesh, not even at the lowest level of its name.

@@ -74,9 +74,11 @@ What version 5 adds to its heuristics (docs/plans/import-material-fixes/plan.md,
   can name `Plane.099`, and only then without Blender's numeric suffix.
 - A renderer's material list counts Unity's submeshes, so it skips a slot no face uses.
 
-What version 6 adds (docs/plans/import-material-fixes/plan.md, After the first gate). Until its
-bump, the cache key still holds version 5:
+What follows version 5, for the bump to version 6 (the same plan, After the first gate):
 
+- A mesh whose name, less Blender's numeric suffix, ends `_Billboard` in any case is dropped
+  beside any other mesh the file keeps, as a higher level is: it is a far stand-in, crossed cards
+  around a tree. A file whose only mesh is a billboard keeps it.
 - Unity orders a mesh's submeshes by each slot's first face, not by the FBX's slot order, and a
   renderer's list follows them, so Big Castle's `tree_b` gets its leaves on its cards. An FBX that
   goes through `assimp` comes back with its faces grouped by slot, so it keeps its slot order.
@@ -113,6 +115,7 @@ ORM_PROPS = ["orm", "ormtex", "arm", "ormmap"]
 OPACITY_PROPS = ["opacitymask", "opacitymap", "opacity", "alphamask", "alphamap", "alpha"]
 COLOR_PROPS = ["basecolorvalue", "basecolor", "color", "tint", "maincolor"]
 LOD_RE = re.compile(r"_lod(\d+)$", re.IGNORECASE)
+BILLBOARD_RE = re.compile(r"_billboard$", re.IGNORECASE)
 # Collision meshes: Unreal-style `UCX_` and `_ConvexHulls`, and Unity `_Collider`/`_Collision`.
 # `import::unity_glb` keeps the same terms for a model's file name, which a test keeps equal.
 COLLISION_RE = re.compile(
@@ -580,11 +583,22 @@ def convert(model: Path, target: Path, guids, by_mesh, by_name, images, mtls, ma
         # By its group, so `_LOD<n>` hides no collision mesh: `X_Collider_LOD1` goes too.
         return bool(COLLISION_RE.search(lod_of(base_name(obj.name))[0]))
 
+    def is_billboard(obj: bpy.types.Object) -> bool:
+        return bool(BILLBOARD_RE.search(base_name(obj.name)))
+
     kept = {o for o in meshes if not above_lowest(o) and not is_collision(o)}
+    # A billboard is a far stand-in, dropped as a higher level is, unless it is all there is.
+    drop_billboards = any(not is_billboard(o) for o in kept)
+    if drop_billboards:
+        kept = {o for o in kept if not is_billboard(o)}
+
+    def dropped(obj: bpy.types.Object) -> bool:
+        return above_lowest(obj) or drop_billboards and is_billboard(obj)
+
     for obj in list(bpy.data.objects):
         name = base_name(obj.name)
         holds_kept = obj.type != "MESH" and not kept.isdisjoint(obj.children_recursive)
-        if (above_lowest(obj) and not holds_kept) or is_collision(obj):
+        if (dropped(obj) and not holds_kept) or is_collision(obj):
             bpy.data.objects.remove(obj)
             continue
         if obj.type != "MESH":
