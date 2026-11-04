@@ -5,7 +5,9 @@ through the Imports view. Four pieces, in order: the Unity GLB converter, the im
 pack metadata, small preview fixes, then LOD grouping.
 
 Status: decisions settled with the owner over three interview rounds. Every finding below was
-checked in the code or measured on real packs, in a throwaway profile, at commit 63efa51.
+checked in the code or measured on real packs, in a throwaway profile, at commit 63efa51. The
+first gate held the deletion, and [After the first gate](#after-the-first-gate) records the owner's
+answers of 2026-11-03 and the work that follows.
 
 ## Outcome
 
@@ -674,12 +676,183 @@ has at least 20 GB free. Record the scope's peak memory. If 24 GB can't be freed
 
 Unreal packs have no floors, because this work never ran them. These first runs set their numbers.
 
-The gate's results are in [gate-report.md](gate-report.md).
+The gate's results are in [gate-report.md](gate-report.md), and what follows from them in
+[After the first gate](#after-the-first-gate).
 
 **Any failed run, cap kill, missed floor, lost map, unmatched GLB other than the expected absences,
 unexplained leftover or unexplained geometry change holds the deletion until the owner decides.**
 Never raise a cap or lower a floor to pass. The owner deletes the old libraries by hand after
 reading the gate report. Piece 4 can land before or after.
+
+## After the first gate
+
+The first gate ([gate-report.md](gate-report.md), measured at `39c679d`) held the deletion: the
+owner's review rejected models in 5 packs, LostRuins lost a mesh with no warning, and the report
+listed 9 decisions and 6 other findings. The owner answered them on 2026-11-03, over four
+interview rounds. This section records those answers, the work they make, and the second gate
+run. The old libraries stay until the second gate passes and the owner has reviewed its sheets.
+
+### Decisions on the gate report
+
+The report's table, row for row:
+
+| # | Item | Decision |
+|---|---|---|
+| 1 | `SM_column04`, a LostRuins mesh the asset registry misses | Fix: find meshes on disk, and warn on any left out |
+| 2 | POLYGON's lost tint, 162 GLBs white, were yellow | Fix: multiply the colour over a base the only-texture rule found, and only there |
+| 3 | Fantasy Adventure's billboards, 15 GLBs | Fix: drop a billboard mesh beside a real mesh |
+| 4 | Branch cutouts, 3 Fantasy Adventure materials | Fix: a cutout rule that also reads the shader |
+| 5 | Big Castle `tree_b`'s slots | Fix, in one ticket that first proves the cause and measures its reach |
+| 6 | Big Castle `ivy_a` and `grassPlane` | Look for their slots' materials, and accept the gap if no file holds them |
+| 7 | Wizard Room `SM_Books3_2` and `SM_Walls2`, 12 GLBs | Accepted: they stay plain white, and no name rule is added |
+| 8 | Waterways ferns, 4 GLBs | Investigate `MI_Fern_02`'s graph, and fix it if the cause is found |
+| 9 | `SM_Frame`, `SM_Grass_A` and `SM_Plane_01`'s colour changes | Confirmed as intended. No ticket |
+
+And the rest:
+
+| Topic | Decision |
+|---|---|
+| Other findings | All six become tickets: Waterways' false hoist warning, a camera for flat models, the engine's grid in the audit, the app's memory peak, Kenney's preview errors and the sheets' other oddities |
+| Unity version | One ticket per fix with no bump, then one ticket bumps to `opendam-unity-glb/6`, as Piece 1 did |
+| Unreal version | Each Unreal export fix bumps `UNREAL_GLB_VERSION` itself |
+| Engine grid | Counted as untextured in `glb_audit.py` only. The export doesn't change |
+| Investigations | Report the cause, and fix it in the same ticket only when the fix is small and not in a converter |
+| A converter cause found later | It waits for a later bump, version 7, and doesn't hold the deletion |
+| Kenney's errors | A preview where one can be made, else a clear reason, not a bare error |
+| Hoist warning | An estimate's preview says the hoist is checked when the export runs, and the build warns on a hoist that was a no-op |
+| Camera | It changes only previews made after it. Nothing requeues existing thumbnails |
+| Second gate | All four runs again in a new clean profile, once the converter, Unreal, hoist, camera and audit work has merged |
+| Floors | The second gate runs against today's `floors.tsv`, which may not fall. Its report proposes the measured counts as new floors, for the owner to accept |
+| Issue #261 | The second gate's pull request says "Part of #261", and the owner closes the issue after the review |
+
+### Work
+
+Each item below is one ticket. The order they can land in is under [Order](#order).
+
+**Unity converter.** Items 1 to 5 change `unity_glb.py` and don't bump its version. Each lands with
+fixture tests in `tests/fixtures/unity-glb/`, and the cache key still holds `opendam-unity-glb/5`,
+so nothing reconverts until item 6. Each ticket that can measure its change on real packs does so
+with a prototype run in a throwaway profile, as Piece 1 did, and reports the GLBs it changes.
+
+1. **Tint over an only-texture base.** When the base texture came from the only-texture rule (rule
+   3 of Piece 1), the material's base colour becomes the glTF `baseColorFactor` over it, written
+   linear as rule 5's colours are. A base found by raw name or display name keeps today's white
+   factor. POLYGON's 162 `PolygonPrototype_Grid_01` GLBs come out yellow with their grid, and only
+   a material whose base came from that rule changes colour. Fixture: a material whose one texture
+   is `_Grid`, with a yellow `_Base_Color`, and one whose base is found by name, with a colour that
+   stays unapplied.
+2. **Drop a billboard beside a real mesh.** In a file with other meshes, a mesh object whose name,
+   without Blender's numeric suffix, ends `_Billboard` in any case is dropped, as a higher LOD is.
+   A file whose only mesh is a billboard keeps it. Fantasy Adventure's 15 GLBs lose their crossed
+   cards. The ticket adds those 15 GLBs, with their before and after vertex and primitive counts, to
+   the expected geometry list (Piece 1 under [Each piece](#each-piece)), and, if one loses a map
+   with its billboard, names it there as expected.
+3. **A cutout read from the shader.** First check that `FAE_TreeBranch` clips on alpha in its shader
+   file. Then a material on a shader that clips, and with no `_ALPHATEST_ON` or
+   `TransparentCutout`, gets its base texture's alpha as a `MASK`. A `.shader` file becomes a
+   conversion input, as `.shadergraph` is, in `UNITY_EXTENSIONS`. `FAE_WillowBranch`,
+   `FAE_PalmBranch` and `FAE_PineBranch` gain their cutout. The ticket lists every material in the
+   11 packs whose `alphaMode` changes, and each must be explained, because the filename rule this
+   plan dropped made false cutouts.
+4. **`tree_b`'s slot order.** First prove the cause: compare Unity's submesh order for
+   `tree_b`'s mesh with Blender's slot order, and count every GLB in the 11 packs whose prefab list
+   the same mismatch reaches. Then match a prefab's material list to Unity's submesh order. The leaf
+   map lands on the 48 cards and the bark on the tree. The ticket lists every GLB whose slots
+   change. If the cause turns out to be something else, the ticket reports it and stops, and the fix
+   is shaped afresh.
+5. **`ivy_a` and `grassPlane`'s materials.** Search Big Castle's prefabs, scenes and `.meta` files
+   for the materials of `Plane.081` and `grassPlane`'s mesh. If a file holds them, the converter
+   learns to read it, with a fixture. If none does, the ticket records them as accepted leftovers
+   in [Piece 1 result](#piece-1-result), and the converter doesn't change.
+6. **Bump to `opendam-unity-glb/6`.** Once items 1 to 5 have merged: `VERSION` and
+   `UNITY_GLB_VERSION` move together, the docstring lists what changed, and `CLAUDE.md`'s
+   `src/import` notes record the new rules. Every built Unity pack needs a Rebuild, as
+   [Rebuild and the version bump](#rebuild-and-the-version-bump) describes.
+
+**Unreal export.** Each item bumps `UNREAL_GLB_VERSION` itself when it changes the export.
+
+7. **Find meshes on disk, and warn on any left out.** `unreal_glb.py` lists the work copy's
+   `.uasset` packages under `Content/` from disk, rather than trusting
+   `get_assets_by_path`, loads each by path, and exports those of an export type by their own class.
+   An `ObjectRedirector` is skipped, and needs no GLB. Any package of an export type that ends with
+   no GLB and isn't recorded as failed becomes a warning in the run's warnings, naming it, so a mesh
+   lost this way can't read as complete again. Bump `UNREAL_GLB_VERSION`. Rust tests with the stub
+   editor cover a package the registry doesn't list and one left without a GLB. A LostRuins run
+   gives 102 GLBs, `SM_column04` among them.
+8. **Waterways' ferns.** Read `MI_Fern_02`'s material graph in the editor and find why the bake
+   keeps so little of its mask (the baked base is 96% opaque). If the cause is in the export, fix it
+   there, bump `UNREAL_GLB_VERSION`, and run Waterways again. If it isn't, or isn't found, record
+   what was learned under [Known gaps](#known-gaps) and change nothing.
+
+**Import dialog.**
+
+9. **Hoist warning on an estimate.** An Unreal pack's tree is an estimate (`Project::estimate`),
+   which gives every `.uasset` a GLB, Waterways' root-level redirector `Content/Cylinder1.uasset`
+   among them, so `flatten` keeps `Waterways/` and `hoist Meshes` finds nothing. For an estimate
+   tree, the preview notes that the hoist is checked once the export runs, rather than warning.
+   The scan still reads no file body. A build whose hoist step finds no folder then adds a warning
+   to its run, so a hoist that really does nothing is still reported. Waterways' dialog no longer
+   warns, and its build doesn't either.
+
+**Previews.**
+
+10. **A camera for flat models.** `modelThumbnailer` faces a flat model's largest side, where today
+    its fixed camera can look at it edge on, so `grassPlane` and `SM_Waterblock_01` show as planes,
+    not slivers. "Flat" is judged from the model's bounding box. Only previews made after the change
+    use it, and nothing requeues existing thumbnails.
+11. **Kenney's 36 preview errors.** Find why the 10 `.ai` files fail, though `.ai` already renders
+    through pdfium, and preview what can be. The 26 `.fbx` animations Assimp can't load, in the
+    Animated Characters packs, and any `.ai` that can't be previewed, end with a reason the UI
+    shows (`preview_reason`), such as "Animation, no mesh", not a bare error.
+
+**Audit.**
+
+12. **The engine's grid isn't a texture.** `glb_audit.py` counts a base texture baked from
+    `WorldGridMaterial` (an image named `WorldGridMaterial_BaseColor`) as untextured. With a test in
+    `test_glb_audit.py`. Waterways' fully textured count becomes 111 of 161, for
+    `SM_Butterfly_Plane`, `SM_CavernHull` and `SM_Vine_05`.
+
+**Investigations.** Neither holds the second gate or the deletion. Each reports its cause in its
+pull request and in this plan. It fixes the cause in the same ticket only when the fix is small and
+not in a converter. A Unity converter cause becomes a ticket for a later bump, version 7, and an
+Unreal one a ticket that bumps `UNREAL_GLB_VERSION`.
+
+13. **The app's memory peak.** The app's scope peaked at 9.8 GB of its 10 GB cap in the 11-pack
+    stage, and the scope's figure doesn't split file cache from the app's own memory. Measure an
+    11-pack import under the cap with the scope's `memory.stat` (anonymous memory against file
+    cache) and say whether a larger import could be killed.
+14. **The sheets' other oddities.** Find why Waterways' `SK_Snake` draws as a thin straight line
+    and `SM_RockWall_01` as a dark scrap with a vine, and why Village's `SM_Tree_01` has a pale patch
+    in its leaves.
+
+**The second gate.**
+
+15. **Run the gate again.** With items 6, 7, 8, 9, 10 and 12 merged, run all four runs in a new
+    clean throwaway profile, through the same driver and checks as the first gate
+    (`apps/desktop/scripts/import-trial/`). They pass on the terms of
+    [Before deleting the old libraries](#before-deleting-the-old-libraries), against today's
+    `floors.tsv` and the expected geometry list as item 2 grew it, and also when:
+    - POLYGON's 162 grid GLBs carry their yellow factor.
+    - Fantasy Adventure's 15 GLBs have no billboard mesh, and the 3 branch materials are `MASK`.
+    - `tree_b`'s leaf map is on its cards, and every other slot change item 4 listed is there.
+    - LostRuins has 102 GLBs, and no package of an export type is left without one or a warning.
+    - Waterways' dialog shows no hoist warning, and its textured count is read with item 12's audit.
+
+    Its results go in `gate-report-2.md` beside the first report, with after sheets from the same
+    path lists, registered as evidence, and a proposed floor per pack from the measured counts.
+    Floors change only when the owner accepts them. The pull request says "Part of #261" and lists
+    the owner's review under Known gaps. Nothing deletes the old libraries: the owner does that by
+    hand, and closes #261, after the review.
+
+### Order
+
+| Item | Blocked by |
+|---|---|
+| 1 to 5, 7 to 14 | Nothing |
+| 6, the Unity bump | 1 to 5 |
+| 15, the second gate | 6, 7, 8, 9, 10 and 12 |
+
+Items 11, 13 and 14 can land before or after the second gate.
 
 ## Evidence so far
 
@@ -715,6 +888,13 @@ reading the gate report. Piece 4 can land before or after.
 - **Collider-only models stay as grid items.** They make empty GLBs and failed previews (7 in the
   Synty and Fantasy Adventure samples).
 - **Models with no `.mtl` and no prefab stay untextured**, as do slots no Unity file resolves.
+  The owner rejected Wizard Room's `SM_Books3_2` in the first gate's review, and on 2026-11-03
+  accepted it and `SM_Walls2` as they are, with no name rule.
+- **A colour applies over a base texture only when the only-texture rule found it.** Unity's Lit
+  shaders multiply `_BaseColor` over every base map, so other textured materials with a tint lose
+  it, as at version 4.
+- **A new thumbnail camera reaches only new previews.** Existing thumbnails keep their old view
+  until they are regenerated.
 - **Hashed mesh IDs aren't read.** Four Synty window walls stay untextured though their prefabs
   list their materials (Piece 1 result).
 - **Conversions aren't byte-stable.** A GLB's image names follow a counter, so a rename or a
