@@ -1,0 +1,58 @@
+mtllib Model.mtl
+o Model
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl M_Graph
+f 1/1 2/2 3/3
+v 3 0 0
+v 4 0 0
+v 3 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl M_Older
+f 4/4 5/5 6/6
+v 6 0 0
+v 7 0 0
+v 6 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl M_Shader
+f 7/7 8/8 9/9
+v 9 0 0
+v 10 0 0
+v 9 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl M_Opaque
+f 10/10 11/11 12/12
+v 12 0 0
+v 13 0 0
+v 12 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl M_Override
+f 13/13 14/14 15/15
+v 15 0 0
+v 16 0 0
+v 15 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl M_Red
+f 16/16 17/17 18/18
+v 18 0 0
+v 19 0 0
+v 18 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+usemtl M_NoThreshold
+f 19/19 20/20 21/21

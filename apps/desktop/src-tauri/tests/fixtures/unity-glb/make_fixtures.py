@@ -41,8 +41,9 @@ GREY = (0.8, 0.8, 0.8, 1)
 
 # The GUID of Unity's built-in resources, which a material on a built-in shader names.
 BUILT_IN = "0000000000000000f000000000000000"
-# The file ID every Shader Graph's main asset has in a material's `m_Shader`.
+# The file ID every Shader Graph's main asset has in a material's `m_Shader`, and a `.shader`'s.
 GRAPH_FILE_ID = -6465566751694194690
+SHADER_FILE_ID = 4800000
 
 
 def guid(pack: str, name: str) -> str:
@@ -115,9 +116,24 @@ class Pack:
         self.meta(f"{name}.shadergraph")
         return guid(self.name, f"{name}.shadergraph")
 
-    def material(self, name: str, textures=None, colors=None, shader=None, cutout=False) -> None:
+    def shader(self, name: str, text: str) -> str:
+        """Writes `name`.shader and its `.meta`, and returns its GUID."""
+        self.write(f"{name}.shader", text)
+        self.meta(f"{name}.shader")
+        return guid(self.name, f"{name}.shader")
+
+    def material(
+        self,
+        name: str,
+        textures=None,
+        colors=None,
+        shader=None,
+        cutout=False,
+        file_id=GRAPH_FILE_ID,
+    ) -> None:
         """Writes `name`.mat and its `.meta`, a material as Unity 2021 writes it: `textures`
-        maps a property to a texture's GUID, or `None` for an empty slot."""
+        maps a property to a texture's GUID, or `None` for an empty slot, and `shader` is the
+        GUID of a graph, or with `SHADER_FILE_ID`, a `.shader`."""
         lines = [
             "%YAML 1.1",
             "%TAG !u! tag:unity3d.com,2011:",
@@ -128,7 +144,7 @@ class Pack:
         ]
         if shader:
             # Unity wraps the line here, past 80 columns.
-            lines += [f"  m_Shader: {{fileID: {GRAPH_FILE_ID}, guid: {shader},", "    type: 3}"]
+            lines += [f"  m_Shader: {{fileID: {file_id}, guid: {shader},", "    type: 3}"]
         else:
             lines.append(f"  m_Shader: {{fileID: 46, guid: {BUILT_IN}, type: 0}}")
         if cutout:
@@ -198,6 +214,120 @@ def older(properties: dict[str, str]) -> str:
             ]
         },
         indent=4,
+    )
+
+
+def clip_stream(prop: str, alpha_from: int = 7, clip: bool = True, override: bool = False) -> str:
+    """A Shader Graph as Unity 2021 writes it whose Alpha block reads output `alpha_from` of a
+    sample of the texture property `prop` (7 is its alpha, 4 its red), and whose target clips
+    when `clip` is set, or leaves that to the material with `override`."""
+
+    def edge(out_node: str, out_slot: int, in_node: str, in_slot: int) -> dict:
+        return {
+            "m_OutputSlot": {"m_Node": {"m_Id": out_node}, "m_SlotId": out_slot},
+            "m_InputSlot": {"m_Node": {"m_Id": in_node}, "m_SlotId": in_slot},
+        }
+
+    objects = [
+        {
+            "m_SGVersion": 3,
+            "m_Type": "UnityEditor.ShaderGraph.GraphData",
+            "m_ObjectId": "graph",
+            "m_Properties": [{"m_Id": "base"}],
+            "m_Edges": [edge("property", 0, "sample", 1), edge("sample", alpha_from, "alpha", 0)],
+        },
+        {
+            "m_Type": "UnityEditor.ShaderGraph.Internal.Texture2DShaderProperty",
+            "m_ObjectId": "base",
+            "m_Name": "Base",
+            "m_DefaultReferenceName": "Texture2D_x",
+            "m_OverrideReferenceName": prop,
+        },
+        {
+            "m_Type": "UnityEditor.ShaderGraph.PropertyNode",
+            "m_ObjectId": "property",
+            "m_Property": {"m_Id": "base"},
+        },
+        {"m_Type": "UnityEditor.ShaderGraph.SampleTexture2DNode", "m_ObjectId": "sample"},
+        {
+            "m_Type": "UnityEditor.ShaderGraph.BlockNode",
+            "m_ObjectId": "alpha",
+            "m_Name": "SurfaceDescription.Alpha",
+        },
+        {
+            "m_Type": "UnityEditor.Rendering.Universal.ShaderGraph.UniversalTarget",
+            "m_ObjectId": "target",
+            "m_AlphaClip": clip,
+            "m_AllowMaterialOverride": override,
+        },
+    ]
+    return "\n\n".join(json.dumps(o, indent=4) for o in objects) + "\n"
+
+
+def older_clip(prop: str, threshold: float) -> str:
+    """A graph from before the stream, as `FAE_TreeBranch` is: a PBR master node whose Alpha
+    reads the alpha of a sample of the texture property `prop`, and whose AlphaClipThreshold,
+    linked to nothing, is `threshold`."""
+
+    def entry(kind: str, data: dict) -> dict:
+        return {
+            "typeInfo": {"fullName": f"UnityEditor.ShaderGraph.{kind}"},
+            "JSONnodeData": json.dumps(data),
+        }
+
+    def edge(out_node: str, out_slot: int, in_node: str, in_slot: int) -> dict:
+        return entry(
+            "Graphing.Edge",
+            {
+                "m_OutputSlot": {"m_SlotId": out_slot, "m_NodeGUIDSerialized": out_node},
+                "m_InputSlot": {"m_SlotId": in_slot, "m_NodeGUIDSerialized": in_node},
+            },
+        )
+
+    slots = [
+        entry("Vector1MaterialSlot", {"m_Id": 7, "m_DisplayName": "Alpha", "m_Value": 1.0}),
+        entry(
+            "Vector1MaterialSlot",
+            {"m_Id": 8, "m_DisplayName": "AlphaClipThreshold", "m_Value": threshold},
+        ),
+    ]
+    graph = {
+        "m_SerializedProperties": [
+            entry(
+                "TextureShaderProperty",
+                {
+                    "m_Guid": {"m_GuidSerialized": "base"},
+                    "m_Name": "MainTex",
+                    "m_DefaultReferenceName": "Texture2D_x",
+                    "m_OverrideReferenceName": prop,
+                },
+            )
+        ],
+        "m_SerializableNodes": [
+            entry("PBRMasterNode", {"m_GuidSerialized": "master", "m_SerializableSlots": slots}),
+            entry(
+                "PropertyNode", {"m_GuidSerialized": "property", "m_PropertyGuidSerialized": "base"}
+            ),
+            entry("SampleTexture2DNode", {"m_GuidSerialized": "sample"}),
+        ],
+        "m_SerializableEdges": [edge("property", 0, "sample", 1), edge("sample", 7, "master", 7)],
+        "m_ActiveOutputNodeGuidSerialized": "master",
+    }
+    return json.dumps(graph, indent=4)
+
+
+def shader_source(render_type: str) -> str:
+    """A `.shader` whose SubShader's tags name `render_type`."""
+    return (
+        'Shader "Fixture/Thing" {\n'
+        '    Properties { _MainTex ("Base", 2D) = "white" {} }\n'
+        "    SubShader {\n"
+        f'        Tags {{ "RenderType"="{render_type}" }}\n'
+        "        CGPROGRAM\n"
+        "        #pragma surface surf Standard\n"
+        "        ENDCG\n"
+        "    }\n"
+        "}\n"
     )
 
 
@@ -644,6 +774,46 @@ def main() -> None:
         pack.material(
             "M_Thing", {"Texture2D_x": pack.texture("T_Base", BASE)}, {"_Color": TINT}, shader
         )
+
+    # A shader that clips sets no keyword in the material. These three clip on their base's
+    # alpha: a graph's target, an older graph's threshold (as `FAE_TreeBranch`'s) and a `.shader`'s
+    # tags. The other four don't: a `.shader` with no cutout tag, a graph leaving the clip to the
+    # material, one whose Alpha reads the base's red, and an older graph whose threshold is 0.
+    pack = Pack(
+        "shader-clip",
+        ["M_Graph", "M_Older", "M_Shader", "M_Opaque", "M_Override", "M_Red", "M_NoThreshold"],
+    )
+    base = pack.texture("T_Base", BASE, 0)
+    for name, prop, shader, file_id in (
+        ("M_Graph", "_BaseMap", pack.graph("S_Graph", clip_stream("_BaseMap")), GRAPH_FILE_ID),
+        ("M_Older", "_MainTex", pack.graph("S_Older", older_clip("_MainTex", 0.5)), GRAPH_FILE_ID),
+        (
+            "M_Shader",
+            "_MainTex",
+            pack.shader("S_Cutout", shader_source("TransparentCutout")),
+            SHADER_FILE_ID,
+        ),
+        ("M_Opaque", "_MainTex", pack.shader("S_Opaque", shader_source("Opaque")), SHADER_FILE_ID),
+        (
+            "M_Override",
+            "_BaseMap",
+            pack.graph("S_Override", clip_stream("_BaseMap", override=True)),
+            GRAPH_FILE_ID,
+        ),
+        (
+            "M_Red",
+            "_BaseMap",
+            pack.graph("S_Red", clip_stream("_BaseMap", alpha_from=4)),
+            GRAPH_FILE_ID,
+        ),
+        (
+            "M_NoThreshold",
+            "_MainTex",
+            pack.graph("S_NoThreshold", older_clip("_MainTex", 0)),
+            GRAPH_FILE_ID,
+        ),
+    ):
+        pack.material(name, {prop: base}, shader=shader, file_id=file_id)
 
     Pack("lod-only").objects(["Model_LOD1"])
 
