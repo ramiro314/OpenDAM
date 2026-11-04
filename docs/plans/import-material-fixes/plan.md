@@ -626,6 +626,41 @@ The list below doesn't cover two of these. The owner accepted them as recorded o
   IDs Unity hashes from the mesh's name. The `.meta` doesn't name them, and the one-list fallback
   can't apply to two meshes with two lists.
 
+**Big Castle's ivy background planes and `grassPlane` have no material in any file.** On 2026-11-03 the owner
+accepted `ivy_a` and `grassPlane` if no file held their materials (decision 6), and Work item 5
+searched on 2026-11-04. The search found the same gap in 4 more ivy GLBs, which the owner's
+decision doesn't name: they are recorded here on the strength of that finding. All 6 are among the
+12 GLBs above:
+
+- **The ivy.** One or two planes have no material in each of these GLBs: `ivy_a`'s `Plane.052`
+  (whose mesh is `Plane.081`), `ivy_a_lod`'s `Plane.056`, `ivy_b`'s `Plane.053`, `ivy_b_lod`'s
+  `Plane.057`, and `ivy_c`'s `Plane.060` and `Plane.061`. No FBX gives them a material:
+  `ivy_a` and `ivy_a_lod` give their one material, `leavePlane`, only to the leaf cards, and
+  `ivy_b`, `ivy_b_lod` and `ivy_c` have none. The `ivy_a`, `ivy_b` and `ivy_c` prefabs,
+  checked by each `m_Mesh` file ID against the FBX `.meta` files, place each model's bark and leaf
+  cards and none of these planes. So in Unity the ivy has no background card at all.
+  `ivy_c_lod` isn't a leftover: it has no such plane, and `ivy_c.prefab` places all four of its
+  meshes, which its GLB textures with bark and `leafes_plane`.
+- **`grassPlane`.** Its FBX has no material, and no prefab or scene places it.
+
+Where the search looked:
+
+- **Package.** The whole `.unitypackage`: every file in it is in the built pack.
+- **`.meta` files.** All 952. The importers of the six ivy FBX files (`ivy_a`, `ivy_b` and
+  `ivy_c`, each with its `_lod`) and of `grassPlane.fbx` (`importMaterials: 0`, no
+  `externalObjects`) remap no material.
+- **Prefabs and scenes.** All 260 prefabs and 5 scenes. No scene places any of those seven FBX
+  files directly: only the `ivy_a`, `ivy_b` and `ivy_c` prefabs refer to the ivy ones, and
+  nothing refers to `grassPlane.fbx`. The scenes' material overrides on the three ivy prefabs
+  change only the bark's renderers.
+- **The other assets.** The two binary terrain assets, read through `unity_text.py`, use
+  `grass_basecolor.png` and `plant_dry_basecolor.png` as detail textures and `tree_b` as a tree.
+- **Materials and textures.** `grass.mat`, `ivy_a_bg_plane_basecolor.png` and
+  `ivy_b_bg_plane_basecolor.png` look like the missing materials, but no file names their GUIDs.
+  Linking them would be the filename rule this plan dropped.
+
+So the converter doesn't change.
+
 ### Pipeline choice result
 
 Measured on 2026-11-02 in a clean throwaway profile (`apps/desktop/scripts/import-trial/run.sh`,
@@ -806,7 +841,10 @@ profile, as Piece 1 did, and reports the GLBs it changes.
 5. **`ivy_a` and `grassPlane`'s materials.** Search Big Castle's prefabs, scenes and `.meta` files
    for the materials of `Plane.081` and `grassPlane`'s mesh. If a file holds them, the converter
    learns to read it, with a fixture. If none does, the ticket records them as accepted leftovers
-   in [Piece 1 result](#piece-1-result), and the converter doesn't change.
+   in [Piece 1 result](#piece-1-result), and the converter doesn't change. Searched on
+   2026-11-04: no file holds them, so they are recorded there as accepted. The 4 other ivy GLBs
+   with the same unplaced planes are recorded with them, as this search's finding: the owner's
+   decision names only `ivy_a` and `grassPlane`.
 6. **Bump to `opendam-unity-glb/6`.** Once items 1 to 5 have merged: `VERSION` and
    `UNITY_GLB_VERSION` move together, the docstring lists what changed, and `CLAUDE.md`'s
    `src/import` notes record the new rules. Every built Unity pack needs a Rebuild, as
