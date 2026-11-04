@@ -79,6 +79,9 @@ What follows version 5, for the bump to version 6 (the same plan, After the firs
 - A mesh whose name, less Blender's numeric suffix, ends `_Billboard` in any case is dropped
   beside any other mesh the file keeps, as a higher level is: it is a far stand-in, crossed cards
   around a tree. A file whose only mesh is a billboard keeps it.
+- A material with no cutout keyword is still a cutout, on its base's alpha, when its shader always
+  clips on that alpha (`clipped_on`): a `.shader` whose tags declare a cutout, or a Shader Graph,
+  either format, whose Alpha reads the base texture's alpha.
 
 A model left with no mesh still writes its GLB. OpenDAM reads each GLB it places and warns of an
 empty one, on every run, since this script only sees uncached models.
@@ -264,6 +267,117 @@ def graph_properties(path: Path) -> tuple[dict[str, str], set[str]]:
     return GRAPHS[path]
 
 
+# A sample node's texture input, and its alpha output by node type, the same slot IDs in both graph
+# formats. The LOD sample's LOD input is slot 4, so its outputs are one higher: its 7 is blue.
+SAMPLE_TEXTURE = 1
+SAMPLE_ALPHA = {"SampleTexture2DNode": 7, "SampleTexture2DLODNode": 8}
+# What `clipped_on` gives a `.shader` that clips: its code isn't traced, so whichever texture is
+# the material's base.
+ANY_BASE = frozenset({"*"})
+CLIPS: dict[Path, frozenset[str]] = {}
+CUTOUT_TAGS = re.compile(r'"RenderType"\s*=\s*"TransparentCutout"|"Queue"\s*=\s*"AlphaTest'
+                         r"|#pragma\s+surface\b.*\balphatest:")
+
+
+def clipped_on(path: Path) -> frozenset[str]:
+    """The references of the texture properties a shader clips on the alpha of, cached per file.
+
+    A `.shader` clips when its tags or its surface pragma declare a cutout, and then on the
+    material's base (`ANY_BASE`). A Shader Graph clips when its target always does (alpha clip on,
+    with no material override, which leaves it to the material's keyword) or, in a graph from
+    before the stream, when its master node's threshold is linked or above 0. It then clips on
+    each texture property a sample node reads, whose alpha reaches the graph's Alpha through any
+    nodes: `FAE_TreeBranch` clips on `_MainTex`'s alpha, and a graph whose Alpha reads a colour,
+    a red channel or nothing clips on none. A file that can't be read clips on nothing."""
+    if path not in CLIPS:
+        try:
+            text = path.read_text(errors="replace").lstrip("\ufeff")
+            if path.suffix.lower() == ".shader":
+                CLIPS[path] = ANY_BASE if CUTOUT_TAGS.search(text) else frozenset()
+            else:
+                CLIPS[path] = graph_clips(text)
+        except (OSError, ValueError, RecursionError, KeyError, TypeError, AttributeError):
+            CLIPS[path] = frozenset()
+    return CLIPS[path]
+
+
+def graph_clips(text: str) -> frozenset[str]:
+    """`clipped_on` for a graph's text. Each format becomes the same three things: each node's
+    kind and the property it reads, each node's incoming edges, and the edges into Alpha."""
+    decoder = json.JSONDecoder()
+    objects, at = [], SPACE_RE.match(text).end()
+    while at < len(text):
+        found, end = decoder.raw_decode(text, at)
+        objects.append(found)
+        at = SPACE_RE.match(text, end).end()
+    nodes: dict[str, tuple[str, str | None]] = {}  # node -> (kind, reference of its property)
+    into: dict[str, list[tuple[int, str, int]]] = {}  # node -> (input slot, from node, output slot)
+
+    def ref(prop: dict) -> str | None:
+        return prop.get("m_OverrideReferenceName") or prop.get("m_DefaultReferenceName")
+
+    if len(objects) == 1 and "m_SerializableNodes" in objects[0]:
+        graph = objects[0]
+        props = {}
+        for entry in graph.get("m_SerializedProperties", []):
+            prop = json.loads(entry["JSONnodeData"])
+            props[prop["m_Guid"]["m_GuidSerialized"]] = ref(prop)
+        master = graph.get("m_ActiveOutputNodeGuidSerialized")
+        slots = {}
+        for entry in graph["m_SerializableNodes"]:
+            node = json.loads(entry["JSONnodeData"])
+            nodes[node["m_GuidSerialized"]] = (entry["typeInfo"]["fullName"],
+                                               props.get(node.get("m_PropertyGuidSerialized")))
+            if node["m_GuidSerialized"] == master:
+                for entry_slot in node.get("m_SerializableSlots", []):
+                    slot = json.loads(entry_slot["JSONnodeData"])
+                    slots[slot.get("m_DisplayName")] = slot
+        for entry in graph.get("m_SerializableEdges", []):
+            edge = json.loads(entry["JSONnodeData"])
+            into.setdefault(edge["m_InputSlot"]["m_NodeGUIDSerialized"], []).append((
+                edge["m_InputSlot"]["m_SlotId"], edge["m_OutputSlot"]["m_NodeGUIDSerialized"],
+                edge["m_OutputSlot"]["m_SlotId"]))
+        alpha, threshold = slots.get("Alpha"), slots.get("AlphaClipThreshold")
+        if not alpha or not threshold:
+            return frozenset()
+        linked = {slot for slot, _, _ in into.get(master, [])}
+        if threshold["m_Id"] not in linked and not (threshold.get("m_Value") or 0) > 0:
+            return frozenset()
+        start = [(node, out) for slot, node, out in into.get(master, []) if slot == alpha["m_Id"]]
+    else:
+        found = {o["m_ObjectId"]: o for o in objects if isinstance(o, dict) and "m_ObjectId" in o}
+        targets = [o for o in found.values() if "m_AlphaClip" in o]
+        if not any(t["m_AlphaClip"] and not t.get("m_AllowMaterialOverride") for t in targets):
+            return frozenset()
+        for key, node in found.items():
+            prop = found.get((node.get("m_Property") or {}).get("m_Id"), {})
+            nodes[key] = (str(node.get("m_Type")), ref(prop))
+        graph = next((o for o in objects if isinstance(o, dict)
+                      and o.get("m_Type") == "UnityEditor.ShaderGraph.GraphData"), {})
+        for edge in graph.get("m_Edges", []):
+            into.setdefault(edge["m_InputSlot"]["m_Node"]["m_Id"], []).append((
+                edge["m_InputSlot"]["m_SlotId"], edge["m_OutputSlot"]["m_Node"]["m_Id"],
+                edge["m_OutputSlot"]["m_SlotId"]))
+        start = [(node, out) for key, block in found.items()
+                 if block.get("m_Name") == "SurfaceDescription.Alpha"
+                 for _, node, out in into.get(key, [])]
+    clipped, seen = set(), set()
+    while start:
+        node, out = start.pop()
+        if (node, out) in seen:
+            continue
+        seen.add((node, out))
+        kind = nodes.get(node, ("", None))[0].rsplit(".", 1)[-1]
+        if kind in SAMPLE_ALPHA:
+            # A sample ends the walk: its UVs may read other textures, but not as alpha.
+            if out == SAMPLE_ALPHA[kind]:
+                clipped.update(nodes.get(source, ("", None))[1]
+                               for slot, source, _ in into.get(node, []) if slot == SAMPLE_TEXTURE)
+            continue
+        start += [(source, source_out) for _, source, source_out in into.get(node, [])]
+    return frozenset(clipped - {None})
+
+
 def linear(color: tuple[float, ...]) -> tuple[float, ...]:
     """An sRGB color, as Unity stores one, as the linear color glTF wants. Alpha stays."""
     def channel(c: float) -> float:
@@ -281,10 +395,12 @@ class UnityMaterial:
         self.path = path
         self.name = name.group(1).strip() if name else path.stem
         shader = re.search(r"m_Shader: \{fileID: -?\d+,\s*guid: ([0-9a-f]{32})", block)
-        graph = guids.get(shader.group(1)) if shader else None
-        is_graph = graph and graph.suffix.lower() == ".shadergraph"
-        names, hdr = graph_properties(graph) if is_graph else ({}, set())
+        shader_file = guids.get(shader.group(1)) if shader else None
+        kind = shader_file.suffix.lower() if shader_file else None
+        names, hdr = graph_properties(shader_file) if kind == ".shadergraph" else ({}, set())
         self.textures: dict[str, Path] = {}
+        # Each texture's raw property names, for the ones its shader clips on.
+        bound: dict[Path, set[str]] = {}
         # (display name, texture), sorted, so `A_BaseColor` wins over `B_BaseColor`.
         self.display: list[tuple[str, Path]] = []
         for prop, guid in re.findall(
@@ -292,6 +408,7 @@ class UnityMaterial:
         ):
             if guid in guids:
                 self.textures.setdefault(norm(prop), guids[guid])
+                bound.setdefault(guids[guid], set()).add(prop)
                 if prop in names:
                     self.display.append((names[prop], guids[guid]))
         self.display.sort(key=lambda shown: shown[0])
@@ -308,6 +425,11 @@ class UnityMaterial:
         for prop in sorted(names.keys() & colors.keys(), key=names.get):
             self.colors.setdefault(alnum(names[prop]), colors[prop])
         self.cutout = "_ALPHATEST_ON" in text or "TransparentCutout" in text
+        if not self.cutout and kind in (".shadergraph", ".shader"):
+            # A shader that always clips sets no keyword: read the clip from the shader.
+            clips = clipped_on(shader_file)
+            base = self.base() if clips else None
+            self.cutout = base is not None and (clips == ANY_BASE or bool(clips & bound[base]))
 
     def texture(self, props: list[str]) -> Path | None:
         return next((self.textures[p] for p in props if p in self.textures), None)
