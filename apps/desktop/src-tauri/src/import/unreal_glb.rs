@@ -15,7 +15,7 @@
 //!   it kills before fails the step, naming the cap.
 //! - **What it exports.** The asset registry's meshes and animations, and the packages on disk
 //!   the registry misses whose own class is one, a redirector skipped. Each session lists the
-//!   packages it expects a GLB of, and any left with none that didn't fail is a warning
+//!   GLBs it expects of the assets that didn't fail, and any not made is a warning
 //!   (`SkipReason::NoGlb`), so a mesh lost on the way can't read as complete.
 //! - **The cache.** Each GLB is kept at `<cache>/glb/<key>.glb` as soon as its session ends,
 //!   keyed by the original's sha256, its `/Game` path, `UNREAL_GLB_VERSION` and the editor's
@@ -384,7 +384,7 @@ fn record_key(original_sha256: &str, editor_version: &str) -> String {
 
 /// What the runs over one original have exported, by `/Game` path, rewritten after every
 /// session: the GLBs made, the assets the exporter failed on, whether a session reported
-/// nothing left, and the packages of an export type the last session listed.
+/// nothing left, and the GLBs the last session expected, by `/Game` path as `exported` names them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub exported: BTreeSet<String>,
@@ -395,7 +395,7 @@ pub struct Record {
 }
 
 impl Record {
-    /// The packages of an export type left with no GLB that the exporter didn't fail on.
+    /// The assets expected a GLB that have none and didn't fail.
     fn lost(&self) -> impl Iterator<Item = &String> {
         self.expected
             .iter()
@@ -834,8 +834,8 @@ async fn failed_in(out: &Path) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// The packages of an export type the last session listed, from its `.gltf-expected`, `None`
-/// when no session wrote one.
+/// The GLBs the last session expected, from its `.gltf-expected`, `None` when no session wrote
+/// one.
 async fn expected_in(out: &Path) -> Option<BTreeSet<String>> {
     packages_in(&out.join(".gltf-expected")).await
 }

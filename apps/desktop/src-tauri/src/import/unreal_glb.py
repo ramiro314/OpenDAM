@@ -17,8 +17,9 @@ or when anything fails.
 What it exports is the asset registry's assets of an export type, as it lists them, and the
 packages on disk below `Content/` that the registry misses (LostRuins' `SM_column04`), each loaded
 by path and kept when its own class is an export type. A redirector is skipped: its target is a
-package of its own. Every session writes the packages it expects a GLB of to
-`$GLTF_OUT/.gltf-expected`, one per line, and OpenDAM warns on any left with none that didn't fail.
+package of its own. Every session lists the GLB of every asset it exports that hasn't failed in
+`$GLTF_OUT/.gltf-expected`, by the `/Game` path OpenDAM reads back from it, and OpenDAM warns on
+any it doesn't find.
 
 Version 3 added the packages the registry misses and `.gltf-expected`.
 """
@@ -88,15 +89,28 @@ def fail(package: str) -> None:
         f.write(f"{package}\n")
 
 
+def glb_game_path(target: Path) -> str:
+    """The `/Game` path OpenDAM reads back from the GLB `target`, as it names what it exported."""
+    return f"/Game/{target.relative_to(OUT).with_suffix('').as_posix()}"
+
+
+def write_expected(targets, failed: set[str]) -> None:
+    """Lists the GLB of every target that hasn't failed, by `glb_game_path`: OpenDAM warns on
+    any it doesn't find. A failed target already warns, under its package."""
+    lines = (glb_game_path(t) for p, _, t in targets if p not in failed)
+    (OUT / ".gltf-expected").write_text("".join(f"{line}\n" for line in lines))
+
+
 def unlisted(package: str, failed_before: set[str]):
-    """A package the registry misses as a target, `(package, asset, glb)`, when its own class is
-    an export type, `None` when it isn't or is a redirector. One that already has a GLB, or has
-    failed, isn't loaded again: it was of an export type. One that can't be loaded is recorded as
-    failed, so it warns."""
+    """A package the registry misses as a target, `(package, object path, glb)`, when its own
+    class is an export type, `None` when it isn't or is a redirector. The asset isn't kept: the
+    export loads it again, so only a batch's assets are held. One that already has a GLB, or has
+    failed, isn't loaded at all: it was of an export type. One that can't be loaded is recorded
+    as failed, so it warns."""
     target = OUT / f"{package.removeprefix('/Game/')}.glb"
-    if target.exists() or package in failed_before:
-        return package, None, target
     object_path = f"{package}.{package.rsplit('/', 1)[-1]}"
+    if target.exists() or package in failed_before:
+        return package, object_path, target
     try:
         asset = unreal.load_asset(object_path)
     except Exception as e:
@@ -115,7 +129,7 @@ def unlisted(package: str, failed_before: set[str]):
     if cls not in TYPES:
         return None
     unreal.log(f"[gltf] found {package}, a {cls} the asset registry doesn't list")
-    return package, asset, target
+    return package, object_path, target
 
 
 def main() -> None:
@@ -127,17 +141,21 @@ def main() -> None:
     failed_before = (
         {line for line in FAILED.read_text().splitlines() if line} if FAILED.exists() else set()
     )
-    # (package, its asset, or None to read it from the registry's data, the GLB)
+    # (package, its registry data or the object path to load it by, the GLB)
     targets = []
     for data in listed:
         if class_name(data) in TYPES:
             rel = str(data.package_path).removeprefix("/Game").strip("/")
             targets.append((str(data.package_name), data, OUT / rel / f"{data.asset_name}.glb"))
-    for package in on_disk():
-        if package not in known and (found := unlisted(package, failed_before)):
+    missed = [p for p in on_disk() if p not in known]
+    for package in missed:
+        if found := unlisted(package, failed_before):
             targets.append(found)
+    if missed:
+        # What the class checks loaded is let go before the batch starts.
+        unreal.SystemLibrary.collect_garbage()
     targets.sort(key=lambda t: t[0])
-    (OUT / ".gltf-expected").write_text("".join(f"{p}\n" for p, _, _ in targets))
+    write_expected(targets, failed_before)
     opts = options()
     todo = [(p, a, t) for p, a, t in targets if not t.exists() and p not in failed_before]
     done = failed = 0
@@ -154,7 +172,9 @@ def main() -> None:
             partial = target.with_name(f".{target.stem}.partial.glb")
             ok = False
             try:
-                if isinstance(asset, unreal.AssetData):
+                if isinstance(asset, str):
+                    asset = unreal.load_asset(asset)
+                else:
                     asset = asset.get_asset()
                 result = unreal.GLTFExporter.export_to_gltf(asset, str(partial), opts, set())
                 # The exporter reports a failure by returning False (with its messages as a
@@ -171,10 +191,12 @@ def main() -> None:
                 unreal.log(f"[gltf] exported {package}")
             else:
                 failed += 1
+                failed_before.add(package)
                 fail(package)
                 unreal.log_warning(f"[gltf] no file written for {package}")
             unreal.SystemLibrary.collect_garbage()
     remaining = len(todo) - done - failed
+    write_expected(targets, failed_before)
     (OUT / ".gltf-remaining").write_text(f"{remaining}\n")
     unreal.log(
         f"[gltf] exported {done}, failed {failed}, remaining {remaining}, "
