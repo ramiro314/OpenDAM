@@ -957,3 +957,27 @@ Items 11, 13 and 14 can land before or after the second gate.
 - **The 16 cached packages not sampled** run no acceptance pass, though the census found no
   sign of trouble.
 - **Nothing flags a stale pack** after a future version bump.
+- **Unreal Nanite meshes export their fallback mesh** (Work item 8, traced on 2026-11-04 in the
+  UE 5.8 editor on a work copy of Waterways). The ferns' mask isn't lost: `MI_Fern_02`'s parent
+  `MM_Plants` takes its opacity mask from `T_Fern_O`'s red channel, and that texture is itself
+  99.3% at or above the 0.3333 cutoff, because the fern's leaflets are geometry and the mask only
+  trims specks. A `SIMPLE` bake matches the texture to 0.13% per pixel. The blocky leaf ends come
+  from the geometry: the exporter writes render data, and a Nanite mesh's LOD 0 there is its
+  fallback (relative error 1.0 here), so `SM_Fern_01` exports 5,621 of its 148,520 triangles,
+  `SM_Fern_02` 2,826 of 78,152 and `SM_Fern_04` 1,047 of 17,728. `SM_Fern_03` isn't Nanite and
+  exports all 148,520. All 112 of Waterways' 146 static meshes that are Nanite export exactly
+  their fallback's count, 111 of them reduced: 352,417 triangles in all, against 18,559,387 in
+  their sources. No one-line change fixes it:
+  - `export_source_model` alone writes the source geometry, but `MM_Plants` reads vertex colour
+    (its AO is `AO * VertexColor.R`), so `USE_MESH_DATA` bakes every input in the lightmap UV,
+    channel 1, which only the render data has. The GLB's base colour points at a `TEXCOORD_1` the
+    mesh lacks, and the fern turns flat yellow-brown.
+  - The source model with a `SIMPLE` bake gives `SM_Fern_01` its rounded leaflets and its colour.
+    But `SIMPLE` everywhere would break materials that really need mesh data, such as
+    `MM_MasterWorldAligned`'s.
+  - Every source is too big to export whole: `SM_SmallStone_04` is 8,472,778 triangles, a 243 MB
+    GLB, against 662 in its fallback.
+
+  A fix is an Unreal export ticket that bumps `UNREAL_GLB_VERSION`, shaped first: which Nanite
+  meshes take their source model (a triangle cap, say), and how a mesh-data bake is kept on a
+  channel the exported mesh has. LostRuins wasn't checked for Nanite meshes.
