@@ -1260,6 +1260,8 @@ async fn python_queue_round(
             let mut result_thumb = None;
             let mut result_model = None;
             let mut report = EngineReport::default();
+            // Why the file has no preview, when the worker knows (an animation with no mesh)
+            let mut reason = None;
 
             if let Ok(resp) = py_resp {
                 if let Some(res) = resp.get("result") {
@@ -1272,6 +1274,8 @@ async fn python_queue_round(
                             result_model = Some(model.to_string());
                         }
                         report = EngineReport::of_result(res);
+                    } else if let Some(why) = res.get("reason").and_then(|v| v.as_str()) {
+                        reason = Some(why.to_string());
                     } else {
                         tracing::error!("Python returned ok=false: {:?}", res);
                     }
@@ -1301,6 +1305,10 @@ async fn python_queue_round(
                 )
                 .await;
                 finished(Ok(done));
+            } else if let Some(reason) = reason {
+                finished(Err(
+                    refuse_job(pool, root_path, &job_id, &asset_id, reason).await
+                ));
             } else {
                 fail_job(pool, &job_id, &asset_id).await;
                 finished(Err((job_id, asset_id, None)));
@@ -2798,6 +2806,48 @@ done
                 .await
                 .unwrap();
         assert_eq!((status.as_str(), reason), ("error", None));
+    }
+
+    #[tokio::test]
+    async fn a_job_the_worker_gives_a_reason_ends_with_it_shown_and_no_thumbnail() {
+        let dir = tempfile::tempdir().unwrap();
+        let reason = r#"printf '{"id":"%s","result":{"ok":false,"error":"Animation, no mesh","reason":"Animation, no mesh","preview_version":2}}\n' "$id""#;
+        let mut engine = stub_engine(dir.path(), ANSWER_2, reason);
+        // With a preview the file had before it changed
+        let old = dir.path().join(".opendam/thumbs/a1_thumb.png");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, b"png").unwrap();
+        let lib = library_with_pending_job(
+            dir.path(),
+            "Animations/run.fbx",
+            ".opendam/thumbs/a1_thumb.png",
+        )
+        .await;
+
+        let outcomes = queue_round(&mut engine, std::slice::from_ref(&lib)).await;
+
+        assert!(
+            matches!(&outcomes[..], [Err((_, _, Some(r)))] if r == "Animation, no mesh"),
+            "the job ends with its reason: {outcomes:?}"
+        );
+        let (status, thumb, shown): (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT preview_status, thumbnail_path, preview_reason FROM assets WHERE id = 'a1'",
+        )
+        .fetch_one(&lib.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (status.as_str(), thumb, shown.as_deref()),
+            ("error", None, Some("Animation, no mesh"))
+        );
+        assert!(!old.exists(), "the old thumbnail is deleted");
+        let job: String = sqlx::query_scalar("SELECT error_message FROM preview_jobs")
+            .fetch_one(&lib.pool)
+            .await
+            .unwrap();
+        assert_eq!(job, "Animation, no mesh");
+        // A reason is an answer, so the worker keeps serving
+        assert_eq!(engine.starts, 1);
     }
 
     #[tokio::test]

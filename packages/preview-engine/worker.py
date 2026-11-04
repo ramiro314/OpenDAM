@@ -540,6 +540,10 @@ def model_meta(
                 res["preview_error"] = "No valid meshes in FBX/3DS file"
         except Exception as e:
             res["preview_error"] = f"FBX/3DS convert failed: {e}"
+        if "preview_model" not in res and ext == ".fbx":
+            reason = fbx_without_mesh(source)
+            if reason:
+                res["reason"] = reason
 
     elif ext == ".vrmat":
         # V-Ray Material file preview
@@ -1030,10 +1034,19 @@ def model_meta(
         # Adobe Illustrator preview (via PDF render engine)
         try:
             import pypdfium2 as pdfium
+            from PIL import Image
 
-            pdf = pdfium.PdfDocument(source)
-            page = pdf[0]
-            img = page.render(scale=3).to_pil()
+            try:
+                pdf = pdfium.PdfDocument(source)
+                page = pdf[0]
+            except pdfium.PdfiumError, IndexError:
+                # No PDF to render, or no page in it: Illustrator 8 and older write PostScript
+                res["reason"] = "No PDF content to preview"
+                raise
+            # At most 3x, and no larger than the thumbnail: a poster-sized page at 3x is
+            # hundreds of megabytes of bitmap
+            scale = min(3, 1440 / max(*page.get_size(), 1))
+            img = page.render(scale=scale).to_pil()
             if max(img.size) > 1440:
                 img.thumbnail((1440, 1440), Image.LANCZOS)
             if img.mode != "RGB":
@@ -1081,8 +1094,34 @@ def model_meta(
     if "thumbnail" not in res and "preview_model" not in res:
         res["ok"] = False
         res["error"] = res.get("preview_error", "No preview available for this format")
+        # A `reason` says why the file has no preview, for the app to show. Without one, the
+        # failure is a bare error, and the app offers to try again.
+        if "reason" in res:
+            res["error"] = res["reason"]
 
     return res
+
+
+def fbx_without_mesh(source: str) -> str | None:
+    """
+    Why the FBX at `source` has no preview when its node tree holds no mesh: "Animation, no
+    mesh" when it has animation curves, as an animation exported on its own does, else "No
+    mesh". None when it holds a mesh or isn't readable, so the converter's own error stands.
+    """
+    import fbx_nodes
+
+    try:
+        doc = fbx_nodes.read(source)
+    except OSError, fbx_nodes.FbxError:
+        return None
+    objects = doc.sections.get("Objects")
+    if objects is None:
+        return None
+    if any(o.name == "Model" and o.props[2:3] == ["Mesh"] for o in objects.children):
+        return None
+    if any(o.name == "AnimationCurve" for o in objects.children):
+        return "Animation, no mesh"
+    return "No mesh"
 
 
 # ── Game export facts ─────────────────────────────────────────────────────
