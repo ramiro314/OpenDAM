@@ -74,10 +74,18 @@ const MODEL_EXTENSIONS: [&str; 2] = ["fbx", "obj"];
 /// The files the script loads as textures. It reads them from its job (`imageExtensions`), so
 /// this is the one list of them.
 const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "tga", "tif", "tiff", "psd", "bmp"];
-/// The other files Blender reads besides the models: Unity's `.meta`, `.mat`, `.prefab`, `.unity`
-/// and `.shadergraph`, and an OBJ's `.mtl`. A test keeps every extension the script names among
-/// these.
-const UNITY_EXTENSIONS: [&str; 6] = ["meta", "mat", "prefab", "unity", "shadergraph", "mtl"];
+/// The other files Blender reads besides the models: Unity's `.meta`, `.mat`, `.prefab`, `.unity`,
+/// `.shadergraph` and `.shader`, and an OBJ's `.mtl`. A test keeps every extension the script
+/// names among these.
+const UNITY_EXTENSIONS: [&str; 7] = [
+    "meta",
+    "mat",
+    "prefab",
+    "unity",
+    "shadergraph",
+    "shader",
+    "mtl",
+];
 /// The Unity files the script reads as text that Unity 4 and 5 could also write in their binary
 /// serialization.
 const SERIALIZED_EXTENSIONS: [&str; 3] = ["mat", "prefab", "unity"];
@@ -952,6 +960,7 @@ pub(crate) mod tests {
             "unity",
             "mat",
             "shadergraph",
+            "shader",
             "mtl",
             "fbx",
             "jpg",
@@ -1098,7 +1107,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn blender_reads_models_textures_and_unity_files_including_shader_graphs() {
+    fn blender_reads_models_textures_and_unity_files_including_shaders() {
         for path in [
             "Models/SM_Log.fbx",
             "Models/SM_Log.OBJ",
@@ -1110,13 +1119,16 @@ pub(crate) mod tests {
             "Scenes/Demo.unity",
             "Shaders/S_Layered.shadergraph",
             "Shaders/S_Layered.ShaderGraph",
+            "Shaders/S_Standard.shader",
+            "Shaders/S_Standard.SHADER",
         ] {
             assert!(is_input(path), "{path}");
         }
         for path in [
             "Readme.txt",
             "Shaders/S_Layered.shadersubgraph",
-            "Shaders/S_Standard.shader",
+            "Shaders/Common.cginc",
+            "Shaders/Common.hlsl",
             "shadergraph",
             ".shadergraph",
         ] {

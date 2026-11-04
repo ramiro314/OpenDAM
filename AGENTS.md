@@ -129,7 +129,8 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               only texture, a blank `MI_X` slot uses `M_X`, and a mask applies
                               with no base color too. Unity's sRGB colors are written linear,
                               but for HDR ones, and a prefab's material list skips a slot no
-                              face uses, as Unity's submeshes do. Each mesh keeps its
+                              face uses and orders the rest by their first face, as Unity's
+                              submeshes do. Each mesh keeps its
                               own lowest `_LOD<n>`, and every placed GLB, new or cached, is read
                               so one with no mesh and no animation warns on every run
                               (`SkipReason::NoMesh`), unless its model is named as a collider.

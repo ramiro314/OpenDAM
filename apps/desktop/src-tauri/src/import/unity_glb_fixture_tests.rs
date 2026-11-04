@@ -30,6 +30,9 @@ mod tests {
     const STORED_TINT_PAST_1: [f64; 4] = [1.0, 0.4, 0.6, 1.0];
     /// `TINT` as a GLB's factor holds it, linear.
     const TINT: [f64; 4] = [0.0331, 0.1329, 0.3185, 1.0];
+    /// `YELLOW` as a GLB's factor holds it, linear.
+    const YELLOW: [f64; 4] = [1.0, 0.6038, 0.0331, 1.0];
+    const WHITE: [f64; 4] = [1.0; 4];
 
     /// What a mask with no base exports as: white, with the mask in its alpha, so the flat colour
     /// shows through the factor. A mask bound as a base would be the mask's black.
@@ -42,6 +45,9 @@ mod tests {
     fn is_graph(name: &str) -> bool {
         name.ends_with(".shadergraph")
     }
+
+    /// A texture's first pixel, as colour and alpha.
+    type Pixel = ([u8; 3], u8);
 
     /// A conversion's GLB.
     struct Converted {
@@ -128,6 +134,28 @@ mod tests {
             let material = mesh["primitives"][0]["material"].as_u64().unwrap() as usize;
             self.material(self.json["materials"][material]["name"].as_str().unwrap())
                 .base
+        }
+
+        /// Each primitive of the node called `name`'s mesh, as its triangle count and its
+        /// material's base color, most triangles first.
+        fn primitives(&self, name: &str) -> Vec<(u64, Option<Pixel>)> {
+            let nodes = self.json["nodes"].as_array().unwrap();
+            let node = nodes.iter().find(|n| n["name"] == name).unwrap();
+            let mesh = &self.json["meshes"][node["mesh"].as_u64().unwrap() as usize];
+            let mut found: Vec<_> = mesh["primitives"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| {
+                    let indices = p["indices"].as_u64().unwrap() as usize;
+                    let triangles = self.json["accessors"][indices]["count"].as_u64().unwrap() / 3;
+                    let material = p["material"].as_u64().unwrap() as usize;
+                    let name = self.json["materials"][material]["name"].as_str().unwrap();
+                    (triangles, self.material(name).base)
+                })
+                .collect();
+            found.sort_by_key(|(triangles, _)| std::cmp::Reverse(*triangles));
+            found
         }
     }
 
@@ -430,6 +458,60 @@ mod tests {
         assert!(is(m.base, BASE) && m.base.unwrap().1 == 0, "{m:?}");
     }
 
+    /// A shader that clips on the base's alpha cuts out a material with no cutout keyword: a
+    /// graph's target, one reading an LOD sample's alpha (its slot 8), an older graph's threshold,
+    /// one with `FAE_TreeBranch`'s shape (a linked threshold of 0, and the alpha through a sub
+    /// graph) and a `.shader`'s tags. One with no cutout tag, a graph that leaves the clip to the
+    /// material, one whose target doesn't clip, one whose Alpha reads the base's red, one reading
+    /// an LOD sample's blue (its slot 7), one that clips on another texture's alpha and an older
+    /// graph whose threshold is 0 leave it opaque.
+    #[tokio::test]
+    async fn a_shader_that_clips_on_the_base_s_alpha_makes_a_cutout() {
+        let Some(glb) = convert("shader-clip").await else {
+            return;
+        };
+        for name in ["M_Graph", "M_Lod", "M_Older", "M_Linked", "M_Shader"] {
+            let m = glb.material(name);
+            assert_eq!(m.alpha_mode.as_deref(), Some("MASK"), "{name}: {m:?}");
+            assert!(is(m.base, BASE) && m.base.unwrap().1 == 0, "{name}: {m:?}");
+        }
+        for name in [
+            "M_Opaque",
+            "M_Override",
+            "M_NoClip",
+            "M_Red",
+            "M_LodBlue",
+            "M_OtherAlpha",
+            "M_NoThreshold",
+        ] {
+            let m = glb.material(name);
+            assert!(is(m.base, BASE) && m.alpha_mode.is_none(), "{name}: {m:?}");
+        }
+    }
+
+    /// A `.shader` is an input: the same pack with its `.shader` files left out, in the same
+    /// cache, converts again, and the material on the cutout one is opaque.
+    #[tokio::test]
+    async fn a_shader_left_out_converts_again_without_its_cutout() {
+        let cache = tempfile::tempdir().unwrap();
+        let Some(with) = convert_in("shader-clip", |_| true, cache.path()).await else {
+            return;
+        };
+        assert_eq!(
+            with.material("M_Shader").alpha_mode.as_deref(),
+            Some("MASK")
+        );
+        let without = convert_in("shader-clip", |n| !n.ends_with(".shader"), cache.path())
+            .await
+            .unwrap();
+        let m = without.material("M_Shader");
+        assert!(is(m.base, BASE) && m.alpha_mode.is_none(), "{m:?}");
+        assert_eq!(
+            without.material("M_Graph").alpha_mode.as_deref(),
+            Some("MASK")
+        );
+    }
+
     /// Blank twin, Twin with no .mat, Twin over colours, and a prefab naming the blank `MI_X`
     /// for a slot of another name: each uses `M_X`'s texture.
     #[tokio::test]
@@ -566,6 +648,24 @@ mod tests {
             return;
         };
         assert!(is(glb.material("M_Thing").base, BASE));
+    }
+
+    /// Only texture, tinted: the colour multiplies a base the only-texture rule found, as its
+    /// linear factor, and leaves a base found by raw or display name white.
+    #[tokio::test]
+    async fn only_an_only_texture_base_takes_the_colour() {
+        let Some(glb) = convert("only-texture-tint").await else {
+            return;
+        };
+        let m = glb.material("M_Grid");
+        assert!(is(m.base, BASE) && is_colour(&m.factor, YELLOW), "{m:?}");
+        for name in ["M_Raw", "M_Shown"] {
+            let m = glb.material(name);
+            assert!(
+                is(m.base, BASE) && is_colour(&m.factor, WHITE),
+                "{name}: {m:?}"
+            );
+        }
     }
 
     /// A base hint beside another role's word isn't a base: not `Albedo Mask`, which sorts first,
@@ -970,35 +1070,40 @@ bpy.ops.export_scene.fbx(filepath={fbx:?})
         );
     }
 
-    /// `Model.fbx`, made by `blender`, of one plane per (object name, mesh name).
-    async fn fbx_of(blender: &Path, fbx: &Path, planes: &[(&str, &str)]) {
-        let script = format!(
+    /// A Blender script that makes one plane per (object name, mesh name).
+    fn planes(planes: &[(&str, &str)]) -> String {
+        format!(
             r#"
-import bpy
-bpy.ops.object.select_all(action="SELECT")
-bpy.ops.object.delete()
 for n, (name, mesh) in enumerate({planes:?}):
     bpy.ops.mesh.primitive_plane_add(location=(n * 3, 0, 0))
     obj = bpy.context.active_object
     obj.name = name
     obj.data.name = mesh
     obj.data.materials.append(bpy.data.materials.new("Imported"))
-bpy.ops.export_scene.fbx(filepath={fbx:?})
-"#,
-            fbx = fbx.to_str().unwrap(),
-        );
-        run_script(blender, script).await;
+"#
+        )
     }
 
-    /// Runs the step over the pack `case` with a `Model.fbx` of `planes` beside its files.
-    async fn run_with_fbx(case: &str, planes: &[(&str, &str)]) -> Option<Run> {
+    /// Runs the step over the pack `case` with a `Model.fbx` beside its files, which `make`, a
+    /// Blender script, builds in an empty scene.
+    async fn run_with_fbx(case: &str, make: &str) -> Option<Run> {
         let blender = test_blender()?;
         let pack = tempfile::tempdir().unwrap();
         for entry in std::fs::read_dir(fixtures().join(case)).unwrap() {
             let entry = entry.unwrap();
             std::fs::copy(entry.path(), pack.path().join(entry.file_name())).unwrap();
         }
-        fbx_of(&blender, &pack.path().join("Model.fbx"), planes).await;
+        let script = format!(
+            r#"
+import bpy
+bpy.ops.object.select_all(action="SELECT")
+bpy.ops.object.delete()
+{make}
+bpy.ops.export_scene.fbx(filepath={fbx:?})
+"#,
+            fbx = pack.path().join("Model.fbx").to_str().unwrap(),
+        );
+        run_script(&blender, script).await;
         let cache = tempfile::tempdir().unwrap();
         run_over(pack.path(), "Model.glb", |_| true, cache.path()).await
     }
@@ -1007,8 +1112,8 @@ bpy.ops.export_scene.fbx(filepath={fbx:?})
     /// their meshes' exact names, which `Plane` isn't.
     #[tokio::test]
     async fn a_mesh_named_exactly_in_a_meta_finds_its_object_s_material() {
-        let planes = [("Thing", "Plane.099"), ("Other", "Plane.100")];
-        let Some(run) = run_with_fbx("mesh-name", &planes).await else {
+        let meshes = [("Thing", "Plane.099"), ("Other", "Plane.100")];
+        let Some(run) = run_with_fbx("mesh-name", &planes(&meshes)).await else {
             return;
         };
         assert_eq!(run.glb.meshes(), ["Other", "Thing"]);
@@ -1022,13 +1127,40 @@ bpy.ops.export_scene.fbx(filepath={fbx:?})
     /// its own exact lookup.
     #[tokio::test]
     async fn an_exact_name_comes_before_the_name_without_its_suffix() {
-        let planes = [("Plane.099", "Thing"), ("Other", "Plane.100")];
-        let Some(run) = run_with_fbx("exact-first", &planes).await else {
+        let meshes = [("Plane.099", "Thing"), ("Other", "Plane.100")];
+        let Some(run) = run_with_fbx("exact-first", &planes(&meshes)).await else {
             return;
         };
         assert_eq!(run.glb.meshes(), ["Other", "Plane.099"]);
         assert!(is(run.glb.base_of("Plane.099"), BASE));
         assert!(is(run.glb.base_of("Other"), OTHER_BASE));
+    }
+
+    /// Submesh order: `Tree`'s FBX lists `Leaf` before `Bark`, but its first face is a bark one,
+    /// and Unity orders a mesh's submeshes by each slot's first face. So the prefab's first
+    /// material, `M_Bark`, goes on the two bark faces and `M_Leaf` on the leaf, as on Big Castle's
+    /// `tree_b`.
+    #[tokio::test]
+    async fn a_prefab_s_list_follows_each_slot_s_first_face() {
+        let make = r#"
+mesh = bpy.data.meshes.new("Tree")
+quad = lambda x: [(x, 0, 0), (x + 1, 0, 0), (x + 1, 1, 0), (x, 1, 0)]
+mesh.from_pydata(quad(0) + quad(2) + quad(4), [], [(0, 1, 2, 3), (4, 5, 6, 7), (8, 9, 10, 11)])
+mesh.uv_layers.new()
+mesh.materials.append(bpy.data.materials.new("Leaf"))
+mesh.materials.append(bpy.data.materials.new("Bark"))
+mesh.polygons.foreach_set("material_index", [1, 0, 1])
+bpy.context.collection.objects.link(bpy.data.objects.new("Tree", mesh))
+"#;
+        let Some(run) = run_with_fbx("submesh-order", make).await else {
+            return;
+        };
+        let primitives = run.glb.primitives("Tree");
+        assert_eq!(primitives.len(), 2, "{primitives:?}");
+        let (bark, leaf) = (&primitives[0], &primitives[1]);
+        assert_eq!((bark.0, leaf.0), (4, 2), "{primitives:?}");
+        assert!(is(bark.1, BASE), "{primitives:?}");
+        assert!(is(leaf.1, OTHER_BASE), "{primitives:?}");
     }
 
     /// A byte order mark doesn't hide a graph's names.
