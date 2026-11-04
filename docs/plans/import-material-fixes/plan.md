@@ -887,7 +887,7 @@ Unreal one a ticket that bumps `UNREAL_GLB_VERSION`.
     - POLYGON's 162 grid GLBs carry their yellow factor.
     - Fantasy Adventure's 15 GLBs have no billboard mesh, and the 3 branch materials are `MASK`.
     - If item 4 shipped a fix, `tree_b`'s leaf map is on its cards, and every other slot change it
-      listed is there.
+      listed is there. It did: [slot-order.tsv](slot-order.tsv) lists 79 GLBs.
     - LostRuins has 102 GLBs, and no package of an export type is left without one or a warning.
     - Waterways' dialog shows no hoist warning, and its textured count is read with item 12's audit.
       LostRuins and Waterways still have no row in `floors.tsv`, so they pass on the Unreal rows'
@@ -910,6 +910,37 @@ Unreal one a ticket that bumps `UNREAL_GLB_VERSION`.
 | 15, the second gate | 6, 7, 8, 9, 10 and 12 |
 
 Items 11, 13 and 14 can land before or after the second gate.
+
+### Slot order result
+
+Item 4 found the cause it expected, measured on 2026-11-04 against the first gate's pack folders
+(`~/.local/share/opendam-import-gate/libs`):
+
+- **`tree_b`.** Its FBX's one mesh, `tree.002`, lists `branch.001` (48 faces) at index 0 and
+  `Apple1.001` (3,196 faces) at index 1, and its first face is an `Apple1.001` one. The prefab
+  lists `bark`, then `tree_b_branch`. Version 5 counted submeshes by slot index, so the 48 cards
+  got the bark. Unity orders a mesh's submeshes by each slot's first face, so its first submesh is
+  the 3,196-face tree, which takes the bark.
+- **Unity's rule.** No Unity runs here, so the rule was read from the packs' own prefabs. Of the
+  meshes with two or more used slots whose two orders differ, 106 get a prefab list. In the 89
+  Medieval Houses ones, whose FBX material names are the `.mat` names, every list follows
+  first-face order, and none follows slot index order. The 17 Big Castle ones use generic names
+  (`Material.001`), and renders of `tree_b`, `column` and `window_a_inside`, before and after,
+  look right only in first-face order.
+- **Reach.** Converting every model of the 11 packs before and after the fix (2,566 GLBs, the pack
+  map's total) changes the slots of 79 GLBs, the same 79 a static read of the FBX files finds: 62
+  in Medieval Houses, each a pair of `M_MH_01_Atlas_*` materials on each other's faces, and 17 in
+  Big Castle. [slot-order.tsv](slot-order.tsv) lists each changed primitive, with its material before
+  and after. No other pack changes: their slot orders agree, or no prefab list reaches the mesh.
+  The 15 ASCII FBX files, which go through `assimp`, already list their faces grouped by slot.
+- **No count moves.** Every pack's fully textured count is the gate's, and no base, normal or ORM
+  map is gained or lost. No vertex, primitive or mesh count changes. So `floors.tsv` stands.
+
+The fix orders a slot by its first face in Blender's import, which keeps the file's face order.
+It lands at version 5, and item 6's bump reconverts it. It was measured at `32a54e1`, before items
+1 to 3 merged. None of them changes which material a slot takes: they change a factor, an
+`alphaMode` and which meshes stay, and the billboards are in Fantasy Adventure, which no slot
+change reaches.
 
 ## Evidence so far
 
@@ -962,3 +993,10 @@ Items 11, 13 and 14 can land before or after the second gate.
 - **The 16 cached packages not sampled** run no acceptance pass, though the census found no
   sign of trouble.
 - **Nothing flags a stale pack** after a future version bump.
+- **An ASCII FBX keeps its slot order.** It reaches Blender through `assimp`, which groups its
+  faces by slot, so the first-face rule can't see the original's order. The 15 in the 11 packs
+  already group their faces so.
+- **Unity 5's material layout isn't read.** Big Castle's `wall_b_x2.mat` lists its properties as
+  `- first: name: _MainTex`, which `UnityMaterial` doesn't parse, so it reads as empty, and
+  `window_a_inside`'s wall slot takes `window_a`'s texture by name. It is the only such `.mat` in
+  the 11 packs. A fix is a converter change for version 7.
