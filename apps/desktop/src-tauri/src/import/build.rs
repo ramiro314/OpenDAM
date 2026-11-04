@@ -37,7 +37,9 @@ use super::place::{place, PlaceStep};
 use super::records::{self, InsertedRows, ManifestRow, Origin, Output, Recipe};
 use super::scan;
 use super::unity_glb::{self, Conversion};
-use super::unitypackage::{extract_unitypackage, extract_variant, ExtractedFile, SkippedEntry};
+use super::unitypackage::{
+    extract_unitypackage, extract_variant, ExtractedFile, SkipReason, SkippedEntry,
+};
 use super::unreal_glb;
 use super::zipfile::extract_zip;
 use crate::db::{Database, LibraryHandle};
@@ -926,11 +928,19 @@ async fn stage(
         total: 0,
     });
     let (to, steps, mut files) = (staging.to_path_buf(), plan.place.clone(), files);
-    let files = blocking(move || {
-        place(&to, &mut files, &steps).map_err(|e| format!("{e:#}"))?;
-        Ok(files)
+    let (files, missing) = blocking(move || {
+        let missing = place(&to, &mut files, &steps).map_err(|e| format!("{e:#}"))?;
+        Ok((files, missing))
     })
     .await?;
+    // An Unreal pack's preview was an estimate, which could only note its hoists, so a hoist
+    // that moved nothing warns here. Any other pack's preview already warned of it.
+    if matches!(plan.extract, Extract::Unreal(_)) {
+        warnings.extend(missing.into_iter().map(|folder| SkippedEntry {
+            source_path: vec![folder],
+            reason: SkipReason::NoHoistFolder,
+        }));
+    }
     cancelled()?;
 
     // A staged file the previous build had, by file key, size and sha256, keeps its mtime.

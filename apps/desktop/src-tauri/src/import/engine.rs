@@ -2122,6 +2122,24 @@ mod tests {
         assert_eq!(package["title"], "Stylized Village", "{package}");
     }
 
+    /// Wizard Room's shape: the whole package holds `Art` only below its pipeline folders, so the
+    /// Fab preset's `hoist Art` moves nothing. The preview warned of it, from an exact tree, so the
+    /// build doesn't warn again.
+    #[tokio::test]
+    async fn an_exact_tree_s_build_doesn_t_warn_of_a_hoist_that_moves_nothing() {
+        let s = setup().await;
+        let request = s.zip_request(
+            "fab-unity-folders.zip",
+            Some("Crypt/Crypt.unitypackage"),
+            None,
+            "Fab/Folders",
+        );
+        let run = s.engine.start_import(request).await.unwrap();
+        let run = s.wait_for(&run.id, "done").await;
+        assert_eq!(run.warnings, []);
+        assert!(s.dir.path().join("Fab/Folders/URP/URP_Crypt/Art").is_dir());
+    }
+
     #[tokio::test]
     async fn a_fab_variant_and_a_pipeline_folder_build_from_inside_the_zip() {
         let s = setup().await;

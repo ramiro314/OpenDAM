@@ -138,6 +138,9 @@ pub struct Tree {
     pub skipped: Vec<SkippedEntry>,
     /// The steps that would do nothing, each with why: a hoist whose folder is missing.
     pub warnings: Vec<String>,
+    /// What only the build can tell: in an estimate, a hoist whose folder it doesn't hold,
+    /// checked once the export runs, where it would be a warning.
+    pub notes: Vec<String>,
     /// Why the build would fail, when it would: an unreadable archive, a clash in a step, an
     /// Unreal project with a `Source/` folder.
     pub error: Option<String>,
@@ -203,6 +206,7 @@ impl Tree {
             glbs,
             skipped: Vec::new(),
             warnings: Vec::new(),
+            notes: Vec::new(),
             error: None,
             estimate: false,
         }
@@ -219,15 +223,30 @@ impl Tree {
 
 /// A source's listing, placed by `place`, with the `datapackage.json` the metadata step writes
 /// at the pack root (every candidate's default steps end with it), and counted. A listing or
-/// step that fails gives a tree naming the error, as the build would fail.
-fn preview(listing: Result<Extraction>, place: &[PlaceStep], convert: bool) -> Tree {
+/// step that fails gives a tree naming the error, as the build would fail. A hoist that finds
+/// no folder is a warning, or in an `estimate`, whose files only the export knows, a note that
+/// the build checks it.
+fn preview(
+    listing: Result<Extraction>,
+    place: &[PlaceStep],
+    convert: bool,
+    estimate: bool,
+) -> Tree {
     let mut extraction = match listing {
         Ok(extraction) => extraction,
         Err(err) => return Tree::failed(err, Vec::new()),
     };
-    let warnings = match place_listed(&mut extraction.files, place) {
-        Ok(warnings) => warnings,
+    let missing = match place_listed(&mut extraction.files, place) {
+        Ok(missing) => missing,
         Err(err) => return Tree::failed(err, extraction.skipped),
+    };
+    let (warnings, notes) = if estimate {
+        (Vec::new(), missing.iter().map(|f| hoist_note(f)).collect())
+    } else {
+        (
+            missing.iter().map(|f| hoist_warning(f)).collect(),
+            Vec::new(),
+        )
     };
     if let Some(path) = metadata::clash(&extraction.files) {
         let err = anyhow::anyhow!(metadata::clash_message(path));
@@ -237,8 +256,25 @@ fn preview(listing: Result<Extraction>, place: &[PlaceStep], convert: bool) -> T
     Tree {
         skipped: extraction.skipped,
         warnings,
+        notes,
         ..Tree::of(files.chain([metadata::FILE]), convert)
     }
+}
+
+/// The preview's warning for a hoist of `folder` that finds no folder.
+fn hoist_warning(folder: &str) -> String {
+    format!(
+        "hoist {folder}: no folder at {folder}, so this step moves nothing. Give the folder's \
+         path from the pack root."
+    )
+}
+
+/// An estimate's note for a hoist of `folder` that finds no folder in it.
+fn hoist_note(folder: &str) -> String {
+    format!(
+        "hoist {folder}: checked once the export runs, since only the Unreal Editor knows which \
+         assets it writes. The run warns if the step moves nothing."
+    )
 }
 
 /// The tree of one source of `original`, of kind `kind`, placed by `place`: what the import
@@ -274,7 +310,12 @@ pub fn preview_source(
         (_, Some(variant)) => list_variant(original, variant, subpath),
         (_, None) => index_zip(original).and_then(|index| index.list(subpath)),
     };
-    preview(listing, place, kind == "unitypackage" || variant.is_some())
+    preview(
+        listing,
+        place,
+        kind == "unitypackage" || variant.is_some(),
+        false,
+    )
 }
 
 /// The files of `extraction` below `folder`, relative to it, as a listing with that sub-folder
@@ -549,7 +590,7 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
                 .map(|pipeline| PipelineChoice {
                     pipeline,
                     ticked: pipeline == "urp",
-                    tree: preview(Ok(for_pipeline(listing, pipeline)), &place, true),
+                    tree: preview(Ok(for_pipeline(listing, pipeline)), &place, true, false),
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -568,7 +609,7 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
                 target: publisher_target(&publisher, &name),
                 tree: match ticked {
                     Some(choice) => Some(choice.tree.clone()),
-                    None if pipelines.is_empty() => Some(preview(listing, &place, true)),
+                    None if pipelines.is_empty() => Some(preview(listing, &place, true, false)),
                     None => None,
                 },
                 name,
@@ -611,7 +652,7 @@ pub fn detect(original: &Path, kind: &str, publisher: &str) -> Result<Vec<Offer>
         layout: "zip",
         candidates: vec![Candidate {
             target: name.clone(),
-            tree: Some(preview(Ok(zip), &place, false)),
+            tree: Some(preview(Ok(zip), &place, false, false)),
             name,
             ticked: true,
             preset: "none",
@@ -664,7 +705,7 @@ fn fab(original: &Path, zip: &Extraction, name: &str, publisher: &str) -> Option
         let folder_trees: Vec<Tree> = match &listing {
             Ok(listing) => folders
                 .iter()
-                .map(|(top, _)| preview(Ok(below_folder(listing, top)), &place, true))
+                .map(|(top, _)| preview(Ok(below_folder(listing, top)), &place, true, false))
                 .collect(),
             Err(_) => Vec::new(),
         };
@@ -673,7 +714,7 @@ fn fab(original: &Path, zip: &Extraction, name: &str, publisher: &str) -> Option
             subpath: None,
             pipeline: pipeline(package_stem(in_zip)),
             ticked: false,
-            tree: preview(listing, &place, true),
+            tree: preview(listing, &place, true, false),
         });
         for ((top, pipeline), tree) in folders.into_iter().zip(folder_trees) {
             variants.push(Variant {
@@ -782,7 +823,7 @@ fn unreal_preview(
                 files: project.estimate(),
                 skipped,
             };
-            let mut tree = preview(Ok(estimate), place, false);
+            let mut tree = preview(Ok(estimate), place, false, true);
             if tree.error.is_none() {
                 // At most one per `.uasset`: "at most N models".
                 tree.glbs = project.assets.len() as u64;
@@ -910,7 +951,7 @@ fn kenney(index: &ZipIndex, zip: &Extraction, name: &str) -> Option<Offer> {
                                 "lookup_store_page": true }),
                     ),
                 ],
-                tree: Some(preview(files, &[], false)),
+                tree: Some(preview(files, &[], false, false)),
             }
         })
         .collect();
@@ -951,12 +992,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("Pack");
         let mut extraction = extract(&root).unwrap();
-        let warnings = place_listed(&mut extraction.files.clone(), steps).unwrap();
-        place(&root, &mut extraction.files, steps).unwrap();
+        let missing = place(&root, &mut extraction.files, steps).unwrap();
         std::fs::write(root.join(metadata::FILE), "{}").unwrap();
         Tree {
             skipped: extraction.skipped,
-            warnings,
+            warnings: missing.iter().map(|f| hoist_warning(f)).collect(),
             ..Tree::of(on_disk(&root).iter().map(String::as_str), convert)
         }
     }
@@ -1670,6 +1710,35 @@ mod tests {
         );
     }
 
+    /// Waterways' shape: the estimate gives `Content/Cylinder1.uasset` a GLB, so `flatten` keeps
+    /// `Fixture/` and `hoist Meshes` finds nothing. Only the export knows, so the preview notes
+    /// the hoist instead of warning, from the listing alone. A hoist it finds needs no note.
+    #[test]
+    fn an_estimate_notes_a_hoist_it_finds_no_folder_for_and_warns_nothing() {
+        let original = fixture("unreal-loose.zip");
+        let offers = detect(&original, "zip", "Fab").unwrap();
+        let tree = offers[0].candidates[0].tree.as_ref().unwrap();
+        assert!(tree.estimate);
+        assert_eq!(tree.error, None);
+        assert_eq!(tree.warnings, Vec::<String>::new());
+        assert_eq!(tree.notes, [hoist_note("Meshes")]);
+        assert!(
+            tree.folders.iter().any(|f| f.path == "Fixture/Meshes"),
+            "{tree:?}"
+        );
+
+        let place = [
+            PlaceStep::Flatten,
+            PlaceStep::Hoist {
+                folder: "Fixture/Meshes".into(),
+            },
+        ];
+        let found = preview_source(&original, "zip", None, None, None, &place, true);
+        assert!(found.estimate);
+        assert_eq!(found.warnings, Vec::<String>::new());
+        assert_eq!(found.notes, Vec::<String>::new());
+    }
+
     #[test]
     fn license_folders_nest_into_the_outermost_and_a_root_license_names_the_pack() {
         let zip = |paths: &[&str]| Extraction {
@@ -1769,7 +1838,7 @@ mod tests {
             },
         ];
         let listing = list_unitypackage(&fixture("synthetic.unitypackage"), None, None);
-        let tree = preview(listing, &steps, true);
+        let tree = preview(listing, &steps, true, false);
         assert_eq!(
             tree.error.as_deref(),
             Some("hoist Art: merging Art into the pack root would overwrite T_Rock.png, T_Rock.png.meta")
