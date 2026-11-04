@@ -75,29 +75,40 @@ export function cameraUp(direction: THREE.Vector3): THREE.Vector3 {
   return Math.abs(direction.y) > 0.99 ? new THREE.Vector3(0, 0, -1) : new THREE.Vector3(0, 1, 0);
 }
 
-/** Reads the shape of every mesh under `object`, with its world transform */
+/** Reads the shape of every mesh under `object`, and every instance of one, in world space */
 export function measureShape(object: THREE.Object3D): Shape {
   object.updateWorldMatrix(true, true);
-  const meshes: THREE.Mesh[] = [];
+  // Each mesh at its world transform, or an instanced one at each instance's, as it is drawn.
+  const parts: { mesh: THREE.Mesh; matrix: THREE.Matrix4 }[] = [];
   object.traverse((child) => {
     const mesh = child as THREE.Mesh;
-    if (mesh.isMesh && mesh.geometry.attributes.position) meshes.push(mesh);
+    if (!mesh.isMesh || !mesh.geometry.attributes.position) return;
+    const instanced = mesh as THREE.InstancedMesh;
+    if (!instanced.isInstancedMesh) {
+      parts.push({ mesh, matrix: mesh.matrixWorld });
+      return;
+    }
+    for (let i = 0; i < instanced.count; i++) {
+      const matrix = new THREE.Matrix4();
+      instanced.getMatrixAt(i, matrix);
+      parts.push({ mesh, matrix: matrix.premultiply(mesh.matrixWorld) });
+    }
   });
 
   const point = new THREE.Vector3();
   const eachPoint = (visit: (p: THREE.Vector3) => void) => {
-    for (const mesh of meshes) {
+    for (const { mesh, matrix } of parts) {
       const position = mesh.geometry.attributes.position;
       for (let i = 0; i < position.count; i++) {
-        visit(point.fromBufferAttribute(position, i).applyMatrix4(mesh.matrixWorld));
+        visit(point.fromBufferAttribute(position, i).applyMatrix4(matrix));
       }
     }
   };
 
   const normalSum = new THREE.Vector3();
   let area = 0;
-  const triangles = meshes.reduce(
-    (n, mesh) =>
+  const triangles = parts.reduce(
+    (n, { mesh }) =>
       n + Math.floor((mesh.geometry.index ?? mesh.geometry.attributes.position).count / 3),
     0
   );
@@ -106,16 +117,16 @@ export function measureShape(object: THREE.Object3D): Shape {
   const a = new THREE.Vector3();
   const b = new THREE.Vector3();
   const c = new THREE.Vector3();
-  for (const mesh of meshes) {
+  for (const { mesh, matrix } of parts) {
     const { index, attributes } = mesh.geometry;
     const position = attributes.position;
     const count = index ? index.count : position.count;
     // A mirrored mesh draws its faces with the opposite winding (three.js flips its front face).
-    const winding = mesh.matrixWorld.determinant() < 0 ? -0.5 : 0.5;
+    const winding = matrix.determinant() < 0 ? -0.5 : 0.5;
     const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
     const doubleSided = materials.every((material) => material.side === THREE.DoubleSide);
     const corner = (v: THREE.Vector3, i: number) =>
-      v.fromBufferAttribute(position, index ? index.getX(i) : i).applyMatrix4(mesh.matrixWorld);
+      v.fromBufferAttribute(position, index ? index.getX(i) : i).applyMatrix4(matrix);
     for (let i = 0; i + 2 < count; i += 3) {
       corner(a, i);
       corner(b, i + 1).sub(a);

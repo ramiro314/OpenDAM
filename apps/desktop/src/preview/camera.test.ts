@@ -196,6 +196,22 @@ describe('measureShape', () => {
     expect(card([both, both]).faces[3]).toBe(1);
   });
 
+  test('an instanced mesh is measured at every instance', () => {
+    // Two 4 x 2 cards 10 apart along the mesh's own X, which its turn of 90° about Y puts along Z.
+    const cards = new THREE.InstancedMesh(new THREE.PlaneGeometry(4, 2), undefined, 2);
+    cards.setMatrixAt(0, new THREE.Matrix4());
+    cards.setMatrixAt(1, new THREE.Matrix4().makeTranslation(10, 0, 0));
+    cards.rotation.y = Math.PI / 2;
+
+    const measured = measureShape(cards);
+    expect(measured.area).toBeCloseTo(16);
+    expect(measured.faces.length).toBe(2 * 2 * 4);
+    expect(measured.box.extents[2]).toBeCloseTo(14);
+    expect(Math.abs(measured.box.axes[2].z)).toBeCloseTo(1);
+    // Both cards face the mesh's +Z, turned to world +X.
+    expect(angle(measured.normalSum, v(1, 0, 0))).toBeCloseTo(0);
+  });
+
   test('a cube keeps the usual view', () => {
     const cube = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1));
     cube.rotation.set(0.3, 0.7, 0.1);
