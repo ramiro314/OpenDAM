@@ -613,6 +613,8 @@ decision doesn't name: they are recorded here on the strength of that finding. A
   `ivy_b`, `ivy_b_lod` and `ivy_c` have none. The `ivy_a`, `ivy_b` and `ivy_c` prefabs,
   checked by each `m_Mesh` file ID against the FBX `.meta` files, place each model's bark and leaf
   cards and none of these planes. So in Unity the ivy has no background card at all.
+  `ivy_c_lod` isn't a leftover: it has no such plane, and `ivy_c.prefab` places all four of its
+  meshes, which its GLB textures with bark and `leafes_plane`.
 - **`grassPlane`.** Its FBX has no material, and no prefab or scene places it.
 
 Where the search looked:
