@@ -12,6 +12,12 @@ const MIN_FRONT_ANGLE = THREE.MathUtils.degToRad(20);
 const FACE_WEIGHT = 3;
 /** A new view must show this many times the drawn face area the usual view shows */
 const MIN_GAIN = 1.5;
+/** Faces whose normals sum to this share of their area along the ground face one way, as a wall's */
+const SIDE_RATIO = 0.25;
+/** The usual view walked round the model a quarter, a half and three quarters of the way */
+const TURNS = [1, 2, 3].map((quarters) =>
+  VIEW_DIRECTION.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), (quarters * Math.PI) / 2)
+);
 
 /** A model's oriented bounding box: its principal axes, thinnest first, and its extent along each */
 export interface OrientedBox {
@@ -40,13 +46,15 @@ export interface Shape {
  * face both ways, the side nearer the usual view, and a card's front is where its faces point.
  * When the usual view sees that front edge on or from behind, the model is faced from its front
  * instead, leaning a little toward the usual view, as long as that shows clearly more of its
- * drawn faces. Anything else gets the usual three-quarter view.
+ * drawn faces. Anything else gets the usual three-quarter view, or that view from another side
+ * (`usualView`).
  */
-export function viewDirection({ box, normalSum, area, faces }: Shape): THREE.Vector3 {
+export function viewDirection(shape: Shape): THREE.Vector3 {
+  const { box, normalSum, area, faces } = shape;
   const [thin, middle] = box.extents;
   const thinBox = middle > 0 && thin <= FLAT_RATIO * middle;
   const sheet = area > 0 && normalSum.length() >= SHEET_RATIO * area;
-  if (!thinBox && !sheet) return VIEW_DIRECTION.clone();
+  if (!thinBox && !sheet) return usualView(shape);
 
   // A card faces where its faces point, which a curved one's thinnest axis may not.
   const axis = thinBox ? box.axes[0].clone() : normalSum.clone().normalize();
@@ -54,10 +62,28 @@ export function viewDirection({ box, normalSum, area, faces }: Shape): THREE.Vec
   const side =
     Math.abs(facing) >= 0.25 * area ? Math.sign(facing) : Math.sign(axis.dot(VIEW_DIRECTION)) || 1;
   const front = axis.multiplyScalar(side);
-  if (front.dot(VIEW_DIRECTION) >= Math.sin(MIN_FRONT_ANGLE)) return VIEW_DIRECTION.clone();
+  if (front.dot(VIEW_DIRECTION) >= Math.sin(MIN_FRONT_ANGLE)) return usualView(shape);
   const faced = front.multiplyScalar(FACE_WEIGHT).add(VIEW_DIRECTION).normalize();
   const gain = seenArea(faces, faced) >= MIN_GAIN * seenArea(faces, VIEW_DIRECTION);
-  return gain ? faced : VIEW_DIRECTION.clone();
+  return gain ? faced : usualView(shape);
+}
+
+/**
+ * The usual three-quarter view, from the side a model faces. A model whose faces face one way
+ * along the ground, as a one-sided wall's do, is seen from whichever quarter turn of the usual view
+ * shows the most of its drawn faces, as long as that is clearly more than the usual view shows, so
+ * the camera doesn't look at its culled back.
+ */
+function usualView({ normalSum, area, faces }: Shape): THREE.Vector3 {
+  const usual = VIEW_DIRECTION.clone();
+  if (!(area > 0) || Math.hypot(normalSum.x, normalSum.z) < SIDE_RATIO * area) return usual;
+  let best = usual;
+  let most = 0;
+  for (const turn of TURNS) {
+    const seen = seenArea(faces, turn);
+    if (seen > most) [best, most] = [turn, seen];
+  }
+  return most > 0 && most >= MIN_GAIN * seenArea(faces, usual) ? best.clone() : usual;
 }
 
 /** The area of the drawn faces a camera in `direction` sees, as if none hid another */

@@ -135,6 +135,51 @@ describe('viewDirection thresholds', () => {
   });
 });
 
+describe('viewDirection from another side', () => {
+  /** One-sided faces, each a normal times its area */
+  const oneSided = (...normals: THREE.Vector3[]) =>
+    new Float32Array(normals.flatMap((n) => [...n.toArray(), 0]));
+  /** A box that isn't flat, with faces facing -Z by `share` of their area of 1, and up and down */
+  const wall = (share: number) =>
+    shape([1, 1.2, 2], {
+      normalSum: v(0, 0, -share),
+      faces: oneSided(v(0, 0, -share), v(0, 0.3, 0), v(0, -0.3, 0)),
+    });
+
+  test('a one-sided wall facing away is seen from the quarter turn that sees its front', () => {
+    // SM_RockWall_01: its faces lean away from the usual view, which sees its culled back.
+    const direction = viewDirection(wall(0.4));
+    expect(direction.y).toBeCloseTo(VIEW_DIRECTION.y);
+    expect(direction.z).toBeLessThan(0);
+    expect(seenArea(wall(0.4).faces, direction)).toBeGreaterThan(
+      1.5 * seenArea(wall(0.4).faces, VIEW_DIRECTION)
+    );
+  });
+
+  test('a one-sided wall facing the usual view keeps it', () => {
+    const toView = shape([1, 1.2, 2], {
+      normalSum: v(0, 0, 0.4),
+      faces: oneSided(v(0, 0, 0.4), v(0, 0.3, 0), v(0, -0.3, 0)),
+    });
+    expect(viewDirection(toView)).toEqual(VIEW_DIRECTION);
+  });
+
+  test('a closed shape keeps the usual view, though another side shows more of it', () => {
+    // A fence on a diagonal the usual view sees end on: its faces face both ways.
+    const along = v(1, 0, -1).normalize().multiplyScalar(0.4);
+    const across = v(1, 0, 1).normalize().multiplyScalar(0.1);
+    const fence = shape([1, 1.2, 2], {
+      faces: oneSided(along, along.clone().negate(), across, across.clone().negate()),
+    });
+    expect(viewDirection(fence)).toEqual(VIEW_DIRECTION);
+  });
+
+  test('faces face one way from a quarter of their area along the ground', () => {
+    expect(viewDirection(wall(0.26))).not.toEqual(VIEW_DIRECTION);
+    expect(viewDirection(wall(0.24))).toEqual(VIEW_DIRECTION);
+  });
+});
+
 test('seenArea counts a one-sided face only from its front', () => {
   const faces = new Float32Array([0, 0, 2, 0, 0, 0, 3, 1]);
   expect(seenArea(faces, v(0, 0, 1))).toBeCloseTo(5);
