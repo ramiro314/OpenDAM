@@ -106,11 +106,14 @@ for log in "${logs[@]}"; do
   # and reclaimed.
   if [[ -f $h/memstat.tsv ]]; then
     awk -F'\t' -v s="$stage" '
-      $2 == s {
-        if ($6 > anon[$3]) anon[$3] = $6
-        if ($7 > file[$3]) file[$3] = $7
-        if ($5 > peak[$3]) peak[$3] = $5
-        events[$3] = $14
+      # Columns by the header session.sh writes, so its stat_fields can change.
+      NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+      $col["stage"] == s {
+        k = $col["scope"]
+        if ($col["anon"] > anon[k]) anon[k] = $col["anon"]
+        if ($col["file"] > file[k]) file[k] = $col["file"]
+        if ($col["peak"] > peak[k]) peak[k] = $col["peak"]
+        events[k] = $col["max_events"]
       }
       END {
         for (k in anon)
