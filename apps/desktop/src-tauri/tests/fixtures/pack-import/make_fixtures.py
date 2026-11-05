@@ -44,6 +44,9 @@ committed, like `tests/fixtures/game-export/`. The fixtures grow with the plan's
   and `Config/` at the project root. The `.uasset` files are stand-ins: only their names count.
 - `unreal-source.zip`: the same project with a `Source/` folder of C++ code, which the prebuilt
   editor can't compile.
+- `unreal-loose.zip`: the same project with a `Cylinder1.uasset` directly in `Content/`, as
+  Waterways has a redirector there: the scan's estimate gives it a GLB, so `flatten` keeps
+  `Fixture/`, but an export writes none for it.
 """
 
 import gzip
@@ -479,7 +482,7 @@ def uasset(name: str) -> bytes:
     return b"\xc1\x83\x2a\x9e" + name.encode() + b"\n"
 
 
-def unreal(source: bool) -> bytes:
+def unreal(source: bool = False, loose: bool = False) -> bytes:
     z = Zip()
     z.member("Feif/Feif.uproject", UPROJECT)
     z.member("Feif/README.md", b"# Feif\n\nA Fab fixture project.\n")
@@ -490,6 +493,8 @@ def unreal(source: bool) -> bytes:
     z.member("Feif/Content/Fixture/Readme.txt", b"Fixture, an Unreal fixture pack.\n")
     if source:
         z.member("Feif/Source/Feif/Feif.Build.cs", b"public class Feif : ModuleRules {}\n")
+    if loose:
+        z.member("Feif/Content/Cylinder1.uasset", uasset("Cylinder1"))
     return z.finish()
 
 
@@ -503,6 +508,7 @@ def main() -> None:
     (HERE / "escape.zip").write_bytes(escape_zip())
     (HERE / "unreal.zip").write_bytes(unreal(source=False))
     (HERE / "unreal-source.zip").write_bytes(unreal(source=True))
+    (HERE / "unreal-loose.zip").write_bytes(unreal(loose=True))
 
 
 if __name__ == "__main__":

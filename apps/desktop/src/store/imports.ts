@@ -232,6 +232,7 @@ const SKIP_REASONS: Record<SkippedEntry['reason'], string> = {
   symlink: 'a symbolic link',
   special: 'not a regular file',
   noMesh: 'no mesh left, so its GLB is empty',
+  noHoistFolder: 'no such folder once the export ran, so its hoist moved nothing',
 };
 
 /** A run's warning, named by its path in the original (nested packages joined by ` > `) */

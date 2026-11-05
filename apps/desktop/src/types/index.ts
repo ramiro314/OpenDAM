@@ -991,7 +991,8 @@ export type ProposalDecision =
 
 /**
  * An archive entry an extraction skipped, or a model a conversion left with no mesh (`noMesh`, on a
- * run only), named by its path in the original
+ * run only), named by its path in the original, or an Unreal build's hoist that moved nothing
+ * (`noHoistFolder`, on a run only), named by its folder
  */
 export interface SkippedEntry {
   sourcePath: string[];
@@ -1003,7 +1004,8 @@ export interface SkippedEntry {
     | 'hardlink'
     | 'symlink'
     | 'special'
-    | 'noMesh';
+    | 'noMesh'
+    | 'noHoistFolder';
 }
 
 /** A folder of a build's tree, the pack root being `''` */
@@ -1024,6 +1026,8 @@ export interface ImportTree {
   skipped: SkippedEntry[];
   /** The steps that would do nothing, each with why: a hoist whose folder is missing */
   warnings: string[];
+  /** In an estimate, the hoists only the build can check, where an exact tree would warn */
+  notes?: string[];
   /** Why the build would fail, when it would */
   error: string | null;
   /** An Unreal pack's tree: its `glbs` are at most so many */

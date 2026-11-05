@@ -77,7 +77,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               name a file by source path, move or drop its .meta with it, and fail
                               naming the step and path on a clash or a source no longer produced
                               (a hoist whose folder is missing is a no-op, which the scan's preview
-                              reports in its tree's `warnings`),
+                              reports in its tree's `warnings`, or for an Unreal pack's estimated
+                              tree as a note in its `notes`, and then its build as a run warning,
+                              `SkipReason::NoHoistFolder`; a hoist of a folder an earlier flatten
+                              merged into the root isn't missing),
                               scan, an original's candidate packs (Unity cache, Fab variants,
                               Kenney packs, any zip) with presets, default targets and steps and
                               a preview of each build's tree, made by the same extract and place
