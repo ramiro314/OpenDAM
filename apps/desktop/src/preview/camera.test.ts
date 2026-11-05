@@ -174,6 +174,43 @@ describe('viewDirection from another side', () => {
     expect(viewDirection(fence)).toEqual(VIEW_DIRECTION);
   });
 
+  test('the quarter turn that shows the most is chosen, not the first that shows enough', () => {
+    // Faces leaning toward -X-Z: the turn to +X-Z shows 1.8 times the usual view, the one to
+    // -X-Z 3.5 times.
+    const lean = v(-0.2, 0, -0.4);
+    const leaning = shape([1, 1.2, 2], {
+      normalSum: lean,
+      area: lean.length() + 0.6,
+      faces: oneSided(lean, v(0, 0.3, 0), v(0, -0.3, 0)),
+    });
+    const toMinusXZ = v(-1, 0.8, -1).normalize();
+    expect(angle(viewDirection(leaning), toMinusXZ)).toBeCloseTo(0);
+  });
+
+  test('a sheet whose front the usual view sees turns it to see more', () => {
+    // Faces facing up and toward +X-Z: the usual view sees the front at over 20°, so it isn't
+    // faced, but its quarter turn to +X-Z sees 2.5 times as much.
+    const lean = v(0.35, 0, -0.35);
+    const sheet = shape([1, 1.2, 2], {
+      normalSum: v(0.35, 0.6, -0.35),
+      area: lean.length() + 0.6,
+      faces: oneSided(lean, v(0, 0.6, 0)),
+    });
+    expect(angle(viewDirection(sheet), v(1, 0.8, -1).normalize())).toBeCloseTo(0);
+  });
+
+  test('a flat box that facing would show too little of turns the usual view', () => {
+    // Thinnest along Z, its front facing -Z: facing it shows 1.3 times the usual view, short of
+    // 1.5, but a face toward +X makes the quarter turn to +X-Z show 1.6 times.
+    const flat = shape([0.1, 2, 3], {
+      thin: v(0, 0, -1),
+      normalSum: v(0.5, 0, -0.3),
+      area: 0.8,
+      faces: oneSided(v(0, 0, -0.3), v(0.5, 0, 0)),
+    });
+    expect(angle(viewDirection(flat), v(1, 0.8, -1).normalize())).toBeCloseTo(0);
+  });
+
   test('faces face one way from a quarter of their area along the ground', () => {
     expect(viewDirection(wall(0.26))).not.toEqual(VIEW_DIRECTION);
     expect(viewDirection(wall(0.24))).toEqual(VIEW_DIRECTION);
