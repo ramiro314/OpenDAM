@@ -38,6 +38,7 @@ PACKS = {
     "Medieval Houses": "GameAssetFactory/Medieval Houses Modular Vol 1",
 }
 MEDIEVAL = PACKS["Medieval Houses"]
+FAE = PACKS["Fantasy Adventure"]
 
 
 def table_rows(lines: list[str], start: int) -> list[list[str]]:
@@ -79,6 +80,10 @@ def manifest_leftovers(path: Path) -> dict[str, dict[str, set[str]]]:
             if not row["base"]:
                 packs[row["pack"]][row["path"]].add(row["material"])
     return packs
+
+
+def materials_of(glbs: dict[str, set[str]]) -> set[str]:
+    return {material for materials in glbs.values() for material in materials}
 
 
 def bare(material: str) -> str:
@@ -198,6 +203,15 @@ def main() -> int:
                 print(
                     "  Differs as the plan expects: the 2 were the doubled import, and the "
                     "Outcome table sets 193 of 193 once only the URP copy lands"
+                )
+            elif (
+                pack == FAE
+                and expected - len(leftovers[pack]) == 4
+                and not any("billboard" in m.lower() for m in materials_of(leftovers[pack]))
+            ):
+                print(
+                    "  Differs as the plan expects: its 4 untextured billboards are dropped "
+                    "(After the first gate, item 2)"
                 )
             else:
                 bad += 1
