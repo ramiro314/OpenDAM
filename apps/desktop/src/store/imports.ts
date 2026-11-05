@@ -231,6 +231,8 @@ const SKIP_REASONS: Record<SkippedEntry['reason'], string> = {
   hardlink: 'a hard link',
   symlink: 'a symbolic link',
   special: 'not a regular file',
+  notExported: 'the Unreal export failed on it',
+  noGlb: 'a mesh or animation the export made no GLB of',
   noMesh: 'no mesh left, so its GLB is empty',
   noHoistFolder: 'no such folder once the export ran, so its hoist moved nothing',
 };

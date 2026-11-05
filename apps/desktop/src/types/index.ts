@@ -990,9 +990,10 @@ export type ProposalDecision =
 // ── Pack import (docs/plans/pack-import/plan.md) ──────────────────────────
 
 /**
- * An archive entry an extraction skipped, or a model a conversion left with no mesh (`noMesh`, on a
- * run only), named by its path in the original, or an Unreal build's hoist that moved nothing
- * (`noHoistFolder`, on a run only), named by its folder
+ * An archive entry an extraction skipped, or a model a conversion left with no mesh (`noMesh`) or
+ * an Unreal export made none of (`notExported`, `noGlb`), on a run only, named by its path in the
+ * original, or an Unreal build's hoist that moved nothing (`noHoistFolder`, on a run only), named
+ * by its folder
  */
 export interface SkippedEntry {
   sourcePath: string[];
@@ -1004,6 +1005,8 @@ export interface SkippedEntry {
     | 'hardlink'
     | 'symlink'
     | 'special'
+    | 'notExported'
+    | 'noGlb'
     | 'noMesh'
     | 'noHoistFolder';
 }

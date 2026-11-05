@@ -458,6 +458,15 @@ describe('progress and warnings', () => {
     );
   });
 
+  test('an Unreal package left without a GLB says whether the export failed on it', () => {
+    expect(skippedText({ sourcePath: ['/Game/Meshes/SM_A'], reason: 'notExported' })).toBe(
+      '/Game/Meshes/SM_A: the Unreal export failed on it'
+    );
+    expect(skippedText({ sourcePath: ['/Game/Meshes/SM_B'], reason: 'noGlb' })).toBe(
+      '/Game/Meshes/SM_B: a mesh or animation the export made no GLB of'
+    );
+  });
+
   test("an Unreal build's hoist that moved nothing is named by its folder", () => {
     expect(skippedText({ sourcePath: ['Props'], reason: 'noHoistFolder' })).toBe(
       'Props: no such folder once the export ran, so its hoist moved nothing'

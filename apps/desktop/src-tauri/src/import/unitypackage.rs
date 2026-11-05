@@ -65,6 +65,9 @@ pub enum SkipReason {
     Special,
     /// An Unreal asset the editor's glTF exporter failed on, named by its `/Game` path.
     NotExported,
+    /// An Unreal package of an export type left with no GLB, though the exporter didn't fail on
+    /// it, named by its `/Game` path.
+    NoGlb,
     /// A model the conversion left with no mesh. Unlike the others it isn't skipped: its empty
     /// GLB lands in the pack.
     NoMesh,

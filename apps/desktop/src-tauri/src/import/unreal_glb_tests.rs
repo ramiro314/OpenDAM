@@ -30,7 +30,9 @@ mod tests {
     /// its path below `Content/`) gets no GLB either: as the script does, the session counts it
     /// in its batch, lists it in `.gltf-failed`, and later sessions skip it.
     /// With a `kill` file holding K, a session exits 137, as the memory cap kills it, once it
-    /// has written K GLBs.
+    /// has written K GLBs. Each session lists the `SM_*` packages in `.gltf-expected`, and one
+    /// named in a `lose` file is listed but never exported nor failed. `script_editor` runs the
+    /// real script instead.
     fn stub_editor(root: &Path) {
         let r = root.display();
         write_editor(
@@ -44,9 +46,12 @@ case "$2" in -ExecutePythonScript=*) [ -f "${{2#-ExecutePythonScript=}}" ] || ex
 stall=$(cat '{r}/stall' 2>/dev/null || echo 999)
 content="$(dirname "$1")/Content"
 all=0; todo=0
+: > "$GLTF_OUT/.gltf-expected"
 for asset in $(cd "$content" && find . -name 'SM_*.uasset' | sort); do
-  all=$((all + 1))
   rel=${{asset#./}}; rel=${{rel%.uasset}}
+  echo "/Game/$rel" >> "$GLTF_OUT/.gltf-expected"
+  all=$((all + 1))
+  grep -qx "$rel" '{r}/lose' 2>/dev/null && continue
   [ -e "$GLTF_OUT/$rel.glb" ] && continue
   grep -qx "/Game/$rel" "$GLTF_OUT/.gltf-failed" 2>/dev/null && continue
   todo=$((todo + 1))
@@ -55,6 +60,7 @@ echo "LogPython: [gltf] $all assets, $todo left, exporting up to $GLTF_BATCH (st
 made=0; wrote=0; left=0
 for asset in $(cd "$content" && find . -name 'SM_*.uasset' | sort); do
   rel=${{asset#./}}; rel=${{rel%.uasset}}
+  grep -qx "$rel" '{r}/lose' 2>/dev/null && continue
   glb="$GLTF_OUT/$rel.glb"
   [ -e "$glb" ] && continue
   grep -qx "/Game/$rel" "$GLTF_OUT/.gltf-failed" 2>/dev/null && continue
@@ -587,6 +593,214 @@ echo "$left" > "$GLTF_OUT/.gltf-remaining""#
         assert_eq!((row.progress_done, row.progress_total), (3, 3));
         assert_eq!(row.warnings.len(), 1);
         assert_eq!(s.passes(&run.id, STEP), [whole_pass(3)]);
+    }
+
+    /// An editor below `root` that runs the embedded `unreal_glb.py` itself, under plain Python,
+    /// against the stand-in `unreal` module in `tests/fixtures/unreal-stub`: the asset registry
+    /// lists what `root/registry.json` holds, and `load_asset` gives what `root/loads.json` maps
+    /// an object path to.
+    fn script_editor(root: &Path, registry: Value, loads: Value) {
+        let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unreal-stub");
+        std::fs::write(root.join("registry.json"), registry.to_string()).unwrap();
+        std::fs::write(root.join("loads.json"), loads.to_string()).unwrap();
+        write_editor(
+            root,
+            &format!(
+                r#"export FAKE_UNREAL='{}' FAKE_CONTENT="$(dirname "$1")/Content" PYTHONPATH='{}'
+exec python3 -B "${{2#-ExecutePythonScript=}}""#,
+                root.display(),
+                fake.display()
+            ),
+        );
+    }
+
+    /// The fixture's registry entry for `SM_<name>` below `Fixture/Meshes`.
+    fn listed(name: &str, asset: &str, class: &str) -> Value {
+        json!({"package": format!("/Game/Fixture/Meshes/{name}"), "asset": asset, "class": class})
+    }
+
+    /// The real script, against a registry that lists only `SM_A`, under another asset name, and
+    /// misses `SM_B`, a mesh, `SM_C`, a redirector to `SM_A`, `T_A`, a texture, and the World
+    /// Partition packages below `__ExternalActors__` and `__ExternalObjects__`, which `load_asset`
+    /// can't load: `SM_B` is loaded by path and exported, `SM_C` and `T_A` get no GLB, the World
+    /// Partition packages are never loaded, and nothing warns, `SM_A` included.
+    #[tokio::test]
+    async fn a_package_the_registry_misses_exports_and_a_redirector_needs_no_glb() {
+        let s = setup_with(false).await;
+        let root = s.stub_unreal().await;
+        script_editor(
+            &root,
+            json!([listed("SM_A", "SM_A_Mesh", "StaticMesh")]),
+            json!({
+                "/Game/Fixture/Meshes/SM_B.SM_B":
+                    {"path": "/Game/Fixture/Meshes/SM_B.SM_B", "class": "StaticMesh"},
+                "/Game/Fixture/Meshes/SM_C.SM_C":
+                    {"path": "/Game/Fixture/Meshes/SM_A.SM_A_Mesh", "class": "StaticMesh"},
+                "/Game/Fixture/Textures/T_A.T_A":
+                    {"path": "/Game/Fixture/Textures/T_A.T_A", "class": "Texture2D"},
+            }),
+        );
+        let run = s
+            .engine
+            .start_import(s.unreal_request("unreal-world.zip"))
+            .await
+            .unwrap();
+        tokio::spawn(s.engine.clone().start());
+
+        let done = s.wait_for(&run.id, "done").await;
+        assert_eq!(
+            on_disk(&s.pack_dir()),
+            [
+                "README.md",
+                "Readme.txt",
+                "SM_A_Mesh.glb",
+                "SM_B.glb",
+                "datapackage.json"
+            ]
+        );
+        let glb = std::fs::read_to_string(s.pack_dir().join("SM_B.glb")).unwrap();
+        assert_eq!(glb, "glTF /Game/Fixture/Meshes/SM_B.SM_B");
+        assert_eq!(done.warnings, []);
+        s.no_work_folder();
+    }
+
+    /// The real script, one asset per session, against a registry that misses `SM_B`, a mesh,
+    /// `SM_C`, a redirector, and `T_A`, a texture: each class check lets its asset go with a
+    /// garbage collection before the next load, and the second session loads neither `SM_C` nor
+    /// `T_A` again, as the first recorded them as skipped.
+    #[tokio::test]
+    async fn each_missed_package_is_let_go_at_once_and_a_skipped_one_checked_once() {
+        let s = setup_with(false).await;
+        let root = s.stub_unreal().await;
+        script_editor(
+            &root,
+            json!([listed("SM_A", "SM_A", "StaticMesh")]),
+            json!({
+                "/Game/Fixture/Meshes/SM_B.SM_B":
+                    {"path": "/Game/Fixture/Meshes/SM_B.SM_B", "class": "StaticMesh"},
+                "/Game/Fixture/Meshes/SM_C.SM_C":
+                    {"path": "/Game/Fixture/Meshes/SM_A.SM_A", "class": "StaticMesh"},
+                "/Game/Fixture/Textures/T_A.T_A":
+                    {"path": "/Game/Fixture/Textures/T_A.T_A", "class": "Texture2D"},
+            }),
+        );
+        let run = s
+            .engine
+            .start_import(s.unreal_request("unreal.zip"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE import_steps SET options = '{\"batch\":1}' WHERE kind = 'export_unreal'",
+        )
+        .execute(&s.lib.pool)
+        .await
+        .unwrap();
+        tokio::spawn(s.engine.clone().start());
+
+        let done = s.wait_for(&run.id, "done").await;
+        assert_eq!(done.warnings, []);
+        assert!(s.pack_dir().join("SM_B.glb").is_file());
+        let calls = std::fs::read_to_string(root.join("calls.log")).unwrap();
+        let (b, c, t) = (
+            "load /Game/Fixture/Meshes/SM_B.SM_B",
+            "load /Game/Fixture/Meshes/SM_C.SM_C",
+            "load /Game/Fixture/Textures/T_A.T_A",
+        );
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            [
+                // Session 1: the class checks, each let go, then SM_A's export.
+                b, "gc", c, "gc", t, "gc", "gc",
+                // Session 2: SM_B's class check and its export, and no SM_C or T_A.
+                b, "gc", b, "gc",
+            ]
+        );
+    }
+
+    /// The real script, where a package the registry misses can't be loaded: it is recorded as
+    /// failed, so it warns, and the export goes on.
+    #[tokio::test]
+    async fn a_package_the_registry_misses_that_can_t_load_warns_as_failed() {
+        let s = setup_with(false).await;
+        let root = s.stub_unreal().await;
+        script_editor(
+            &root,
+            json!([
+                listed("SM_A", "SM_A", "StaticMesh"),
+                listed("SM_C", "SM_C", "StaticMesh"),
+            ]),
+            json!({}),
+        );
+        let run = s
+            .engine
+            .start_import(s.unreal_request("unreal.zip"))
+            .await
+            .unwrap();
+        tokio::spawn(s.engine.clone().start());
+
+        let done = s.wait_for(&run.id, "done").await;
+        assert!(s.pack_dir().join("SM_A.glb").is_file());
+        assert!(s.pack_dir().join("SM_C.glb").is_file());
+        let warned: Vec<(Vec<String>, SkipReason)> = done
+            .warnings
+            .iter()
+            .map(|w| (w.source_path.clone(), w.reason))
+            .collect();
+        assert_eq!(
+            warned,
+            [
+                (
+                    vec!["/Game/Fixture/Meshes/SM_B".to_string()],
+                    SkipReason::NotExported
+                ),
+                (
+                    vec!["/Game/Fixture/Textures/T_A".to_string()],
+                    SkipReason::NotExported
+                ),
+            ]
+        );
+    }
+
+    /// A package of an export type the export leaves with no GLB, though the exporter didn't
+    /// fail on it, is a warning naming it, and a rebuild from the cache, which runs no editor,
+    /// warns again.
+    #[tokio::test]
+    async fn a_package_left_without_a_glb_is_a_warning_even_from_the_cache() {
+        let s = setup_with(false).await;
+        let root = s.stub_unreal().await;
+        std::fs::write(root.join("lose"), "Fixture/Meshes/SM_B\n").unwrap();
+        let run = s
+            .engine
+            .start_import(s.unreal_request("unreal.zip"))
+            .await
+            .unwrap();
+        tokio::spawn(s.engine.clone().start());
+
+        let lost = [(
+            vec!["/Game/Fixture/Meshes/SM_B".to_string()],
+            SkipReason::NoGlb,
+        )];
+        let warned = |warnings: &[crate::import::unitypackage::SkippedEntry]| {
+            warnings
+                .iter()
+                .map(|w| (w.source_path.clone(), w.reason))
+                .collect::<Vec<_>>()
+        };
+        let done = s.wait_for(&run.id, "done").await;
+        assert!(!s.pack_dir().join("SM_B.glb").exists());
+        assert!(s.pack_dir().join("SM_C.glb").is_file());
+        assert_eq!(warned(&done.warnings), lost);
+
+        let sessions_before = sessions(&root).len();
+        let pack_id = run.packs[0].pack_id.clone();
+        let rebuild = s
+            .engine
+            .rebuild_pack("lib", &pack_id, Vec::new())
+            .await
+            .unwrap();
+        let rebuilt = s.wait_for(&rebuild.id, "done").await;
+        assert_eq!(sessions(&root).len(), sessions_before, "no editor ran");
+        assert_eq!(warned(&rebuilt.warnings), lost);
     }
 
     /// A project with a `Source/` folder is refused with the reason: by the scan, which offers
