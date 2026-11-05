@@ -6,7 +6,8 @@ It reads `$FAKE_UNREAL/registry.json`, the asset registry's list (`[{"package", 
 "class"}]`), and `$FAKE_UNREAL/loads.json`, what `load_asset` gives for an object path
 (`{"/Game/X/A.A": {"path", "class"}}`, the path differing for a redirector that is followed).
 The project's `Content/` folder is `$FAKE_CONTENT`. An export writes a small file naming the
-asset's path, and logs go to stdout as the editor's do.
+asset's path, and logs go to stdout as the editor's do. Every `load_asset` call and garbage
+collection is appended to `$FAKE_UNREAL/calls.log` (`load <object path>`, `gc`), across sessions.
 """
 
 import json
@@ -19,6 +20,11 @@ _DIR = Path(os.environ["FAKE_UNREAL"])
 def _read(name: str, default):
     path = _DIR / name
     return json.loads(path.read_text()) if path.exists() else default
+
+
+def _call(line: str) -> None:
+    with (_DIR / "calls.log").open("a") as f:
+        f.write(f"{line}\n")
 
 
 def log(message: str) -> None:
@@ -89,6 +95,7 @@ class Paths:
 
 
 def load_asset(object_path: str):
+    _call(f"load {object_path}")
     found = _read("loads.json", {}).get(object_path)
     return Object(found["path"], found["class"]) if found else None
 
@@ -136,7 +143,7 @@ class ScopedSlowTask:
 class SystemLibrary:
     @staticmethod
     def collect_garbage() -> None:
-        pass
+        _call("gc")
 
     @staticmethod
     def quit_editor() -> None:

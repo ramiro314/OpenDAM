@@ -35,6 +35,7 @@ OUT = Path(os.environ["GLTF_OUT"])
 TYPES = {"StaticMesh", "SkeletalMesh", "AnimSequence"}
 REDIRECTOR = "ObjectRedirector"
 FAILED = OUT / ".gltf-failed"
+SKIPPED = OUT / ".gltf-skipped"
 BATCH = int(os.environ.get("GLTF_BATCH", "30"))
 
 
@@ -70,7 +71,7 @@ def class_name(data: unreal.AssetData) -> str:
 
 
 def on_disk() -> list[str]:
-    """The `/Game` package of every `.uasset` below the project's `Content/` folder. World
+    """The `/Game` package of every `.uasset` below the project's `Content/` folder, sorted. World
     Partition's one-file-per-actor folders (`__ExternalActors__`, `__ExternalObjects__`) hold no
     asset of their own, and are left out."""
     content = Path(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir()))
@@ -81,12 +82,22 @@ def on_disk() -> list[str]:
         rel = path.relative_to(content).with_suffix("")
         if not any(part.startswith("__External") for part in rel.parts):
             packages.append(f"/Game/{rel.as_posix()}")
-    return packages
+    return sorted(packages)
 
 
 def fail(package: str) -> None:
     with FAILED.open("a") as f:
         f.write(f"{package}\n")
+
+
+def skip(package: str) -> None:
+    with SKIPPED.open("a") as f:
+        f.write(f"{package}\n")
+
+
+def listed_in(file: Path) -> set[str]:
+    """The packages in one of the script's lists, one per line: a /Game path can hold spaces."""
+    return {line for line in file.read_text().splitlines() if line} if file.exists() else set()
 
 
 def glb_game_path(target: Path) -> str:
@@ -103,10 +114,12 @@ def write_expected(targets, failed: set[str]) -> None:
 
 def unlisted(package: str, failed_before: set[str]):
     """A package the registry misses as a target, `(package, object path, glb)`, when its own
-    class is an export type, `None` when it isn't or is a redirector. The asset isn't kept: the
-    export loads it again, so only a batch's assets are held. One that already has a GLB, or has
-    failed, isn't loaded at all: it was of an export type. One that can't be loaded is recorded
-    as failed, so it warns."""
+    class is an export type, `None` when it isn't or is a redirector. The asset is let go, with a
+    garbage collection, before the next package loads, so at most one is held during the class
+    checks however many the registry misses, and the export loads it again. One that already has
+    a GLB, or has failed, isn't loaded at all: it was of an export type. One that isn't, or is a
+    redirector, is recorded in `.gltf-skipped`, which later sessions skip, so each package is
+    checked once per work folder. One that can't be loaded is recorded as failed, so it warns."""
     target = OUT / f"{package.removeprefix('/Game/')}.glb"
     object_path = f"{package}.{package.rsplit('/', 1)[-1]}"
     if target.exists() or package in failed_before:
@@ -123,10 +136,15 @@ def unlisted(package: str, failed_before: set[str]):
         return None
     cls = asset.get_class().get_name()
     # Loading a redirector can give its target, a package of its own.
-    if cls == REDIRECTOR or asset.get_path_name() != object_path:
+    redirector = cls == REDIRECTOR or asset.get_path_name() != object_path
+    del asset
+    unreal.SystemLibrary.collect_garbage()
+    if redirector:
+        skip(package)
         unreal.log(f"[gltf] skipped {package}, a redirector")
         return None
     if cls not in TYPES:
+        skip(package)
         return None
     unreal.log(f"[gltf] found {package}, a {cls} the asset registry doesn't list")
     return package, object_path, target
@@ -137,23 +155,19 @@ def main() -> None:
     registry.search_all_assets(True)
     listed = registry.get_assets_by_path("/Game", recursive=True)
     known = {str(a.package_name) for a in listed}
-    # One package per line: a /Game path can hold spaces.
-    failed_before = (
-        {line for line in FAILED.read_text().splitlines() if line} if FAILED.exists() else set()
-    )
+    failed_before = listed_in(FAILED)
+    skipped_before = listed_in(SKIPPED)
     # (package, its registry data or the object path to load it by, the GLB)
     targets = []
     for data in listed:
         if class_name(data) in TYPES:
             rel = str(data.package_path).removeprefix("/Game").strip("/")
             targets.append((str(data.package_name), data, OUT / rel / f"{data.asset_name}.glb"))
-    missed = [p for p in on_disk() if p not in known]
-    for package in missed:
+    for package in on_disk():
+        if package in known or package in skipped_before:
+            continue
         if found := unlisted(package, failed_before):
             targets.append(found)
-    if missed:
-        # What the class checks loaded is let go before the batch starts.
-        unreal.SystemLibrary.collect_garbage()
     targets.sort(key=lambda t: t[0])
     write_expected(targets, failed_before)
     opts = options()

@@ -664,6 +664,59 @@ exec python3 -B "${{2#-ExecutePythonScript=}}""#,
         s.no_work_folder();
     }
 
+    /// The real script, one asset per session, against a registry that misses `SM_B`, a mesh,
+    /// `SM_C`, a redirector, and `T_A`, a texture: each class check lets its asset go with a
+    /// garbage collection before the next load, and the second session loads neither `SM_C` nor
+    /// `T_A` again, as the first recorded them as skipped.
+    #[tokio::test]
+    async fn each_missed_package_is_let_go_at_once_and_a_skipped_one_checked_once() {
+        let s = setup_with(false).await;
+        let root = s.stub_unreal().await;
+        script_editor(
+            &root,
+            json!([listed("SM_A", "SM_A", "StaticMesh")]),
+            json!({
+                "/Game/Fixture/Meshes/SM_B.SM_B":
+                    {"path": "/Game/Fixture/Meshes/SM_B.SM_B", "class": "StaticMesh"},
+                "/Game/Fixture/Meshes/SM_C.SM_C":
+                    {"path": "/Game/Fixture/Meshes/SM_A.SM_A", "class": "StaticMesh"},
+                "/Game/Fixture/Textures/T_A.T_A":
+                    {"path": "/Game/Fixture/Textures/T_A.T_A", "class": "Texture2D"},
+            }),
+        );
+        let run = s
+            .engine
+            .start_import(s.unreal_request("unreal.zip"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE import_steps SET options = '{\"batch\":1}' WHERE kind = 'export_unreal'",
+        )
+        .execute(&s.lib.pool)
+        .await
+        .unwrap();
+        tokio::spawn(s.engine.clone().start());
+
+        let done = s.wait_for(&run.id, "done").await;
+        assert_eq!(done.warnings, []);
+        assert!(s.pack_dir().join("SM_B.glb").is_file());
+        let calls = std::fs::read_to_string(root.join("calls.log")).unwrap();
+        let (b, c, t) = (
+            "load /Game/Fixture/Meshes/SM_B.SM_B",
+            "load /Game/Fixture/Meshes/SM_C.SM_C",
+            "load /Game/Fixture/Textures/T_A.T_A",
+        );
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            [
+                // Session 1: the class checks, each let go, then SM_A's export.
+                b, "gc", c, "gc", t, "gc", "gc",
+                // Session 2: SM_B's class check and its export, and no SM_C or T_A.
+                b, "gc", b, "gc",
+            ]
+        );
+    }
+
     /// The real script, where a package the registry misses can't be loaded: it is recorded as
     /// failed, so it warns, and the export goes on.
     #[tokio::test]
