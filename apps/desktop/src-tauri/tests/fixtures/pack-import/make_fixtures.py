@@ -47,6 +47,9 @@ committed, like `tests/fixtures/game-export/`. The fixtures grow with the plan's
 - `unreal-loose.zip`: the same project with a `Cylinder1.uasset` directly in `Content/`, as
   Waterways has a redirector there: the scan's estimate gives it a GLB, so `flatten` keeps
   `Fixture/`, but an export writes none for it.
+- `unreal-world.zip`: the same project with World Partition's one-file-per-actor packages, one
+  below `Content/Fixture/__ExternalActors__/` and one below `__ExternalObjects__/`, which the
+  asset registry doesn't list and the export never loads.
 """
 
 import gzip
@@ -482,7 +485,7 @@ def uasset(name: str) -> bytes:
     return b"\xc1\x83\x2a\x9e" + name.encode() + b"\n"
 
 
-def unreal(source: bool = False, loose: bool = False) -> bytes:
+def unreal(source: bool = False, loose: bool = False, world: bool = False) -> bytes:
     z = Zip()
     z.member("Feif/Feif.uproject", UPROJECT)
     z.member("Feif/README.md", b"# Feif\n\nA Fab fixture project.\n")
@@ -495,6 +498,12 @@ def unreal(source: bool = False, loose: bool = False) -> bytes:
         z.member("Feif/Source/Feif/Feif.Build.cs", b"public class Feif : ModuleRules {}\n")
     if loose:
         z.member("Feif/Content/Cylinder1.uasset", uasset("Cylinder1"))
+    if world:
+        for asset in [
+            "__ExternalActors__/Maps/Demo/0/AB/XYZ",
+            "__ExternalObjects__/Maps/Demo/CD/UVW",
+        ]:
+            z.member(f"Feif/Content/Fixture/{asset}.uasset", uasset(asset))
     return z.finish()
 
 
@@ -509,6 +518,7 @@ def main() -> None:
     (HERE / "unreal.zip").write_bytes(unreal(source=False))
     (HERE / "unreal-source.zip").write_bytes(unreal(source=True))
     (HERE / "unreal-loose.zip").write_bytes(unreal(loose=True))
+    (HERE / "unreal-world.zip").write_bytes(unreal(world=True))
 
 
 if __name__ == "__main__":

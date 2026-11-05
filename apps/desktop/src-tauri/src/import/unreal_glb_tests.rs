@@ -620,9 +620,10 @@ exec python3 -B "${{2#-ExecutePythonScript=}}""#,
     }
 
     /// The real script, against a registry that lists only `SM_A`, under another asset name, and
-    /// misses `SM_B`, a mesh, `SM_C`, a redirector to `SM_A`, and `T_A`, a texture: `SM_B` is
-    /// loaded by path and exported, `SM_C` and `T_A` get no GLB, and nothing warns, `SM_A`
-    /// included.
+    /// misses `SM_B`, a mesh, `SM_C`, a redirector to `SM_A`, `T_A`, a texture, and the World
+    /// Partition packages below `__ExternalActors__` and `__ExternalObjects__`, which `load_asset`
+    /// can't load: `SM_B` is loaded by path and exported, `SM_C` and `T_A` get no GLB, the World
+    /// Partition packages are never loaded, and nothing warns, `SM_A` included.
     #[tokio::test]
     async fn a_package_the_registry_misses_exports_and_a_redirector_needs_no_glb() {
         let s = setup_with(false).await;
@@ -641,7 +642,7 @@ exec python3 -B "${{2#-ExecutePythonScript=}}""#,
         );
         let run = s
             .engine
-            .start_import(s.unreal_request("unreal.zip"))
+            .start_import(s.unreal_request("unreal-world.zip"))
             .await
             .unwrap();
         tokio::spawn(s.engine.clone().start());
