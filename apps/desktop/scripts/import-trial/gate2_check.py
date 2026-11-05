@@ -39,6 +39,8 @@ import glb_audit  # noqa: E402
 
 POLYGON = "Synty Studios/POLYGON - Prototype Pack - Art by Synty"
 FAE = "Staggart Creations/Fantasy Adventure Environment"
+# The pack of Piece 1's two expected geometry changes, which the plan's sentence doesn't name.
+VILLAGE = "Stylarts/Stylized Village"
 LOST_RUINS = "Fab/Lost Ruins"
 WATERWAYS = "Fab/Waterways"
 # Item 1's measured factors, linear, to the 4 places the plan gives them.
@@ -71,9 +73,9 @@ class Checks:
 
 
 def expected_changes(plan: list[str]) -> tuple[dict, dict]:
-    """The plan's expected geometry, by GLB name: (primitives, vertices, meshes) before and after,
-    meshes None where the plan doesn't state them, and the GLBs that lose a map with their
-    billboard."""
+    """The plan's expected geometry, by pack and GLB name: (primitives, vertices, meshes) before and
+    after, meshes None where the plan doesn't state them, and the Fantasy Adventure GLBs that lose
+    a map with their billboard."""
     geometry = {}
     text = "\n".join(plan)
     piece1 = re.search(r"The expected list\s+is exactly (.+?)\. Any other", text, re.S)
@@ -81,7 +83,7 @@ def expected_changes(plan: list[str]) -> tuple[dict, dict]:
         rf"`(\w+\.glb)` \({NUMBER} to {NUMBER} vertices, {NUMBER} to {NUMBER} primitives?\)",
         piece1[1],
     ):
-        geometry[glb] = ((number(p0), number(p1)), (number(v0), number(v1)), None)
+        geometry[(VILLAGE, glb)] = ((number(p0), number(p1)), (number(v0), number(v1)), None)
     at = [line.strip() for line in plan].index(
         "| GLB | Vertices | Primitives | Lost with the billboard |"
     )
@@ -93,7 +95,7 @@ def expected_changes(plan: list[str]) -> tuple[dict, dict]:
         glb = glb.strip("`")
         v0, v1 = (number(v) for v in vertices.split(" to "))
         p0, p1 = (number(p) for p in primitives.split(" to "))
-        geometry[glb] = ((p0, p1), (v0, v1), (2, 1))
+        geometry[(FAE, glb)] = ((p0, p1), (v0, v1), (2, 1))
         if lost.startswith("Base and normal"):
             loses.add(glb)
     return geometry, loses
@@ -115,25 +117,30 @@ def check_compare(checks: Checks, current: glb_audit.Manifest, plan: list[str]) 
     checks.check(absent == 193, "only the 193 Built-In GLBs absent", f"{absent}")
 
     geometry, loses = expected_changes(plan)
-    found = {}
+    # By pack and file name, as the plan names them. Two changed GLBs of one name in one pack
+    # can't both be the plan's row, so the second is unexpected rather than overwriting the first.
+    found = set()
+    unexpected = []
     for line in result.geometry:
         pack, path, change = line.split("\t")
         m = re.match(
             r"meshes (\d+) to (\d+), primitives (\d+) to (\d+), vertices (\d+) to (\d+)", change
         )
-        found[Path(path).name] = (pack, tuple(map(int, m.groups())))
-    unexpected = []
-    for glb, (pack, (m0, m1, p0, p1, v0, v1)) in sorted(found.items()):
-        want = geometry.get(glb)
-        if want is None or want[0] != (p0, p1) or want[1] != (v0, v1):
-            unexpected.append(f"{glb}: {change_text(m0, m1, p0, p1, v0, v1)}")
+        m0, m1, p0, p1, v0, v1 = map(int, m.groups())
+        key = (pack, Path(path).name)
+        want = geometry.get(key)
+        if key in found:
+            unexpected.append(f"{pack}/{path}: a second changed GLB named {key[1]}")
+        elif want is None or want[0] != (p0, p1) or want[1] != (v0, v1):
+            unexpected.append(f"{pack}/{path}: {change_text(m0, m1, p0, p1, v0, v1)}")
         elif want[2] is not None and want[2] != (m0, m1):
-            unexpected.append(f"{glb}: meshes {m0} to {m1}")
-    missing = sorted(set(geometry) - set(found))
+            unexpected.append(f"{pack}/{path}: meshes {m0} to {m1}")
+        found.add(key)
+    missing = sorted(set(geometry) - found)
     checks.check(
         not unexpected and not missing,
         f"geometry changes are exactly the plan's {len(geometry)}",
-        "; ".join(unexpected + [f"{glb} unchanged" for glb in missing]),
+        "; ".join(unexpected + [f"{pack}/{glb} unchanged" for pack, glb in missing]),
     )
 
     lost = Counter()
@@ -197,7 +204,7 @@ def check_billboards(
     checks: Checks, libs: Path, current: glb_audit.Manifest, plan: list[str]
 ) -> None:
     trees, _ = expected_changes(plan)
-    trees = {glb for glb, (_, _, meshes) in trees.items() if meshes}
+    trees = {glb for (pack, glb), (_, _, meshes) in trees.items() if pack == FAE and meshes}
     kept = []
     seen = set()
     for path in current[FAE]:
