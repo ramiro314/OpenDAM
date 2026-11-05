@@ -978,6 +978,36 @@ Unreal one a ticket that bumps `UNREAL_GLB_VERSION`.
     and `SM_RockWall_01` as a dark scrap with a vine, and why Village's `SM_Tree_01` has a pale patch
     in its leaves.
 
+    Result (2026-11-04), read from the first gate's GLBs and sources, and each tile reproduced by
+    rendering its preview GLB through `modelThumbnailer`'s own scene and `camera.ts` in headless
+    Chrome:
+    - **`SK_Snake` is a straight stick in its source.** Its mesh is `Snake.fbx`'s `pCylinder1`,
+      0.66 by 0.02 m, skinned to 5 joints whose bind pose is straight, with
+      `MI_Potion_Color_03`'s lilac on its one slot. Waterways ships no animation for it, only
+      `SKEL_Snake` and `PHYS_Snake`, and `L_Showcase` places it as a `SkeletalMeshActor` with no
+      animation to play and no physics. The GLB matches its source, so nothing changes.
+    - **`SM_RockWall_01` was seen from behind.** It is a one-sided mossy wall with a culvert
+      through it, whose faces face about -Z. The usual view, from +X+Z, sees its culled back: the
+      culvert's inside and the wall's rim. The camera now walks the usual view round a model
+      whose faces face one way along the ground, as a wall's do (their normals sum to at least a
+      quarter of their area there), to the quarter turn that shows the most drawn faces, when
+      that shows at least 1.5 times what the usual view does. Over the gate's 7,887 preview GLBs,
+      10 turn, and all 10 look better: `SM_RockWall_01`, `SM_Cave` and `SM_RockPart_03` in
+      Waterways, `SM_grass02` in LostRuins, Lost Cave's 3 `SM_WallGrassClump`s, Elven Valley's
+      `SM_Folliage03a` and `SM_Folliage03b`, and Kenney's `terrain_sideCorner`. The next model
+      faces one way by 0.045 of its area. Without that test, 143 would turn, mostly closed
+      Kenney track and fence pieces whose other side only has a bigger outline. The wall is also
+      Nanite, so it exports its fallback, 3,813 of its source's 119,122 triangles (see
+      [Known gaps](#known-gaps)), but that only coarsens it.
+    - **`SM_Tree_01`'s patch is the sun's highlight.** Its leaf cards' vertex normals point out
+      from the crown's center (a mean dot of 0.83), whatever way each card faces, so the crown
+      shades like one ball. Its base is the white `Opacity Mask` texture under the graph's dark
+      `Color` (`0.031, 0.047, 0`), and its roughness is 0.5, so the directional light's specular
+      highlight shows as one pale patch. At roughness 0.8 it goes. The 0.5 is Blender's default:
+      `build_material` sets roughness only from an ORM map, and reads no smoothness, though this
+      graph's `Glosinnes` (0.2 on `M_Tree_01`) reaches its Smoothness output. That is a converter
+      cause, so its fix waits for version 7 (see [Known gaps](#known-gaps)).
+
 **The second gate.**
 
 15. **Run the gate again.** With items 6, 7, 8, 9, 10 and 12 merged, run all four runs in a new
@@ -1083,7 +1113,12 @@ change reaches.
   shaders multiply `_BaseColor` over every base map, so other textured materials with a tint lose
   it, as at version 4.
 - **A new thumbnail camera reaches only new previews.** Existing thumbnails keep their old view
-  until they are regenerated.
+  until they are regenerated. That holds for Work item 14's quarter turn too.
+- **Unity materials keep Blender's default roughness** (Work item 14, 2026-11-04). A material
+  with no ORM map exports at roughness 0.5, because `unity_glb.py` reads no `_Smoothness`,
+  `_Glossiness` or graph smoothness input. In the first gate, 1,854 material uses in 1,522 of
+  the converted Unity GLBs have exactly 0.5. On a dark base it shows as a highlight, as on
+  `SM_Tree_01`'s leaves. A fix is a converter change for version 7.
 - **`SM_Waterblock_01` stays a sliver** (Work item 10, 2026-11-04). Its box is flat and today's
   view sees it edge on, but its GLB is narrow ribbons that show as lines from every side, and its
   water is 17% opaque. Facing its box would show only 1.27 times the drawn faces today's view
