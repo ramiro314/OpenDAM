@@ -1,0 +1,45 @@
+{
+    "m_SerializedProperties": [
+        {
+            "typeInfo": {
+                "fullName": "UnityEditor.ShaderGraph.TextureShaderProperty"
+            },
+            "JSONnodeData": "{\"m_Guid\": {\"m_GuidSerialized\": \"base\"}, \"m_Name\": \"MainTex\", \"m_DefaultReferenceName\": \"Texture2D_x\", \"m_OverrideReferenceName\": \"_MainTex\"}"
+        }
+    ],
+    "m_SerializableNodes": [
+        {
+            "typeInfo": {
+                "fullName": "UnityEditor.ShaderGraph.PBRMasterNode"
+            },
+            "JSONnodeData": "{\"m_GuidSerialized\": \"master\", \"m_SerializableSlots\": [{\"typeInfo\": {\"fullName\": \"UnityEditor.ShaderGraph.Vector1MaterialSlot\"}, \"JSONnodeData\": \"{\\\"m_Id\\\": 7, \\\"m_DisplayName\\\": \\\"Alpha\\\", \\\"m_Value\\\": 1.0}\"}, {\"typeInfo\": {\"fullName\": \"UnityEditor.ShaderGraph.Vector1MaterialSlot\"}, \"JSONnodeData\": \"{\\\"m_Id\\\": 8, \\\"m_DisplayName\\\": \\\"AlphaClipThreshold\\\", \\\"m_Value\\\": 0}\"}]}"
+        },
+        {
+            "typeInfo": {
+                "fullName": "UnityEditor.ShaderGraph.PropertyNode"
+            },
+            "JSONnodeData": "{\"m_GuidSerialized\": \"property\", \"m_PropertyGuidSerialized\": \"base\"}"
+        },
+        {
+            "typeInfo": {
+                "fullName": "UnityEditor.ShaderGraph.SampleTexture2DNode"
+            },
+            "JSONnodeData": "{\"m_GuidSerialized\": \"sample\"}"
+        }
+    ],
+    "m_SerializableEdges": [
+        {
+            "typeInfo": {
+                "fullName": "UnityEditor.ShaderGraph.Graphing.Edge"
+            },
+            "JSONnodeData": "{\"m_OutputSlot\": {\"m_SlotId\": 0, \"m_NodeGUIDSerialized\": \"property\"}, \"m_InputSlot\": {\"m_SlotId\": 1, \"m_NodeGUIDSerialized\": \"sample\"}}"
+        },
+        {
+            "typeInfo": {
+                "fullName": "UnityEditor.ShaderGraph.Graphing.Edge"
+            },
+            "JSONnodeData": "{\"m_OutputSlot\": {\"m_SlotId\": 7, \"m_NodeGUIDSerialized\": \"sample\"}, \"m_InputSlot\": {\"m_SlotId\": 7, \"m_NodeGUIDSerialized\": \"master\"}}"
+        }
+    ],
+    "m_ActiveOutputNodeGuidSerialized": "master"
+}

@@ -49,14 +49,20 @@ impl fmt::Display for PlaceStep {
 }
 
 /// Runs `steps` in order over the tree at `root`, whose files `files` lists, and keeps `files`
-/// in step with it, sorted by path.
-pub fn place(root: &Path, files: &mut Vec<ExtractedFile>, steps: &[PlaceStep]) -> Result<()> {
-    place_in(Tree::Disk(root), files, steps).map(drop)
+/// in step with it, sorted by path. It returns the folder of each `hoist` that found none, so
+/// moved nothing. A hoist of a folder an earlier `flatten` already merged into the root, such
+/// as `Meshes` once `flatten` took `Pack/` and then `Meshes/`, did its work, so isn't one.
+pub fn place(
+    root: &Path,
+    files: &mut Vec<ExtractedFile>,
+    steps: &[PlaceStep],
+) -> Result<Vec<String>> {
+    place_in(Tree::Disk(root), files, steps)
 }
 
 /// Runs `steps` over `files` alone, as `place` would over a tree holding exactly those files,
 /// moving nothing on disk: an import's scan previews a build with it (`super::scan`). It returns
-/// a warning for each step that would do nothing: a `hoist` whose folder is missing.
+/// the folder of each `hoist` that would find none, as `place` does.
 pub fn place_listed(files: &mut Vec<ExtractedFile>, steps: &[PlaceStep]) -> Result<Vec<String>> {
     place_in(Tree::Listed, files, steps)
 }
@@ -66,16 +72,13 @@ fn place_in(
     files: &mut Vec<ExtractedFile>,
     steps: &[PlaceStep],
 ) -> Result<Vec<String>> {
-    let mut warnings = Vec::new();
+    let (mut missing, mut merged) = (Vec::new(), Vec::new());
     for step in steps {
         let result = match step {
-            PlaceStep::Flatten => flatten(tree, files),
+            PlaceStep::Flatten => flatten(tree, files, &mut merged),
             PlaceStep::Hoist { folder } => hoist(tree, files, folder).map(|found| {
-                if !found {
-                    warnings.push(format!(
-                        "{step}: no folder at {folder}, so this step moves nothing. \
-                         Give the folder's path from the pack root."
-                    ));
+                if !found && !flattened(&merged, folder) {
+                    missing.push(folder.clone());
                 }
             }),
             PlaceStep::Rename { source, name } => rename(tree, files, source, name),
@@ -84,7 +87,7 @@ fn place_in(
         result.map_err(|err| anyhow!("{step}: {err:#}"))?;
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(warnings)
+    Ok(missing)
 }
 
 /// The tree a place step works on: on disk below a folder, or only the file list (`Listed`),
@@ -183,11 +186,22 @@ impl Tree<'_> {
     }
 }
 
-fn flatten(tree: Tree, files: &mut Vec<ExtractedFile>) -> Result<()> {
+/// Merges wrappers into the root until none is left, adding each one's name to `merged`.
+fn flatten(tree: Tree, files: &mut Vec<ExtractedFile>, merged: &mut Vec<String>) -> Result<()> {
     while let Some(folder) = wrapper(tree, files)? {
         merge(tree, files, &folder)?;
+        merged.push(folder);
     }
     Ok(())
+}
+
+/// Whether `flatten` merged `folder` into the root: its path's names are wrappers it merged one
+/// after another, `merged` listing them in order.
+fn flattened(merged: &[String], folder: &str) -> bool {
+    let Ok(parts) = clean(folder) else {
+        return false;
+    };
+    !parts.is_empty() && merged.windows(parts.len()).any(|w| w == parts.as_slice())
 }
 
 /// The root's only folder, when nothing else there is an asset. Hidden entries don't count.
@@ -693,22 +707,68 @@ mod tests {
     }
 
     #[test]
-    fn a_listed_hoist_warns_when_its_folder_is_missing_and_changes_nothing() {
+    fn a_hoist_names_its_folder_when_it_is_missing_and_changes_nothing() {
         let layout = ["Art.txt", "Docs/a.txt", "Wrap/Art/x.fbx"];
         for folder in ["Art", "Art.txt", "Meshes"] {
-            let (_tmp, mut files) = tree(&layout);
             let hoist = PlaceStep::Hoist {
                 folder: folder.into(),
             };
+            let (_tmp, mut files) = tree(&layout);
             assert_eq!(
-                place_listed(&mut files, &[hoist]).unwrap(),
-                [format!(
-                    "hoist {folder}: no folder at {folder}, so this step moves nothing. \
-                     Give the folder's path from the pack root."
-                )]
+                place_listed(&mut files, std::slice::from_ref(&hoist)).unwrap(),
+                [folder]
             );
             assert_eq!(paths(&files), layout);
+
+            let (tmp, mut files) = tree(&layout);
+            assert_eq!(place(tmp.path(), &mut files, &[hoist]).unwrap(), [folder]);
+            assert_eq!(on_disk(tmp.path()), layout);
         }
+    }
+
+    /// Waterways' built shape: `flatten` takes `Waterways/`, then `Meshes/`, the only folder left,
+    /// so the hoist finds nothing to move but its folder is already at the root.
+    #[test]
+    fn a_hoist_of_a_folder_flatten_merged_isn_t_missing() {
+        let layout = ["Waterways/Meshes/SM_A.glb", "Waterways/Readme.txt"];
+        for (folder, missing) in [
+            ("Meshes", None),
+            ("Waterways/Meshes", None),
+            ("./Meshes/", None),
+            ("Waterways", None),
+            ("Props", Some("Props")),
+            ("Meshes/Waterways", Some("Meshes/Waterways")),
+        ] {
+            let steps = [
+                PlaceStep::Flatten,
+                PlaceStep::Hoist {
+                    folder: folder.into(),
+                },
+            ];
+            let missing: Vec<&str> = missing.into_iter().collect();
+            let (tmp, mut files) = tree(&layout);
+            assert_eq!(
+                place(tmp.path(), &mut files, &steps).unwrap(),
+                missing,
+                "{folder}"
+            );
+            assert_eq!(paths(&files), ["Readme.txt", "SM_A.glb"]);
+            let (_tmp, mut listed) = tree(&layout);
+            assert_eq!(
+                place_listed(&mut listed, &steps).unwrap(),
+                missing,
+                "{folder}"
+            );
+        }
+        // Only a `flatten` before it counts.
+        let (_tmp, mut listed) = tree(&layout);
+        let steps = [
+            PlaceStep::Hoist {
+                folder: "Meshes".into(),
+            },
+            PlaceStep::Flatten,
+        ];
+        assert_eq!(place_listed(&mut listed, &steps).unwrap(), ["Meshes"]);
     }
 
     #[test]
@@ -860,9 +920,7 @@ mod tests {
             };
             let mut listed = on_disk.clone();
             let disk = place(tmp.path(), &mut on_disk, &steps).map_err(|e| e.to_string());
-            let list = place_listed(&mut listed, &steps)
-                .map(drop)
-                .map_err(|e| e.to_string());
+            let list = place_listed(&mut listed, &steps).map_err(|e| e.to_string());
             assert_eq!(list, disk, "{layout:?} {steps:?}");
             if disk.is_ok() {
                 assert_eq!(listed, on_disk, "{layout:?} {steps:?}");

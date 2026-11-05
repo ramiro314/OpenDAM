@@ -234,6 +234,7 @@ const SKIP_REASONS: Record<SkippedEntry['reason'], string> = {
   notExported: 'the Unreal export failed on it',
   noGlb: 'a mesh or animation the export made no GLB of',
   noMesh: 'no mesh left, so its GLB is empty',
+  noHoistFolder: 'no such folder once the export ran, so its hoist moved nothing',
 };
 
 /** A run's warning, named by its path in the original (nested packages joined by ` > `) */

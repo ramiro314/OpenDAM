@@ -77,7 +77,10 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               name a file by source path, move or drop its .meta with it, and fail
                               naming the step and path on a clash or a source no longer produced
                               (a hoist whose folder is missing is a no-op, which the scan's preview
-                              reports in its tree's `warnings`),
+                              reports in its tree's `warnings`, or for an Unreal pack's estimated
+                              tree as a note in its `notes`, and then its build as a run warning,
+                              `SkipReason::NoHoistFolder`; a hoist of a folder an earlier flatten
+                              merged into the root isn't missing),
                               scan, an original's candidate packs (Unity cache, Fab variants,
                               Kenney packs, any zip) with presets, default targets and steps and
                               a preview of each build's tree, made by the same extract and place
@@ -129,7 +132,8 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               only texture, a blank `MI_X` slot uses `M_X`, and a mask applies
                               with no base color too. Unity's sRGB colors are written linear,
                               but for HDR ones, and a prefab's material list skips a slot no
-                              face uses, as Unity's submeshes do. Each mesh keeps its
+                              face uses and orders the rest by their first face, as Unity's
+                              submeshes do. Each mesh keeps its
                               own lowest `_LOD<n>`, and every placed GLB, new or cached, is read
                               so one with no mesh and no animation warns on every run
                               (`SkipReason::NoMesh`), unless its model is named as a collider.
@@ -328,7 +332,10 @@ docs/plans                    Plans for this fork
   (`db::add_preview_columns`), never in `metadata`. The asset goes to `error`, because the
   structure pass requeues every `none`, so nothing retries until the file changes or you ask
   again. Any finished job clears the reason. The UI shows the reason and never loads an original
-  that has one (`imageOf`, `tileMedia`).
+  that has one (`imageOf`, `tileMedia`). A worker result with `ok: false` and a `reason` ends
+  through `refuse_job` the same way: an FBX 7 whose node tree holds no mesh ("Animation, no mesh"
+  or "No mesh", `worker.fbx_without_mesh`) and an `.ai` pdfium can't open. Any other failure
+  stays a bare `error`, which the UI offers to retry.
 - **One persistent Python worker.** The worker is a long-lived JSON-over-stdio daemon. Send it
   requests over the existing stream; one process serves every file. The queue starts it eagerly
   and asks each new process its `engine_info`, publishing the answer in

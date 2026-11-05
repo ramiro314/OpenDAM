@@ -288,6 +288,17 @@ def test_a_primitive_with_no_material_is_not_textured():
     assert not facts.textured()
 
 
+def test_a_base_baked_from_the_engines_grid_is_not_textured():
+    grid = material(base=glb_audit.ENGINE_GRID)
+    assert not glb(WorldGridMaterial=grid).textured()
+    assert not glb(WorldGridMaterial=grid, Stone=material()).textured()
+    assert glb_audit.leftovers({"grid.glb": glb(WorldGridMaterial=grid)}) == Counter(
+        {"WorldGridMaterial": 1}
+    )
+    # Only the engine's grid: a base that merely names it is a texture.
+    assert glb(Grid=material(base="MI_WorldGridMaterial_BaseColor")).textured()
+
+
 def test_two_materials_of_one_name_stay_two_rows():
     gltf = GLTF | {
         "materials": [{"name": "Stone"}, {"name": "Stone"}],

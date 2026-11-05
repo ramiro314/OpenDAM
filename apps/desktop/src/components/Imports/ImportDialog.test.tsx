@@ -26,4 +26,12 @@ describe('the tree preview', () => {
   test('shows no warning for a tree without any', () => {
     expect(render(tree())).not.toContain('data-tree-warning');
   });
+
+  test("shows an estimate's note as a hint, not a warning", () => {
+    const note = 'hoist Meshes: checked once the export runs';
+    const html = render(tree({ estimate: true, glbs: 4, notes: [note] }));
+    expect(html).toContain('data-tree-note');
+    expect(html).toContain(note);
+    expect(html).not.toContain('data-tree-warning');
+  });
 });

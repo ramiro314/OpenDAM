@@ -71,15 +71,18 @@ pub enum SkipReason {
     /// A model the conversion left with no mesh. Unlike the others it isn't skipped: its empty
     /// GLB lands in the pack.
     NoMesh,
+    /// A `hoist` step that found no folder, so moved nothing, in a build whose preview was an
+    /// estimate (an Unreal pack's). Its source path is the step's folder.
+    NoHoistFolder,
 }
 
-/// An entry the extraction skipped, or a model the conversion left with no mesh, for the run's
-/// warnings.
+/// An entry the extraction skipped, a model the conversion left with no mesh, or an estimate's
+/// hoist that moved nothing, for the run's warnings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkippedEntry {
     /// The entry's source path, or for a tar member with no known `pathname`, the chain ending in
-    /// the member's own name.
+    /// the member's own name. A hoist's is its folder.
     pub source_path: Vec<String>,
     pub reason: SkipReason,
 }

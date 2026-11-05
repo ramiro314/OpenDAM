@@ -4,13 +4,12 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { api } from '../api';
 import { useAssetStore } from '../store';
+import { cameraDirection, cameraUp } from './camera';
 import { modelsToRender, onModelRendered, renderKey } from './previewDone';
 
 const SIZE = 512;
 const BATCH = 20;
 const IDLE_POLL_MS = 3000;
-/** Three-quarter view from above, like a product shot */
-const VIEW_DIRECTION = new THREE.Vector3(1, 0.8, 1).normalize();
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -49,7 +48,9 @@ export function startModelThumbnailer(): () => void {
 
       const camera = new THREE.PerspectiveCamera(30, 1, sphere.radius / 100, sphere.radius * 100);
       const distance = (sphere.radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2))) * 1.05;
-      camera.position.copy(sphere.center).addScaledVector(VIEW_DIRECTION, distance);
+      const direction = cameraDirection(model);
+      camera.position.copy(sphere.center).addScaledVector(direction, distance);
+      camera.up.copy(cameraUp(direction));
       camera.lookAt(sphere.center);
 
       // Export in the same task as the render, before the drawing buffer is cleared.

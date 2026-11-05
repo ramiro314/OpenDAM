@@ -518,6 +518,32 @@ The rules:
     is exactly `SM_Bulidings.glb` (0 to 2,116,110 vertices, 0 to 176 primitives) and
     `SM_Grass_Foliage.glb` (0 to 3,610 vertices, 0 to 1 primitive). Any other increase may be
     doubled geometry from a LOD group that didn't match, and blocks the merge until explained.
+  - From [After the first gate](#after-the-first-gate)'s item 2 on, the list also holds Fantasy
+    Adventure's 15 trees under `Models/Trees/`, each losing its `_Billboard` mesh: 2 meshes to 1,
+    one primitive fewer, and the billboard's vertices. 11 of them also lose the base and normal
+    map of their billboard's own material, which `glb_audit.py compare` lists as lost maps
+    (`base: 3 to 2 materials`, `normal: 2 to 1 materials`). Those 22 losses are expected, and no
+    other. The other 4 billboards had no texture (the "4 billboards" leftovers of
+    [Piece 1 result](#piece-1-result)), so those 4 GLBs become fully textured and the pack's
+    count rises from 26 to 30 of 36. Before is `baseline-v4.tsv`, which version 5 matched:
+
+    | GLB | Vertices | Primitives | Lost with the billboard |
+    |---|---|---|---|
+    | `FAE_Birch_A.glb` | 1,518 to 1,502 | 3 to 2 | Base and normal of `FAE_Birch_A_Billboard` |
+    | `FAE_Birch_B.glb` | 722 to 706 | 3 to 2 | Base and normal of `FAE_Birch_B_Billboard` |
+    | `FAE_Birch_C.glb` | 1,073 to 1,057 | 3 to 2 | Base and normal of `FAE_Birch_C_Billboard` |
+    | `FAE_Palm_A.glb` | 1,054 to 1,038 | 3 to 2 | Base and normal of `FAE_Palm_A_Billboard` |
+    | `FAE_Palm_B.glb` | 2,754 to 2,730 | 3 to 2 | None, its billboard was untextured |
+    | `FAE_Palm_C.glb` | 3,666 to 3,642 | 3 to 2 | None, its billboard was untextured |
+    | `FAE_Pine_A.glb` | 1,562 to 1,546 | 3 to 2 | Base and normal of `FAE_Pine_A_Billboard` |
+    | `FAE_Spruce_A.glb` | 1,713 to 1,697 | 3 to 2 | Base and normal of `FAE_Spruce_A_Billboard` |
+    | `FAE_Spruce_B.glb` | 1,481 to 1,465 | 3 to 2 | Base and normal of `FAE_Spruce_B_Billboard` |
+    | `FAE_Spruce_C.glb` | 1,426 to 1,410 | 3 to 2 | Base and normal of `FAE_Spruce_C_Billboard` |
+    | `FAE_Tree_A.glb` | 4,573 to 4,557 | 3 to 2 | Base and normal of `FAE_Tree_A_Billboard` |
+    | `FAE_Tree_B.glb` | 3,609 to 3,593 | 3 to 2 | Base and normal of `FAE_Tree_B_Billboard` |
+    | `FAE_Tree_C.glb` | 4,401 to 4,385 | 3 to 2 | Base and normal of `FAE_Tree_C_Billboard` |
+    | `FAE_Willow_A.glb` | 8,049 to 8,025 | 3 to 2 | None, its billboard was untextured |
+    | `FAE_Willow_B.glb` | 10,704 to 10,680 | 3 to 2 | None, its billboard was untextured |
   - Rebuilding Ancient Ruins in step 5's copy replaces each changed GLB's version 4 thumbnail,
     keeps a tag and a rename, and leaves byte-identical GLBs and their thumbnails alone.
 - **Piece 2:** the 6 Fab packs get a model cover, not a texture. Wizard Room's dialog warns about
@@ -599,6 +625,41 @@ The list below doesn't cover two of these. The owner accepted them as recorded o
 - **Four Synty window walls have a Unity file.** Their prefabs list each mesh's materials, by file
   IDs Unity hashes from the mesh's name. The `.meta` doesn't name them, and the one-list fallback
   can't apply to two meshes with two lists.
+
+**Big Castle's ivy background planes and `grassPlane` have no material in any file.** On 2026-11-03 the owner
+accepted `ivy_a` and `grassPlane` if no file held their materials (decision 6), and Work item 5
+searched on 2026-11-04. The search found the same gap in 4 more ivy GLBs, which the owner's
+decision doesn't name: they are recorded here on the strength of that finding. All 6 are among the
+12 GLBs above:
+
+- **The ivy.** One or two planes have no material in each of these GLBs: `ivy_a`'s `Plane.052`
+  (whose mesh is `Plane.081`), `ivy_a_lod`'s `Plane.056`, `ivy_b`'s `Plane.053`, `ivy_b_lod`'s
+  `Plane.057`, and `ivy_c`'s `Plane.060` and `Plane.061`. No FBX gives them a material:
+  `ivy_a` and `ivy_a_lod` give their one material, `leavePlane`, only to the leaf cards, and
+  `ivy_b`, `ivy_b_lod` and `ivy_c` have none. The `ivy_a`, `ivy_b` and `ivy_c` prefabs,
+  checked by each `m_Mesh` file ID against the FBX `.meta` files, place each model's bark and leaf
+  cards and none of these planes. So in Unity the ivy has no background card at all.
+  `ivy_c_lod` isn't a leftover: it has no such plane, and `ivy_c.prefab` places all four of its
+  meshes, which its GLB textures with bark and `leafes_plane`.
+- **`grassPlane`.** Its FBX has no material, and no prefab or scene places it.
+
+Where the search looked:
+
+- **Package.** The whole `.unitypackage`: every file in it is in the built pack.
+- **`.meta` files.** All 952. The importers of the six ivy FBX files (`ivy_a`, `ivy_b` and
+  `ivy_c`, each with its `_lod`) and of `grassPlane.fbx` (`importMaterials: 0`, no
+  `externalObjects`) remap no material.
+- **Prefabs and scenes.** All 260 prefabs and 5 scenes. No scene places any of those seven FBX
+  files directly: only the `ivy_a`, `ivy_b` and `ivy_c` prefabs refer to the ivy ones, and
+  nothing refers to `grassPlane.fbx`. The scenes' material overrides on the three ivy prefabs
+  change only the bark's renderers.
+- **The other assets.** The two binary terrain assets, read through `unity_text.py`, use
+  `grass_basecolor.png` and `plant_dry_basecolor.png` as detail textures and `tree_b` as a tree.
+- **Materials and textures.** `grass.mat`, `ivy_a_bg_plane_basecolor.png` and
+  `ivy_b_bg_plane_basecolor.png` look like the missing materials, but no file names their GUIDs.
+  Linking them would be the filename rule this plan dropped.
+
+So the converter doesn't change.
 
 ### Pipeline choice result
 
@@ -745,13 +806,24 @@ profile, as Piece 1 did, and reports the GLBs it changes.
    factor. POLYGON's 162 `PolygonPrototype_Grid_01` GLBs come out yellow with their grid, and only
    a material whose base came from that rule changes colour. Fixture: a material whose one texture
    is `_Grid`, with a yellow `_Base_Color`, and one whose base is found by name, with a colour that
-   stays unapplied.
+   stays unapplied. Result: a prototype run of the old and new script over the 11 packs' built
+   copies in the first gate's profile changed 163 of 2,566 GLBs, all in POLYGON, and only their
+   `baseColorFactor`: the 162 `PolygonPrototype_Grid_01` GLBs, to `[1, 0.4831, 0, 1]`, and
+   `SM_Buildings_WindowGlass_01`, whose `PolygonPrototype_Glass_01` is on the same grid shader
+   with `_Grid` its only texture, to its cyan `[0.0051, 0.6596, 0.8714, 1]`. No model failed, and
+   no texture, alpha mode or geometry changed.
 2. **Drop a billboard beside a real mesh.** In a file with other meshes, a mesh object whose name,
    without Blender's numeric suffix, ends `_Billboard` in any case is dropped, as a higher LOD is.
    A file whose only mesh is a billboard keeps it. Fantasy Adventure's 15 GLBs lose their crossed
    cards. The ticket adds those 15 GLBs, with their before and after vertex and primitive counts, to
    the expected geometry list (Piece 1 under [Each piece](#each-piece)), and, if one loses a map
-   with its billboard, names it there as expected.
+   with its billboard, names it there as expected. Measured on 2026-11-04 by a prototype run of
+   the script, before and after, over the first gate's Fantasy Adventure files, all 36 models:
+   exactly those 15 GLBs changed, and 11 of them lost their billboard's base and normal map,
+   the list's figures. A billboard that is a file's only mesh is in none of the 11 packs, so
+   only the fixtures cover it. The second gate's leftover check
+   (`gate_plan_check.py`) will find 4 fewer Fantasy Adventure leftovers than Piece 1 result's
+   table, the 4 untextured billboards.
 3. **A cutout read from the shader.** First check that `FAE_TreeBranch` clips on alpha in its shader
    file. Then a material on a shader that clips, and with no `_ALPHATEST_ON` or
    `TransparentCutout`, gets its base texture's alpha as a `MASK`. A `.shader` file becomes a
@@ -769,7 +841,10 @@ profile, as Piece 1 did, and reports the GLBs it changes.
 5. **`ivy_a` and `grassPlane`'s materials.** Search Big Castle's prefabs, scenes and `.meta` files
    for the materials of `Plane.081` and `grassPlane`'s mesh. If a file holds them, the converter
    learns to read it, with a fixture. If none does, the ticket records them as accepted leftovers
-   in [Piece 1 result](#piece-1-result), and the converter doesn't change.
+   in [Piece 1 result](#piece-1-result), and the converter doesn't change. Searched on
+   2026-11-04: no file holds them, so they are recorded there as accepted. The 4 other ivy GLBs
+   with the same unplaced planes are recorded with them, as this search's finding: the owner's
+   decision names only `ivy_a` and `grassPlane`.
 6. **Bump to `opendam-unity-glb/6`.** Once items 1 to 5 have merged: `VERSION` and
    `UNITY_GLB_VERSION` move together, the docstring lists what changed, and `CLAUDE.md`'s
    `src/import` notes record the new rules. Every built Unity pack needs a Rebuild, as
@@ -793,6 +868,14 @@ profile, as Piece 1 did, and reports the GLBs it changes.
    there, bump `UNREAL_GLB_VERSION`, and run Waterways again. If it isn't, or isn't found, record
    what was learned under [Known gaps](#known-gaps) and change nothing.
 
+   Result (2026-11-04): the cause is in the export, but it isn't the mask. The export writes each
+   Nanite mesh's fallback geometry, and no small change fixes that, so this item landed as a
+   record under [Known gaps](#known-gaps) ("Unreal Nanite meshes export their fallback mesh"),
+   with no code change and no version bump. That departs from the route above. Its fix is a later
+   Unreal export ticket that bumps `UNREAL_GLB_VERSION`. The owner shapes it first, so it has no
+   number in this list or under [Order](#order) yet, and it doesn't hold the second gate: the
+   ferns stay as they are in it.
+
 **Import dialog.**
 
 9. **Hoist warning on an estimate.** An Unreal pack's tree is an estimate (`Project::estimate`),
@@ -812,11 +895,31 @@ profile, as Piece 1 did, and reports the GLBs it changes.
 10. **A camera for flat models.** `modelThumbnailer` faces a flat model's largest side, where today
     its fixed camera can look at it edge on, so `grassPlane` and `SM_Waterblock_01` show as planes,
     not slivers. "Flat" is judged from the model's bounding box. Only previews made after the change
-    use it, and nothing requeues existing thumbnails.
+    use it, and nothing requeues existing thumbnails. As built (`preview/camera.ts`), and confirmed
+    by the owner on 2026-11-04:
+    - **The box is oriented** (the vertices' principal axes), since neither model is flat by an
+      axis-aligned one.
+    - **A card counts as flat** when its faces mostly point one way. `grassPlane` is a bent card
+      whose faces point away from the fixed camera, and no box calls it flat.
+    - **A flat model keeps today's view** when that view sees its front at 20° or more, as it
+      sees floors and walls, or when facing it wouldn't show 1.5 times the drawn faces.
+    - **The result:** 109 of the gate's 7,803 GLBs get the new view, and `SM_Waterblock_01`
+      isn't one of them (see [Known gaps](#known-gaps)).
 11. **Kenney's 36 preview errors.** Find why the 10 `.ai` files fail, though `.ai` already renders
     through pdfium, and preview what can be. The 26 `.fbx` animations Assimp can't load, in the
     Animated Characters packs, and any `.ai` that can't be previewed, end with a reason the UI
     shows (`preview_reason`), such as "Animation, no mesh", not a bare error.
+
+    Result (2026-11-04): the `.ai` branch used PIL's `Image` without importing it, and another
+    branch's `from PIL import Image` makes it a local name of `model_meta`, so every page that
+    rendered past 1440 px failed with `UnboundLocalError`, all 10 of Kenney's among them. With
+    the import, all 10 render, and a page now renders at the thumbnail's size rather than at 3x
+    and shrunk (Kenney's 4500 pt backgrounds were a 13,500 px bitmap). The 26 animations hold a
+    58-bone skeleton and two takes and no mesh, so Assimp refuses them with an empty message:
+    the worker reads the node tree on a failed FBX and answers "Animation, no mesh" (or "No
+    mesh"), and an `.ai` pdfium can't open "No PDF content to preview". Run over the gate's 36
+    files, the worker gives 10 thumbnails and 26 reasons. The gate's library keeps its 36
+    `error` rows until each is regenerated, since nothing requeues them.
 
 **Audit.**
 
@@ -836,9 +939,74 @@ Unreal one a ticket that bumps `UNREAL_GLB_VERSION`.
     stage, and the scope's figure doesn't split file cache from the app's own memory. Measure an
     11-pack import under the cap with the scope's `memory.stat` (anonymous memory against file
     cache) and say whether a larger import could be killed.
+
+    Result (2026-11-04): the peak is file cache, and the cap reclaims it. An 11-pack run at
+    `99ada97`, as the first gate's (`run.sh` with `TRIAL_UI`, `packs.json`, a new profile in
+    `~/.local/share/opendam-import-memory`), ended `done` with 11 runs, no error, all 4,182
+    previews and no cap kill (`gate-caps.sh` exits 0). `session.sh` now reads each scope's
+    `memory.stat` every 5 s:
+
+    | Scope | Peak | Most held | Most anon | Most file cache | Reclaims at the cap |
+    |---|---|---|---|---|---|
+    | The app (10 GB cap) | 10,240 MiB, the cap | 2,515 MiB | 2,481 MiB | 9,475 MiB | 143,925 |
+    | Blender, its largest conversion (12 GB cap) | 6,239 MiB | 2,270 MiB | 2,262 MiB | 4,232 MiB | 0 |
+
+    "Held" is what the cap can't reclaim, at its most in one sample: anon, shmem and kernel memory
+    but its reclaimable slab. File cache is `memory.stat`'s `file` less its shmem (at most 20 MiB
+    in the app).
+
+    - **The app's scope reaches its cap 6 minutes in and stays there.** Its writes (each pack's
+      extraction and staging, the GLBs, the thumbnails) and its reads are charged to it as file
+      cache, which the kernel reclaims at the cap (`memory.events` `max`) before it kills
+      anything. So the first gate's 9.8 GB, and this run's 10 GB, measure the cache, not a risk.
+    - **Its own memory stays near a quarter of the cap.** Anon was 0.6 to 2.5 GB through the run,
+      with no growth from pack to pack. By process, at most: `opendam-desktop` 1.6 GB, in
+      spikes during builds that settle near 0.8 GB, the preview worker 0.8 GB and WebKit's web
+      process 0.7 GB. Blender runs in scopes of its own and doesn't count against the app.
+    - **A larger import could not be killed by the cache.** With swap at 0, only held memory can
+      kill the scope, and it reached 2.5 GB of 10 GB. The number of packs doesn't move it. The
+      cache's dirty pages, at most 1.3 GB, are reclaimed only once written out, and the cap
+      waits for that rather than killing. One pack much larger than these could raise the app's
+      spikes during its build, which this run doesn't measure.
+    - **The fix is in the gate's tooling.** `memory.peak` alone made the scope look near a kill,
+      so `session.sh` writes `h/memstat.tsv` (anon, shmem, kernel, file cache, the cap's reclaim
+      count) and `h/memproc.tsv` (each process's anon, file and peak resident size), and
+      `gate-caps.sh` prints each scope's most held, anon, shmem and file cache beside its peak.
+      The second gate reports those. The app and the converters don't change, and no follow-up
+      is needed: no cause is in a converter.
 14. **The sheets' other oddities.** Find why Waterways' `SK_Snake` draws as a thin straight line
     and `SM_RockWall_01` as a dark scrap with a vine, and why Village's `SM_Tree_01` has a pale patch
     in its leaves.
+
+    Result (2026-11-04), read from the first gate's GLBs and sources, and each tile reproduced by
+    rendering its preview GLB through `modelThumbnailer`'s own scene and `camera.ts` in headless
+    Chrome:
+    - **`SK_Snake` is a straight stick in its source.** Its mesh is `Snake.fbx`'s `pCylinder1`,
+      0.66 by 0.02 m, skinned to 5 joints whose bind pose is straight, with
+      `MI_Potion_Color_03`'s lilac on its one slot. Waterways ships no animation for it, only
+      `SKEL_Snake` and `PHYS_Snake`, and `L_Showcase` places it as a `SkeletalMeshActor` with no
+      animation to play and no physics. The GLB matches its source, so nothing changes.
+    - **`SM_RockWall_01` was seen from behind.** It is a one-sided mossy wall with a culvert
+      through it, whose faces face about -Z. The usual view, from +X+Z, sees its culled back: the
+      culvert's inside and the wall's rim. The camera now walks the usual view round a model
+      whose faces face one way along the ground, as a wall's do (their normals sum to at least a
+      quarter of their area there), to the quarter turn that shows the most drawn faces, when
+      that shows at least 1.5 times what the usual view does. Over the gate's 7,887 preview GLBs,
+      10 turn, and all 10 look better: `SM_RockWall_01`, `SM_Cave` and `SM_RockPart_03` in
+      Waterways, `SM_grass02` in LostRuins, Lost Cave's 3 `SM_WallGrassClump`s, Elven Valley's
+      `SM_Folliage03a` and `SM_Folliage03b`, and Kenney's `terrain_sideCorner`. The next model
+      faces one way by 0.045 of its area. Without that test, 143 would turn, mostly closed
+      Kenney track and fence pieces whose other side only has a bigger outline. The wall is also
+      Nanite, so it exports its fallback, 3,813 of its source's 119,122 triangles (see
+      [Known gaps](#known-gaps)), but that only coarsens it.
+    - **`SM_Tree_01`'s patch is the sun's highlight.** Its leaf cards' vertex normals point out
+      from the crown's center (a mean dot of 0.83), whatever way each card faces, so the crown
+      shades like one ball. Its base is the white `Opacity Mask` texture under the graph's dark
+      `Color` (`0.031, 0.047, 0`), and its roughness is 0.5, so the directional light's specular
+      highlight shows as one pale patch. At roughness 0.8 it goes. The 0.5 is Blender's default:
+      `build_material` sets roughness only from an ORM map, and reads no smoothness, though this
+      graph's `Glosinnes` (0.2 on `M_Tree_01`) reaches its Smoothness output. That is a converter
+      cause, so its fix waits for version 7 (see [Known gaps](#known-gaps)).
 
 **The second gate.**
 
@@ -850,7 +1018,7 @@ Unreal one a ticket that bumps `UNREAL_GLB_VERSION`.
     - POLYGON's 162 grid GLBs carry their yellow factor.
     - Fantasy Adventure's 15 GLBs have no billboard mesh, and the 3 branch materials are `MASK`.
     - If item 4 shipped a fix, `tree_b`'s leaf map is on its cards, and every other slot change it
-      listed is there.
+      listed is there. It did: [slot-order.tsv](slot-order.tsv) lists 79 GLBs.
     - LostRuins has 102 GLBs, and no package of an export type is left without one or a warning.
     - Waterways' dialog shows no hoist warning, and its textured count is read with item 12's audit.
       LostRuins and Waterways still have no row in `floors.tsv`, so they pass on the Unreal rows'
@@ -873,6 +1041,37 @@ Unreal one a ticket that bumps `UNREAL_GLB_VERSION`.
 | 15, the second gate | 6, 7, 8, 9, 10 and 12 |
 
 Items 11, 13 and 14 can land before or after the second gate.
+
+### Slot order result
+
+Item 4 found the cause it expected, measured on 2026-11-04 against the first gate's pack folders
+(`~/.local/share/opendam-import-gate/libs`):
+
+- **`tree_b`.** Its FBX's one mesh, `tree.002`, lists `branch.001` (48 faces) at index 0 and
+  `Apple1.001` (3,196 faces) at index 1, and its first face is an `Apple1.001` one. The prefab
+  lists `bark`, then `tree_b_branch`. Version 5 counted submeshes by slot index, so the 48 cards
+  got the bark. Unity orders a mesh's submeshes by each slot's first face, so its first submesh is
+  the 3,196-face tree, which takes the bark.
+- **Unity's rule.** No Unity runs here, so the rule was read from the packs' own prefabs. Of the
+  meshes with two or more used slots whose two orders differ, 106 get a prefab list. In the 89
+  Medieval Houses ones, whose FBX material names are the `.mat` names, every list follows
+  first-face order, and none follows slot index order. The 17 Big Castle ones use generic names
+  (`Material.001`), and renders of `tree_b`, `column` and `window_a_inside`, before and after,
+  look right only in first-face order.
+- **Reach.** Converting every model of the 11 packs before and after the fix (2,566 GLBs, the pack
+  map's total) changes the slots of 79 GLBs, the same 79 a static read of the FBX files finds: 62
+  in Medieval Houses, each a pair of `M_MH_01_Atlas_*` materials on each other's faces, and 17 in
+  Big Castle. [slot-order.tsv](slot-order.tsv) lists each changed primitive, with its material before
+  and after. No other pack changes: their slot orders agree, or no prefab list reaches the mesh.
+  The 15 ASCII FBX files, which go through `assimp`, already list their faces grouped by slot.
+- **No count moves.** Every pack's fully textured count is the gate's, and no base, normal or ORM
+  map is gained or lost. No vertex, primitive or mesh count changes. So `floors.tsv` stands.
+
+The fix orders a slot by its first face in Blender's import, which keeps the file's face order.
+It lands at version 5, and item 6's bump reconverts it. It was measured at `32a54e1`, before items
+1 to 3 merged. None of them changes which material a slot takes: they change a factor, an
+`alphaMode` and which meshes stay, and the billboards are in Fantasy Adventure, which no slot
+change reaches.
 
 ## Evidence so far
 
@@ -914,7 +1113,16 @@ Items 11, 13 and 14 can land before or after the second gate.
   shaders multiply `_BaseColor` over every base map, so other textured materials with a tint lose
   it, as at version 4.
 - **A new thumbnail camera reaches only new previews.** Existing thumbnails keep their old view
-  until they are regenerated.
+  until they are regenerated. That holds for Work item 14's quarter turn too.
+- **Unity materials keep Blender's default roughness** (Work item 14, 2026-11-04). A material
+  with no ORM map exports at roughness 0.5, because `unity_glb.py` reads no `_Smoothness`,
+  `_Glossiness` or graph smoothness input. In the first gate, 1,854 material uses in 1,522 of
+  the converted Unity GLBs have exactly 0.5. On a dark base it shows as a highlight, as on
+  `SM_Tree_01`'s leaves. A fix is a converter change for version 7.
+- **`SM_Waterblock_01` stays a sliver** (Work item 10, 2026-11-04). Its box is flat and today's
+  view sees it edge on, but its GLB is narrow ribbons that show as lines from every side, and its
+  water is 17% opaque. Facing its box would show only 1.27 times the drawn faces today's view
+  does, under the 1.5 the camera needs to move, so it keeps today's view.
 - **Hashed mesh IDs aren't read.** Four Synty window walls stay untextured though their prefabs
   list their materials (Piece 1 result).
 - **Conversions aren't byte-stable.** A GLB's image names follow a counter, so a rename or a
@@ -925,3 +1133,35 @@ Items 11, 13 and 14 can land before or after the second gate.
 - **The 16 cached packages not sampled** run no acceptance pass, though the census found no
   sign of trouble.
 - **Nothing flags a stale pack** after a future version bump.
+- **An ASCII FBX keeps its slot order.** It reaches Blender through `assimp`, which groups its
+  faces by slot, so the first-face rule can't see the original's order. The 15 in the 11 packs
+  already group their faces so.
+- **Unity 5's material layout isn't read.** Big Castle's `wall_b_x2.mat` lists its properties as
+  `- first: name: _MainTex`, which `UnityMaterial` doesn't parse, so it reads as empty, and
+  `window_a_inside`'s wall slot takes `window_a`'s texture by name. It is the only such `.mat` in
+  the 11 packs. A fix is a converter change for version 7.
+- **Unreal Nanite meshes export their fallback mesh** (Work item 8, traced on 2026-11-04 in the UE
+  5.8 editor on a work copy of Waterways). The ferns' mask isn't lost: `MI_Fern_02`'s parent
+  `MM_Plants` takes its opacity mask from `T_Fern_O`'s red channel, and that texture is itself 99.3%
+  at or above the 0.3333 cutoff, because the fern's leaflets are geometry and the mask only trims
+  specks. A `SIMPLE` bake matches the texture to a mean absolute difference of 0.0013. The blocky
+  leaf ends come from the geometry: the exporter writes render data, and a Nanite mesh's LOD 0 there
+  is its fallback (relative error 1.0 here), so `SM_Fern_01` exports 5,621 of its 148,520 triangles,
+  `SM_Fern_02` 2,826 of 78,152 and `SM_Fern_04` 1,047 of 17,728. `SM_Fern_03` isn't Nanite and
+  exports all 148,520, the same count as `SM_Fern_01`'s source, as the editor reports both. All 112
+  of Waterways' 146 static meshes that are Nanite export exactly their fallback's count, 111 of them
+  reduced: 352,417 triangles in all, against 18,559,387 in their sources. No one-line change fixes
+  it:
+  - `export_source_model` alone writes the source geometry, but `MM_Plants` reads vertex colour
+    (its AO is `AO * VertexColor.R`), so `USE_MESH_DATA` bakes every input in the lightmap UV,
+    channel 1, which only the render data has. The GLB's base colour points at a `TEXCOORD_1` the
+    mesh lacks, and the fern turns flat yellow-brown.
+  - The source model with a `SIMPLE` bake gives `SM_Fern_01` its rounded leaflets and its colour.
+    But `SIMPLE` everywhere would break materials that really need mesh data, such as
+    `MM_MasterWorldAligned`'s.
+  - Exporting every source whole is too big: `SM_SmallStone_04` is 8,472,778 triangles, a 243 MB
+    GLB, against 662 in its fallback.
+
+  A fix is an Unreal export ticket that bumps `UNREAL_GLB_VERSION`, shaped first: which Nanite
+  meshes take their source model (a triangle cap, say), and how a mesh-data bake is kept on a
+  channel the exported mesh has. LostRuins wasn't checked for Nanite meshes.

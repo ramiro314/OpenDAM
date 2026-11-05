@@ -13,6 +13,7 @@ mod tests {
 
     use crate::import::engine::tests::{setup, setup_with, whole_pass, Setup};
     use crate::import::engine::*;
+    use crate::import::place::PlaceStep;
     use crate::import::unitypackage::tests::{fixture, on_disk};
     use crate::import::unitypackage::SkipReason;
     use crate::import::unreal_glb::tests::{write_editor, write_version};
@@ -198,6 +199,82 @@ echo "$left" > "$GLTF_OUT/.gltf-remaining""#
         let package: Value =
             serde_json::from_str(&std::fs::read_to_string(package).unwrap()).unwrap();
         assert_eq!(package["title"], "Lost Ruins", "{package}");
+    }
+
+    /// Waterways' shape: the estimate gives `Content/Cylinder1.uasset` a GLB, so `flatten` keeps
+    /// `Fixture/` and `hoist Meshes` finds nothing there. The scan notes the hoist rather than
+    /// warning, and the export writes no GLB for it, so the build hoists the meshes and warns of
+    /// nothing either.
+    #[tokio::test]
+    async fn an_estimate_s_hoist_is_a_note_and_a_build_that_hoists_warns_nothing() {
+        let s = setup().await;
+        s.stub_unreal().await;
+        let original = fixture("unreal-loose.zip");
+        let scan = s
+            .engine
+            .scan("lib", &original.to_string_lossy())
+            .await
+            .unwrap();
+        let unreal = scan.offers.iter().find(|o| o.layout == "unreal").unwrap();
+        let tree = unreal.candidates[0].tree.as_ref().unwrap();
+        assert!(tree.estimate);
+        assert_eq!(tree.warnings, Vec::<String>::new());
+        assert_eq!(tree.notes.len(), 1, "{tree:?}");
+        assert!(
+            tree.notes[0].starts_with("hoist Meshes: checked once the export runs"),
+            "{tree:?}"
+        );
+
+        let run = s
+            .engine
+            .start_import(s.unreal_request("unreal-loose.zip"))
+            .await
+            .unwrap();
+        let done = s.wait_for(&run.id, "done").await;
+        assert_eq!(done.warnings, []);
+        assert_eq!(
+            on_disk(&s.pack_dir()),
+            [
+                "README.md",
+                "Readme.txt",
+                "SM_A.glb",
+                "SM_B.glb",
+                "SM_C.glb",
+                "datapackage.json"
+            ]
+        );
+    }
+
+    /// An estimate's hoist that moves nothing in the build too warns in its run, naming the
+    /// folder: the preview could only note it. A hoist of a folder `flatten` lifted, as
+    /// Waterways' `Meshes`, doesn't (above).
+    #[tokio::test]
+    async fn an_estimate_s_build_warns_of_a_hoist_that_moves_nothing() {
+        let s = setup().await;
+        s.stub_unreal().await;
+        let place = vec![
+            PlaceStep::Flatten,
+            PlaceStep::Hoist {
+                folder: "Props".into(),
+            },
+        ];
+        let request = ImportRequest {
+            place: Some(place),
+            ..s.unreal_request("unreal.zip")
+        };
+        let run = s.engine.start_import(request).await.unwrap();
+        let done = s.wait_for(&run.id, "done").await;
+        let warned: Vec<(Vec<String>, SkipReason)> = done
+            .warnings
+            .iter()
+            .map(|w| (w.source_path.clone(), w.reason))
+            .collect();
+        assert_eq!(
+            warned,
+            [(vec!["Props".to_string()], SkipReason::NoHoistFolder)]
+        );
+        // `flatten` took `Fixture/`, then `Meshes/`, the only folder left with an asset.
+        assert!(s.pack_dir().join("SM_A.glb").is_file());
     }
 
     /// A finished run reads back what it exported, also when a rebuild exports nothing because

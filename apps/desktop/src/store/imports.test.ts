@@ -467,6 +467,12 @@ describe('progress and warnings', () => {
     );
   });
 
+  test("an Unreal build's hoist that moved nothing is named by its folder", () => {
+    expect(skippedText({ sourcePath: ['Props'], reason: 'noHoistFolder' })).toBe(
+      'Props: no such folder once the export ran, so its hoist moved nothing'
+    );
+  });
+
   test('the heading counts warnings of every reason', () => {
     expect(warningsHeading(1)).toBe('1 warning');
     expect(warningsHeading(2)).toBe('2 warnings');

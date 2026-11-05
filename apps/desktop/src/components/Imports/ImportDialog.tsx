@@ -57,6 +57,11 @@ export function Tree({ tree, converts }: { tree: ImportTree; converts: boolean }
           {w}
         </span>
       ))}
+      {tree.notes?.map((n) => (
+        <span key={n} className={styles.hint} data-tree-note>
+          {n}
+        </span>
+      ))}
       <ul className={styles.tree}>
         {shown.map((f) => {
           const depth = f.path ? f.path.split('/').length : 0;

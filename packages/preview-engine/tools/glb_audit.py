@@ -59,12 +59,20 @@ ROLES = ("base", "normal", "orm")
 # The `material` cell of a GLB with no mesh, and of a primitive with no material.
 NO_MESH = "(no mesh)"
 NO_MATERIAL = "(no material)"
+# The base Unreal's export bakes from the engine's default grid material, no real texture (plan
+# "After the first gate", item 12). A manifest keeps the name, and only the counts ignore it.
+ENGINE_GRID = "WorldGridMaterial_BaseColor"
 
 # Baseline GLBs that may have no match: Medieval's Built-In copy, which Piece 2 stops importing.
 # The map's GLBs column still has to match, so losing them before Piece 2 fails on the count.
 EXPECTED_ABSENT = (
     ("GameAssetFactory/Medieval Houses Modular Vol 1", "Medieval_Houses_Vol1_Built-In/"),
 )
+
+
+def has_base(m: dict[str, str]) -> bool:
+    """Whether a material row has a base map, the engine's grid not counting as one."""
+    return bool(m["base"]) and m["base"] != ENGINE_GRID
 
 
 class AuditError(Exception):
@@ -85,7 +93,7 @@ class Glb:
 
     def textured(self) -> bool:
         """The plan's "fully textured": every material its meshes use has a base map."""
-        return bool(self.materials) and all(m["base"] for m in self.materials.values())
+        return bool(self.materials) and all(has_base(m) for m in self.materials.values())
 
     def count(self, role: str) -> int:
         return sum(1 for m in self.materials.values() if m[role])
@@ -404,7 +412,7 @@ def leftovers(glbs: dict[str, Glb]) -> Counter:
         if not glb.materials:
             left[NO_MESH] += 1
         for name, m in glb.materials.items():
-            if not m["base"]:
+            if not has_base(m):
                 left[name] += 1
     return left
 
