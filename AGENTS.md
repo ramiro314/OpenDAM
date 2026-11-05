@@ -128,15 +128,19 @@ apps/desktop/                 Tauri app (bun workspace @opendam/desktop)
                               path, final name and sha256 (and, with binary Unity files,
                               unity_text.py's VERSION and the locked UnityPy). A material's maps
                               come from its raw property names, then the display names in its
-                              `.shadergraph` (an input), and a base color with neither from its
-                              only texture, a blank `MI_X` slot uses `M_X`, and a mask applies
-                              with no base color too. Unity's sRGB colors are written linear,
-                              but for HDR ones, and a prefab's material list skips a slot no
-                              face uses and orders the rest by their first face, as Unity's
-                              submeshes do. Each mesh keeps its
-                              own lowest `_LOD<n>`, and every placed GLB, new or cached, is read
-                              so one with no mesh and no animation warns on every run
-                              (`SkipReason::NoMesh`), unless its model is named as a collider.
+                              `.shadergraph` (an input), and a base color with neither from its only
+                              texture, tinted by the material's color (a base found by name keeps a
+                              white factor), a blank `MI_X` slot uses `M_X`, and a mask applies with
+                              no base color too. A material with no cutout keyword is still a cutout
+                              on its base's alpha when its `.shader` or `.shadergraph` (both inputs)
+                              always clips on that alpha (`clipped_on`). Unity's sRGB colors are
+                              written linear, but for HDR ones, and a prefab's material list skips a
+                              slot no face uses and orders the rest by their first face, as Unity's
+                              submeshes do. Each mesh keeps its own lowest `_LOD<n>`, a
+                              `*_Billboard` mesh is dropped beside any other mesh the file keeps,
+                              and every placed GLB, new or cached, is read so one with no mesh and
+                              no animation warns on every run (`SkipReason::NoMesh`), unless its
+                              model is named as a collider.
                               A version bump changes every GLB's key, so a Rebuild reconverts
                               the pack, and nothing flags a pack built by an older version;
                               and unreal_glb, the

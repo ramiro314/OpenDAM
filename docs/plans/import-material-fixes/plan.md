@@ -850,6 +850,10 @@ profile, as Piece 1 did, and reports the GLBs it changes.
    `src/import` notes record the new rules. Every built Unity pack needs a Rebuild, as
    [Rebuild and the version bump](#rebuild-and-the-version-bump) describes.
 
+   Result (2026-11-04): items 1 to 4 each shipped their fix, so version 6 carries the tint, the
+   billboards, the shader cutouts and the slot order. Item 5 changed no converter code, since no
+   file holds those materials, so it adds nothing to version 6 and nothing to `CLAUDE.md`.
+
 **Unreal export.** Each item bumps `UNREAL_GLB_VERSION` itself when it changes the export.
 
 7. **Find meshes on disk, and warn on any left out.** `unreal_glb.py` lists the work copy's

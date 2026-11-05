@@ -74,7 +74,7 @@ What version 5 adds to its heuristics (docs/plans/import-material-fixes/plan.md,
   can name `Plane.099`, and only then without Blender's numeric suffix.
 - A renderer's material list counts Unity's submeshes, so it skips a slot no face uses.
 
-What follows version 5, for the bump to version 6 (the same plan, After the first gate):
+What version 6 adds (the same plan, After the first gate):
 
 - A base the only-texture rule found is multiplied by the material's flat color, its glTF
   `baseColorFactor` (`UnityMaterial.tint`). A base found by name keeps a white factor, whatever
@@ -106,7 +106,7 @@ import bpy
 
 # OpenDAM records it with each GLB and keys its cache by it: `import::unity_glb::UNITY_GLB_VERSION`,
 # which a test keeps equal. Bump both when the GLBs this writes change.
-VERSION = "opendam-unity-glb/5"
+VERSION = "opendam-unity-glb/6"
 
 # Property names are matched lowercased, without underscores: `_Base_Map` is `basemap`.
 BASE_PROPS = ["basemap", "maintex", "basecolormap", "mainbasemap", "base", "albedo", "albedomap",
