@@ -61,19 +61,23 @@ watch_memory() {
 # h/memproc.tsv line per process of it, in kB, with its peak resident size (VmHWM).
 stat_fields=(anon file kernel shmem file_mapped file_dirty file_writeback slab_reclaimable)
 watch_stat() {
-  local now scope name stat fields field events pid
+  local now scope name stat current peak fields field events pid
   now=$(date +%s)
   for scope in $(trial_scopes); do
     name=$(basename "$scope" .scope)
+    # A scope can end mid-read, Blender's often do: then it writes no line, never a partial one.
     stat=$(cat "$scope/memory.stat" 2>/dev/null) || continue
+    current=$(cat "$scope/memory.current" 2>/dev/null) || continue
+    peak=$(cat "$scope/memory.peak" 2>/dev/null) || continue
+    # How often the scope reached its cap and had to reclaim, and the kills there.
+    events=$(awk '$1 == "max" || $1 == "oom_kill" { printf "%s\t", $2 }' "$scope/memory.events" \
+      2>/dev/null) || continue
+    [[ $events == *$'\t'*$'\t' ]] || continue
     fields=()
     for field in "${stat_fields[@]}"; do
       fields+=("$(awk -v f="$field" '$1 == f { print $2 }' <<<"$stat")")
     done
-    # How often the scope reached its cap and had to reclaim, and the kills there.
-    events=$(awk '$1 == "max" || $1 == "oom_kill" { printf "%s\t", $2 }' "$scope/memory.events")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$TRIAL_STAGE" "$name" \
-      "$(cat "$scope/memory.current")" "$(cat "$scope/memory.peak")" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$TRIAL_STAGE" "$name" "$current" "$peak" \
       "$(IFS=$'\t' && echo "${fields[*]}")" "${events%$'\t'}" >>"$TRIAL_DIR/h/memstat.tsv"
     for pid in $(cat "$scope/cgroup.procs" 2>/dev/null); do
       awk -v t="$now" -v s="$TRIAL_STAGE" -v n="$name" -v p="$pid" '

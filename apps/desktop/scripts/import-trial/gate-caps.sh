@@ -101,24 +101,31 @@ for log in "${logs[@]}"; do
   fi
 
   # A scope's peak counts file cache, which the kernel reclaims before it kills, so the peak alone
-  # can't say how near a stage came to a kill. session.sh's h/memstat.tsv splits it: anon is what
-  # the cap can't reclaim (its swap is 0), and max_events counts the times the scope hit its cap
-  # and reclaimed.
+  # can't say how near a stage came to a kill. session.sh's h/memstat.tsv splits it. With swap at
+  # 0, what the cap can't reclaim is anon, shmem (counted in memory.stat's file too) and kernel
+  # memory but its reclaimable slab: "held" is the most of that sum in any one sample, the figure
+  # to compare with the cap. "File cache" is file less shmem. max_events counts the times the
+  # scope hit its cap and reclaimed, and only grows, so the most of it is the scope's count.
   if [[ -f $h/memstat.tsv ]]; then
     awk -F'\t' -v s="$stage" '
       # Columns by the header session.sh writes, so its stat_fields can change.
       NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
       $col["stage"] == s {
         k = $col["scope"]
+        held = $col["anon"] + $col["shmem"] + $col["kernel"] - $col["slab_reclaimable"]
+        cache = $col["file"] - $col["shmem"]
+        if (held > most[k]) most[k] = held
         if ($col["anon"] > anon[k]) anon[k] = $col["anon"]
-        if ($col["file"] > file[k]) file[k] = $col["file"]
+        if ($col["shmem"] > shmem[k]) shmem[k] = $col["shmem"]
+        if (cache > file[k]) file[k] = cache
         if ($col["peak"] > peak[k]) peak[k] = $col["peak"]
-        events[k] = $col["max_events"]
+        if ($col["max_events"] > events[k]) events[k] = $col["max_events"]
       }
       END {
-        for (k in anon)
-          printf "memory.stat %s: peak %d MiB, most anon %d MiB, most file cache %d MiB, %d reclaims at the cap\n",
-            k, peak[k] / 1048576, anon[k] / 1048576, file[k] / 1048576, events[k]
+        for (k in most)
+          printf "memory.stat %s: peak %d MiB, most held (anon, shmem, unreclaimable kernel) %d MiB, most anon %d MiB, most shmem %d MiB, most file cache %d MiB, %d reclaims at the cap\n",
+            k, peak[k] / 1048576, most[k] / 1048576, anon[k] / 1048576, shmem[k] / 1048576,
+            file[k] / 1048576, events[k]
       }' "$h/memstat.tsv"
   else
     echo "no h/memstat.tsv, so the peaks below don't split file cache from anon"

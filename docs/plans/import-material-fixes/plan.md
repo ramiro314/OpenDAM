@@ -946,10 +946,14 @@ Unreal one a ticket that bumps `UNREAL_GLB_VERSION`.
     previews and no cap kill (`gate-caps.sh` exits 0). `session.sh` now reads each scope's
     `memory.stat` every 5 s:
 
-    | Scope | Peak | Most anon | Most file cache | Reclaims at the cap |
-    |---|---|---|---|---|
-    | The app (10 GB cap) | 10,240 MiB, the cap | 2,481 MiB | 9,491 MiB | 143,925 |
-    | Blender, its largest conversion (12 GB cap) | 6,239 MiB | 2,262 MiB | 4,232 MiB | 0 |
+    | Scope | Peak | Most held | Most anon | Most file cache | Reclaims at the cap |
+    |---|---|---|---|---|---|
+    | The app (10 GB cap) | 10,240 MiB, the cap | 2,515 MiB | 2,481 MiB | 9,475 MiB | 143,925 |
+    | Blender, its largest conversion (12 GB cap) | 6,239 MiB | 2,270 MiB | 2,262 MiB | 4,232 MiB | 0 |
+
+    "Held" is what the cap can't reclaim, at its most in one sample: anon, shmem and kernel memory
+    but its reclaimable slab. File cache is `memory.stat`'s `file` less its shmem (at most 20 MiB
+    in the app).
 
     - **The app's scope reaches its cap 6 minutes in and stays there.** Its writes (each pack's
       extraction and staging, the GLBs, the thumbnails) and its reads are charged to it as file
@@ -959,16 +963,17 @@ Unreal one a ticket that bumps `UNREAL_GLB_VERSION`.
       with no growth from pack to pack. By process, at most: `opendam-desktop` 1.6 GB, in
       spikes during builds that settle near 0.8 GB, the preview worker 0.8 GB and WebKit's web
       process 0.7 GB. Blender runs in scopes of its own and doesn't count against the app.
-    - **A larger import could not be killed by the cache.** With swap at 0, only anon and
-      unreclaimable kernel memory can kill the scope, and they reached 2.5 GB of 10 GB. The
-      number of packs doesn't move it. One pack much larger than these could raise the app's
+    - **A larger import could not be killed by the cache.** With swap at 0, only held memory can
+      kill the scope, and it reached 2.5 GB of 10 GB. The number of packs doesn't move it. The
+      cache's dirty pages, at most 1.3 GB, are reclaimed only once written out, and the cap
+      waits for that rather than killing. One pack much larger than these could raise the app's
       spikes during its build, which this run doesn't measure.
     - **The fix is in the gate's tooling.** `memory.peak` alone made the scope look near a kill,
-      so `session.sh` writes `h/memstat.tsv` (anon, file cache, the cap's reclaim count) and
-      `h/memproc.tsv` (each process's anon, file and peak resident size), and `gate-caps.sh`
-      prints each scope's most anon and most file cache beside its peak. The second gate reports
-      those. The app and the converters don't change, and no follow-up is needed: no cause is
-      in a converter.
+      so `session.sh` writes `h/memstat.tsv` (anon, shmem, kernel, file cache, the cap's reclaim
+      count) and `h/memproc.tsv` (each process's anon, file and peak resident size), and
+      `gate-caps.sh` prints each scope's most held, anon, shmem and file cache beside its peak.
+      The second gate reports those. The app and the converters don't change, and no follow-up
+      is needed: no cause is in a converter.
 14. **The sheets' other oddities.** Find why Waterways' `SK_Snake` draws as a thin straight line
     and `SM_RockWall_01` as a dark scrap with a vine, and why Village's `SM_Tree_01` has a pale patch
     in its leaves.
