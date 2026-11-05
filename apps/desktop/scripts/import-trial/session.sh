@@ -55,6 +55,40 @@ watch_memory() {
   fi
 }
 
+# Every 5 s, what each scope's memory is made of, from its memory.stat, since memory.peak counts
+# file cache, which the kernel reclaims before it kills, with the app's own memory (anon, which
+# can't be swapped out under MemorySwapMax=0). One h/memstat.tsv line per scope, in bytes, and one
+# h/memproc.tsv line per process of it, in kB, with its peak resident size (VmHWM).
+stat_fields=(anon file kernel shmem file_mapped file_dirty file_writeback slab_reclaimable)
+watch_stat() {
+  local now scope name stat fields field events pid
+  now=$(date +%s)
+  for scope in $(trial_scopes); do
+    name=$(basename "$scope" .scope)
+    stat=$(cat "$scope/memory.stat" 2>/dev/null) || continue
+    fields=()
+    for field in "${stat_fields[@]}"; do
+      fields+=("$(awk -v f="$field" '$1 == f { print $2 }' <<<"$stat")")
+    done
+    # How often the scope reached its cap and had to reclaim, and the kills there.
+    events=$(awk '$1 == "max" || $1 == "oom_kill" { printf "%s\t", $2 }' "$scope/memory.events")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$TRIAL_STAGE" "$name" \
+      "$(cat "$scope/memory.current")" "$(cat "$scope/memory.peak")" \
+      "$(IFS=$'\t' && echo "${fields[*]}")" "${events%$'\t'}" >>"$TRIAL_DIR/h/memstat.tsv"
+    for pid in $(cat "$scope/cgroup.procs" 2>/dev/null); do
+      awk -v t="$now" -v s="$TRIAL_STAGE" -v n="$name" -v p="$pid" '
+        /^Name:/ { c = $2 } /^VmHWM:/ { h = $2 } /^RssAnon:/ { a = $2 } /^RssFile:/ { f = $2 }
+        /^RssShmem:/ { m = $2 }
+        END { if (c != "") printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", t, s, n, p, c, a, f, m, h }
+      ' "/proc/$pid/status" 2>/dev/null >>"$TRIAL_DIR/h/memproc.tsv"
+    done
+  done
+}
+[[ -e $TRIAL_DIR/h/memstat.tsv ]] || printf 'time\tstage\tscope\tcurrent\tpeak\t%s\tmax_events\toom_kills\n' \
+  "$(IFS=$'\t' && echo "${stat_fields[*]}")" >"$TRIAL_DIR/h/memstat.tsv"
+[[ -e $TRIAL_DIR/h/memproc.tsv ]] || printf 'time\tstage\tscope\tpid\tname\trss_anon\trss_file\trss_shmem\thwm\n' \
+  >"$TRIAL_DIR/h/memproc.tsv"
+
 rm -f "$TRIAL_DIR/h/stop"
 "$TRIAL_REPO/scripts/memory-cap.sh" "$TRIAL_REPO/apps/desktop/src-tauri/target/debug/opendam-desktop" \
   >"$TRIAL_DIR/h/app-$TRIAL_STAGE.log" 2>&1 &
@@ -64,6 +98,7 @@ for ((second = 0; second < TRIAL_SECONDS; second++)); do
   grep -q '"k":"done"' "$TRIAL_DIR/h/log.jsonl" 2>/dev/null && break
   [[ -e $TRIAL_DIR/h/stop ]] && break
   ((second % 30 == 0)) && watch_memory
+  ((second % 5 == 0)) && watch_stat
   sleep 1
 done
 kill "$pid" 2>/dev/null

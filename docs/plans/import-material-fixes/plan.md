@@ -939,6 +939,36 @@ Unreal one a ticket that bumps `UNREAL_GLB_VERSION`.
     stage, and the scope's figure doesn't split file cache from the app's own memory. Measure an
     11-pack import under the cap with the scope's `memory.stat` (anonymous memory against file
     cache) and say whether a larger import could be killed.
+
+    Result (2026-11-04): the peak is file cache, and the cap reclaims it. An 11-pack run at
+    `99ada97`, as the first gate's (`run.sh` with `TRIAL_UI`, `packs.json`, a new profile in
+    `~/.local/share/opendam-import-memory`), ended `done` with 11 runs, no error, all 4,182
+    previews and no cap kill (`gate-caps.sh` exits 0). `session.sh` now reads each scope's
+    `memory.stat` every 5 s:
+
+    | Scope | Peak | Most anon | Most file cache | Reclaims at the cap |
+    |---|---|---|---|---|
+    | The app (10 GB cap) | 10,240 MiB, the cap | 2,481 MiB | 9,491 MiB | 143,925 |
+    | Blender, its largest conversion (12 GB cap) | 6,239 MiB | 2,262 MiB | 4,232 MiB | 0 |
+
+    - **The app's scope reaches its cap 6 minutes in and stays there.** Its writes (each pack's
+      extraction and staging, the GLBs, the thumbnails) and its reads are charged to it as file
+      cache, which the kernel reclaims at the cap (`memory.events` `max`) before it kills
+      anything. So the first gate's 9.8 GB, and this run's 10 GB, measure the cache, not a risk.
+    - **Its own memory stays near a quarter of the cap.** Anon was 0.6 to 2.5 GB through the run,
+      with no growth from pack to pack. By process, at most: `opendam-desktop` 1.6 GB, in
+      spikes during builds that settle near 0.8 GB, the preview worker 0.8 GB and WebKit's web
+      process 0.7 GB. Blender runs in scopes of its own and doesn't count against the app.
+    - **A larger import could not be killed by the cache.** With swap at 0, only anon and
+      unreclaimable kernel memory can kill the scope, and they reached 2.5 GB of 10 GB. The
+      number of packs doesn't move it. One pack much larger than these could raise the app's
+      spikes during its build, which this run doesn't measure.
+    - **The fix is in the gate's tooling.** `memory.peak` alone made the scope look near a kill,
+      so `session.sh` writes `h/memstat.tsv` (anon, file cache, the cap's reclaim count) and
+      `h/memproc.tsv` (each process's anon, file and peak resident size), and `gate-caps.sh`
+      prints each scope's most anon and most file cache beside its peak. The second gate reports
+      those. The app and the converters don't change, and no follow-up is needed: no cause is
+      in a converter.
 14. **The sheets' other oddities.** Find why Waterways' `SK_Snake` draws as a thin straight line
     and `SM_RockWall_01` as a dark scrap with a vine, and why Village's `SM_Tree_01` has a pale patch
     in its leaves.

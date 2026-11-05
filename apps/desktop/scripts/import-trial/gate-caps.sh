@@ -100,6 +100,27 @@ for log in "${logs[@]}"; do
       sed -E 's/\.scope: Consumed .* wall clock time, / peak /' | sort -t' ' -k3 -h | tail -8
   fi
 
+  # A scope's peak counts file cache, which the kernel reclaims before it kills, so the peak alone
+  # can't say how near a stage came to a kill. session.sh's h/memstat.tsv splits it: anon is what
+  # the cap can't reclaim (its swap is 0), and max_events counts the times the scope hit its cap
+  # and reclaimed.
+  if [[ -f $h/memstat.tsv ]]; then
+    awk -F'\t' -v s="$stage" '
+      $2 == s {
+        if ($6 > anon[$3]) anon[$3] = $6
+        if ($7 > file[$3]) file[$3] = $7
+        if ($5 > peak[$3]) peak[$3] = $5
+        events[$3] = $14
+      }
+      END {
+        for (k in anon)
+          printf "memory.stat %s: peak %d MiB, most anon %d MiB, most file cache %d MiB, %d reclaims at the cap\n",
+            k, peak[k] / 1048576, anon[k] / 1048576, file[k] / 1048576, events[k]
+      }' "$h/memstat.tsv"
+  else
+    echo "no h/memstat.tsv, so the peaks below don't split file cache from anon"
+  fi
+
   kernel=$(journalctl _TRANSPORT=kernel --since "@$since" --until "@$until" --no-pager 2>/dev/null |
     grep -ciE 'out of memory|oom-kill|oom_reaper')
   echo "kernel OOM lines in the window: $kernel"

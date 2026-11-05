@@ -10,7 +10,8 @@
 #
 # The folder must be new or empty, so a trial can never write to an existing baseline or to a real
 # library. It ends up as the baseline is laid out: libs/, data/, cache/ and h/, with h/log.jsonl
-# the page's log, h/app-*.log the app's and, under the real UI, h/watch.log the memory it saw. Then
+# the page's log, h/app-*.log the app's and, under the real UI, h/watch.log the memory it saw, with
+# h/memstat.tsv and h/memproc.tsv splitting it into the app's own memory and file cache. Then
 # audit it:
 #
 #   python3 packages/preview-engine/tools/glb_audit.py manifest <folder>/libs/Fab \
