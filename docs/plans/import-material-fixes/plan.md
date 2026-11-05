@@ -1036,6 +1036,12 @@ Unreal one a ticket that bumps `UNREAL_GLB_VERSION`.
     the owner's review under Known gaps. Nothing deletes the old libraries: the owner does that by
     hand, and closes #261, after the review.
 
+    Result (2026-11-05, at `feb8c19`): every check of all four runs passes, by
+    [gate-report-2.md](gate-report-2.md). `gate2_check.py` checks this item's own terms. Waterways
+    ran 1.1 GB under the 24 GB memory floor, which the owner waived for this run, with no cap kill.
+    The report proposes floors, and `floors.tsv` is unchanged until the owner accepts them. The
+    owner's review of the sheets is still to come.
+
 ### Order
 
 | Item | Blocked by |

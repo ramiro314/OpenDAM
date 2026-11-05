@@ -82,6 +82,7 @@
     glbs: candidate.tree?.glbs ?? null,
     estimate: candidate.tree?.estimate ?? false,
     warnings: candidate.tree?.warnings ?? [],
+    notes: candidate.tree?.notes ?? [],
     treeError: candidate.tree?.error ?? null,
     skipped: candidate.tree?.skipped ?? [],
   });
