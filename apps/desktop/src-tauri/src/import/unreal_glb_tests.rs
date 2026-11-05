@@ -542,24 +542,24 @@ exec python3 -B "${{2#-ExecutePythonScript=}}""#,
         json!({"package": format!("/Game/Fixture/Meshes/{name}"), "asset": asset, "class": class})
     }
 
-    /// The real script, against a registry that lists `SM_A` under another asset name and the
-    /// texture, but not `SM_B`, a mesh, nor `SM_C`, a redirector to `SM_A`: `SM_B` is loaded by
-    /// path and exported, `SM_C` gets no GLB, and nothing warns, `SM_A` included.
+    /// The real script, against a registry that lists only `SM_A`, under another asset name, and
+    /// misses `SM_B`, a mesh, `SM_C`, a redirector to `SM_A`, and `T_A`, a texture: `SM_B` is
+    /// loaded by path and exported, `SM_C` and `T_A` get no GLB, and nothing warns, `SM_A`
+    /// included.
     #[tokio::test]
     async fn a_package_the_registry_misses_exports_and_a_redirector_needs_no_glb() {
         let s = setup_with(false).await;
         let root = s.stub_unreal().await;
         script_editor(
             &root,
-            json!([
-                listed("SM_A", "SM_A_Mesh", "StaticMesh"),
-                {"package": "/Game/Fixture/Textures/T_A", "asset": "T_A", "class": "Texture2D"},
-            ]),
+            json!([listed("SM_A", "SM_A_Mesh", "StaticMesh")]),
             json!({
                 "/Game/Fixture/Meshes/SM_B.SM_B":
                     {"path": "/Game/Fixture/Meshes/SM_B.SM_B", "class": "StaticMesh"},
                 "/Game/Fixture/Meshes/SM_C.SM_C":
                     {"path": "/Game/Fixture/Meshes/SM_A.SM_A_Mesh", "class": "StaticMesh"},
+                "/Game/Fixture/Textures/T_A.T_A":
+                    {"path": "/Game/Fixture/Textures/T_A.T_A", "class": "Texture2D"},
             }),
         );
         let run = s
